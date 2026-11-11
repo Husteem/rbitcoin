@@ -155,10 +155,13 @@ cargo test --workspace
 ./scripts/coverage.sh   # uses target/cov — does not thrash target/dev
 ```
 
-Windows/macOS PR surface is `./scripts/ci-os-smoke.sh` (store IO/RAM/mmap
-fuse, a few-block query confirm, `--smoke`), not this full suite —
-see CONTRIBUTING (What works on each OS). No `libbitcoinconsensus` in the graph:
-`cargo tree -i bitcoinconsensus` must fail to resolve.
+On Windows and macOS, every PR runs `./scripts/ci-os-smoke.sh` (store
+IO/RAM/mmap fuse, a few-block query confirm, `--smoke`). macOS also runs the
+optional `macos-test` job:
+`cargo test --workspace --exclude rbitcoin-bench --features skip-flushes`
+(see Skip flushes below). See CONTRIBUTING (What works on each OS). No
+`libbitcoinconsensus` in the graph: `cargo tree -i bitcoinconsensus` must fail
+to resolve.
 
 ### Artifact silos (do not mix)
 
@@ -229,8 +232,11 @@ process the test starts, such as the `journey-node` in `asmap_journey`,
 still flushes. A test that needs a real flush belongs in a suite that does
 not call the macro, such as `rbitcoin-store`'s. The `skip-flushes-call` and
 `skip-flushes-macro` ast-grep rules refuse the switch anywhere else. CI's
-`test` job runs each suite's switch test with the flag. Without the flag,
-and in `ci-os-smoke.sh`, flushes still run.
+`test` job runs each suite's switch test with the flag. The `macos-test`
+job runs the whole workspace with the flag, but only the five suites above
+skip flushes. The rest, such as electrum, esplora, and store, still flush.
+The workspace `cargo test` step in the required `test` job and
+`ci-os-smoke.sh` do not pass the flag, so every suite they run flushes.
 
 ### Suite speed budgets (default tier)
 
