@@ -5249,13 +5249,16 @@ impl MempoolHub {
     /// start maintenance, so catch-up is not paced by a large pool. Mined
     /// prioritisation deltas still drop, including a tx that already left
     /// the mempool and a block that removes nothing live.
-    pub fn remove_for_block(&self, txids: &[Txid]) -> usize {
+    ///
+    /// `removal` is `Committed(Block)` for a block, and `Undo` for a
+    /// `testmempoolaccept` dry run that takes its admits back.
+    pub fn remove_for_block(&self, txids: &[Txid], removal: Removal) -> usize {
         if !self.pool_maintained() {
             self.drop_mined_fee_deltas(txids);
             return 0;
         }
         let utxo = self.utxo_provider();
-        let n = self.unlink_block_txids(txids);
+        let n = self.unlink_block_txids(txids, removal);
         for tid in txids {
             self.promote_orphans_staged(*tid, &utxo);
         }
@@ -5265,7 +5268,11 @@ impl MempoolHub {
 
     /// [`Self::remove_for_block`] for an armed task. Orphan promotion takes a
     /// store permit per coin read and drops it before script verify.
-    pub async fn remove_for_block_async(self: &Arc<Self>, txids: Vec<Txid>) -> usize {
+    pub async fn remove_for_block_async(
+        self: &Arc<Self>,
+        txids: Vec<Txid>,
+        removal: Removal,
+    ) -> usize {
         let hub = Arc::clone(self);
         let ids = txids.clone();
         let n = crate::reactor::off_pool(move || {
@@ -5273,7 +5280,7 @@ impl MempoolHub {
                 hub.drop_mined_fee_deltas(&ids);
                 None
             } else {
-                Some(hub.unlink_block_txids(&ids))
+                Some(hub.unlink_block_txids(&ids, removal))
             }
         })
         .await;
@@ -5289,7 +5296,7 @@ impl MempoolHub {
     }
 
     /// Pull mined txids out of the live set. Does not promote or unindex.
-    fn unlink_block_txids(&self, txids: &[Txid]) -> usize {
+    fn unlink_block_txids(&self, txids: &[Txid], removal: Removal) -> usize {
         let mut g = self.lock_write();
         let bps = g.graph.bytes_per_sigop();
         for tid in txids {
@@ -5303,8 +5310,7 @@ impl MempoolHub {
                 self.push_confirm_memory(rate);
             }
         }
-        g.remove_live_txids(txids, Removal::Committed(RemovalReason::Block))
-            .unwrap_or(0)
+        g.remove_live_txids(txids, removal).unwrap_or(0)
     }
 
     /// Drop orphans the block spent, then the relay rows and fee deltas.
@@ -5327,7 +5333,7 @@ impl MempoolHub {
             return 0;
         }
         if spent.is_empty() {
-            return self.remove_for_block(txids);
+            return self.remove_for_block(txids, Removal::Committed(RemovalReason::Block));
         }
         let utxo = self.utxo_provider();
         let (n, gone) = {

@@ -2,7 +2,7 @@ use super::*;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
-use rbitcoin_net::{MempoolHub, QueryUtxoProvider, UtxoProvider};
+use rbitcoin_net::{MempoolHub, QueryUtxoProvider, Removal, UtxoProvider};
 use rbitcoin_primitives::Fk;
 use rbitcoin_primitives::Height;
 use serde_json::{json, Value};
@@ -1487,7 +1487,7 @@ pub fn testmempoolaccept_package_rows(
         }
     }
     if !added.is_empty() {
-        mp.remove_for_block(&added);
+        mp.remove_for_block(&added, Removal::Undo);
     }
     json!(out)
 }
@@ -1581,7 +1581,7 @@ async fn testmempoolaccept_package_rows_work(
         }
     }
     if !added.is_empty() {
-        mp.remove_for_block_async(added).await;
+        mp.remove_for_block_async(added, Removal::Undo).await;
     }
     json!(out)
 }
