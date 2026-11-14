@@ -88,7 +88,8 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   opt-in (`--esplora-listen`). Internal electrs HTTP (`/internal/*`) is unix
   listen only, not the public TCP bind. Its address and scripthash totals skip
   `--max-sh-creates`, so a process that can open the socket can start a large
-  join (one at a time under `--heavy-sh-creates`). Edge TLS, multi-tenant metering, and API keys
+  join (one at a time under `--heavy-sh-creates`). Its `/history` lists skip
+  the cap too; they walk one wave at a time instead of the whole join. Edge TLS, multi-tenant metering, and API keys
   are still out of process (see [`docs/operator/interfaces.md`](./docs/operator/interfaces.md)).
 - **Health listener:** `--health-listen` is opt-in, read-only, and
   unauthenticated (`/healthz`, `/readyz`, `/progress`, and `/metrics` with

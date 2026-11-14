@@ -174,6 +174,17 @@ totals for seven scripts with 22,000 to 1.9 million creates each took 0.3 s to
 21 s and raised node memory by up to 0.6 GB. Time and memory do not follow the
 create count: the largest took 8 s, a pay-to-anchor script with 77,000 took 21 s.
 
+`GET /internal/scripthash/:hash/history` (and `/internal/address/:address/history`)
+on the same socket is the confirmed `get_history` list with no
+`--max-sh-creates`, for an explorer that copies a large script's whole list
+once. It does not run the unpaged join. It reads the script's creates, sorts
+them by height, then joins 4096 at a time and writes each wave's rows before
+reading the next. Rows wait in memory only while they belong to a block above
+the next unread create (a spend of an older output), so the node holds one
+wave and those rows, not the whole list. It does not take the
+`--heavy-sh-creates` turn: a slow reader would hold that node-wide turn for as
+long as it reads. Each wave takes the store-read budget only while it reads.
+
 `--heavy-sh-creates N` (conf `heavy_sh_creates=`, default **10000**, **0** off)
 lets one unpaged join with more than N creates run at a time across the
 node. One join near a raised cap of 100000 was measured at 2.1 GiB peak RSS,

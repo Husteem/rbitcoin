@@ -2292,6 +2292,111 @@ impl Query {
     }
 }
 
+/// The confirmed history of one script as of a pinned view, handed out in
+/// `get_history` order (height, then txid bytes) one create wave at a time,
+/// so a caller can write rows while later waves are still unread.
+///
+/// Creates are walked by height. A row is handed out once no unread create
+/// sits at or below its height: a spend is never below the create it spends.
+/// Only spends above that frontier wait in `held`; the full join is never in
+/// RAM. No `--max-sh-creates` or `--heavy-sh-creates` admit: the one caller
+/// is the Esplora unix socket. Each wave rechecks the view, so a reorg below
+/// the pin fails the walk rather than ending it short.
+#[doc(hidden)]
+pub struct ShHistoryWalk {
+    scripthash: [u8; 32],
+    view: ChainView,
+    wave: usize,
+    creates: Vec<(u32, Fk)>,
+    next: usize,
+    held: BTreeMap<(u32, [u8; 32]), Fk>,
+    done: bool,
+}
+
+impl Query {
+    /// Start an [`ShHistoryWalk`] over `wave` creates per step.
+    #[doc(hidden)]
+    pub fn sh_history_walk(
+        &self,
+        scripthash: &[u8; 32],
+        view: &ChainView,
+        wave: usize,
+    ) -> Result<ShHistoryWalk, QueryError> {
+        let fks = self.strong_sh_creates(scripthash, view)?;
+        let heights = self.store.tx_height_get_batch(&fks)?;
+        if heights.len() != fks.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: SH create height batch length",
+            ));
+        }
+        let mut creates: Vec<(u32, Fk)> = heights
+            .into_iter()
+            .map(|h| h.unwrap_or(0))
+            .zip(fks)
+            .collect();
+        creates.sort_unstable_by_key(|(h, fk)| (*h, fk.0));
+        Ok(ShHistoryWalk {
+            scripthash: *scripthash,
+            view: *view,
+            wave: wave.max(1),
+            creates,
+            next: 0,
+            held: BTreeMap::new(),
+            done: false,
+        })
+    }
+}
+
+impl ShHistoryWalk {
+    /// The next rows in order (possibly none yet), or `None` once every row
+    /// was handed out.
+    pub fn next_rows(
+        &mut self,
+        q: &Query,
+    ) -> Result<Option<Vec<ScriptHashHistoryItem>>, QueryError> {
+        if self.done {
+            return Ok(None);
+        }
+        let end = self.next.saturating_add(self.wave).min(self.creates.len());
+        let fks: Vec<Fk> = self.creates[self.next..end]
+            .iter()
+            .map(|(_, fk)| *fk)
+            .collect();
+        self.next = end;
+        let created = q.expand_create_fks_wave(&self.scripthash, &fks, ShJoinNeed::HISTORY)?;
+        for rec in q.join_spends_wave(&created, ShJoinNeed::HISTORY, &self.view)? {
+            self.held
+                .insert((rec.out.create_height, rec.out.txid), rec.out.create_tx_fk);
+            for sp in rec.spenders {
+                self.held.insert((sp.height, sp.txid), sp.fk);
+            }
+        }
+        if !self.view.still_live(q)? {
+            return Err(StoreError::Stale("chain view moved"));
+        }
+        let rows = match self.creates.get(self.next) {
+            Some(&(frontier, _)) => {
+                let later = self.held.split_off(&(frontier, [0u8; 32]));
+                std::mem::replace(&mut self.held, later)
+            }
+            None => {
+                self.done = true;
+                std::mem::take(&mut self.held)
+            }
+        };
+        Ok(Some(
+            rows.into_iter()
+                .map(|((height, txid), tx_fk)| ScriptHashHistoryItem {
+                    height: i64::from(height),
+                    txid,
+                    tx_fk,
+                    fee: None,
+                })
+                .collect(),
+        ))
+    }
+}
+
 /// An admitted unpaged join. A heavy one holds the node's single heavy turn
 /// until this drops.
 pub struct JoinAdmit<'a> {

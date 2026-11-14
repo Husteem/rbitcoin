@@ -356,6 +356,158 @@ pub async fn get_internal_scripthash(
     .await
 }
 
+/// `GET /internal/address/:a/history`. See [`get_internal_scripthash_history`].
+#[cfg(unix)]
+pub async fn get_internal_address_history(
+    State(st): State<AppState>,
+    Path(addr_s): Path<String>,
+    AsOf(asof): AsOf,
+) -> Response {
+    let Ok(sh) = resolve_address_sh(&addr_s, st.network) else {
+        return not_found();
+    };
+    sh_history_stream(st, sh, asof).await
+}
+
+/// `GET /internal/scripthash/:h/history`: every confirmed transaction of the
+/// script as of the pinned view, as Electrum `get_history` rows
+/// (`[{"tx_hash","height"}, ...]`, height then txid bytes). No
+/// `--max-sh-creates`: the socket's caller is trusted. The body is written
+/// one create wave at a time. A failure after the headers aborts the body
+/// without its closing chunk or `]`, so a short list never reads as whole.
+#[cfg(unix)]
+pub async fn get_internal_scripthash_history(
+    State(st): State<AppState>,
+    Path(sh_hex): Path<String>,
+    AsOf(asof): AsOf,
+) -> Response {
+    let Ok(sh) = parse_hash32(&sh_hex) else {
+        return not_found();
+    };
+    sh_history_stream(st, sh, asof).await
+}
+
+/// A started walk at its pinned view, or the reply that ends the request.
+#[cfg(unix)]
+enum HistoryStart {
+    Walk(
+        rbitcoin_query::ChainView,
+        rbitcoin_query::scripthash::ShHistoryWalk,
+    ),
+    Reply(Response),
+}
+
+#[cfg(unix)]
+async fn sh_history_stream(st: AppState, sh: [u8; 32], asof: Option<[u8; 32]>) -> Response {
+    let q = std::sync::Arc::clone(&st.query);
+    let started = crate::handlers::store_blocking(move || {
+        let view = match crate::handlers::sh_pin(&st, asof) {
+            Ok(Some(view)) => view,
+            Ok(None) => return HistoryStart::Reply(json_reply_here(Vec::<Value>::new())),
+            Err(resp) => return HistoryStart::Reply(resp),
+        };
+        match st
+            .query
+            .sh_history_walk(&sh, &view, rbitcoin_query::scripthash::SH_JOIN_WAVE)
+        {
+            Ok(walk) => HistoryStart::Walk(view, walk),
+            Err(e) => HistoryStart::Reply(store_err(e)),
+        }
+    })
+    .await;
+    let (view, walk) = match started {
+        Ok(HistoryStart::Walk(view, walk)) => (view, walk),
+        Ok(HistoryStart::Reply(resp)) => return resp,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    rbitcoin_net::spawn_with_store_budget(write_history(q, walk, tx));
+    let mut resp = (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        axum::body::Body::new(ChunkBody(rx)),
+    )
+        .into_response();
+    resp.extensions_mut().insert(view);
+    resp
+}
+
+/// Walk one wave per store permit and send its rows. The permit is never
+/// held while a slow reader leaves the channel full.
+#[cfg(unix)]
+async fn write_history(
+    q: std::sync::Arc<rbitcoin_query::Query>,
+    mut walk: rbitcoin_query::scripthash::ShHistoryWalk,
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+) {
+    let mut open = Some(b'[');
+    loop {
+        let q = std::sync::Arc::clone(&q);
+        let step = crate::handlers::store_blocking(move || {
+            let rows = walk.next_rows(&q);
+            (walk, rows)
+        })
+        .await;
+        let (next, rows) = match step {
+            Ok(step) => step,
+            Err(e) => {
+                let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                return;
+            }
+        };
+        walk = next;
+        let rows = match rows {
+            Ok(Some(rows)) => rows,
+            Ok(None) => {
+                let end: &'static [u8] = if open.is_some() { b"[]" } else { b"]" };
+                let _ = tx.send(Ok(Bytes::from_static(end))).await;
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                return;
+            }
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let mut out = Vec::with_capacity(rows.len().saturating_mul(96));
+        for row in rows {
+            out.push(open.take().unwrap_or(b','));
+            out.extend_from_slice(
+                format!(
+                    "{{\"tx_hash\":\"{}\",\"height\":{}}}",
+                    block_hash_hex(&row.txid),
+                    row.height
+                )
+                .as_bytes(),
+            );
+        }
+        if tx.send(Ok(Bytes::from(out))).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// A response body fed by [`write_history`]. An `Err` frame aborts it.
+#[cfg(unix)]
+#[doc(hidden)]
+pub struct ChunkBody(pub tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>);
+
+#[cfg(unix)]
+impl hyper::body::Body for ChunkBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        self.0
+            .poll_recv(cx)
+            .map(|chunk| chunk.map(|r| r.map(hyper::body::Frame::data)))
+    }
+}
+
 /// Most txids one `POST /internal/txs/outspends/by-txid` may name.
 pub const MAX_OUTSPENDS_TXIDS: usize = 1_000;
 

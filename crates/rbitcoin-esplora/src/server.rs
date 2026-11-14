@@ -266,6 +266,8 @@ pub fn path_accepts_asof(path: &str) -> bool {
             | ["scripthash", _]
             | ["internal", "address", _]
             | ["internal", "scripthash", _]
+            | ["internal", "address", _, "history"]
+            | ["internal", "scripthash", _, "history"]
             | ["address", _, "utxo"]
             | ["scripthash", _, "utxo"]
             | ["address", _, "txs"]
@@ -1008,6 +1010,14 @@ pub fn internal_routes() -> Router<AppState> {
         .route(
             "/internal/scripthash/{hash}",
             get(crate::internal::get_internal_scripthash),
+        )
+        .route(
+            "/internal/address/{addr}/history",
+            get(crate::internal::get_internal_address_history),
+        )
+        .route(
+            "/internal/scripthash/{hash}/history",
+            get(crate::internal::get_internal_scripthash_history),
         )
 }
 

@@ -215,6 +215,72 @@ fn sh_history_caps() {
     assert_newest_page_leaves_slot_empty(&q, &sh);
     let stats = q.scripthash_chain_stats(&sh).unwrap();
     assert_eq!((stats.funded_txo_count, stats.spent_txo_count), (7, 1));
+    history_walk_is_the_open_history(&q, &sh, stats.tx_count);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every row of a history walk, in the order it hands them out.
+fn walk_all(
+    q: &Query,
+    sh: &[u8; 32],
+    view: &rbitcoin_query::ChainView,
+    wave: usize,
+) -> Result<Vec<rbitcoin_query::ScriptHashHistoryItem>, QueryError> {
+    let mut walk = q.sh_history_walk(sh, view, wave)?;
+    let mut rows = Vec::new();
+    while let Some(more) = walk.next_rows(q)? {
+        rows.extend(more);
+    }
+    Ok(rows)
+}
+
+/// The walk is the Electrum `get_history` list at any wave size, one row
+/// per transaction (the totals' `tx_count`), and `--max-sh-creates` does
+/// not refuse it.
+fn history_walk_is_the_open_history(q: &Query, sh: &[u8; 32], tx_count: u32) {
+    let view = q.pin_sh_chain_view().unwrap().expect("sh view");
+    let open = q
+        .scripthash_history_filtered_in(sh, &rbitcoin_query::HistoryFilter::open(), &view)
+        .unwrap()
+        .rows;
+    assert_eq!(open.len(), tx_count as usize);
+    q.set_max_sh_creates(2);
+    let refused = q
+        .scripthash_history_filtered_in(sh, &rbitcoin_query::HistoryFilter::open(), &view)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(refused, rbitcoin_store::StoreError::ShCreatesCap { .. }),
+        "Electrum's open history still refuses: {refused}"
+    );
+    for wave in [1, 2, 3, rbitcoin_query::scripthash::SH_JOIN_WAVE] {
+        let rows = walk_all(q, sh, &view, wave).expect("the walk ignores the cap");
+        assert_eq!(rows, open, "wave {wave}");
+    }
+    q.set_max_sh_creates(0);
+}
+
+/// A walk whose pinned block leaves the best chain fails instead of ending
+/// short or mixing two chains.
+#[test]
+fn history_walk_fails_once_its_view_leaves_the_chain() {
+    let (dir, q) = temp_query("sh-walk-reorg");
+    let sh = script_hash(&[0x51]);
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for h in 0..3u32 {
+        let (header, ta) = coinbase_block(h, prev, parent);
+        parent = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    q.apply_sh_pending().unwrap();
+    let view = q.pin_sh_chain_view().unwrap().expect("sh view");
+    let mut walk = q.sh_history_walk(&sh, &view, 1).unwrap();
+    let first = walk.next_rows(&q).unwrap().expect("first wave");
+    assert!(first.len() <= 1, "{first:?}");
+    q.disconnect_tip().unwrap();
+    let err = walk.next_rows(&q).unwrap_err();
+    assert!(matches!(err, rbitcoin_store::StoreError::Stale(_)), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
