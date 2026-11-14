@@ -260,6 +260,42 @@ fn history_walk_is_the_open_history(q: &Query, sh: &[u8; 32], tx_count: u32) {
     q.set_max_sh_creates(0);
 }
 
+/// A BIP30 duplicate coinbase: one txid confirmed at two heights, both
+/// paying the script. The walk lists each confirmed instance, as the totals
+/// count them. Electrum's open history keeps one row at the first height.
+#[test]
+fn history_walk_lists_each_bip30_instance() {
+    let (dir, q) = temp_query("sh-walk-bip30");
+    let sh = script_hash(&[0x51]);
+    let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
+    let first = cb0.tx.txid;
+    let prev = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let (h1, cb1) = coinbase_block(1, prev, Some(h0.hash));
+    let dup = cb1.tx.txid;
+    let prev = q.connect_block(Height(1), &h1, std::slice::from_ref(&cb1)).unwrap();
+    let (h2, _) = coinbase_block(2, prev, Some(h1.hash));
+    q.connect_block(Height(2), &h2, &[cb1]).unwrap();
+    q.apply_sh_pending().unwrap();
+    let view = q.pin_sh_chain_view().unwrap().expect("sh view");
+    let rows: Vec<(i64, [u8; 32])> = walk_all(&q, &sh, &view, 1)
+        .unwrap()
+        .iter()
+        .map(|r| (r.height, r.txid))
+        .collect();
+    assert_eq!(rows, [(0, first), (1, dup), (2, dup)]);
+    let stats = q.scripthash_chain_stats_in(&sh, &view).unwrap();
+    assert_eq!(stats.tx_count as usize, rows.len());
+    let electrum = q
+        .scripthash_history_filtered_in(&sh, &rbitcoin_query::HistoryFilter::open(), &view)
+        .unwrap()
+        .rows;
+    assert_eq!(
+        electrum.iter().map(|r| (r.height, r.txid)).collect::<Vec<_>>(),
+        [(0, first), (1, dup)]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A walk whose pinned block leaves the best chain fails instead of ending
 /// short or mixing two chains.
 #[test]

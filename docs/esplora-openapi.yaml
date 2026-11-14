@@ -954,7 +954,9 @@ paths:
       description: |
         Electrum `blockchain.scripthash.get_history` rows for the confirmed chain
         as of the pinned view, in its order: height ascending, then txid bytes
-        (internal byte order, the reverse of the hex). No mempool rows. `?asof=`
+        (internal byte order, the reverse of the hex). One row per confirmed
+        instance: a BIP30 duplicate coinbase (one txid in two blocks) is listed
+        at both heights, where `get_history` keeps only the first. No mempool rows. `?asof=`
         and the chain-tip headers are those of `/internal/scripthash/{scripthash}`,
         and the row count equals its `chain_stats.tx_count` at the same pin.
         The body is chunked and written one wave of creates at a time. If the
