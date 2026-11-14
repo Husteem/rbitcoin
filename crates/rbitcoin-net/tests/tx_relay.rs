@@ -4625,6 +4625,21 @@ fn failed_commit_publishes_raised_fee_floor() {
             !hub.try_contains(&parent.compute_txid()),
             "package={package}: parent chunk must have been evicted"
         );
+        // The child was never in the pool. Only the parent left it.
+        let left: Vec<(Txid, rbitcoin_mempool::RemovalReason)> = hub
+            .removed_rows()
+            .rows
+            .iter()
+            .map(|r| (r.txid, r.reason))
+            .collect();
+        assert_eq!(
+            left,
+            vec![(
+                parent.compute_txid(),
+                rbitcoin_mempool::RemovalReason::SizeLimit
+            )],
+            "package={package}"
+        );
         let enforced = hub.lock_read().mempool_min_fee_sat_kvb();
         assert!(
             enforced > advertised,

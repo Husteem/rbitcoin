@@ -169,6 +169,9 @@ pub struct AcceptResult {
     /// Sigop-adjusted weight; `vsize = ceil(weight / 4)` is Core's `m_vsize`.
     pub weight: u64,
     pub slot: u32,
+    /// The `mempool_sequence` this admit took. A row its txid takes from
+    /// here on belongs to this admit.
+    pub seq: u64,
     /// Node-time seconds stamped on the durable record (Core `nTime`).
     pub accept_secs: u64,
     /// Mempool txids removed by full-RBF / RBFR when admitting this tx (empty if no conflict).
@@ -1547,7 +1550,7 @@ impl ActiveMempool {
         };
         let body = Arc::new(tx.clone());
         self.graph.insert(entry, tx);
-        self.sequence.advance();
+        let seq = self.sequence.advance();
         self.bodies.insert(txid, Arc::clone(&body));
         self.vin_aux.insert(txid, aux);
 
@@ -1590,6 +1593,7 @@ impl ActiveMempool {
             fee_sat,
             weight: adj_weight,
             slot,
+            seq,
             accept_secs,
             replaced: conflict_set.into_iter().collect(),
             replaced_scripthashes,
@@ -1616,11 +1620,13 @@ impl ActiveMempool {
         self.sequence.retract_since(since, by);
     }
 
-    /// Drop the `replaced` rows of admits a rollback takes back. Those
-    /// admits did not stay.
-    pub fn forget_replacements(&mut self, accepted: &[AcceptResult]) {
+    /// Drop the rows of admits a rollback takes back: the `replaced` rows of
+    /// their victims, and the row an admit took if a trim evicted it first.
+    /// Those admits did not stay.
+    pub fn forget_admits(&mut self, accepted: &[AcceptResult]) {
         for r in accepted {
             self.sequence.retract_replaced(r.txid, &r.replaced);
+            self.sequence.retract_since(r.seq, r.txid);
         }
     }
 
@@ -1637,6 +1643,8 @@ impl ActiveMempool {
             fee_sat,
             weight,
             slot: 0,
+            // Nothing was admitted, so no row belongs to this result.
+            seq: self.sequence.next(),
             accept_secs: self.node_now_secs(),
             replaced: conflict_set.into_iter().collect(),
             replaced_scripthashes: Vec::new(),
@@ -2275,7 +2283,7 @@ impl ActiveMempool {
         for r in accepted.iter().rev() {
             let _ = self.unlink_tree(&r.txid, Removal::Undo);
         }
-        self.forget_replacements(accepted);
+        self.forget_admits(accepted);
         let _ = self.store.sync_deaths();
         let _ = self.restore_victims(&victims, &accept_secs, utxos, tip, RestoreOrphans::Promote);
     }

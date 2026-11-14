@@ -3506,7 +3506,7 @@ impl MempoolHub {
             for r in accepted.iter().rev() {
                 gone.extend(g.remove_txid_tree(&r.txid, Removal::Undo));
             }
-            g.forget_replacements(accepted);
+            g.forget_admits(accepted);
         }
         self.unindex_evicted(&gone);
         victims
@@ -6446,7 +6446,7 @@ impl MempoolHub {
 
     #[doc(hidden)]
     pub fn live_accept_result(&self, txid: &Txid) -> Option<AcceptResult> {
-        let (txid, fee_sat, weight, slot) = {
+        let (txid, fee_sat, weight, slot, seq) = {
             let g = self.lock_read();
             let e = g.graph.get(txid)?;
             (
@@ -6454,6 +6454,8 @@ impl MempoolHub {
                 e.fee_sat,
                 e.adjusted_weight(g.graph.bytes_per_sigop()),
                 e.slot,
+                // Already live: no row before now belongs to this result.
+                g.mempool_sequence(),
             )
         };
         Some(AcceptResult {
@@ -6461,6 +6463,7 @@ impl MempoolHub {
             fee_sat,
             weight,
             slot,
+            seq,
             accept_secs: self
                 .accept_time_txid(&txid)
                 .unwrap_or_else(|| self.relay_now_secs()),
