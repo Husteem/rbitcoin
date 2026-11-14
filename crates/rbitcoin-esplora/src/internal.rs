@@ -394,9 +394,10 @@ enum HistoryStart {
     Reply(Response),
 }
 
-/// Pin the view, then answer 200 and write the rows from a task. The create
-/// scan is the walk's first step, after the headers, so a large script does
-/// not race the request timeout.
+/// Pin the view, then answer 200 and write the rows from a task that waits
+/// for the body's first poll. The create scan is the walk's first step, so it
+/// runs after the response has left the middleware and the request timeout,
+/// and it never competes with them for the store-read budget.
 #[cfg(unix)]
 async fn sh_history_stream(st: AppState, sh: [u8; 32], asof: Option<[u8; 32]>) -> Response {
     let q = std::sync::Arc::clone(&st.query);
@@ -419,19 +420,22 @@ async fn sh_history_stream(st: AppState, sh: [u8; 32], asof: Option<[u8; 32]>) -
         rbitcoin_query::scripthash::SH_JOIN_WAVE,
     );
     let (tx, rx) = tokio::sync::mpsc::channel(2);
-    rbitcoin_net::spawn_with_store_budget(write_history(q, walk, tx, stall));
+    let (start, started) = tokio::sync::oneshot::channel();
+    rbitcoin_net::spawn_with_store_budget(write_history(q, walk, tx, stall, started));
     let mut resp = (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
-        axum::body::Body::new(ChunkBody::new(rx)),
+        axum::body::Body::new(ChunkBody::new(rx, start)),
     )
         .into_response();
     resp.extensions_mut().insert(view);
     resp
 }
 
-/// Walk one wave per store permit and send its rows. The permit and the
-/// heavy turn are never held while the channel is full. A reader that
-/// leaves a chunk unread for `stall` ends the walk, and its body fails.
+/// Once `start` fires, walk one wave per store permit and send its rows. A
+/// body dropped before its first poll drops `start`, and nothing is read.
+/// The permit and the heavy turn are never held while the channel is full.
+/// A reader that leaves a chunk unread for `stall` ends the walk, and its
+/// body fails.
 #[cfg(unix)]
 #[doc(hidden)]
 pub async fn write_history(
@@ -439,7 +443,11 @@ pub async fn write_history(
     mut walk: rbitcoin_query::scripthash::ShHistoryWalk,
     tx: tokio::sync::mpsc::Sender<Result<HistoryChunk, std::io::Error>>,
     stall: std::time::Duration,
+    start: tokio::sync::oneshot::Receiver<()>,
 ) {
+    if start.await.is_err() {
+        return;
+    }
     let send = |item| {
         let tx = tx.clone();
         async move { matches!(tokio::time::timeout(stall, tx.send(item)).await, Ok(Ok(()))) }
@@ -501,20 +509,28 @@ pub enum HistoryChunk {
     Last(Bytes),
 }
 
-/// A response body fed by [`write_history`]. An `Err` frame, or a channel
-/// that closes before [`HistoryChunk::Last`], fails it, so a body cut short
-/// never ends with its final chunk.
+/// A response body fed by [`write_history`]. Its first poll fires `start`.
+/// An `Err` frame, or a channel that closes before [`HistoryChunk::Last`],
+/// fails it, so a body cut short never ends with its final chunk.
 #[cfg(unix)]
 #[doc(hidden)]
 pub struct ChunkBody {
     rx: tokio::sync::mpsc::Receiver<Result<HistoryChunk, std::io::Error>>,
+    start: Option<tokio::sync::oneshot::Sender<()>>,
     ended: bool,
 }
 
 #[cfg(unix)]
 impl ChunkBody {
-    pub fn new(rx: tokio::sync::mpsc::Receiver<Result<HistoryChunk, std::io::Error>>) -> Self {
-        Self { rx, ended: false }
+    pub fn new(
+        rx: tokio::sync::mpsc::Receiver<Result<HistoryChunk, std::io::Error>>,
+        start: tokio::sync::oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            rx,
+            start: Some(start),
+            ended: false,
+        }
     }
 }
 
@@ -529,6 +545,9 @@ impl hyper::body::Body for ChunkBody {
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         if self.ended {
             return std::task::Poll::Ready(None);
+        }
+        if let Some(start) = self.start.take() {
+            let _ = start.send(());
         }
         let frame = match std::task::ready!(self.rx.poll_recv(cx)) {
             Some(Ok(HistoryChunk::Rows(rows))) => Ok(rows),

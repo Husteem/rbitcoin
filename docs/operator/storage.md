@@ -177,8 +177,8 @@ create count: the largest took 8 s, a pay-to-anchor script with 77,000 took 21 s
 `GET /internal/scripthash/:hash/history` (and `/internal/address/:address/history`)
 on the same socket is the confirmed `get_history` list with no
 `--max-sh-creates`, for an explorer that copies a large script's whole list
-once. It does not run the unpaged join. After the response headers it reads
-the script's creates and sorts them by height, then joins 4096 at a time and
+once. It does not run the unpaged join. Once the response has left the
+request timeout and its body is first read, it reads the script's creates and sorts them by height, then joins 4096 at a time and
 writes each wave's rows before reading the next. For as long as the response is
 open the node keeps that sorted create list (a height and a key, 16 bytes a
 create), one wave, and the rows that belong to a block above the next unread

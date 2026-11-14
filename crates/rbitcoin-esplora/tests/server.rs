@@ -925,13 +925,16 @@ fn get_with_client(path: &str, client: &str) -> axum::http::Request<axum::body::
         .unwrap()
 }
 
-/// A reader that leaves a history body unread past the stall limit ends the
-/// walk, and what it then reads is not a complete body.
-#[cfg(unix)]
-#[tokio::test(start_paused = true)]
-async fn stalled_history_reader_ends_the_walk() {
-    use rbitcoin_esplora::internal::{write_history, ChunkBody};
-    let (_dir, q) = temp_query("esplora-history-stall");
+/// Five coinbase blocks paying `0x51`, and a one-create-per-wave walk over
+/// that script at the tip.
+fn five_block_history(
+    label: &str,
+) -> (
+    rbitcoin_query::testutil::TempDir,
+    Arc<Query>,
+    rbitcoin_query::scripthash::ShHistoryWalk,
+) {
+    let (dir, q) = temp_query(label);
     let mut prev = Fk::NULL;
     let mut parent = None;
     for h in 0..5 {
@@ -942,10 +945,58 @@ async fn stalled_history_reader_ends_the_walk() {
     q.apply_sh_pending().unwrap();
     let view = q.pin_sh_chain_view().unwrap().expect("sh view");
     let walk = rbitcoin_query::scripthash::ShHistoryWalk::new(&script_hash(&[0x51]), &view, 1);
+    (dir, Arc::new(q), walk)
+}
+
+/// A reader that leaves a history body unread past the stall limit ends the
+/// walk, and what it then reads is not a complete body.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn stalled_history_reader_ends_the_walk() {
+    use rbitcoin_esplora::internal::{write_history, ChunkBody};
+    let (_dir, q, walk) = five_block_history("esplora-history-stall");
     let (tx, rx) = tokio::sync::mpsc::channel(2);
-    write_history(Arc::new(q), walk, tx, Duration::from_secs(120)).await;
-    let body = axum::body::Body::new(ChunkBody::new(rx));
+    let (start, started) = tokio::sync::oneshot::channel();
+    start.send(()).unwrap();
+    write_history(q, walk, tx, Duration::from_secs(120), started).await;
+    let body = axum::body::Body::new(ChunkBody::new(rx, tokio::sync::oneshot::channel().0));
     assert!(axum::body::to_bytes(body, 1 << 20).await.is_err());
+}
+
+/// The walk reads nothing until its body is first polled, so the create scan
+/// never runs while the response is still inside the middleware and the
+/// request timeout. A body dropped unpolled ends the walk with no rows.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn history_walk_waits_for_the_first_body_poll() {
+    use rbitcoin_esplora::internal::{write_history, ChunkBody};
+    let (_dir, q, walk) = five_block_history("esplora-history-unpolled");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let (start, started) = tokio::sync::oneshot::channel::<()>();
+    drop(start);
+    write_history(q, walk, tx, Duration::from_secs(120), started).await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
+
+    let (_dir, q, walk) = five_block_history("esplora-history-polled");
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let (start, started) = tokio::sync::oneshot::channel();
+    let producer = tokio::spawn(write_history(
+        q,
+        walk,
+        tx,
+        Duration::from_secs(120),
+        started,
+    ));
+    let body = axum::body::Body::new(ChunkBody::new(rx, start));
+    let bytes = axum::body::to_bytes(body, 1 << 20)
+        .await
+        .expect("whole body");
+    let rows: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rows.len(), 5);
+    producer.await.unwrap();
 }
 
 /// TCP mounts no `/internal` route, so with the SH index off an internal

@@ -672,7 +672,7 @@ async fn history_body_cut_short_is_not_a_complete_body() {
             tx.send(end).await.unwrap();
         }
         drop(tx);
-        let body = axum::body::Body::new(ChunkBody::new(rx));
+        let body = axum::body::Body::new(ChunkBody::new(rx, tokio::sync::oneshot::channel().0));
         assert!(axum::body::to_bytes(body, 1 << 20).await.is_err());
     }
 }
