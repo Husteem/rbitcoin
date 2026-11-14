@@ -789,7 +789,7 @@ impl ActiveMempool {
             store.abandon_live()?;
         }
         let loaded = store.load_live_txs()?;
-        let ingested = Self::ingest_loaded(loaded);
+        let ingested = Self::ingest_loaded(loaded, |_| 0);
         store.set_live_count(ingested.graph.len() as u32);
         Ok(Self {
             store,
@@ -960,7 +960,9 @@ impl ActiveMempool {
     pub fn compact(&mut self) -> Result<(u32, usize), MempoolError> {
         let (live, body_len) = self.store.compact()?;
         let loaded = self.store.load_live_txs()?;
-        let mut ingested = Self::ingest_loaded(loaded);
+        // The same entries in new slots: each keeps the sequence its insert took.
+        let live_seq = |txid: &Txid| self.graph.get(txid).map_or(0, |e| e.seq);
+        let mut ingested = Self::ingest_loaded(loaded, live_seq);
         ingested
             .graph
             .set_cluster_limits(self.cluster_count_overlay, self.cluster_size_kvb_overlay);
@@ -979,7 +981,12 @@ impl ActiveMempool {
     }
 
     #[doc(hidden)]
-    pub fn ingest_loaded(loaded: Vec<crate::store::LiveTx>) -> IngestedLive {
+    /// `seq_of` gives each entry the sequence its insert took: 0 at open,
+    /// the live entry's own across a compact.
+    pub fn ingest_loaded(
+        loaded: Vec<crate::store::LiveTx>,
+        seq_of: impl Fn(&Txid) -> u64,
+    ) -> IngestedLive {
         let mut graph = TxGraph::new();
         let mut bodies = std::collections::HashMap::new();
         let mut vin_aux = std::collections::HashMap::new();
@@ -1002,7 +1009,7 @@ impl ActiveMempool {
                 // [`ActiveMempool::recompute_missing_sigops`]. MAX never fits a block.
                 sigop_cost: p.sigop_cost.unwrap_or(u64::MAX),
                 slot: live.slot,
-                seq: 0,
+                seq: seq_of(&p.txid),
                 parents: BTreeSet::new(),
                 children: BTreeSet::new(),
             };
@@ -1620,7 +1627,8 @@ impl ActiveMempool {
         kept_trust: Vec<Txid>,
     ) {
         self.trust_kept.extend(kept_trust);
-        self.sequence.retract_replaced(by, victims);
+        let before = admitted.unwrap_or(self.sequence.next());
+        self.sequence.retract_replaced(by, before, victims);
         if let Some(seq) = admitted {
             self.sequence.retract_admit(by, seq);
         }
@@ -1631,7 +1639,7 @@ impl ActiveMempool {
     /// Those admits did not stay.
     pub fn forget_admits(&mut self, accepted: &[AcceptResult]) {
         for r in accepted {
-            self.sequence.retract_replaced(r.txid, &r.replaced);
+            self.sequence.retract_replaced(r.txid, r.seq, &r.replaced);
             self.sequence.retract_admit(r.txid, r.seq);
         }
     }

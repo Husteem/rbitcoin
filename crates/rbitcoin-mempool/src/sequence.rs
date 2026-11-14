@@ -131,16 +131,24 @@ impl PoolSequence {
         });
     }
 
-    /// Drop the newest `replaced` row by `by` for each of `victims`. That
-    /// replacement did not stay, so it replaced nothing. The sequence keeps
-    /// its numbers: membership did change.
-    pub fn retract_replaced<'a>(&mut self, by: Txid, victims: impl IntoIterator<Item = &'a Txid>) {
+    /// Drop, for each of `victims`, the newest `replaced` row by `by`
+    /// numbered below `before`. `before` is the sequence that admit of `by`
+    /// took (its victims left just ahead of it), so a later replacement by
+    /// the same txid keeps its rows. That replacement did not stay, so it
+    /// replaced nothing. The sequence keeps its numbers: membership did
+    /// change.
+    pub fn retract_replaced<'a>(
+        &mut self,
+        by: Txid,
+        before: u64,
+        victims: impl IntoIterator<Item = &'a Txid>,
+    ) {
         let mut left: Vec<Txid> = victims.into_iter().copied().collect();
         let mut i = self.rows.len();
         while i > 0 && !left.is_empty() {
             i -= 1;
             let row = self.rows[i].row;
-            if row.reason != (RemovalReason::Replaced { by }) {
+            if row.seq >= before || row.reason != (RemovalReason::Replaced { by }) {
                 continue;
             }
             if let Some(k) = left.iter().position(|v| *v == row.txid) {

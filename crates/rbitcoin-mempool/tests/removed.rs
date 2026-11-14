@@ -309,3 +309,47 @@ fn a_rollback_keeps_the_row_of_a_later_stay() {
     mp.forget_admits(std::slice::from_ref(&staged));
     assert_eq!(mp.removed_rows().rows, vec![mined]);
 }
+
+/// A compact rebuilds the graph and keeps each entry's stay, so a rollback
+/// after it still finds the row of the admit it takes back.
+#[test]
+fn a_rollback_finds_its_row_after_a_compact() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(1);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let tx = spend(ops[0], 99_000);
+    let staged = mp.accept_tx(&tx, &utxos, TIP_OK).expect("staged");
+    mp.compact().unwrap();
+    mp.remove_live_txids(&[staged.txid], Removal::Committed(RemovalReason::SizeLimit))
+        .unwrap();
+    assert_eq!(mp.removed_rows().rows.len(), 1);
+    mp.forget_admits(std::slice::from_ref(&staged));
+    assert!(mp.removed_rows().rows.is_empty(), "{:?}", mp.removed_rows());
+}
+
+/// A rollback drops the `replaced` row its own admit wrote. The same pair
+/// replacing again later keeps its row.
+#[test]
+fn a_rollback_keeps_a_later_replacement_by_the_same_txid() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(1);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let victim = spend(ops[0], 99_000);
+    let bump = spend(ops[0], 90_000);
+    let by = bump.compute_txid();
+    mp.accept_tx(&victim, &utxos, TIP_OK).expect("victim");
+    let staged = mp.accept_tx(&bump, &utxos, TIP_OK).expect("staged bump");
+    mp.remove_live_txids(&[by], Removal::Committed(RemovalReason::SizeLimit))
+        .unwrap();
+    mp.accept_tx(&victim, &utxos, TIP_OK).expect("victim again");
+    mp.accept_tx(&bump, &utxos, TIP_OK).expect("bump again");
+    mp.remove_live_txids(&[by], BLOCK).unwrap();
+    let rows = mp.removed_rows().rows;
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    let later = vec![rows[2], rows[3]];
+    assert_eq!(later[0].reason, RemovalReason::Replaced { by });
+    assert_eq!(later[1].reason, RemovalReason::Block);
+
+    mp.forget_admits(std::slice::from_ref(&staged));
+    assert_eq!(mp.removed_rows().rows, later);
+}
