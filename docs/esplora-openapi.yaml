@@ -30,8 +30,8 @@ info:
     the scripthash-index watermark, so the JSON matches
     the join that produced it, except `/address/{address}/txs/mempool` and
     `/scripthash/{scripthash}/txs/mempool`, which are not stamped. With `?asof=`,
-    the stamp is the as-of block. Public `/mempool`, `/mempool/txids`, and
-    `/mempool/recent` are not stamped. `/mempool/txids/page` and
+    the stamp is the as-of block. Public `/mempool`, `/mempool/txids`,
+    `/mempool/recent`, and `/mempool/removed` are not stamped. `/mempool/txids/page` and
     `/mempool/txids/page/{last_txid}` are, because the unstamped check is only
     `/mempool` and `/mempool/{one segment}`. `/fee-estimates`, `POST /tx`, and
     `POST /txs/package` are not stamped. `/internal/mempool/*` is stamped.
@@ -751,6 +751,29 @@ paths:
                     fee: { type: integer, description: sats }
                     vsize: { type: integer }
                     value: { type: integer, description: total output value in sats }
+  /mempool/removed:
+    get:
+      tags: [mempool]
+      summary: Recent committed mempool removals with their reason (rbitcoin dialect)
+      description: |
+        Not in Blockstream Esplora API.md. The removals the pool still holds,
+        oldest first. `seq` is the RPC `getrawmempool false true`
+        `mempool_sequence` that removal took. Every removal numbered `oldest`
+        or later is in `removed`. At most 16,666 rows; past that the oldest
+        drops. An admit the node takes back writes no row. Without a mempool
+        the answer is `{"oldest": 1, "removed": []}`.
+      responses:
+        "200":
+          description: Removal rows
+          headers: { X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MempoolRemoved" }
+              example:
+                oldest: 1180
+                removed:
+                  - { seq: 1202, txid: "aa00000000000000000000000000000000000000000000000000000000000000", reason: replaced, by: "bb00000000000000000000000000000000000000000000000000000000000000" }
+                  - { seq: 1203, txid: "cc00000000000000000000000000000000000000000000000000000000000000", reason: block }
   /fee-estimates:
     get:
       tags: [mempool]
@@ -1249,6 +1272,25 @@ components:
         - { type: integer, minimum: 0 }
       minItems: 4
       maxItems: 4
+    MempoolRemoved:
+      type: object
+      required: [oldest, removed]
+      properties:
+        oldest: { type: integer, description: Lowest sequence the list still covers }
+        removed: { type: array, items: { $ref: "#/components/schemas/MempoolRemovedRow" } }
+    MempoolRemovedRow:
+      type: object
+      required: [seq, txid, reason]
+      properties:
+        seq: { type: integer, description: The `mempool_sequence` this removal took }
+        txid: { $ref: "#/components/schemas/Hash" }
+        reason:
+          type: string
+          enum: [expiry, sizelimit, reorg, block, conflict, replaced]
+          description: Core `MemPoolRemovalReason`
+        by:
+          allOf: [{ $ref: "#/components/schemas/Hash" }]
+          description: The replacing txid. Present only when `reason` is `replaced`.
     MempoolInfo:
       type: object
       required: [count, vsize, total_fee, fee_histogram]

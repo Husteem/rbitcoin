@@ -69,8 +69,8 @@ const SMALLEST_TX_WEIGHT: u64 = 240;
 
 /// Rows held. A maximal block of the smallest transactions removes
 /// `MAX_BLOCK_WEIGHT / SMALLEST_TX_WEIGHT` (16,666), the largest removal the
-/// node makes in normal running. A full ring is about 1.5 MB. Past it the
-/// oldest row drops.
+/// node makes in normal running. A full ring is about 1.3 MB (80-byte rows).
+/// Past it the oldest row drops.
 pub const REMOVED_ROWS: usize =
     (rbitcoin_consensus::block::MAX_BLOCK_WEIGHT / SMALLEST_TX_WEIGHT) as usize;
 

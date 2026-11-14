@@ -222,12 +222,39 @@ the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](.
 | Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status; compact `/block/:hash/txs/summary` (dialect; [`COMPAT.md`](../../COMPAT.md)) |
 | Tx | full JSON, hex, **raw**, status, Electrum merkle-proof, **BIP37 merkleblock-proof**, outspends |
 | Address / scripthash | chain_stats, utxo, `/txs` + `/txs/chain` + `/txs/mempool`, compact `/txs/summary` (dialect; [`COMPAT.md`](../../COMPAT.md)); complete after SH tip finalize |
-| Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
+| Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/mempool/removed` (dialect; [below](#mempool-removal-reasons)), `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |
 | Without mempool | mempool routes empty/safe; POST broadcast → **503** |
 | Unknown / non-goal | **404** (address-prefix; Liquid; mempool.space `/ws` / `/v1/ws`). `GET /block-template` is 404 unless `--esplora-block-template`. `/internal/*` **unix listen only** (TCP 404): [`COMPAT.md`](../../COMPAT.md) |
 
 **Large responses:** `GET /block/:hash/raw` may be multi‑MB; concurrency/timeout from `ServeLimits` still apply.
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.
+
+### Mempool removal reasons
+
+`GET /mempool/removed` answers why a transaction left the pool. The body is
+`{"oldest": n, "removed": [{"seq", "txid", "reason", "by"?}, ...]}`, oldest
+first. `reason` is Core's name: `expiry`, `sizelimit`, `reorg`, `block`,
+`conflict`, or `replaced`; only `replaced` carries `by`, the replacing txid.
+Every removal numbered `oldest` or later is listed. The list holds 16,666
+rows (one maximal block of the smallest transactions; 2 to 3 MB of JSON
+when full); past that the oldest row drops.
+
+`seq` is RPC `getrawmempool false true`'s `mempool_sequence`, which advances
+on every add and every removal. A client that diffs listings:
+
+1. Take `getrawmempool false true` at S1, and later at S2.
+2. The same sequence means the same membership.
+3. For each txid in the first listing and not in the second, the last row
+   for that txid with `S1 <= seq < S2` gives the reason, provided
+   `oldest <= S1`.
+4. If `oldest > S1`, or there is no row, keep the new listing; there is no
+   reason for that txid. An admit the node took back (a package or 1p1c
+   rollback, a `testmempoolaccept` dry run) writes no row.
+5. A sequence that went backwards means the node restarted. Take the
+   listing as new.
+
+Fee, size, and time of a live transaction come from the listing or
+`getmempoolentry`; the route keeps removals only.
 
 ### mempool.space
 
