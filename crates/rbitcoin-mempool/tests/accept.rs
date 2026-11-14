@@ -2057,6 +2057,18 @@ fn failed_replacement_restores_below_floor_and_cpfp_set() {
         mp.graph.contains(&victim_id),
         "below-floor conflict must stay"
     );
+    // The child left with the anchor before it committed, and the victim is
+    // back. Only the anchor left for good.
+    let left: Vec<(Txid, RemovalReason)> = mp
+        .removed_rows()
+        .rows
+        .iter()
+        .map(|r| (r.txid, r.reason))
+        .collect();
+    assert_eq!(
+        left,
+        vec![(anchor.compute_txid(), RemovalReason::SizeLimit)]
+    );
     assert_eq!(mp.orphan_count(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 

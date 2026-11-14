@@ -257,6 +257,18 @@ fn an_undo_writes_no_row_but_moves_the_sequence() {
         .unwrap();
     assert_eq!(mp.mempool_sequence(), at + 1);
     assert!(mp.removed_rows().rows.is_empty());
+
+    // A listed transaction that left for good keeps that row when a later
+    // staged copy of it is taken back. The listed one left for that reason.
+    mp.accept_tx(&staged, &utxos, TIP_OK).expect("listed");
+    mp.remove_live_txids(&[staged.compute_txid()], BLOCK)
+        .unwrap();
+    let kept = mp.removed_rows();
+    assert_eq!(kept.rows.len(), 1);
+    mp.accept_tx(&staged, &utxos, TIP_OK).expect("staged copy");
+    mp.remove_live_txids(&[staged.compute_txid()], Removal::Undo)
+        .unwrap();
+    assert_eq!(mp.removed_rows(), kept);
 }
 
 #[test]

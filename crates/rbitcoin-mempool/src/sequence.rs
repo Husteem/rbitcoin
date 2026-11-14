@@ -138,6 +138,18 @@ impl PoolSequence {
         }
     }
 
+    /// Drop the rows `txid` took at `since` or later. A candidate that left
+    /// before its admit committed was never in the pool.
+    pub fn retract_since(&mut self, since: u64, txid: Txid) {
+        let mut i = self.rows.len();
+        while i > 0 && self.rows[i - 1].seq >= since {
+            i -= 1;
+            if self.rows[i].txid == txid {
+                self.rows.remove(i);
+            }
+        }
+    }
+
     pub fn removed_rows(&self) -> RemovedRows {
         RemovedRows {
             oldest: self.oldest,

@@ -1453,6 +1453,7 @@ impl ActiveMempool {
         prep: PreparedAdmit,
         trim: bool,
     ) -> Result<AcceptResult, AcceptError> {
+        let since = self.sequence.next();
         self.undone_replacements.clear();
         self.undone_accept_secs.clear();
         let (conflict_set, fee_sat, adj_weight) = self.plan_after_script(tx, &prep)?;
@@ -1502,7 +1503,7 @@ impl ActiveMempool {
         let mut evicted = match self.ensure_free_slot(Some(txid)) {
             Ok(evicted) => evicted,
             Err(e) => {
-                self.abandon_replacement(txid, &conflict_set, kept_conflicts);
+                self.abandon_commit(since, txid, &conflict_set, kept_conflicts);
                 return Err(e);
             }
         };
@@ -1525,7 +1526,7 @@ impl ActiveMempool {
             Ok(slot) => slot,
             Err(e) => {
                 self.last_evicted = evicted;
-                self.abandon_replacement(txid, &conflict_set, kept_conflicts);
+                self.abandon_commit(since, txid, &conflict_set, kept_conflicts);
                 return Err(e.into());
             }
         };
@@ -1555,7 +1556,7 @@ impl ActiveMempool {
                 Ok(more) => evicted.extend(more),
                 Err(e) => {
                     self.last_evicted = evicted;
-                    self.abandon_replacement(txid, &conflict_set, kept_conflicts);
+                    self.abandon_commit(since, txid, &conflict_set, kept_conflicts);
                     return Err(e);
                 }
             }
@@ -1564,7 +1565,7 @@ impl ActiveMempool {
         // A lone protected tx stays.
         if trim && !self.graph.contains(&txid) {
             self.last_evicted = evicted;
-            self.abandon_replacement(txid, &conflict_set, kept_conflicts);
+            self.abandon_commit(since, txid, &conflict_set, kept_conflicts);
             return Err(AcceptError::Policy("mempool full"));
         }
         if prep.trust_warn.is_some() || prep.keep_mark {
@@ -1601,9 +1602,18 @@ impl ActiveMempool {
 
     /// `by` unlinked `victims` and then did not commit. The trust marks go
     /// back, so the restore admits them again, and their `replaced` rows go.
-    fn abandon_replacement(&mut self, by: Txid, victims: &BTreeSet<Txid>, kept_trust: Vec<Txid>) {
+    /// So does the row `by` took if it left with an evicted parent: it was
+    /// never in the pool.
+    fn abandon_commit(
+        &mut self,
+        since: u64,
+        by: Txid,
+        victims: &BTreeSet<Txid>,
+        kept_trust: Vec<Txid>,
+    ) {
         self.trust_kept.extend(kept_trust);
         self.sequence.retract_replaced(by, victims);
+        self.sequence.retract_since(since, by);
     }
 
     /// Drop the `replaced` rows of admits a rollback takes back. Those

@@ -238,15 +238,22 @@ fn a_listing_under_concurrent_admits_matches_its_sequence() {
     let dir = tmp();
     let hub = Arc::new(MempoolHub::open(&dir, q).unwrap());
     hub.set_relay_enabled(true);
+    // The watcher lists once before any admit starts, so it does not depend
+    // on which thread the scheduler runs first.
+    let (listed, first_listing) = std::sync::mpsc::channel();
     let snaps = std::thread::scope(|s| {
         let watcher = s.spawn(|| {
-            let mut snaps = Vec::new();
+            let mut snaps = vec![listing(&hub)];
+            listed
+                .send(())
+                .expect("the test waits for the first listing");
             while hub.live_count() < cbs.len() {
                 snaps.push(listing(&hub));
                 std::thread::yield_now();
             }
             snaps
         });
+        first_listing.recv().expect("the watcher listed");
         for chunk in cbs.chunks(3) {
             let hub = Arc::clone(&hub);
             s.spawn(move || {
@@ -257,7 +264,6 @@ fn a_listing_under_concurrent_admits_matches_its_sequence() {
         }
         watcher.join().unwrap()
     });
-    assert!(!snaps.is_empty());
     for (txids, seq) in &snaps {
         assert_eq!(txids.len() as u64, seq - 1, "listing at {seq}: {txids:?}");
     }
