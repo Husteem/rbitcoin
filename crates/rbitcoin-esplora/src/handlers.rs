@@ -17,7 +17,7 @@ use bitcoin::consensus::{deserialize, encode::serialize, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::pow::{CompactTarget, Target};
 use bitcoin::{MerkleBlock, Network, OutPoint, Txid};
-use rbitcoin_net::MempoolHub;
+use rbitcoin_net::{MempoolHub, RemovalReason};
 use rbitcoin_primitives::{Fk, Height};
 
 use rbitcoin_query::{
@@ -2102,6 +2102,35 @@ pub async fn mempool_recent(State(st): State<AppState>) -> Response {
         })
         .collect();
     json_reply_here(rows)
+}
+
+/// Dialect: the committed removals the pool still holds, oldest first.
+/// `oldest` is the lowest sequence the list still covers.
+pub async fn mempool_removed(State(st): State<AppState>) -> Response {
+    spawn_join(move || mempool_removed_sync(&st)).await
+}
+
+fn mempool_removed_sync(st: &AppState) -> Response {
+    let Some(mp) = st.mempool.as_ref() else {
+        return json_reply_here(json!({"oldest": 1, "removed": []}));
+    };
+    let held = mp.removed_rows();
+    let rows: Vec<Value> = held
+        .rows
+        .iter()
+        .map(|r| {
+            let mut row = json!({
+                "seq": r.seq,
+                "txid": block_hash_hex(&r.txid.to_byte_array()),
+                "reason": r.reason.as_str(),
+            });
+            if let RemovalReason::Replaced { by } = r.reason {
+                row["by"] = json!(block_hash_hex(&by.to_byte_array()));
+            }
+            row
+        })
+        .collect();
+    json_reply_here(json!({"oldest": held.oldest, "removed": rows}))
 }
 
 /// Mempool-only history (up to 50), dedicated Esplora path.

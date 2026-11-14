@@ -5940,6 +5940,11 @@ impl MempoolHub {
             .collect()
     }
 
+    /// The committed removals the pool still holds, oldest first.
+    pub fn removed_rows(&self) -> rbitcoin_mempool::RemovedRows {
+        self.lock_read().removed_rows()
+    }
+
     /// The live txids and Core's `mempool_sequence`, from one read of the
     /// pool, so the sequence names exactly this membership.
     pub fn live_txids_and_sequence(&self) -> (Vec<Txid>, u64) {

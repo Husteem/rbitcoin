@@ -520,6 +520,58 @@ async fn esplora_unix_internal() {
     let _ = pad.dir;
 }
 
+/// `GET /mempool/removed` lists committed removals, oldest first. Only a
+/// `replaced` row names the transaction that took its place.
+#[tokio::test]
+async fn mempool_removed_lists_rows_on_the_unix_listener() {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let pad = pad_hub("mempool-removed", 1);
+    let sock_dir = rbitcoin_query::testutil::TempDir::for_socket().expect("temp dir");
+    let (handle, sock) = run_unix(
+        sock_dir.path(),
+        Arc::clone(&pad.q),
+        Some(Arc::clone(&pad.hub)),
+    )
+    .await;
+    let removed = |sock: std::path::PathBuf| async move {
+        let (st, body) = http_get_unix(&sock, "/mempool/removed").await;
+        assert_eq!(st, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    assert_eq!(
+        removed(sock.clone()).await,
+        json!({"oldest": 1, "removed": []})
+    );
+
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let first = spend_true(pad.cbs[0], 1_000, spk.clone());
+    let bump = spend_true(pad.cbs[0], 50_000, spk);
+    for tx in [&first, &bump] {
+        let (st, body) = http_post_unix(&sock, "/tx", serialize_hex(tx).as_bytes()).await;
+        assert_eq!(st, 200, "{body}");
+    }
+    pad.hub.remove_for_block(
+        &[bump.compute_txid()],
+        rbitcoin_net::Removal::Committed(rbitcoin_net::RemovalReason::Block),
+    );
+    assert_eq!(
+        removed(sock.clone()).await,
+        json!({"oldest": 1, "removed": [
+            {
+                "seq": 2,
+                "txid": first.compute_txid().to_string(),
+                "reason": "replaced",
+                "by": bump.compute_txid().to_string(),
+            },
+            {"seq": 4, "txid": bump.compute_txid().to_string(), "reason": "block"},
+        ]})
+    );
+
+    handle.shutdown().await;
+    let _ = pad.dir;
+}
+
 /// `(status, lowercased head, body)` for one GET on the unix socket.
 /// `client` names a join client; the socket trusts that header.
 async fn http_get_unix_head(

@@ -1291,6 +1291,7 @@ pub async fn run_esplora(
         )
         .route("/mempool/txids", get(handlers::mempool_txids))
         .route("/mempool/recent", get(handlers::mempool_recent))
+        .route("/mempool/removed", get(handlers::mempool_removed))
         .route("/fee-estimates", get(handlers::fee_estimates));
     #[cfg(unix)]
     let rest = if matches!(config.listen, EsploraListen::Unix(_)) {
