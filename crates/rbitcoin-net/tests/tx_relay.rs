@@ -28,7 +28,7 @@ fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
         .block_on(fut)
 }
 
-fn tmp() -> std::path::PathBuf {
+pub(crate) fn tmp() -> std::path::PathBuf {
     // macOS clocks tick in µs: back-to-back calls can share `n`.
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SystemTime::now()
@@ -531,7 +531,7 @@ fn spend_vout(prev: OutPoint, value: u64) -> Transaction {
     tx
 }
 
-fn spend_true(cb: Txid, fee: u64, spk: ScriptBuf) -> Transaction {
+pub(crate) fn spend_true(cb: Txid, fee: u64, spk: ScriptBuf) -> Transaction {
     Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
@@ -3790,7 +3790,7 @@ fn failed_package_leaves_its_parked_child_parked() {
 ///
 /// `n == 3` and `n == 12` return the process pad. Callers that connect
 /// or disconnect take [`copy_maturity_pad`] and leave this store in place.
-fn pad_cbs(n: u32) -> (std::path::PathBuf, Arc<Query>, Vec<Txid>) {
+pub(crate) fn pad_cbs(n: u32) -> (std::path::PathBuf, Arc<Query>, Vec<Txid>) {
     if n == 3 || n == 12 {
         let p = maturity_pad(n);
         return (p.dir.clone(), Arc::clone(&p.q), p.cbs.clone());
@@ -3845,7 +3845,7 @@ fn build_maturity_pad(n: u32) -> MaturityPad {
     }
 }
 
-fn copy_maturity_pad(n: u32) -> (std::path::PathBuf, Arc<Query>, Vec<Txid>) {
+pub(crate) fn copy_maturity_pad(n: u32) -> (std::path::PathBuf, Arc<Query>, Vec<Txid>) {
     let src = maturity_pad(n);
     let dir = tmp();
     std::fs::create_dir_all(&dir).unwrap();

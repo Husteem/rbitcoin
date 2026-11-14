@@ -6,7 +6,7 @@ use crate::graph::{
 };
 use crate::orphanage::{OrphanSnapshot, Orphanage};
 use crate::packed::VinAux;
-use crate::sequence::PoolSequence;
+use crate::sequence::{PoolSequence, Removal, RemovalReason, RemovedRows};
 use crate::store::Mempool;
 use bitcoin::{OutPoint, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_consensus::policy::{self, PolicyResult};
@@ -651,6 +651,11 @@ impl ActiveMempool {
         self.sequence.next()
     }
 
+    /// The committed removals still held, oldest first.
+    pub fn removed_rows(&self) -> RemovedRows {
+        self.sequence.removed_rows()
+    }
+
     /// Share the hub's mock clock so stamped accept times follow `setmocktime`.
     pub fn set_node_clock(&mut self, clock: Arc<AtomicU64>) {
         self.node_clock = clock;
@@ -863,7 +868,7 @@ impl ActiveMempool {
         if !self.graph.contains(txid) {
             return Ok(());
         }
-        if self.unlink_txid(txid).is_err() || self.graph.contains(txid) {
+        if self.unlink_txid(txid, Removal::Undo).is_err() || self.graph.contains(txid) {
             return Err(MempoolError::Corrupt("marked tx still live"));
         }
         Ok(())
@@ -1486,8 +1491,9 @@ impl ActiveMempool {
             .filter(|id| self.trust_kept.contains(id))
             .collect();
         self.undone_replacements = replaced_txs;
+        let replaced = Removal::Committed(RemovalReason::Replaced { by: txid });
         for c in conflict_set.iter().rev() {
-            let _ = self.unlink_txid(c);
+            let _ = self.unlink_txid(c, replaced);
         }
         // A failed sync leaves `deaths_unsynced` set for `persist_due`.
         let _ = self.store.sync_deaths();
@@ -1496,7 +1502,7 @@ impl ActiveMempool {
         let mut evicted = match self.ensure_free_slot(Some(txid)) {
             Ok(evicted) => evicted,
             Err(e) => {
-                self.trust_kept.extend(kept_conflicts);
+                self.abandon_replacement(txid, &conflict_set, kept_conflicts);
                 return Err(e);
             }
         };
@@ -1519,7 +1525,7 @@ impl ActiveMempool {
             Ok(slot) => slot,
             Err(e) => {
                 self.last_evicted = evicted;
-                self.trust_kept.extend(kept_conflicts);
+                self.abandon_replacement(txid, &conflict_set, kept_conflicts);
                 return Err(e.into());
             }
         };
@@ -1549,7 +1555,7 @@ impl ActiveMempool {
                 Ok(more) => evicted.extend(more),
                 Err(e) => {
                     self.last_evicted = evicted;
-                    self.trust_kept.extend(kept_conflicts);
+                    self.abandon_replacement(txid, &conflict_set, kept_conflicts);
                     return Err(e);
                 }
             }
@@ -1558,7 +1564,7 @@ impl ActiveMempool {
         // A lone protected tx stays.
         if trim && !self.graph.contains(&txid) {
             self.last_evicted = evicted;
-            self.trust_kept.extend(kept_conflicts);
+            self.abandon_replacement(txid, &conflict_set, kept_conflicts);
             return Err(AcceptError::Policy("mempool full"));
         }
         if prep.trust_warn.is_some() || prep.keep_mark {
@@ -1591,6 +1597,21 @@ impl ActiveMempool {
             replaced_trust: kept_conflicts,
             evicted,
         })
+    }
+
+    /// `by` unlinked `victims` and then did not commit. The trust marks go
+    /// back, so the restore admits them again, and their `replaced` rows go.
+    fn abandon_replacement(&mut self, by: Txid, victims: &BTreeSet<Txid>, kept_trust: Vec<Txid>) {
+        self.trust_kept.extend(kept_trust);
+        self.sequence.retract_replaced(by, victims);
+    }
+
+    /// Drop the `replaced` rows of admits a rollback takes back. Those
+    /// admits did not stay.
+    pub fn forget_replacements(&mut self, accepted: &[AcceptResult]) {
+        for r in accepted {
+            self.sequence.retract_replaced(r.txid, &r.replaced);
+        }
     }
 
     /// Prepare + RBF/cluster checks with no graph or store mutation.
@@ -1978,7 +1999,7 @@ impl ActiveMempool {
                 continue;
             }
             if self.graph.contains(t) {
-                gone.extend(self.unlink_tree(t));
+                gone.extend(self.unlink_tree(t, Removal::Committed(RemovalReason::SizeLimit)));
             }
         }
         let _ = self.store.sync_deaths();
@@ -2242,8 +2263,9 @@ impl ActiveMempool {
             self.trust_kept.insert(*id);
         }
         for r in accepted.iter().rev() {
-            let _ = self.unlink_tree(&r.txid);
+            let _ = self.unlink_tree(&r.txid, Removal::Undo);
         }
+        self.forget_replacements(accepted);
         let _ = self.store.sync_deaths();
         let _ = self.restore_victims(&victims, &accept_secs, utxos, tip, RestoreOrphans::Promote);
     }
@@ -2380,7 +2402,7 @@ impl ActiveMempool {
 
     /// Drop one live tx from the graph and `pwrite` its slot DEAD. No `fdatasync`.
     #[doc(hidden)]
-    pub fn unlink_txid(&mut self, txid: &Txid) -> Result<(), AcceptError> {
+    pub fn unlink_txid(&mut self, txid: &Txid, removal: Removal) -> Result<(), AcceptError> {
         let entry = self
             .graph
             .get(txid)
@@ -2394,7 +2416,7 @@ impl ActiveMempool {
         self.remember_extra_compact(&tx);
         self.store.mark_slot_dead(entry.slot)?;
         self.graph.remove(txid, &tx);
-        self.sequence.advance();
+        self.sequence.note_removed(*txid, removal);
         self.bodies.remove(txid);
         self.vin_aux.remove(txid);
         self.trust_kept.remove(txid);
@@ -2402,15 +2424,16 @@ impl ActiveMempool {
     }
 
     /// Durable remove one live tx (confirm / RBF / eviction).
-    pub fn remove_txid(&mut self, txid: &Txid) -> Result<(), AcceptError> {
-        self.unlink_txid(txid)?;
+    pub fn remove_txid(&mut self, txid: &Txid, removal: Removal) -> Result<(), AcceptError> {
+        self.unlink_txid(txid, removal)?;
         let _ = self.store.sync_deaths();
         Ok(())
     }
 
     /// Remove `txid` and live mempool txs that spend it, without syncing.
+    /// The spenders leave with the same `removal`.
     #[doc(hidden)]
-    pub fn unlink_tree(&mut self, txid: &Txid) -> Vec<Txid> {
+    pub fn unlink_tree(&mut self, txid: &Txid, removal: Removal) -> Vec<Txid> {
         let n_out = self
             .get_tx(txid)
             .map(|tx| tx.output.len() as u32)
@@ -2418,8 +2441,8 @@ impl ActiveMempool {
         let spent: Vec<OutPoint> = (0..n_out)
             .map(|vout| OutPoint { txid: *txid, vout })
             .collect();
-        let mut gone = self.unlink_conflicts(&spent);
-        if self.unlink_txid(txid).is_ok() {
+        let mut gone = self.unlink_conflicts(&spent, removal);
+        if self.unlink_txid(txid, removal).is_ok() {
             gone.push(*txid);
         }
         gone
@@ -2428,8 +2451,8 @@ impl ActiveMempool {
     /// Remove `txid` and live mempool txs that spend it (1p1c child-fail rollback).
     ///
     /// Returns every txid dropped (spenders first, then `txid` if it was live).
-    pub fn remove_txid_tree(&mut self, txid: &Txid) -> Vec<Txid> {
-        let gone = self.unlink_tree(txid);
+    pub fn remove_txid_tree(&mut self, txid: &Txid, removal: Removal) -> Vec<Txid> {
+        let gone = self.unlink_tree(txid, removal);
         let _ = self.store.sync_deaths();
         gone
     }
@@ -2452,11 +2475,15 @@ impl ActiveMempool {
         )
     }
 
-    /// Remove live graph entries listed in `block_txids` (no orphan promote).
+    /// Remove live graph entries listed in `txids` (no orphan promote).
     ///
     /// One slots `fdatasync`, then one `meta` sync, for every tx this call drops.
-    pub fn remove_live_txids(&mut self, block_txids: &[Txid]) -> Result<usize, AcceptError> {
-        let stripped = self.unlink_listed(block_txids);
+    pub fn remove_live_txids(
+        &mut self,
+        txids: &[Txid],
+        removal: Removal,
+    ) -> Result<usize, AcceptError> {
+        let stripped = self.unlink_listed(txids, removal);
         let _ = self.store.sync_deaths();
         let n = stripped?;
         if n > 0 {
@@ -2468,11 +2495,15 @@ impl ActiveMempool {
 
     /// `pwrite` DEAD for each live id. Does not sync.
     #[doc(hidden)]
-    pub fn unlink_listed(&mut self, block_txids: &[Txid]) -> Result<usize, AcceptError> {
+    pub fn unlink_listed(
+        &mut self,
+        txids: &[Txid],
+        removal: Removal,
+    ) -> Result<usize, AcceptError> {
         let mut n = 0usize;
-        for txid in block_txids {
+        for txid in txids {
             if self.graph.contains(txid) {
-                self.unlink_txid(txid)?;
+                self.unlink_txid(txid, removal)?;
                 n += 1;
             }
         }
@@ -2485,8 +2516,8 @@ impl ActiveMempool {
         txids: &[Txid],
         spent: &[OutPoint],
     ) -> Result<(usize, Vec<Txid>), AcceptError> {
-        let stripped = self.unlink_listed(txids);
-        let gone = self.unlink_conflicts(spent);
+        let stripped = self.unlink_listed(txids, Removal::Committed(RemovalReason::Block));
+        let gone = self.unlink_conflicts(spent, Removal::Committed(RemovalReason::Conflict));
         let _ = self.store.sync_deaths();
         let n = stripped?;
         if n > 0 || !gone.is_empty() {
@@ -2503,7 +2534,7 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
     ) -> Result<usize, AcceptError> {
-        let n = self.remove_live_txids(block_txids)?;
+        let n = self.remove_live_txids(block_txids, Removal::Committed(RemovalReason::Block))?;
         for txid in block_txids {
             self.promote_orphans_of(*txid, utxos, tip);
         }
@@ -2516,7 +2547,7 @@ impl ActiveMempool {
     /// A confirmed block that double-spends mempool txs does not list those
     /// txs in `txdata`; `remove_for_block` alone would leave them hanging.
     pub fn evict_conflicts_with(&mut self, spent: &[OutPoint]) -> Vec<Txid> {
-        let out = self.unlink_conflicts(spent);
+        let out = self.unlink_conflicts(spent, Removal::Committed(RemovalReason::Conflict));
         let _ = self.store.sync_deaths();
         if !out.is_empty() {
             let _ = self.maybe_compact();
@@ -2527,7 +2558,7 @@ impl ActiveMempool {
 
     /// Drop live txs (and their descendants) that spend `spent`. No sync.
     #[doc(hidden)]
-    pub fn unlink_conflicts(&mut self, spent: &[OutPoint]) -> Vec<Txid> {
+    pub fn unlink_conflicts(&mut self, spent: &[OutPoint], removal: Removal) -> Vec<Txid> {
         let mut direct = Vec::new();
         for op in spent {
             if let Some(c) = self.graph.conflict_txid(op) {
@@ -2540,7 +2571,7 @@ impl ActiveMempool {
         let set = self.graph.conflict_set(&direct);
         let mut out = Vec::new();
         for id in set {
-            if self.unlink_txid(&id).is_ok() {
+            if self.unlink_txid(&id, removal).is_ok() {
                 out.push(id);
             }
         }
@@ -2748,7 +2779,7 @@ impl ActiveMempool {
                     }
                 }
                 if missing_chain || (structural.is_err() && !keep_fault) {
-                    let _ = self.unlink_txid(&id);
+                    let _ = self.unlink_txid(&id, Removal::Committed(RemovalReason::Reorg));
                     removed = true;
                 }
             }
@@ -2801,7 +2832,7 @@ impl ActiveMempool {
                     }
                 }
                 _ => {
-                    let gone = self.unlink_tree(&id);
+                    let gone = self.unlink_tree(&id, Removal::Undo);
                     rbitcoin_log::info!(
                         "mempool: sigops recompute evicted {id} ({} with spenders): inputs gone or cost over block budget",
                         gone.len()

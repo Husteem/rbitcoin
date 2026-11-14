@@ -379,7 +379,7 @@ fn block_evicts_conflicts_and_confirms_the_rest(
         life.chain.spend(op);
     }
     let rest: Vec<Txid> = life.live_set().into_iter().collect();
-    assert_eq!(life.mp.remove_live_txids(&rest).unwrap(), rest.len());
+    assert_eq!(life.mp.remove_live_txids(&rest, BLOCK).unwrap(), rest.len());
     assert_eq!(life.mp.live_count(), 0);
 }
 
@@ -409,7 +409,7 @@ fn reorg_readmits_and_evicts_nonfinal(life: &mut Life) {
 
     life.chain.confirm(&zp, 200);
     life.tip.height = 200;
-    assert_eq!(life.mp.remove_live_txids(&[zp.compute_txid()]).unwrap(), 1);
+    assert_eq!(life.mp.remove_live_txids(&[zp.compute_txid()], BLOCK).unwrap(), 1);
 }
 
 /// With -minrelaytxfee at 50 sat/vB a parent below it goes to the extra
