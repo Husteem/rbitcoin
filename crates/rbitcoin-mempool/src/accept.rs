@@ -1002,6 +1002,7 @@ impl ActiveMempool {
                 // [`ActiveMempool::recompute_missing_sigops`]. MAX never fits a block.
                 sigop_cost: p.sigop_cost.unwrap_or(u64::MAX),
                 slot: live.slot,
+                seq: 0,
                 parents: BTreeSet::new(),
                 children: BTreeSet::new(),
             };
@@ -1456,7 +1457,8 @@ impl ActiveMempool {
         prep: PreparedAdmit,
         trim: bool,
     ) -> Result<AcceptResult, AcceptError> {
-        let since = self.sequence.next();
+        // The sequence the candidate's insert took, once it is in the graph.
+        let mut admitted = None;
         self.undone_replacements.clear();
         self.undone_accept_secs.clear();
         let (conflict_set, fee_sat, adj_weight) = self.plan_after_script(tx, &prep)?;
@@ -1506,7 +1508,7 @@ impl ActiveMempool {
         let mut evicted = match self.ensure_free_slot(Some(txid)) {
             Ok(evicted) => evicted,
             Err(e) => {
-                self.abandon_commit(since, txid, &conflict_set, kept_conflicts);
+                self.abandon_commit(txid, admitted, &conflict_set, kept_conflicts);
                 return Err(e);
             }
         };
@@ -1529,7 +1531,7 @@ impl ActiveMempool {
             Ok(slot) => slot,
             Err(e) => {
                 self.last_evicted = evicted;
-                self.abandon_commit(since, txid, &conflict_set, kept_conflicts);
+                self.abandon_commit(txid, admitted, &conflict_set, kept_conflicts);
                 return Err(e.into());
             }
         };
@@ -1545,12 +1547,14 @@ impl ActiveMempool {
             weight,
             sigop_cost: prep.sigop_cost,
             slot,
+            seq: self.sequence.next(),
             parents: BTreeSet::new(),
             children: BTreeSet::new(),
         };
         let body = Arc::new(tx.clone());
         self.graph.insert(entry, tx);
         let seq = self.sequence.advance();
+        admitted = Some(seq);
         self.bodies.insert(txid, Arc::clone(&body));
         self.vin_aux.insert(txid, aux);
 
@@ -1559,7 +1563,7 @@ impl ActiveMempool {
                 Ok(more) => evicted.extend(more),
                 Err(e) => {
                     self.last_evicted = evicted;
-                    self.abandon_commit(since, txid, &conflict_set, kept_conflicts);
+                    self.abandon_commit(txid, admitted, &conflict_set, kept_conflicts);
                     return Err(e);
                 }
             }
@@ -1568,7 +1572,7 @@ impl ActiveMempool {
         // A lone protected tx stays.
         if trim && !self.graph.contains(&txid) {
             self.last_evicted = evicted;
-            self.abandon_commit(since, txid, &conflict_set, kept_conflicts);
+            self.abandon_commit(txid, admitted, &conflict_set, kept_conflicts);
             return Err(AcceptError::Policy("mempool full"));
         }
         if prep.trust_warn.is_some() || prep.keep_mark {
@@ -1606,18 +1610,20 @@ impl ActiveMempool {
 
     /// `by` unlinked `victims` and then did not commit. The trust marks go
     /// back, so the restore admits them again, and their `replaced` rows go.
-    /// So does the row `by` took if it left with an evicted parent: it was
-    /// never in the pool.
+    /// So does the row `by` took if it was `admitted` and then left with an
+    /// evicted parent: it was never in the pool.
     fn abandon_commit(
         &mut self,
-        since: u64,
         by: Txid,
+        admitted: Option<u64>,
         victims: &BTreeSet<Txid>,
         kept_trust: Vec<Txid>,
     ) {
         self.trust_kept.extend(kept_trust);
         self.sequence.retract_replaced(by, victims);
-        self.sequence.retract_since(since, by);
+        if let Some(seq) = admitted {
+            self.sequence.retract_admit(by, seq);
+        }
     }
 
     /// Drop the rows of admits a rollback takes back: the `replaced` rows of
@@ -1626,7 +1632,7 @@ impl ActiveMempool {
     pub fn forget_admits(&mut self, accepted: &[AcceptResult]) {
         for r in accepted {
             self.sequence.retract_replaced(r.txid, &r.replaced);
-            self.sequence.retract_since(r.seq, r.txid);
+            self.sequence.retract_admit(r.txid, r.seq);
         }
     }
 
@@ -2434,7 +2440,7 @@ impl ActiveMempool {
         self.remember_extra_compact(&tx);
         self.store.mark_slot_dead(entry.slot)?;
         self.graph.remove(txid, &tx);
-        self.sequence.note_removed(*txid, removal);
+        self.sequence.note_removed(*txid, entry.seq, removal);
         self.bodies.remove(txid);
         self.vin_aux.remove(txid);
         self.trust_kept.remove(txid);

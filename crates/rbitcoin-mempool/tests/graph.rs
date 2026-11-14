@@ -41,6 +41,7 @@ fn entry_for(tx: &Transaction, fee: u64, slot: u32) -> TxEntry {
         weight: tx.weight().to_wu(),
         sigop_cost: 0,
         slot,
+        seq: 0,
         parents: BTreeSet::new(),
         children: BTreeSet::new(),
     }

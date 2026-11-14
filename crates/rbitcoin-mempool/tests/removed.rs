@@ -276,15 +276,36 @@ fn the_ring_drops_its_oldest_row_past_the_cap() {
     let mut seq = PoolSequence::default();
     let txid = |i: usize| Txid::from_byte_array([(i % 251) as u8; 32]);
     for i in 0..REMOVED_ROWS {
-        seq.note_removed(txid(i), BLOCK);
+        seq.note_removed(txid(i), 0, BLOCK);
     }
     let full = seq.removed_rows();
     assert_eq!((full.oldest, full.rows.len()), (1, REMOVED_ROWS));
-    seq.note_removed(txid(REMOVED_ROWS), BLOCK);
-    seq.note_removed(txid(REMOVED_ROWS + 1), BLOCK);
+    seq.note_removed(txid(REMOVED_ROWS), 0, BLOCK);
+    seq.note_removed(txid(REMOVED_ROWS + 1), 0, BLOCK);
     let past = seq.removed_rows();
     assert_eq!(past.rows.len(), REMOVED_ROWS);
     assert_eq!(past.rows[0].seq, 3, "rows 1 and 2 dropped");
     assert_eq!(past.oldest, 3);
     assert_eq!(seq.next(), REMOVED_ROWS as u64 + 3);
+}
+
+/// A rollback drops the row of the stay it takes back, and no other. The
+/// same txid admitted again and mined keeps its `block` row.
+#[test]
+fn a_rollback_keeps_the_row_of_a_later_stay() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(1);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let tx = spend(ops[0], 99_000);
+    let id = tx.compute_txid();
+    let staged = mp.accept_tx(&tx, &utxos, TIP_OK).expect("staged");
+    mp.remove_live_txids(&[id], Removal::Committed(RemovalReason::SizeLimit))
+        .unwrap();
+    mp.accept_tx(&tx, &utxos, TIP_OK).expect("admitted again");
+    mp.remove_live_txids(&[id], BLOCK).unwrap();
+    let mined = *mp.removed_rows().rows.last().unwrap();
+    assert_eq!(mined.reason, RemovalReason::Block);
+
+    mp.forget_admits(std::slice::from_ref(&staged));
+    assert_eq!(mp.removed_rows().rows, vec![mined]);
 }

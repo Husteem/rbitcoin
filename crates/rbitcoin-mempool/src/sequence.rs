@@ -81,7 +81,14 @@ pub const REMOVED_ROWS: usize =
 pub struct PoolSequence {
     next: u64,
     oldest: u64,
-    rows: VecDeque<RemovedRow>,
+    rows: VecDeque<Held>,
+}
+
+/// A row, and the sequence the removed entry's insert took. That names one
+/// stay in the pool, so a retraction cannot reach another stay of the txid.
+struct Held {
+    row: RemovedRow,
+    admitted: u64,
 }
 
 impl Default for PoolSequence {
@@ -107,17 +114,21 @@ impl PoolSequence {
     }
 
     /// Number one graph remove, and keep a row when it is committed.
-    pub fn note_removed(&mut self, txid: Txid, removal: Removal) {
+    /// `admitted` is the sequence the entry's insert took.
+    pub fn note_removed(&mut self, txid: Txid, admitted: u64, removal: Removal) {
         let seq = self.advance();
         let Removal::Committed(reason) = removal else {
             return;
         };
         if self.rows.len() == REMOVED_ROWS {
             if let Some(dropped) = self.rows.pop_front() {
-                self.oldest = dropped.seq.saturating_add(1);
+                self.oldest = dropped.row.seq.saturating_add(1);
             }
         }
-        self.rows.push_back(RemovedRow { seq, txid, reason });
+        self.rows.push_back(Held {
+            row: RemovedRow { seq, txid, reason },
+            admitted,
+        });
     }
 
     /// Drop the newest `replaced` row by `by` for each of `victims`. That
@@ -128,24 +139,27 @@ impl PoolSequence {
         let mut i = self.rows.len();
         while i > 0 && !left.is_empty() {
             i -= 1;
-            if self.rows[i].reason != (RemovalReason::Replaced { by }) {
+            let row = self.rows[i].row;
+            if row.reason != (RemovalReason::Replaced { by }) {
                 continue;
             }
-            if let Some(k) = left.iter().position(|v| *v == self.rows[i].txid) {
+            if let Some(k) = left.iter().position(|v| *v == row.txid) {
                 left.swap_remove(k);
                 self.rows.remove(i);
             }
         }
     }
 
-    /// Drop the rows `txid` took at `since` or later. A candidate that left
-    /// before its admit committed was never in the pool.
-    pub fn retract_since(&mut self, since: u64, txid: Txid) {
+    /// Drop the row for the stay of `txid` whose insert took `admitted`. An
+    /// admit that left before it committed, or that a rollback takes back,
+    /// was never in the pool. A later stay of the same txid keeps its row.
+    pub fn retract_admit(&mut self, txid: Txid, admitted: u64) {
         let mut i = self.rows.len();
-        while i > 0 && self.rows[i - 1].seq >= since {
+        while i > 0 && self.rows[i - 1].row.seq > admitted {
             i -= 1;
-            if self.rows[i].txid == txid {
+            if self.rows[i].row.txid == txid && self.rows[i].admitted == admitted {
                 self.rows.remove(i);
+                return;
             }
         }
     }
@@ -153,7 +167,7 @@ impl PoolSequence {
     pub fn removed_rows(&self) -> RemovedRows {
         RemovedRows {
             oldest: self.oldest,
-            rows: self.rows.iter().copied().collect(),
+            rows: self.rows.iter().map(|held| held.row).collect(),
         }
     }
 }
