@@ -416,6 +416,21 @@ async fn jsonrpc(addr: SocketAddr, method: &str, params: Value) -> Value {
     rbitcoin_test::jsonrpc::jsonrpc(addr, method, params).await
 }
 
+/// After the catch-up block, the tip loop purges the pool and turns relay on.
+async fn wait_relay_enabled(rpc_addr: SocketAddr) {
+    let relay_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = jsonrpc(rpc_addr, "getmempoolinfo", json!([])).await;
+        if info["result"]["relay_enabled"] == true {
+            break;
+        }
+        if Instant::now() >= relay_deadline {
+            panic!("relay never enabled after the catch-up block: {info}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// A9: `waitforblockheight` timeout=0 while behind returns the live tip.
 async fn pin_waitforblockheight_timeout_zero_behind(
     rpc_addr: SocketAddr,
@@ -1616,6 +1631,121 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
     }
 }
 
+/// A client lists the pool over RPC at S1 and S2. Each txid that left in
+/// between has its row on `GET /mempool/removed`, numbered in `[S1, S2)`.
+#[tokio::test(flavor = "multi_thread")]
+async fn listing_diff_finds_each_removal_reason_on_esplora() {
+    let td = TestDatadir::new().unwrap();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let cbs = {
+        let q = Query::open_or_create_tiny(td.store_path()).unwrap();
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let (_tip, _time, cbs) = pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            2,
+        );
+        q.flush().unwrap();
+        cbs
+    };
+    let unbound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut cfg = NodeConfig::default()
+        .with_datadir(td.path())
+        .with_network(Network::Regtest)
+        .with_tiny_heads()
+        .with_p2p_listen(unbound);
+    cfg.listen.use_seeds = false;
+    cfg.listen.connect.clear();
+    cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(unbound));
+    cfg.rpc.listen = Some(unbound);
+    std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            td.path().join("rpc.token"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    cfg.max_run_secs = Some(60);
+    let node = tokio::spawn(run_p2p(cfg));
+    let esplora_addr = published_listener(&td.path(), "esplora").await;
+    let rpc_addr = published_listener(&td.path(), "rpc").await;
+    wait_listeners(&[esplora_addr, rpc_addr]).await;
+    let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
+    assert!(mined["result"].is_array(), "{mined}");
+    wait_relay_enabled(rpc_addr).await;
+
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let first = acs_spend(cbs[0], 50_0000_0000, 1_000, spk.clone());
+    let other = acs_spend(cbs[1], 50_0000_0000, 1_000, spk.clone());
+    let bump = acs_spend(cbs[0], 50_0000_0000, 50_000, spk);
+    let send = |tx: &Transaction| {
+        let hex = encode_tx(tx);
+        async move {
+            let sent = jsonrpc(rpc_addr, "sendrawtransaction", json!([hex])).await;
+            assert!(sent["result"].is_string(), "{sent}");
+        }
+    };
+    let listing = || async {
+        let got = jsonrpc(rpc_addr, "getrawmempool", json!([false, true])).await;
+        let txids: Vec<String> = serde_json::from_value(got["result"]["txids"].clone())
+            .unwrap_or_else(|_| panic!("{got}"));
+        let seq = got["result"]["mempool_sequence"]
+            .as_u64()
+            .expect("sequence");
+        (txids, seq)
+    };
+    send(&first).await;
+    send(&other).await;
+    let (before, s1) = listing().await;
+    assert_eq!(before.len(), 2, "{before:?}");
+    send(&bump).await;
+    let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
+    assert!(mined["result"].is_array(), "{mined}");
+    let (after, s2) = listing().await;
+    assert!(after.is_empty(), "{after:?}");
+    assert_eq!(
+        s2,
+        s1 + 4,
+        "the replacement in and out, the victim, the other"
+    );
+
+    let (st, body) = http_get(esplora_addr, "/mempool/removed").await;
+    assert_eq!(st, 200, "{body}");
+    let removed: Value = serde_json::from_str(&body).unwrap();
+    assert!(removed["oldest"].as_u64().unwrap() <= s1, "{removed}");
+    let rows = removed["removed"].as_array().expect("rows");
+    let row_of = |txid: &str| {
+        let hits: Vec<&Value> = rows
+            .iter()
+            .filter(|r| r["txid"] == txid)
+            .filter(|r| (s1..s2).contains(&r["seq"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(hits.len(), 1, "{txid}: {removed}");
+        hits[0].clone()
+    };
+    let first_row = row_of(&first.compute_txid().to_string());
+    assert_eq!(first_row["reason"], "replaced", "{first_row}");
+    assert_eq!(first_row["by"], bump.compute_txid().to_string());
+    let other_row = row_of(&other.compute_txid().to_string());
+    assert_eq!(other_row["reason"], "block", "{other_row}");
+    assert!(other_row.get("by").is_none(), "{other_row}");
+
+    let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
+    assert!(
+        matches!(stopped, Ok(Ok(Ok(())))),
+        "run_p2p did not stop cleanly"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let td = TestDatadir::new().unwrap();
@@ -1727,17 +1857,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         caught_up["result"].as_array().is_some_and(|h| h.len() == 1),
         "{caught_up}"
     );
-    let relay_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let info = jsonrpc(rpc_addr, "getmempoolinfo", json!([])).await;
-        if info["result"]["relay_enabled"] == true {
-            break;
-        }
-        if Instant::now() >= relay_deadline {
-            panic!("relay never enabled after the catch-up block: {info}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_relay_enabled(rpc_addr).await;
 
     let rpc_spk = ScriptBuf::from_bytes(vec![0x54]);
     let rpc_spend = acs_spend(rpc_cb, 50_0000_0000, 1_000, rpc_spk);
