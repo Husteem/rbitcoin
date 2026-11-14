@@ -927,6 +927,7 @@ fn get_with_client(path: &str, client: &str) -> axum::http::Request<axum::body::
 
 /// Five coinbase blocks paying `0x51`, and a one-create-per-wave walk over
 /// that script at the tip.
+#[cfg(unix)]
 fn five_block_history(
     label: &str,
 ) -> (
