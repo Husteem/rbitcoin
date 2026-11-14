@@ -1202,7 +1202,7 @@ fn live_pool_recent_accepts_and_1p1c_rollback() {
     assert!(rows.iter().any(|r| r.height == -1));
     let delta = hub.scripthash_unconfirmed_delta(&sh).unwrap();
     assert_eq!(delta, 50_0000_0000 - 2_000 - 50_0000_0000 - 50_0000_0000);
-    assert!(hub.is_relay_servable(&wtxid, hub.current_relay_seq()));
+    assert!(hub.is_relay_servable(&wtxid, hub.next_relay_seq.load(Ordering::Relaxed)));
     assert!(hub.remove_for_block(&[parent.compute_txid()], MINED) >= 1);
     hub.mark_fee_dirty();
     let e1b = hub.estimate_fee_btc_per_kb(1);

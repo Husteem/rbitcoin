@@ -5626,10 +5626,6 @@ impl MempoolHub {
         self.reorg_servable.lock().unwrap().contains(wtxid)
     }
 
-    pub fn current_relay_seq(&self) -> u64 {
-        self.next_relay_seq.load(Ordering::Relaxed)
-    }
-
     /// True when entry_sequence < peer's last INV sequence.
     pub fn is_relay_servable(&self, wtxid: &Wtxid, last_inv_seq: u64) -> bool {
         self.relay_seq
@@ -5942,6 +5938,14 @@ impl MempoolHub {
             .iter()
             .map(|(txid, e)| (*txid, e.fee_sat, e.weight))
             .collect()
+    }
+
+    /// The live txids and Core's `mempool_sequence`, from one read of the
+    /// pool, so the sequence names exactly this membership.
+    pub fn live_txids_and_sequence(&self) -> (Vec<Txid>, u64) {
+        let g = self.lock_read();
+        let txids = g.graph.iter().map(|(txid, _)| *txid).collect();
+        (txids, g.mempool_sequence())
     }
 
     /// Core `GetTotalTxSize` / `totalFee`: (count, sigop-adjusted vbytes, fee) for `getmempoolinfo`.

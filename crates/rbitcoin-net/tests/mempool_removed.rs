@@ -147,3 +147,120 @@ fn package_and_one_parent_rollbacks_write_no_row() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn listing(hub: &MempoolHub) -> (BTreeSet<Txid>, u64) {
+    let (txids, seq) = hub.live_txids_and_sequence();
+    (txids.into_iter().collect(), seq)
+}
+
+/// What a client does with two listings: each txid in the first and not in
+/// the second has exactly one row numbered between their sequences.
+#[test]
+fn two_listings_and_the_rows_between_them_explain_every_disappearance() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    hub.set_relay_enabled(true);
+    hub.note_mock_now(10_000);
+    let mut listings = vec![listing(&hub)];
+
+    let a = spend(cbs[0], 1_000);
+    let b = spend(cbs[1], 1_000);
+    let b_child = child_of(&b, 1_000);
+    let c = spend(cbs[2], 1_000);
+    for tx in [&a, &b, &b_child, &c] {
+        hub.accept_tx(tx).expect("admit");
+        listings.push(listing(&hub));
+    }
+    let a_bump = spend(cbs[0], 50_000);
+    hub.accept_tx(&a_bump).expect("replacement");
+    listings.push(listing(&hub));
+    hub.remove_for_block_spent(&[b.compute_txid()], &[OutPoint::new(cbs[2], 0)]);
+    listings.push(listing(&hub));
+    hub.note_mock_now(10_000 + 3_605);
+    let d = spend(cbs[3], 1_000);
+    let e = spend(cbs[4], 50_000);
+    hub.accept_tx(&d).expect("d");
+    hub.accept_tx(&e).expect("e");
+    listings.push(listing(&hub));
+    hub.set_expiry_hours(1);
+    hub.expire_stale();
+    listings.push(listing(&hub));
+    hub.set_max_weight(e.weight().to_wu());
+    hub.trim_over_budget();
+    listings.push(listing(&hub));
+
+    let last = listings.last().unwrap();
+    assert_eq!(last.0, BTreeSet::from([e.compute_txid()]));
+    let want = [
+        (
+            a.compute_txid(),
+            RemovalReason::Replaced {
+                by: a_bump.compute_txid(),
+            },
+        ),
+        (b.compute_txid(), RemovalReason::Block),
+        (c.compute_txid(), RemovalReason::Conflict),
+        (a_bump.compute_txid(), RemovalReason::Expiry),
+        (b_child.compute_txid(), RemovalReason::Expiry),
+        (d.compute_txid(), RemovalReason::SizeLimit),
+    ];
+    let removed = hub.lock_read().removed_rows();
+    assert_eq!(removed.oldest, 1);
+    let mut checked = 0;
+    for (i, (first, s1)) in listings.iter().enumerate() {
+        for (second, s2) in &listings[i..] {
+            for gone in first.difference(second) {
+                let rows: Vec<&RemovedRow> = removed
+                    .rows
+                    .iter()
+                    .filter(|r| r.txid == *gone && *s1 <= r.seq && r.seq < *s2)
+                    .collect();
+                assert_eq!(rows.len(), 1, "{gone} between {s1} and {s2}: {rows:?}");
+                let reason = want.iter().find(|(t, _)| t == gone).map(|(_, r)| *r);
+                assert_eq!(Some(rows[0].reason), reason, "{gone}");
+                checked += 1;
+            }
+            if first == second {
+                assert_eq!(s1, s2, "same members, same sequence here");
+            }
+        }
+    }
+    assert!(checked >= want.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The txids and the sequence come from one read of the pool. With adds
+/// only, a listing at sequence `s` holds exactly `s - 1` transactions.
+#[test]
+fn a_listing_under_concurrent_admits_matches_its_sequence() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = Arc::new(MempoolHub::open(&dir, q).unwrap());
+    hub.set_relay_enabled(true);
+    let snaps = std::thread::scope(|s| {
+        let watcher = s.spawn(|| {
+            let mut snaps = Vec::new();
+            while hub.live_count() < cbs.len() {
+                snaps.push(listing(&hub));
+                std::thread::yield_now();
+            }
+            snaps
+        });
+        for chunk in cbs.chunks(3) {
+            let hub = Arc::clone(&hub);
+            s.spawn(move || {
+                for cb in chunk {
+                    hub.accept_tx(&spend(*cb, 1_000)).expect("admit");
+                }
+            });
+        }
+        watcher.join().unwrap()
+    });
+    assert!(!snaps.is_empty());
+    for (txids, seq) in &snaps {
+        assert_eq!(txids.len() as u64, seq - 1, "listing at {seq}: {txids:?}");
+    }
+    assert_eq!(listing(&hub).1, cbs.len() as u64 + 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

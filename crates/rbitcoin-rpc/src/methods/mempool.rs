@@ -234,23 +234,23 @@ pub(crate) fn getrawmempool(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     let Some(mp) = ctx.mempool.as_ref() else {
         return Ok(if verbose { json!({}) } else { json!([]) });
     };
-    let live = mp.list_live_meta();
     if !verbose {
+        let (live, sequence) = mp.live_txids_and_sequence();
         let mut ids: Vec<String> = live
             .iter()
-            .map(|(t, _, _)| hash_hex_display(&t.to_byte_array()))
+            .map(|t| hash_hex_display(&t.to_byte_array()))
             .collect();
         ids.sort();
         if want_seq {
             return Ok(json!({
                 "txids": ids,
-                "mempool_sequence": mp.current_relay_seq(),
+                "mempool_sequence": sequence,
             }));
         }
         return Ok(json!(ids));
     }
     let mut map = serde_json::Map::new();
-    for (txid, fee, weight) in live {
+    for (txid, fee, weight) in mp.list_live_meta() {
         map.insert(
             hash_hex_display(&txid.to_byte_array()),
             mempool_graph_json(mp, &txid, fee, weight),
