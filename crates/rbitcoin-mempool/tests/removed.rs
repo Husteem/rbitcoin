@@ -353,3 +353,32 @@ fn a_rollback_keeps_a_later_replacement_by_the_same_txid() {
     mp.forget_admits(std::slice::from_ref(&staged));
     assert_eq!(mp.removed_rows().rows, later);
 }
+
+/// Two rollbacks that overlap leave an earlier, committed replacement of
+/// the same pair alone. The second finds its own row already gone and
+/// takes no other in its place.
+#[test]
+fn overlapping_rollbacks_keep_an_earlier_replacement() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(1);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let victim = spend(ops[0], 99_000);
+    let bump = spend(ops[0], 90_000);
+    let by = bump.compute_txid();
+    mp.accept_tx(&victim, &utxos, TIP_OK).expect("victim");
+    mp.accept_tx(&bump, &utxos, TIP_OK).expect("bump replaces");
+    mp.remove_live_txids(&[by], Removal::Committed(RemovalReason::SizeLimit))
+        .unwrap();
+    let committed = mp.removed_rows().rows;
+    assert_eq!(committed.len(), 2, "{committed:?}");
+
+    let staged_victim = mp
+        .accept_tx(&victim, &utxos, TIP_OK)
+        .expect("staged victim");
+    let staged_bump = mp.accept_tx(&bump, &utxos, TIP_OK).expect("staged bump");
+    assert_eq!(mp.removed_rows().rows.len(), 3);
+    mp.forget_admits(std::slice::from_ref(&staged_victim));
+    assert_eq!(mp.removed_rows().rows, committed);
+    mp.forget_admits(std::slice::from_ref(&staged_bump));
+    assert_eq!(mp.removed_rows().rows, committed);
+}

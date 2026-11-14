@@ -6458,11 +6458,13 @@ impl MempoolHub {
                 g.mempool_sequence(),
             )
         };
+        let began = seq;
         Some(AcceptResult {
             txid,
             fee_sat,
             weight,
             slot,
+            began,
             seq,
             accept_secs: self
                 .accept_time_txid(&txid)

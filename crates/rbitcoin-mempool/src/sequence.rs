@@ -131,28 +131,18 @@ impl PoolSequence {
         });
     }
 
-    /// Drop, for each of `victims`, the newest `replaced` row by `by`
-    /// numbered below `before`. `before` is the sequence that admit of `by`
-    /// took (its victims left just ahead of it), so a later replacement by
-    /// the same txid keeps its rows. That replacement did not stay, so it
-    /// replaced nothing. The sequence keeps its numbers: membership did
-    /// change.
-    pub fn retract_replaced<'a>(
-        &mut self,
-        by: Txid,
-        before: u64,
-        victims: impl IntoIterator<Item = &'a Txid>,
-    ) {
-        let mut left: Vec<Txid> = victims.into_iter().copied().collect();
+    /// Drop the `replaced` rows by `by` numbered in `attempt`: from the
+    /// sequence when that admit of `by` began up to the one its insert took.
+    /// One admit holds the pool for that whole span, so only its own victims
+    /// are numbered there, and no other replacement by the same txid is.
+    /// That replacement did not stay, so it replaced nothing. The sequence
+    /// keeps its numbers: membership did change.
+    pub fn retract_replaced(&mut self, by: Txid, attempt: std::ops::Range<u64>) {
         let mut i = self.rows.len();
-        while i > 0 && !left.is_empty() {
+        while i > 0 && self.rows[i - 1].row.seq >= attempt.start {
             i -= 1;
             let row = self.rows[i].row;
-            if row.seq >= before || row.reason != (RemovalReason::Replaced { by }) {
-                continue;
-            }
-            if let Some(k) = left.iter().position(|v| *v == row.txid) {
-                left.swap_remove(k);
+            if row.seq < attempt.end && row.reason == (RemovalReason::Replaced { by }) {
                 self.rows.remove(i);
             }
         }
