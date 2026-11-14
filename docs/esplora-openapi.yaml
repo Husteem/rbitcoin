@@ -760,7 +760,9 @@ paths:
         oldest first. `seq` is the RPC `getrawmempool false true`
         `mempool_sequence` that removal took. Every removal numbered `oldest`
         or later is in `removed`. At most 16,666 rows; past that the oldest
-        drops. An admit the node takes back writes no row. Without a mempool
+        drops. An admit the node takes back writes no row. A `replaced` row
+        whose replacement did not stay is dropped once the replaced
+        transaction is back in the pool. Without a mempool
         the answer is `{"oldest": 1, "removed": []}`.
       responses:
         "200":

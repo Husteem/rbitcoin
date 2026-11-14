@@ -2,7 +2,7 @@ use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-use rbitcoin_mempool::accept::MapUtxoProvider;
+use rbitcoin_mempool::accept::{MapUtxoProvider, PrepareOpts};
 use rbitcoin_mempool::{
     ActiveMempool, ChainTipCtx, Coin, PoolSequence, Removal, RemovalReason, RemovedRow,
     REMOVED_ROWS,
@@ -350,7 +350,11 @@ fn a_rollback_keeps_a_later_replacement_by_the_same_txid() {
     assert_eq!(later[0].reason, RemovalReason::Replaced { by });
     assert_eq!(later[1].reason, RemovalReason::Block);
 
+    // The first bump's own eviction goes. Its victim's row waits for the
+    // victim to be back.
     mp.forget_admits(std::slice::from_ref(&staged));
+    assert_eq!(mp.removed_rows().rows, vec![rows[0], rows[2], rows[3]]);
+    mp.accept_tx(&victim, &utxos, TIP_OK).expect("victim back");
     assert_eq!(mp.removed_rows().rows, later);
 }
 
@@ -377,8 +381,74 @@ fn overlapping_rollbacks_keep_an_earlier_replacement() {
         .expect("staged victim");
     let staged_bump = mp.accept_tx(&bump, &utxos, TIP_OK).expect("staged bump");
     assert_eq!(mp.removed_rows().rows.len(), 3);
+    // The staged victim did leave for the bump, which is still live.
     mp.forget_admits(std::slice::from_ref(&staged_victim));
+    assert_eq!(mp.removed_rows().rows.len(), 3);
+    // The bump goes and its victim is put back, so that row goes too.
+    mp.rollback_accepted_package(std::slice::from_ref(&staged_bump), &utxos, TIP_OK);
+    assert!(mp.graph.contains(&victim.compute_txid()));
     assert_eq!(mp.removed_rows().rows, committed);
-    mp.forget_admits(std::slice::from_ref(&staged_bump));
-    assert_eq!(mp.removed_rows().rows, committed);
+}
+
+/// A member that a block, a replacement, an expiry or a conflict took out
+/// before its package rolled back really left for that reason. The rollback
+/// keeps that row. It drops only the member's own size-limit eviction.
+#[test]
+fn a_rollback_keeps_a_real_removal_of_its_member() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(1);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let tx = spend(ops[0], 99_000);
+    let staged = mp.accept_tx(&tx, &utxos, TIP_OK).expect("staged");
+    mp.remove_live_txids(&[staged.txid], BLOCK).unwrap();
+    let mined = mp.removed_rows().rows;
+    assert_eq!(mined.len(), 1);
+    mp.forget_admits(std::slice::from_ref(&staged));
+    assert_eq!(mp.removed_rows().rows, mined);
+}
+
+/// A replacement that does not commit leaves its victim's row until the
+/// victim is back in the pool. A victim that cannot be put back is gone,
+/// and its row says what took it out.
+#[test]
+fn a_failed_replacement_keeps_its_row_until_the_victim_is_back() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(1);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let victim = spend(ops[0], 99_000);
+    let id = mp.accept_tx(&victim, &utxos, TIP_OK).expect("victim").txid;
+    let bump = spend(ops[0], 90_000);
+    let prep = mp
+        .prepare_admit(
+            &bump,
+            &utxos,
+            TIP_OK,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: false,
+                min_relay: Some(0),
+                waive: false,
+            },
+        )
+        .expect("bump prepares");
+    mp.store.fail_next_append = true;
+    assert!(mp.commit_after_script(&bump, prep).is_err());
+    let out = vec![row(
+        2,
+        &victim,
+        RemovalReason::Replaced {
+            by: bump.compute_txid(),
+        },
+    )];
+    assert_eq!(mp.removed_rows().rows, out, "the victim is out");
+
+    let no_coins = MapUtxoProvider {
+        map: HashMap::new(),
+    };
+    mp.restore_undone(&no_coins, TIP_OK);
+    assert!(!mp.graph.contains(&id));
+    assert_eq!(mp.removed_rows().rows, out, "it could not be put back");
+
+    mp.accept_tx(&victim, &utxos, TIP_OK).expect("victim back");
+    assert!(mp.removed_rows().rows.is_empty());
 }

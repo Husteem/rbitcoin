@@ -1602,6 +1602,9 @@ impl ActiveMempool {
         }
         let replaced_txs = std::mem::take(&mut self.undone_replacements);
         let replaced_accept_secs = std::mem::take(&mut self.undone_accept_secs);
+        // It is in the pool. If a replacement that did not stay had taken it
+        // out, that replaced nothing.
+        self.sequence.note_returned(txid);
 
         Ok(AcceptResult {
             txid,
@@ -1621,9 +1624,10 @@ impl ActiveMempool {
     }
 
     /// `by` unlinked its conflicts from `began` on and then did not commit.
-    /// The trust marks go back, so the restore admits them again, and their
-    /// `replaced` rows go. So does the row `by` took if it was `admitted` and
-    /// then left with an evicted parent: it was never in the pool.
+    /// The trust marks go back, so the restore admits them again. Their
+    /// `replaced` rows are marked and go as each one is put back. The row
+    /// `by` took if it was `admitted` and then left with an evicted parent
+    /// goes now: it was never accepted.
     fn abandon_commit(
         &mut self,
         by: Txid,
@@ -1633,19 +1637,19 @@ impl ActiveMempool {
     ) {
         self.trust_kept.extend(kept_trust);
         let until = admitted.unwrap_or(self.sequence.next());
-        self.sequence.retract_replaced(by, began..until);
+        self.sequence.note_replacer_gone(by, began..until);
         if let Some(seq) = admitted {
-            self.sequence.retract_admit(by, seq);
+            self.sequence.retract_evicted(by, seq);
         }
     }
 
-    /// Drop the rows of admits a rollback takes back: the `replaced` rows of
-    /// their victims, and the row an admit took if a trim evicted it first.
-    /// Those admits did not stay.
+    /// The admits a rollback takes back did not stay. The `replaced` rows of
+    /// their victims are marked and go as each victim is put back. The row
+    /// an admit took when a trim evicted it first goes now.
     pub fn forget_admits(&mut self, accepted: &[AcceptResult]) {
         for r in accepted {
-            self.sequence.retract_replaced(r.txid, r.began..r.seq);
-            self.sequence.retract_admit(r.txid, r.seq);
+            self.sequence.note_replacer_gone(r.txid, r.began..r.seq);
+            self.sequence.retract_evicted(r.txid, r.seq);
         }
     }
 

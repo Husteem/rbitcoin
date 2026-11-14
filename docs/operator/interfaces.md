@@ -249,7 +249,9 @@ on every add and every removal. A client that diffs listings:
    `oldest <= S1`.
 4. If `oldest > S1`, or there is no row, keep the new listing; there is no
    reason for that txid. An admit the node took back (a package or 1p1c
-   rollback, a `testmempoolaccept` dry run) writes no row.
+   rollback, a `testmempoolaccept` dry run) writes no row. A `replaced` row
+   whose replacement did not stay is dropped once the replaced transaction
+   is back in the pool.
 5. A sequence that went backwards means the node restarted. Take the
    listing as new.
 

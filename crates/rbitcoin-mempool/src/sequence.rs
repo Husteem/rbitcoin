@@ -82,6 +82,9 @@ pub struct PoolSequence {
     next: u64,
     oldest: u64,
     rows: VecDeque<Held>,
+    /// Rows held with `replacer_gone` set. Zero on the admit path, so a
+    /// commit does not scan the ring.
+    replacer_gone: usize,
 }
 
 /// A row, and the sequence the removed entry's insert took. That names one
@@ -89,6 +92,10 @@ pub struct PoolSequence {
 struct Held {
     row: RemovedRow,
     admitted: u64,
+    /// A `replaced` row whose replacer did not stay. The row goes when its
+    /// txid is back in the pool. Until then the transaction is out, and the
+    /// row says what took it out.
+    replacer_gone: bool,
 }
 
 impl Default for PoolSequence {
@@ -97,6 +104,7 @@ impl Default for PoolSequence {
             next: 1,
             oldest: 1,
             rows: VecDeque::new(),
+            replacer_gone: 0,
         }
     }
 }
@@ -123,40 +131,72 @@ impl PoolSequence {
         if self.rows.len() == REMOVED_ROWS {
             if let Some(dropped) = self.rows.pop_front() {
                 self.oldest = dropped.row.seq.saturating_add(1);
+                self.forget(&dropped);
             }
         }
         self.rows.push_back(Held {
             row: RemovedRow { seq, txid, reason },
             admitted,
+            replacer_gone: false,
         });
     }
 
-    /// Drop the `replaced` rows by `by` numbered in `attempt`: from the
-    /// sequence when that admit of `by` began up to the one its insert took.
-    /// One admit holds the pool for that whole span, so only its own victims
-    /// are numbered there, and no other replacement by the same txid is.
-    /// That replacement did not stay, so it replaced nothing. The sequence
-    /// keeps its numbers: membership did change.
-    pub fn retract_replaced(&mut self, by: Txid, attempt: std::ops::Range<u64>) {
+    /// A row left the ring.
+    fn forget(&mut self, gone: &Held) {
+        if gone.replacer_gone {
+            self.replacer_gone -= 1;
+        }
+    }
+
+    /// `by` did not stay. Mark the `replaced` rows it wrote, the ones
+    /// numbered in `attempt`: from the sequence when that admit of `by`
+    /// began up to the one its insert took. One admit holds the pool for
+    /// that whole span, so only its own victims are numbered there, and no
+    /// other replacement by the same txid is. A marked row goes when its
+    /// victim is back ([`Self::note_returned`]).
+    pub fn note_replacer_gone(&mut self, by: Txid, attempt: std::ops::Range<u64>) {
         let mut i = self.rows.len();
         while i > 0 && self.rows[i - 1].row.seq >= attempt.start {
             i -= 1;
-            let row = self.rows[i].row;
-            if row.seq < attempt.end && row.reason == (RemovalReason::Replaced { by }) {
-                self.rows.remove(i);
+            let held = &mut self.rows[i];
+            if held.row.seq < attempt.end
+                && held.row.reason == (RemovalReason::Replaced { by })
+                && !held.replacer_gone
+            {
+                held.replacer_gone = true;
+                self.replacer_gone += 1;
             }
         }
     }
 
-    /// Drop the row for the stay of `txid` whose insert took `admitted`. An
-    /// admit that left before it committed, or that a rollback takes back,
-    /// was never in the pool. A later stay of the same txid keeps its row.
-    pub fn retract_admit(&mut self, txid: Txid, admitted: u64) {
+    /// `txid` is in the pool again. A replacement that did not stay
+    /// replaced nothing, so its rows for `txid` go. The sequence keeps its
+    /// numbers: membership did change.
+    pub fn note_returned(&mut self, txid: Txid) {
+        let mut i = self.rows.len();
+        while i > 0 && self.replacer_gone > 0 {
+            i -= 1;
+            if self.rows[i].replacer_gone && self.rows[i].row.txid == txid {
+                self.rows.remove(i);
+                self.replacer_gone -= 1;
+            }
+        }
+    }
+
+    /// Drop the size-limit row for the stay of `txid` whose insert took
+    /// `admitted`. An admit that a trim evicted before it committed, or
+    /// before its package was rolled back, was never accepted. A block, a
+    /// replacement, an expiry or a conflict that took that stay out is why
+    /// it left, so that row stays. So does the row of another stay.
+    pub fn retract_evicted(&mut self, txid: Txid, admitted: u64) {
         let mut i = self.rows.len();
         while i > 0 && self.rows[i - 1].row.seq > admitted {
             i -= 1;
-            if self.rows[i].row.txid == txid && self.rows[i].admitted == admitted {
-                self.rows.remove(i);
+            let held = &self.rows[i];
+            if held.row.txid == txid && held.admitted == admitted {
+                if held.row.reason == RemovalReason::SizeLimit {
+                    self.rows.remove(i);
+                }
                 return;
             }
         }
