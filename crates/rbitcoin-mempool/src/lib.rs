@@ -58,6 +58,7 @@ pub mod linearize;
 pub mod orphanage;
 #[doc(hidden)]
 pub mod packed;
+mod sequence;
 #[doc(hidden)]
 pub mod store;
 pub mod testutil;

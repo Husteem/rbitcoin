@@ -6,6 +6,7 @@ use crate::graph::{
 };
 use crate::orphanage::{OrphanSnapshot, Orphanage};
 use crate::packed::VinAux;
+use crate::sequence::PoolSequence;
 use crate::store::Mempool;
 use bitcoin::{OutPoint, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_consensus::policy::{self, PolicyResult};
@@ -641,9 +642,15 @@ pub struct ActiveMempool {
     pub trust_kept: HashSet<Txid>,
     /// The chain enforces BIP 54 ([`Self::set_enforce_bip54`]).
     pub enforce_bip54: bool,
+    sequence: PoolSequence,
 }
 
 impl ActiveMempool {
+    /// Core's `mempool_sequence`: the value the next add or removal takes.
+    pub fn mempool_sequence(&self) -> u64 {
+        self.sequence.next()
+    }
+
     /// Share the hub's mock clock so stamped accept times follow `setmocktime`.
     pub fn set_node_clock(&mut self, clock: Arc<AtomicU64>) {
         self.node_clock = clock;
@@ -798,6 +805,7 @@ impl ActiveMempool {
             loaded_accept: ingested.accept_secs,
             trust_kept: ingested.trust_kept,
             enforce_bip54: false,
+            sequence: PoolSequence::default(),
         })
     }
 
@@ -1532,6 +1540,7 @@ impl ActiveMempool {
         };
         let body = Arc::new(tx.clone());
         self.graph.insert(entry, tx);
+        self.sequence.advance();
         self.bodies.insert(txid, Arc::clone(&body));
         self.vin_aux.insert(txid, aux);
 
@@ -2385,6 +2394,7 @@ impl ActiveMempool {
         self.remember_extra_compact(&tx);
         self.store.mark_slot_dead(entry.slot)?;
         self.graph.remove(txid, &tx);
+        self.sequence.advance();
         self.bodies.remove(txid);
         self.vin_aux.remove(txid);
         self.trust_kept.remove(txid);
