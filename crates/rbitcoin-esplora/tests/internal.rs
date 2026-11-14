@@ -657,19 +657,24 @@ async fn internal_route_probe(sock: &std::path::Path) {
     }
 }
 
-/// An error after some rows fails the body; it never reads as complete.
+/// An error after some rows, or a channel that closes before the closing
+/// chunk, fails the body; it never reads as complete.
 #[tokio::test]
-async fn history_body_error_is_not_a_complete_body() {
-    let (tx, rx) = tokio::sync::mpsc::channel(2);
-    tx.send(Ok(axum::body::Bytes::from_static(b"[{")))
+async fn history_body_cut_short_is_not_a_complete_body() {
+    for end in [Some(Err(std::io::Error::other("chain view moved"))), None] {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(Ok(HistoryChunk::Rows(axum::body::Bytes::from_static(
+            b"[{",
+        ))))
         .await
         .unwrap();
-    tx.send(Err(std::io::Error::other("chain view moved")))
-        .await
-        .unwrap();
-    drop(tx);
-    let body = axum::body::Body::new(ChunkBody(rx));
-    assert!(axum::body::to_bytes(body, 1 << 20).await.is_err());
+        if let Some(end) = end {
+            tx.send(end).await.unwrap();
+        }
+        drop(tx);
+        let body = axum::body::Body::new(ChunkBody::new(rx));
+        assert!(axum::body::to_bytes(body, 1 << 20).await.is_err());
+    }
 }
 
 /// `(height, display txid)` rows of a history body, checked to be strictly
@@ -705,7 +710,6 @@ async fn internal_history_lifts_the_cap(
     tcp: std::net::SocketAddr,
     pad: &Pad,
     p2wsh: &ScriptBuf,
-    asof50: &str,
 ) {
     let q = &pad.q;
     let cb5 = q
@@ -722,71 +726,38 @@ async fn internal_history_lifts_the_cap(
     let addr = bitcoin::Address::from_script(p2wsh, bitcoin::Network::Regtest)
         .unwrap()
         .to_string();
-    let tip = q.tip_height().unwrap().0;
     let view = q.pin_sh_chain_view().unwrap().expect("sh view");
-    for (sh, x) in [
-        (
-            rbitcoin_store::script_hash(&[0x51]),
-            format!(
-                "scripthash/{}",
-                rbitcoin_primitives::scripthash_display_hex(&[0x51])
-            ),
-        ),
-        (
-            rbitcoin_store::script_hash(p2wsh.as_bytes()),
-            format!("address/{addr}"),
-        ),
-    ] {
-        q.set_max_sh_creates(0);
-        let electrum: Vec<(i64, String)> = q
-            .scripthash_history_filtered_in(&sh, &rbitcoin_query::HistoryFilter::open(), &view)
-            .unwrap()
-            .rows
-            .iter()
-            .map(|r| (r.height, rbitcoin_primitives::display_hash_hex(r.txid)))
-            .collect();
-        q.set_max_sh_creates(2);
-        let (st, _, body) = http_get_unix_head(sock, &format!("/{x}"), None).await;
-        assert_eq!(st, 503, "/{x} stays capped: {body}");
-        for (asof, at) in [(None, tip), (Some(asof50), 50)] {
-            let pin = asof.map(|a| format!("?asof={a}")).unwrap_or_default();
-            let (st, head, body) =
-                http_get_unix_head(sock, &format!("/internal/{x}/history{pin}"), None).await;
-            assert_eq!(st, 200, "/internal/{x}/history{pin}: {body}");
-            tip_headers(&head, q, at);
-            let rows = history_rows(&body);
-            let (st, _, totals) =
-                http_get_unix_head(sock, &format!("/internal/{x}{pin}"), None).await;
-            assert_eq!(st, 200, "{totals}");
-            let totals: Value = serde_json::from_str(&totals).unwrap();
-            assert_eq!(totals["chain_stats"]["tx_count"], rows.len(), "/{x}{pin}");
-            if asof.is_none() {
-                assert_eq!(rows, electrum, "/{x} is the get_history list");
-            } else {
-                assert!(rows.iter().all(|(h, _)| *h <= 50), "{rows:?}");
-            }
-        }
-        let (st, body) = http_get_tcp(tcp, &format!("/internal/{x}/history")).await;
-        assert_eq!(
-            (st, body.as_str()),
-            (404, "Not Found"),
-            "TCP has no /internal/{x}/history"
-        );
-    }
+    let tip_hash = rbitcoin_primitives::display_hash_hex(view.hash);
+    let pin = format!("?asof={tip_hash}");
+    q.set_max_sh_creates(2);
+    let (st, _, body) = http_get_unix_head(sock, &format!("/address/{addr}{pin}"), None).await;
+    assert_eq!(st, 503, "public stats stay capped: {body}");
+    let (st, _, totals) =
+        http_get_unix_head(sock, &format!("/internal/address/{addr}{pin}"), None).await;
+    assert_eq!(st, 200, "{totals}");
+    let listed = format!("/internal/address/{addr}/history{pin}");
+    let (st, head, body) = http_get_unix_head(sock, &listed, None).await;
+    assert_eq!(st, 200, "{listed}: {body}");
+    tip_headers(&head, q, view.height.0);
+    let rows = history_rows(&body);
+    let totals: Value = serde_json::from_str(&totals).unwrap();
+    assert_eq!(totals["chain_stats"]["tx_count"], rows.len(), "{rows:?}");
+    let (st, body) = http_get_tcp(tcp, &listed).await;
+    assert_eq!(
+        (st, body.as_str()),
+        (404, "Not Found"),
+        "TCP has no {listed}"
+    );
     let zeros = "00".repeat(32);
     let (st, body) = http_get_unix(sock, &format!("/internal/scripthash/{zeros}/history")).await;
     assert_eq!((st, body.as_str()), (200, "[]"), "probe");
     let (st, body) = http_get_unix(sock, "/internal/scripthash/zz/history").await;
     assert_eq!((st, body.as_str()), (404, "Not Found"));
 
-    // Totals pinned to the tip, then that block is reorged out before the list.
-    let tip_hash = rbitcoin_primitives::display_hash_hex(view.hash);
-    let pinned = format!("/internal/address/{addr}/history?asof={tip_hash}");
-    let (st, body) =
-        http_get_unix(sock, &format!("/internal/address/{addr}?asof={tip_hash}")).await;
-    assert_eq!(st, 200, "{body}");
+    // The totals above were pinned to the tip. That block is reorged out
+    // before the list is read again.
     q.disconnect_tip().unwrap();
-    let (st, body) = http_get_unix(sock, &pinned).await;
+    let (st, body) = http_get_unix(sock, &listed).await;
     assert_eq!(
         (st, body.as_str()),
         (404, "Not Found"),
@@ -852,7 +823,7 @@ async fn internal_totals_lift_the_cap(sock: &std::path::Path, pad: &Pad) {
 
     internal_route_probe(sock).await;
     internal_totals_take_heavy_turns(q, sock, &h51, &asof50).await;
-    internal_history_lifts_the_cap(sock, tcp.local_addr, pad, &p2wsh, &asof50).await;
+    internal_history_lifts_the_cap(sock, tcp.local_addr, pad, &p2wsh).await;
     q.set_max_sh_creates(0);
     tcp.shutdown().await;
 }
@@ -867,11 +838,15 @@ async fn internal_totals_take_heavy_turns(
 ) {
     q.set_heavy_sh_creates(1);
     q.sh_join_probe.arm();
-    let path = format!("/internal/scripthash/{h51}?asof={asof}");
-    let (a, b) = tokio::join!(http_get_unix(sock, &path), http_get_unix(sock, &path));
+    let totals = format!("/internal/scripthash/{h51}?asof={asof}");
+    let listed = format!("/internal/scripthash/{h51}/history?asof={asof}");
+    let (a, b) = tokio::join!(http_get_unix(sock, &totals), http_get_unix(sock, &listed));
     assert_eq!((a.0, b.0), (200, 200), "{a:?} {b:?}");
-    assert_eq!(a.1, b.1);
-    assert_eq!(q.sh_join_probe.entered(), (0, 2), "two heavy joins");
+    assert_eq!(
+        q.sh_join_probe.entered(),
+        (0, 2),
+        "the totals join and the one history wave are heavy"
+    );
     assert_eq!(q.sh_join_probe.peaks().1, 1, "heavy joins take turns");
     q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
 }

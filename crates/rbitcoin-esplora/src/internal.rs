@@ -387,58 +387,63 @@ pub async fn get_internal_scripthash_history(
     sh_history_stream(st, sh, asof).await
 }
 
-/// A started walk at its pinned view, or the reply that ends the request.
+/// The pinned view a history starts from, or the reply that ends the request.
 #[cfg(unix)]
 enum HistoryStart {
-    Walk(
-        rbitcoin_query::ChainView,
-        rbitcoin_query::scripthash::ShHistoryWalk,
-    ),
+    Pinned(rbitcoin_query::ChainView),
     Reply(Response),
 }
 
+/// Pin the view, then answer 200 and write the rows from a task. The create
+/// scan is the walk's first step, after the headers, so a large script does
+/// not race the request timeout.
 #[cfg(unix)]
 async fn sh_history_stream(st: AppState, sh: [u8; 32], asof: Option<[u8; 32]>) -> Response {
     let q = std::sync::Arc::clone(&st.query);
-    let started = crate::handlers::store_blocking(move || {
-        let view = match crate::handlers::sh_pin(&st, asof) {
-            Ok(Some(view)) => view,
-            Ok(None) => return HistoryStart::Reply(json_reply_here(Vec::<Value>::new())),
-            Err(resp) => return HistoryStart::Reply(resp),
-        };
-        match st
-            .query
-            .sh_history_walk(&sh, &view, rbitcoin_query::scripthash::SH_JOIN_WAVE)
-        {
-            Ok(walk) => HistoryStart::Walk(view, walk),
-            Err(e) => HistoryStart::Reply(store_err(e)),
-        }
-    })
-    .await;
-    let (view, walk) = match started {
-        Ok(HistoryStart::Walk(view, walk)) => (view, walk),
+    let stall = st.send_stall;
+    let started =
+        crate::handlers::store_blocking(move || match crate::handlers::sh_pin(&st, asof) {
+            Ok(Some(view)) => HistoryStart::Pinned(view),
+            Ok(None) => HistoryStart::Reply(json_reply_here(Vec::<Value>::new())),
+            Err(resp) => HistoryStart::Reply(resp),
+        })
+        .await;
+    let view = match started {
+        Ok(HistoryStart::Pinned(view)) => view,
         Ok(HistoryStart::Reply(resp)) => return resp,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
+    let walk = rbitcoin_query::scripthash::ShHistoryWalk::new(
+        &sh,
+        &view,
+        rbitcoin_query::scripthash::SH_JOIN_WAVE,
+    );
     let (tx, rx) = tokio::sync::mpsc::channel(2);
-    rbitcoin_net::spawn_with_store_budget(write_history(q, walk, tx));
+    rbitcoin_net::spawn_with_store_budget(write_history(q, walk, tx, stall));
     let mut resp = (
         [(axum::http::header::CONTENT_TYPE, "application/json")],
-        axum::body::Body::new(ChunkBody(rx)),
+        axum::body::Body::new(ChunkBody::new(rx)),
     )
         .into_response();
     resp.extensions_mut().insert(view);
     resp
 }
 
-/// Walk one wave per store permit and send its rows. The permit is never
-/// held while a slow reader leaves the channel full.
+/// Walk one wave per store permit and send its rows. The permit and the
+/// heavy turn are never held while the channel is full. A reader that
+/// leaves a chunk unread for `stall` ends the walk, and its body fails.
 #[cfg(unix)]
-async fn write_history(
+#[doc(hidden)]
+pub async fn write_history(
     q: std::sync::Arc<rbitcoin_query::Query>,
     mut walk: rbitcoin_query::scripthash::ShHistoryWalk,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
+    tx: tokio::sync::mpsc::Sender<Result<HistoryChunk, std::io::Error>>,
+    stall: std::time::Duration,
 ) {
+    let send = |item| {
+        let tx = tx.clone();
+        async move { matches!(tokio::time::timeout(stall, tx.send(item)).await, Ok(Ok(()))) }
+    };
     let mut open = Some(b'[');
     loop {
         let q = std::sync::Arc::clone(&q);
@@ -450,7 +455,7 @@ async fn write_history(
         let (next, rows) = match step {
             Ok(step) => step,
             Err(e) => {
-                let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                send(Err(std::io::Error::other(e.to_string()))).await;
                 return;
             }
         };
@@ -459,11 +464,11 @@ async fn write_history(
             Ok(Some(rows)) => rows,
             Ok(None) => {
                 let end: &'static [u8] = if open.is_some() { b"[]" } else { b"]" };
-                let _ = tx.send(Ok(Bytes::from_static(end))).await;
+                send(Ok(HistoryChunk::Last(Bytes::from_static(end)))).await;
                 return;
             }
             Err(e) => {
-                let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                send(Err(std::io::Error::other(e.to_string()))).await;
                 return;
             }
         };
@@ -482,16 +487,36 @@ async fn write_history(
                 .as_bytes(),
             );
         }
-        if tx.send(Ok(Bytes::from(out))).await.is_err() {
+        if !send(Ok(HistoryChunk::Rows(Bytes::from(out)))).await {
             return;
         }
     }
 }
 
-/// A response body fed by [`write_history`]. An `Err` frame aborts it.
+/// One frame of a history body: rows, or the closing `]`.
 #[cfg(unix)]
 #[doc(hidden)]
-pub struct ChunkBody(pub tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>);
+pub enum HistoryChunk {
+    Rows(Bytes),
+    Last(Bytes),
+}
+
+/// A response body fed by [`write_history`]. An `Err` frame, or a channel
+/// that closes before [`HistoryChunk::Last`], fails it, so a body cut short
+/// never ends with its final chunk.
+#[cfg(unix)]
+#[doc(hidden)]
+pub struct ChunkBody {
+    rx: tokio::sync::mpsc::Receiver<Result<HistoryChunk, std::io::Error>>,
+    ended: bool,
+}
+
+#[cfg(unix)]
+impl ChunkBody {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<Result<HistoryChunk, std::io::Error>>) -> Self {
+        Self { rx, ended: false }
+    }
+}
 
 #[cfg(unix)]
 impl hyper::body::Body for ChunkBody {
@@ -502,9 +527,19 @@ impl hyper::body::Body for ChunkBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
-        self.0
-            .poll_recv(cx)
-            .map(|chunk| chunk.map(|r| r.map(hyper::body::Frame::data)))
+        if self.ended {
+            return std::task::Poll::Ready(None);
+        }
+        let frame = match std::task::ready!(self.rx.poll_recv(cx)) {
+            Some(Ok(HistoryChunk::Rows(rows))) => Ok(rows),
+            Some(Ok(HistoryChunk::Last(end))) => {
+                self.ended = true;
+                Ok(end)
+            }
+            Some(Err(e)) => Err(e),
+            None => Err(std::io::Error::other("history ended before its last row")),
+        };
+        std::task::Poll::Ready(Some(frame.map(hyper::body::Frame::data)))
     }
 }
 

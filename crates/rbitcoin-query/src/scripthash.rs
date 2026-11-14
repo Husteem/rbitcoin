@@ -783,17 +783,27 @@ impl Query {
         if cap > 0 && n > cap {
             return Err(StoreError::ShCreatesCap { creates: n, cap });
         }
-        if heavy == 0 || n <= heavy {
-            return Ok(light);
+        Ok(self.heavy_turn(n))
+    }
+
+    /// The node's single heavy turn when `creates` is above
+    /// `--heavy-sh-creates`, else a light admit that waits on nothing.
+    fn heavy_turn(&self, creates: u32) -> JoinAdmit<'_> {
+        let heavy = self.heavy_sh_creates();
+        if heavy == 0 || creates <= heavy {
+            return JoinAdmit {
+                heavy: false,
+                _turn: None,
+            };
         }
-        Ok(JoinAdmit {
+        JoinAdmit {
             heavy: true,
             _turn: Some(
                 self.heavy_sh_join
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             ),
-        })
+        }
     }
 
     /// A `from_height` above 0 scans that window and never fills the join.
@@ -2296,58 +2306,40 @@ impl Query {
 /// `get_history` order (height, then txid bytes) one create wave at a time,
 /// so a caller can write rows while later waves are still unread.
 ///
-/// Creates are walked by height. A row is handed out once no unread create
-/// sits at or below its height: a spend is never below the create it spends.
-/// Only spends above that frontier wait in `held`; the full join is never in
-/// RAM. No `--max-sh-creates` or `--heavy-sh-creates` admit: the one caller
-/// is the Esplora unix socket. Each wave rechecks the view, so a reorg below
-/// the pin fails the walk rather than ending it short.
+/// The first step reads the script's creates and sorts them by height
+/// (a height and a key per create, kept for the whole walk). Each step then
+/// joins one wave and hands out every row below the next unread create: a
+/// spend is never below the create it spends. Only spends above that
+/// frontier wait in `held`; the full join is never in RAM. No
+/// `--max-sh-creates`: the one caller is the Esplora unix socket. Each step
+/// holds the `--heavy-sh-creates` turn as an unpaged join would, and only
+/// while it reads. Each step rechecks the view, so a reorg below the pin
+/// fails the walk rather than ending it short.
 #[doc(hidden)]
 pub struct ShHistoryWalk {
     scripthash: [u8; 32],
     view: ChainView,
     wave: usize,
-    creates: Vec<(u32, Fk)>,
+    creates: Option<Vec<(u32, Fk)>>,
     next: usize,
     held: BTreeMap<(u32, [u8; 32]), Fk>,
     done: bool,
 }
 
-impl Query {
-    /// Start an [`ShHistoryWalk`] over `wave` creates per step.
-    #[doc(hidden)]
-    pub fn sh_history_walk(
-        &self,
-        scripthash: &[u8; 32],
-        view: &ChainView,
-        wave: usize,
-    ) -> Result<ShHistoryWalk, QueryError> {
-        let fks = self.strong_sh_creates(scripthash, view)?;
-        let heights = self.store.tx_height_get_batch(&fks)?;
-        if heights.len() != fks.len() {
-            return Err(StoreError::Corrupt(
-                "invariant: SH create height batch length",
-            ));
-        }
-        let mut creates: Vec<(u32, Fk)> = heights
-            .into_iter()
-            .map(|h| h.unwrap_or(0))
-            .zip(fks)
-            .collect();
-        creates.sort_unstable_by_key(|(h, fk)| (*h, fk.0));
-        Ok(ShHistoryWalk {
+impl ShHistoryWalk {
+    /// A walk over `wave` creates per step. Reads nothing yet.
+    pub fn new(scripthash: &[u8; 32], view: &ChainView, wave: usize) -> Self {
+        Self {
             scripthash: *scripthash,
             view: *view,
             wave: wave.max(1),
-            creates,
+            creates: None,
             next: 0,
             held: BTreeMap::new(),
             done: false,
-        })
+        }
     }
-}
 
-impl ShHistoryWalk {
     /// The next rows in order (possibly none yet), or `None` once every row
     /// was handed out.
     pub fn next_rows(
@@ -2357,12 +2349,20 @@ impl ShHistoryWalk {
         if self.done {
             return Ok(None);
         }
-        let end = self.next.saturating_add(self.wave).min(self.creates.len());
-        let fks: Vec<Fk> = self.creates[self.next..end]
-            .iter()
-            .map(|(_, fk)| *fk)
-            .collect();
+        let admit = q.heavy_turn(q.scripthash_create_count(&self.scripthash)?);
+        #[cfg(debug_assertions)]
+        let _probe = q.sh_join_probe.enter(admit.heavy);
+        #[cfg(not(debug_assertions))]
+        let _admit = admit;
+        let creates = match self.creates.take() {
+            Some(creates) => creates,
+            None => Self::creates_by_height(q, &self.scripthash, &self.view)?,
+        };
+        let end = self.next.saturating_add(self.wave).min(creates.len());
+        let fks: Vec<Fk> = creates[self.next..end].iter().map(|(_, fk)| *fk).collect();
         self.next = end;
+        let frontier = creates.get(end).map(|(h, _)| *h);
+        self.creates = Some(creates);
         let created = q.expand_create_fks_wave(&self.scripthash, &fks, ShJoinNeed::HISTORY)?;
         for rec in q.join_spends_wave(&created, ShJoinNeed::HISTORY, &self.view)? {
             self.held
@@ -2374,8 +2374,8 @@ impl ShHistoryWalk {
         if !self.view.still_live(q)? {
             return Err(StoreError::Stale("chain view moved"));
         }
-        let rows = match self.creates.get(self.next) {
-            Some(&(frontier, _)) => {
+        let rows = match frontier {
+            Some(frontier) => {
                 let later = self.held.split_off(&(frontier, [0u8; 32]));
                 std::mem::replace(&mut self.held, later)
             }
@@ -2394,6 +2394,27 @@ impl ShHistoryWalk {
                 })
                 .collect(),
         ))
+    }
+
+    fn creates_by_height(
+        q: &Query,
+        scripthash: &[u8; 32],
+        view: &ChainView,
+    ) -> Result<Vec<(u32, Fk)>, QueryError> {
+        let fks = q.strong_sh_creates(scripthash, view)?;
+        let heights = q.store.tx_height_get_batch(&fks)?;
+        if heights.len() != fks.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: SH create height batch length",
+            ));
+        }
+        let mut creates: Vec<(u32, Fk)> = heights
+            .into_iter()
+            .map(|h| h.unwrap_or(0))
+            .zip(fks)
+            .collect();
+        creates.sort_unstable_by_key(|(h, fk)| (*h, fk.0));
+        Ok(creates)
     }
 }
 

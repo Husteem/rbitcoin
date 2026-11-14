@@ -177,13 +177,15 @@ create count: the largest took 8 s, a pay-to-anchor script with 77,000 took 21 s
 `GET /internal/scripthash/:hash/history` (and `/internal/address/:address/history`)
 on the same socket is the confirmed `get_history` list with no
 `--max-sh-creates`, for an explorer that copies a large script's whole list
-once. It does not run the unpaged join. It reads the script's creates, sorts
-them by height, then joins 4096 at a time and writes each wave's rows before
-reading the next. Rows wait in memory only while they belong to a block above
-the next unread create (a spend of an older output), so the node holds one
-wave and those rows, not the whole list. It does not take the
-`--heavy-sh-creates` turn: a slow reader would hold that node-wide turn for as
-long as it reads. Each wave takes the store-read budget only while it reads.
+once. It does not run the unpaged join. After the response headers it reads
+the script's creates and sorts them by height, then joins 4096 at a time and
+writes each wave's rows before reading the next. For as long as the response is
+open the node keeps that sorted create list (a height and a key, 16 bytes a
+create), one wave, and the rows that belong to a block above the next unread
+create (spends of older outputs); never the whole join or the whole list. Each
+wave holds the `--heavy-sh-creates` turn and the store-read budget only while
+it reads, not while it waits on the reader. A reader that leaves a chunk unread
+for the listener idle timeout ends the response, and its body fails.
 
 `--heavy-sh-creates N` (conf `heavy_sh_creates=`, default **10000**, **0** off)
 lets one unpaged join with more than N creates run at a time across the

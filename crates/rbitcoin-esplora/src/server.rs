@@ -628,6 +628,9 @@ pub struct AppState {
     pub join_header_trusted: bool,
     pub block_template: Option<BlockTemplateFn>,
     pub gbt_cache: Arc<Mutex<Option<GbtCache>>>,
+    /// How long a streamed body waits on a reader that leaves its next
+    /// chunk unread before it fails the body (the listener idle timeout).
+    pub send_stall: Duration,
 }
 
 #[doc(hidden)]
@@ -1184,6 +1187,7 @@ pub async fn run_esplora(
         },
         block_template: config.block_template,
         gbt_cache: Arc::new(Mutex::new(None)),
+        send_stall: timeout,
     };
 
     // axum 0.8 path params use `{name}` (not `:name`).

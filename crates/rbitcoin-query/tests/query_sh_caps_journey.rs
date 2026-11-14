@@ -226,7 +226,7 @@ fn walk_all(
     view: &rbitcoin_query::ChainView,
     wave: usize,
 ) -> Result<Vec<rbitcoin_query::ScriptHashHistoryItem>, QueryError> {
-    let mut walk = q.sh_history_walk(sh, view, wave)?;
+    let mut walk = rbitcoin_query::scripthash::ShHistoryWalk::new(sh, view, wave);
     let mut rows = Vec::new();
     while let Some(more) = walk.next_rows(q)? {
         rows.extend(more);
@@ -311,7 +311,7 @@ fn history_walk_fails_once_its_view_leaves_the_chain() {
     }
     q.apply_sh_pending().unwrap();
     let view = q.pin_sh_chain_view().unwrap().expect("sh view");
-    let mut walk = q.sh_history_walk(&sh, &view, 1).unwrap();
+    let mut walk = rbitcoin_query::scripthash::ShHistoryWalk::new(&sh, &view, 1);
     let first = walk.next_rows(&q).unwrap().expect("first wave");
     assert!(first.len() <= 1, "{first:?}");
     q.disconnect_tip().unwrap();
