@@ -679,11 +679,11 @@ impl Store {
         Ok(self.class_a_confirmed_cut(covered)?.is_none())
     }
 
-    /// After open truncates Class A, drop confirmed heights whose tx range
-    /// ends past that count. The header clear is flushed before the tip
-    /// shrink. A crash after that clear still shrinks: the strong bit past
-    /// the count is set and the range is already gone. Trailing nulls, a
-    /// header-only tip, and a Class C fixture are not this drop.
+    /// After open fits Class A, drop confirmed heights it no longer covers.
+    ///
+    /// The fit never keeps fewer creates than a durable Class C row names:
+    /// [`crate::tx_table::refuse_below_committed`] stops open first. What
+    /// is left is trailing nulls, a header-only tip, and a Class C fixture.
     pub(crate) fn drop_confirmed_past_creates(&self) -> Result<(), StoreError> {
         let covered = self.txs.count();
         let Some(tip) = self.confirmed.tip_height() else {
@@ -692,25 +692,8 @@ impl Store {
         let write = crate::array_table::ClassCWrite::new();
         let mut report = TipRevalidateReport::default();
         if let Some(bad) = self.class_a_confirmed_cut(covered)? {
-            let kept = bad.checked_sub(1);
-            match self.header_tx_end(Height(bad))? {
-                Some(end) if end > covered => {
-                    if covered == 0 && !self.txs.bodies_allocated_past_header() {
-                        return Ok(());
-                    }
-                    let mut fks = Vec::new();
-                    for h in bad..=tip.0 {
-                        if let Some(fk) = self.confirmed.get(Height(h))? {
-                            fks.push(fk);
-                        }
-                    }
-                    self.clear_header_fks(&write, &fks)?;
-                    self.shrink_tip_to(&write, kept, &mut report)?;
-                }
-                None if self.strong_past_covered(covered)? => {
-                    self.shrink_tip_to(&write, kept, &mut report)?;
-                }
-                _ => {}
+            if self.header_tx_end(Height(bad))?.is_none() && self.strong_past_covered(covered)? {
+                self.shrink_tip_to(&write, bad.checked_sub(1), &mut report)?;
             }
             return Ok(());
         }
@@ -728,17 +711,6 @@ impl Store {
             return Ok(false);
         };
         self.strong_tx.is_strong(fk)
-    }
-
-    fn clear_header_fks(
-        &self,
-        write: &crate::array_table::ClassCWrite,
-        fks: &[Fk],
-    ) -> Result<(), StoreError> {
-        for fk in fks {
-            let _ = self.header_txs.clear_body(write, *fk)?;
-        }
-        self.header_txs.flush()
     }
 
     /// Height a spend checkpoint may call durable, or `None` when no create is.

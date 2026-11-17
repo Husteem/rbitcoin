@@ -265,6 +265,52 @@ fn pread_batch_on_pool_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sync batch that gives up waiting still reports the failure it saw, and
+/// every sync it did not hear back from as failed.
+///
+/// The sequential retry it used to fall back to runs on the same file
+/// description, which already took the writeback error, so it returns 0.
+#[cfg(debug_assertions)]
+#[test]
+fn sync_batch_that_gives_up_keeps_its_failed_syncs() {
+    use rbitcoin_store::uring_session::{with_drain_hard_cap, SessionKind, UringSession};
+    let dir = rbitcoin_store::testutil::fresh_path("sync-batch-gives-up");
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = std::fs::File::create(dir.join("a")).unwrap();
+    let b = std::fs::File::create(dir.join("b")).unwrap();
+    let (ha, hb) = (IoHandle::from_file(&a), IoHandle::from_file(&b));
+    rbitcoin_store::io_handle::arm_fail_sync(ha, 1);
+    // Just past the 200 ms cap. The worker still holds `b` when the batch
+    // gives up; keep both files open until it is done with it.
+    let delay = std::time::Duration::from_millis(300);
+    let start = std::time::Instant::now();
+    rbitcoin_store::io_handle::arm_sync_delay(hb, delay);
+    let res = with_drain_hard_cap(std::time::Duration::from_millis(200), || {
+        let mut sess = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+        sync_data_batch_on_session(&mut sess, &[ha, hb])
+    });
+    let res = res.expect("a batch that submitted its syncs fell back to a retry");
+    assert_ne!(res[0], 0, "the failed sync was dropped");
+    assert_ne!(res[1], 0, "an unanswered sync counted as done");
+    std::thread::sleep(
+        (delay + std::time::Duration::from_millis(200)).saturating_sub(start.elapsed()),
+    );
+    drop((a, b));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only a submitted sync can have taken the writeback error. One the batch
+/// never pushed is left for the caller's one-at-a-time sync (`i32::MIN`),
+/// so a failed push does not latch the store without an IO error.
+#[test]
+fn abandoned_sync_batch_fails_only_what_it_submitted() {
+    let m = i32::MIN;
+    assert_eq!(
+        abandoned_sync_results(vec![0, -5, m, m, m], 3),
+        vec![0, -5, -5, m, m]
+    );
+}
+
 #[test]
 fn held_pread_errno_on_live_ring_is_ok_true() {
     let dir = std::env::temp_dir().join(format!(

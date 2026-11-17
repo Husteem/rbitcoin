@@ -911,55 +911,20 @@ fn sealed_spend_chain() -> (
     (dir, q, params, ms, h_spend, c1, block, tip_time)
 }
 
+/// The input locator fell back below the sealed spend block. The barrier
+/// syncs it before the seal, so only an older binary leaves this image:
+/// open refuses and asks for a reindex rather than free the spend's number.
 #[test]
-fn short_input_hwm_shrinks_below_the_edgeless_create() {
-    let (dir, q, params, ms, h_spend, c1, block, tip_time) = sealed_spend_chain();
+fn short_input_hwm_below_the_sealed_tip_refuses() {
+    let (dir, q, _params, _ms, h_spend, _c1, _block, _tip_time) = sealed_spend_chain();
     assert_eq!(q.tip_height(), Some(Height(h_spend)));
-    let keep = u64::from(h_spend);
     let store = q.store().path().to_path_buf();
     drop(q);
-    shrink_input_loc_hwm(&store, keep);
-
-    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
-    q.set_spend_index(true);
-    let tip_h = q.tip_height().expect("a prefix of the chain stays");
-    assert!(
-        tip_h.0 < h_spend,
-        "open must drop the block whose creates lost their edges, tip {}",
-        tip_h.0
-    );
-    rbitcoin_query::replay_spend_annotations(&q).unwrap();
-    let marked = q.store().spend_annotated_through().unwrap();
-    assert_ne!(
-        marked,
-        Some(h_spend),
-        "the spend marker must not name the pre-loss tip"
-    );
-    if let Some((ann, durable)) = marker_heights(&store) {
-        assert_ne!(ann, h_spend);
-        assert_ne!(durable, h_spend);
+    shrink_input_loc_hwm(&store, u64::from(h_spend));
+    match rbitcoin_query::Query::open_or_create_tiny(&store) {
+        Err(e) => assert!(e.to_string().contains("reindex"), "open returned {e}"),
+        Ok(q) => panic!("open cut committed creates: tip {:?}", q.tip_height()),
     }
-    let spend_txid = block.txdata[1].compute_txid();
-    assert!(
-        q.tx_fk_by_txid(spend_txid.as_byte_array())
-            .unwrap()
-            .is_none(),
-        "the edgeless spend create is not left in the archive"
-    );
-
-    accept_and_connect_block(&q, &params, Height(tip_h.0 + 1), &block, ms).unwrap();
-    let respend = mine(
-        block.block_hash(),
-        tip_time + 1_200,
-        tip_h.0 + 2,
-        vec![spend_one(c1, Amount::from_sat(48_0000_0000))],
-    );
-    let err = accept_and_connect_block(&q, &params, Height(tip_h.0 + 2), &respend, ms)
-        .expect_err("reconnecting the spend keeps the output spent");
-    assert!(
-        matches!(err, ConfirmError::Rules(ConsensusError::PrevoutSpent)),
-        "respend after reconnect: {err}"
-    );
     let _ = dir;
 }
 

@@ -550,7 +550,9 @@ impl Store {
         if layout.is_split() {
             refuse_cold_index_dirs(&path, &seqsigwit_dir)?;
         }
-        let txs = TxTable::open_seqsigwit(&path, &seqsigwit_dir, layout.open_opts())?;
+        let committed = committed_create_count(&header_txs)?;
+        let txs =
+            TxTable::open_seqsigwit(&path, &seqsigwit_dir, layout.open_opts(), Some(committed))?;
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }
@@ -880,6 +882,8 @@ impl Store {
     /// fsyncing every mega-batch of txs/ins/outs.
     ///
     pub fn flush_header_archive(&self) -> Result<(), StoreError> {
+        // A durable body association must name durable creates.
+        self.txs.sync_class_a_data()?;
         self.headers.flush()?;
         self.header_txs.flush()?;
         Ok(())
@@ -969,7 +973,7 @@ impl Store {
         first: u64,
         last: u64,
     ) -> Result<Vec<Option<crate::TxStatRow>>, StoreError> {
-        let blob = self.txs.txstat.header_blob(header_fk)?;
+        let blob = self.txs.txstat.header_blob_or_empty(header_fk)?;
         self.txs.txstat.get_range(first, last, Some(&blob))
     }
 
@@ -1024,19 +1028,20 @@ impl Store {
         match crate::txstat::parse_cell(cell)? {
             crate::txstat::CellParse::Unstamped => Ok(None),
             crate::txstat::CellParse::Complete(row) => Ok(Some(row)),
+            // The tail is found through the create's confirmed block. A
+            // create a spend commit or scripthash mark keeps has none until
+            // its block lands: it reads as unstamped.
             crate::txstat::CellParse::NeedTail => {
-                let h = self
-                    .tx_height_get(fk)?
-                    .ok_or(StoreError::Corrupt("invariant: txstat overflow missing"))?;
-                let hfk = self
-                    .confirmed
-                    .get(Height(h))?
-                    .ok_or(StoreError::Corrupt("invariant: txstat overflow missing"))?;
-                let (first, _) = self
-                    .header_txs
-                    .get_range(hfk)?
-                    .ok_or(StoreError::Corrupt("invariant: txstat overflow missing"))?;
-                let blob = self.txs.txstat.header_blob(hfk)?;
+                let Some(h) = self.tx_height_get(fk)? else {
+                    return Ok(None);
+                };
+                let Some(hfk) = self.confirmed.get(Height(h))? else {
+                    return Ok(None);
+                };
+                let Some((first, _)) = self.header_txs.get_range(hfk)? else {
+                    return Ok(None);
+                };
+                let blob = self.txs.txstat.header_blob_or_empty(hfk)?;
                 self.txs.txstat.get_row_merged(fk, first.0, &blob)
             }
         }
@@ -1847,12 +1852,16 @@ impl Store {
 
     /// Flush Class C **except** `confirmed[]` (pre-tip half of the barrier).
     ///
-    /// Order: `strong_tx` → `header_txs`. Used so a mid-barrier kill can leave
-    /// strong durable **above** tip (repairable) without advancing tip. Prefer
-    /// [`Self::flush_class_c_tip`] for the full barrier.
+    /// Order: Class A `sync_data` → `strong_tx` → `header_txs`. Used so a
+    /// mid-barrier kill can leave strong durable **above** tip (repairable)
+    /// without advancing tip. Prefer [`Self::flush_class_c_tip`] for the full
+    /// barrier.
     #[doc(hidden)]
     pub fn flush_class_c_pre_tip(&self) -> Result<(), StoreError> {
         // Tip-as-commit: never flush confirmed here.
+        // Class A first: no Class C row on disk names a create the device
+        // does not hold, so open may truncate any Class A tail it finds.
+        self.txs.sync_class_a_data()?;
         // Headers first so conf tip cannot reference a non-durable header_fk.
         self.headers.flush()?;
         self.strong_tx.flush()?;
@@ -1890,9 +1899,9 @@ impl Store {
         let gen = self
             .spend_reorg_gen
             .load(std::sync::atomic::Ordering::Acquire);
-        self.spenders.sync_data_only()?;
+        // The checkpoint syncs spenders and Class A after its freeze, before
+        // the commit names a spender; the marker below names no later create.
         self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
-        self.txs.sync_replay_data()?;
         self.store_spend_marker(tip, tip, gen)?;
         Ok(t.elapsed().as_nanos() as u64)
     }
@@ -2000,6 +2009,7 @@ impl Store {
         let view = &self.utxo_view;
         let confirmed = &self.confirmed;
         let spenders = &self.spenders;
+        let txs = &self.txs;
         let durable =
             crate::spend_durable::SpendDurable::load(self.path())?.map(|m| m.durable_through());
         let reorgs = &self.spend_reorg_gen;
@@ -2015,7 +2025,12 @@ impl Store {
                     log.freeze_open(tip, disconnected.then_some(keep))?;
                     filtered.store(seen, Ordering::Release);
                 }
-                spenders.sync_data_only()
+                // Every spender a frozen note names was appended before the
+                // freeze. Sync it before the commit can name its number.
+                let named = txs.count();
+                spenders.sync_data_only()?;
+                txs.sync_class_a_named(named)?;
+                Ok(())
             },
             durable,
         )
@@ -2164,9 +2179,9 @@ impl Store {
         during_sync: impl FnOnce(&Self),
     ) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
-        self.spenders.sync_data_only()?;
+        // The checkpoint syncs spenders and Class A after its freeze, before
+        // the commit names a spender; the marker below names no later create.
         self.publish_open_spend_pages(height, |meta| self.spend_slot_still_live(meta))?;
-        self.txs.sync_replay_data()?;
         during_sync(self);
         if self.spend_reorg_gen.load(Ordering::Acquire) != gen {
             return Ok(());
@@ -2302,8 +2317,8 @@ impl Store {
 
     /// Process-exit flush (IBD / SIGTERM). Target: seconds, not minutes.
     ///
-    /// 1. Fsync tip / Class C tables only.
-    /// 2. MS_ASYNC Class A bodies.
+    /// 1. The connect barrier: Class A `sync_data`, then the Class C tables.
+    /// 2. MS_ASYNC Class A bodies and the derived heads.
     pub fn flush_for_shutdown(&self) -> Result<(), StoreError> {
         let t0 = std::time::Instant::now();
         rbitcoin_log::info!("store: shutdown flush — fsync tip tables…");
@@ -2319,6 +2334,20 @@ impl Store {
         rbitcoin_log::info!("store: shutdown flush done elapsed={:?}", t0.elapsed());
         Ok(())
     }
+}
+
+/// Highest create any durable `header_txs` range names (`0` for none).
+fn committed_create_count(header_txs: &HeaderTxsTable) -> Result<u64, StoreError> {
+    let n = header_txs.first.len().min(header_txs.count.len());
+    let mut end = 0u64;
+    for i in 0..n {
+        let count = header_txs.count.get(i)?;
+        let first = header_txs.first.get(i)?;
+        if count != 0 && first != 0 {
+            end = end.max(first.saturating_add(count).saturating_sub(1));
+        }
+    }
+    Ok(end)
 }
 
 fn incomplete_creation_files(layout: &StoreLayout) -> bool {

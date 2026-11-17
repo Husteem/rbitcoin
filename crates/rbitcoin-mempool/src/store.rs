@@ -1125,14 +1125,6 @@ pub fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32, u16), Memp
             .write(true)
             .open(path)
             .map_err(|e| MempoolError::io(path, e))?;
-        let len = file
-            .metadata()
-            .map_err(|e| MempoolError::io(path, e))?
-            .len();
-        // A torn sidecar, not an IO fault: open moves the image aside.
-        if len < META_LEN as u64 {
-            return Err(MempoolError::Corrupt("mempool meta short"));
-        }
         let mut buf = [0u8; META_LEN];
         file.read_exact(&mut buf)
             .map_err(|e| MempoolError::io(path, e))?;

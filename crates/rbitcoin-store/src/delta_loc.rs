@@ -295,10 +295,12 @@ impl DeltaLoc {
     }
 
     pub fn open(dir: &Path, stem: &str) -> Result<Self, StoreError> {
-        Self::open_inner(dir, stem)
+        Self::open_above(dir, stem, 0)
     }
 
-    fn open_inner(dir: &Path, stem: &str) -> Result<Self, StoreError> {
+    /// [`Self::open`] that refuses, before it cuts anything, to keep fewer
+    /// than `floor` creates.
+    pub fn open_above(dir: &Path, stem: &str, floor: u64) -> Result<Self, StoreError> {
         let loc = open_loc_file(&dir.join(format!("{stem}.loc")), TableKind::DeltaLoc)?;
         let ovf_path = dir.join(format!("{stem}.loc.ovf"));
         let ovf = if ovf_path.exists() {
@@ -342,6 +344,9 @@ impl DeltaLoc {
         // A short checkpoint is an unpublished append tail, including when
         // the prune sidecar already exists. The cut publishes locator length
         // 0 before it shrinks the checkpoint, so that crash is count 0 here.
+        if full > 0 {
+            crate::tx_table::refuse_below_committed(count, floor)?;
+        }
         opened.truncate_to_count(count)?;
         // A row past the overflow header belongs to a create this file does not name.
         let last_ovf = opened
@@ -354,6 +359,7 @@ impl DeltaLoc {
         if let Some(cut) =
             unresolved_ovf_cut(&opened.loc, &opened.ovf, opened.count(), last_ovf, false)?
         {
+            crate::tx_table::refuse_below_committed(cut, floor)?;
             opened.truncate_to_count(cut)?;
         }
         Ok(opened)

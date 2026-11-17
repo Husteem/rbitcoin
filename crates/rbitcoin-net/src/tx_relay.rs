@@ -2353,8 +2353,15 @@ impl MempoolHub {
                 if g.graph.contains(&op.txid) && !confirmed_resident.contains(&op.txid) {
                     continue;
                 }
+                // A cached create is the parent only while it is strong and
+                // still holds the parent's txid: a power cut can lose the
+                // create, and open hands the number to a later block.
                 match aux.get(i).and_then(|a| a.create_fk) {
-                    Some(fk) if store.is_confirmed_strong(fk).map_err(|_| ())? => {
+                    Some(fk)
+                        if store.is_confirmed_strong(fk).map_err(|_| ())?
+                            && store.txs.body_txid(fk).map_err(|_| ())?
+                                == op.txid.to_byte_array() =>
+                    {
                         op_fk.insert(op, fk);
                     }
                     _ => need_id.push(op.txid.to_byte_array()),

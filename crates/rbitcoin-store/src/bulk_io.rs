@@ -1,5 +1,5 @@
-//! Bulk table IO via **io_uring** (Linux): pipelined preads and pwrites so the
-//! kernel can keep many independent ops in flight.
+//! Bulk table IO via **io_uring** (Linux): pipelined preads, pwrites, and
+//! `fdatasync`s so the kernel can keep many independent ops in flight.
 //!
 //! All io_uring work is driven by [`crate::uring_session::UringSession`] (same
 //! type as archive streaming head-resolve). Hot-path
@@ -8,8 +8,9 @@
 //! Nested bulk_io on the same thread (re-entrant) opens a temporary ring.
 //! Falls back to libc `pread`/`pwrite` when uring is off.
 //!
-//! Used by archive head-resolve body prefixes, confirm load body batches, and
-//! Class C bulk slots. Completions are unordered within a submit batch.
+//! Used by archive head-resolve body prefixes, confirm load body batches,
+//! Class C bulk slots, and the Class A barrier's overlapped syncs
+//! ([`sync_data_batch`]). Completions are unordered within a submit batch.
 //!
 //! # Controls
 //!
@@ -560,6 +561,114 @@ pub fn pwrite_batch_on_session(
         return false;
     }
     ok
+}
+
+/// `sync_data` every handle on the configured bulk-IO session, all in
+/// flight at once: io_uring datasync `FSYNC` ops, the shared pool's workers,
+/// or IOCP (which flushes inline). Returns each handle's 0 or negated errno.
+///
+/// `None` when no session runs (`RBITCOIN_IO=pread`, or it did not open)
+/// or the batch failed before it submitted a sync; the caller syncs one at
+/// a time.
+///
+/// A submitted sync may have taken the file description's writeback error,
+/// and a retry on the same fd then returns 0. So once one is submitted, a
+/// failed batch reports every submitted sync it did not hear back from as
+/// EIO, and `i32::MIN` for one it never pushed (the caller syncs those).
+#[doc(hidden)]
+pub fn sync_data_batch(handles: &[IoHandle]) -> Option<Vec<i32>> {
+    if handles.is_empty() {
+        return Some(Vec::new());
+    }
+    if !io_uring_enabled() {
+        return None;
+    }
+    with_bulk_session(|session| sync_data_batch_on_session(session, handles)).flatten()
+}
+
+#[doc(hidden)]
+pub fn sync_data_batch_on_session(
+    session: &mut crate::uring_session::UringSession,
+    handles: &[IoHandle],
+) -> Option<Vec<i32>> {
+    use crate::uring_session::{pack_ud, unpack_ud, KIND_BULK_FSYNC};
+    session.begin_batch().ok()?;
+    let epoch = session.epoch();
+    let n = handles.len();
+    let mut res = vec![i32::MIN; n];
+    let mut next = 0usize;
+    let mut completed = 0usize;
+    while completed < n {
+        while next < n && session.free_sq() > 0 {
+            let ud = pack_ud(KIND_BULK_FSYNC, epoch, next as u32);
+            if session.push_sync_data(handles[next], ud).is_err() {
+                if session.in_flight() == 0 {
+                    return sync_batch_abandoned(session, res, next);
+                }
+                break;
+            }
+            next += 1;
+        }
+        #[cfg(debug_assertions)]
+        if next == n && completed == 0 {
+            crate::io_handle::note_sync_batch(handles);
+        }
+        session.sync_submission();
+        let cqes = match session.harvest_ready() {
+            Ok(c) => c,
+            Err(_) => {
+                return sync_batch_abandoned(session, res, next);
+            }
+        };
+        if cqes.is_empty() {
+            match empty_harvest_next(session.submit_and_wait_one().is_ok()) {
+                EmptyHarvest::Retry => continue,
+                EmptyHarvest::Fail => {
+                    return sync_batch_abandoned(session, res, next);
+                }
+            }
+        }
+        for (ud, r) in cqes {
+            let (kind, ep, slot) = unpack_ud(ud);
+            let i = slot as usize;
+            if kind != KIND_BULK_FSYNC || ep != epoch || i >= n || res[i] != i32::MIN {
+                session.poison();
+                return sync_batch_abandoned(session, res, next);
+            }
+            res[i] = r;
+            completed += 1;
+        }
+    }
+    let _ = session.drain_all();
+    Some(res)
+}
+
+/// Drain a failed sync batch. Nothing submitted: `None`, the caller may
+/// sync one at a time. Otherwise see [`abandoned_sync_results`].
+fn sync_batch_abandoned(
+    session: &mut crate::uring_session::UringSession,
+    res: Vec<i32>,
+    submitted: usize,
+) -> Option<Vec<i32>> {
+    let _ = session.drain_all();
+    if submitted == 0 {
+        return None;
+    }
+    Some(abandoned_sync_results(res, submitted))
+}
+
+/// Results of a sync batch that failed after `submitted` pushes (in index
+/// order). A submitted sync with no result is EIO: it may have taken the
+/// writeback error. One never pushed stays `i32::MIN`, for the caller to
+/// sync itself.
+#[doc(hidden)]
+pub fn abandoned_sync_results(mut res: Vec<i32>, submitted: usize) -> Vec<i32> {
+    for r in res.iter_mut().take(submitted) {
+        if *r == i32::MIN {
+            *r = -5;
+        }
+    }
+    res
 }
 
 /// Unfilled or failed pwrite ops are not success. Caller libc-retries.

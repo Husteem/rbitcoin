@@ -983,7 +983,7 @@ impl Query {
         // Current schema is on disk before the locator goes to zero. A crash
         // that leaves schema 26 and an empty locator is what a 26 binary wipes.
         rbitcoin_store::store::write_meta(self.store.path())?;
-        self.store.txs.input.flush()?;
+        self.store.txs.flush_input()?;
         self.store.set_prune_seqsigwit_mode(true);
         let before = std::fs::metadata(self.store.txs.seqsigwit.body_file_path())
             .map(|m| m.len())
@@ -3169,7 +3169,9 @@ impl Query {
         let write = rbitcoin_store::ClassCWrite::new();
         let cleared = self.store.header_txs.clear_body(&write, fk)?;
         if cleared {
-            self.store.header_txs.flush()?;
+            // The flush writes every dirty range, not just this one: sync
+            // the creates they name first.
+            self.store.flush_header_archive()?;
         }
         Ok(cleared)
     }

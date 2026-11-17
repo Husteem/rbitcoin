@@ -89,8 +89,10 @@ impl Query {
         self.sh_force_rebuild.store(on, Ordering::SeqCst);
     }
 
+    /// The operator flag, or a torn slab the write-behind apply found.
     pub fn sh_force_rebuild(&self) -> bool {
         self.sh_force_rebuild.load(Ordering::SeqCst)
+            || rbitcoin_store::scripthash::sh_rebuild_marked(self.store.path())
     }
 
     /// Enter **direct** IBD with scripthash indexing **on** (library / test default).
@@ -321,6 +323,19 @@ impl Query {
         &self,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<u64, QueryError> {
+        let forced = self.sh_force_rebuild();
+        let n = self.finalize_sh_unsorted_inner(cancel)?;
+        if forced {
+            // The rebuild finished; a crash before this wipes and rebuilds again.
+            rbitcoin_store::scripthash::clear_sh_rebuild(self.store.path())?;
+        }
+        Ok(n)
+    }
+
+    fn finalize_sh_unsorted_inner(
+        &self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<u64, QueryError> {
         if self.sh_force_rebuild() {
             rbitcoin_log::info!(
                 "node: scripthash FORCE_REBUILD + unsorted-shards — wipe head then Class A collect"
@@ -405,6 +420,8 @@ impl Query {
         let mut total = 0u64;
         loop {
             let last = self.store.txs.count();
+            // `include_hwm` names creates through `last`; they reach the device first.
+            self.store.txs.sync_class_a_named(last)?;
             self.sh_run.refresh_seal();
             let floor = durable_sh_inclusion_floor(
                 self.store.scripthash.include_hwm(),

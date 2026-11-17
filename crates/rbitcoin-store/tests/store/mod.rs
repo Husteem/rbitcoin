@@ -731,6 +731,8 @@ fn open_schema24_occupied_creates_zero_txstat() {
         let s = Store::create_tiny(&dir).unwrap();
         let item = coinbase_item([0x25u8; 32], vec![OutputRecord::unspent(50, vec![0x51])]);
         s.put_tx_full_batch_indexed(&[item], true).unwrap();
+        // A durable record names these creates, or open cuts them.
+        s.txs.sync_class_a_named(s.txs.count()).unwrap();
         s.flush().unwrap();
     }
     std::fs::remove_file(dir.join("txstat.body")).unwrap();
@@ -777,6 +779,8 @@ fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
         let s = Store::create_tiny(&dir).unwrap();
         let item = coinbase_item([0x27u8; 32], vec![OutputRecord::unspent(50, vec![0x51])]);
         s.put_tx_full_batch_indexed(&[item], true).unwrap();
+        // A durable record names these creates, or open cuts them.
+        s.txs.sync_class_a_named(s.txs.count()).unwrap();
         s.flush().unwrap();
     }
     write_store_meta_ver(&dir, 26);
@@ -913,6 +917,8 @@ fn put_full_fat_txout_past_u16_strides() {
     let script = vec![0u8; 524_288];
     let item = coinbase_item([0x89u8; 32], vec![OutputRecord::unspent(0, script.clone())]);
     let fk = s.put_tx_full_batch_indexed(&[item], true).unwrap()[0];
+    // A durable record names these creates, or open cuts them.
+    s.txs.sync_class_a_named(s.txs.count()).unwrap();
     let (tx, _ins, outs) = s.get_tx_full(fk).unwrap();
     assert_eq!(tx.output_count, 1);
     assert_eq!(outs[0].script.len(), 524_288);
@@ -932,6 +938,8 @@ fn open_schema22_occupied_rewrites_create_ovf_12_to_16() {
         let outs = vec![OutputRecord::unspent(1, vec![0x51]); n_out as usize];
         let item = coinbase_item([0x22u8; 32], outs);
         s.put_tx_full_batch_indexed(&[item], true).unwrap();
+        // A durable record names these creates, or open cuts them.
+        s.txs.sync_class_a_named(s.txs.count()).unwrap();
         s.flush().unwrap();
     }
     snapshot_create_ovf_as_v22_12b(&dir);
@@ -1100,6 +1108,8 @@ fn class_a_v17_roundtrip_templates() {
     let fks = s
         .put_tx_full_batch_indexed(&[v1, v2, v3, hi], true)
         .unwrap();
+    // A durable record names these creates, or open cuts them.
+    s.txs.sync_class_a_named(s.txs.count()).unwrap();
     assert_eq!(fks.len(), 4);
 
     let (off, len) = s.txs.body_range(fks[0]).unwrap();
@@ -1712,6 +1722,8 @@ fn store_open_upgrade_missing_tables_and_unspent_no_range() {
         let s = Store::create_tiny(&dir).unwrap();
         let create = coinbase_item([20u8; 32], vec![OutputRecord::unspent(10, vec![0x51])]);
         let fk = s.put_tx_full_batch_indexed(&[create], true).unwrap()[0];
+        // A durable record names these creates, or open cuts them.
+        s.txs.sync_class_a_named(s.txs.count()).unwrap();
         s.flush().unwrap();
         drop(s);
         // Remove optional tables so open recreate branches run.
@@ -2241,6 +2253,8 @@ fn split_roundtrip_create_fk_and_seqsigwit_range() {
         .txs
         .put_full_batch_indexed(std::slice::from_ref(&item), true)
         .unwrap();
+    // A durable record names these creates, or open cuts them.
+    s.txs.sync_class_a_named(s.txs.count()).unwrap();
     assert_eq!(fks.len(), 1);
     let range = s.tx_seqsigwit_range(fks[0]).unwrap();
     assert!(range.1 > 0);
@@ -2662,6 +2676,8 @@ fn kill_first_start_leftover_oa_without_flag_opens_and_with_flag_materializes() 
         let fks = s
             .put_tx_full_batch_indexed(std::slice::from_ref(&item), true)
             .unwrap();
+        // A durable record names these creates, or open cuts them.
+        s.txs.sync_class_a_named(s.txs.count()).unwrap();
         s.flush().unwrap();
         fks[0]
     };

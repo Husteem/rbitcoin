@@ -231,6 +231,8 @@ itself changed.
     seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off). Presence is prune mode
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
+    class_a.pad                      # optional: u64 LE create count an unfinished tombstone pad must reach (open after an older binary's cut). Removed when the pad is synced. No SCHEMA_VERSION bump
+    scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
     spent.delta/{seg.<id>, idx.<id>, log.<id>, commit, fold}  # schema-30 spend delta overlay
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
@@ -904,7 +906,7 @@ Schema 15 leftover `tx_height.body` is unlinked on open (logged).
 
 1. `strong_tx` (may lead tip after kill, before the barrier)
 2. Height-fence extend (RAM), then **`confirmed[]` tip advance** ← **commit**
-3. `flush_class_c_tip` (headers, then `strong_tx`, `header_txs`, `confirmed[]` last)
+3. `flush_class_c_tip` (Class A `sync_data`, then headers, `strong_tx`, `header_txs`, `confirmed[]` last)
 4. Scripthash write-behind enqueue (after tip). Direct IBD defers SH until tip entry
 
 `is_confirmed_strong(tx)` ⇔ strong ∧ fence contains the fk (implies height ≤ tip

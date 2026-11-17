@@ -102,6 +102,16 @@ where
     write_tmp_synced(path, TmpSync::FileAndDir, write)
 }
 
+/// [`write_synced_tmp_file`] for a secret: on Unix the temp is created
+/// `0600`, so no other user can open it before or after the first byte. A
+/// stale temp is removed first; `O_CREAT` would keep its mode.
+pub fn write_private_synced_tmp_file<F>(path: &Path, write: F) -> Result<(), StoreError>
+where
+    F: FnOnce(&mut File) -> Result<(), StoreError>,
+{
+    write_tmp_with(path, TmpSync::FileAndDir, true, write)
+}
+
 #[doc(hidden)]
 pub fn write_tmp_file<F>(path: &Path, sync: bool, write: F) -> Result<(), StoreError>
 where
@@ -122,6 +132,13 @@ fn write_tmp_synced<F>(path: &Path, sync: TmpSync, write: F) -> Result<(), Store
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
+    write_tmp_with(path, sync, false, write)
+}
+
+fn write_tmp_with<F>(path: &Path, sync: TmpSync, private: bool, write: F) -> Result<(), StoreError>
+where
+    F: FnOnce(&mut File) -> Result<(), StoreError>,
+{
     let tmp = tmp_sidecar_path(path);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -129,7 +146,7 @@ where
         }
     }
     {
-        let mut f = File::create(&tmp).map_err(|e| StoreError::io(&tmp, e))?;
+        let mut f = open_tmp(&tmp, private).map_err(|e| StoreError::io(&tmp, e))?;
         write(&mut f)?;
         if sync != TmpSync::None {
             f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
@@ -144,6 +161,21 @@ where
         }
     }
     Ok(())
+}
+
+fn open_tmp(tmp: &Path, private: bool) -> std::io::Result<File> {
+    if !private {
+        return File::create(tmp);
+    }
+    match std::fs::remove_file(tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(tmp)
 }
 
 /// `fsync` the directory so a renamed dirent survives a crash.
@@ -1350,6 +1382,49 @@ impl TableFile {
         self.read_file
             .sync_data()
             .map_err(|e| StoreError::io(&self.path, e))
+    }
+
+    /// [`Self::sync_data_only`] on every file, with the waits overlapped.
+    ///
+    /// The syncs go to the configured bulk-IO session together
+    /// ([`crate::bulk_io::sync_data_batch`]): one io_uring submission, the
+    /// shared pool's workers, or IOCP. The filesystem can then share journal
+    /// commits and device cache flushes between them. With
+    /// `RBITCOIN_IO=pread`, or for a file the session never submitted, they
+    /// run one after another.
+    pub fn sync_data_all(files: &[&TableFile]) -> Result<(), StoreError> {
+        #[cfg(debug_assertions)]
+        for f in files {
+            if let Some(d) = crate::io_handle::take_sync_delay(f.io_handle()) {
+                std::thread::sleep(d);
+            }
+            if crate::io_handle::take_fail_sync(f.io_handle()) {
+                return Err(StoreError::io(
+                    &f.path,
+                    std::io::Error::from_raw_os_error(5),
+                ));
+            }
+        }
+        let handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
+        let res = crate::bulk_io::sync_data_batch(&handles)
+            .unwrap_or_else(|| vec![i32::MIN; files.len()]);
+        for (f, r) in files.iter().zip(res) {
+            match r {
+                0 => {}
+                // Never submitted: sync it here.
+                i32::MIN => f
+                    .read_file
+                    .sync_data()
+                    .map_err(|e| StoreError::io(&f.path, e))?,
+                r => {
+                    return Err(StoreError::io(
+                        &f.path,
+                        std::io::Error::from_raw_os_error(-r),
+                    ))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Persist HWM / trailer and `sync_data`.
