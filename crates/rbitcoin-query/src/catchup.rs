@@ -220,31 +220,48 @@ impl Query {
     }
 
     /// Delete a pack-complete head that has neither an include mark nor a
-    /// SEAL, so the next materialize scans Class A.
+    /// SEAL, or any head or unfinished collect whose marks name creates the
+    /// archive does not hold, so the next materialize scans Class A.
     ///
     /// Append only adds creates past each key's tail. Replaying every height
     /// from 0 cannot fill a hole under a later append, and on a long chain it
     /// is the slow path. A SEAL still names the prefix when the mark file is
-    /// missing. `--sh-index` off leaves the files in place.
+    /// missing. A mark past the create count comes from an older binary that
+    /// named creates no block range committed, which open then cut: their
+    /// postings would attach to the creates that take those numbers, and a
+    /// resumed collect would skip them. Start runs this before any append
+    /// reuses a cut number. `--sh-index` off leaves the files in place.
     pub fn discard_unproven_scripthash_head(&self) -> Result<(), QueryError> {
-        if !self.sh_index_enabled() || !self.store.scripthash.has_durable_index() {
+        if !self.sh_index_enabled() {
             return Ok(());
         }
-        if self.store.txs.count() == 0 {
-            return Ok(());
-        }
+        let count = self.store.txs.count();
+        let unsorted = rbitcoin_store::unsorted_shard_dir(self.store.path());
+        let collected = rbitcoin_store::unsorted_marks_last_fk(
+            &unsorted,
+            self.store.scripthash.head_shard_count(),
+        );
+        let durable = self.store.scripthash.has_durable_index();
         self.sh_run.refresh_seal();
         let floor = crate::sh_builder::durable_sh_inclusion_floor(
             self.store.scripthash.include_hwm(),
             self.sh_run.sealed_max_create_fk(),
         );
-        if floor > 0 {
+        let named = floor.max(collected);
+        if named > count {
+            rbitcoin_log::warn!(
+                "scripthash index names creates through {named} but the archive \
+                 holds {count}; deleting it so tip entry can materialize from Class A"
+            );
+        } else if !durable || count == 0 || floor > 0 {
             return Ok(());
+        } else {
+            rbitcoin_log::warn!(
+                "scripthash head has no include mark and no SEAL; deleting it so \
+                 tip entry can materialize from Class A"
+            );
         }
-        rbitcoin_log::warn!(
-            "scripthash head has no include mark and no SEAL; deleting it so \
-             tip entry can materialize from Class A"
-        );
+        rbitcoin_store::clear_unsorted_shard_dir(&unsorted);
         self.sh_run.prepare_force_full_rebuild(&self.store)?;
         self.set_sh_indexed_through_height(None);
         self.sh.applied_max_fk.store(0, Ordering::Release);

@@ -337,6 +337,19 @@ pub fn unsorted_done_last_fk(dir: &Path, n_shards: usize) -> Option<u64> {
     read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards).map(|d| d.last_fk)
 }
 
+/// Highest create a `DONE.keys` or `DONE.post` mark names, `0` for none.
+pub fn unsorted_marks_last_fk(dir: &Path, n_shards: usize) -> u64 {
+    [
+        (KEYS_DONE_NAME, KEYS_DONE_MAGIC),
+        (POST_DONE_NAME, POST_DONE_MAGIC),
+    ]
+    .into_iter()
+    .filter_map(|(name, magic)| read_phase_done(dir, name, magic, n_shards))
+    .map(|d| d.last_fk)
+    .max()
+    .unwrap_or(0)
+}
+
 #[doc(hidden)]
 pub fn leftover_legacy_unsorted(dir: &Path) -> bool {
     if !dir.is_dir() {

@@ -27,7 +27,10 @@ Fixed
   so a retried fsync cannot commit over pages the kernel dropped and no
   checkpoint or mark can name a transaction whose header write failed.
   The node stops with an error instead of failing every later block; a
-  full disk now needs a restart once space is freed. A spend checkpoint
+  full disk now needs a restart once space is freed. An address index,
+  or an unfinished index build, that names transactions the archive no
+  longer holds (an older binary's crash) is rebuilt from the archive on
+  start. A spend checkpoint
   syncs the archive before its spend delta commit can name a spender.
 - **A power cut no longer rebuilds the whole txid index.** The txid
   index (`tx.head`) is written ahead of the barrier that makes its

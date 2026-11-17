@@ -163,7 +163,8 @@ pub use scripthash::{script_hash, ColdProgress, ScriptHashRecord, INCLUDE_HWM_NA
 pub use scripthash_layout::ShHeadValue;
 pub use scripthash_materialize::{
     clear_unsorted_shard_dir, collect_unsorted_shard_files, materialize_sh_unsorted_from_class_a,
-    unsorted_collect_workers, unsorted_done_last_fk, unsorted_pack_workers, unsorted_shard_dir,
+    unsorted_collect_workers, unsorted_done_last_fk, unsorted_marks_last_fk, unsorted_pack_workers,
+    unsorted_shard_dir,
 };
 pub use sorted_run::free_gib_label;
 pub use sp_tweaks::{SpTweaksTable, TrimLast};
