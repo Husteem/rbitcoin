@@ -757,11 +757,6 @@ impl TableFile {
         self.published_len.load(Ordering::Acquire)
     }
 
-    /// Length a flush will store. A withheld header stays at the last landed end.
-    pub(crate) fn header_persist_len(&self) -> u64 {
-        self.header_len_to_persist()
-    }
-
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
@@ -978,9 +973,11 @@ impl TableFile {
 
     /// Write `bytes` at `offset` via complete **`pwrite`**, then publish HWM.
     ///
-    /// Complete-or-fail: either all bytes are written and HWM advances to cover
-    /// `offset+len`, or an error is returned and HWM is left unchanged for this
-    /// write (prior published range remains valid).
+    /// Complete-or-fail: either all bytes are written and the header names
+    /// `offset+len`, or an error is returned. A payload write that fails
+    /// leaves the length unchanged. A header write that fails returns an
+    /// error with the RAM length already moved, as [`Self::publish_end`]
+    /// does.
     pub fn write_at_pwrite(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
         if bytes.is_empty() {
             return Ok(());
@@ -988,8 +985,14 @@ impl TableFile {
         let end = offset.saturating_add(bytes.len() as u64);
         self.ensure_capacity(end)?;
         self.pwrite_all(offset, bytes)?;
-        let _ = self.publish_end(end, true);
+        let landed = self.publish_end(end, true);
         self.needs_sync.store(true, Ordering::Release);
+        if !landed {
+            return Err(StoreError::io(
+                &self.path,
+                std::io::Error::other("header write failed"),
+            ));
+        }
         Ok(())
     }
 

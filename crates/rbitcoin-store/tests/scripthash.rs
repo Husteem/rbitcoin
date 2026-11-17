@@ -4056,6 +4056,111 @@ fn include_hwm_reads_eight_and_ignores_short() {
     assert_eq!(load_include_hwm(dir.path()), 0);
 }
 
+fn put_shard_creates(s: &rbitcoin_store::Store, salt: u8, n_shards: usize) {
+    for shard in 0..n_shards {
+        let mut txid = [salt; 32];
+        txid[0] = shard as u8;
+        s.put_tx_full_batch_indexed(
+            &[class_a_coinbase(
+                txid,
+                script_for_prefix_shard(shard, n_shards),
+            )],
+            true,
+        )
+        .unwrap();
+    }
+}
+
+/// No block range names these creates: only `DONE.keys` and then
+/// `DONE.post` do. Each reopen keeps every create the last mark names, so
+/// no later transaction takes a number the scripthash files hold.
+#[test]
+fn reopen_keeps_the_creates_a_collect_names() {
+    let dir = tmp();
+    let s = rbitcoin_store::Store::create_tiny(&dir).unwrap();
+    let n_shards = 4usize;
+    put_shard_creates(&s, 1, n_shards);
+    let sh_dir = dir.join("sh4");
+    std::fs::create_dir_all(&sh_dir).unwrap();
+    let table = four_shard_dir_table(&sh_dir);
+    let udir = sh_dir.join(UNSORTED_SHARD_DIR);
+    let keys =
+        collect_unsorted_covering_txs(&s.txs, &table, &udir, n_shards, 1, false, None).unwrap();
+    assert_eq!(keys.last_fk, 4);
+    drop(s);
+    let s = rbitcoin_store::Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 4, "open cut creates DONE.keys names");
+    put_shard_creates(&s, 2, n_shards);
+    seal_mphf_from_keys(&table, &udir, n_shards, None).unwrap();
+    let posts = rbitcoin_store::scripthash_materialize::collect_posts_covering(
+        &s.txs, &table, &udir, 1, false, None,
+    )
+    .unwrap();
+    assert_eq!(posts.last_fk, 8);
+    drop(s);
+    let s = rbitcoin_store::Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 8, "open cut creates DONE.post names");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An append publishes its bodies and locator before it writes `txid.body`,
+/// `txstat`, and `input`. Collects that run in that window name only
+/// finished creates: a later open keeps creates 1..=4 and cuts the unnamed
+/// create 5.
+#[cfg(debug_assertions)]
+#[test]
+fn collect_does_not_name_an_unfinished_append() {
+    let dir = tmp();
+    let s = std::sync::Arc::new(rbitcoin_store::Store::create_tiny(&dir).unwrap());
+    let n_shards = 4usize;
+    put_shard_creates(&s, 1, n_shards);
+    let sh_dir = dir.join("sh4");
+    std::fs::create_dir_all(&sh_dir).unwrap();
+    let marks = std::sync::Arc::new(std::sync::Mutex::new((0u64, 0u64)));
+    let (inside, seen) = (std::sync::Arc::clone(&s), std::sync::Arc::clone(&marks));
+    rbitcoin_store::tx_table::set_after_bodies_for_test(Some(Box::new(move || {
+        assert_eq!(
+            inside.txs.count(),
+            5,
+            "the bodies published before txid.body"
+        );
+        let table = four_shard_dir_table(&sh_dir);
+        let udir = sh_dir.join(UNSORTED_SHARD_DIR);
+        let keys =
+            collect_unsorted_covering_txs(&inside.txs, &table, &udir, n_shards, 1, false, None)
+                .unwrap();
+        seal_mphf_from_keys(&table, &udir, n_shards, None).unwrap();
+        let posts = rbitcoin_store::scripthash_materialize::collect_posts_covering(
+            &inside.txs,
+            &table,
+            &udir,
+            1,
+            false,
+            None,
+        )
+        .unwrap();
+        *seen.lock().unwrap() = (keys.last_fk, posts.last_fk);
+    })));
+    s.put_tx_full_batch_indexed(
+        &[class_a_coinbase(
+            [5; 32],
+            script_for_prefix_shard(0, n_shards),
+        )],
+        true,
+    )
+    .unwrap();
+    rbitcoin_store::tx_table::set_after_bodies_for_test(None);
+    assert_eq!(
+        *marks.lock().unwrap(),
+        (4, 4),
+        "DONE.keys or DONE.post named an unfinished create"
+    );
+    drop(s);
+    let s = rbitcoin_store::Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 4);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A scripthash collect syncs the Class A creates it scans before it names
 /// them in `DONE.keys` or `DONE.post`. Creates that never reached the device
 /// can be cut at the next open, and their numbers taken by other txs.

@@ -21,13 +21,14 @@ Fixed
   A short `input.body` header cuts the input locator the same way, and an
   input locator past that prefix is cut. A datadir torn below a committed
   block (by an older binary, or a disk that lost synced writes) refuses to
-  start and asks for a reindex, without changing any archive file: cutting
-  it would let stale spends and address history attach to a later
-  transaction.
-  A failed archive sync now latches until restart, so a retried fsync
-  cannot commit over pages the kernel dropped, and the node stops with an
-  error instead of failing every later block. A spend checkpoint syncs the
-  archive before its page commit can name a spender.
+  start and asks for a reindex instead of cutting below that block:
+  cutting it would let stale spends and address history attach to a later
+  transaction. A failed archive write or sync now latches until restart,
+  so a retried fsync cannot commit over pages the kernel dropped and no
+  checkpoint or mark can name a transaction whose header write failed.
+  The node stops with an error instead of failing every later block; a
+  full disk now needs a restart once space is freed. A spend checkpoint
+  syncs the archive before its spend delta commit can name a spender.
 - **An interrupted `tx.head` rebuild rebuilds again.** Segment files with
   no `tx.head/meta` refused startup as a legacy layout and needed a manual
   delete. Open now wipes that directory and rebuilds it from the archive.

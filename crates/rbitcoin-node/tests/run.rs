@@ -2896,17 +2896,17 @@ fn oversized_or_symlinked_marker_refuses_with_a_short_error() {
 }
 
 /// A failed Class A sync stops the node with an error, so it exits
-/// non-zero instead of failing every later block.
-#[test]
-fn class_a_sync_failure_stops_the_node() {
+/// non-zero instead of failing every later block. `run_p2p` takes its
+/// shutdown from [`node_shutdown`].
+#[tokio::test]
+async fn class_a_sync_failure_stops_the_node() {
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
     let dir = std::env::temp_dir().join(format!("rbitcoin-class-a-stop-{n}"));
     let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
-    let shutdown = Shutdown::new();
-    stop_on_class_a_sync_failure(&q, &shutdown);
+    let shutdown = node_shutdown(&q);
     let spent = q.store().txs.spent.body.io_handle();
     rbitcoin_store::io_handle::arm_fail_sync(spent, 1);
     assert!(q.store().txs.sync_class_a_data().is_err());

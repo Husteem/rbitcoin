@@ -154,11 +154,13 @@ impl Query {
     /// Tip mode on restart — no Direct recollect / bulk materialize).
     ///
     /// Requires a non-empty durable head, no residual on-disk runs, and
-    /// `include_hwm`/SEAL **≥** tip create HWM (strict; not memtable lag).
+    /// `include_hwm`/SEAL **≥** the settled create count (strict; not
+    /// memtable lag). An append still in flight, or one that failed after
+    /// its bodies published, is not a create the index can name yet.
     pub fn sh_is_tip_ready(&self) -> bool {
         use crate::sh_builder::durable_sh_inclusion_floor;
 
-        let tip_max = self.store.txs.count();
+        let tip_max = self.store.txs.settled_count();
         if tip_max == 0 {
             // Empty / genesis-only store: not "tip ready" for SH (nothing to serve).
             return false;
@@ -357,14 +359,14 @@ impl Query {
         if tip_max > 0 {
             let mut n = n;
             // A create can land after the chase samples readiness and before
-            // this check. The watermark is then behind `txs.count()`, so scan
-            // again. A watermark that already covers the count is a real gap.
+            // this check. The watermark is then behind the settled count, so
+            // scan again. A watermark that already covers it is a real gap.
             const GAP: &str =
                 "scripthash unsorted-shards create gap remain after materialize drain \
                      (refuse tip-follow / Electrum)";
             while !self.sh_is_tip_ready() {
                 if !self.store.scripthash.has_durable_index()
-                    || self.store.scripthash.include_hwm() >= self.store.txs.count()
+                    || self.store.scripthash.include_hwm() >= self.store.txs.settled_count()
                 {
                     return Err(StoreError::Corrupt(GAP));
                 }
@@ -395,7 +397,7 @@ impl Query {
                 }
                 return Ok(n);
             }
-            if self.store.scripthash.include_hwm() >= self.store.txs.count() {
+            if self.store.scripthash.include_hwm() >= self.store.txs.settled_count() {
                 return Err(StoreError::Corrupt(gap));
             }
         }
@@ -404,7 +406,7 @@ impl Query {
     /// Append Class A creates after the durable inclusion floor onto a live SH head.
     ///
     /// Confirm keeps appending while this runs (`submitblock` during
-    /// materialize). Each pass samples `txs.count()` and, when that count
+    /// materialize). Each pass samples `txs.settled_count()` and, when that count
     /// grew, scans the new tail before publishing the watermark.
     ///
     /// The chunk append holds `sh.appender`, the same mutex as
@@ -419,7 +421,7 @@ impl Query {
         const CHUNK: u64 = 64_000;
         let mut total = 0u64;
         loop {
-            let last = self.store.txs.count();
+            let last = self.store.txs.settled_count();
             // `include_hwm` names creates through `last`; they reach the device first.
             self.store.txs.sync_class_a_named(last)?;
             self.sh_run.refresh_seal();
@@ -437,7 +439,7 @@ impl Query {
                 hook(self);
             }
             if last < first {
-                if self.store.txs.count() <= last {
+                if self.store.txs.settled_count() <= last {
                     return Ok(total);
                 }
                 continue;
@@ -467,7 +469,7 @@ impl Query {
             self.store.scripthash.flush()?;
             self.store.scripthash.note_include_hwm(last)?;
             self.sh_run.publish_seal_watermark(last)?;
-            if self.store.txs.count() <= last {
+            if self.store.txs.settled_count() <= last {
                 return Ok(total);
             }
         }
@@ -522,7 +524,7 @@ fn sh_backfill_after_sample_hook() -> Option<fn(&Query)> {
     SH_BACKFILL_AFTER_SAMPLE.with(|c| c.take())
 }
 
-/// One-shot hook invoked after a Class A tail backfill samples `txs.count()`.
+/// One-shot hook invoked after a Class A tail backfill samples `txs.settled_count()`.
 /// Tests use it to confirm another create in that window.
 #[cfg(debug_assertions)]
 #[doc(hidden)]

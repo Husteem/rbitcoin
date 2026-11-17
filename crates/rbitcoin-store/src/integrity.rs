@@ -668,17 +668,6 @@ impl Store {
         Ok(())
     }
 
-    /// The connect barrier may seal this tip. A withheld Class A header whose
-    /// tip range ends past the locator count skips the flush. No header behind
-    /// means the RAM count is the commit, including a Class C fixture.
-    pub(crate) fn tip_fits_durable_creates(&self) -> Result<bool, StoreError> {
-        if !self.txs.class_a_header_behind() {
-            return Ok(true);
-        }
-        let covered = self.txs.durable_create_count()?;
-        Ok(self.class_a_confirmed_cut(covered)?.is_none())
-    }
-
     /// After open fits Class A, drop confirmed heights it no longer covers.
     ///
     /// The fit never keeps fewer creates than a durable Class C row names:
@@ -711,18 +700,6 @@ impl Store {
             return Ok(false);
         };
         self.strong_tx.is_strong(fk)
-    }
-
-    /// Height a spend checkpoint may call durable, or `None` when no create is.
-    pub(crate) fn spend_height_within_class_a(
-        &self,
-        height: u32,
-    ) -> Result<Option<u32>, StoreError> {
-        let covered = self.txs.durable_create_count()?;
-        let Some(bad) = self.class_a_confirmed_cut(covered)? else {
-            return Ok(Some(height));
-        };
-        Ok(bad.checked_sub(1).map(|good| good.min(height)))
     }
 
     /// First confirmed height whose tx range ends past `covered`, if any.

@@ -86,58 +86,6 @@ pub(crate) fn unresolved_ovf_cut(
     cut_for_ovf_row(loc, count, last_ovf_fk, &row, pair)
 }
 
-/// Creates covered while the overflow header lags the RAM end.
-///
-/// `count` is the locator-header count. The first row at the durable end
-/// cuts before that create when the row is inside `count`. A row past
-/// `count`, or bytes that are not a row, leaves `count` in place: those
-/// creates are already named by the locator and the checkpoint header.
-/// A failed read of that row is an error, so the tip does not seal.
-pub(crate) fn withheld_ovf_limit(
-    loc: &TableFile,
-    ovf: &TableFile,
-    count: u64,
-    pair: bool,
-) -> Result<u64, StoreError> {
-    let durable_end = ovf.header_persist_len();
-    if durable_end >= ovf.logical_len() {
-        return Ok(count);
-    }
-    let width: u64 = if pair { CREATE_OVF_SLOT } else { 12 };
-    let durable_data = durable_end.saturating_sub(FILE_HEADER_LEN as u64);
-    if durable_end < FILE_HEADER_LEN as u64 || !durable_data.is_multiple_of(width) {
-        return Ok(0);
-    }
-    let last_ovf_fk = if durable_data >= width {
-        let mut row = [0u8; 16];
-        ovf.pread_all(durable_end - width, &mut row[..width as usize])?;
-        le_u64!(row, 0)
-    } else {
-        0
-    };
-    match ovf_row_cut(loc, ovf, count, last_ovf_fk, durable_end, pair)? {
-        Some(cut) => Ok(cut.min(count)),
-        None => Ok(count),
-    }
-}
-
-fn ovf_row_cut(
-    loc: &TableFile,
-    ovf: &TableFile,
-    count: u64,
-    last_ovf_fk: u64,
-    row_at: u64,
-    pair: bool,
-) -> Result<Option<u64>, StoreError> {
-    if last_ovf_fk >= count {
-        return Ok(None);
-    }
-    let width = if pair { 16 } else { 12 };
-    let mut row = [0u8; 16];
-    ovf.pread_all(row_at, &mut row[..width])?;
-    cut_for_ovf_row(loc, count, last_ovf_fk, &row, pair)
-}
-
 fn cut_for_ovf_row(
     loc: &TableFile,
     count: u64,

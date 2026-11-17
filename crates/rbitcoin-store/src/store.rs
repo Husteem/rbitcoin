@@ -2027,7 +2027,7 @@ impl Store {
                 }
                 // Every spender a frozen note names was appended before the
                 // freeze. Sync it before the commit can name its number.
-                let named = txs.count();
+                let named = txs.settled_count();
                 spenders.sync_data_only()?;
                 txs.sync_class_a_named(named)?;
                 Ok(())
@@ -2199,9 +2199,6 @@ impl Store {
             },
             _ => height,
         };
-        let Some(height) = self.spend_height_within_class_a(height)? else {
-            return Ok(());
-        };
         self.store_spend_marker(height, height, gen)?;
         Ok(())
     }
@@ -2269,14 +2266,9 @@ impl Store {
         crate::spend_durable::SpendDurable::new(annotated, durable).store(self.path())
     }
 
-    /// The tip this call sealed. A withheld locator header skips the barrier
-    /// and returns `Ok(None)`, so a caller cannot treat the RAM tip as sealed.
+    /// The tip this call sealed, `None` for an empty chain. After a failed
+    /// Class A write or sync, the latch fails this call.
     pub fn flush_class_c_tip(&self) -> Result<Option<Height>, StoreError> {
-        // A withheld locator header is not a commit. Skip the whole barrier
-        // so header_txs is not left naming creates open will truncate.
-        if !self.tip_fits_durable_creates()? {
-            return Ok(None);
-        }
         self.flush_class_c_pre_tip()?;
         // Commit point on disk: tip advance only after strong/header_txs.
         self.confirmed.flush()?;

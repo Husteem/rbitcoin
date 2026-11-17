@@ -487,6 +487,129 @@ fn backfill_syncs_the_scanned_creates_before_the_watermark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn in_flight_create(q: &rbitcoin_query::Query, salt: u8) {
+    q.store
+        .put_tx_full_batch_indexed(
+            &[(
+                rbitcoin_store::TxRecord {
+                    txid: [salt; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![rbitcoin_store::InputRecord::coinbase(
+                    u32::MAX,
+                    vec![0x01],
+                    vec![],
+                )],
+                vec![rbitcoin_store::OutputRecord::unspent(50, vec![0x51, salt])],
+            )],
+            true,
+        )
+        .unwrap();
+}
+
+/// Confirm appends a block's creates before its range commits. The backfill
+/// names that create in `include_hwm`, so a reopen keeps it: a later
+/// transaction never takes a number the scripthash index already holds.
+#[test]
+fn reopen_keeps_a_create_the_backfill_names() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-backfill-mark");
+    seed_direct_chain(&q, 3);
+    let _ = q.finalize_sh_runs().unwrap();
+    q.join_tip_flush().unwrap();
+    in_flight_create(&q, 0xa1);
+    let last = q.store.txs.count();
+    q.backfill_sh_creates_from_class_a().unwrap();
+    assert_eq!(q.store.scripthash.include_hwm(), last);
+    let path = q.store.path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    assert_eq!(
+        q.store.txs.count(),
+        last,
+        "open cut a create include_hwm names"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An append publishes its bodies and locator before it writes `txid.body`,
+/// `txstat`, and `input`. A backfill in that window names only finished
+/// creates: a later open keeps them and cuts the unnamed one.
+#[cfg(debug_assertions)]
+#[test]
+fn backfill_does_not_name_an_unfinished_append() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-backfill-unfinished");
+    let q = Arc::new(q);
+    seed_direct_chain(&q, 3);
+    let _ = q.finalize_sh_runs().unwrap();
+    q.join_tip_flush().unwrap();
+    in_flight_create(&q, 0xa3);
+    let finished = q.store.txs.count();
+    let inside = Arc::clone(&q);
+    rbitcoin_store::tx_table::set_after_bodies_for_test(Some(Box::new(move || {
+        assert_eq!(inside.store.txs.count(), finished + 1);
+        inside.backfill_sh_creates_from_class_a().unwrap();
+    })));
+    in_flight_create(&q, 0xa4);
+    rbitcoin_store::tx_table::set_after_bodies_for_test(None);
+    assert_eq!(q.store.scripthash.include_hwm(), finished);
+    let path = q.store.path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    assert_eq!(q.store.txs.count(), finished);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After a failed append, `count` stays one past the settled creates: every
+/// later append refuses on the stem count. Materialize compares readiness
+/// against the settled count, so it returns instead of chasing a create no
+/// pass can name. A shutdown joins this thread.
+#[cfg(debug_assertions)]
+#[test]
+fn materialize_returns_after_a_failed_append() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-failed-append");
+    let q = Arc::new(q);
+    seed_direct_chain(&q, 3);
+    let _ = q.finalize_sh_runs().unwrap();
+    q.join_tip_flush().unwrap();
+    in_flight_create(&q, 0xa5);
+    let finished = q.store.txs.count();
+    let txids = q.store.txs.txids.file.io_handle();
+    rbitcoin_store::io_handle::arm_short_pwrite(txids);
+    let failed = q.store.put_tx_full_batch_indexed(
+        &[(
+            rbitcoin_store::TxRecord {
+                txid: [0xa6; 32],
+                version: 1,
+                locktime: 0,
+                input_count: 1,
+                output_count: 1,
+            },
+            vec![rbitcoin_store::InputRecord::coinbase(
+                u32::MAX,
+                vec![0x01],
+                vec![],
+            )],
+            vec![rbitcoin_store::OutputRecord::unspent(50, vec![0x51, 0xa6])],
+        )],
+        true,
+    );
+    rbitcoin_store::io_handle::disarm_pwrite(txids);
+    assert!(failed.is_err());
+    assert_eq!(q.store.txs.count(), finished + 1);
+    let q2 = Arc::clone(&q);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(q2.finalize_sh_unsorted_cancellable(None).is_ok());
+    });
+    rx.recv_timeout(Duration::from_secs(20))
+        .expect("materialize did not return after a failed append");
+    assert!(q.store.scripthash.include_hwm() <= finished);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A rebuild mark wipes and recollects the index on the next finalize, then
 /// is dropped so the start after that keeps the head.
 #[test]

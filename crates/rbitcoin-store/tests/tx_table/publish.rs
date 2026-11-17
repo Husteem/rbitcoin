@@ -141,41 +141,34 @@ fn short_create_off_reopens_at_the_last_complete_window() {
         .is_err());
 }
 
-/// A locator header pwrite that misses still publishes RAM. The body header
-/// of that wave may land first. Flush does not then store the locator header.
-/// The next connect retries it, and reopen sees both creates.
+/// A locator header pwrite that misses fails the append, though RAM moved.
+/// Flush does not then store that locator header, no later append stacks on
+/// it, and reopen keeps none of it.
 #[test]
-fn locator_header_miss_retries_on_the_next_append() {
+fn locator_header_miss_fails_the_append() {
     let dir = super::tempfile_dir("loc-header-miss");
     let t = TxTable::create_tiny(&dir).unwrap();
     let loc_fd = t.create_loc.loc.io_handle();
     rbitcoin_store::io_handle::arm_fail_hwm_pwrites(loc_fd, 1);
     let disarm = Disarm(loc_fd);
     let before = FILE_HEADER_LEN as u64;
-    t.put_full_batch_indexed(&[one(1)], false)
-        .expect("a missed header pwrite is not a failed connect");
+    assert!(t.put_full_batch_indexed(&[one(1)], false).is_err());
     drop(disarm);
     assert_eq!(t.create_loc.count(), 1);
-    assert!(t.body.body_logical_len() > before);
     assert_eq!(on_disk_hwm(&t.create_loc.loc), before);
-    t.body
-        .with_bytes_at(before, 1, |_| Ok(()))
-        .expect("in-process readers follow the RAM end");
     t.create_loc.loc.flush().unwrap();
     assert_eq!(
         on_disk_hwm(&t.create_loc.loc),
         before,
         "flush stored a locator header the pwrite had missed"
     );
-
-    t.put_full_batch_indexed(&[one(2)], false).unwrap();
-    assert!(on_disk_hwm(&t.create_loc.loc) > before);
-    assert!(on_disk_hwm(&t.body.body) > before);
-    assert!(on_disk_hwm(&t.seqsigwit.body) > before);
-    assert!(on_disk_hwm(&t.spent.body) > before);
+    assert!(
+        t.put_full_batch_indexed(&[one(2)], false).is_err(),
+        "an append stacked on a failed one"
+    );
     drop(t);
     let t = TxTable::open_tiny(&dir).unwrap();
-    assert_eq!(t.count(), 2);
+    assert_eq!(t.count(), 0);
 }
 
 fn wide(n: u8) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
@@ -198,30 +191,9 @@ fn wide(n: u8) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
     )
 }
 
-/// The overflow header misses, then a later block with no overflow row
-/// commits. Reopen still returns that create's outputs.
-#[test]
-fn ovf_header_miss_then_plain_block_reopens_the_create() {
-    let dir = super::tempfile_dir("ovf-header-retry");
-    let t = TxTable::create_tiny(&dir).unwrap();
-    t.put_full_batch_indexed(&[wide(1)], false).unwrap();
-    let ovf_fd = t.create_loc.ovf.io_handle();
-    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(ovf_fd, 1);
-    let disarm = Disarm(ovf_fd);
-    t.put_full_batch_indexed(&[wide(2)], false).unwrap();
-    drop(disarm);
-    t.put_full_batch_indexed(&[one(3)], false).unwrap();
-    drop(t);
-    let t = TxTable::open_tiny(&dir).unwrap();
-    assert_eq!(t.count(), 3);
-    assert_eq!(outs(&t, 2).len(), 256);
-    assert_eq!(outs(&t, 2)[0].script, vec![2, 0]);
-    assert_eq!(outs(&t, 3)[0].script, vec![3]);
-}
-
-/// Every overflow header pwrite fails, including the later block's retry.
-/// Reopen drops the unpublished create instead of keeping one that cannot
-/// be decoded.
+/// The overflow header pwrite fails, so the append fails and no later one
+/// runs. Reopen drops the unpublished create instead of keeping one that
+/// cannot be decoded.
 #[test]
 fn ovf_header_miss_does_not_seal_the_create() {
     let dir = super::tempfile_dir("ovf-header-seal");
@@ -230,8 +202,8 @@ fn ovf_header_miss_does_not_seal_the_create() {
     let ovf_fd = t.create_loc.ovf.io_handle();
     rbitcoin_store::io_handle::arm_fail_hwm_pwrites(ovf_fd, 8);
     let disarm = Disarm(ovf_fd);
-    t.put_full_batch_indexed(&[wide(2)], false).unwrap();
-    t.put_full_batch_indexed(&[one(3)], false).unwrap();
+    assert!(t.put_full_batch_indexed(&[wide(2)], false).is_err());
+    assert!(t.put_full_batch_indexed(&[one(3)], false).is_err());
     drop(disarm);
     drop(t);
     let t = TxTable::open_tiny(&dir).unwrap();

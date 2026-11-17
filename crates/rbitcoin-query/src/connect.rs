@@ -311,8 +311,8 @@ impl Query {
     /// Tip mode returns after it. IBD returns before it and may dequeue the
     /// RAM body queue: a kill then loses at most one more batch to download
     /// again. Returns the last sealed tip. IBD returns that height while
-    /// this batch's flush is still running. A withheld locator header does
-    /// not move it. Seqsigwit prune keeps its window below that tip.
+    /// this batch's flush is still running. Seqsigwit prune keeps its window
+    /// below that tip.
     #[doc(hidden)]
     pub fn flush_tip(&self, before: Option<Height>) -> Result<Option<Height>, QueryError> {
         self.require_pruned_keep_spills()?;

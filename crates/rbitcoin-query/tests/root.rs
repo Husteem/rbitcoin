@@ -787,6 +787,39 @@ fn apply_sh_pending_writes_creates_and_advances_watermark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Tip mode: block 1's locator header write fails. The append fails and
+/// latches, so the inline barrier never seals block 1 and the write-behind
+/// never names its create in `include_hwm`: a power cut would cut it.
+#[cfg(debug_assertions)]
+#[test]
+fn write_behind_does_not_name_a_create_whose_header_write_failed() {
+    let (dir, q) = temp_query("sh-wb-failed-header");
+    assert!(q.index_mode().expect("index mode cell").is_tip());
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let fk0 = q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    q.apply_sh_pending().unwrap();
+    let include = q.store().scripthash.include_hwm();
+    assert_eq!(include, q.store().txs.count());
+
+    let loc = q.store().txs.create_loc.loc.read_fd();
+    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(loc, 8);
+    let (h1, t1) = coinbase_block(1, fk0, Some(h0.hash));
+    let connected = q.connect_block(Height(1), &h1, &[t1]);
+    rbitcoin_store::io_handle::disarm_pwrite(loc);
+    let _ = q.apply_sh_pending();
+    let _ = q.advance_sh_include_hwm();
+    assert_eq!(
+        q.store().scripthash.include_hwm(),
+        include,
+        "the write-behind named a create whose header write failed"
+    );
+    assert!(
+        connected.is_err(),
+        "block 1 connected after its append failed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `apply_sh_pending` must wait out an in-flight job (worker vs generate drain).
 #[test]
 fn apply_sh_pending_waits_for_in_flight_job() {
