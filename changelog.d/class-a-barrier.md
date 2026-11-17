@@ -29,6 +29,11 @@ Fixed
   The node stops with an error instead of failing every later block; a
   full disk now needs a restart once space is freed. A spend checkpoint
   syncs the archive before its spend delta commit can name a spender.
+- **A power cut no longer rebuilds the whole txid index.** The txid
+  index (`tx.head`) is written ahead of the barrier that makes its
+  transactions durable, so after a power cut it could name transactions
+  open cut, and open rebuilt it from every transaction. Open now drops
+  only the index segments past the cut and refills them.
 - **An interrupted `tx.head` rebuild rebuilds again.** Segment files with
   no `tx.head/meta` refused startup as a legacy layout and needed a manual
   delete. Open now wipes that directory and rebuilds it from the archive.

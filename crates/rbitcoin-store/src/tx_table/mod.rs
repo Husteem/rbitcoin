@@ -1643,9 +1643,18 @@ impl TxTable {
             match SegmentedTxHead::open(dir) {
                 Ok(h) => {
                     let covered = h.last_inserted_fk();
-                    if covered > n_bodies {
-                        // Torn Class A truncate: stale head entries past the
-                        // bodies would fail a later seal — rebuild instead.
+                    if covered > n_bodies && h.drop_segments_past(n_bodies)? {
+                        // Inserts ran ahead of the barrier, and open cut
+                        // their creates. The segments below the cut stay;
+                        // the backfill below refills from the last kept fk.
+                        rbitcoin_log::warn!(
+                            "store: tx.head leads Class A covered={covered} n={n_bodies} \
+                             — dropped segments past the cut, kept through {}",
+                            h.last_inserted_fk()
+                        );
+                        h
+                    } else if covered > n_bodies {
+                        // No segment ends inside the cut: rebuild it all.
                         rbitcoin_log::warn!(
                             "store: tx.head leads Class A covered={covered} n={n_bodies} \
                              — wipe + rebuild"

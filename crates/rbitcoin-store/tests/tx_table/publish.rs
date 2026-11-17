@@ -261,3 +261,73 @@ fn tx_head_without_meta_rebuilds_from_class_a() {
         rbitcoin_primitives::Fk(1)
     );
 }
+
+/// A kill leaves `tx.head` past the creates open keeps: its inserts ran
+/// ahead of the barrier that names them. Open drops only the segments that
+/// reach past the cut, sealed or open, and backfills from there. A sealed
+/// segment below the cut stays as it was, so a kill costs a segment, not
+/// the whole head.
+#[test]
+fn open_cut_keeps_the_tx_head_segments_below_it() {
+    use rbitcoin_store::address_head::HeadLayout;
+    use std::sync::atomic::Ordering;
+    let dir = super::tempfile_dir("head-cut-keeps-sealed");
+    // 8-bit head: 204 keys per segment.
+    let t = TxTable::create_with_head_layout(&dir, HeadLayout::new(8).unwrap()).unwrap();
+    for n in 1..=450u16 {
+        t.put_full_batch_indexed(&[numbered(n)], true).unwrap();
+    }
+    t.head.flush().unwrap();
+    t.put_full_batch_indexed(&[numbered(451)], true).unwrap();
+    t.head.flush().unwrap();
+    let before = t.head.segments_snapshot();
+    let ids: Vec<u32> = before.iter().map(|seg| seg.file_id).collect();
+    let kept = before[0].clone();
+    assert!(kept.sealed && before[1].sealed, "two segments sealed");
+    let kept_end = kept.first_fk + kept.count.load(Ordering::Relaxed) - 1;
+    let dropped_end = before[1].first_fk + before[1].count.load(Ordering::Relaxed) - 1;
+    assert!(kept_end < 300 && dropped_end > 300);
+    assert_eq!(t.head.last_inserted_fk(), 451);
+    drop((before, t));
+
+    let t =
+        TxTable::open_seqsigwit(&dir, &dir, rbitcoin_store::HeadOpenOpts::TINY, Some(300)).unwrap();
+    assert_eq!(t.count(), 300);
+    let after = t.head.segments_snapshot();
+    assert_eq!(t.head.bits(), 8, "open wiped and rebuilt the whole head");
+    assert_eq!(
+        (after[0].file_id, after[0].first_fk, after[0].sealed),
+        (kept.file_id, 1, true)
+    );
+    assert_eq!(
+        after[0].count.load(Ordering::Relaxed),
+        kept_end,
+        "open rebuilt a sealed segment below the cut"
+    );
+    assert_eq!(t.head.last_inserted_fk(), 300);
+    for n in 1..=300u16 {
+        let (fk, _) = t
+            .get_by_txid(&numbered(n).0.txid)
+            .unwrap()
+            .unwrap_or_else(|| panic!("create {n} missing from tx.head"));
+        assert_eq!(fk.0, u64::from(n));
+    }
+    assert!(t.get_by_txid(&numbered(345).0.txid).unwrap().is_none());
+    let root = rbitcoin_store::segmented_head::head_root(&dir);
+    for id in ids.iter().filter(|id| **id != kept.file_id) {
+        let base = format!("{id:06}");
+        for ent in std::fs::read_dir(&root).unwrap().flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            assert!(
+                name != base && !name.starts_with(&format!("{base}.")),
+                "a dropped segment's file stayed: {name}"
+            );
+        }
+    }
+    t.head.flush().unwrap();
+    drop((after, t));
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 300);
+    assert_eq!(t.head.last_inserted_fk(), 300);
+    assert_eq!(t.head.bits(), 8);
+}

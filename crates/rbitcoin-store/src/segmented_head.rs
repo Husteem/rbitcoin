@@ -997,6 +997,40 @@ impl SegmentedTxHead {
         Ok(())
     }
 
+    /// Drop every segment that holds a create past `n`, the count open kept.
+    ///
+    /// Inserts run ahead of the barrier that names their creates, so a kill
+    /// can leave the head past the cut. The segments below it keep their
+    /// rows; the caller backfills from [`Self::last_inserted_fk`]. Meta is
+    /// published before the dropped files go, so a crash between the two
+    /// leaves only unnamed files. Returns false, and changes nothing, when
+    /// no segment would stay.
+    pub fn drop_segments_past(&self, n: u64) -> Result<bool, StoreError> {
+        let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let segs = self.segments_snapshot();
+        let keep = segs
+            .iter()
+            .take_while(|seg| {
+                let count = seg.count.load(Ordering::Relaxed);
+                seg.first_fk.saturating_add(count).saturating_sub(1) <= n
+            })
+            .count();
+        if keep == 0 {
+            return Ok(false);
+        }
+        let dropped: Vec<u32> = segs[keep..].iter().map(|seg| seg.file_id).collect();
+        {
+            let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
+            *guard = Arc::new(segs[..keep].to_vec());
+        }
+        self.persist_meta_locked()?;
+        drop(segs);
+        for file_id in dropped {
+            remove_segment_files(&self.dir, file_id);
+        }
+        Ok(true)
+    }
+
     #[doc(hidden)]
     pub fn persist_meta_locked(&self) -> Result<(), StoreError> {
         let segs = self.segments_snapshot();
@@ -1173,6 +1207,20 @@ pub fn ensure_head_layout(dir: &Path) -> Result<(), StoreError> {
 #[doc(hidden)]
 pub fn segment_head_path(dir: &Path, file_id: u32) -> PathBuf {
     head_root(dir).join(format!("{file_id:06}"))
+}
+
+/// Unlink a segment's open head, its sealed sidecars, and its fuse.
+fn remove_segment_files(dir: &Path, file_id: u32) {
+    let base = format!("{file_id:06}");
+    let Ok(rd) = std::fs::read_dir(head_root(dir)) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name == base || name.starts_with(&format!("{base}.")) {
+            let _ = std::fs::remove_file(ent.path());
+        }
+    }
 }
 
 #[doc(hidden)]
