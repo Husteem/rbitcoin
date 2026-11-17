@@ -1264,6 +1264,26 @@ thread_local! {
     static SPEND_META_PEEK_GROUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static BODY_TXID_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Zero the debug count of single-create [`TxTable::body_txid`] reads.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_body_txid_reads() {
+    BODY_TXID_READS.with(|n| n.set(0));
+}
+
+/// Single-create [`TxTable::body_txid`] reads on this thread since the last
+/// reset. A walk over many creates batches them through `txid.body` pages.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn body_txid_reads() -> u64 {
+    BODY_TXID_READS.with(|n| n.get())
+}
+
 /// Zero the debug counters [`spend_meta_read_counts`] returns.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
@@ -2251,6 +2271,8 @@ impl TxTable {
     /// Thin I/O: one 32-byte sidefile pread — no idx / body.
     pub fn body_txid(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
         use std::time::Instant;
+        #[cfg(debug_assertions)]
+        BODY_TXID_READS.with(|n| n.set(n.get().saturating_add(1)));
         let t = Instant::now();
         let id = self.txids.get(fk)?;
         crate::head_resolve_stats::add_body(t.elapsed().as_nanos() as u64);
