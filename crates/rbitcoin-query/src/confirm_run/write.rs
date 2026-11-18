@@ -2,6 +2,7 @@
 
 use super::phases::{class_c_commit, post_commit, structural_run};
 use super::*;
+use rbitcoin_primitives::Fk;
 use std::cell::RefCell;
 
 thread_local! {
@@ -172,6 +173,27 @@ pub struct ArchivePlanNs {
     pub ensure_ns: u64,
     pub plan_take_ns: u64,
     pub create_map_ns: u64,
+    pub appended: Appended,
+}
+
+/// The rows this batch's Class A appended, with the ranges the append gave
+/// them. Their spent slots lie at or past the published end the batch
+/// started from, which only moves back at open, so no note names them.
+#[derive(Debug, Default)]
+pub struct Appended {
+    fks: Vec<rbitcoin_primitives::Fk>,
+    loc: Vec<rbitcoin_store::CreateLocPair>,
+}
+
+impl Appended {
+    /// `spent.body` range of `fk` when this batch appended it.
+    fn spent(&self, fk: rbitcoin_primitives::Fk) -> Option<(u64, u64)> {
+        let base = self.fks.first()?.get()?;
+        let at = usize::try_from(fk.get()?.checked_sub(base)?).ok()?;
+        (self.fks.get(at) == Some(&fk))
+            .then(|| self.loc.get(at).map(|pair| pair.spent))
+            .flatten()
+    }
 }
 
 #[doc(hidden)]
@@ -186,6 +208,7 @@ pub fn apply_archive_plan(
         ensure_ns: 0,
         plan_take_ns: 0,
         create_map_ns: 0,
+        appended: Appended::default(),
     };
     let Some(mut plan) = batch.archive_plan.take() else {
         return Ok(ns);
@@ -243,6 +266,10 @@ pub fn apply_archive_plan(
     if let Some(last) = batch.prepared.last() {
         query.set_class_a_hi(Some(last.height.0));
     }
+    ns.appended = Appended {
+        fks: planned_fks,
+        loc,
+    };
     Ok(ns)
 }
 
@@ -328,6 +355,7 @@ fn write_phase_inner(
         mut ensure_ns,
         plan_take_ns,
         create_map_ns,
+        appended,
     } = apply_archive_plan(query, batch)?;
     let t_ens = Instant::now();
     let abs_jobs = match super::collect_spend_abs_after_fill(&batch.batch_parents, &batch.prepared)
@@ -379,7 +407,7 @@ fn write_phase_inner(
             )
         })?;
         let structural_ns = t_struct.elapsed().as_nanos() as u64;
-        push_same_block_spends(query, &batch.prepared, &mut slots)?;
+        push_same_block_spends(query, &batch.prepared, &appended, &mut slots)?;
 
         let n_blocks = batch.prepared.len();
         let pending_token = batch
@@ -850,15 +878,21 @@ pub fn annotate_slots_from_connected_hash(
 /// Structural has no job for a parent earlier in the same block. Class A
 /// writes no `spent.body` bytes, so the delta note this writes is the only
 /// record of that spend, as open replay writes it from `input_edges`.
+///
+/// A parent this batch appended takes its range from the append and an
+/// empty slot, reading nothing. A parent archived earlier (a reconnect)
+/// reads its range from `create.loc` and its slot, which may hold that
+/// block's note from when it was last connected.
 fn push_same_block_spends(
     query: &Query,
     prepared: &[Prepared],
+    appended: &Appended,
     slots: &mut crate::block_pipeline::AnnotateSlots,
 ) -> Result<(), ConfirmError> {
     if !query.spend_index_enabled() {
         return Ok(());
     }
-    let mut edges = Vec::new();
+    let mut archived = Vec::new();
     for p in prepared {
         if !p
             .spends
@@ -880,32 +914,30 @@ fn push_same_block_spends(
                 .ok_or(ConfirmError::Store(StoreError::Corrupt(
                     "invariant: same-block spend parent not in its block",
                 )))?;
-            edges.push((parent, vout, spend_fk, vin));
+            match appended.spent(parent) {
+                Some(range) => {
+                    let abs = same_block_slot(range, vout)?;
+                    slots.push((abs, parent, vout, spend_fk, vin), (Fk::NULL, 0, 0));
+                }
+                None => archived.push((parent, vout, spend_fk, vin)),
+            }
         }
     }
-    if edges.is_empty() {
+    if archived.is_empty() {
         return Ok(());
     }
     let t_meta = Instant::now();
-    let parents: Vec<rbitcoin_primitives::Fk> = edges.iter().map(|e| e.0).collect();
+    let parents: Vec<Fk> = archived.iter().map(|e| e.0).collect();
     let ranges = query
         .store()
         .tx_spent_range_batch(&parents)
         .map_err(ConfirmError::from)?;
-    let mut offs = Vec::with_capacity(edges.len());
-    for (&(_, vout, _, _), range) in edges.iter().zip(ranges) {
-        let (off, len) = range.ok_or(ConfirmError::Store(StoreError::Corrupt(
+    let mut offs = Vec::with_capacity(archived.len());
+    for (&(_, vout, _, _), range) in archived.iter().zip(ranges) {
+        let range = range.ok_or(ConfirmError::Store(StoreError::Corrupt(
             "invariant: same-block spend parent without spent range",
         )))?;
-        let abs = rbitcoin_store::spent_abs(off, vout);
-        if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
-            > off.saturating_add(len)
-        {
-            return Err(ConfirmError::Store(StoreError::Corrupt(
-                "invariant: same-block spent slot OOB",
-            )));
-        }
-        offs.push(abs);
+        offs.push(same_block_slot(range, vout)?);
     }
     let metas = query
         .store()
@@ -914,13 +946,26 @@ fn push_same_block_spends(
     let meta_ns = t_meta.elapsed().as_nanos() as u64;
     crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
     crate::note_confirm(&query.confirm_stats().spend_meta_n, offs.len() as u64);
-    for (((parent, vout, spend_fk, vin), abs), meta) in edges.into_iter().zip(offs).zip(metas) {
+    for (((parent, vout, spend_fk, vin), abs), meta) in archived.into_iter().zip(offs).zip(metas) {
         let known = meta.ok_or(ConfirmError::Store(StoreError::Corrupt(
             "invariant: same-block spent slot short, undecodable, or past the published body",
         )))?;
         slots.push((abs, parent, vout, spend_fk, vin), known);
     }
     Ok(())
+}
+
+/// Absolute slot of `vout` in a parent's `spent.body` range.
+fn same_block_slot((off, len): (u64, u64), vout: u32) -> Result<u64, ConfirmError> {
+    let abs = rbitcoin_store::spent_abs(off, vout);
+    if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
+        > off.saturating_add(len)
+    {
+        return Err(ConfirmError::Store(StoreError::Corrupt(
+            "invariant: same-block spent slot OOB",
+        )));
+    }
+    Ok(abs)
 }
 
 /// After Class A commit, stamp spend creates from append RAM loc
