@@ -98,7 +98,7 @@ pub mod sorted_run;
 pub mod sp_tweaks;
 #[doc(hidden)]
 pub mod sp_tweaks_uring;
-pub mod spend_annotate_uring;
+pub mod spend_annotate;
 #[doc(hidden)]
 pub mod spend_durable;
 #[doc(hidden)]
@@ -166,7 +166,6 @@ pub use scripthash_materialize::{
 pub use sorted_run::free_gib_label;
 pub use sp_tweaks::{SpTweaksTable, TrimLast};
 pub use sp_tweaks_uring::{load_tweak_wave, LoadedTweakTx};
-pub use spend_annotate_uring::spend_ann_backend;
 pub use spend_durable::{
     elapsed_after_checkpoint, spend_sync_due, SPEND_DURABLE_INTERVAL_MS, SPEND_DURABLE_NAME,
 };

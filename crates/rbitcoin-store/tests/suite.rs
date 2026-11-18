@@ -42,7 +42,7 @@ mod segmented_head;
 mod sorted_run;
 mod sp_tweaks;
 mod sp_tweaks_uring;
-mod spend_annotate_uring;
+mod spend_annotate;
 mod spend_durable;
 mod spend_page_log;
 mod spender_table;

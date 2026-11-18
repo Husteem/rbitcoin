@@ -1,7 +1,7 @@
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::compact::output_flags;
 use rbitcoin_store::error::StoreError;
-use rbitcoin_store::spend_annotate_uring::*;
+use rbitcoin_store::spend_annotate::*;
 use rbitcoin_store::spender_table::SpenderTable;
 use rbitcoin_store::tx_table::{InputRecord, TxRecord};
 use rbitcoin_store::tx_table::{OutputRecord, TxTable};
@@ -66,29 +66,6 @@ fn pure_write_known_null_mmap_and_uring() {
     let (f2, fl2, _vin) = bulk2[0].unwrap();
     assert_eq!(f2, sfk);
     assert_eq!(fl2 & output_flags::MULTI_SPENDER, 0);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Shipped RMW machine annotates the sole spender on the process session.
-#[test]
-fn shipped_rmw_annotates_sole_spender() {
-    let (dir, t, spenders) = temp_table();
-    let (cfk, off, _len) = put_one(&t);
-    let abs = rbitcoin_store::tx_table::spent_abs(off, 0);
-    let sfk = Fk(88);
-    let cold = match put_spend_batch_by_abs_meta_uring(&t, &spenders, &[(abs, cfk, 0, sfk, 0)]) {
-        Ok(cold) => cold,
-        Err(StoreError::Unavailable) => {
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
-        Err(e) => panic!("rmw: {e}"),
-    };
-    assert!(cold.is_empty());
-    let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-    let (field, flags, _vin) = bulk[0].unwrap();
-    assert_eq!(field, sfk);
-    assert_eq!(flags & output_flags::MULTI_SPENDER, 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -349,7 +326,6 @@ fn unknown_meta_annotate_stays_in_the_directory() {
     let a2 = rbitcoin_store::spent_abs(off, 510);
     assert_eq!(a0 / 4096, a1 / 4096);
     assert_ne!(a0 / 4096, a2 / 4096);
-    rbitcoin_store::spend_annotate_uring::reset_spend_annotate_counts();
     let edges = [
         (a0, fk, 0u32, Fk(10), 1u32),
         (a1, fk, 1u32, Fk(11), 2u32),
@@ -360,11 +336,7 @@ fn unknown_meta_annotate_stays_in_the_directory() {
         .unwrap()
         .is_empty());
     // Every published slot, including the short tail, stays in the directory.
-    // The body bytes stay zero. The page-RMW counters stay quiet.
-    assert_eq!(
-        rbitcoin_store::spend_annotate_uring::spend_annotate_counts(),
-        (0, 0)
-    );
+    // The body bytes stay zero.
     let published = t.spent.body_published_len();
     let mut slot = [0u8; 8];
     t.spent
@@ -536,52 +508,4 @@ fn historical_second_spend_keeps_both_edges() {
     assert_ne!(bulk[0].unwrap().1 & output_flags::MULTI_SPENDER, 0);
     assert_eq!(bulk[1].unwrap().0, Fk(12));
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn group_writes_by_spent_page_merges_same_page() {
-    let meta = [1u8; META_LEN];
-    let slot = META_LEN as u64;
-    let writes = [
-        (16u64, Fk(1), 0, Fk(10), 0, meta),
-        (16 + 2 * slot, Fk(1), 2, Fk(12), 0, meta),
-    ];
-    let rec = 3 * slot;
-    let g = group_writes_by_spent_page(&writes, 16 + rec);
-    assert_eq!(g.len(), 1);
-    assert_eq!(g[0].off, rbitcoin_store::file::FILE_HEADER_LEN as u64);
-    assert_eq!(g[0].len, rec as usize);
-    assert_eq!(g[0].writes.len(), 2);
-}
-
-#[test]
-fn group_writes_by_spent_page_keeps_distinct_pages() {
-    let meta = [1u8; META_LEN];
-    let writes = [
-        (16u64, Fk(1), 0, Fk(10), 0, meta),
-        (4096u64 + 16, Fk(2), 0, Fk(12), 0, meta),
-    ];
-    let g = group_writes_by_spent_page(&writes, 4096 + 16 + META_LEN as u64);
-    assert_eq!(g.len(), 2);
-    assert_eq!(g[0].off, rbitcoin_store::file::FILE_HEADER_LEN as u64);
-    assert_eq!(g[1].off, 4096);
-}
-
-#[test]
-fn group_writes_by_spent_page_merges_straddle() {
-    let meta = [1u8; META_LEN];
-    let slot = META_LEN as u64;
-    // Slot starts 3 bytes before the 4 KiB page end so the RMW straddles.
-    let first = 4096u64 - 3;
-    let second = first + slot;
-    let end = second + slot;
-    let writes = [
-        (first, Fk(1), 0, Fk(10), 0, meta),
-        (second, Fk(1), 1, Fk(11), 0, meta),
-    ];
-    let g = group_writes_by_spent_page(&writes, end);
-    assert_eq!(g.len(), 1);
-    assert_eq!(g[0].writes.len(), 2);
-    assert!(g[0].off <= first);
-    assert!(g[0].off + g[0].len as u64 >= end);
 }

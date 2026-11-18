@@ -2375,19 +2375,6 @@ impl TxTable {
         Ok((field, flags, vin))
     }
 
-    /// Page read, then 8-byte slot pwrites, for [`Self::put_spend_batch_by_abs_meta`].
-    ///
-    /// Same slot bytes and cold list as the uring helper. The write does not
-    /// store the rest of the page.
-    #[doc(hidden)]
-    pub fn put_spend_batch_by_abs_meta_pwrite(
-        &self,
-        spenders: &crate::spender_table::SpenderTable,
-        abs_edges: &[(u64, Fk, u32, Fk, u32)],
-    ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
-        crate::spend_annotate_uring::annotate_unknown_pages_pwrite(self, spenders, abs_edges)
-    }
-
     /// Bulk 8-byte spender meta reads at absolute `spent.body` file offsets.
     ///
     /// Returns `(spender_field, flags)` — multi = `flags & MULTI_SPENDER`.
@@ -2500,9 +2487,7 @@ impl TxTable {
         abs_edges: &[(u64, Fk, u32, Fk, u32)],
         known: &[(Fk, u8, u32)],
     ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
-        crate::spend_annotate_uring::put_spend_batch_by_abs_meta_known(
-            self, spenders, abs_edges, known,
-        )
+        crate::spend_annotate::put_spend_batch_by_abs_meta_known(self, spenders, abs_edges, known)
     }
 
     pub(crate) fn spend_log_serves(&self, abs: u64) -> bool {
