@@ -347,7 +347,6 @@ pub fn structural_run(
     wire_blocks: &[Arc<Block>],
     batch_parents: &crate::BatchParents,
     abs_jobs: &[Vec<crate::block_pipeline::StructuralAbsJob>],
-    class_a_wave: &crate::block_pipeline::ClassAWave,
     reuse: &mut StructuralReuse,
 ) -> Result<
     (
@@ -377,16 +376,8 @@ pub fn structural_run(
     }
     let mut tot = StructuralPhaseNs::default();
     let bip34_ancestor = bip34_ancestor_for_write(query, params, prepared);
-    let (offs, keep) = crate::block_pipeline::write_meta_abs_offs(
-        prepared
-            .iter()
-            .zip(abs_jobs.iter())
-            .map(|(p, jobs)| (p.spends.as_slice(), jobs.as_slice())),
-        class_a_wave,
-    );
-    reuse.scratch.meta_offs = offs;
-    reuse.scratch.meta_keep = keep;
-    reuse.scratch.meta_job_at = 0;
+    reuse.scratch.meta_offs =
+        crate::block_pipeline::write_meta_abs_offs(abs_jobs.iter().map(Vec::as_slice));
     if !reuse.scratch.meta_offs.is_empty() {
         let meta_backend = rbitcoin_store::spend_meta_backend();
         let t_meta = Instant::now();
@@ -416,7 +407,6 @@ pub fn structural_run(
             batch_parents,
             &mut mtp_cache,
             &index,
-            class_a_wave,
             &mut reuse.scratch,
             &abs_jobs[i],
             bip34_ancestor,
@@ -430,9 +420,7 @@ pub fn structural_run(
         tot.create_h_ns = tot.create_h_ns.saturating_add(ph.create_h_ns);
         tot.bip68_ns = tot.bip68_ns.saturating_add(ph.bip68_ns);
     }
-    if reuse.scratch.meta_at != Some(reuse.scratch.meta_offs.len())
-        || reuse.scratch.meta_job_at != reuse.scratch.meta_keep.len()
-    {
+    if reuse.scratch.meta_at != Some(reuse.scratch.meta_offs.len()) {
         return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
             "invariant: structural meta prefetch short",
         )));
@@ -520,7 +508,15 @@ pub fn post_commit(
 ) -> Result<u64, ConfirmError> {
     let t_spent = Instant::now();
     if query.spend_index_enabled() && !slots.abs_edges.is_empty() {
-        query.store().wait_spend_edge_room();
+        let t_room = Instant::now();
+        query
+            .store()
+            .wait_spend_edge_room()
+            .map_err(ConfirmError::from)?;
+        crate::note_confirm(
+            &query.confirm_stats().spend_room_wait_ns,
+            t_room.elapsed().as_nanos() as u64,
+        );
         let _utxo_view = query.store().hold_utxo_view();
         let t_ann = Instant::now();
         let cold = query

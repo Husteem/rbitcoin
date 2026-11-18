@@ -284,7 +284,8 @@ fn spender_below_its_create_height_is_corrupt() {
     let slot = rbitcoin_store::tx_table::encode_spent_slot(flags, field, vin).unwrap();
     assert_ne!(slot, [0u8; 8]);
     let to = slot_abs(later_txid);
-    q.store().txs.spent.write_body_pwrite(to, &slot).unwrap();
+    q.store().note_open_spend_slots(&[(to, slot)]).unwrap();
+    q.store().checkpoint_spend_through(maturity + 4).unwrap();
     let store = q.store().path().to_path_buf();
     drop(q);
 
@@ -650,9 +651,14 @@ fn spend_vout(prev: Txid, vout: u32, val: Amount) -> Transaction {
     }
 }
 
+/// The `spent.body` bytes at `abs`. The file is sparse: past its end it
+/// holds zeroes.
 fn read_slot(store: &std::path::Path, abs: u64) -> [u8; 8] {
     use std::io::Read;
     let mut f = std::fs::File::open(store.join("spent.body")).unwrap();
+    if f.metadata().unwrap().len() < abs + 8 {
+        return [0u8; 8];
+    }
     f.seek(SeekFrom::Start(abs)).unwrap();
     let mut slot = [0u8; 8];
     f.read_exact(&mut slot).unwrap();
@@ -661,10 +667,10 @@ fn read_slot(store: &std::path::Path, abs: u64) -> [u8; 8] {
 
 /// Two later blocks spend outputs on a full historical page. Readers see both
 /// spends and the unspent neighbor before any checkpoint, and the page bytes
-/// on `spent.body` stay the pre-spend image until the next checkpoint folds
-/// the generation the first one published.
+/// on `spent.body` stay the pre-spend image while the spends are in the delta.
+/// A store this small never folds, so this does not pin the fold.
 #[test]
-fn historical_page_stays_unwritten_until_spend_checkpoint() {
+fn historical_page_stays_unwritten_while_in_the_delta() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-page-log");
     q.set_spend_index(true);
     let params = ChainParams::regtest();
@@ -776,19 +782,14 @@ fn historical_page_stays_unwritten_until_spend_checkpoint() {
             "folding page 0 must not rewrite the spent.body file header"
         );
     }
-    assert_ne!(
-        read_slot(&store, abs0),
-        before0,
-        "the next checkpoint folds the cooled page onto spent.body"
-    );
-    assert_ne!(read_slot(&store, abs1), before1);
     assert_eq!(read_slot(&store, abs_neighbor), before_n);
     assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
     assert!(q.is_outpoint_spent(created_id.as_byte_array(), 1).unwrap());
     let _ = dir;
 }
 
-/// A spend that does not survive disconnect is not folded onto `spent.body`.
+/// A spend that does not survive disconnect does not reach `spent.body`. A
+/// store this small never folds, so this pins the delta write path only.
 #[test]
 fn disconnected_historical_spend_is_not_folded() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-page-hold");
@@ -1154,13 +1155,13 @@ fn checkpoint_append_above_snapshot_still_publishes() {
 }
 
 #[test]
-fn replay_folds_a_full_open_directory() {
+fn replay_keeps_a_full_open_directory_in_delta() {
     let (dir, q) = chain_at_height("spend-replay-cap", 1);
     let _ = std::fs::remove_file(q.store().path().join(rbitcoin_store::SPEND_DURABLE_NAME));
     // Null spender field, vin 1. `keep` retains a null field, and the body
     // byte is not zero, so a fold is visible.
     let slot = [0u8, 0, 0, 0, 0, 0, 1, 0];
-    let cap = rbitcoin_store::spend_page_log::OPEN_EDGE_CAP;
+    let cap = rbitcoin_store::spend_delta::OPEN_EDGE_CAP;
     let last_page = 1 + (cap - 1) / 512;
     let end = (last_page + 1) * 4096;
     let count = q.store().txs.spent.count();
@@ -1182,14 +1183,7 @@ fn replay_folds_a_full_open_directory() {
     }
     assert!(q.store().spend_checkpoint_early());
     rbitcoin_query::replay_spend_annotations(&q).unwrap();
-    let published = q.store().txs.spent.body_published_len();
-    let mut got = [0u8; 8];
-    q.store()
-        .txs
-        .spent
-        .read_prefix_at_published(published, 4096, 8, &mut got)
-        .unwrap();
-    assert_eq!(got, slot);
+    assert_eq!(q.store().txs.spend_log_slot(4096).unwrap(), Some(slot));
     let _ = dir;
 }
 
@@ -1291,4 +1285,358 @@ fn reconnected_block_in_block_spend_checkpoint_while_active() {
 #[test]
 fn reconnected_block_in_block_spend_checkpoint_after_disconnect() {
     assert_in_block_spend_kept("spend-inblock-after", false, true);
+}
+
+/// A crash can leave a delta commit naming a spender whose block the
+/// recovered tip no longer holds. Open drops that slot before anything is
+/// appended, so a create that later takes the spender's fk is not read as
+/// spending the output.
+#[test]
+fn open_drops_a_delta_spend_above_the_recovered_tip() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-delta-above-tip");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let b1 = mine(
+        genesis.block_hash(),
+        genesis.header.time + 600,
+        1,
+        Vec::new(),
+    );
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    let (mut tip, mut tip_time) = (b1.block_hash(), b1.header.time);
+    for h in 2..=maturity + 2 {
+        let b = mine(tip, tip_time + 600, h, Vec::new());
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        (tip, tip_time) = (b.block_hash(), b.header.time);
+    }
+    let h_spend = maturity + 3;
+    let block = mine(
+        tip,
+        tip_time + 600,
+        h_spend,
+        vec![spend_one(c1, Amount::from_sat(49_0000_0000))],
+    );
+    accept_and_connect_block(&q, &params, Height(h_spend), &block, ms).unwrap();
+    let create_fk = q.tx_fk_by_txid(c1.as_byte_array()).unwrap().unwrap();
+    let (off, _) = q.store().tx_spent_range(create_fk).unwrap();
+    let abs = spent_abs(off, 0);
+    q.store().checkpoint_spend_through(h_spend).unwrap();
+    let logged = q.store().spend_directory_slot(abs).unwrap();
+    assert!(
+        logged.is_some_and(|m| m != [0u8; 8]),
+        "the checkpoint commits the spend to the delta"
+    );
+    q.store()
+        .confirmed
+        .disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(h_spend))
+        .unwrap();
+    q.store().flush_confirmed_only().unwrap();
+    let store = q.store().path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(h_spend - 1)));
+    rbitcoin_query::replay_spend_annotations(&q).unwrap();
+    assert_eq!(
+        q.store().spend_directory_slot(abs).unwrap(),
+        Some([0u8; 8]),
+        "open must zero a delta spend whose spender is above the tip"
+    );
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    assert_eq!(q.store().spend_directory_slot(abs).unwrap(), Some([0u8; 8]));
+    let _ = dir;
+}
+
+/// A crash that leaves no confirmed block at all still drops every delta
+/// spend: each spender is above the empty tip.
+#[test]
+fn open_drops_delta_spends_when_no_block_is_left() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-delta-empty-chain");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let b1 = mine(
+        genesis.block_hash(),
+        genesis.header.time + 600,
+        1,
+        Vec::new(),
+    );
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    let (mut tip, mut tip_time) = (b1.block_hash(), b1.header.time);
+    for h in 2..=maturity + 2 {
+        let b = mine(tip, tip_time + 600, h, Vec::new());
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        (tip, tip_time) = (b.block_hash(), b.header.time);
+    }
+    let h_spend = maturity + 3;
+    let block = mine(
+        tip,
+        tip_time + 600,
+        h_spend,
+        vec![spend_one(c1, Amount::from_sat(49_0000_0000))],
+    );
+    accept_and_connect_block(&q, &params, Height(h_spend), &block, ms).unwrap();
+    let create_fk = q.tx_fk_by_txid(c1.as_byte_array()).unwrap().unwrap();
+    let (off, _) = q.store().tx_spent_range(create_fk).unwrap();
+    let abs = spent_abs(off, 0);
+    q.store().checkpoint_spend_through(h_spend).unwrap();
+    assert!(q
+        .store()
+        .spend_directory_slot(abs)
+        .unwrap()
+        .is_some_and(|m| m != [0u8; 8]));
+    for h in (0..=h_spend).rev() {
+        q.store()
+            .confirmed
+            .disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(h))
+            .unwrap();
+    }
+    q.store().flush_confirmed_only().unwrap();
+    let store = q.store().path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    assert_eq!(q.tip_height(), None);
+    rbitcoin_query::replay_spend_annotations(&q).unwrap();
+    assert_eq!(
+        q.store().spend_directory_slot(abs).unwrap(),
+        Some([0u8; 8]),
+        "open must zero a delta spend when no block is left"
+    );
+    let _ = dir;
+}
+
+/// A dense page folds into the real `spent.body`, which stays sparse: Class
+/// A wrote none of its bytes, and only the folded page takes disk. After a
+/// reopen its spends read from `spent.body`, and a later spend on it reads
+/// from the delta record over that page.
+#[cfg(unix)]
+#[test]
+fn a_dense_page_folds_into_a_sparse_spent_body_and_reopens() {
+    use std::os::unix::fs::MetadataExt;
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-delta-sparse-fold");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let b1 = mine(
+        genesis.block_hash(),
+        genesis.header.time + 600,
+        1,
+        Vec::new(),
+    );
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    let (mut tip, mut tip_time) = (b1.block_hash(), b1.header.time);
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, maturity + 2);
+    let mut h = maturity + 2;
+    let mut connect = |txs: Vec<Transaction>, tip: &mut bitcoin::BlockHash, tip_time: &mut u32| {
+        h += 1;
+        let b = mine(*tip, *tip_time + 600, h, txs);
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        *tip = b.block_hash();
+        *tip_time = b.header.time;
+        h
+    };
+    // 1,200 outputs always cover one whole `spent.body` page.
+    let each = Amount::from_sat(1_000_000);
+    let a = pay_many(c1, 1_200, each);
+    let a_txid = a.compute_txid();
+    connect(vec![a], &mut tip, &mut tip_time);
+    let a_fk = q.tx_fk_by_txid(a_txid.as_byte_array()).unwrap().unwrap();
+    let (off, _) = q.store().tx_spent_range(a_fk).unwrap();
+    let page = off.div_ceil(4096) * 4096;
+    let vout = |k: u64| ((page - off) / 8 + k) as u32;
+    let spend_many = |ks: std::ops::Range<u64>| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: ks
+            .clone()
+            .map(|k| TxIn {
+                previous_output: OutPoint {
+                    txid: a_txid,
+                    vout: vout(k),
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::from_sat(each.to_sat() * (ks.end - ks.start) - 10_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let b = spend_many(0..300);
+    let b_txid = b.compute_txid();
+    let hb = connect(vec![b], &mut tip, &mut tip_time);
+    q.store().checkpoint_spend_through(hb).unwrap();
+    let c = spend_many(400..401);
+    let c_txid = c.compute_txid();
+    let hc = connect(vec![c], &mut tip, &mut tip_time);
+    q.store().checkpoint_spend_through(hc).unwrap();
+    let stats = q.store().txs.spend_delta_stats();
+    assert!(stats.fold_records > 0, "{stats:?}");
+    let abs = |k: u64| spent_abs(off, vout(k));
+    assert_eq!(
+        q.store().txs.spend_log_slot(abs(5)).unwrap(),
+        None,
+        "the folded page reads spent.body"
+    );
+    let store = q.store().path().to_path_buf();
+    let published = q.store().txs.spent.body_published_len();
+    let meta = std::fs::metadata(store.join("spent.body")).unwrap();
+    assert!(
+        meta.blocks() * 512 <= 2 * 4096 + 4096,
+        "spent.body takes {} bytes on disk for a {published}-byte end",
+        meta.blocks() * 512
+    );
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    let b_fk = q.tx_fk_by_txid(b_txid.as_byte_array()).unwrap().unwrap();
+    let c_fk = q.tx_fk_by_txid(c_txid.as_byte_array()).unwrap().unwrap();
+    for k in [0u64, 5, 299] {
+        let (_, field, vin) = q
+            .store()
+            .txs
+            .get_output_spender_meta(a_fk, vout(k))
+            .unwrap();
+        assert_eq!((field, vin), (b_fk, k as u32), "vout at slot {k}");
+    }
+    let (_, field, _) = q
+        .store()
+        .txs
+        .get_output_spender_meta(a_fk, vout(400))
+        .unwrap();
+    assert_eq!(field, c_fk);
+    let (_, field, _) = q
+        .store()
+        .txs
+        .get_output_spender_meta(a_fk, vout(350))
+        .unwrap();
+    assert!(field.is_null());
+    let _ = dir;
+}
+
+/// Spends Class A once wrote into `spent.body` are delta notes until a
+/// checkpoint. A crash before one loses them from RAM, and open replay
+/// writes them again: an in-block spend and a spend of an output created
+/// one block earlier both read spent after reopen.
+#[test]
+fn replay_restores_in_block_and_recent_spends_after_a_crash() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-delta-replay-recent");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let mut cbs = Vec::new();
+    for h in 1..=maturity + 2 {
+        let b = mine(tip, tip_time + 600, h, Vec::new());
+        cbs.push(b.txdata[0].compute_txid());
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+    let parent = pay_many(cbs[0], 2, Amount::from_sat(10_0000_0000));
+    let parent_txid = parent.compute_txid();
+    let h1 = maturity + 3;
+    let b = mine(tip, tip_time + 600, h1, vec![parent]);
+    accept_and_connect_block(&q, &params, Height(h1), &b, ms).unwrap();
+    (tip, tip_time) = (b.block_hash(), b.header.time);
+    let child = spend_vout(parent_txid, 0, Amount::from_sat(9_0000_0000));
+    let in_block = pay_many(cbs[1], 1, Amount::from_sat(10_0000_0000));
+    let in_block_txid = in_block.compute_txid();
+    let in_block_child = spend_vout(in_block_txid, 0, Amount::from_sat(9_0000_0000));
+    let b = mine(
+        tip,
+        tip_time + 600,
+        h1 + 1,
+        vec![child, in_block, in_block_child],
+    );
+    accept_and_connect_block(&q, &params, Height(h1 + 1), &b, ms).unwrap();
+    assert!(q.is_outpoint_spent(parent_txid.as_byte_array(), 0).unwrap());
+    assert!(q
+        .is_outpoint_spent(in_block_txid.as_byte_array(), 0)
+        .unwrap());
+    let store = q.store().path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    assert!(
+        q.store()
+            .spend_annotated_through()
+            .unwrap()
+            .is_none_or(|a| a < h1 + 1),
+        "no checkpoint covered the spends: replay must write them"
+    );
+    assert!(q.store().txs.spend_delta_stats().record_bytes == 0);
+    rbitcoin_query::replay_spend_annotations(&q).unwrap();
+    assert!(q.is_outpoint_spent(parent_txid.as_byte_array(), 0).unwrap());
+    assert!(!q.is_outpoint_spent(parent_txid.as_byte_array(), 1).unwrap());
+    assert!(q
+        .is_outpoint_spent(in_block_txid.as_byte_array(), 0)
+        .unwrap());
+    let _ = dir;
+}
+
+/// Past 50% of `spent.body` and three segments, a checkpoint reclaims a
+/// segment once the marker covers it: its records fold into
+/// `spent.body`, and those slots then read from the body. This test grows `spent.body` by hand, past what
+/// Class A names, so it does not reopen; the log suite pins a fold across
+/// one.
+#[test]
+fn checkpoint_folds_old_delta_segments_into_spent_body() {
+    let (dir, q) = chain_at_height("spend-delta-fold", 1);
+    let slot = [0u8, 0, 0, 0, 0, 0, 1, 0];
+    // Three 16 MiB segments of full-page records.
+    let pages = 6_700u64;
+    let end = (pages + 1) * 4096;
+    let count = q.store().txs.spent.count();
+    q.store().txs.spent.truncate_body_to(count, end).unwrap();
+    let mut batch = Vec::with_capacity(512);
+    for page in 1..=pages {
+        for rel in 0..512u64 {
+            batch.push((page * 4096 + rel * 8, slot));
+        }
+        q.store().note_open_spend_slots(&batch).unwrap();
+        batch.clear();
+    }
+    q.store().checkpoint_spend_through(1).unwrap();
+    assert_eq!(q.store().txs.spend_delta_stats().fold_records, 0);
+    assert!(q.store().spend_annotated_through().unwrap().is_some());
+    q.store()
+        .note_open_spend_slots(&[(4096 + 8, slot)])
+        .unwrap();
+    q.store().checkpoint_spend_through(1).unwrap();
+    let stats = q.store().txs.spend_delta_stats();
+    assert!(stats.fold_records > 0, "{stats:?}");
+    let folded = (2..=pages)
+        .map(|p| p * 4096)
+        .find(|&abs| q.store().txs.spend_log_slot(abs).unwrap().is_none())
+        .expect("a folded page reads spent.body");
+    let read_body = |q: &rbitcoin_query::Query| {
+        let published = q.store().txs.spent.body_published_len();
+        let mut got = [0u8; 8];
+        q.store()
+            .txs
+            .spent
+            .read_prefix_at_published(published, folded, 8, &mut got)
+            .unwrap();
+        got
+    };
+    assert_eq!(read_body(&q), slot);
+    let _ = dir;
 }

@@ -718,45 +718,6 @@ impl ArchiveWritePlan {
         }
     }
 
-    /// Exact `spent.body` bytes for creates in this plan (Class A overlay).
-    ///
-    /// Coinbase / external parents stay zero until annotate after tip.
-    /// One slot per vout: the lowest `spend_fk`, which is the first spender
-    /// in chain order (plans append in height order). A later spender of the
-    /// same output is a double spend that structural rejects, and the
-    /// rejected write keeps this Class A. The slot must still name the first.
-    pub fn same_batch_spent_overlay(
-        &self,
-    ) -> Result<rbitcoin_store::tx_table::SpentBodyImage, StoreError> {
-        let n_outs: Vec<u32> = self
-            .packed
-            .iter()
-            .map(|(pin, _)| pin.packed_n_out())
-            .collect();
-        let mut image = rbitcoin_store::tx_table::SpentBodyImage::zeros(&n_outs);
-        if image.create_count() == 0 {
-            return Ok(image);
-        }
-        let mut idx: crate::U64Map<usize> = crate::U64Map::default();
-        for (i, fk) in self.planned_fks.iter().enumerate() {
-            if let Some(id) = fk.get() {
-                idx.insert(id, i);
-            }
-        }
-        for eds in self.edges.values() {
-            for e in eds {
-                let Some(cid) = e.create_fk.get() else {
-                    continue;
-                };
-                let Some(&i) = idx.get(&cid) else {
-                    continue;
-                };
-                image.place(i, e.vout, e.spend_fk, e.vin)?;
-            }
-        }
-        Ok(image)
-    }
-
     /// Drop stamp staging (ranges + txid reverse) after pin.
     ///
     /// Sparse need-vouts already live in [`crate::BatchParents`]; commit never
@@ -1895,7 +1856,6 @@ impl Query {
         let reserve_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
-        let overlay = plan.same_batch_spent_overlay()?;
         let txstat = stamp_txstat_rows(&plan)?;
         let txstat_ns = t.elapsed().as_nanos() as u64;
         self.confirm_stats().note_write_txstat(txstat_ns);
@@ -1906,7 +1866,6 @@ impl Query {
         let (got_tx_fks, loc) = self.store.put_tx_pins_encoded(
             &pins,
             /*index=*/ false,
-            overlay,
             &txstat,
             &plan.per_header_ranges,
             &edge_rows,

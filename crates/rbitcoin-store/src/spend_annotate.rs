@@ -1,8 +1,8 @@
 //! Spender-meta annotation for Class A.
 //!
 //! Confirm decides sole, multi or promote from the slot it already knows and
-//! logs every published slot, including the short tail. Nothing here writes
-//! `spent.body`.
+//! notes the result in the spend delta. Nothing here reads or writes
+//! `spent.body`: a fold is its only writer.
 
 use crate::compact::output_flags;
 use crate::error::StoreError;
@@ -12,9 +12,6 @@ use rbitcoin_primitives::Fk;
 
 #[doc(hidden)]
 pub const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
-
-#[doc(hidden)]
-pub type SpentAbsWrite = (u64, Fk, u32, Fk, u32, [u8; META_LEN]);
 
 /// Decision from structural snapshot + spend_fk (no body read).
 #[doc(hidden)]
@@ -77,10 +74,12 @@ pub fn multi_list_contains(
     Ok(false)
 }
 
-/// Pure-write annotate: `known[i]` is structural `(field, flags)` for `abs_edges[i]`.
+/// Note each spend at its absolute `spent.body` offset, from the slot
+/// `known[i]` that confirm already holds for `abs_edges[i]`.
 ///
-/// A published slot, including the short tail, is a directory insert.
-/// Returns edges past the published body as cold.
+/// A slot that already names this spender is noted again: a freeze after a
+/// disconnect may have zeroed that note, and the delta must hold the decision
+/// confirm acts on. A slot past the published body is returned as cold.
 pub fn put_spend_batch_by_abs_meta_known(
     txs: &TxTable,
     spenders: &SpenderTable,
@@ -98,62 +97,24 @@ pub fn put_spend_batch_by_abs_meta_known(
             return Err(StoreError::InvalidFk);
         }
     }
-
     let mut order: Vec<usize> = (0..abs_edges.len()).collect();
     order.sort_unstable_by_key(|&i| abs_edges[i].0);
-
     let body_pub = txs.spent.body_published_len();
-    let mut cold: Vec<(Fk, u32, Fk, u32)> = Vec::new();
-    let mut writes: Vec<SpentAbsWrite> = Vec::with_capacity(order.len());
-
+    let mut cold = Vec::new();
+    let mut notes: Vec<(u64, [u8; META_LEN])> = Vec::with_capacity(order.len());
     for &i in &order {
         let (abs, cfk, vout, sfk, vin) = abs_edges[i];
-        if abs.saturating_add(META_LEN as u64) > body_pub {
+        if !crate::spend_delta::is_historical(body_pub, abs) {
             cold.push((cfk, vout, sfk, vin));
             continue;
         }
         let (field, flags, field_vin) = known[i];
-        match decide_annotate(field, flags, field_vin, sfk, vin, spenders)? {
-            AnnotateOp::Skip => {
-                // `keep` can drop the image after this batch decided to skip.
-                // A slot the log still serves is written again. The body is
-                // read only on a miss, so a torn page does not fail that rewrite.
-                let rewrite = txs.spend_log_serves(abs)
-                    || !txs.body_slot_matches(abs, field, flags, field_vin)?;
-                if rewrite {
-                    let meta = encode_spent_slot(flags, field, field_vin)?;
-                    writes.push((abs, cfk, vout, sfk, vin, meta));
-                }
-            }
-            AnnotateOp::Write(meta) => writes.push((abs, cfk, vout, sfk, vin, meta)),
-        }
+        let meta = match decide_annotate(field, flags, field_vin, sfk, vin, spenders)? {
+            AnnotateOp::Skip => encode_spent_slot(flags, field, field_vin)?,
+            AnnotateOp::Write(meta) => meta,
+        };
+        notes.push((abs, meta));
     }
-
-    if writes.is_empty() {
-        return Ok(cold);
-    }
-    let more = apply_prepared_spend_writes(txs, &writes)?;
-    cold.extend(more);
-    Ok(cold)
-}
-
-/// Every slot inside the published body lands in the page directory.
-///
-/// A slot past that length is cold. This path does not write `spent.body`.
-fn apply_prepared_spend_writes(
-    txs: &TxTable,
-    writes: &[SpentAbsWrite],
-) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
-    let published = txs.spent.body_published_len();
-    let mut cold = Vec::new();
-    let mut hist: Vec<(u64, [u8; META_LEN])> = Vec::new();
-    for w in writes {
-        if crate::spend_page_log::is_historical(published, w.0) {
-            hist.push((w.0, w.5));
-        } else {
-            cold.push((w.1, w.2, w.3, w.4));
-        }
-    }
-    txs.note_historical_spend_slots(&hist)?;
+    txs.note_spend_slots(&notes)?;
     Ok(cold)
 }

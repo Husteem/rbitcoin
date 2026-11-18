@@ -244,11 +244,12 @@ pub struct IbdPerfSample {
     /// Pending spend annotate a failed write left, replayed before the next
     /// write. Nested in `spend=`, not an exclusive write token.
     pub spend_replay_ms: u64,
+    /// Confirm parked at the spend delta's open edge cap until a checkpoint
+    /// froze the open notes.
+    pub spend_room_wait_ms: u64,
     /// Structural meta bulk read wall ms / peek count.
     pub meta_ms: u64,
     pub meta_n: u64,
-    /// Same-batch overlay slots that skipped the structural meta pread.
-    pub ovl_n: u64,
     pub load_ms: u64,
     /// Wire load residual (inside load/pre_asm, outside pin): Arc clone.
     pub prep_wire_arc_ms: u64,
@@ -526,9 +527,9 @@ impl Default for IbdPerfSample {
             ann_pread_skip: 0,
             ann_sync_ms: 0,
             spend_replay_ms: 0,
+            spend_room_wait_ms: 0,
             meta_ms: 0,
             meta_n: 0,
-            ovl_n: 0,
             load_ms: 0,
             prep_wire_arc_ms: 0,
             prep_struct_ms: 0,
@@ -915,9 +916,9 @@ pub fn sample(
     let ann_pread_skip = w.spend_ann_pread_skip;
     let ann_sync_ns = w.spend_durable_ns;
     let spend_replay_ns = w.spend_replay_ns;
+    let spend_room_wait_ns = w.spend_room_wait_ns;
     let meta_ns = w.spend_meta_ns;
     let meta_n = w.spend_meta_n;
-    let ovl_n = w.spend_overlay_skip_n;
     let ensure_res_hit = w.ensure_res_hit;
     let ensure_cold_n = w.ensure_cold_n;
     let asm_prevout_ns = w.asm_prevout_ns;
@@ -1031,9 +1032,9 @@ pub fn sample(
         ann_pread_skip,
         ann_sync_ms: ns_ms(ann_sync_ns),
         spend_replay_ms: ns_ms(spend_replay_ns),
+        spend_room_wait_ms: ns_ms(spend_room_wait_ns),
         meta_ms: ns_ms(meta_ns),
         meta_n,
-        ovl_n,
         load_ms: ns_ms(load_ns),
         prep_wire_arc_ms: ns_ms(prep_wire_arc_ns),
         prep_struct_ms: ns_ms(prep_struct_ns),

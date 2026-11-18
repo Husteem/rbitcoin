@@ -175,9 +175,11 @@ confirm_window! {
     // Pending spend annotate replayed before a write after a failed one.
     // Nested in utxo_apply_ns (the replay runs post_commit).
     spend_replay_ns,
+    // Confirm parked at the spend delta's open edge cap, waiting for a
+    // checkpoint to freeze the open notes.
+    spend_room_wait_ns,
     spend_meta_ns,
     spend_meta_n,
-    spend_overlay_skip_n,
     phase_prep_wire_arc_ns,
     phase_prep_struct_ns,
     phase_prep_header_ns,

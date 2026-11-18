@@ -167,7 +167,6 @@ pub fn finish_already_committed_write(
 #[doc(hidden)]
 pub struct ArchivePlanNs {
     pub pins: FkMap<crate::CreatePin>,
-    pub class_a_wave: crate::block_pipeline::ClassAWave,
     pub header_ranges: Vec<(rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)>,
     pub class_a_ns: u64,
     pub ensure_ns: u64,
@@ -182,7 +181,6 @@ pub fn apply_archive_plan(
 ) -> Result<ArchivePlanNs, ConfirmError> {
     let mut ns = ArchivePlanNs {
         pins: FkMap::default(),
-        class_a_wave: crate::block_pipeline::ClassAWave::default(),
         header_ranges: Vec::new(),
         class_a_ns: 0,
         ensure_ns: 0,
@@ -244,11 +242,6 @@ pub fn apply_archive_plan(
     ns.ensure_ns = t_ens.elapsed().as_nanos() as u64;
     if let Some(last) = batch.prepared.last() {
         query.set_class_a_hi(Some(last.height.0));
-    }
-    // The overlay is proven only for rows this commit wrote. A plan trimmed
-    // at commit wrote fewer rows than `planned_fks` names.
-    if loc.len() == planned_fks.len() {
-        ns.class_a_wave = crate::block_pipeline::ClassAWave::new(planned_fks);
     }
     Ok(ns)
 }
@@ -330,7 +323,6 @@ fn write_phase_inner(
 
     let ArchivePlanNs {
         pins: write_create_pins,
-        class_a_wave,
         header_ranges,
         class_a_ns,
         mut ensure_ns,
@@ -383,17 +375,11 @@ fn write_phase_inner(
                 &batch.wire_blocks,
                 &batch.batch_parents,
                 &abs_jobs,
-                &class_a_wave,
                 &mut reuse.borrow_mut(),
             )
         })?;
         let structural_ns = t_struct.elapsed().as_nanos() as u64;
-        push_same_block_spends_of_archived_bodies(
-            query,
-            &batch.prepared,
-            &class_a_wave,
-            &mut slots,
-        )?;
+        push_same_block_spends(query, &batch.prepared, &mut slots)?;
 
         let n_blocks = batch.prepared.len();
         let pending_token = batch
@@ -632,6 +618,12 @@ pub const REPLAY_STATUS_MS: u64 = 10_000;
 /// Returns how many heights were rewritten. Call this on process open after
 /// tip-window revalidation.
 pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConfirmError> {
+    // Before any return: a crash can leave no block at all, and every delta
+    // spend is then above the tip.
+    query
+        .store()
+        .drop_spends_above_tip()
+        .map_err(ConfirmError::from)?;
     let Some(tip) = query.tip_height().map(|h| h.0) else {
         return Ok(0);
     };
@@ -643,9 +635,7 @@ pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConfirmError> {
         .store()
         .spend_annotated_through()
         .map_err(ConfirmError::from)?;
-    // The page-log commit can name a higher height than the marker, and its
-    // freeze tip can sit above both. Hold before replay folds that image.
-    if annotated.is_some_and(|h| h > tip) || query.store().spend_log_above(tip) {
+    if annotated.is_some_and(|h| h > tip) {
         query
             .store()
             .clamp_spend_durable()
@@ -855,17 +845,14 @@ pub fn annotate_slots_from_connected_hash(
     Ok(())
 }
 
-/// Annotate slots for the same-block spends of each block whose body this
-/// wave did not append.
+/// Annotate slots for the same-block spends of each block.
 ///
 /// Structural has no job for a parent earlier in the same block. Class A
-/// pre-fills that slot only when it appends the body, and a checkpoint after
-/// a disconnect may have zeroed that pre-fill. A block connected again from
-/// the archive writes it here, as open replay does from `input_edges`.
-fn push_same_block_spends_of_archived_bodies(
+/// writes no `spent.body` bytes, so the delta note this writes is the only
+/// record of that spend, as open replay writes it from `input_edges`.
+fn push_same_block_spends(
     query: &Query,
     prepared: &[Prepared],
-    class_a_wave: &crate::block_pipeline::ClassAWave,
     slots: &mut crate::block_pipeline::AnnotateSlots,
 ) -> Result<(), ConfirmError> {
     if !query.spend_index_enabled() {
@@ -873,15 +860,6 @@ fn push_same_block_spends_of_archived_bodies(
     }
     let mut edges = Vec::new();
     for p in prepared {
-        // Class A appends a body whole, and a trimmed plan leaves the wave
-        // empty, so the coinbase stands for the block.
-        let body_appended = p
-            .tx_fks
-            .first()
-            .is_some_and(|&fk| class_a_wave.contains(fk));
-        if body_appended {
-            continue;
-        }
         if !p
             .spends
             .iter()

@@ -149,7 +149,7 @@ RAM fence (~15 MiB at 1M blocks), not a file.
 |------|-----|----------|
 | Pin outs / body pipeline | `RBITCOIN_IO` | uring/pread on **`txout.body` FD** (Full also zips `seqsigwit`). `group_body_peeks` also merges a hole of at most 64 KiB when the span stays at most 256 KiB. |
 | Head-resolve identity | `RBITCOIN_IO` | uring/pread on **`txid.body`** (not a packed body prefix) |
-| Spend-meta 8 B peeks | `RBITCOIN_IO` | Directory hit, else uring/pread on **`spent.body` FD**. A logged page is not part of the body span. Misses are page-grouped with the pin caps (`group_body_peeks`), pipelined at ring depth 128. A singleton stays an 8-byte pread. |
+| Spend-meta 8 B peeks | `RBITCOIN_IO` | Directory hit, else uring/pread on **`spent.body` FD**, only on a page a fold wrote; any other page reads zero without IO. Misses are page-grouped with the pin caps (`group_body_peeks`), pipelined at ring depth 128. A singleton stays an 8-byte pread. |
 | Spend annotate | `RBITCOIN_IO` | Every published slot, including the short tail, is a directory insert. That path does not set `POSIX_FADV_RANDOM`. Unknown meta decides sole / multi / promote before the slot write, so `MULTI_SPENDER` is visible only once the overflow node is appended. |
 | Class C create-height | (RAM fence) | no IO |
 | Class A body/idx **linear append** | always | **pwrite** (three stems + three idx). `--datadir-hdd` submits each body stem as its own `pwrite_batch`; otherwise the stems are one wave |
@@ -167,7 +167,7 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 |--------|------|--------|
 | **`txout.body`** | L0 | Hot outs (pin / SH / Electrum tweaks); pread/pwrite/uring |
 | **`seqsigwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
-| **`spent.body`** | L0 | 8 B×n_out sole-spender. Historical annotate is a directory insert, including the short tail. Cooled images fold here from `spend.pages` |
+| **`spent.body`** | L0 | 8 B×n_out sole-spender, sparse. Class A moves its published end and writes no bytes; every spend is a `spent.delta` note. A checkpoint's fold writes whole pages, the only writer |
 | **`create.loc` / `seqsigwit.loc`** | L0 | FdOnly 2 B/create (hot) / u16 (cold); leftover `spent.off` unlinked. `create.loc` leftover stamp: batched window preads, sum/read through max fk in-window, running-sum + SIMD deinterleave (no loc L2) |
 | **`tx.head` segments** | L0 | Open OA: read-only `MAP_SHARED` view of the slot file (probe + insert hop, no syscall; slots carry a 7-bit fingerprint) + one 4 KiB page pwrite per dirty page. Sealed: mmap `.fuse8` (heap `fuse8=0`); packed BDZ `g` FdOnly 4 KiB page stream (`KIND_MPHF_G`); MPHF output is `rel−1` |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |

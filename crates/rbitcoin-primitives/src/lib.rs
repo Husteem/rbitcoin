@@ -107,6 +107,12 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **30:** Every spend slot is a note in `spent.delta/`: page records in
+///         16 MiB segments, a directory base plus log, and `commit`. Class A
+///         writes no `spent.body` bytes; only a fold does. A 29 binary would
+///         read an empty `spent.body` and miss the delta, so it refuses 30
+///         `meta`. This binary rewrites 22–29 `meta` to 30 and adopts a 29
+///         `spent.body` and page log as the first delta generation.
 /// **29:** `spend.pages.commit` records name the generation file that holds
 ///         each page image. An unchanged page stays in the older file. A
 ///         schema-28 binary reads every offset as the newest file and would
@@ -140,7 +146,7 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         this binary opens.
 /// **21 and older:** not opened. Meta below 22 is one wipe-and-IBD refuse.
 ///         Those layouts are archaeology in `SCHEMA_HISTORY.md`.
-pub const SCHEMA_VERSION: u16 = 29;
+pub const SCHEMA_VERSION: u16 = 30;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
@@ -336,6 +342,12 @@ pub enum TableKind {
     InputLoc = 23,
     /// Optional BIP158 basic filter bytes (`blockfilter.body`).
     BlockFilter = 24,
+    /// Schema-30 spend delta segment (`spent.delta/seg.<id>`).
+    SpendDelta = 25,
+    /// Schema-30 spend delta page directory base (`spent.delta/idx.<id>`).
+    SpendDeltaIdx = 26,
+    /// Schema-30 spend delta directory log (`spent.delta/log.<id>`).
+    SpendDeltaLog = 27,
 }
 
 impl TableKind {
@@ -363,6 +375,9 @@ impl TableKind {
             22 => Some(TableKind::Input),
             23 => Some(TableKind::InputLoc),
             24 => Some(TableKind::BlockFilter),
+            25 => Some(TableKind::SpendDelta),
+            26 => Some(TableKind::SpendDeltaIdx),
+            27 => Some(TableKind::SpendDeltaLog),
             _ => None,
         }
     }

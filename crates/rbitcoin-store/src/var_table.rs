@@ -20,6 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Encoded Class A append waiting for body write + idx + HWM publish.
 pub struct PreparedAppend {
     pub start: u64,
+    /// End once published. Past `start + body_blob.len()` for a stem whose
+    /// bytes are not written ([`VarTable::prepare_sized`]).
+    pub end: u64,
     pub body_blob: Vec<u8>,
     pub starts: Vec<u64>,
     pub fks: Vec<Fk>,
@@ -28,7 +31,7 @@ pub struct PreparedAppend {
 
 impl PreparedAppend {
     pub fn aligned_lens(&self) -> Vec<u64> {
-        let end = self.start.saturating_add(self.body_blob.len() as u64);
+        let end = self.end;
         self.starts
             .iter()
             .enumerate()
@@ -51,7 +54,7 @@ pub fn next_aligned_tx_start(cursor: u64) -> u64 {
 pub fn exact_body_starts(
     cursor: u64,
     record_lens: &[u64],
-    blob_len: usize,
+    blob_len: u64,
 ) -> Result<Vec<u64>, StoreError> {
     if !cursor.is_multiple_of(8) {
         return Err(StoreError::Corrupt("spent body cursor"));
@@ -71,7 +74,7 @@ pub fn exact_body_starts(
             .checked_add(len)
             .ok_or(StoreError::Corrupt("spent overlay n_out"))?;
     }
-    if sum != blob_len as u64 {
+    if sum != blob_len {
         return Err(StoreError::Corrupt("spent overlay n_out"));
     }
     Ok(starts)
@@ -116,6 +119,39 @@ impl VarTable {
         count: u64,
     ) -> Result<Self, StoreError> {
         let body = TableFile::open(Self::body_path(dir, stem), body_kind)?;
+        let body_end = body.logical_len().max(FILE_HEADER_LEN as u64);
+        Ok(Self {
+            body,
+            count: AtomicU64::new(count),
+            published_body_end: AtomicU64::new(body_end),
+            publish_seq: AtomicU64::new(0),
+        })
+    }
+
+    /// [`Self::create_body_only`] on a [`crate::file::GrowPolicy::Sparse`]
+    /// body: appends publish an end and write no bytes (`spent`).
+    pub fn create_sparse_body(
+        dir: &Path,
+        stem: &str,
+        body_kind: TableKind,
+    ) -> Result<Self, StoreError> {
+        let body = TableFile::create_sparse(Self::body_path(dir, stem), body_kind)?;
+        Ok(Self {
+            body,
+            count: AtomicU64::new(0),
+            published_body_end: AtomicU64::new(FILE_HEADER_LEN as u64),
+            publish_seq: AtomicU64::new(0),
+        })
+    }
+
+    /// [`Self::open_body_only`] on a sparse body.
+    pub fn open_sparse_body(
+        dir: &Path,
+        stem: &str,
+        body_kind: TableKind,
+        count: u64,
+    ) -> Result<Self, StoreError> {
+        let body = TableFile::open_sparse(Self::body_path(dir, stem), body_kind)?;
         let body_end = body.logical_len().max(FILE_HEADER_LEN as u64);
         Ok(Self {
             body,
@@ -247,8 +283,6 @@ impl VarTable {
         unsafe {
             buf.set_len(n);
         }
-        #[cfg(debug_assertions)]
-        crate::io_handle::note_test_pread();
         f(buf)
     }
 
@@ -463,6 +497,7 @@ impl VarTable {
         }
         Ok(Some(PreparedAppend {
             start,
+            end: start + body_blob.len() as u64,
             body_blob,
             starts,
             fks,
@@ -470,22 +505,20 @@ impl VarTable {
         }))
     }
 
-    /// Prepared append whose body is `body_blob` itself.
+    /// Prepared append that reserves `record_lens` bytes and writes none:
+    /// the publish moves the end, and the file is not extended.
     ///
     /// `cursor` must already be 8-aligned. Each record length is a non-zero
-    /// multiple of 8 and the lengths sum to `blob_len`. No pad is inserted.
-    pub fn prepare_exact_body(
-        &self,
-        record_lens: &[u64],
-        body_blob: Vec<u8>,
-    ) -> Result<PreparedAppend, StoreError> {
+    /// multiple of 8. No pad is inserted.
+    pub fn prepare_sized(&self, record_lens: &[u64]) -> Result<PreparedAppend, StoreError> {
         let n = record_lens.len();
         if n == 0 {
             return Err(StoreError::Corrupt("spent overlay n_out"));
         }
         let base_count = self.count.load(Ordering::Acquire);
         let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
-        let starts = exact_body_starts(start, record_lens, body_blob.len())?;
+        let len: u64 = record_lens.iter().sum();
+        let starts = exact_body_starts(start, record_lens, len)?;
         if self.count.load(Ordering::Acquire) != base_count {
             return Err(StoreError::Corrupt("var put_batch_encode race"));
         }
@@ -501,7 +534,8 @@ impl VarTable {
         let fks = (0..n).map(|i| Fk(base_count + 1 + i as u64)).collect();
         Ok(PreparedAppend {
             start,
-            body_blob,
+            end: start + len,
+            body_blob: Vec::new(),
             starts,
             fks,
             base_count,
@@ -527,7 +561,7 @@ impl VarTable {
 
     /// Count + body-end publish after the body blob is already on disk (and HWM set).
     pub fn finish_prepared(&self, prep: PreparedAppend) -> Result<Vec<Fk>, StoreError> {
-        let new_end = prep.start.saturating_add(prep.body_blob.len() as u64);
+        let new_end = prep.end;
         let new_count = prep.base_count + prep.fks.len() as u64;
         self.publish_begin();
         self.published_body_end.store(new_end, Ordering::Relaxed);
