@@ -12,7 +12,8 @@ info:
 
     ## Hashes
     Every txid and block hash is 64 hex characters in display order (the
-    order Core and Esplora print). `a-f` and `A-F` are both accepted, as is an
+    order Core and Esplora print). A scripthash is SHA256(scriptPubKey) in
+    digest order, not reversed. `a-f` and `A-F` are both accepted, as is an
     optional `0x` or `0X` prefix. A malformed hash in a path or in `?asof=`
     returns **404** `Not Found`.
 
@@ -1141,7 +1142,7 @@ components:
       name: scripthash
       in: path
       required: true
-      description: Electrum scripthash (SHA256 of the scriptPubKey, byte-reversed hex)
+      description: SHA256 of the scriptPubKey, hex in digest order, as electrs reads it. Not reversed like an Electrum scripthash.
       schema: { $ref: "#/components/schemas/Hash" }
     LastSeenTxid:
       { name: last_seen_txid, in: path, required: true, schema: { $ref: "#/components/schemas/Hash" } }
@@ -1176,6 +1177,7 @@ components:
         application/json:
           schema: { type: array, maxItems: 300, items: { type: string } }
     ScripthashArray:
+      description: Scripthashes in the same form as the `scripthash` path parameter (digest order).
       required: true
       content:
         application/json:
