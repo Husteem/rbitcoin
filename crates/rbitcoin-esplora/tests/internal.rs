@@ -828,7 +828,7 @@ async fn internal_totals_lift_the_cap(sock: &std::path::Path, pad: &Pad) {
     let addr = bitcoin::Address::from_script(&p2wsh, bitcoin::Network::Regtest)
         .unwrap()
         .to_string();
-    let h51 = rbitcoin_primitives::scripthash_display_hex(&[0x51]);
+    let h51 = rbitcoin_primitives::hex_encode(rbitcoin_store::script_hash(&[0x51]));
     let tip = q.tip_height().unwrap().0;
     let (_, at50) = q.header_at_height(Height(50)).unwrap().unwrap();
     let asof50 = rbitcoin_primitives::display_hash_hex(at50.hash);
