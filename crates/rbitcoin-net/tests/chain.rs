@@ -2660,8 +2660,19 @@ fn ensure_header_fork_child_rejects_old_time_and_wrong_bits() {
     assert!(hub
         .stored_header_height(&BlockHash::from_byte_array([0xab; 32]))
         .is_none());
-    let mtp = hub.mtp_off_tip(&b1.header, &empty);
+    let mtp = hub
+        .mtp_off_tip(&b1.header, &empty)
+        .expect("the walk from b1 reaches genesis");
     assert!(mtp <= b1.header.time);
+    let mut orphan = b1.header;
+    orphan.prev_blockhash = BlockHash::from_byte_array([0xab; 32]);
+    let err = hub
+        .mtp_off_tip(&orphan, &empty)
+        .expect_err("an unknown ancestor leaves the median window incomplete");
+    assert!(
+        err.is_local_fault(),
+        "an incomplete median window is a local fault: {err}"
+    );
     let child_bits = hub
         .expected_bits_off_tip(&h2, &b1.header, 1, None, &empty)
         .unwrap();
@@ -5093,6 +5104,24 @@ fn hostile_peer_session() {
     );
     assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
 
+    // The median of genesis and `honest` is `honest`'s own stamp, so a child
+    // at exactly that time fails the `<=` check and can never become valid.
+    let old = mine(honest.block_hash(), honest.header.time, 2);
+    hub.note_asked_block(old.block_hash());
+    let err = hub
+        .accept_received_block(old.clone())
+        .expect_err("header at the parent median time past");
+    let msg = err
+        .consensus_rules()
+        .map(rbitcoin_consensus::block_reject_reason)
+        .unwrap_or_else(|| panic!("expected a rule failure, got {err:?}"));
+    assert!(msg.contains("time-too-old"), "got {msg}");
+    assert!(
+        hub.is_block_invalid(&old.block_hash()),
+        "time-too-old caches BLOCK_FAILED"
+    );
+    assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
+
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -7226,18 +7255,24 @@ fn header_inv_challenge_clears_once_the_walk_takes_it() {
 
 #[test]
 fn accept_err_string_bags_classify_time_and_warn() {
-    for needle in [
-        "time-too-new",
-        "time-too-old",
-        "timestamp too far in future",
-        "median-time-past",
-    ] {
+    for needle in ["time-too-new", "timestamp too far in future"] {
         assert!(
             accept_err_is_temporary_time(&NetError::Consensus(needle.into())),
             "{needle}"
         );
     }
+    for needle in ["time-too-old", "median-time-past"] {
+        assert!(
+            !accept_err_is_temporary_time(&NetError::Consensus(needle.into())),
+            "{needle}"
+        );
+    }
     assert!(accept_err_is_temporary_time(&NetError::ConnectFailed {
+        hash: [0; 32],
+        msg: "timestamp too far in future".into(),
+        rules: None,
+    }));
+    assert!(!accept_err_is_temporary_time(&NetError::ConnectFailed {
         hash: [0; 32],
         msg: "median-time-past".into(),
         rules: None,

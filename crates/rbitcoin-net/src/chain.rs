@@ -586,10 +586,12 @@ fn soften_parent_header(
     result
 }
 
+/// Only a stamp past the two-hour window can become valid, once the clock
+/// catches up. A stamp at or below the parent's median never does.
 fn rules_are_temporary_time(e: &rbitcoin_consensus::ConsensusError) -> bool {
     matches!(
         rbitcoin_consensus::block_reject_reason(e).as_str(),
-        "time-too-old" | "time-too-new"
+        "time-too-new"
     )
 }
 
@@ -600,10 +602,7 @@ pub fn accept_err_is_temporary_time(e: &NetError) -> bool {
     match e {
         NetError::Consensus(s) | NetError::ConnectFailed { msg: s, .. } => {
             let s = s.to_ascii_lowercase();
-            s.contains("time-too-new")
-                || s.contains("time-too-old")
-                || s.contains("timestamp too far in future")
-                || s.contains("median-time-past")
+            s.contains("time-too-new") || s.contains("timestamp too far in future")
         }
         _ => false,
     }
@@ -2081,7 +2080,7 @@ impl ChainHub {
             let parent_height = self
                 .sync_parent_height(&parent_hash, in_batch)
                 .ok_or_else(|| NetError::Consensus("header parent height unknown".into()))?;
-            let mtp = self.mtp_off_tip(&parent, in_batch);
+            let mtp = self.mtp_off_tip(&parent, in_batch)?;
             let first = self.period_first_off_tip(&parent, parent_height, in_batch);
             let expected =
                 self.expected_bits_off_tip(header, &parent, parent_height, first, in_batch)?;
@@ -2113,7 +2112,7 @@ impl ChainHub {
         };
         let none = HashMap::new();
         self.header_sync_contextual(&block.header, &none)?;
-        let mtp = self.mtp_off_tip(&parent, &none);
+        let mtp = self.mtp_off_tip(&parent, &none)?;
         let ctx = rbitcoin_consensus::ValidationContext::at(
             &self.params,
             Height(parent_h.saturating_add(1)),
@@ -2165,12 +2164,17 @@ impl ChainHub {
         )
     }
 
+    /// Median time past of the 11 headers ending at `parent`.
+    ///
+    /// Errs instead of taking the median of a partial window: a short prefix
+    /// can sit above the real median, so a header between the two would be
+    /// rejected as `time-too-old` though it is valid.
     #[doc(hidden)]
     pub fn mtp_off_tip(
         &self,
         parent: &Header,
         in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
-    ) -> u32 {
+    ) -> Result<u32, NetError> {
         let mut times = Vec::with_capacity(11);
         let mut hdr = *parent;
         loop {
@@ -2183,12 +2187,17 @@ impl ChainHub {
             }
             match self.sync_parent_header(&hdr.prev_blockhash, in_batch) {
                 Some(p) => hdr = p,
-                None => break,
+                None => {
+                    return Err(NetError::store(format!(
+                        "median time past window incomplete: ancestor {} not loaded",
+                        hdr.prev_blockhash
+                    )));
+                }
             }
         }
-        rbitcoin_primitives::MedianWindow::new(&times)
+        Ok(rbitcoin_primitives::MedianWindow::new(&times)
             .map(rbitcoin_primitives::median_time_past_times)
-            .unwrap_or(parent.time)
+            .unwrap_or(parent.time))
     }
 
     /// The header at [`ChainParams::period_first_height`] for the child of
@@ -3872,7 +3881,7 @@ impl ChainHub {
                         } else {
                             let parent = &blocks[i - 1].header;
                             let parent_height = height.saturating_sub(1);
-                            let mtp = self.mtp_off_tip(parent, &batch);
+                            let mtp = self.mtp_off_tip(parent, &batch)?;
                             let first = self.period_first_off_tip(parent, parent_height, &batch);
                             let expected = self.expected_bits_off_tip(
                                 &b.header,
