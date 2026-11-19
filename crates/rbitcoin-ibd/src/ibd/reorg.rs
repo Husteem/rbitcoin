@@ -82,6 +82,16 @@ impl IbdReorgState {
         }
     }
 
+    /// Move every deferred hash into `cands`, skipping ones already there.
+    /// Each off-lock pass takes the whole list, so its ranking sees them.
+    pub fn drain_deferred_into(&mut self, cands: &mut Vec<BlockHash>) {
+        for h in std::mem::take(&mut self.deferred) {
+            if !cands.contains(&h) {
+                cands.push(h);
+            }
+        }
+    }
+
     /// Register hashes (and optional path tip) for exploration densify / apply.
     ///
     /// Each list keeps at most [`Self::EXPLORE_CAP`] hashes. A new hash past
@@ -417,11 +427,7 @@ pub fn heavier_fork_candidates(
     if cands.is_empty() {
         cands.extend(unplanted_walk_tip(st, hub));
     }
-    for h in std::mem::take(&mut st.reorg.deferred) {
-        if !cands.contains(&h) {
-            cands.push(h);
-        }
-    }
+    st.reorg.drain_deferred_into(&mut cands);
     let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
     Ok((cands, invalid))
 }
@@ -957,14 +963,17 @@ pub(crate) fn apply_off_lock_rewind(
 }
 
 /// Most-work rewind with the store reads outside `shared`. The commit puts
-/// the path's header fks in `header_fks`.
+/// the path's header fks in `header_fks`. Deferred candidates are ranked
+/// with the explore and competing ones, so this pass cannot commit a fork
+/// lighter than one still waiting for the coordinator.
 pub fn rewind_off_coord_lock(
     shared: &Mutex<super::state::IbdWorkState>,
     hub: &ChainHub,
 ) -> Result<bool, NetError> {
     let (cands, invalid) = {
-        let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-        let cands = rewind_candidate_hashes(&st, hub)?;
+        let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
+        let mut cands = rewind_candidate_hashes(&st, hub)?;
+        st.reorg.drain_deferred_into(&mut cands);
         let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
         (cands, invalid)
     };

@@ -905,6 +905,30 @@ fn a_fork_lighter_than_the_confirmed_chain_never_replaces_a_heavier_one() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A header batch names a third fork while two deferred forks wait for the
+/// coordinator. The header thread's pass ranks the deferred forks with it,
+/// so it rewinds to the heaviest, not to the one it alone can see.
+#[test]
+fn the_header_thread_ranks_deferred_forks_too() {
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_700;
+    let chain = confirmed_chain(&hub, 2, t);
+    let named = side_headers(&hub, &chain, 1, 2, t + 2);
+    let deferred = side_headers(&hub, &chain, 1, 4, t + 1);
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg.defer(&[deferred[3]]);
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(named[1]));
+    let shared = Mutex::new(st);
+    assert!(rewind_off_coord_lock(&shared, &hub).unwrap());
+    assert_eq!(hub.tip_height(), Some(1));
+    let st = shared.into_inner().unwrap_or_else(|err| err.into_inner());
+    assert_eq!(st.height_to_hash.get(&5), Some(&deferred[3]));
+    assert!(st.reorg.deferred.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A selected fork whose rewind cannot run while confirm holds the tip
 /// commit is deferred again, by the pass under `shared` and by the
 /// coordinator's off-lock turn. Once the commit is free the next turn
