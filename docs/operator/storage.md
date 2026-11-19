@@ -118,7 +118,7 @@ bytes of `spent.body`. Open logs the same totals once.
 
 The `timing` line is one checkpoint: `since_ms` since the previous one
 started, the sealed pages and slot notes, the preads and bytes that read back
-the committed records they merge into (records close together in a segment
+the committed records they merge into (records touching in a segment
 share one pread), `hot_folds` (touched pages folded) and `hot_fold_record_bytes`
 (what rewriting those records would have written), the dense touched pages
 kept because their segment is newer than the durable marker

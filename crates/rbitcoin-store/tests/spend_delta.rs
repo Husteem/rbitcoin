@@ -1766,6 +1766,24 @@ fn a_merge_reads_neighbouring_records_together() {
     }
 }
 
+/// Records are read together only when they touch: a dead record between
+/// two live ones splits the read rather than being read.
+#[test]
+fn a_merge_does_not_read_a_dead_record_between_two_live_ones() {
+    let d = dir();
+    let log = SpendPageLog::create(&d).unwrap();
+    let mut body = MemBody::new(0);
+    let pages = [4096u64, 2 * 4096, 3 * 4096];
+    log.note_slots(&pages.map(|p| (p + 16, [1u8; 8]))).unwrap();
+    reporting_commit(&log, 1, |_| Ok(true), &mut body, None).unwrap();
+    log.note_slots(&[(pages[1] + 24, [2u8; 8])]).unwrap();
+    reporting_commit(&log, 2, |_| Ok(true), &mut body, None).unwrap();
+    log.note_slots(&[(pages[0] + 24, [3u8; 8]), (pages[2] + 24, [3u8; 8])])
+        .unwrap();
+    let r = reporting_commit(&log, 3, |_| Ok(true), &mut body, None).unwrap();
+    assert_eq!((r.merge_reads, r.merge_read_bytes), (2, 2 * 20));
+}
+
 /// With no sealed layer left by a failed checkpoint, the freeze moves the
 /// open notes instead of copying them under the lock confirm takes.
 #[cfg(debug_assertions)]
@@ -1848,6 +1866,40 @@ fn reclaim_reads_only_the_live_records() {
     drop(log);
     let log = SpendPageLog::load_with(&d, &mut body, ROOMY).unwrap();
     assert_eq!(read_through(&log, &body, small), [2u8; 8]);
+    assert_eq!(read_through(&log, &body, big + 500 * 8), [3u8; 8]);
+}
+
+/// A record this checkpoint rewrites is dead before reclaim reads its
+/// segment, so reclaim does not read it.
+#[test]
+fn reclaim_does_not_read_a_record_this_checkpoint_rewrites() {
+    const ROOMY: Policy = Policy {
+        segment_cap: 6000,
+        reclaim_from_segments: 2,
+        keep_segments: 1,
+        sparse_permille: 999,
+        reclaim_slope: 0,
+        reclaim_rate: 100,
+        fold_round_pages: usize::MAX,
+        log_fold_min: 4 << 20,
+    };
+    let d = dir();
+    let mut body = MemBody::new(8 * 4096);
+    let log = SpendPageLog::create_with(&d, ROOMY).unwrap();
+    let (big, small) = (4 * 4096u64, 5 * 4096u64);
+    let notes: Vec<(u64, [u8; 8])> = (0..500u64).map(|rel| (big + rel * 8, [1u8; 8])).collect();
+    log.note_slots(&notes).unwrap();
+    log.note_slots(&[(small, [2u8; 8])]).unwrap();
+    reporting_commit(&log, 1, |_| Ok(true), &mut body, Some(u32::MAX)).unwrap();
+    log.note_slots(&[(6 * 4096, [4u8; 8])]).unwrap();
+    reporting_commit(&log, 2, |_| Ok(true), &mut body, Some(u32::MAX)).unwrap();
+    // The big page's record in the first segment dies with this checkpoint.
+    log.note_slots(&[(big + 500 * 8, [3u8; 8])]).unwrap();
+    let r = reporting_commit(&log, 3, |_| Ok(true), &mut body, Some(u32::MAX)).unwrap();
+    assert_eq!(r.reclaim_segments, 1, "{r:?}");
+    assert_eq!(r.reclaim_read_bytes, 20, "{r:?}");
+    assert_eq!(read_through(&log, &body, small), [2u8; 8]);
+    assert_eq!(read_through(&log, &body, big), [1u8; 8]);
     assert_eq!(read_through(&log, &body, big + 500 * 8), [3u8; 8]);
 }
 

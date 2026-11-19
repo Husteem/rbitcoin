@@ -256,7 +256,7 @@ pub struct CheckpointReport {
     /// Since the previous checkpoint in this process started.
     pub since_ms: u64,
     /// Preads of the committed records the sealed notes merge into, records
-    /// close together in a segment sharing one, and the bytes they read.
+    /// touching in a segment sharing one, and the bytes they read.
     pub merge_reads: u64,
     pub merge_read_bytes: u64,
     pub merge_ms: u64,
@@ -1423,7 +1423,7 @@ impl SpendPageLog {
     }
 
     /// The committed records of `page_offs` that have one, by page. Records
-    /// close together in a segment are read in one pread.
+    /// touching in a segment are read in one pread.
     fn committed_records(
         &self,
         page_offs: &[u64],
@@ -2067,9 +2067,10 @@ impl SpendPageLog {
     ///
     /// Eligible: not this writer's active or rolled segments, and every live
     /// record from a generation sealed at or below `durable`. Only the live
-    /// records are read, found from the RAM directory; nearby ones share a
-    /// `pread`. Each goes one of three ways, and the victim is always freed:
-    /// - its page is in `sealed`: this generation rewrites it, so it is dropped;
+    /// records are read, found from the RAM directory; touching ones share a
+    /// `pread`. A record whose page is in `sealed` is dropped unread: this
+    /// generation rewrites that page. Each other goes one of two ways, and the
+    /// victim is always freed:
     /// - its page is not page 0, is wholly below the published end, and its
     ///   spends cover at least half the slots its base leaves unset (any
     ///   record once the threshold reaches 1000): it is folded, in rounds of
@@ -2105,7 +2106,8 @@ impl SpendPageLog {
         let published = body.published_len();
         let victims = self.pick_victims(w, sealed, new_bytes, published, durable);
         report.reclaim_segments = victims.len() as u64;
-        let mut live = self.live_records(&victims);
+        let (mut live, dropped) = self.live_records(&victims, sealed);
+        report.dropped = dropped;
         for victim in &victims {
             let records = live.remove(&victim.id).unwrap_or_default();
             for run in coalesce(&records) {
@@ -2115,10 +2117,6 @@ impl SpendPageLog {
                 report.reclaim_read_bytes += buf.len() as u64;
                 report.reclaim_read_ms += ms_since(read);
                 for rec in run {
-                    if sealed.contains_key(&rec.page_off) {
-                        report.dropped += 1;
-                        continue;
-                    }
                     let at = (rec.offset - first.offset) as usize;
                     let c = Committed {
                         record: Record::check(buf[at..at + rec.len].to_vec(), rec.page_off)?,
@@ -2227,12 +2225,19 @@ impl SpendPageLog {
     }
 
     /// The live records in `victims`, by segment and in file order, from the
-    /// RAM directory. The writer lock is held, so the directory only changes
-    /// under this writer's own publish; `Inner` is released between chunks.
-    fn live_records(&self, victims: &[Victim]) -> HashMap<u32, Vec<LiveRecord>> {
+    /// RAM directory, and how many records of `sealed` pages it left out: this
+    /// generation rewrites those pages, so their records die unread. The
+    /// writer lock is held, so the directory only changes under this writer's
+    /// own publish; `Inner` is released between chunks.
+    fn live_records(
+        &self,
+        victims: &[Victim],
+        sealed: &Layer,
+    ) -> (HashMap<u32, Vec<LiveRecord>>, u64) {
         let mut out: HashMap<u32, Vec<LiveRecord>> = HashMap::new();
+        let mut dropped = 0;
         if victims.is_empty() {
-            return out;
+            return (out, dropped);
         }
         let ids: HashSet<u32> = victims.iter().map(|v| v.id).collect();
         let mut page = 0usize;
@@ -2247,9 +2252,15 @@ impl SpendPageLog {
                     base,
                 } = at.at()
                 {
-                    if ids.contains(&seg) {
+                    let page_off = (page + i) as u64 * PAGE;
+                    if !ids.contains(&seg) {
+                        continue;
+                    }
+                    if sealed.contains_key(&page_off) {
+                        dropped += 1;
+                    } else {
                         out.entry(seg).or_default().push(LiveRecord {
-                            page_off: (page + i) as u64 * PAGE,
+                            page_off,
                             offset,
                             len,
                             base,
@@ -2265,7 +2276,7 @@ impl SpendPageLog {
         for records in out.values_mut() {
             records.sort_unstable_by_key(|r| r.offset);
         }
-        out
+        (out, dropped)
     }
 
     /// Write one generation and install it.
@@ -2718,10 +2729,6 @@ struct LiveRecord {
     base: Base,
 }
 
-/// Records closer than this are read with the bytes between them, in one
-/// `pread`.
-const READ_GAP: u64 = 4096;
-
 /// One pread covering `run`, from its first record's offset.
 fn read_run(file: &TableFile, run: &[LiveRecord]) -> Result<Vec<u8>, StoreError> {
     let (first, last) = (run[0], run[run.len() - 1]);
@@ -2730,9 +2737,10 @@ fn read_run(file: &TableFile, run: &[LiveRecord]) -> Result<Vec<u8>, StoreError>
     Ok(buf)
 }
 
-/// Split offset-ordered records into runs that one `pread` each covers.
+/// Split offset-ordered records into runs of touching records, one `pread`
+/// each. A gap between two records holds dead bytes, which are not read.
 fn coalesce(records: &[LiveRecord]) -> impl Iterator<Item = &[LiveRecord]> + '_ {
-    records.chunk_by(|a, b| b.offset <= a.offset + a.len as u64 + READ_GAP)
+    records.chunk_by(|a, b| b.offset == a.offset + a.len as u64)
 }
 
 #[derive(Default)]
