@@ -407,3 +407,40 @@ async fn get(addr: SocketAddr, path: &str) -> String {
 }
 
 mod metrics;
+
+/// A client that keeps connecting past the cap must not append one log line
+/// per refused socket. The health port has no auth, so anyone who reaches
+/// it could otherwise fill the log. The accept loop runs on this thread, so
+/// the capture sees its lines.
+#[tokio::test(flavor = "current_thread")]
+async fn health_rejects_past_the_cap_log_fewer_lines_than_rejects() {
+    const EXTRA: usize = 20;
+    rbitcoin_log::reset_repeated_info();
+    rbitcoin_log::capture_logs(true);
+    let _ = rbitcoin_log::take_logs();
+    let status = NodeStatus::new(Network::Regtest, false);
+    let handle = run_health("127.0.0.1:0".parse().unwrap(), status, false)
+        .await
+        .expect("health listen");
+    let mut opened = Vec::new();
+    for _ in 0..HEALTH_MAX_CONNECTIONS + EXTRA {
+        opened.push(
+            TcpStream::connect(handle.local_addr)
+                .await
+                .expect("connect"),
+        );
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let rejects = lines
+        .iter()
+        .filter(|(_, msg)| msg.contains("health: reject") && msg.contains("max connections"))
+        .count();
+    assert!(
+        (1..EXTRA).contains(&rejects),
+        "{rejects} reject lines for {EXTRA} refused sockets: {lines:?}"
+    );
+    drop(opened);
+}

@@ -276,13 +276,19 @@ pub async fn run_health(
                 Ok((io, peer)) => {
                     conns.0.retain(|t| !t.is_finished());
                     if !rbitcoin_net::listen::listener_fd_room() {
-                        warn!("health: reject {peer} (descriptor reserve)");
+                        rbitcoin_log::warn_repeated(
+                            rbitcoin_log::RepeatedInfo::DescriptorReserve,
+                            format_args!("health: reject {peer} (descriptor reserve)"),
+                        );
                         drop(io);
                         continue;
                     }
                     let Ok(permit) = sem.clone().try_acquire_owned() else {
-                        warn!(
-                            "health: reject {peer} (at max connections={HEALTH_MAX_CONNECTIONS})"
+                        rbitcoin_log::warn_repeated(
+                            rbitcoin_log::RepeatedInfo::HealthAtMaxConnections,
+                            format_args!(
+                                "health: reject {peer} (at max connections={HEALTH_MAX_CONNECTIONS})"
+                            ),
                         );
                         drop(io);
                         continue;

@@ -363,8 +363,9 @@ pub async fn run_electrum(
             match accept {
                 Ok((stream, peer)) => {
                     if !rbitcoin_net::listen::listener_fd_room() {
-                        rbitcoin_log::warn!(
-                            "electrum: reject {peer} (descriptor reserve)"
+                        rbitcoin_log::warn_repeated(
+                            rbitcoin_log::RepeatedInfo::DescriptorReserve,
+                            format_args!("electrum: reject {peer} (descriptor reserve)"),
                         );
                         drop(stream);
                         continue;

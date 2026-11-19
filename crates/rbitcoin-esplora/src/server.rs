@@ -1110,8 +1110,9 @@ fn spawn_capped<L: CappedAccept>(
                         Ok((io, peer)) => {
                             conns.0.retain(|t| !t.is_finished());
                             if !rbitcoin_net::listen::listener_fd_room() {
-                                rbitcoin_log::warn!(
-                                    "esplora: reject {peer:?} (descriptor reserve)"
+                                rbitcoin_log::warn_repeated(
+                                    rbitcoin_log::RepeatedInfo::DescriptorReserve,
+                                    format_args!("esplora: reject {peer:?} (descriptor reserve)"),
                                 );
                                 drop(io);
                                 continue;
