@@ -11,8 +11,8 @@
 //! reinit, cold install, and inserts). Large shards without a sidecar skip
 //! the scan and mark occupancy **unknown** (never treated as empty, never bulk-fill).
 //! A zero sidecar on a large shard is not proof the slots are empty: the table
-//! write can land before the sidecar rename. A bulk fill scans first and keeps
-//! any live slots.
+//! write can land before the sidecar rename. Open scans that head and keeps
+//! the count it finds. A head this process just created is still empty.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -197,7 +197,14 @@ impl ScriptHashHead {
             let _ = store_occ_sidecar(file.path(), occ);
             (occ, true)
         } else if let Some(occ) = load_occ_sidecar(file.path()) {
-            (occ, true)
+            // Torn sidecar: the slot table can be durable while `.occ` is still 0.
+            if occ == 0 {
+                let live = scan_occupied(&file, slots)?;
+                store_occ_sidecar(file.path(), live)?;
+                (live, true)
+            } else {
+                (occ, true)
+            }
         } else {
             // Multi‑GiB mainnet shard without sidecar: do **not** read every slot.
             // Occupancy unknown — never empty, never bulk-fill (see insert path).
@@ -355,24 +362,12 @@ impl ScriptHashHead {
             return Ok(());
         }
         // Bulk-fill only when occupancy is known empty — never when open skipped
-        // the scan (would overwrite a live multi‑GiB table). A large head whose
-        // sidecar is still 0 may already hold slots; scan before replacing them.
+        // the scan (would overwrite a live multi‑GiB table). Does not grow.
         {
             let state = self.state.lock().unwrap();
             if state.occ_known && state.occupied == 0 {
-                let slots = state.slots;
                 drop(state);
-                let body = slots.saturating_mul(SH_HEAD_SLOT_SIZE as u64);
-                if body > OCC_SCAN_BYTE_CAP {
-                    let live = scan_occupied(&self.file, slots)?;
-                    if live > 0 {
-                        self.set_occupied_known(live)?;
-                    } else {
-                        return self.bulk_fill_empty(&upserts);
-                    }
-                } else {
-                    return self.bulk_fill_empty(&upserts);
-                }
+                return self.bulk_fill_empty(&upserts);
             }
         }
 

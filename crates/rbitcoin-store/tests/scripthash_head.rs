@@ -127,6 +127,11 @@ fn zero_occ_sidecar_does_not_bulk_fill_over_live_slots() {
     drop(h);
     store_occ_sidecar(&path, 0).unwrap();
     let h = ScriptHashHead::open(&path).unwrap();
+    assert!(
+        !h.is_known_empty(),
+        "a zero .occ on a live head reported empty"
+    );
+    assert_eq!(h.occupied(), 1, "open kept the zero .occ count");
     let mut key_b = [0u8; 32];
     key_b[0] = 0x22;
     let val_b = ShHeadValue::inline_one(Fk(9));
@@ -137,8 +142,36 @@ fn zero_occ_sidecar_does_not_bulk_fill_over_live_slots() {
         "a zero .occ let the next insert overwrite the live head"
     );
     assert_eq!(h.get(&key_b).unwrap().unwrap().inline_fks(), vec![Fk(9)]);
+    assert_eq!(h.occupied(), 2, "open count plus the new key");
+    assert_eq!(load_occ_sidecar(&path), Some(2));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
+}
+
+/// `insert_many` must surface a `.occ` rename error. A directory at the
+/// sidecar path makes that rename fail.
+#[test]
+fn insert_many_returns_sidecar_rename_error() {
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-shhead-occ-dir-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let occ = occ_sidecar_path(&path);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&occ);
+    let h = ScriptHashHead::create_with_slots(&path, 8).unwrap();
+    std::fs::remove_file(&occ).unwrap();
+    std::fs::create_dir(&occ).unwrap();
+    let mut key = [0u8; 32];
+    key[0] = 1;
+    let err = h.insert_many(&[(key, ShHeadValue::inline_one(Fk(1)))]);
+    assert!(err.is_err(), "a sidecar rename error must fail insert_many");
+    drop(h);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&occ);
 }
 
 #[test]
