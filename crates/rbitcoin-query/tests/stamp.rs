@@ -37,7 +37,6 @@ fn skeleton_hit_skips_leftover_head() {
         ids: Arc::new(ids),
         spent: Arc::new(spent),
         n_out: Default::default(),
-        need_vouts: U64Map::default(),
     };
     let empty = InFlight::new();
     let st =
@@ -266,7 +265,6 @@ fn inflight_hit_adopts_skeleton_loc() {
         ids: Arc::new(ids),
         spent: Arc::new(spent),
         n_out: Arc::new(n_out),
-        need_vouts: U64Map::default(),
     };
     let st = stamp_external_parents(
         q.store(),

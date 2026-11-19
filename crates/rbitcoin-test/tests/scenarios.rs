@@ -1576,7 +1576,7 @@ fn pin_head_parent_via_waves_and_leftover_stamp(
         carried_need: w1
             .items
             .iter()
-            .flat_map(|(_, _, w)| w.spend_keys.iter().map(|&(t, _)| t))
+            .flat_map(|(_, _, w)| w.spend_keys.iter().copied())
             .collect(),
         carried_header_fks: Vec::new(),
         carried_header_hashes: Vec::new(),

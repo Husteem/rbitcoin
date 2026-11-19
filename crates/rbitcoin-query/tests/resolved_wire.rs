@@ -24,11 +24,11 @@ fn resolved_wire_stamps_n_inputs() {
         pres: Arc::clone(&wire.pres),
         n_inputs: 9,
         header_fk: 7,
-        spend_keys: Arc::from([([0x11u8; 32], 3)]),
+        spend_keys: Arc::from([[0x11u8; 32]]),
         sender: None,
     };
     assert_eq!(stamped.n_inputs, 9);
     assert_eq!(stamped.header_fk, 7);
     assert_eq!(wire.header_fk, 0);
-    assert_eq!(stamped.spend_keys.as_ref(), &[([0x11u8; 32], 3)]);
+    assert_eq!(stamped.spend_keys.as_ref(), &[[0x11u8; 32]]);
 }

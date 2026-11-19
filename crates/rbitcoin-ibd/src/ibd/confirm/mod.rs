@@ -1481,33 +1481,6 @@ pub fn split_wave_into_load_batches_kind(
     out
 }
 
-/// Per-chunk need-vouts from carried spend keys ∩ wave ids (no wire input walk).
-pub fn chunk_parent_ids(
-    wave: &rbitcoin_query::BatchParentIds,
-    items: &[(u32, [u8; 32], rbitcoin_query::ResolvedWire)],
-) -> rbitcoin_query::BatchParentIds {
-    let mut need_vouts: rbitcoin_query::U64Map<Vec<u32>> = rbitcoin_query::U64Map::default();
-    for (_, _, w) in items {
-        for &(prev, vout) in w.spend_keys.iter() {
-            if let Some((fk, _)) = wave.ids.get(&prev) {
-                if let Some(id) = fk.get() {
-                    need_vouts.entry(id).or_default().push(vout);
-                }
-            }
-        }
-    }
-    for vouts in need_vouts.values_mut() {
-        vouts.sort_unstable();
-        vouts.dedup();
-    }
-    rbitcoin_query::BatchParentIds {
-        ids: std::sync::Arc::clone(&wave.ids),
-        spent: std::sync::Arc::clone(&wave.spent),
-        n_out: std::sync::Arc::clone(&wave.n_out),
-        need_vouts,
-    }
-}
-
 /// Chunk a lookup wave into loadq batches; mark the last sent with `drop_below`.
 pub fn load_batches_from_wave(
     items: &[(u32, [u8; 32], rbitcoin_query::ResolvedWire)],
@@ -1529,7 +1502,7 @@ pub fn load_batches_from_wave(
         let chunk = &items[i..end];
         out.push(LoadBatch {
             items: chunk.to_vec(),
-            parent_ids: Some(chunk_parent_ids(wave_ids, chunk)),
+            parent_ids: Some(wave_ids.clone()),
             drop_inflight_below: None,
             epoch: 0,
             gen: 0,
@@ -2860,7 +2833,7 @@ pub fn spawn_confirm_engine(
                 let mut carried_header_fks = Vec::with_capacity(wire_batch.len());
                 let mut carried_header_hashes = Vec::with_capacity(wire_batch.len());
                 for (_, ha, w) in &wire_batch {
-                    for &(txid, _) in w.spend_keys.iter() {
+                    for &txid in w.spend_keys.iter() {
                         if txid != [0u8; 32] {
                             carried_need.push(txid);
                         }
