@@ -542,6 +542,8 @@ impl UringSession {
                 if unsafe { ring.submission().push(&sqe) }.is_err() {
                     Err(StoreError::BudgetFull("io_uring SQ"))
                 } else {
+                    #[cfg(debug_assertions)]
+                    crate::durability::count_flush();
                     Ok(())
                 }
             }

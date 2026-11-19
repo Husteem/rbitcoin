@@ -15,6 +15,9 @@ doctest = false
 [features]
 # Nightly cargo-mutants only. Off for the node build.
 mutants = ["dep:mutants"]
+# Skip file flushes in `suite` (`cargo test --workspace --features
+# skip-flushes`, TESTING.md).
+skip-flushes = []
 
 [dependencies]
 # Attribute only. cargo-mutants reads it; it does not change compiled code.

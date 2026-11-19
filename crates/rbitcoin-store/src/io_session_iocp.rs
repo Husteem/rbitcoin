@@ -156,7 +156,8 @@ impl IocpEngine {
     /// Windows has no overlapped `FlushFileBuffers`. Flush now and queue
     /// the completion.
     pub fn push_sync(&mut self, handle: IoHandle, user_data: u64) -> Result<(), StoreError> {
-        self.ready.push_back((user_data, handle.sync_data()));
+        self.ready
+            .push_back((user_data, handle.durable_sync_data()));
         Ok(())
     }
 

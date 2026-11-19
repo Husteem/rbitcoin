@@ -231,7 +231,7 @@ pub fn worker_loop(shared: Arc<SharedPool>) {
                 let buf = unsafe { std::slice::from_raw_parts_mut(job.ptr, job.len) };
                 job.handle.pread(job.offset, buf)
             }
-            JobOp::Sync => job.handle.sync_data(),
+            JobOp::Sync => job.handle.durable_sync_data(),
         };
         {
             let mut cq = job.cq.cqes.lock().unwrap_or_else(|e| e.into_inner());

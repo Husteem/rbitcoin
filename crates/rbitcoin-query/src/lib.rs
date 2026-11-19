@@ -147,6 +147,7 @@ use bitcoin::{
     TxMerkleNode, TxOut, Witness,
 };
 use rbitcoin_primitives::{le_u32, le_u64, Fk, Height};
+use rbitcoin_store::durability::Durable as _;
 
 fn spill_id_len(raw: &[u8], i: usize) -> (u64, usize) {
     let mut hdr = [0u8; 12];
@@ -1152,7 +1153,8 @@ impl Query {
                 .write(true)
                 .open(&path)
                 .map_err(|e| StoreError::io(&path, e))?;
-            file.sync_all().map_err(|e| StoreError::io(&path, e))?;
+            file.durable_sync_all()
+                .map_err(|e| StoreError::io(&path, e))?;
         }
         self.sync_spill_dir()
     }
