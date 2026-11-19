@@ -230,8 +230,42 @@ print(f"cjdns: TUN still dead after supervisor restart: {last}", file=sys.stderr
 sys.exit(1)
 PY
 
+cat >"$ROOT/restart-b.sh" <<RESTART
+#!/usr/bin/env bash
+set -euo pipefail
+sudo kill "\$(cat "$ROOT/b.pid")" 2>/dev/null || true
+sudo pkill -f "cjdroute core $ROOT/b\\\\." 2>/dev/null || true
+for _ in \$(seq 1 100); do ip link show rbtc1 >/dev/null 2>&1 || break; sleep 0.2; done
+if ip link show rbtc1 >/dev/null 2>&1; then
+  echo "cjdns: rbtc1 still up after stop" >&2
+  exit 1
+fi
+sudo bash -c 'exec setsid "\$1" --nobg <"\$2" >>"\$3" 2>&1' _ "$CJDNS_BIN" "$ROOT/b.conf" "$ROOT/b.log" &
+echo \$! >"$ROOT/b.pid"
+python3 - "$IPV6_B" <<'PY'
+import socket, sys, time
+ip = sys.argv[1]
+end = time.time() + 60
+last = ""
+while time.time() < end:
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        s.bind((ip, 0))
+        sys.exit(0)
+    except OSError as e:
+        last = str(e)
+    finally:
+        s.close()
+    time.sleep(0.2)
+print(f"cjdns: {ip} not back after restart: {last}", file=sys.stderr)
+sys.exit(1)
+PY
+RESTART
+chmod +x "$ROOT/restart-b.sh"
+
 cat >"$ROOT/env" <<EOF
 OVERLAY_CJDNS_A=${IPV6_A}
 OVERLAY_CJDNS_B=${IPV6_B}
+OVERLAY_CJDNS_RESTART_B=$ROOT/restart-b.sh
 EOF
 cat "$ROOT/env"

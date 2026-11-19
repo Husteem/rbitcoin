@@ -11,8 +11,9 @@ use rbitcoin_test::jsonrpc::write_rpc_token;
 use rbitcoin_test::mine::spend_anyone_can_spend;
 use rbitcoin_test::overlay::{
     base_node, ephemeral_addr, i2p_b32_from_dest, jsonrpc, jsonrpc_try, localaddresses,
-    require_env, socks_electrum_rpc, socks_http_get, spawn_node, wait_file, wait_i2p_stream,
-    wait_jsonrpc, wait_onion_port, wait_p2p_onion, wait_peer_network, wait_socks_onion, OverlayEnv,
+    require_env, restart_daemon, socks_electrum_rpc, socks_http_get, spawn_node, wait_file,
+    wait_i2p_stream, wait_jsonrpc, wait_onion_port, wait_p2p_onion, wait_peer_network,
+    wait_socks_onion, OverlayEnv,
 };
 use rbitcoin_test::TempDir;
 use serde_json::json;
@@ -317,6 +318,150 @@ async fn cjdns_tun_two_node() {
             .any(|r| { r["address"] == env.cjdns_a.to_string() && r["port"] == a_p2p.port() }),
         "cjdns listen must be a local address: {ainfo}"
     );
+
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tor_onion_comes_back_after_tor_restarts() {
+    let env = require_env();
+    let b_dir = TempDir::new().unwrap();
+    let a_dir = TempDir::new().unwrap();
+    let b_rpc = ephemeral_addr();
+    let a_rpc = ephemeral_addr();
+
+    let b = spawn_node(tor_b(&env, b_dir.path(), b_rpc), b_rpc).await;
+    generate_n(b_rpc, 3).await;
+    let (onion, port) = wait_p2p_onion(b_rpc, Duration::from_secs(90)).await;
+    wait_socks_onion(env.tor_socks, &onion, port, Duration::from_secs(90)).await;
+
+    restart_daemon(&env.tor_restart).await;
+    let again = wait_p2p_onion(b_rpc, Duration::from_secs(90)).await;
+    assert_eq!(
+        again,
+        (onion.clone(), port),
+        "the same onion after the restart"
+    );
+    wait_socks_onion(env.tor_socks, &onion, port, Duration::from_secs(90)).await;
+
+    let a = spawn_node(tor_a(&env, a_dir.path(), a_rpc, &onion, port), a_rpc).await;
+    wait_jsonrpc(
+        a_rpc,
+        "getblockcount",
+        json!([]),
+        Duration::from_secs(90),
+        |v| v["result"] == 3,
+    )
+    .await;
+    wait_peer_network(a_rpc, "onion", false, Duration::from_secs(30)).await;
+
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i2p_destination_comes_back_after_i2pd_restarts() {
+    let env = require_env();
+    let b_dir = TempDir::new().unwrap();
+    let a_dir = TempDir::new().unwrap();
+    let b_rpc = ephemeral_addr();
+    let a_rpc = ephemeral_addr();
+
+    write_rpc_token(b_dir.path());
+    let mut cfg_b = base_node(b_dir.path());
+    cfg_b.listen.p2p = P2pListen::Socket(ephemeral_addr());
+    cfg_b.listen.i2p_sam = Some(env.i2p_sam_b);
+    cfg_b.listen.i2p_accept_incoming = true;
+    cfg_b.listen.only_net = vec![OnlyNet::I2p];
+    cfg_b.rpc.listen = Some(b_rpc);
+    let b = spawn_node(cfg_b, b_rpc).await;
+    generate_n(b_rpc, 3).await;
+    let dest = wait_file(
+        &b_dir.path().join("i2p").join("p2p.priv"),
+        Duration::from_secs(180),
+    )
+    .await;
+    let b32 = i2p_b32_from_dest(&dest);
+    wait_i2p_stream(env.i2p_sam, &b32, Duration::from_secs(180)).await;
+
+    restart_daemon(&env.i2p_restart_b).await;
+    wait_jsonrpc(
+        b_rpc,
+        "getnetworkinfo",
+        json!([]),
+        Duration::from_secs(180),
+        |v| localaddresses(v).iter().any(|r| r["address"] == b32),
+    )
+    .await;
+    wait_i2p_stream(env.i2p_sam, &b32, Duration::from_secs(180)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    write_rpc_token(a_dir.path());
+    let mut cfg_a = base_node(a_dir.path());
+    cfg_a.listen.p2p = P2pListen::Off;
+    cfg_a.listen.i2p_sam = Some(env.i2p_sam);
+    cfg_a.listen.only_net = vec![OnlyNet::I2p];
+    cfg_a.listen.connect = vec![format!("{b32}:0").parse().unwrap()];
+    cfg_a.rpc.listen = Some(a_rpc);
+    let a = spawn_node(cfg_a, a_rpc).await;
+    wait_jsonrpc(
+        a_rpc,
+        "getblockcount",
+        json!([]),
+        Duration::from_secs(180),
+        |v| v["result"] == 3,
+    )
+    .await;
+    wait_peer_network(a_rpc, "i2p", false, Duration::from_secs(60)).await;
+
+    a.stop().await;
+    b.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cjdns_listener_works_after_cjdroute_restarts() {
+    let env = require_env();
+    let b_dir = TempDir::new().unwrap();
+    let a_dir = TempDir::new().unwrap();
+    let b_rpc = ephemeral_addr();
+    let a_rpc = ephemeral_addr();
+    let b_p2p = std::net::TcpListener::bind((env.cjdns_b, 0))
+        .and_then(|l| l.local_addr())
+        .unwrap_or_else(|e| panic!("bind {} (TUN missing?): {e}", env.cjdns_b));
+    let a_p2p = std::net::TcpListener::bind((env.cjdns_a, 0))
+        .and_then(|l| l.local_addr())
+        .unwrap_or_else(|e| panic!("bind {} (TUN missing?): {e}", env.cjdns_a));
+
+    write_rpc_token(b_dir.path());
+    let mut cfg_b = base_node(b_dir.path());
+    cfg_b.listen.p2p = P2pListen::Socket(b_p2p);
+    cfg_b.listen.cjdns_reachable = true;
+    cfg_b.listen.only_net = vec![OnlyNet::Cjdns];
+    cfg_b.rpc.listen = Some(b_rpc);
+    let b = spawn_node(cfg_b, b_rpc).await;
+    generate_n(b_rpc, 3).await;
+
+    restart_daemon(&env.cjdns_restart_b).await;
+
+    write_rpc_token(a_dir.path());
+    let mut cfg_a = base_node(a_dir.path());
+    cfg_a.listen.p2p = P2pListen::Socket(a_p2p);
+    cfg_a.listen.cjdns_reachable = true;
+    cfg_a.listen.only_net = vec![OnlyNet::Cjdns];
+    cfg_a.listen.connect = vec![NetAddr::from_str(&b_p2p.to_string()).unwrap()];
+    cfg_a.rpc.listen = Some(a_rpc);
+    let a = spawn_node(cfg_a, a_rpc).await;
+    wait_jsonrpc(
+        a_rpc,
+        "getblockcount",
+        json!([]),
+        Duration::from_secs(60),
+        |v| v["result"] == 3,
+    )
+    .await;
+    wait_peer_network(a_rpc, "cjdns", false, Duration::from_secs(20)).await;
+    wait_peer_network(b_rpc, "cjdns", true, Duration::from_secs(20)).await;
 
     a.stop().await;
     b.stop().await;

@@ -181,8 +181,40 @@ sam_hello "${SAMS[0]}" 180
 sam_hello "${SAMS[1]}" 180
 sleep 2
 
+cat >"$ROOT/restart-b.sh" <<RESTART
+#!/usr/bin/env bash
+set -euo pipefail
+dir="$ROOT/n1"
+pid="\$(cat "\$dir/i2pd.pid")"
+kill "\$pid"
+for _ in \$(seq 1 100); do kill -0 "\$pid" 2>/dev/null || break; sleep 0.2; done
+kill -9 "\$pid" 2>/dev/null || true
+i2pd --datadir "\$dir" --conf "\$dir/i2pd.conf" --address4 127.0.0.3 --reseed.zipfile "$ROOT/reseed.zip" --daemon
+python3 - ${SAMS[1]} <<'PY'
+import socket, sys, time
+port = int(sys.argv[1])
+end = time.time() + 180
+last = ""
+while time.time() < end:
+    try:
+        s = socket.create_connection(("127.0.0.1", port), 2)
+        s.sendall(b"HELLO VERSION MIN=3.1 MAX=3.1\n")
+        last = s.recv(1024).decode("utf-8", "replace")
+        s.close()
+        if "RESULT=OK" in last.upper():
+            sys.exit(0)
+    except OSError as e:
+        last = str(e)
+    time.sleep(0.4)
+print(f"SAM {port} not ready after restart: {last}", file=sys.stderr)
+sys.exit(1)
+PY
+RESTART
+chmod +x "$ROOT/restart-b.sh"
+
 cat >"$ROOT/env" <<EOF
 OVERLAY_I2P_SAM=127.0.0.1:${SAMS[0]}
 OVERLAY_I2P_SAM_B=127.0.0.1:${SAMS[1]}
+OVERLAY_I2P_RESTART_B=$ROOT/restart-b.sh
 EOF
 cat "$ROOT/env"
