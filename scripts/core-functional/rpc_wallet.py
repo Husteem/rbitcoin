@@ -214,6 +214,12 @@ class WalletHub:
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:
                 return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            # The error holds the open response. Left to the finalizer,
+            # Python 3.14 prints to stderr after the socket is gone, and
+            # Core's stop check fails on that stderr.
+            e.close()
+            raise RpcError(ERR_MISC, f"esplora unreachable: {e}") from e
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
             raise RpcError(ERR_MISC, f"esplora unreachable: {e}") from e
 
