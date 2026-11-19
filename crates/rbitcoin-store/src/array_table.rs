@@ -89,8 +89,13 @@ impl TipFlushHold {
     }
 
     /// Same order argument as [`AtomicBool::store`]. A clear notifies the flush.
+    /// Arming clears the entered bit so a flush that passed while the hold
+    /// was down does not count as this pause.
     pub fn store(&self, value: bool, order: Ordering) {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if value {
+            self.entered.store(false, Ordering::Release);
+        }
         self.flag.store(value, order);
         if !value {
             self.cv.notify_all();
@@ -99,8 +104,10 @@ impl TipFlushHold {
 
     fn wait_while_set(&self) {
         let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.entered.store(true, Ordering::Release);
-        self.cv.notify_all();
+        if self.flag.load(Ordering::Acquire) {
+            self.entered.store(true, Ordering::Release);
+            self.cv.notify_all();
+        }
         while self.flag.load(Ordering::Acquire) {
             guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
         }
