@@ -4491,6 +4491,52 @@ fn open_seals_unsealed_nontail_after_copied_roll() {
     let _ = std::fs::remove_dir_all(&copy);
 }
 
+/// Kill right after a roll, with the open cut landing in the new tail:
+/// open drops that tail, so the in-flight seal becomes the last segment.
+/// It has no table (its seal never published), and open must still
+/// rebuild it from Class A instead of failing on the missing table.
+#[test]
+fn open_cut_past_a_roll_rebuilds_the_in_flight_segment() {
+    let dir = tempfile_dir("cut-after-roll-live");
+    let copy = tempfile_dir("cut-after-roll-copy");
+    let txid_of = |i: u64| {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        txid
+    };
+    {
+        let t = TxTable::create_with_head_layout(&dir, HeadLayout::new(8).unwrap()).unwrap();
+        let recs: Vec<TxRecord> = (1..=205u64)
+            .map(|i| TxRecord {
+                txid: txid_of(i),
+                version: 1,
+                locktime: 0,
+                input_count: 0,
+                output_count: 0,
+            })
+            .collect();
+        t.put_full_batch_indexed(&meta_only_items(&recs), true)
+            .unwrap();
+        assert_eq!(t.head.sealed_segment_count(), 0, "seal still in flight");
+        assert_eq!(t.head.last_inserted_fk(), 205);
+        copy_tree(&dir, &copy);
+    }
+    let t = TxTable::open_seqsigwit(&copy, &copy, rbitcoin_store::HeadOpenOpts::TINY, Some(204))
+        .expect("open with a cut just past the roll");
+    assert_eq!(t.count(), 204);
+    for i in [1u64, 100, 204] {
+        assert_eq!(
+            t.probe_body_match_fk(&txid_of(i)).unwrap(),
+            Some(Fk(i)),
+            "fk={i}"
+        );
+    }
+    assert_eq!(t.probe_body_match_fk(&txid_of(205)).unwrap(), None);
+    drop(t);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&copy);
+}
+
 fn rec_meta(version: i32, locktime: u32, n_in: u32, n_out: u32) -> TxRecord {
     TxRecord {
         txid: [0u8; 32],
