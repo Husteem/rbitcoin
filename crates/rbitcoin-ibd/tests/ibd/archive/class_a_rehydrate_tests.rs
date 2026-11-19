@@ -146,13 +146,11 @@ fn bq_rehydrate_residue_keep_drop_gap_and_unknown() {
     let time = 1_300_000_000u32;
     let mut prev = gen;
     let mut hashes = Vec::new();
-    let mut headers = Vec::new();
     let mut fks = Vec::new();
     for h in 1u32..=4 {
         let b = mine(prev, time + h * 600, h);
         fks.push(hub.ensure_header_fk(&b.header).unwrap());
         hashes.push(b.block_hash());
-        headers.push(b.header);
         prev = b.block_hash();
     }
 
@@ -174,11 +172,9 @@ fn bq_rehydrate_residue_keep_drop_gap_and_unknown() {
     hub.query
         .block_queue_enqueue(2, hashes[1].to_byte_array(), fks[1].0, b"wire2")
         .unwrap();
-    hub.note_confirmed_tip(&[(3, hashes[2])], &[headers[2]])
-        .unwrap();
     assert!(
-        hub.has_block(&hashes[2]),
-        "stale confirmed-set must not dequeue above-tip wire"
+        !hub.has_block(&hashes[2]),
+        "a stored header that is not connected is not a held block"
     );
     assert_eq!(hub.tip_height(), Some(0));
     hub.query

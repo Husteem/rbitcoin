@@ -1990,31 +1990,33 @@ fn reopened_chain_seeds_heights_between_genesis_and_the_tip() {
 }
 
 #[test]
-fn confirmed_seed_does_not_restore_a_disconnected_block() {
+fn has_block_follows_the_best_chain_across_rewind_and_restart() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let mut prev = hub.tip_hash().unwrap();
     let mut time = hub.tip_header().unwrap().time;
-    let mut gone = Vec::new();
-    for h in 1..=3u32 {
+    let mut chain = Vec::new();
+    for h in 1..=6u32 {
         time = time.saturating_add(1);
         let b = mine(prev, time, h);
         prev = b.block_hash();
-        gone.push(prev);
+        chain.push(prev);
         hub.accept_block(b).unwrap();
     }
-    hub.rewind_to_height(0).unwrap();
-    for (h, hash) in (1u32..).zip(&gone) {
-        assert!(
-            !hub.has_block(hash),
-            "rewind drops disconnected height {h} from the confirmed set"
-        );
+    hub.rewind_to_height(3).unwrap();
+    let (kept, gone) = chain.split_at(3);
+    for (h, hash) in (4u32..).zip(gone) {
+        assert!(!hub.has_block(hash), "rewind drops disconnected height {h}");
     }
-    publish_confirmed_heights(&hub.query, &hub.confirmed);
-    for (h, hash) in (1u32..).zip(&gone) {
+    let hub = restart_hub(&dir, hub);
+    hub.cache.clear();
+    for (h, hash) in (1u32..).zip(kept) {
+        assert!(hub.has_block(hash), "restart answers confirmed height {h}");
+    }
+    for (h, hash) in (4u32..).zip(gone) {
         assert!(
             !hub.has_block(hash),
-            "the seed copy must not put height {h} back"
+            "restart does not bring back height {h}"
         );
     }
     assert!(

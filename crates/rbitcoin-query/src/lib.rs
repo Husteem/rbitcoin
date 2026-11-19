@@ -795,14 +795,16 @@ impl MilestonePath {
     }
 }
 
-/// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
-/// `tip == None` means empty (open / invalidate); any other tip is incremental.
+/// In-process hash→height map for the confirmed tip chain (~74 MiB at a
+/// ~962k tip). Block hashes are uniform, so the key hashes as its own first
+/// eight bytes. `tip == None` means empty (open / invalidate); any other tip
+/// is incremental.
 #[derive(Default)]
 #[doc(hidden)]
 pub struct HeightByHashIndex {
     /// Tip height the map matches (`None` = empty / needs rebuild).
     pub tip: Option<u32>,
-    pub map: HashMap<[u8; 32], u32>,
+    pub map: TxidMap<u32>,
 }
 
 impl Query {
@@ -3102,7 +3104,7 @@ impl Query {
     ///
     /// Does **not** walk the confirmed chain (that was O(tip) per call and froze
     /// IBD when thousands of header-only rows existed). Callers that need
-    /// "confirmed or archived" should check the confirmed set / tip first.
+    /// "confirmed or archived" should check the height index / tip first.
     pub fn is_block_archived(&self, hash: &[u8; 32]) -> Result<bool, QueryError> {
         let Some((fk, _)) = self.get_header_by_hash(hash)? else {
             return Ok(false);

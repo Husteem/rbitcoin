@@ -10,7 +10,8 @@ fn op_true() -> ScriptBuf {
 
 struct TipAnnouncePad {
     store: rbitcoin_query::testutil::TempDir,
-    // Confirmed-set seed still reads the builder store after that hub drops.
+    // Kept for the pad's lifetime, so no reader of the dropped builder hub
+    // sees its store removed.
     _built: rbitcoin_query::testutil::TempDir,
 }
 

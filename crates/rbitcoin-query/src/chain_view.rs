@@ -349,33 +349,6 @@ impl Query {
         })
     }
 
-    /// Best-chain hashes from the height index, when that index is at or
-    /// behind the store tip.
-    ///
-    /// `None` when the index is empty or still ahead of the store. The caller
-    /// holds [`Self::lock_tip_commit`]: a disconnect shrinks this index before
-    /// it releases that lock, so the returned hashes are still on the chain.
-    pub fn indexed_chain_hashes(&self) -> Option<Vec<[u8; 32]>> {
-        let tip = self.tip_height()?.0;
-        self.with_height_index(|index| {
-            let indexed = index.tip?;
-            if indexed > tip {
-                return None;
-            }
-            let hashes: Vec<[u8; 32]> = index
-                .map
-                .iter()
-                .filter(|(_, height)| **height <= indexed)
-                .map(|(hash, _)| *hash)
-                .collect();
-            if hashes.is_empty() {
-                None
-            } else {
-                Some(hashes)
-            }
-        })
-    }
-
     /// Stored body on the active chain or disconnected by this process.
     ///
     /// An archived span alone does not prove a successful connection. A

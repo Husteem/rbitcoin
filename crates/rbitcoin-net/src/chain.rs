@@ -648,8 +648,6 @@ pub struct ChainHub {
     pub milestone: Milestone,
     pub notify: Arc<Notify>,
     pub tip_tx: broadcast::Sender<TipEvent>,
-    /// Best-chain confirmed block hashes (O(1) `has_block` for IBD hot path).
-    pub confirmed: Arc<RwLock<HashSet<BlockHash>>>,
     /// Serializes tip connect / reorg so multi-peer accept cannot double Class A+C.
     pub connect_lock: std::sync::Mutex<()>,
     /// Serializes one `generate` call, from pool selection through the last
@@ -865,10 +863,6 @@ impl ChainHub {
     pub fn new(query: Query, params: ChainParams, milestone: Milestone) -> Self {
         let (tip_tx, _) = broadcast::channel(64);
         let query = Arc::new(query);
-        let confirmed = Arc::new(RwLock::new(seed_confirmed_tip(&query)));
-        // Full confirmed-set fill in background (mainnet-scale tips make a
-        // synchronous walk multi-minute). Tip/genesis are seeded immediately.
-        spawn_confirmed_seed(query.clone(), confirmed.clone());
         let invalidated = Invalidated::open(query.store().path());
         let header_report = HeaderReport::new(invalidated.set.read().unwrap().clone());
         Self {
@@ -878,7 +872,6 @@ impl ChainHub {
             milestone,
             notify: Arc::new(Notify::new()),
             tip_tx,
-            confirmed,
             connect_lock: std::sync::Mutex::new(()),
             generate_lock: tokio::sync::Mutex::new(()),
             generate_fail_before: AtomicU32::new(0),
@@ -1397,7 +1390,7 @@ impl ChainHub {
         self.query.wire_header_at_height(Height(h)).ok()
     }
 
-    /// Tip, confirmed set, or the recent body cache already has `hash`.
+    /// Tip, best chain, or the recent body cache already has `hash`.
     #[doc(hidden)]
     pub fn already_have(&self, hash: BlockHash) -> bool {
         self.tip_hash() == Some(hash) || self.has_block(&hash)
@@ -1405,18 +1398,18 @@ impl ChainHub {
 
     /// True if `hash` is on the confirmed best chain (or in the RAM tip cache).
     ///
-    /// Uses an in-memory set (tip seeded immediately; full chain filled in the
-    /// background on connect). Must **not** fall back to `height_of_hash` here —
-    /// header-only archive rows would force multi-thousand-height scans per call.
+    /// Reads the published height index, as [`Self::is_connected`] does. Must
+    /// **not** fall back to `height_of_hash` here — header-only archive rows
+    /// would force multi-thousand-height scans per call.
     pub fn has_block(&self, hash: &BlockHash) -> bool {
-        self.cache.has_body(hash) || self.confirmed.read().unwrap().contains(hash)
+        self.cache.has_body(hash) || self.is_connected(hash)
     }
 
     /// True if `hash` is connected on the best chain (has a height).
     ///
     /// Download / fork-start decisions must use this, not [`Self::has_block`]:
-    /// the RAM body cache can evict, and `confirmed` is insert-only across
-    /// reorgs. A stale "we have it" would permanently suppress getdata.
+    /// the RAM body cache can evict. A stale "we have it" would permanently
+    /// suppress getdata.
     /// The check is the published height index only. A lagging index is a
     /// miss, not a header-store walk.
     pub fn is_connected(&self, hash: &BlockHash) -> bool {
@@ -2528,9 +2521,7 @@ impl ChainHub {
                 }
             }
         }
-        let mut confirmed = self.confirmed.write().unwrap();
         for (&(height, hash), header) in need_meta.iter().zip(headers.iter()) {
-            confirmed.insert(hash);
             let _ = self.tip_tx.send(TipEvent {
                 height,
                 hash,
@@ -2538,7 +2529,6 @@ impl ChainHub {
                 reorg_branch_len: 0,
             });
         }
-        drop(confirmed);
         self.notify.notify_waiters();
         if let Some(&(height, _)) = need_meta.last() {
             self.query.release_index_writebehind(Height(height));
@@ -2722,11 +2712,6 @@ impl ChainHub {
             }
             rbitcoin_query::confirm_wire_run(&self.query, &self.params, self.milestone, &blocks)
                 .map_err(NetError::from_confirm)?;
-            let mut confirmed = self.confirmed.write().unwrap();
-            for hash in hashes.iter().skip(hashes.len() - n as usize) {
-                confirmed.insert(*hash);
-            }
-            drop(confirmed);
             left -= n;
         }
         self.ensure_chain_work_prefix()?;
@@ -3935,7 +3920,6 @@ impl ChainHub {
                     .map_err(NetError::store)?;
             }
             self.cache.clear();
-            self.confirmed.write().unwrap().clear();
             return Ok(());
         };
         let gone = self.disconnect_harvest_in_commit(fh)?;
@@ -4656,7 +4640,6 @@ impl ChainHub {
         }
         let mp_strip_ns = t_mp.elapsed().as_nanos() as u64;
         let wall_ns = t_wall.elapsed().as_nanos() as u64;
-        self.confirmed.write().unwrap().insert(hash);
         let tx_count = block.txdata.len();
         let owned = Arc::try_unwrap(block).unwrap_or_else(|a| (*a).clone());
         self.cache.push_best(height, owned);
@@ -4746,18 +4729,9 @@ impl ChainHub {
             if h.0 <= keep_height {
                 break;
             }
-            let gone = self.query.header_at_height(h).map_err(NetError::store)?;
             let res = self.query.disconnect_tip_keep_pending_in_commit();
             // A failed disconnect can still have lowered the store tip.
             let now = self.query.tip_height().map_or(0, |t| t.0);
-            if now < h.0 {
-                if let Some((_, rec)) = gone {
-                    self.confirmed
-                        .write()
-                        .unwrap()
-                        .remove(&BlockHash::from_byte_array(rec.hash));
-                }
-            }
             self.cache.truncate_to_height(now);
             res.map_err(NetError::store)?;
         }
@@ -5647,73 +5621,6 @@ pub fn log_tip_accept_sh(
         sh,
     });
     debug!("tip: accept {line}");
-}
-
-/// Immediate seed: genesis + tip (and tip-1) so open is O(1) at mainnet scale.
-#[doc(hidden)]
-pub fn seed_confirmed_tip(query: &Query) -> HashSet<BlockHash> {
-    let mut set = HashSet::new();
-    let Some(tip) = query.tip_height() else {
-        return set;
-    };
-    for h in [0u32, tip.0.saturating_sub(1), tip.0] {
-        if let Ok(Some((_, rec))) = query.header_at_height(Height(h)) {
-            set.insert(BlockHash::from_byte_array(rec.hash));
-        }
-    }
-    set
-}
-
-/// Publish the best chain into `confirmed` from the height index.
-///
-/// Open already read each header to build that index. The copy holds the tip
-/// commit, which a disconnect also holds while it drops hashes above the new
-/// tip, so a block removed before the copy is not inserted again.
-#[doc(hidden)]
-pub fn publish_confirmed_heights(query: &Query, confirmed: &RwLock<HashSet<BlockHash>>) -> bool {
-    let Ok(_commit) = query.lock_tip_commit() else {
-        warn!("ibd: confirmed-set seed skipped; tip flush failed");
-        return false;
-    };
-    let Some(hashes) = query.indexed_chain_hashes() else {
-        warn!("ibd: confirmed-set seed skipped; height index does not match the tip");
-        return false;
-    };
-    let mut g = confirmed.write().unwrap();
-    g.reserve(hashes.len());
-    for hash in hashes {
-        g.insert(BlockHash::from_byte_array(hash));
-    }
-    true
-}
-
-/// Fill the rest of the confirmed set without blocking P2P start.
-#[doc(hidden)]
-pub fn spawn_confirmed_seed(query: Arc<Query>, confirmed: Arc<RwLock<HashSet<BlockHash>>>) {
-    let Some(tip) = query.tip_height() else {
-        return;
-    };
-    if tip.0 <= 2 {
-        return;
-    }
-    let run = move || {
-        let t0 = std::time::Instant::now();
-        if publish_confirmed_heights(&query, &confirmed) {
-            info!(
-                "ibd: confirmed-set seed complete tip={} in {:?}",
-                tip.0,
-                t0.elapsed()
-            );
-        }
-    };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn_blocking(run);
-    } else {
-        std::thread::Builder::new()
-            .name("confirmed-seed".into())
-            .spawn(run)
-            .ok();
-    }
 }
 
 use crate::most_work::work_better;
