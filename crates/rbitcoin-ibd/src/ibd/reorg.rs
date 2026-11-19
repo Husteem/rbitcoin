@@ -127,7 +127,9 @@ pub const REWIND_MAX_DEPTH: u32 = 1_024;
 /// blocks. A competing tip+1 walks `rewind_cap + 1` headers to the deepest
 /// LCA that rewind takes. Under the floor that is 65,537 header reads; a
 /// proved walk keeps [`ANCESTOR_WALK_MAX`], so it selects no fork deeper
-/// than it did before.
+/// than it did before. Selection takes `rewind_cap` from
+/// [`super::header_walk::walk_depth_cap`], which reads no header under
+/// `shared`.
 #[doc(hidden)]
 pub fn ancestor_walk_max(rewind_cap: u32) -> usize {
     ANCESTOR_WALK_MAX.max(rewind_cap as usize + 1)
@@ -402,8 +404,7 @@ pub fn consider_disconnected_heavier(
 /// rewinds to it; the header thread's rewind does not see it. A candidate
 /// that is not stored has no parent, so no rewind is prepared for it. A tip
 /// as far above the confirmed tip as the widest [`ancestor_walk_max`] is not
-/// named: that walk ends above every connected header. The cap in force is
-/// not read here, since its chain-work read would run under `shared`.
+/// named: that walk ends above every connected header.
 fn unplanted_walk_tip(st: &super::state::IbdWorkState, hub: &ChainHub) -> Option<BlockHash> {
     let tip_h = hub.tip_height()?;
     let planted =
@@ -519,7 +520,7 @@ pub fn maybe_rewind_to_best_work(
 ) -> Result<bool, NetError> {
     let cands = rewind_candidate_hashes(st, hub)?;
     let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
-    let walk_max = ancestor_walk_max(super::header_walk::rewind_depth_cap(st, hub));
+    let walk_max = ancestor_walk_max(super::header_walk::walk_depth_cap(st, hub));
     let Some(path) = select_heavier_path(hub, &cands, &invalid, walk_max)? else {
         return Ok(false);
     };
@@ -783,12 +784,11 @@ pub(crate) fn apply_off_lock_rewind(
     let _gate = rewind_exclusion()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    let (origin, proven) = {
+    let walk_max = {
         let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-        (st.header_walk.origin, st.header_walk.proven)
+        ancestor_walk_max(super::header_walk::walk_depth_cap(&st, hub))
     };
-    let walk_cap = super::header_walk::rewind_depth_cap_of(origin, proven, hub);
-    let Some(path) = select_heavier_path(hub, cands, invalid, ancestor_walk_max(walk_cap))? else {
+    let Some(path) = select_heavier_path(hub, cands, invalid, walk_max)? else {
         return Ok(false);
     };
     let tip_before = tip_pair(hub);

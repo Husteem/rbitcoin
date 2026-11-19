@@ -713,6 +713,35 @@ fn selection_walk_covers_every_rewind_cap() {
     assert_eq!(ancestor_walk_max(REWIND_MAX_DEPTH), ANCESTOR_WALK_MAX);
 }
 
+/// Selection reads its walk bound under `shared`, so only the in-memory
+/// chain-work prefix decides it. A cold prefix keeps a proved walk wide; a
+/// warm one narrows it once the confirmed tip meets the floor.
+#[test]
+fn the_walk_bound_reads_no_header_under_shared() {
+    use rbitcoin_ibd::ibd::header_walk::{walk_depth_cap, UNPROVEN_LEAD_BLOCKS};
+    let (dir, mut hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    hub.confirm_empty_regtest(3).unwrap();
+    hub.milestone = floor_at(hub.chain_work().unwrap());
+    hub.test_clear_chain_work_prefix();
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.header_walk.origin = true;
+    st.header_walk.proven = true;
+    let _probe = rbitcoin_store::HeaderThreadProbe::arm();
+    {
+        let _held = rbitcoin_store::CoordSharedLock::enter();
+        assert_eq!(walk_depth_cap(&st, &hub), UNPROVEN_LEAD_BLOCKS);
+    }
+    assert_eq!(rbitcoin_store::coord_lock_store_reads(), 0);
+    assert!(hub.cached_chain_work().is_none(), "the prefix stays cold");
+    hub.ensure_chain_work_prefix().unwrap();
+    assert_eq!(walk_depth_cap(&st, &hub), REWIND_MAX_DEPTH);
+    hub.milestone = floor_just_above(hub.chain_work().unwrap());
+    assert_eq!(walk_depth_cap(&st, &hub), UNPROVEN_LEAD_BLOCKS);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// An unplanted walk tip as far above the confirmed tip as the widest walk
 /// is not walked: that walk ends before any connected header. One height
 /// lower it is. The recorded height alone decides, so a short fork stands in
