@@ -708,7 +708,8 @@ async fn tall_unknown_parent_skips_reconstruct(
     );
 }
 
-/// Bad proof-of-work disconnects. A stamp past the two-hour window does not.
+/// Bad proof-of-work and a stamp at or below the parent's median time past
+/// disconnect. A stamp past the two-hour window does not.
 async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub) {
     let gen = hub.tip_hash().unwrap();
     let tip_time = hub.tip_header().unwrap().time;
@@ -772,6 +773,42 @@ async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub)
         "an unrequested block with an all-zero parent must disconnect"
     );
     assert!(!hub.knows_header(&zero_prev.block_hash()));
+
+    // A stamp at or below the parent's median time past never becomes valid:
+    // the median depends only on the block's ancestors.
+    let too_old = rbitcoin_consensus::mine_regtest_paying(gen, 1, next_h, op_true(), vec![]);
+    let old_err = hub.ensure_header(&too_old.header).unwrap_err();
+    assert!(
+        !rbitcoin_net::chain::accept_err_is_temporary_time(&old_err),
+        "a stamp at or below the median time past is not temporary: {old_err}"
+    );
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(too_old.block_hash());
+    push(
+        hub,
+        &out_tx,
+        &mut follow,
+        None,
+        NetworkMessage::Block(too_old.clone()),
+    )
+    .await;
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "time-too-old must disconnect a requested block"
+    );
+    let mut follow = PeerFollowState::new();
+    push(
+        hub,
+        &out_tx,
+        &mut follow,
+        None,
+        NetworkMessage::Block(too_old),
+    )
+    .await;
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "time-too-old must disconnect an unrequested block"
+    );
 
     let now = u32::try_from(
         std::time::SystemTime::now()

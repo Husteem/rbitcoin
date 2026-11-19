@@ -586,10 +586,12 @@ fn soften_parent_header(
     result
 }
 
+/// Only a stamp past the two-hour window can become valid, once the clock
+/// catches up. A stamp at or below the parent's median never does.
 fn rules_are_temporary_time(e: &rbitcoin_consensus::ConsensusError) -> bool {
     matches!(
         rbitcoin_consensus::block_reject_reason(e).as_str(),
-        "time-too-old" | "time-too-new"
+        "time-too-new"
     )
 }
 
@@ -600,10 +602,7 @@ pub fn accept_err_is_temporary_time(e: &NetError) -> bool {
     match e {
         NetError::Consensus(s) | NetError::ConnectFailed { msg: s, .. } => {
             let s = s.to_ascii_lowercase();
-            s.contains("time-too-new")
-                || s.contains("time-too-old")
-                || s.contains("timestamp too far in future")
-                || s.contains("median-time-past")
+            s.contains("time-too-new") || s.contains("timestamp too far in future")
         }
         _ => false,
     }
