@@ -3620,6 +3620,10 @@ pub struct PeerFollowState {
     /// earlier lets it leave before the rest of that reply. A later ping
     /// replaces this nonce.
     pub parked_pong: Option<u64>,
+    /// Last hash of a full 500-entry `getblocks` page (Core
+    /// `m_continuation_block`). Serving that block queues one `MSG_BLOCK` inv
+    /// of the tip, which makes the peer send the next `getblocks`.
+    pub continuation_block: Option<BlockHash>,
 }
 
 /// A live session's follow state. Dropping it, including when
@@ -3668,6 +3672,7 @@ impl PeerFollowState {
             getdata_tail: VecDeque::new(),
             getblocktxn_tail: VecDeque::new(),
             parked_pong: None,
+            continuation_block: None,
         }
     }
 }
@@ -4578,6 +4583,9 @@ fn getheaders_apply(
     Ok((headers, withhold_stale, empty_tip))
 }
 
+/// Core's `getblocks` page (`nLimit`).
+const GETBLOCKS_PAGE: usize = 500;
+
 #[doc(hidden)]
 pub async fn on_getblocks(
     hub: &ChainHub,
@@ -4605,9 +4613,14 @@ pub async fn on_getblocks(
         .into_iter()
         .map(|h| h.block_hash())
         .take_while(|h| *h != gb.stop_hash)
-        .take(500)
+        .take(GETBLOCKS_PAGE)
         .map(Inventory::Block)
         .collect();
+    if inv.len() == GETBLOCKS_PAGE {
+        if let Some(Inventory::Block(last)) = inv.last() {
+            follow.continuation_block = Some(*last);
+        }
+    }
     if !inv.is_empty() {
         queue_accounted(session, out_tx, NetworkMessage::Inv(inv))?;
     }
@@ -4662,10 +4675,20 @@ pub async fn serve_getdata_tail(
             // holds the requester's getdata until the stall floor.
             // The header check and the body reconstruct both run on the
             // blocking pool. A missing header or body is `false`.
-            Inventory::Block(h) | Inventory::WitnessBlock(h)
-                if !serve_getdata_full_block(hub, out_tx, session, h).await? =>
-            {
-                notfound.push(item);
+            Inventory::Block(h) | Inventory::WitnessBlock(h) => {
+                if !serve_getdata_full_block(hub, out_tx, session, h).await? {
+                    notfound.push(item);
+                } else if follow.continuation_block == Some(*h) {
+                    // Core sends this right after the block, even when redundant.
+                    follow.continuation_block = None;
+                    if let Some(tip) = hub.tip_hash() {
+                        queue_accounted(
+                            session,
+                            out_tx,
+                            NetworkMessage::Inv(vec![Inventory::Block(tip)]),
+                        )?;
+                    }
+                }
             }
             Inventory::CompactBlock(h) => {
                 serve_getdata_compact(hub, out_tx, follow, session, h).await?;

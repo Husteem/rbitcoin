@@ -314,6 +314,59 @@ fn getblocks_stops_before_hash_stop() {
     assert_eq!(inv, want, "hashStop is not announced");
 }
 
+/// Serve one block `getdata` and return everything it queued.
+fn getdata_out(
+    rt: &tokio::runtime::Runtime,
+    hub: &ChainHub,
+    follow: &mut PeerFollowState,
+    item: Inventory,
+) -> Vec<PeerOut> {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    rt.block_on(serve_getdata(hub, &out_tx, follow, None, vec![item]))
+        .expect("getdata");
+    std::iter::from_fn(|| out_rx.try_recv().ok()).collect()
+}
+
+/// Core's full 500-entry `getblocks` page saves its last hash
+/// (`m_continuation_block`). The `getdata` of that block is followed by one
+/// `MSG_BLOCK` inv of the tip. bitcoinj asks for the next page only after that
+/// inv, so without it a chain past 500 blocks stops on the first page.
+#[test]
+fn getblocks_full_page_continues_with_a_tip_inv() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getblocks-continue");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(510, op_true(), vec![]).unwrap();
+    let chain = best_chain_from_1(&hub, 510);
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+    let mut follow = PeerFollowState::new();
+    let inv = getblocks_inv(
+        &hub,
+        &mut follow,
+        &GetBlocksMessage::new(vec![genesis], BlockHash::all_zeros()),
+    );
+    let want: Vec<Inventory> = chain[..500].iter().copied().map(Inventory::Block).collect();
+    assert_eq!(inv, want, "a full page is heights 1..=500");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getdata runtime");
+
+    let out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(chain[498]));
+    assert_eq!(out.len(), 1, "a block inside the page is served alone");
+    assert_eq!(served_block(out.into_iter().next().unwrap()).block_hash(), chain[498]);
+
+    let mut out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(chain[499])).into_iter();
+    assert_eq!(served_block(out.next().expect("block")).block_hash(), chain[499]);
+    let NetworkMessage::Inv(tip) = out.next().expect("tip inv after the last page block").expect_msg() else {
+        panic!("the continuation is an inv");
+    };
+    assert_eq!(tip, vec![Inventory::Block(chain[509])], "one MSG_BLOCK inv of the tip");
+    assert!(out.next().is_none());
+
+    let out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(chain[499]));
+    assert_eq!(out.len(), 1, "the continuation fires once");
+}
+
 /// Headers peer gets one header. Inv peer gets `MSG_BLOCK`, not a witness inv.
 #[test]
 fn tip_announce_headers_versus_inv() {
