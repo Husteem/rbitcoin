@@ -3109,7 +3109,6 @@ pub fn dispatch_pinned(
                     config.max_scripthash_subs
                 ));
             }
-            sh_subs.insert(sh);
             let status = if let Some(mp) = mempool {
                 scripthash_status_full_slot(query, mp, &sh, sh_join)?
             } else {
@@ -3118,6 +3117,7 @@ pub fn dispatch_pinned(
                     .map_err(|e| e.to_string())?;
                 scripthash_status(&hist)
             };
+            sh_subs.insert(sh);
             Ok(status_json(status))
         }
         "blockchain.scripthash.unsubscribe" => {
