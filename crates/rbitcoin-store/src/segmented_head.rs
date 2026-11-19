@@ -1125,9 +1125,28 @@ impl SegmentedTxHead {
             return Ok(false);
         }
         let dropped: Vec<u32> = segs[keep..].iter().map(|seg| seg.file_id).collect();
+        let mut kept = segs[..keep].to_vec();
+        // A cut just past a roll leaves the in-flight seal as the tail. Open
+        // never loaded its table, so it gets an empty one, and the caller's
+        // tail rebuild refills it from Class A.
+        if let Some(last) = kept.last_mut() {
+            if !last.sealed && last.head.is_none() {
+                *last = Arc::new(Segment {
+                    first_fk: last.first_fk,
+                    count: AtomicU64::new(last.count.load(Ordering::Relaxed)),
+                    file_id: last.file_id,
+                    sealed: false,
+                    tagged: AtomicBool::new(last.tagged.load(Ordering::Relaxed)),
+                    head: Some(Arc::new(AddressHead::empty(self.layout))),
+                    loaded_generation: None,
+                    pack: None,
+                    fuse: None,
+                });
+            }
+        }
         {
             let mut guard = self.segments.write().unwrap_or_else(|e| e.into_inner());
-            *guard = Arc::new(segs[..keep].to_vec());
+            *guard = Arc::new(kept);
         }
         self.persist_meta_locked()?;
         drop(segs);
