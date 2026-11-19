@@ -1495,7 +1495,11 @@ fn every_torn_txstat_stamp_reads_unstamped_and_restamps() {
     let changed: Vec<PathBuf> = stamped
         .iter()
         .filter(|(rel, bytes)| sealed.get(*rel) != Some(*bytes))
-        .filter(|(rel, _)| rel.to_string_lossy().starts_with("txstat."))
+        .filter(|(rel, _)| {
+            let name = rel.to_string_lossy();
+            // `.kept` is the pre-stamp prefix, not one of the three stamp records.
+            name.starts_with("txstat.") && !name.ends_with(".kept")
+        })
         .map(|(rel, _)| rel.clone())
         .collect();
     assert_eq!(changed.len(), 3, "stamp writes: {changed:?}");

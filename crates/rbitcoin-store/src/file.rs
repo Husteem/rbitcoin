@@ -401,6 +401,10 @@ pub struct TableFile {
     pub needs_sync: AtomicBool,
     /// Class A: copy a synced partial 4 KiB tail aside before a write overlaps it.
     keep_tail: AtomicBool,
+    /// Held across a tail rewrite and across the Class A sync that unlinks `.kept`.
+    ///
+    /// Re-locked by the same thread when a bulk write falls back into `pwrite_all`.
+    tail_keep: Mutex<()>,
     /// Header still names a longer end than `published_len`. A grow must store
     /// the short end before it extends the file, or open loads the old end.
     hwm_behind: AtomicBool,
@@ -536,6 +540,50 @@ pub fn set_file_len(file: &File, path: &Path, new_len: u64) -> Result<(), StoreE
     }
 }
 
+thread_local! {
+    static TAIL_KEEP_HELD: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Cross-thread exclusion for a Class A tail rewrite and the sync that unlinks it.
+pub(crate) struct TailKeepGuard<'a> {
+    key: usize,
+    _guard: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl Drop for TailKeepGuard<'_> {
+    fn drop(&mut self) {
+        TAIL_KEEP_HELD.with(|held| {
+            let mut keys = held.borrow_mut();
+            if let Some(i) = keys.iter().rposition(|k| *k == self.key) {
+                keys.remove(i);
+            }
+        });
+    }
+}
+
+fn lock_one_tail(file: &TableFile) -> TailKeepGuard<'_> {
+    let key = std::ptr::from_ref(file) as usize;
+    let already = TAIL_KEEP_HELD.with(|held| held.borrow().contains(&key));
+    if already {
+        TAIL_KEEP_HELD.with(|held| held.borrow_mut().push(key));
+        return TailKeepGuard { key, _guard: None };
+    }
+    let guard = file.tail_keep.lock().unwrap_or_else(|e| e.into_inner());
+    TAIL_KEEP_HELD.with(|held| held.borrow_mut().push(key));
+    TailKeepGuard {
+        key,
+        _guard: Some(guard),
+    }
+}
+
+/// Lock `files` in address order. One file locked twice in the slice counts once.
+pub(crate) fn lock_tails<'a>(files: &[&'a TableFile]) -> Vec<TailKeepGuard<'a>> {
+    let mut order: Vec<&TableFile> = files.to_vec();
+    order.sort_by_key(|file| std::ptr::from_ref(*file) as usize);
+    order.dedup_by_key(|file| std::ptr::from_ref(*file) as usize);
+    order.into_iter().map(lock_one_tail).collect()
+}
+
 impl TableFile {
     pub fn create(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
         let path = path.into();
@@ -564,6 +612,7 @@ impl TableFile {
             needs_sync: AtomicBool::new(false),
             keep_tail: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(false),
+            tail_keep: Mutex::new(()),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         })
@@ -596,6 +645,7 @@ impl TableFile {
             needs_sync: AtomicBool::new(false),
             keep_tail: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(false),
+            tail_keep: Mutex::new(()),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         };
@@ -651,6 +701,7 @@ impl TableFile {
                 needs_sync: AtomicBool::new(false),
                 keep_tail: AtomicBool::new(false),
                 hwm_behind: AtomicBool::new(false),
+                tail_keep: Mutex::new(()),
                 flush_lock: Mutex::new(()),
                 grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
             },
@@ -804,6 +855,7 @@ impl TableFile {
             needs_sync: AtomicBool::new(hwm_behind),
             keep_tail: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(hwm_behind),
+            tail_keep: Mutex::new(()),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         })
@@ -979,8 +1031,14 @@ impl TableFile {
     /// Complete pwrite of all bytes or error (no partial success returned).
     #[doc(hidden)]
     pub fn pwrite_all(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        let _tail = self.lock_tail();
         self.preserve_synced_tail(offset, bytes.len())?;
         handle_pwrite_all(&self.read_file, &self.path, offset, bytes)
+    }
+
+    /// Same-thread re-entry counts as already held. Cross-thread callers wait.
+    pub(crate) fn lock_tail(&self) -> TailKeepGuard<'_> {
+        lock_one_tail(self)
     }
 
     /// Class A files copy a synced partial tail aside before rewriting it.
@@ -1005,7 +1063,9 @@ impl TableFile {
     /// published prefix to [`Self::kept_tail_path`] and sync it.
     ///
     /// A crash can tear the rewritten block to zeroes. The copy is the bytes
-    /// a durable record already names. One copy stands until the next data sync.
+    /// a durable record already names. The caller holds [`Self::lock_tail`]
+    /// across this copy and the rewrite. The Class A sync holds that same
+    /// lock until it has unlinked the copy, so the next rewrite copies again.
     pub(crate) fn preserve_synced_tail(&self, offset: u64, len: usize) -> Result<(), StoreError> {
         if !self.keep_tail.load(Ordering::Acquire) || len == 0 {
             return Ok(());

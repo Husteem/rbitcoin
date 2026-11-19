@@ -327,19 +327,22 @@ impl VarTable {
         }
         let end = start.saturating_add(body_blob.len() as u64);
         self.body.ensure_capacity(end)?;
-        self.body.preserve_synced_tail(start, body_blob.len())?;
-        use crate::bulk_io::{self, WriteOp};
-        let mut ops = [WriteOp {
-            fd: self.body.read_fd(),
-            offset: start,
-            buf: body_blob,
-            result: i32::MIN,
-        }];
-        bulk_io::pwrite_batch(&mut ops);
-        if ops[0].result < 0 {
-            return self.body.write_at_pwrite(start, body_blob);
-        }
-        if (ops[0].result as usize) != body_blob.len() {
+        // The header publish takes `flush_lock`. Do not hold the tail lock
+        // across it: `flush` takes `flush_lock` and then this same tail lock.
+        let wrote = {
+            let _tail = self.body.lock_tail();
+            self.body.preserve_synced_tail(start, body_blob.len())?;
+            use crate::bulk_io::{self, WriteOp};
+            let mut ops = [WriteOp {
+                fd: self.body.read_fd(),
+                offset: start,
+                buf: body_blob,
+                result: i32::MIN,
+            }];
+            bulk_io::pwrite_batch(&mut ops);
+            ops[0].result >= 0 && (ops[0].result as usize) == body_blob.len()
+        };
+        if !wrote {
             return self.body.write_at_pwrite(start, body_blob);
         }
         self.body
@@ -381,6 +384,13 @@ pub fn write_prepared_bodies_one_wave(
         }
         let end = prep.start.saturating_add(prep.body_blob.len() as u64);
         table.ensure_body_end(end)?;
+    }
+    let tails: Vec<&crate::file::TableFile> = jobs.iter().map(|(table, _)| &table.body).collect();
+    let _tail = crate::file::lock_tails(&tails);
+    for (table, prep) in jobs {
+        if prep.body_blob.is_empty() {
+            continue;
+        }
         table
             .body
             .preserve_synced_tail(prep.start, prep.body_blob.len())?;

@@ -763,6 +763,97 @@ fn restore_class_a_kept_tails(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Debug tests pause `sync_class_a_stems` after the data sync and before the
+/// `.kept` unlink, so an append can overlap that window.
+#[cfg(debug_assertions)]
+mod kept_drop_hold {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static SLOT: RefCell<Option<Arc<KeptDropHold>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn bind(hold: Option<Arc<KeptDropHold>>) {
+        SLOT.with(|slot| *slot.borrow_mut() = hold);
+    }
+
+    pub(super) fn wait() {
+        let Some(hold) = SLOT.with(|slot| slot.borrow().clone()) else {
+            return;
+        };
+        hold.wait_for_release();
+    }
+
+    /// Pauses the Class A sync thread after `sync_data_all` and before `.kept` is removed.
+    #[doc(hidden)]
+    pub struct KeptDropHold {
+        armed: AtomicBool,
+        entered: AtomicBool,
+        lock: Mutex<()>,
+        cv: Condvar,
+    }
+
+    impl KeptDropHold {
+        pub fn armed() -> Self {
+            Self {
+                armed: AtomicBool::new(true),
+                entered: AtomicBool::new(false),
+                lock: Mutex::new(()),
+                cv: Condvar::new(),
+            }
+        }
+
+        fn wait_for_release(&self) {
+            let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.entered.store(true, Ordering::Release);
+            self.cv.notify_all();
+            while self.armed.load(Ordering::Acquire) {
+                guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+
+        /// `true` once a sync thread is inside [`Self::wait_for_release`].
+        pub fn wait_until_entered(&self, limit: Duration) -> bool {
+            let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            let deadline = Instant::now() + limit;
+            while !self.entered.load(Ordering::Acquire) {
+                let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                let (next, timeout) = self
+                    .cv
+                    .wait_timeout(guard, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = next;
+                if timeout.timed_out() && !self.entered.load(Ordering::Acquire) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        pub fn release(&self) {
+            let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            self.armed.store(false, Ordering::Release);
+            self.cv.notify_all();
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use kept_drop_hold::KeptDropHold;
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn bind_kept_drop_hold(hold: Option<std::sync::Arc<KeptDropHold>>) {
+    kept_drop_hold::bind(hold);
+}
+
 /// Drop tail copies after their files are synced, then sync each parent once.
 fn drop_kept_tails(files: &[&crate::file::TableFile]) -> Result<(), StoreError> {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
@@ -4149,7 +4240,12 @@ impl TxTable {
             &self.input.off,
             &self.input.body,
         ];
+        // Unlink runs before this guard drops. An append waits, then copies
+        // the prefix this sync made durable before it rewrites the block.
+        let _tail = crate::file::lock_tails(&files);
         crate::file::TableFile::sync_data_all(&files)?;
+        #[cfg(debug_assertions)]
+        kept_drop_hold::wait();
         drop_kept_tails(&files)
     }
 
