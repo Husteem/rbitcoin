@@ -165,14 +165,23 @@ impl StrongTxTable {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let bits = TableFile::open(dir.join("strong_tx.body"), TableKind::StrongTx)?;
         let body = bits.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
-        let mut bytes = vec![0u8; body as usize];
-        if body > 0 {
-            bits.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
-        }
         let table = ArrayTable::bit_image(bits, body)?;
         if body > 0 {
             table.slots.grow((body as usize).div_ceil(8))?;
-            Self::copy_bytes_in(table.slots.slots(Ordering::Relaxed), &bytes);
+            // Read in chunks straight into the reservation: a whole-body Vec
+            // would double the open peak (~177 MiB at mainnet).
+            const CHUNK: usize = 16 << 20;
+            let words = table.slots.slots(Ordering::Relaxed);
+            let mut buf = vec![0u8; CHUNK.min(body as usize)];
+            let mut done = 0usize;
+            while done < body as usize {
+                let len = CHUNK.min(body as usize - done);
+                table
+                    .file
+                    .read_at(FILE_HEADER_LEN as u64 + done as u64, &mut buf[..len])?;
+                Self::copy_bytes_in(&words[done / 8..], &buf[..len]);
+                done += len;
+            }
         }
         Ok(Self {
             table,

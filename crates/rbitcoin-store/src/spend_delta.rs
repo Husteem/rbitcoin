@@ -926,8 +926,7 @@ impl Idx {
         remove_if_present(dir, &idx_name(id))?;
         remove_if_present(dir, &log_name(id))?;
         let base = create_aligned(dir.join(idx_name(id)), TableKind::SpendDeltaIdx)?;
-        let flat: Vec<u8> = entries.iter().flatten().copied().collect();
-        base.write_uncommitted(HEAD, &flat)?;
+        base.write_uncommitted(HEAD, entries.as_flattened())?;
         base.sync_data_only()?;
         let log = create_aligned(dir.join(log_name(id)), TableKind::SpendDeltaLog)?;
         log.sync_data_only()?;
