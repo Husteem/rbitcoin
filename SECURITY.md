@@ -8,12 +8,12 @@ A consensus split on mainnet is vanishingly unlikely. The on-disk format
 and APIs can still change before **1.0** (a named refuse or wipe, not a
 silent wipe), and there is no long-term support window yet. **1.0** is
 where that window, further hardening, and signed release binaries are
-planned. In-tree is **0.9.99** (pre-0.10.0). **0.9.x** (tag 0.9.0) is the
+planned. In-tree is **0.9.99** (pre-0.10.0). **0.9.x** (latest tag 0.9.2) is the
 published line. **`v0.9.x`** is the patch line.
 Occupied **0.6.x** stores refuse
-(wipe and sync again). Schema 24 and 25 open in place. A published 0.8
-directory is schema 26. This binary rewrites that `meta` to 29, and a 0.9.0
-binary then refuses the directory. The runbook is
+(wipe and sync again). A 0.7, 0.8, or 0.9 directory opens in place.
+The upgrade is one way: an older binary then refuses the directory
+([`docs/operator/storage.md`](./docs/operator/storage.md)). The runbook is
 [`docs/operator/mainnet.md`](./docs/operator/mainnet.md). Day-to-day flags
 are [`docs/operator/`](./docs/operator/).
 
@@ -26,7 +26,7 @@ point a wallet at that node unless you accept that peer. The fault list is
 | Version | Support |
 |---------|---------|
 | **0.9.99** (in-tree) | Untagged master toward **0.10.0**. Report against the git commit. |
-| **0.9.x** | Published line (0.9.0). No LTS. Report against the tag. |
+| **0.9.x** | Published line (0.9.2). No LTS. Report against the tag. |
 | **0.8.x** | Previous published line (0.8.0). Report against the tag. |
 | **0.7.x** | Previous published line (0.7.0). Report against the tag. |
 | **0.6.x** | Previous published line (0.6.0 / 0.6.1). Report against the tag. |

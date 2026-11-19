@@ -150,12 +150,11 @@ pub const SCHEMA_VERSION: u16 = 30;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **29** is current. Meta **22** through **29** opens. Occupied **22**
+/// Schema **30** is current. Meta **22** through **30** opens. Occupied **22**
 /// rewrites `create.loc.ovf` 12 B rows to 16 B. Occupied **24/25** strips
-/// trailing size/weight from 96 B `header.body` rows. Any meta below **29**
-/// is rewritten to 29; a short `txstat.body` is aligned to the loc count.
-/// Table bytes do not change for 26. A 27 binary refuses 28 `meta`. A 28
-/// binary refuses 29 `meta`.
+/// trailing size/weight from 96 B `header.body` rows. Any meta below **30**
+/// is rewritten to 30; a short `txstat.body` is aligned to the loc count.
+/// An older binary refuses 30 `meta`.
 /// Meta older than **22** is not
 /// openable: those Class A bodies (`tx.body`, `txout.body`, `inwit.body` /
 /// `seqsigwit.body`) were wiped, not rewritten.

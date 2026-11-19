@@ -9,7 +9,7 @@ runbook. Flags and config keys are the other pages in this directory.
 stays in [`SCHEMA.md`](../../SCHEMA.md).
 
 In-tree is **0.9.99**, toward 0.10.0. The published GitHub Release is
-**0.9.0**. The patch line is **`v0.9.x`**. The container image and the
+**0.9.2**. The patch line is **`v0.9.x`**. The container image and the
 Linux aarch64 binaries ship with 0.9 ([`setup.md`](setup.md)).
 
 ## What you are running
@@ -42,9 +42,9 @@ peer port 48333, RPC port 48332. `--network testnet5` is BIP 95’s Testnet 5:
 BIP 54 from block 1, no minimum-difficulty blocks, peer port 18353, RPC port
 18352. It has no seeds yet, so name a peer with `--connect`.
 
-A 0.7 directory (schema 24) or a 0.8 directory (schema 26) opens in place.
-Schema 22 through 28 rewrite `meta` to 29 on open. That includes a datadir
-that never pruned witnesses. A schema-28 binary refuses 29 `meta`, and a 0.9.0 binary does too. A directory
+A 0.7, 0.8, or 0.9 directory opens in place, pruned or not. The upgrade
+is one way: an older binary then refuses the directory. What each schema
+does on open is the table in [`storage.md`](storage.md). A directory
 from 0.6 or earlier is refused: wipe that datadir and sync again. Do not
 point an older binary at a directory this release has opened.
 
