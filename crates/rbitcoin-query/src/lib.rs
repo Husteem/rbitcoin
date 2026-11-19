@@ -359,16 +359,78 @@ pub struct ResumeWorkEntry {
 }
 
 #[doc(hidden)]
-pub type ResumeChildMap = U64Map<Vec<(Fk, [u8; 32])>>;
-#[doc(hidden)]
 pub type ResumeSibPick = (Fk, [u8; 32], bool, u32, [u8; 32]);
 
-/// One sequential pass over `header.body`: child edges, `nBits`, and `prev_fk`.
+/// One sequential pass over `header.body`: `nBits`, `prev_fk`, and hash per
+/// header fk, plus each parent's children as one flat run.
+///
+/// Children are a counting sort over `prevs`: `child_fks[child_start[p] ..
+/// child_start[p + 1]]` are the children of fk `p` (`0` = no parent), in fk
+/// order. That is ~48 bytes per header, against a hash-map entry and a heap
+/// `Vec` per parent.
 #[doc(hidden)]
 pub struct ResumeHeaderIndex {
-    pub children: ResumeChildMap,
     pub bits: Vec<u32>,
     pub prevs: Vec<u64>,
+    hashes: Vec<[u8; 32]>,
+    child_start: Vec<u32>,
+    child_fks: Vec<u32>,
+}
+
+impl ResumeHeaderIndex {
+    /// Index fk `i + 1` from slot `i` of each vec. A header in `excluded`
+    /// (by fk) keeps its bits and parent but is no parent's child, and a
+    /// parent past the last fk links nothing.
+    pub fn new(
+        bits: Vec<u32>,
+        prevs: Vec<u64>,
+        hashes: Vec<[u8; 32]>,
+        excluded: &[u64],
+    ) -> Result<Self, QueryError> {
+        let n = prevs.len();
+        if bits.len() != n || hashes.len() != n || u32::try_from(n).is_err() {
+            return Err(StoreError::Corrupt("resume header index length"));
+        }
+        let parent_of = |i: usize| -> Option<usize> {
+            let p = usize::try_from(prevs[i]).ok().filter(|&p| p <= n)?;
+            (!excluded.contains(&(i as u64 + 1))).then_some(p)
+        };
+        let mut child_start = vec![0u32; n + 2];
+        for i in 0..n {
+            if let Some(p) = parent_of(i) {
+                child_start[p + 1] += 1;
+            }
+        }
+        for p in 0..=n {
+            child_start[p + 1] += child_start[p];
+        }
+        let mut next = child_start.clone();
+        let mut child_fks = vec![0u32; child_start[n + 1] as usize];
+        for i in 0..n {
+            if let Some(p) = parent_of(i) {
+                child_fks[next[p] as usize] = i as u32 + 1;
+                next[p] += 1;
+            }
+        }
+        Ok(Self {
+            bits,
+            prevs,
+            hashes,
+            child_start,
+            child_fks,
+        })
+    }
+
+    /// Children of `parent` (`0` = no parent) with their hashes, in fk order.
+    pub fn children(&self, parent: u64) -> impl Iterator<Item = (Fk, [u8; 32])> + '_ {
+        let run = usize::try_from(parent)
+            .ok()
+            .and_then(|p| Some((*self.child_start.get(p)?, *self.child_start.get(p + 1)?)))
+            .map_or(0..0, |(a, b)| a as usize..b as usize);
+        self.child_fks[run]
+            .iter()
+            .map(|&c| (Fk(u64::from(c)), self.hashes[c as usize - 1]))
+    }
 }
 
 #[derive(Default)]
@@ -3280,9 +3342,10 @@ impl Query {
         n: u64,
         exclude: &[[u8; 32]],
     ) -> Result<ResumeHeaderIndex, QueryError> {
-        let mut children: ResumeChildMap = ResumeChildMap::default();
         let mut bits = vec![0u32; n as usize];
         let mut prevs = vec![0u64; n as usize];
+        let mut hashes = vec![[0u8; 32]; n as usize];
+        let mut excluded = Vec::new();
         store.headers.for_each_record_through(n, |fk, rec| {
             let i = (fk.0 - 1) as usize;
             let Some(slot) = bits.get_mut(i) else {
@@ -3293,18 +3356,13 @@ impl Query {
                 return Err(StoreError::Corrupt("resume header fk"));
             };
             *slot = rec.prev_fk.0;
+            hashes[i] = rec.hash;
             if exclude.contains(&rec.hash) {
-                return Ok(());
+                excluded.push(fk.0);
             }
-            let prev = rec.prev_fk.get().unwrap_or(0);
-            children.entry(prev).or_default().push((fk, rec.hash));
             Ok(())
         })?;
-        Ok(ResumeHeaderIndex {
-            children,
-            bits,
-            prevs,
-        })
+        ResumeHeaderIndex::new(bits, prevs, hashes, &excluded)
     }
 
     #[doc(hidden)]
@@ -3330,36 +3388,34 @@ impl Query {
                 break;
             };
             let (path_sub_w, _path_sub_d) = Self::resume_subtree_score(index, path_fk, score_memo)?;
-            if let Some(sibs) = index.children.get(&parent_fk) {
-                for &(fk, hash) in sibs {
-                    if fk == path_fk {
-                        continue;
-                    }
-                    let has_body = self.store.header_txs.has_body(fk)?;
-                    let (sub_w, sub_d) = Self::resume_subtree_score(index, fk, score_memo)?;
-                    if sub_w <= path_sub_w {
-                        continue;
-                    }
-                    let take = match best_sib {
-                        None => true,
-                        Some((best_fk, _, best_body, _, _)) => {
-                            let (best_w, best_d) =
-                                Self::resume_subtree_score(index, best_fk, score_memo)?;
-                            if sub_w != best_w {
-                                sub_w > best_w
-                            } else if sub_d != best_d {
-                                sub_d > best_d
-                            } else if has_body != best_body {
-                                has_body && !best_body
-                            } else {
-                                fk.0 > best_fk.0
-                            }
+            for (fk, hash) in index.children(parent_fk) {
+                if fk == path_fk {
+                    continue;
+                }
+                let has_body = self.store.header_txs.has_body(fk)?;
+                let (sub_w, sub_d) = Self::resume_subtree_score(index, fk, score_memo)?;
+                if sub_w <= path_sub_w {
+                    continue;
+                }
+                let take = match best_sib {
+                    None => true,
+                    Some((best_fk, _, best_body, _, _)) => {
+                        let (best_w, best_d) =
+                            Self::resume_subtree_score(index, best_fk, score_memo)?;
+                        if sub_w != best_w {
+                            sub_w > best_w
+                        } else if sub_d != best_d {
+                            sub_d > best_d
+                        } else if has_body != best_body {
+                            has_body && !best_body
+                        } else {
+                            fk.0 > best_fk.0
                         }
-                    };
-                    if take {
-                        let parent_hash = self.get_header(Fk(parent_fk))?.hash;
-                        best_sib = Some((fk, hash, has_body, path_h, parent_hash));
                     }
+                };
+                if take {
+                    let parent_hash = self.get_header(Fk(parent_fk))?.hash;
+                    best_sib = Some((fk, hash, has_body, path_h, parent_hash));
                 }
             }
             if best_sib.is_some() {
@@ -3400,14 +3456,8 @@ impl Query {
             };
 
         while out.len() < max {
-            let Some(kids) = index.children.get(&cur_fk.0) else {
-                break;
-            };
-            if kids.is_empty() {
-                break;
-            }
             let mut best: Option<(Fk, [u8; 32], bool, bitcoin::Work, u32)> = None;
-            for &(fk, hash) in kids {
+            for (fk, hash) in index.children(cur_fk.0) {
                 let has_body = self.store.header_txs.has_body(fk)?;
                 let (sub_work, depth) = Self::resume_subtree_score(index, fk, score_memo)?;
                 let take = match best {
@@ -3481,11 +3531,9 @@ impl Query {
                     continue;
                 }
                 stack.push((fk, true));
-                if let Some(kids) = index.children.get(&fk.0) {
-                    for &(ck, _) in kids {
-                        if !memo.contains_key(&ck.0) && !on_stack.contains(&ck.0) {
-                            stack.push((ck, false));
-                        }
+                for (ck, _) in index.children(fk.0) {
+                    if !memo.contains_key(&ck.0) && !on_stack.contains(&ck.0) {
+                        stack.push((ck, false));
                     }
                 }
                 continue;
@@ -3500,16 +3548,14 @@ impl Query {
             let own = Target::from_compact(CompactTarget::from_consensus(bits)).to_work();
             let mut best_child_w = bitcoin::Work::from_be_bytes([0u8; 32]);
             let mut best_depth = 0u32;
-            if let Some(kids) = index.children.get(&fk.0) {
-                for &(ck, _) in kids {
-                    let Some(&(w, d)) = memo.get(&ck.0) else {
-                        // Cycle / incomplete child — treat as zero (corrupt graph).
-                        continue;
-                    };
-                    if w > best_child_w || (w == best_child_w && d > best_depth) {
-                        best_child_w = w;
-                        best_depth = d;
-                    }
+            for (ck, _) in index.children(fk.0) {
+                let Some(&(w, d)) = memo.get(&ck.0) else {
+                    // Cycle / incomplete child — treat as zero (corrupt graph).
+                    continue;
+                };
+                if w > best_child_w || (w == best_child_w && d > best_depth) {
+                    best_child_w = w;
+                    best_depth = d;
                 }
             }
             memo.insert(fk.0, (own + best_child_w, best_depth.saturating_add(1)));

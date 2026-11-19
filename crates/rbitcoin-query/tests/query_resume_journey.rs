@@ -94,15 +94,18 @@ fn resume_most_work_header_path() {
     assert_eq!(path.len(), 32, "capped walk length");
     assert_eq!((path[0].height, path[31].height), (1, 32));
 
-    let mut children: rbitcoin_query::U64Map<Vec<(Fk, [u8; 32])>> = rbitcoin_query::U64Map::default();
-    children.insert(gfk.0, vec![(pfk, p.hash)]);
-    children.insert(pfk.0, vec![(gfk, g.hash)]);
+    // A `prev_fk` cycle: each of `g` and `p` names the other as its parent.
     let n = q.store().header_count() as usize;
-    let index = rbitcoin_query::ResumeHeaderIndex {
-        children,
-        bits: vec![0x1d00ffff; n],
-        prevs: vec![0; n],
-    };
+    let mut prevs = vec![0u64; n];
+    prevs[(gfk.0 - 1) as usize] = pfk.0;
+    prevs[(pfk.0 - 1) as usize] = gfk.0;
+    let index = rbitcoin_query::ResumeHeaderIndex::new(
+        vec![0x1d00ffff; n],
+        prevs,
+        vec![[0u8; 32]; n],
+        &[],
+    )
+    .unwrap();
     let mut memo = rbitcoin_query::U64Map::default();
     let (_w, d) = rbitcoin_query::Query::resume_subtree_score(&index, gfk, &mut memo)
         .expect("a prev_fk cycle must not hang");
