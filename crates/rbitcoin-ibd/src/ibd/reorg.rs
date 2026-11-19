@@ -563,7 +563,9 @@ pub fn extend_valid_header_tip(
 ///
 /// The caller holds `shared`, so the walk stays at [`ANCESTOR_WALK_MAX`].
 /// When nothing is selected the candidates are deferred to the next
-/// off-lock turn, which walks as far as the rewind cap.
+/// off-lock turn, which walks as far as the rewind cap. After a rewind the
+/// candidates off the path it took are deferred too while that walk is
+/// longer: they may be forks this walk did not reach.
 pub fn maybe_rewind_to_best_work(
     st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
@@ -583,14 +585,23 @@ pub fn maybe_rewind_to_best_work_n(
     let picked = select_heavier_path(hub, &cands, &invalid, walk_max, &mut || {
         *cap.get_or_insert_with(|| super::header_walk::rewind_depth_cap(st, hub))
     })?;
-    let rewound = match picked {
-        Some((path, cap)) => apply_header_rewind(st, hub, &path, cap)?,
-        None => false,
-    };
-    if !rewound {
+    let Some((path, cap)) = picked else {
         st.reorg.defer(&cands);
+        return Ok(false);
+    };
+    if !apply_header_rewind(st, hub, &path, cap)? {
+        st.reorg.defer(&cands);
+        return Ok(false);
     }
-    Ok(rewound)
+    if walk_max < ancestor_walk_max(cap) {
+        let off_path: Vec<BlockHash> = cands
+            .iter()
+            .copied()
+            .filter(|c| !path.contains(c))
+            .collect();
+        st.reorg.defer(&off_path);
+    }
+    Ok(true)
 }
 
 #[doc(hidden)]
