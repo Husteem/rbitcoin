@@ -223,6 +223,29 @@ impl SpendDeltaStats {
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static FREEZE_COPIED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Notes the freeze on this thread copied rather than moved.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn freeze_copied_notes() -> u64 {
+    FREEZE_COPIED.with(std::cell::Cell::get)
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_freeze_copied_notes() {
+    FREEZE_COPIED.with(|n| n.set(0));
+}
+
+#[cfg(debug_assertions)]
+fn note_freeze_copied(n: usize) {
+    FREEZE_COPIED.with(|c| c.set(c.get() + n as u64));
+}
+
 /// What one checkpoint read and wrote, and how long each step took, for the
 /// operator log. Times are wall milliseconds.
 #[derive(Clone, Debug, Default)]
@@ -232,7 +255,8 @@ pub struct CheckpointReport {
     pub sealed_edges: u64,
     /// Since the previous checkpoint in this process started.
     pub since_ms: u64,
-    /// Committed records read back to merge the sealed notes into.
+    /// Preads of the committed records the sealed notes merge into, records
+    /// close together in a segment sharing one, and the bytes they read.
     pub merge_reads: u64,
     pub merge_read_bytes: u64,
     pub merge_ms: u64,
@@ -1398,6 +1422,62 @@ impl SpendPageLog {
         }))
     }
 
+    /// The committed records of `page_offs` that have one, by page. Records
+    /// close together in a segment are read in one pread.
+    fn committed_records(
+        &self,
+        page_offs: &[u64],
+        report: &mut CheckpointReport,
+    ) -> Result<HashMap<u64, Committed>, StoreError> {
+        let mut by_seg: HashMap<u32, (Arc<TableFile>, u32, Vec<LiveRecord>)> = HashMap::new();
+        {
+            let g = self.lock();
+            for &page_off in page_offs {
+                if let At::Rec {
+                    seg,
+                    offset,
+                    len,
+                    base,
+                } = placed_at(&g, page_off).at()
+                {
+                    let s = &g.segs[&seg];
+                    by_seg
+                        .entry(seg)
+                        .or_insert_with(|| (Arc::clone(&s.file), s.last_gen, Vec::new()))
+                        .2
+                        .push(LiveRecord {
+                            page_off,
+                            offset,
+                            len,
+                            base,
+                        });
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for (file, seg_gen, mut records) in by_seg.into_values() {
+            records.sort_unstable_by_key(|r| r.offset);
+            for run in coalesce(&records) {
+                let buf = read_run(&file, run)?;
+                report.merge_reads += 1;
+                report.merge_read_bytes += buf.len() as u64;
+                for rec in run {
+                    let at = (rec.offset - run[0].offset) as usize;
+                    let record = Record::check(buf[at..at + rec.len].to_vec(), rec.page_off)?;
+                    out.insert(
+                        rec.page_off,
+                        Committed {
+                            record,
+                            base: rec.base,
+                            seg_gen,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The slot at `abs`. `None`: `spent.body` holds it, on a page a fold
     /// wrote. A page no fold wrote reads zero where the delta holds nothing.
     pub fn slot(&self, abs: u64) -> Result<Option<Slot>, StoreError> {
@@ -1516,13 +1596,23 @@ impl SpendPageLog {
         }
         {
             let mut g = self.lock();
-            let mut merged = g.sealed.as_deref().cloned().unwrap_or_default();
-            for (&page, slots) in &g.open {
-                merged
-                    .entry(page)
-                    .or_default()
-                    .extend(slots.iter().map(|(&r, &m)| (r, m)));
-            }
+            let open = std::mem::take(&mut g.open);
+            let mut merged = match g.sealed.take() {
+                None => open,
+                // A failed checkpoint left a sealed layer: the open pages go
+                // into it. It is copied only while a reader still holds it.
+                Some(sealed) => {
+                    let mut sealed = Arc::try_unwrap(sealed).unwrap_or_else(|held| {
+                        #[cfg(debug_assertions)]
+                        note_freeze_copied(held.values().map(|p| p.len()).sum());
+                        (*held).clone()
+                    });
+                    for (page, slots) in open {
+                        sealed.entry(page).or_default().extend(slots);
+                    }
+                    sealed
+                }
+            };
             // A note rewritten since the copy was not judged; keep it.
             for (page, rel, meta) in rejected {
                 if let Some(m) = merged.get_mut(&page).and_then(|p| p.get_mut(&rel)) {
@@ -1531,7 +1621,6 @@ impl SpendPageLog {
                     }
                 }
             }
-            g.open.clear();
             g.open_edges = 0;
             g.sealed_tip = Some(g.sealed_tip.map_or(tip, |prev| prev.max(tip)));
             if !merged.is_empty() {
@@ -1838,12 +1927,11 @@ impl SpendPageLog {
             new_bytes: 0,
             dense_bytes: 0,
         };
+        let mut committed = self.committed_records(&page_offs, report)?;
         for page_off in page_offs {
             let mut merged = BTreeMap::new();
             let mut base = placed_at(&self.lock(), page_off).base();
-            if let Some(c) = self.committed_record(page_off)? {
-                report.merge_reads += 1;
-                report.merge_read_bytes += c.record.0.len() as u64;
+            if let Some(c) = committed.remove(&page_off) {
                 if self.touch_folds(page_off, &c, touch, report) {
                     base = rounds.push(&self.dir, body, page_off, &c, report)?.base();
                     report.hot_folds += 1;
@@ -2021,10 +2109,9 @@ impl SpendPageLog {
         for victim in &victims {
             let records = live.remove(&victim.id).unwrap_or_default();
             for run in coalesce(&records) {
-                let (first, last) = (run[0], run[run.len() - 1]);
+                let first = run[0];
                 let read = Instant::now();
-                let mut buf = vec![0u8; (last.offset + last.len as u64 - first.offset) as usize];
-                victim.file.pread_all(first.offset, &mut buf)?;
+                let buf = read_run(&victim.file, run)?;
                 report.reclaim_read_bytes += buf.len() as u64;
                 report.reclaim_read_ms += ms_since(read);
                 for rec in run {
@@ -2634,6 +2721,14 @@ struct LiveRecord {
 /// Records closer than this are read with the bytes between them, in one
 /// `pread`.
 const READ_GAP: u64 = 4096;
+
+/// One pread covering `run`, from its first record's offset.
+fn read_run(file: &TableFile, run: &[LiveRecord]) -> Result<Vec<u8>, StoreError> {
+    let (first, last) = (run[0], run[run.len() - 1]);
+    let mut buf = vec![0u8; (last.offset + last.len as u64 - first.offset) as usize];
+    file.pread_all(first.offset, &mut buf)?;
+    Ok(buf)
+}
 
 /// Split offset-ordered records into runs that one `pread` each covers.
 fn coalesce(records: &[LiveRecord]) -> impl Iterator<Item = &[LiveRecord]> + '_ {

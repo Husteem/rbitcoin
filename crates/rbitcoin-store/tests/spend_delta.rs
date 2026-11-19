@@ -1747,6 +1747,40 @@ fn a_checkpoint_reports_its_reads_and_writes() {
     assert_eq!(second.idx_entries, 1);
 }
 
+/// Records one generation wrote side by side are read back in one pread
+/// when a later checkpoint touches their pages again.
+#[test]
+fn a_merge_reads_neighbouring_records_together() {
+    let d = dir();
+    let log = SpendPageLog::create(&d).unwrap();
+    let mut body = MemBody::new(0);
+    let pages = [4096u64, 2 * 4096, 3 * 4096];
+    log.note_slots(&pages.map(|p| (p + 16, [1u8; 8]))).unwrap();
+    reporting_commit(&log, 1, |_| Ok(true), &mut body, None).unwrap();
+    log.note_slots(&pages.map(|p| (p + 24, [2u8; 8]))).unwrap();
+    let r = reporting_commit(&log, 2, |_| Ok(true), &mut body, None).unwrap();
+    assert_eq!((r.merge_reads, r.merge_read_bytes), (1, 3 * (10 + 10)));
+    for p in pages {
+        assert_eq!(log.slot(p + 16).unwrap(), Some([1u8; 8]));
+        assert_eq!(log.slot(p + 24).unwrap(), Some([2u8; 8]));
+    }
+}
+
+/// With no sealed layer left by a failed checkpoint, the freeze moves the
+/// open notes instead of copying them under the lock confirm takes.
+#[cfg(debug_assertions)]
+#[test]
+fn a_freeze_moves_the_open_notes() {
+    let d = dir();
+    let log = SpendPageLog::create(&d).unwrap();
+    let notes: Vec<(u64, [u8; 8])> = (1..=200u64).map(|i| (i * 4096 + 16, [1u8; 8])).collect();
+    log.note_slots(&notes).unwrap();
+    rbitcoin_store::spend_delta::reset_freeze_copied_notes();
+    reporting_commit(&log, 1, |_| Ok(true), &mut MemBody::new(0), None).unwrap();
+    assert_eq!(rbitcoin_store::spend_delta::freeze_copied_notes(), 0);
+    assert_eq!(log.slot(200 * 4096 + 16).unwrap(), Some([1u8; 8]));
+}
+
 /// A checkpoint that reclaims reports the segments it read and what became
 /// of their live records, matching the lifetime counters.
 #[test]
