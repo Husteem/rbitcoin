@@ -4724,11 +4724,19 @@ pub async fn serve_getdata_full_block(
     h: &bitcoin::BlockHash,
     witness: bool,
 ) -> Result<bool, NetError> {
+    // `MSG_BLOCK` decodes the whole block to strip it: the same budget as
+    // the compact serve. The witness form passes stored bytes through.
+    let permit = if witness {
+        None
+    } else {
+        Some(block_reconstruct_permit().await?)
+    };
     let query = Arc::clone(&hub.query);
     let cache = Arc::clone(&hub.cache);
     let hash = *h;
     let encoded = tokio::task::spawn_blocking(move || {
         let _g = crate::reactor::BlockingRegion::enter();
+        let _permit = permit;
         encode_served_block(cache.as_ref(), query.as_ref(), &hash, witness)
     })
     .await

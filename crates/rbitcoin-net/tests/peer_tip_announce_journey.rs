@@ -400,6 +400,49 @@ fn tx_announce_skips_a_tx_gone_from_the_pool() {
     assert_eq!(tx_announce_inv(mp, &gone), None);
 }
 
+/// A `MSG_BLOCK` serve decodes the whole block to strip it, so it takes a
+/// block decode permit as the compact serve does. With every permit held it
+/// waits, and it finishes once they are released.
+#[test]
+fn getdata_msg_block_waits_for_a_decode_permit() {
+    let (_dir, hub) = open_tip_announce_hub("getdata-permit");
+    let tip = hub.tip_hash().expect("tip");
+    let sem = Arc::clone(rbitcoin_net::msg_decode::block_decode_semaphore());
+    let all = u32::try_from(rbitcoin_net::msg_decode::block_decode_permits()).unwrap();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getdata runtime")
+        .block_on(async {
+            let held = sem
+                .acquire_many_owned(all)
+                .await
+                .expect("hold every permit");
+            let serve = serve_getdata(
+                &hub,
+                &out_tx,
+                &mut follow,
+                None,
+                vec![Inventory::Block(tip)],
+            );
+            tokio::pin!(serve);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut serve)
+                    .await
+                    .is_err(),
+                "MSG_BLOCK serve waits for a decode permit"
+            );
+            drop(held);
+            serve.await.expect("getdata");
+        });
+    assert_eq!(
+        served_block(out_rx.try_recv().expect("served")).block_hash(),
+        tip
+    );
+}
+
 /// The `block` payload of a served `getdata`, as it goes on the wire.
 fn served_block_payload(p: PeerOut) -> Vec<u8> {
     match p {
