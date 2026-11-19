@@ -1108,6 +1108,9 @@ struct Inner {
     segs: BTreeMap<u32, Seg>,
     commit: Commit,
     open_edges: u64,
+    /// Notes in `sealed`. After a failed checkpoint they count toward
+    /// [`OPEN_EDGE_CAP`], so a retry that fails again releases no waiter.
+    sealed_edges: u64,
 }
 
 impl Inner {
@@ -1316,6 +1319,7 @@ impl SpendPageLog {
                 segs,
                 commit,
                 open_edges: 0,
+                sealed_edges: 0,
             }),
             pace: Pace::new(),
         }
@@ -1347,7 +1351,7 @@ impl SpendPageLog {
     }
 
     pub fn relax_pace(&self) {
-        let early = self.lock().open_edges >= OPEN_EDGE_CAP;
+        let early = self.at_edge_cap(&self.lock());
         self.pace.early.store(early, Ordering::Release);
         if early {
             self.pace.arm();
@@ -1358,13 +1362,20 @@ impl SpendPageLog {
         self.lock().open_edges
     }
 
-    /// Wait while the open notes are at [`OPEN_EDGE_CAP`] and a sync thread
+    fn at_edge_cap(&self, g: &Inner) -> bool {
+        let failed = self.pace.failures.load(Ordering::Acquire) > 0;
+        let held = if failed { g.sealed_edges } else { 0 };
+        g.open_edges.saturating_add(held) >= OPEN_EDGE_CAP
+    }
+
+    /// Wait while the open notes, and the sealed ones once a checkpoint
+    /// failed, are at [`OPEN_EDGE_CAP`] and a sync thread
     /// is bound to drain them. Past [`CHECKPOINT_FAILURES_STOP`] failed
     /// checkpoints in a row this returns an error instead of waiting.
     pub fn wait_open_edge_room(&self) -> Result<(), StoreError> {
         loop {
             let room = self.pace.room_mu.lock().unwrap_or_else(|e| e.into_inner());
-            if self.lock().open_edges < OPEN_EDGE_CAP {
+            if !self.at_edge_cap(&self.lock()) {
                 return Ok(());
             }
             let bound = self
@@ -1550,7 +1561,7 @@ impl SpendPageLog {
                     added = true;
                 }
             }
-            added && g.open_edges >= OPEN_EDGE_CAP
+            added && self.at_edge_cap(&g)
         };
         if arm {
             self.pace.arm();
@@ -1570,7 +1581,8 @@ impl SpendPageLog {
     /// layers as they were.
     ///
     /// The open edge count drops to zero here, so a confirm thread parked at
-    /// the edge cap is released now, not after the publish.
+    /// the edge cap is released now, not after the publish. After a failed
+    /// checkpoint the sealed notes still count, so a retry releases none.
     pub fn freeze_open<K>(&self, tip: u32, keep: Option<K>) -> Result<(), StoreError>
     where
         K: FnMut(&Slot) -> Result<bool, StoreError>,
@@ -1597,6 +1609,11 @@ impl SpendPageLog {
         {
             let mut g = self.lock();
             let open = std::mem::take(&mut g.open);
+            let moved = std::mem::take(&mut g.open_edges);
+            g.sealed_edges = match g.sealed {
+                Some(_) => g.sealed_edges.saturating_add(moved),
+                None => moved,
+            };
             let mut merged = match g.sealed.take() {
                 None => open,
                 // A failed checkpoint left a sealed layer: the open pages go
@@ -1621,7 +1638,6 @@ impl SpendPageLog {
                     }
                 }
             }
-            g.open_edges = 0;
             g.sealed_tip = Some(g.sealed_tip.map_or(tip, |prev| prev.max(tip)));
             if !merged.is_empty() {
                 g.sealed = Some(Arc::new(merged));
@@ -1818,6 +1834,7 @@ impl SpendPageLog {
         } else {
             self.pace.failures.fetch_add(1, Ordering::AcqRel);
         }
+
         // A waiter re-checks the failure count as well as the room.
         self.pace.notify_room();
         out
@@ -2378,6 +2395,7 @@ impl SpendPageLog {
                 if g.sealed.as_ref().is_some_and(|s| Arc::ptr_eq(s, r)) {
                     g.sealed = None;
                     g.sealed_tip = None;
+                    g.sealed_edges = 0;
                 }
             }
             let empty: Vec<u32> = g

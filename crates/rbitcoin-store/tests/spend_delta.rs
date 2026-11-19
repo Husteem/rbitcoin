@@ -712,7 +712,7 @@ fn checkpoint_keeps_only_the_slots_it_seals() {
 }
 
 /// A freeze empties the open notes, so it releases a confirm thread parked
-/// at the edge cap even when the checkpoint after it fails.
+/// at the edge cap before the checkpoint writes anything.
 #[test]
 fn freeze_releases_an_edge_cap_waiter() {
     use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -731,20 +731,17 @@ fn freeze_releases_an_edge_cap_waiter() {
     assert!(rx
         .recv_timeout(std::time::Duration::from_millis(200))
         .is_err());
-    assert!(log
-        .checkpoint(
-            |l| {
-                l.freeze_open(0, None::<fn(&[u8; 8]) -> _>)?;
-                Err(rbitcoin_store::error::StoreError::Corrupt(
-                    "after the freeze",
-                ))
-            },
-            &mut MemBody::new(0),
-            None,
-        )
-        .is_err());
-    rx.recv_timeout(std::time::Duration::from_secs(10))
-        .expect("the freeze releases the edge-cap waiter");
+    log.checkpoint(
+        |l| {
+            l.freeze_open(0, None::<fn(&[u8; 8]) -> _>)?;
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the freeze releases the edge-cap waiter");
+            Ok(())
+        },
+        &mut MemBody::new(0),
+        None,
+    )
+    .unwrap();
 }
 
 /// A commit from an earlier schema-30 build refuses open with a wipe line
@@ -2745,4 +2742,59 @@ fn checkpoints_that_keep_failing_stop_the_edge_cap_wait() {
         log.wait_open_edge_room().is_ok(),
         "a success clears the count"
     );
+    fail(&log);
+    let (tx, rx) = mpsc::channel();
+    let waiter = Arc::clone(&log);
+    std::thread::spawn(move || tx.send(waiter.wait_open_edge_room()).unwrap());
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the published notes hold nothing");
+    assert!(got.is_ok());
+}
+
+/// A checkpoint that fails after its freeze keeps the notes it sealed. They
+/// still count toward the cap, so the parked confirm stays parked until the
+/// failures stop it, instead of noting another cap's worth each retry.
+#[test]
+fn notes_a_failed_checkpoint_sealed_still_hold_the_edge_cap() {
+    use rbitcoin_store::spend_delta::{CHECKPOINT_FAILURES_STOP, OPEN_EDGE_CAP};
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    let d = dir();
+    let mut body = MemBody::new((PAGES * 4096) as usize);
+    for page in 0..PAGES {
+        let at = (page * 4096 + 24) as usize;
+        body.bytes[at..at + 8].copy_from_slice(&[0xa5u8; 8]);
+    }
+    body.fail_writes = true;
+    let log = Arc::new(SpendPageLog::create_with(&d, SMALL).unwrap());
+    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    let mut tip = 0;
+    let mut failed = 0;
+    while failed == 0 {
+        tip += 1;
+        log.note_slots(&[(u64::from(tip) * 4096 + 16, page_meta(u64::from(tip), 1))])
+            .unwrap();
+        if folding_commit(&log, tip, |_| Ok(true), &mut body, Some(u32::MAX)).is_err() {
+            failed += 1;
+        }
+    }
+    let slots: Vec<(u64, [u8; 8])> = (0..OPEN_EDGE_CAP).map(|i| (16 + i * 8, [1u8; 8])).collect();
+    log.note_slots(&slots).unwrap();
+    log.bind_sync_wake(Arc::new((Mutex::new(false), Condvar::new())));
+    let (tx, rx) = mpsc::channel();
+    let waiter = Arc::clone(&log);
+    std::thread::spawn(move || tx.send(waiter.wait_open_edge_room()).unwrap());
+    while failed < CHECKPOINT_FAILURES_STOP {
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(50))
+                .is_err(),
+            "parked after {failed} failures"
+        );
+        assert!(folding_commit(&log, tip, |_| Ok(true), &mut body, Some(u32::MAX)).is_err());
+        failed += 1;
+    }
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the wait gives up");
+    assert!(got.is_err());
 }
