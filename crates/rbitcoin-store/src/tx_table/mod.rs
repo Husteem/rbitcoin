@@ -1792,17 +1792,27 @@ impl TxTable {
                 t.head.segment_count()
             );
         } else {
-            // Crash before write-behind drain: head occupancy lags Class A.
+            // A missing or generation-mismatched snapshot lost the whole open
+            // tail. Rebuild that tail from `txid.body` before any probe.
+            // A matching snapshot only backfills creates appended after it.
+            // Seal the in-flight segment before the tail rebuild can roll.
+            t.seal_unsealed_nontail_from_body()?;
             let n = t.count();
             let covered = t.head.last_inserted_fk();
-            if covered < n {
+            if let Some(first) = t.head.open_tail_rebuild_from()? {
+                rbitcoin_log::info!(
+                    "store: tx.head open tail snapshot missing first_fk={first} \
+                     covered={covered} n={n} — rebuild tail"
+                );
+                t.backfill_head_from(first)?;
+                t.head.flush()?;
+            } else if covered < n {
                 rbitcoin_log::info!(
                     "store: tx.head lags Class A covered={covered} n={n} — backfill tail"
                 );
                 t.backfill_head_from(covered.saturating_add(1))?;
                 t.head.flush()?;
             }
-            t.seal_unsealed_nontail_from_body()?;
             t.tag_untagged_open_heads()?;
         }
         Ok(t)
@@ -3899,7 +3909,7 @@ impl TxTable {
 
     /// Insert txid→fk into the segmented head (mixes keys; may seal/roll).
     ///
-    /// Rolls the open OA when its fk span reaches 80% slots (`max_keys`).
+    /// Rolls the open tail when its fk span reaches 80% slots (`max_keys`).
     /// Class A loc/body size does not cut `tx.head` shards.
     pub fn head_insert_many(&self, entries: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {

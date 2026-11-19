@@ -2311,6 +2311,8 @@ impl Store {
     ///
     /// 1. The connect barrier: Class A `sync_data`, then the Class C tables.
     /// 2. MS_ASYNC Class A bodies and the derived heads.
+    /// 3. Snapshot the open `tx.head`. That error is logged. It does not
+    ///    skip the writebacks, and a writeback error does not skip it.
     pub fn flush_for_shutdown(&self) -> Result<(), StoreError> {
         let t0 = std::time::Instant::now();
         rbitcoin_log::info!("store: shutdown flush — fsync tip tables…");
@@ -2320,11 +2322,16 @@ impl Store {
             "store: shutdown flush — async Class A… elapsed={:?}",
             t0.elapsed()
         );
-        self.txs.flush_async()?;
-        self.spenders.flush_async()?;
-        self.scripthash.flush_async()?;
+        let txs = self.txs.flush_async();
+        let spenders = self.spenders.flush_async();
+        let scripthash = self.scripthash.flush_async();
+        // One dense image of the open tx.head tail. Not Store::flush: that
+        // fsyncs every Class A body.
+        if let Err(e) = self.txs.flush_head() {
+            rbitcoin_log::warn!("store: shutdown tx.head snapshot failed: {e}");
+        }
         rbitcoin_log::info!("store: shutdown flush done elapsed={:?}", t0.elapsed());
-        Ok(())
+        txs.and(spenders).and(scripthash)
     }
 }
 

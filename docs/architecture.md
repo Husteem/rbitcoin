@@ -45,8 +45,8 @@ for unknown-height bodies (mark missing → re-getdata).
 
 - **Storage center** is a **transaction-relational archive**, not a UTXO
   set plus LevelDB chainstate. Class A bodies are pread/pwrite. `tx.head`
-  slot lookup is a read-only map of that file. Sealed `.fuse8` sidecars
-  are the other read-only map. Packed MPHF `g` stays FdOnly.
+  open-tail lookup hops a private slot table. Sealed `.fuse8` sidecars
+  are a read-only map. Packed MPHF `g` stays FdOnly.
   IO modality: [`io-modality.md`](./io-modality.md).
 - **Consensus scripts** are verified in **pure Rust** (secp256k1 only as the
   crypto primitive via the rust-bitcoin stack — **no** `libbitcoinconsensus`
@@ -71,7 +71,7 @@ for unknown-height bodies (mark missing → re-getdata).
 
 | Concern | rbitcoin | Bitcoin Core (typical) |
 |---------|----------|------------------------|
-| Primary store | Class A/B/C tables. Bodies are pread/pwrite. `tx.head` lookup maps its slot file read-only. Page cache is the hot tier | `blocks/blk*.dat` + `undo` + LevelDB `chainstate` (UTXO) |
+| Primary store | Class A/B/C tables. Bodies are pread/pwrite. `tx.head` open-tail lookup hops a private slot table. Sealed segments map `.fuse8` read-only. Page cache is the hot tier for bodies | `blocks/blk*.dat` + `undo` + LevelDB `chainstate` (UTXO) |
 | Historical block serve | **Reconstruct** from `txout` plus `seqsigwit`. `--prune-seqsigwit` keeps witness bytes only for the last 288 blocks ([`COMPAT.md`](../COMPAT.md)). Tip serve uses the body queue and peer wire | Serve raw blk files / undo |
 | Spentness | Annotations on create outputs (+ rare multi-list); no mutable UTXO set as truth | Coins view / UTXO mutations |
 | Concurrency during IBD | Fixed **roles** (one Class A appender, separate confirm pipeline); HWM publish order — **no map epochs** | More global chainstate coupling |

@@ -368,10 +368,9 @@ fn seal_mphf_one_candidate_bip30_unlinks_oa() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Seal publish must persist sealed meta **before** unlinking the open OA.
-/// A meta-persist failure mid-publish (crash model) must leave the OA on
-/// disk so reopen serves the segment unsealed instead of forcing a full
-/// head rebuild.
+/// Seal publish must persist sealed meta before dropping the private table.
+/// A meta-persist failure mid-publish leaves that table's snapshot on disk
+/// so reopen serves the segment unsealed.
 #[test]
 fn seal_publish_keeps_oa_when_meta_persist_fails() {
     let dir = tmp();
@@ -398,6 +397,86 @@ fn seal_publish_keeps_oa_when_meta_persist_fails() {
     let h2 = SegmentedTxHead::open(&dir).expect("reopen without rebuild");
     let cands = h2.probe_candidates(&mixed(1)).unwrap();
     assert!(cands.iter().any(|f| f.0 == 1), "cands={cands:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A meta write that fails during seal publish must not put the unsealed
+/// table back. The next roll then records one unsealed non-tail, not two.
+#[test]
+fn failed_seal_meta_stays_sealed_for_the_next_roll() {
+    let dir = tmp();
+    let layout = HeadLayout::new(8).unwrap();
+    let h = SegmentedTxHead::create(&dir, layout).unwrap();
+    let max_keys = h.max_keys;
+    let mut first: Vec<_> = (0..max_keys).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+    h.insert_many(&mut first).unwrap();
+    let block = dir.join("tx.head").join("meta.tmp");
+    std::fs::create_dir(&block).unwrap();
+    h.flush()
+        .expect_err("meta persist must fail during publish");
+    std::fs::remove_dir(&block).unwrap();
+    let mut second: Vec<_> = (0..max_keys)
+        .map(|i| {
+            let fk = max_keys + 1 + i;
+            (mixed(fk), Fk(fk))
+        })
+        .collect();
+    h.insert_many(&mut second).unwrap();
+    let (_bits, descs) = read_meta(&dir).unwrap();
+    let unsealed_nontail = descs
+        .iter()
+        .enumerate()
+        .filter(|(i, d)| i + 1 != descs.len() && d.flags & 1 == 0)
+        .count();
+    assert!(
+        unsealed_nontail <= 1,
+        "unsealed non-tails={unsealed_nontail} segs={}",
+        descs.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An untrusted tail still carries its meta count. A refill that stores only
+/// a prefix must snapshot that prefix, not the old span.
+#[test]
+fn partial_tail_rebuild_snapshots_only_rows_held() {
+    let dir = tmp();
+    let layout = HeadLayout::new(10).unwrap();
+    {
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        let mut entries: Vec<_> = (0..100u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h.insert_many(&mut entries).unwrap();
+        h.flush().unwrap();
+    }
+    let oa = dir.join("tx.head").join("000000");
+    let mut raw = std::fs::read(&oa).unwrap();
+    let gen_at = raw.len() - 8;
+    raw[gen_at..].fill(0);
+    std::fs::write(&oa, &raw).unwrap();
+    {
+        let h = SegmentedTxHead::open(&dir).unwrap();
+        let first = h.open_tail_rebuild_from().unwrap().expect("untrusted tail");
+        assert_eq!(first, 1);
+        assert_eq!(
+            h.last_inserted_fk(),
+            0,
+            "the meta span is not rows this process holds"
+        );
+        assert!(!oa.is_file(), "the untrusted image is removed");
+        let mut prefix: Vec<_> = (0..10u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h.insert_many(&mut prefix).unwrap();
+        assert_eq!(h.last_inserted_fk(), 10);
+    }
+    let h2 = SegmentedTxHead::open(&dir).unwrap();
+    assert_eq!(h2.last_inserted_fk(), 10);
+    for i in 1..=10u64 {
+        let cands = h2.probe_candidates(&mixed(i)).unwrap();
+        assert!(cands.iter().any(|f| f.0 == i), "missing {i}");
+    }
+    assert!(
+        h2.probe_candidates(&mixed(50)).unwrap().is_empty(),
+        "a row never stored must not probe"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -529,7 +608,7 @@ fn roll_does_not_join_seal_open_probes_sealing_oa() {
         "tail + in-flight seal, unsealed={unsealed:?}"
     );
     let oa = dir.join("tx.head").join("000000");
-    assert!(oa.is_file(), "sealing OA stays on disk until publish");
+    assert!(!oa.is_file(), "a roll keeps the sealing table in memory");
     let open = h
         .probe_candidates_batch_wave(
             &[mixed(1)],

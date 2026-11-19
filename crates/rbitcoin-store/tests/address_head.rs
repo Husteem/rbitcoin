@@ -36,14 +36,12 @@ fn probe_batch(h: &AddressHead, txids: &[[u8; 32]]) -> Result<Vec<Vec<Fk>>, Stor
     Ok(h.probe_fks_batch(txids))
 }
 
-/// Raw slot word in the **file** (`rel | fp << bits`).
+/// Raw slot word (`rel | fp << bits`).
 fn read_slot_raw(h: &AddressHead, slot: u64) -> u32 {
-    let mut buf = [0u8; 4];
-    h.file.read_at(entry_file_off(slot), &mut buf).unwrap();
-    u32::from_le_bytes(buf)
+    h.slot_word(slot)
 }
 
-/// Plain rel in the **file** at `slot`.
+/// Plain rel at `slot`.
 fn read_slot(h: &AddressHead, slot: u64) -> u64 {
     u64::from(read_slot_raw(h, slot)) & ((1u64 << h.bits()) - 1)
 }
@@ -61,14 +59,7 @@ fn colliding_pair() -> ([u8; 32], [u8; 32]) {
 
 /// Rewrite every occupied slot without its tag, as a meta v1 head wrote it.
 fn strip_tags(h: &AddressHead) {
-    for slot in 0..h.layout.slots() {
-        let rel = read_slot(h, slot) as u32;
-        if rel != 0 {
-            h.file
-                .write_at(entry_file_off(slot), &rel.to_le_bytes())
-                .unwrap();
-        }
-    }
+    h.strip_tags_for_test().unwrap();
 }
 
 /// Some slot of the page holds `fk` (tag bits above `bits` ignored).
@@ -195,9 +186,9 @@ fn bip30_second_create_same_page() {
     let _ = std::fs::remove_file(meta_path(&path));
 }
 
-/// FdOnly trailing head: page-coalesce insert uses pread/pwrite (phase 2 A/B path).
+/// Inserts stay in the private table. A snapshot is what reopen reads.
 #[test]
-fn fd_only_insert_many_probe_and_reopen() {
+fn insert_does_not_rewrite_an_open_address_file() {
     let path = tmp("fd_only_head");
     let h = head_bits(&path, 14).unwrap();
     let mut batch = Vec::new();
@@ -207,14 +198,17 @@ fn fd_only_insert_many_probe_and_reopen() {
         batch.push((txid, Fk(i)));
     }
     h.insert_many_in_place(&mut batch).unwrap();
+    assert!(!path.is_file(), "insert must not publish the open table");
     for i in [1u64, 250, 500] {
         let mut txid = [0u8; 32];
         txid[0..8].copy_from_slice(&i.to_le_bytes());
         let cands = probe_one(&h, &txid).unwrap();
         assert!(cands.contains(&Fk(i)), "fk={i} cands={cands:?}");
     }
+    h.write_snapshot(&path, 500).unwrap();
     drop(h);
     let h2 = AddressHead::open(&path).unwrap();
+    assert_eq!(h2.snapshot_generation(), Some(500));
     let mut txid = [0u8; 32];
     txid[0..8].copy_from_slice(&42u64.to_le_bytes());
     assert!(probe_one(&h2, &txid).unwrap().contains(&Fk(42)));
@@ -226,6 +220,7 @@ fn fd_only_insert_many_probe_and_reopen() {
 fn meta_v1_refused_linear_probe() {
     let path = tmp("meta_v1");
     let h = head_bits(&path, 12).unwrap();
+    h.write_snapshot(&path, 0).unwrap();
     drop(h);
     // Corrupt footer layout version (v1 = double-hash era / pre-footer meta).
     let mut raw = std::fs::read(&path).unwrap();
@@ -248,6 +243,7 @@ fn meta_v1_refused_linear_probe() {
 fn eight_byte_footer_is_refused_not_read_as_pairs() {
     let path = tmp("footer8");
     let h = head_bits(&path, 12).unwrap();
+    h.write_snapshot(&path, 0).unwrap();
     drop(h);
     let mut raw = std::fs::read(&path).unwrap();
     let n = raw.len();
@@ -400,6 +396,7 @@ fn untagged_rows_match_any_key_until_filled() {
         insert_one(&h, &a, Fk(1)).unwrap();
         insert_one(&h, &b, Fk(2)).unwrap();
         strip_tags(&h);
+        h.write_snapshot(&path, 2).unwrap();
     }
     let h = AddressHead::open(&path).unwrap();
     assert_eq!(probe_one(&h, &a).unwrap(), vec![Fk(1), Fk(2)]);
@@ -409,6 +406,7 @@ fn untagged_rows_match_any_key_until_filled() {
         .unwrap();
     assert_eq!(probe_one(&h, &a).unwrap(), vec![Fk(1)]);
     assert_eq!(probe_one(&h, &b).unwrap(), vec![Fk(2)]);
+    h.write_snapshot(&path, 2).unwrap();
     drop(h);
     let h = AddressHead::open(&path).unwrap();
     assert_eq!(
@@ -427,8 +425,8 @@ fn fingerprint_uses_bytes_16_through_23() {
     assert_eq!(fingerprint(&mixed, 10), 3_968_334);
 }
 
-/// Every occupied slot in the file carries its key's fingerprint, and the
-/// map sees each insert.
+/// Every occupied slot carries its key's fingerprint. Insert does not
+/// create the snapshot file.
 #[test]
 fn insert_writes_the_fingerprint_into_the_file() {
     let path = tmp("fp-file");
@@ -442,6 +440,7 @@ fn insert_writes_the_fingerprint_into_the_file() {
     }
     let by_rel = entries.clone();
     h.insert_many_in_place(&mut entries).unwrap();
+    assert!(!path.is_file(), "fingerprint stores stay in memory");
     let mut occupied = 0;
     for slot in 0..h.layout.slots() {
         let rel = read_slot(&h, slot);
@@ -512,7 +511,7 @@ fn reopen_with_meta() {
         let h = head_bits(&path, 12).unwrap();
         let txid = [7u8; 32];
         insert_one(&h, &txid, Fk(3)).unwrap();
-        h.flush().unwrap();
+        h.write_snapshot(&path, 1).unwrap();
     }
     let h = AddressHead::open(&path).unwrap();
     assert_eq!(h.bits(), 12);

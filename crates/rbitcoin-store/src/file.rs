@@ -665,7 +665,11 @@ impl TableFile {
         }
         self.trailing_ext = ext;
         let logical = self.published_len.load(Ordering::Acquire);
-        self.write_trailer(logical)
+        self.write_trailer(logical)?;
+        // `write_trailer` pwrites the footer and does not mark the file dirty.
+        // The next `flush` must sync this extension (the snapshot generation).
+        self.needs_sync.store(true, Ordering::Release);
+        Ok(())
     }
 
     #[doc(hidden)]

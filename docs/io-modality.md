@@ -5,9 +5,8 @@
 [`TableFile`](../crates/rbitcoin-store/src/file.rs) stays **FdOnly**. The mmap
 exceptions are **read-only**: sealed `.fuse8` fingerprint arrays
 ([`fuse8_filter.rs`](../crates/rbitcoin-store/src/fuse8_filter.rs)), SH
-BDZ3 occupancy bitvectors (prefix of `NN.mphf` through occ, not tags), and the
-open `tx.head` OA slot array, a live file its sole writer `pwrite`s (the page
-cache keeps the view coherent). Unix
+BDZ3 occupancy bitvectors (prefix of `NN.mphf` through occ, not tags). The
+open `tx.head` slot table is private anonymous memory, not a mapped file. Unix
 `mmap` `PROT_READ`/`MAP_SHARED`, Windows `MapViewOfFile` `PAGE_READONLY`. Packed
 MPHF `g` stays FdOnly 4 KiB: a mapped miss is one synchronous fault on the lookup
 thread, while `KIND_MPHF_G` keeps 128 pages in flight on the completion
@@ -169,7 +168,7 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 | **`seqsigwit.body`** | L0 | Cold ins+witness; reconstruct / getdata only |
 | **`spent.body`** | L0 | 8 B×n_out sole-spender, sparse. Class A moves its published end and writes no bytes; every spend is a `spent.delta` note. A checkpoint's fold writes whole pages, the only writer |
 | **`create.loc` / `seqsigwit.loc`** | L0 | FdOnly 2 B/create (hot) / u16 (cold); leftover `spent.off` unlinked. `create.loc` leftover stamp: batched window preads, sum/read through max fk in-window, running-sum + SIMD deinterleave (no loc L2) |
-| **`tx.head` segments** | L0 | Open OA: read-only `MAP_SHARED` view of the slot file (probe + insert hop, no syscall; slots carry a 7-bit fingerprint) + one 4 KiB page pwrite per dirty page. Sealed: mmap `.fuse8` (heap `fuse8=0`); packed BDZ `g` FdOnly 4 KiB page stream (`KIND_MPHF_G`); MPHF output is `rel−1` |
+| **`tx.head` segments** | L0 | Open tail: private slot table (probe + insert hop, no syscall; slots carry a 7-bit fingerprint). No page `pwrite`. Shutdown writes that table once. Sealed: mmap `.fuse8` (heap `fuse8=0`); packed BDZ `g` FdOnly 4 KiB page stream (`KIND_MPHF_G`); MPHF output is `rel−1` |
 | Header hash head | L0+L1 | 128-slot (~3 KiB) chunk cache |
 | Hash multi-list (`.mlt`) | L0 | Linear append |
 | **`scripthash.head` / body** | L0+L1 / idx in process | Sealed MPHF main: mapped occ + BDZ `g` FdOnly + tag/val pread, **no fuse**. Ingest/OA: 4 KiB chunk cache. Sealed ovf L0 SHSR: idx + mapped `.fuse8`. L1 ovf: mapped fuse + mapped occ + FdOnly `g`. Body slabs L0 |
@@ -183,17 +182,17 @@ IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 | Path | Table part | Fd/uring bulk part |
 |------|------------|---------------------|
 | Pin outs | FdOnly `create.loc` ranges (batched window preads; sum/read only through max fk in-window) | uring/pread `txout` bytes (starting OS page; full span if need is likely to spill) |
-| Head resolve stream | Open OA probe through its read-only map (no syscall); sealed fuse + FdOnly BDZ `g` pages on the held session; **one** FdOnly loc batch after identity (standalone bulk, not on the probe ring) | uring/pread `txid.body` identity |
+| Head resolve stream | Open-tail probe hops a private slot table (no syscall); sealed fuse + FdOnly BDZ `g` pages on the held session; **one** FdOnly loc batch after identity (standalone bulk, not on the probe ring) | uring/pread `txid.body` identity |
 | IBD **getdata serve** reconstruct | FdOnly `create.loc` / `seqsigwit.loc` ranges for a contiguous `header_txs` run | libc span pread of `txout.body` + `seqsigwit.body` in parallel (not confirm `idx_body_pipeline`) |
 
 ---
 
 ## Head insert locality
 
-Do not demap heads without an operator-host measurement (musl static).
-A host A/B showed io_uring head inserts about 5× slower on head ms/blk than
-a mapped insert. Prefer page-coalesced pread → mutate → pwrite over per-slot
-uring. Segmented heads do not remove that page-locality constraint.
+The open `tx.head` tail is a private slot table. Insert stores into that
+table and does not write a page. Sealed segments stay fuse plus FdOnly BDZ.
+Do not put the open tail back on a mapped file without an operator-host
+measurement.
 
 ---
 
@@ -251,8 +250,7 @@ exceptions (read-only, not `MmapMut`). Packed `g` stays FdOnly. Class C is
 L2 write-behind (`flush_class_c_tip`) — **not** mapped (`strong_tx` write-behind is tip-last).
 Mempool schema 4 is InRam Vecs + `pwrite`.
 
-Live head insert copies the page from the map → mutate → one pwrite per dirty
-page (no pread, not per-slot uring); the map shows the new slots once the
-pwrite lands. Head resolve hops the map for the open OA, then one loc batch
+Live head insert updates the private slot table (no pread, no page `pwrite`).
+Head resolve hops that table for the open tail, then one loc batch
 after identity (not on the probe ring). Node start logs `io=`,
 not `tx_head_access=`.

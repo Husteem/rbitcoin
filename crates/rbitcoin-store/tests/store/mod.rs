@@ -14,6 +14,19 @@ fn tmp() -> rbitcoin_store::testutil::TempDir {
     rbitcoin_store::testutil::TempDir::labeled("store").unwrap()
 }
 
+/// A snapshot that cannot be written must not skip the Class A writebacks,
+/// and must not fail the shutdown flush.
+#[test]
+fn shutdown_head_snapshot_error_still_returns_ok() {
+    let dir = tmp();
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    let block = dir.join("tx.head").join("meta.tmp");
+    std::fs::create_dir(&block).unwrap();
+    s.flush_for_shutdown()
+        .expect("a head snapshot error is logged, not returned");
+    let _ = std::fs::remove_dir(&block);
+}
+
 fn sh_put_create(s: &Store, rec: rbitcoin_store::scripthash::ScriptHashRecord) {
     s.scripthash
         .put_create_batch_append(std::slice::from_ref(&rec))

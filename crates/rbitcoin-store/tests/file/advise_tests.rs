@@ -527,6 +527,32 @@ fn write_during_flush_stays_pending() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The footer extension is a real commit. `flush` must not return while that
+/// pwrite is still only in the page cache.
+#[test]
+fn set_trailing_ext_leaves_pending_sync() {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("rbitcoin-trail-ext-sync-{id}"));
+    let _ = std::fs::remove_file(&path);
+    let mut f = TableFile::create_trailing_header(&path, TableKind::HashHead).unwrap();
+    let data_bytes = 64u64;
+    f.set_logical_len(data_bytes + TRAILING_FOOTER_LEN as u64)
+        .unwrap();
+    f.write_at(0, &[0xABu8; 64]).unwrap();
+    f.flush().unwrap();
+    assert!(!f.pending_sync());
+    f.set_trailing_ext([0x11; 16]).unwrap();
+    assert!(
+        f.pending_sync(),
+        "the extension pwrite must be synced by the next flush"
+    );
+    f.flush().unwrap();
+    assert!(!f.pending_sync());
+    drop(f);
+    let _ = std::fs::remove_file(&path);
+}
+
 /// A data barrier must not publish the high-water mark or take the write
 /// thread's sync bit. A flush after a later append still publishes that append.
 #[test]
