@@ -273,7 +273,8 @@ From current `origin/master` at `X.Y.99`:
 3. `./scripts/release-cut.sh --patch`. Write **`### Highlights`**
    (bullets, then the thanks paragraph, same as a minor). Narrative
    as needed.
-4. PR → **`vX.Y.x`** (not `master`). Same ship labels and gates.
+4. PR → **`vX.Y.x`** (not `master`). Same ship labels and gates, including
+   the `release.yml` run on the ship branch (`--ref` that branch).
 5. Merge, fetch, checkout `origin/vX.Y.x`, `./scripts/release-post.sh`
    (tags; does **not** create a new maint branch or a `.99` bump).
 

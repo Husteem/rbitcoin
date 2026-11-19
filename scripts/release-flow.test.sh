@@ -219,16 +219,26 @@ assert_ok "release-notes omit detailed Unreleased body" \
   bash -c "! grep -q 'ship this' <<<'$out'"
 assert_ok "release-notes name CHANGELOG section" \
   grep -q '## \[0.6.0\]' <<<"$out"
-# release.yml runs the notes after the tag exists. That tag, and a newer tag
-# on another line, are not where this release's range starts.
+# release.yml runs the notes after the tag exists. The range starts at the
+# previous release tag HEAD descends from: not this version's own tag, and
+# not a higher tag on another line.
+GIT_AUTHOR_NAME='Old Timer' \
+GIT_AUTHOR_EMAIL='Old-Timer@users.noreply.github.com' \
+  git_c -C "$MINOR" commit -q --allow-empty -m 'before the previous release'
+git_c -C "$MINOR" tag -a v0.5.9 -m v0.5.9
+GIT_AUTHOR_NAME='New Comer' \
+GIT_AUTHOR_EMAIL='New-Comer@users.noreply.github.com' \
+  git_c -C "$MINOR" commit -q --allow-empty -m 'in this release'
 git_c -C "$MINOR" tag -a v0.6.0 -m v0.6.0
 git_c -C "$MINOR" switch -q -c side
 git_c -C "$MINOR" commit -q --allow-empty -m 'later line'
 git_c -C "$MINOR" tag -a v0.7.0 -m v0.7.0
 git_c -C "$MINOR" switch -q -
 out="$(bash "$NOTES" --root "$MINOR")"
-assert_ok "release-notes thank contributors once this version is tagged" \
-  grep -q '@Hero-Gamer' <<<"$out"
+assert_ok "release-notes thank a contributor after the previous tag once this version is tagged" \
+  grep -q '@New-Comer' <<<"$out"
+assert_ok "release-notes do not thank a contributor before the previous tag" \
+  bash -c "! grep -q '@Old-Timer' <<<'$out'"
 
 # --- one-shot thanks is consumed by the cut ---
 ONCE="$WORKDIR/once"
