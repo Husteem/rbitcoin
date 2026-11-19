@@ -267,3 +267,26 @@ fn a_notfound_lasts_one_stall_window() {
         "past the stall window the peer is asked again"
     );
 }
+
+/// Past the cap the oldest `notfound` gives way to the newest: the record
+/// keeps the blocks the peer was asked about last. A repeat refreshes its
+/// time and keeps its place.
+#[test]
+fn a_full_notfound_record_drops_its_oldest() {
+    let mut peer = PeerChain::default();
+    let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+    peer.note_notfound_capped(hash(1), 1_000, 2);
+    peer.note_notfound_capped(hash(2), 1_001, 2);
+    peer.note_notfound_capped(hash(1), 20_000, 2);
+    assert!(
+        peer.lacks(&hash(1), 40_000),
+        "the repeat moved its time to 20 s"
+    );
+    peer.note_notfound_capped(hash(3), 20_001, 2);
+    assert!(peer.lacks(&hash(3), 20_001), "the newest is kept");
+    assert!(peer.lacks(&hash(2), 20_001));
+    assert!(
+        !peer.lacks(&hash(1), 20_001),
+        "the first answered gave way despite its repeat"
+    );
+}

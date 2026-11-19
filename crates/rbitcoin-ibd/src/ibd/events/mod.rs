@@ -1085,8 +1085,9 @@ fn note_announcement(st: &mut IbdWorkState, peer: usize) {
     }
 }
 
+/// A `notfound` is an answer, not a block: it frees the hashes but leaves
+/// the stall clock alone, so a peer that owes another block still stalls.
 pub fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
-    note_block_progress(&mut st.slots, peer);
     let mut freed = Vec::new();
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
         for h in &hashes {

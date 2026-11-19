@@ -11,7 +11,7 @@ use rbitcoin_ibd::ibd::assign::{assign_work_ordered, inflight_add_peer, AssignDe
 use rbitcoin_ibd::ibd::dial::{
     dial_batch, disconnect_stalled_block_peers_at, release_peer_block_work,
 };
-use rbitcoin_ibd::ibd::events::{apply_block_framed, FramedBody};
+use rbitcoin_ibd::ibd::events::{apply_block_framed, apply_notfound, FramedBody};
 use rbitcoin_ibd::ibd::peer_io::{
     IbdReadCtx, LightDecodes, PeerCmd, PeerEvent, PeerEventSinks, LATE_ANSWER_MS,
 };
@@ -22,7 +22,7 @@ use rbitcoin_net::chain::ChainHub;
 use rbitcoin_net::codec::FramedMessage;
 use rbitcoin_net::peers::PeerConnType;
 use std::collections::HashSet;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -760,6 +760,41 @@ fn stalling_outbound_peer_is_still_disconnected() {
     assert!(!st.slots[0].alive, "an outbound staller is dropped");
     assert!(drain_wire(&mut wire)[0].1, "and told to shut down");
     assert!(st.addr_cooldown.contains_key(&net));
+
+    st.slots.retain(|s| s.alive);
+    assign(&mut st, &hub);
+    assert!(drain_wire(&mut wire)[1].0.contains(&h(1)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A `notfound` is not a block. A peer that owes a block on the wire and
+/// answers `notfound` for other hashes inside the stall window is not
+/// quiet, but it still stalls out, and the block it withholds goes to
+/// another peer.
+#[test]
+fn notfound_does_not_hold_off_a_block_stall() {
+    let (dir, hub) = tmp_hub();
+    let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
+    owe_on_wire(&mut st, 0, h(1), 0);
+    owe_on_wire(&mut st, 0, h(2), 0);
+    // A small block it sent before the window. A progress mark would copy it.
+    st.slots[0].solicited_bytes.store(1_000, Ordering::Relaxed);
+    apply_notfound(
+        &mut st,
+        0,
+        vec![h(2), BlockHash::from_byte_array([0xee; 32])],
+    );
+    // The reader stamps the socket read that carried the `notfound`.
+    st.slots[0].rate.note_any_rx(30_000);
+    assert!(st.slots[0].in_flight.contains(&h(1)), "h(1) is still owed");
+    assert_eq!(
+        st.slots[0].rate.bytes_at_progress, 0,
+        "a notfound marks no block progress"
+    );
+
+    stall_pass(&mut st, &hub, 30_001);
+    assert!(!st.slots[0].alive, "the withholding peer is dropped");
+    assert!(drain_wire(&mut wire)[0].1, "and told to shut down");
 
     st.slots.retain(|s| s.alive);
     assign(&mut st, &hub);

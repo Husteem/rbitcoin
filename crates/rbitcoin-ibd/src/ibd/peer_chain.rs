@@ -11,7 +11,8 @@ use bitcoin::BlockHash;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// `notfound` hashes kept per peer. Past the cap a peer may be asked again.
+/// `notfound` hashes kept per peer. Past the cap the first answered gives
+/// way and the peer may be asked for it again.
 const LACKS_CAP: usize = 1024;
 /// How long a `notfound` keeps a peer off that block: one stall window. A
 /// peer that answered `notfound` everywhere is asked again after it.
@@ -28,6 +29,8 @@ const PROBE_REFRESH: Duration = Duration::from_secs(10);
 pub struct PeerChain {
     /// `notfound` hashes, with the mono ms they were answered.
     lacks: HashMap<BlockHash, u64>,
+    /// The same hashes, in the order first answered.
+    lacks_order: VecDeque<BlockHash>,
     /// This peer's announced chain above the confirmed tip, oldest first.
     announced: VecDeque<BlockHash>,
     /// Height of `announced[0]`.
@@ -61,12 +64,21 @@ pub struct PeerChain {
 
 impl PeerChain {
     pub fn note_notfound(&mut self, hash: BlockHash, now_ms: u64) {
-        if self.lacks.len() >= LACKS_CAP {
-            self.lacks
-                .retain(|_, at| now_ms.saturating_sub(*at) < LACKS_TTL_MS);
+        self.note_notfound_capped(hash, now_ms, LACKS_CAP);
+    }
+
+    /// [`Self::note_notfound`] with at most `cap` hashes kept. A new hash
+    /// past the cap drops the first answered, so each costs O(1).
+    #[doc(hidden)]
+    pub fn note_notfound_capped(&mut self, hash: BlockHash, now_ms: u64, cap: usize) {
+        if self.lacks.insert(hash, now_ms).is_some() {
+            return;
         }
-        if self.lacks.len() < LACKS_CAP {
-            self.lacks.insert(hash, now_ms);
+        self.lacks_order.push_back(hash);
+        if self.lacks_order.len() > cap {
+            if let Some(oldest) = self.lacks_order.pop_front() {
+                self.lacks.remove(&oldest);
+            }
         }
     }
 
@@ -79,6 +91,7 @@ impl PeerChain {
     /// A headers message or a block inv: the peer may have those blocks now.
     pub fn note_announcement(&mut self) {
         self.lacks.clear();
+        self.lacks_order.clear();
     }
 
     pub fn probed(&self) -> bool {
