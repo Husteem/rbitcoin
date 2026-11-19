@@ -677,6 +677,50 @@ fn withheld_locator_header_does_not_seal_the_tip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Open cuts a create whose locator header never landed. A committed delta
+/// spend of its output, by a spender still on the chain, goes with it: the
+/// delta is clipped to the cut `spent.body` end, so the next create at the
+/// same offsets reads unspent.
+#[test]
+fn a_spend_of_a_cut_create_does_not_mark_the_create_that_reuses_its_slot() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (prev, parent_hash) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.flush_class_c_tip().unwrap();
+    s.note_spend_snapshot(0);
+    s.checkpoint_spend_through(0).unwrap();
+
+    let loc = s.txs.create_loc.loc.read_fd();
+    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(loc, 8);
+    let disarm = Disarm(loc);
+    connect_coinbase(&s, &write, 1, prev, parent_hash);
+    drop(disarm);
+    let cut = s.txs.spent_range(Fk(2)).unwrap();
+    s.put_spend_create(Fk(2), 0, Fk(1), 0).unwrap();
+    s.flush_class_c_tip().unwrap();
+    s.txs.flush().unwrap();
+    s.note_spend_snapshot(1);
+    s.checkpoint_spend_through(1).unwrap();
+    assert_eq!(s.txs.get_output_spender_meta(Fk(2), 0).unwrap().1, Fk(1));
+    drop(s);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.count(), 1, "open cuts the create");
+    let (rec, ins, outs) = coinbase(9);
+    let fk = s
+        .put_tx_full_batch_indexed(&[(rec, ins, outs)], false)
+        .unwrap()[0];
+    assert_eq!(fk, Fk(2));
+    assert_eq!(s.txs.spent_range(fk).unwrap(), cut, "the same slot again");
+    let (_, field, _) = s.txs.get_output_spender_meta(fk, 0).unwrap();
+    assert!(
+        field.is_null(),
+        "a new create's output reads spent by {field:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn assert_withheld_overflow_stays_unsealed(dir: &std::path::Path, genesis: Fk, withheld: Fk) {
     let s = Store::open_tiny(dir).unwrap();
     assert_eq!(s.confirmed.tip_height(), Some(Height(0)));

@@ -4851,11 +4851,11 @@ fn short_pwrite_on_tip_connect_does_not_swap_gettxout() {
                 self.0.query.store().txs.disarm_short_body_pwrite();
             }
         }
-        hub.query.store().txs.arm_short_body_pwrite("spent");
+        hub.query.store().txs.arm_short_body_pwrite("txout");
         let _disarm = Disarm(&hub);
         hub.accept_received_block(failed.clone())
     };
-    let err = err.expect_err("short spent.body write");
+    let err = err.expect_err("short txout.body write");
     assert!(matches!(err, NetError::Store(_)), "tip extend: {err:?}");
     assert!(
         !hub.is_block_invalid(&failed_hash),

@@ -197,6 +197,52 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// One write [`arm_write_trace`] recorded.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub enum TracedWrite {
+    /// A positional write of `len` bytes at `offset`.
+    Write {
+        path: PathBuf,
+        offset: u64,
+        len: u64,
+    },
+    /// A length change to `len`.
+    SetLen { path: PathBuf, len: u64 },
+}
+
+/// Record every positional write and length change of a table file on this
+/// thread. Crash tests tear the blocks these touched. A release build does
+/// not record.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_write_trace() {
+    WRITE_TRACE.with(|t| *t.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop recording and return the writes since [`arm_write_trace`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_write_trace() -> Vec<TracedWrite> {
+    WRITE_TRACE.with(|t| t.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(debug_assertions)]
+fn note_write(w: TracedWrite) {
+    WRITE_TRACE.with(|t| {
+        if let Some(trace) = t.borrow_mut().as_mut() {
+            trace.push(w);
+        }
+    });
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static WRITE_TRACE: std::cell::RefCell<Option<Vec<TracedWrite>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Let `skip` directory syncs succeed, then fail the next `times` on this thread.
 ///
 /// Debug tests use this for a rename that is already visible when only the
@@ -294,6 +340,9 @@ pub enum GrowPolicy {
     Tight1MiB = 1,
     /// Round `need` up to 64 KiB (SH shard / ovf body).
     Align64k = 2,
+    /// Never reserve: the header names a logical end the file need not
+    /// reach, and a write past the file's end extends it (`spent.body`).
+    Sparse = 3,
 }
 
 #[doc(hidden)]
@@ -335,6 +384,12 @@ pub fn handle_pwrite_all(
         return Ok(());
     }
     rbitcoin_primitives::assert_not_script_worker("store write");
+    #[cfg(debug_assertions)]
+    note_write(TracedWrite::Write {
+        path: path.to_path_buf(),
+        offset,
+        len: bytes.len() as u64,
+    });
     let handle = IoHandle::from_file(file);
     let mut done = 0usize;
     while done < bytes.len() {
@@ -386,6 +441,11 @@ pub fn handle_pread_all(
 
 #[doc(hidden)]
 pub fn set_file_len(file: &File, path: &Path, new_len: u64) -> Result<(), StoreError> {
+    #[cfg(debug_assertions)]
+    note_write(TracedWrite::SetLen {
+        path: path.to_path_buf(),
+        len: new_len,
+    });
     #[cfg(windows)]
     {
         crate::io_handle::win_set_eof(file, new_len).map_err(|e| StoreError::io(path, e))
@@ -593,7 +653,25 @@ impl TableFile {
     }
 
     pub fn open(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
-        let path = path.into();
+        Self::open_header(path.into(), kind, true)
+    }
+
+    /// Open a [`GrowPolicy::Sparse`] file: its header names the logical end
+    /// even where the file is shorter, and capacity is never reserved.
+    pub fn open_sparse(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
+        let file = Self::open_header(path.into(), kind, false)?;
+        file.set_grow_policy(GrowPolicy::Sparse);
+        Ok(file)
+    }
+
+    /// [`Self::create`] for a [`GrowPolicy::Sparse`] file.
+    pub fn create_sparse(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
+        let file = Self::create(path, kind)?;
+        file.set_grow_policy(GrowPolicy::Sparse);
+        Ok(file)
+    }
+
+    fn open_header(path: PathBuf, kind: TableKind, clamp: bool) -> Result<Self, StoreError> {
         let file = table_open_opts()
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
@@ -620,7 +698,7 @@ impl TableFile {
         if logical < FILE_HEADER_LEN as u64 {
             logical = FILE_HEADER_LEN as u64;
         }
-        let hwm_behind = logical > file_len;
+        let hwm_behind = clamp && logical > file_len;
         if hwm_behind {
             logical = file_len;
         }
@@ -709,6 +787,25 @@ impl TableFile {
         set_file_len(&file, &self.path, logical)?;
         drop(file);
         self.file_cap.store(logical, Ordering::Release);
+        Ok(())
+    }
+
+    /// Cut the file to `len` when it is longer, without writing the header.
+    ///
+    /// For files whose lengths a separate commit names: a header write would
+    /// rewrite the first block, and a cut on a block boundary rewrites none.
+    pub fn shrink_to(&self, len: u64) -> Result<(), StoreError> {
+        let file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let now = file
+            .metadata()
+            .map_err(|e| StoreError::io(&self.path, e))?
+            .len();
+        if len >= now {
+            return Ok(());
+        }
+        set_file_len(&file, &self.path, len)?;
+        drop(file);
+        self.file_cap.store(len, Ordering::Release);
         Ok(())
     }
 
@@ -1078,6 +1175,9 @@ impl TableFile {
             return Ok(());
         }
         let policy = self.grow_policy.load(Ordering::Acquire);
+        if policy == GrowPolicy::Sparse as u8 {
+            return Ok(());
+        }
         if policy == GrowPolicy::Tight1MiB as u8 {
             let target = need.saturating_add(1 << 20).max(need);
             return self.grow_to_at_least(target, need);

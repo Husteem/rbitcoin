@@ -685,8 +685,8 @@ pub struct TxTable {
     pub prune_seqsigwit_mode: std::sync::atomic::AtomicBool,
     /// `--datadir-hdd`: Class A body stems are one pwrite wave each.
     pub datadir_hdd: std::sync::atomic::AtomicBool,
-    /// Historical spend slots not yet folded into `spent.body`.
-    spend_pages: crate::spend_page_log::SpendPageLog,
+    /// Schema-30 spend delta: every spend slot, over the pages folds wrote.
+    spend_pages: crate::spend_delta::SpendPageLog,
     /// Per-fk packed `txout` decodes for an outs reader
     /// ([`Self::get_meta_and_outputs`], and [`Self::get`] through it), the
     /// decode the mempool and block-proposal pins count. [`Self::get_full`] is
@@ -1087,13 +1087,20 @@ fn class_a_loc_pairs(
     (recs, loc)
 }
 
+/// `spent.body` bytes each create reserves: one 8-byte slot per output.
+fn spent_lens(n_outs: &[u32]) -> Vec<u64> {
+    n_outs
+        .iter()
+        .map(|&n| u64::from(n) * OutputRecord::SPENT_SLOT_LEN as u64)
+        .collect()
+}
+
 fn publish_prepared_body(
     table: &VarTable,
     prep: crate::var_table::PreparedAppend,
     durable: bool,
 ) -> Result<(Vec<Fk>, bool), StoreError> {
-    let end = prep.start.saturating_add(prep.body_blob.len() as u64);
-    let landed = table.note_body_end(end, durable);
+    let landed = table.note_body_end(prep.end, durable);
     let fks = table.finish_prepared(prep)?;
     Ok((fks, landed))
 }
@@ -1159,6 +1166,70 @@ fn note_spend_meta_read(groups: usize) {
     }
 }
 
+/// `spent.body` as the spend delta folds into it. Every folded slot is below
+/// the published end.
+struct SpentFold<'a>(&'a VarTable);
+
+impl crate::spend_delta::SpentBody for SpentFold<'_> {
+    fn published_len(&self) -> u64 {
+        self.0.body_published_len()
+    }
+
+    fn read(&self, abs: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        let end = self.0.body_published_len();
+        self.0
+            .read_prefix_at_published(end, abs, buf.len() as u64, buf)?;
+        Ok(())
+    }
+
+    fn write(&mut self, abs: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        self.0.write_body_pwrite(abs, bytes)
+    }
+
+    fn sync(&mut self) -> Result<(), StoreError> {
+        self.0.sync_data_only()
+    }
+}
+
+/// Open the spend delta.
+///
+/// A `spent.body` written up to its published end was filled by an older
+/// schema's Class A: a schema-30 body is sparse, and before its first
+/// commit no fold has extended it. Such a body, and a schema-29 page log if
+/// there is one, become the delta's first generation, and the 29 files are
+/// removed once that commit is durable. A crash before that commit adopts
+/// again at the next open. A populated schema-30 body with no `spent.delta/`
+/// refuses: its spends were only there.
+fn open_spend_delta(
+    dir: &Path,
+    spent: &VarTable,
+) -> Result<crate::spend_delta::SpendPageLog, StoreError> {
+    let body_end = spent.body_published_len();
+    let path = spent.body_file_path();
+    let physical = std::fs::metadata(path)
+        .map_err(|e| StoreError::io(path, e))?
+        .len();
+    let populated = body_end > crate::file::FILE_HEADER_LEN as u64;
+    let filled_by_class_a = physical >= body_end;
+    if populated && !filled_by_class_a && !dir.join(crate::spend_delta::SPEND_DELTA_DIR).exists() {
+        return Err(StoreError::Corrupt(
+            "spent.delta is missing beside a populated spent.body; wipe datadir and redo IBD",
+        ));
+    }
+    let log = crate::spend_delta::SpendPageLog::load_with(
+        dir,
+        &mut SpentFold(spent),
+        crate::spend_delta::Policy::DEFAULT,
+    )?;
+    let v29 = crate::spend_pages_v29::read(dir, body_end)?;
+    if populated && filled_by_class_a {
+        let (images, tip) = v29.map_or((Vec::new(), 0), |v| (v.images, v.tip));
+        log.adopt_v29(images, tip, &SpentFold(spent))?;
+    }
+    crate::spend_pages_v29::remove(dir)?;
+    Ok(log)
+}
+
 impl TxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Self::create_with_opts(dir, HeadOpenOpts::MAINNET)
@@ -1205,7 +1276,7 @@ impl TxTable {
         Ok(Self {
             body: VarTable::create(dir, "txout", TableKind::TxOut)?,
             seqsigwit: VarTable::create(seqsigwit_dir, "seqsigwit", TableKind::SeqSigWit)?,
-            spent: VarTable::create(dir, "spent", TableKind::Spent)?,
+            spent: VarTable::create_sparse_body(dir, "spent", TableKind::Spent)?,
             create_loc: crate::create_loc::CreateLoc::create(dir)?,
             seqsigwit_loc: crate::delta_loc::DeltaLoc::create(seqsigwit_dir, "seqsigwit")?,
             head: SegmentedTxHead::create(dir, layout)?,
@@ -1220,7 +1291,7 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
-            spend_pages: crate::spend_page_log::SpendPageLog::create(dir),
+            spend_pages: crate::spend_delta::SpendPageLog::create(dir)?,
         })
     }
 
@@ -1317,9 +1388,9 @@ impl TxTable {
             VarTable::create_body_only(seqsigwit_dir, "seqsigwit", TableKind::SeqSigWit)?
         };
         let spent = if had_spent {
-            VarTable::open_body_only(dir, "spent", TableKind::Spent, loc_count)?
+            VarTable::open_sparse_body(dir, "spent", TableKind::Spent, loc_count)?
         } else {
-            VarTable::create_body_only(dir, "spent", TableKind::Spent)?
+            VarTable::create_sparse_body(dir, "spent", TableKind::Spent)?
         };
         let txids = if dir.join("txid.body").exists() {
             crate::txid_body::TxidBody::open(dir)?
@@ -1439,7 +1510,7 @@ impl TxTable {
             }
         };
         let secret = crate::store_secret::StoreSecret::load_existing(dir)?;
-        let spent_body_end = spent.body_published_len();
+        let spend_pages = open_spend_delta(dir, &spent)?;
         let t = Self {
             body,
             seqsigwit,
@@ -1458,7 +1529,7 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
-            spend_pages: crate::spend_page_log::SpendPageLog::load_clipped(dir, spent_body_end)?,
+            spend_pages,
         };
         match input_open_tail(t.input.count(), n_bodies, t.seqsigwit.count()) {
             InputOpenTail::Backfill { from } => {
@@ -2375,19 +2446,6 @@ impl TxTable {
         Ok((field, flags, vin))
     }
 
-    /// Page read, then 8-byte slot pwrites, for [`Self::put_spend_batch_by_abs_meta`].
-    ///
-    /// Same slot bytes and cold list as the uring helper. The write does not
-    /// store the rest of the page.
-    #[doc(hidden)]
-    pub fn put_spend_batch_by_abs_meta_pwrite(
-        &self,
-        spenders: &crate::spender_table::SpenderTable,
-        abs_edges: &[(u64, Fk, u32, Fk, u32)],
-    ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
-        crate::spend_annotate_uring::annotate_unknown_pages_pwrite(self, spenders, abs_edges)
-    }
-
     /// Bulk 8-byte spender meta reads at absolute `spent.body` file offsets.
     ///
     /// Returns `(spender_field, flags)` — multi = `flags & MULTI_SPENDER`.
@@ -2457,7 +2515,7 @@ impl TxTable {
         let body_path = self.spent.body_file_path();
 
         let mut out: Vec<Option<SpenderSlot>> = vec![None; abs_offs.len()];
-        let logged = self.spend_pages.slots_at(abs_offs);
+        let logged = self.spend_pages.slots_at(abs_offs)?;
         let mut submitted: Vec<usize> = Vec::with_capacity(abs_offs.len());
         for (i, &off) in abs_offs.iter().enumerate() {
             let end = off.saturating_add(META_LEN as u64);
@@ -2500,25 +2558,7 @@ impl TxTable {
         abs_edges: &[(u64, Fk, u32, Fk, u32)],
         known: &[(Fk, u8, u32)],
     ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
-        crate::spend_annotate_uring::put_spend_batch_by_abs_meta_known(
-            self, spenders, abs_edges, known,
-        )
-    }
-
-    pub(crate) fn spend_log_serves(&self, abs: u64) -> bool {
-        self.spend_pages.covers(abs)
-    }
-
-    /// True when the published body slot is exactly `(field, flags, vin)`.
-    pub(crate) fn body_slot_matches(
-        &self,
-        abs: u64,
-        field: Fk,
-        flags: u8,
-        vin: u32,
-    ) -> Result<bool, StoreError> {
-        let (got_field, got_flags, got_vin) = self.body_spend_slot(abs)?;
-        Ok(got_field == field && got_flags == flags && got_vin == vin)
+        crate::spend_annotate::put_spend_batch_by_abs_meta_known(self, spenders, abs_edges, known)
     }
 
     /// Read multi + spender_field for create tx output (packed Class A body).
@@ -2543,7 +2583,7 @@ impl TxTable {
         if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
             return Err(StoreError::Corrupt("spent slot OOB"));
         }
-        if let Some(raw) = self.spend_pages.slot(abs) {
+        if let Some(raw) = self.spend_pages.slot(abs)? {
             let (flags, field, vin) = decode_spent_slot(&raw)?;
             return Ok((flags & output_flags::MULTI_SPENDER != 0, field, vin));
         }
@@ -2556,9 +2596,9 @@ impl TxTable {
 
     /// Spender meta for many vouts.
     ///
-    /// The page log is read first. One `spent.body` walk fills the misses.
-    /// Returns `(vout, multi, field, vin)` for each found vout. Missing vouts
-    /// are omitted.
+    /// The delta is read first; a slot it leaves to `spent.body` is read
+    /// there, on a page a fold wrote. Returns `(vout, multi, field, vin)` for
+    /// each vout inside the range; one past it is omitted.
     pub fn get_output_spender_metas_at(
         &self,
         body_off: u64,
@@ -2580,37 +2620,18 @@ impl TxTable {
         }
         let logged = self
             .spend_pages
-            .slots_at(&in_range.iter().map(|(_, abs)| *abs).collect::<Vec<_>>());
-        let mut misses = Vec::new();
-        for (&(i, _), raw) in in_range.iter().zip(logged) {
-            if let Some(logged) = raw {
-                hits[i] = decode_spent_slot(&logged).ok().map(|(flags, field, vin)| {
-                    (flags & output_flags::MULTI_SPENDER != 0, field, vin)
-                });
-                if hits[i].is_none() {
-                    misses.push(i);
+            .slots_at(&in_range.iter().map(|(_, abs)| *abs).collect::<Vec<_>>())?;
+        for (&(i, abs), raw) in in_range.iter().zip(logged) {
+            let (field, flags, vin) = match raw {
+                Some(logged) => {
+                    let (flags, field, vin) = decode_spent_slot(&logged)?;
+                    (field, flags, vin)
                 }
-            } else {
-                misses.push(i);
-            }
+                None => self.body_spend_slot(abs)?,
+            };
+            hits[i] = Some((flags & output_flags::MULTI_SPENDER != 0, field, vin));
         }
-        if misses.is_empty() {
-            return Ok(Self::pack_spender_metas(vouts, hits));
-        }
-        self.spent.with_bytes_at(body_off, body_len, |raw| {
-            for i in misses {
-                let v = vouts[i];
-                let start = (v as usize).saturating_mul(slot);
-                let stop = start.saturating_add(slot);
-                if stop > raw.len() {
-                    continue;
-                }
-                if let Ok((flags, field, vin)) = decode_spent_slot(&raw[start..stop]) {
-                    hits[i] = Some((flags & output_flags::MULTI_SPENDER != 0, field, vin));
-                }
-            }
-            Ok(Self::pack_spender_metas(vouts, hits))
-        })
+        Ok(Self::pack_spender_metas(vouts, hits))
     }
 
     fn pack_spender_metas(
@@ -2624,54 +2645,32 @@ impl TxTable {
             .collect()
     }
 
-    pub(crate) fn note_historical_spend_slots(
+    pub(crate) fn note_spend_slots(
         &self,
         slots: &[(u64, [u8; OutputRecord::SPENT_SLOT_LEN])],
     ) -> Result<(), StoreError> {
         self.spend_pages.note_slots(slots)
     }
 
-    pub(crate) fn prepare_open_spend_pages<K, B, S>(
+    pub(crate) fn checkpoint_spend_pages<B>(
         &self,
-        height: u32,
-        keep: K,
         before_freeze: B,
-        seal_tip: S,
+        durable: Option<u32>,
     ) -> Result<(), StoreError>
     where
-        K: FnMut(&[u8; OutputRecord::SPENT_SLOT_LEN]) -> Result<bool, StoreError>,
-        B: FnOnce(&crate::spend_page_log::SpendPageLog, &dyn Fn() -> u64) -> Result<(), StoreError>,
-        S: FnOnce(&crate::spend_page_log::SpendPageLog) -> Result<u32, StoreError>,
+        B: FnOnce(&crate::spend_delta::SpendPageLog) -> Result<(), StoreError>,
     {
-        let published = self.spent.body_published_len();
-        let len_now = || self.spent.body_published_len();
-        self.spend_pages.prepare_commit_in(
-            height,
-            published,
-            |off, len| {
-                let mut buf = vec![0u8; len];
-                let end = self.spent.body_published_len();
-                self.spent
-                    .read_prefix_at_published(end, off, len as u64, &mut buf)?;
-                Ok(buf)
-            },
-            keep,
-            |log| before_freeze(log, &len_now),
-            seal_tip,
-        )
+        self.spend_pages
+            .checkpoint(before_freeze, &mut SpentFold(&self.spent), durable)
+            .map(|_| ())
     }
 
-    /// RAM install only. The caller unlinks with the returned set after it
-    /// drops the utxo view.
-    pub(crate) fn install_open_spend_pages(&self) -> Option<std::collections::HashSet<u32>> {
-        self.spend_pages.install_directory()
+    /// Lifetime write counters and sizes of the spend delta.
+    pub fn spend_delta_stats(&self) -> crate::spend_delta::SpendDeltaStats {
+        self.spend_pages.stats()
     }
 
-    pub(crate) fn unlink_spend_generations_if_synced(&self, live: &std::collections::HashSet<u32>) {
-        self.spend_pages.unlink_if_synced(live);
-    }
-
-    pub(crate) fn bind_spend_sync_wake(&self, wake: crate::spend_page_log::SpendSyncWake) {
+    pub(crate) fn bind_spend_sync_wake(&self, wake: crate::spend_delta::SpendSyncWake) {
         self.spend_pages.bind_sync_wake(wake);
     }
 
@@ -2683,60 +2682,25 @@ impl TxTable {
         self.spend_pages.relax_pace();
     }
 
-    pub(crate) fn wait_spend_edge_room(&self) {
-        self.spend_pages.wait_open_edge_room();
+    pub(crate) fn wait_spend_edge_room(&self) -> Result<(), StoreError> {
+        self.spend_pages.wait_open_edge_room()
     }
 
     #[doc(hidden)]
-    pub fn open_spend_edge_count(&self) -> u64 {
-        self.spend_pages.open_edge_count()
-    }
-
-    #[doc(hidden)]
-    pub fn spend_log_slot(&self, abs: u64) -> Option<[u8; 8]> {
+    pub fn spend_log_slot(&self, abs: u64) -> Result<Option<[u8; 8]>, StoreError> {
         self.spend_pages.slot(abs)
     }
 
-    pub(crate) fn hold_spend_fold_above(&self, tip: u32) -> Result<(), StoreError> {
-        self.spend_pages.hold_fold_above(tip)
+    pub(crate) fn drop_spends_above<K>(&self, tip: u32, keep: K) -> Result<(), StoreError>
+    where
+        K: FnMut(&[u8; OutputRecord::SPENT_SLOT_LEN]) -> Result<bool, StoreError>,
+    {
+        self.spend_pages.drop_spends_above(tip, keep)
     }
 
-    pub(crate) fn widen_for_checkpoint(&self, height: u32) {
-        self.spend_pages.widen_for_checkpoint(height);
-    }
-
-    /// Swap open pages into `frozen` before the cooled copy.
-    ///
-    /// The confirmed tip is sealed after that copy. Sealing it here holds a
-    /// generation that does not contain the disconnected block.
-    #[doc(hidden)]
-    pub fn freeze_open_spend_pages(&self) {
-        self.spend_pages.freeze_before_cooled_copy();
-    }
-
-    pub(crate) fn spend_log_above(&self, tip: u32) -> bool {
-        self.spend_pages.above_tip(tip)
-    }
-
-    pub(crate) fn copy_cooled_spend_pages(&self) -> Result<(), StoreError> {
-        // Grow-only. `write_body_abs` samples the length, then stores that
-        // sample. Confirm can publish a longer end in between.
-        self.spend_pages.copy_cooled(
-            |off, image| self.spent.write_body_pwrite(off, image),
-            || self.spent.sync_data_only(),
-        )
-    }
-
-    pub(crate) fn finish_cooled_spend_pages(&self) -> Result<(), StoreError> {
-        self.spend_pages.finish_cooled()
-    }
-
-    /// Record one decided spend slot.
-    ///
-    /// A slot inside the published body, or one the page log already serves,
-    /// is a directory note. A later fold must not copy an older image over
-    /// that spend. A slot past the published body is the create-time overlay
-    /// and stays a `spent.body` write.
+    /// Record one decided spend slot as a delta note. Class A writes no
+    /// `spent.body` bytes; a fold is their only writer. A slot past the
+    /// published body is refused.
     pub(crate) fn store_spend_slot_at(
         &self,
         body_off: u64,
@@ -2757,51 +2721,13 @@ impl TxTable {
             0
         };
         let slot_vin = if multi { 0 } else { vin };
+        if !crate::spend_delta::is_historical(self.spent.body_published_len(), abs) {
+            // Only `clip` at open drops a note past the end: a create that
+            // failed to publish would leave it for the next create there.
+            return Err(StoreError::Corrupt("spent slot past the published body"));
+        }
         let meta = encode_spent_slot(flags, field, slot_vin)?;
-        let published = self.spent.body_published_len();
-        if self.spend_pages.covers(abs) || crate::spend_page_log::is_historical(published, abs) {
-            return self.note_historical_spend_slots(&[(abs, meta)]);
-        }
-        self.spent.write_body_pwrite(abs, &meta)
-    }
-
-    /// Patch multi + spender_field on create tx output (packed Class A body).
-    pub fn set_output_spender_meta(
-        &self,
-        create_tx_fk: Fk,
-        vout: u32,
-        multi: bool,
-        field: Fk,
-        vin: u32,
-    ) -> Result<(), StoreError> {
-        let (off, len) = self.spent_range(create_tx_fk)?;
-        self.set_output_spender_meta_at(off, len, vout, multi, field, vin)
-    }
-
-    /// Patch spender meta using a cache-held body range (no idx read on the hot path).
-    pub fn set_output_spender_meta_at(
-        &self,
-        body_off: u64,
-        body_len: u64,
-        vout: u32,
-        multi: bool,
-        field: Fk,
-        vin: u32,
-    ) -> Result<(), StoreError> {
-        let abs = spent_abs(body_off, vout);
-        let end = body_off.saturating_add(body_len);
-        if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
-            return Err(StoreError::Corrupt("spent slot OOB"));
-        }
-        let flags = if multi {
-            output_flags::MULTI_SPENDER
-        } else {
-            0
-        };
-        let slot_vin = if multi { 0 } else { vin };
-        let slot = encode_spent_slot(flags, field, slot_vin)?;
-        self.spent.write_body_pwrite(abs, &slot)?;
-        Ok(())
+        self.note_spend_slots(&[(abs, meta)])
     }
 
     /// Full tx: `txout` + `seqsigwit` zip.
@@ -3160,10 +3086,7 @@ impl TxTable {
             return Err(StoreError::Corrupt("invariant: create n_out"));
         }
         let n_outs: Vec<u32> = items.iter().map(|(_, _, o)| o.len() as u32).collect();
-        let spent_image = SpentBodyImage::zeros(&n_outs);
-        let spent = self
-            .spent
-            .prepare_exact_body(&spent_image.record_lens(), spent_image.into_bytes())?;
+        let spent = self.spent.prepare_sized(&spent_lens(&n_outs))?;
         let (fks, _loc) = self.append_stems_one_wave(
             items.len(),
             est_out,
@@ -3198,24 +3121,20 @@ impl TxTable {
 
     /// Like [`Self::put_full_batch_indexed`], but outs live in a shared pin
     /// ([`PackedCreate`]). Encode borrows pin fields — no outs deep clone.
-    ///
-    /// `spent` is the exact `spent.body` image for this append (`8 × n_out` per create).
     pub fn put_full_batch_from_pins<P: PackedCreate>(
         &self,
         items: &[(P, Vec<InputRecord>)],
         index: bool,
-        spent: SpentBodyImage,
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
         let rows: Vec<crate::txstat::TxStatRow> =
             items.iter().map(|_| txstat_placeholder()).collect();
-        self.put_full_batch_from_pins_with_txstat(items, index, spent, &rows, &[])
+        self.put_full_batch_from_pins_with_txstat(items, index, &rows, &[])
     }
 
     pub fn put_full_batch_from_pins_with_txstat<P: PackedCreate>(
         &self,
         items: &[(P, Vec<InputRecord>)],
         index: bool,
-        spent: SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
@@ -3230,7 +3149,6 @@ impl TxTable {
         self.put_pins_with_edges(
             &pins,
             index,
-            spent,
             txstat,
             header_ranges,
             &edges,
@@ -3247,7 +3165,6 @@ impl TxTable {
         &self,
         pins: &[&P],
         index: bool,
-        spent: SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
         input_edges: &[Vec<crate::input::InputEdge>],
@@ -3257,7 +3174,6 @@ impl TxTable {
         self.put_pins_with_edges(
             pins,
             index,
-            spent,
             txstat,
             header_ranges,
             input_edges,
@@ -3272,7 +3188,6 @@ impl TxTable {
         &self,
         pins: &[&P],
         index: bool,
-        spent: SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
         input_edges: &[Vec<crate::input::InputEdge>],
@@ -3288,9 +3203,6 @@ impl TxTable {
         if input_edges.len() != pins.len() {
             return Err(StoreError::Corrupt("input edge batch length"));
         }
-        if spent.create_count() != pins.len() {
-            return Err(StoreError::Corrupt("spent overlay length"));
-        }
         let est_out: usize = pins.iter().map(|pin| pin.packed_outs_est()).sum();
         let base = self.body.count();
         if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
@@ -3301,19 +3213,14 @@ impl TxTable {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
         let mut n_outs = Vec::with_capacity(pins.len());
-        for (i, pin) in pins.iter().enumerate() {
+        for pin in pins {
             let n_out = pin.packed_n_out();
             if n_out == 0 {
                 return Err(StoreError::Corrupt("invariant: create n_out"));
             }
-            if spent.n_out(i) != n_out {
-                return Err(StoreError::Corrupt("spent overlay n_out"));
-            }
             n_outs.push(n_out);
         }
-        let spent = self
-            .spent
-            .prepare_exact_body(&spent.record_lens(), spent.into_bytes())?;
+        let spent = self.spent.prepare_sized(&spent_lens(&n_outs))?;
         let (fks, loc) = self.append_stems_one_wave(
             pins.len(),
             est_out,
@@ -3342,7 +3249,8 @@ impl TxTable {
         Ok((fks, loc))
     }
 
-    /// Arm short pwrites on one Class A body (`txout`, `seqsigwit`, or `spent`).
+    /// Arm short pwrites on one Class A body (`txout` or `seqsigwit`;
+    /// Class A writes no `spent` bytes).
     ///
     /// The next long writes to that file store an 8-byte prefix and return
     /// disk-full, and they stay failing until [`Self::disarm_short_body_pwrite`].
@@ -3353,7 +3261,6 @@ impl TxTable {
         let handle = match stem {
             "txout" => self.body.body_write_fd(),
             "seqsigwit" => self.seqsigwit.body_write_fd(),
-            "spent" => self.spent.body_write_fd(),
             _ => panic!("arm_short_body_pwrite: unknown stem {stem}"),
         };
         crate::io_handle::arm_short_pwrite(handle);
@@ -3405,7 +3312,7 @@ impl TxTable {
         staged_loc: crate::create_loc::StagedCreate,
     ) -> Result<Vec<Fk>, StoreError> {
         crate::var_table::write_prepared_bodies_one_wave(
-            &[(&self.body, &p_out), (&self.spent, &p_sp)],
+            &[(&self.body, &p_out)],
             self.datadir_hdd(),
         )?;
         self.create_loc.write_staged(&staged_loc)?;
@@ -3432,11 +3339,7 @@ impl TxTable {
         let seq_lens = p_in.aligned_lens();
         let staged_seq = self.seqsigwit_loc.stage(&p_in.starts, &seq_lens)?;
         crate::var_table::write_prepared_bodies_one_wave(
-            &[
-                (&self.body, &p_out),
-                (&self.seqsigwit, &p_in),
-                (&self.spent, &p_sp),
-            ],
+            &[(&self.body, &p_out), (&self.seqsigwit, &p_in)],
             self.datadir_hdd(),
         )?;
         self.create_loc.write_staged(&staged_loc)?;

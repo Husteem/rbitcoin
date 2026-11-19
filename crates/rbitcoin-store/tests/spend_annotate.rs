@@ -1,7 +1,7 @@
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::compact::output_flags;
 use rbitcoin_store::error::StoreError;
-use rbitcoin_store::spend_annotate_uring::*;
+use rbitcoin_store::spend_annotate::*;
 use rbitcoin_store::spender_table::SpenderTable;
 use rbitcoin_store::tx_table::{InputRecord, TxRecord};
 use rbitcoin_store::tx_table::{OutputRecord, TxTable};
@@ -41,6 +41,23 @@ fn put_n_outs(t: &TxTable, n_out: u32, txid_byte: u8) -> (Fk, u64, u64) {
     (fk, off, len)
 }
 
+/// Reopen with `spent.body` filled out to its published end and no
+/// `spent.delta/`, as a datadir from before schema 30: open takes every page
+/// as one a fold wrote.
+fn reopen_as_older_schema(dir: &std::path::Path, t: TxTable) -> TxTable {
+    let end = t.spent.body_published_len();
+    drop(t);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("spent.body"))
+        .unwrap();
+    if f.metadata().unwrap().len() < end {
+        f.set_len(end).unwrap();
+    }
+    std::fs::remove_dir_all(dir.join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR)).unwrap();
+    TxTable::open_tiny(dir).unwrap()
+}
+
 fn put_one(t: &TxTable) -> (Fk, u64, u64) {
     put_n_outs(t, 1, 0x11)
 }
@@ -69,29 +86,6 @@ fn pure_write_known_null_mmap_and_uring() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Shipped RMW machine annotates the sole spender on the process session.
-#[test]
-fn shipped_rmw_annotates_sole_spender() {
-    let (dir, t, spenders) = temp_table();
-    let (cfk, off, _len) = put_one(&t);
-    let abs = rbitcoin_store::tx_table::spent_abs(off, 0);
-    let sfk = Fk(88);
-    let cold = match put_spend_batch_by_abs_meta_uring(&t, &spenders, &[(abs, cfk, 0, sfk, 0)]) {
-        Ok(cold) => cold,
-        Err(StoreError::Unavailable) => {
-            let _ = std::fs::remove_dir_all(&dir);
-            return;
-        }
-        Err(e) => panic!("rmw: {e}"),
-    };
-    assert!(cold.is_empty());
-    let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-    let (field, flags, _vin) = bulk[0].unwrap();
-    assert_eq!(field, sfk);
-    assert_eq!(flags & output_flags::MULTI_SPENDER, 0);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn pure_write_idempotent_skip() {
     let (dir, t, spenders) = temp_table();
@@ -113,50 +107,6 @@ fn pure_write_idempotent_skip() {
         .unwrap();
     let bulk2 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
     assert_eq!(bulk2[0].unwrap().0, sfk);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn class_a_same_batch_slot_annotate_is_skip() {
-    let (dir, t, spenders) = temp_table();
-    let tx = TxRecord {
-        txid: [0x21; 32],
-        version: 1,
-        locktime: 0,
-        input_count: 1,
-        output_count: 2,
-    };
-    let pin = std::sync::Arc::new((
-        tx,
-        vec![
-            OutputRecord::unspent(7, vec![0x51]),
-            OutputRecord::unspent(8, vec![0x52]),
-        ],
-    ));
-    let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
-    let sfk = Fk(9);
-    let (fks, _loc) = t
-        .put_full_batch_from_pins(
-            &[(pin, ins)],
-            false,
-            rbitcoin_store::tx_table::SpentBodyImage::from_pairs(&[2], &[vec![(0u32, sfk, 0)]])
-                .unwrap(),
-        )
-        .unwrap();
-    let cfk = fks[0];
-    let (off, _) = t.spent_range(cfk).unwrap();
-    let abs = rbitcoin_store::tx_table::spent_abs(off, 0);
-    let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-    assert_eq!(bulk[0].unwrap().0, sfk);
-    let cold =
-        put_spend_batch_by_abs_meta_known(&t, &spenders, &[(abs, cfk, 0, sfk, 0)], &[(sfk, 0, 0)])
-            .unwrap();
-    assert!(cold.is_empty());
-    let bulk2 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-    assert_eq!(bulk2[0].unwrap().0, sfk);
-    let abs1 = rbitcoin_store::tx_table::spent_abs(off, 1);
-    let neighbor = t.get_spender_meta_at_abs_batch(&[abs1]).unwrap();
-    assert!(neighbor[0].unwrap().0.is_null());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -249,41 +199,6 @@ fn pure_write_two_vouts_same_page_preserves_neighbor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A long body pwrite is armed to fail. The tail slot must still land, and the
-/// neighbor on that page must stay put. A page rewrite is longer than 8 bytes,
-/// so this fails closed on that path.
-#[test]
-fn tail_slot_write_survives_a_short_page_pwrite() {
-    let (dir, t, spenders) = temp_table();
-    let (cfk, off, _len) = put_n_outs(&t, 3, 0x22);
-    let abs0 = rbitcoin_store::tx_table::spent_abs(off, 0);
-    let abs1 = rbitcoin_store::tx_table::spent_abs(off, 1);
-    let sentinel = Fk(0x61);
-    let known1 = t.get_spender_meta_at_abs_batch(&[abs1]).unwrap()[0].unwrap();
-    assert!(put_spend_batch_by_abs_meta_known(
-        &t,
-        &spenders,
-        &[(abs1, cfk, 1, sentinel, 0)],
-        &[known1],
-    )
-    .unwrap()
-    .is_empty());
-    let known0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
-    rbitcoin_store::io_handle::arm_short_pwrite(t.spent.body_write_fd());
-    let cold =
-        put_spend_batch_by_abs_meta_known(&t, &spenders, &[(abs0, cfk, 0, Fk(10), 0)], &[known0])
-            .unwrap();
-    rbitcoin_store::io_handle::disarm_short_pwrite();
-    assert!(
-        cold.is_empty(),
-        "an 8-byte tail slot must not take the long page-write path"
-    );
-    let bulk = t.get_spender_meta_at_abs_batch(&[abs0, abs1]).unwrap();
-    assert_eq!(bulk[0].unwrap().0, Fk(10));
-    assert_eq!(bulk[1].unwrap().0, sentinel);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Vouts whose abs straddle a 4 KiB page both persist.
 #[test]
 fn pure_write_two_pages_both_land() {
@@ -349,7 +264,6 @@ fn unknown_meta_annotate_stays_in_the_directory() {
     let a2 = rbitcoin_store::spent_abs(off, 510);
     assert_eq!(a0 / 4096, a1 / 4096);
     assert_ne!(a0 / 4096, a2 / 4096);
-    rbitcoin_store::spend_annotate_uring::reset_spend_annotate_counts();
     let edges = [
         (a0, fk, 0u32, Fk(10), 1u32),
         (a1, fk, 1u32, Fk(11), 2u32),
@@ -359,26 +273,13 @@ fn unknown_meta_annotate_stays_in_the_directory() {
         .put_spend_batch_by_abs_meta(&spenders, &edges)
         .unwrap()
         .is_empty());
-    // Every published slot, including the short tail, stays in the directory.
-    // The body bytes stay zero. The page-RMW counters stay quiet.
-    assert_eq!(
-        rbitcoin_store::spend_annotate_uring::spend_annotate_counts(),
-        (0, 0)
+    // Every published slot, including the short tail, stays in the delta:
+    // `spent.body` is not written, or extended, at all.
+    let physical = std::fs::metadata(t.spent.body_file_path()).unwrap().len();
+    assert!(
+        physical < t.spent.body_published_len(),
+        "spent.body is {physical} bytes"
     );
-    let published = t.spent.body_published_len();
-    let mut slot = [0u8; 8];
-    t.spent
-        .read_prefix_at_published(published, a0, 8, &mut slot)
-        .unwrap();
-    assert_eq!(slot, [0u8; 8]);
-    t.spent
-        .read_prefix_at_published(published, a1, 8, &mut slot)
-        .unwrap();
-    assert_eq!(slot, [0u8; 8]);
-    t.spent
-        .read_prefix_at_published(published, a2, 8, &mut slot)
-        .unwrap();
-    assert_eq!(slot, [0u8; 8]);
     let (off, len) = t.spent_range(fk).unwrap();
     let (m0, f0, v0) = t.get_output_spender_meta_at(off, len, 0).unwrap();
     let (m1, f1, v1) = t.get_output_spender_meta_at(off, len, 1).unwrap();
@@ -453,27 +354,8 @@ fn known_skip_rewrites_a_logged_slot_over_a_torn_body() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A known skip with no log note still refuses a reserved body flag.
-#[test]
-fn known_skip_refuses_a_torn_body_when_the_log_misses() {
-    let (dir, t, spenders) = temp_table();
-    let (cfk, off, _len) = put_one(&t);
-    let abs = rbitcoin_store::tx_table::spent_abs(off, 0);
-    t.spent
-        .write_body_abs(abs, &[0xff, 0, 0, 0, 0, 0, 0, 0])
-        .unwrap();
-    let err = put_spend_batch_by_abs_meta_known(
-        &t,
-        &spenders,
-        &[(abs, cfk, 0, Fk(77), 0)],
-        &[(Fk(77), 0, 0)],
-    )
-    .unwrap_err();
-    assert!(matches!(err, StoreError::Corrupt(_)));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// A published slot with no directory note and reserved flags fails the batch.
+#[cfg(debug_assertions)]
 #[test]
 fn batched_annotate_refuses_a_corrupt_body_slot() {
     let (dir, t, spenders) = temp_table();
@@ -482,10 +364,34 @@ fn batched_annotate_refuses_a_corrupt_body_slot() {
     t.spent
         .write_body_abs(abs, &[0xff, 0, 0, 0, 0, 0, 0, 0])
         .unwrap();
+    let t = reopen_as_older_schema(&dir, t);
     let err = t
         .put_spend_batch_by_abs_meta(&spenders, &[(abs, fk, 0, Fk(10), 1)])
         .unwrap_err();
     assert!(matches!(err, StoreError::Corrupt(_)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `spent.body` bytes on a page no fold wrote are never read: a crash can
+/// leave a fold there that no commit names.
+#[test]
+fn a_body_page_no_fold_wrote_is_not_read() {
+    let (dir, t, spenders) = temp_table();
+    let (fk, off, len) = put_one(&t);
+    let abs = rbitcoin_store::spent_abs(off, 0);
+    t.spent
+        .write_body_abs(abs, &[0xff, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    assert!(t
+        .get_output_spender_meta_at(off, len, 0)
+        .unwrap()
+        .1
+        .is_null());
+    assert!(t
+        .put_spend_batch_by_abs_meta(&spenders, &[(abs, fk, 0, Fk(10), 1)])
+        .unwrap()
+        .is_empty());
+    assert_eq!(t.get_output_spender_meta_at(off, len, 0).unwrap().1, Fk(10));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -513,17 +419,8 @@ fn historical_second_spend_keeps_both_edges() {
         .put_spend_batch_by_abs_meta(&spenders, &[(a_tail, fk, 510, Fk(12), 3)])
         .unwrap()
         .is_empty());
-    let published = t.spent.body_published_len();
-    let mut body = [0u8; 8];
-    t.spent
-        .read_prefix_at_published(published, a0, 8, &mut body)
-        .unwrap();
-    assert_eq!(body, [0u8; 8]);
-    t.spent
-        .read_prefix_at_published(published, a_tail, 8, &mut body)
-        .unwrap();
-    assert_eq!(body, [0u8; 8]);
-    t.spent.write_body_abs(a0, &[0u8; 8]).unwrap();
+    let physical = std::fs::metadata(t.spent.body_file_path()).unwrap().len();
+    assert!(physical < a_tail, "spent.body is {physical} bytes");
     let (multi, field, vin) = t.get_output_spender_meta_at(off, len, 0).unwrap();
     assert!(multi && vin == 0);
     let (second, second_vin, next) = spenders.get(field).unwrap();
@@ -538,50 +435,17 @@ fn historical_second_spend_keeps_both_edges() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A spend slot past the published body is refused, not noted: only open's
+/// clip drops a note past the end, so a create that failed to publish would
+/// leave it for the next create at that offset.
 #[test]
-fn group_writes_by_spent_page_merges_same_page() {
-    let meta = [1u8; META_LEN];
-    let slot = META_LEN as u64;
-    let writes = [
-        (16u64, Fk(1), 0, Fk(10), 0, meta),
-        (16 + 2 * slot, Fk(1), 2, Fk(12), 0, meta),
-    ];
-    let rec = 3 * slot;
-    let g = group_writes_by_spent_page(&writes, 16 + rec);
-    assert_eq!(g.len(), 1);
-    assert_eq!(g[0].off, rbitcoin_store::file::FILE_HEADER_LEN as u64);
-    assert_eq!(g[0].len, rec as usize);
-    assert_eq!(g[0].writes.len(), 2);
-}
-
-#[test]
-fn group_writes_by_spent_page_keeps_distinct_pages() {
-    let meta = [1u8; META_LEN];
-    let writes = [
-        (16u64, Fk(1), 0, Fk(10), 0, meta),
-        (4096u64 + 16, Fk(2), 0, Fk(12), 0, meta),
-    ];
-    let g = group_writes_by_spent_page(&writes, 4096 + 16 + META_LEN as u64);
-    assert_eq!(g.len(), 2);
-    assert_eq!(g[0].off, rbitcoin_store::file::FILE_HEADER_LEN as u64);
-    assert_eq!(g[1].off, 4096);
-}
-
-#[test]
-fn group_writes_by_spent_page_merges_straddle() {
-    let meta = [1u8; META_LEN];
-    let slot = META_LEN as u64;
-    // Slot starts 3 bytes before the 4 KiB page end so the RMW straddles.
-    let first = 4096u64 - 3;
-    let second = first + slot;
-    let end = second + slot;
-    let writes = [
-        (first, Fk(1), 0, Fk(10), 0, meta),
-        (second, Fk(1), 1, Fk(11), 0, meta),
-    ];
-    let g = group_writes_by_spent_page(&writes, end);
-    assert_eq!(g.len(), 1);
-    assert_eq!(g[0].writes.len(), 2);
-    assert!(g[0].off <= first);
-    assert!(g[0].off + g[0].len as u64 >= end);
+fn a_spend_slot_past_the_published_body_is_refused() {
+    let (dir, t, spenders) = temp_table();
+    let _ = put_one(&t);
+    let end = t.spent.body_published_len();
+    let err = t
+        .put_spends_on_create_at(&spenders, end, 8, &[(0, Fk(9), 0)])
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt(_)), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
