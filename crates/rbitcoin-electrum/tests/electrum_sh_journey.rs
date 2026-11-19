@@ -471,6 +471,42 @@ pub fn listunspent_skips_unused(q: &Arc<Query>, hub: &MempoolHub, spent_cb: &bit
     );
 }
 
+#[doc(hidden)]
+pub fn fee_histogram_is_sat_per_vbyte_by_bin(q: &Arc<Query>, hub: &MempoolHub) {
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let mut header_sub = false;
+    let mut sh_subs = HashSet::new();
+    let reply = dispatch(
+        "mempool.get_fee_histogram",
+        &json!([]),
+        q,
+        &cfg,
+        &params,
+        Some(hub),
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap();
+    let want = hub.fee_histogram();
+    assert!(
+        want.len() >= 2,
+        "need several bins so a running total differs from the bin sizes: {want:?}"
+    );
+    let rows = reply.as_array().expect("histogram array");
+    assert_eq!(rows.len(), want.len(), "{reply}");
+    for (row, (rate_kvb, vsize)) in rows.iter().zip(want) {
+        let rate = row[0].as_f64().expect("rate is a number");
+        let expect = (rate_kvb as f64) / 1000.0;
+        assert!((rate - expect).abs() < 1e-9, "{row} vs {rate_kvb}");
+        assert_eq!(
+            row[1].as_u64(),
+            Some(vsize),
+            "each bin carries its own vsize: {row}"
+        );
+    }
+}
+
 pub async fn read_push(stream: &mut TcpStream) -> Value {
     let mut reader = BufReader::new(&mut *stream);
     let mut resp = String::new();
@@ -764,6 +800,7 @@ pub async fn electrum_sh_join() {
             .expect("accept spend");
     }
     listunspent_skips_unused(&q, &hub, &coinbase_txids[0]);
+    fee_histogram_is_sat_per_vbyte_by_bin(&q, &hub);
     tip_push_two_clients_and_late(Arc::clone(&q), Some(hub)).await;
     let _ = std::fs::remove_dir_all(&dir);
 }

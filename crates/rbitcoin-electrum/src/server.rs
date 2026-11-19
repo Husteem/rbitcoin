@@ -3280,13 +3280,17 @@ pub fn dispatch_pinned(
         }
         "mempool.get_fee_histogram" => {
             let hist = mempool.map(|m| m.fee_histogram()).unwrap_or_default();
-            // Electrum: array of [feerate, cumulative_vsize] with cumulative sizes.
-            let mut cum = 0u64;
-            let mut arr = Vec::new();
-            for (rate, vsize) in hist {
-                cum = cum.saturating_add(vsize);
-                arr.push(json!([rate, cum]));
-            }
+            // Electrum: [fee_rate, vsize] pairs, highest rate first. The rate is
+            // sat/vB (the snapshot's sat/kvB divided by 1,000, as Esplora's
+            // `/mempool` sends it); each vsize is that bin's own size, as the
+            // protocol's per-interval definition asks, not a running total.
+            let arr: Vec<Value> = hist
+                .into_iter()
+                .map(|(rate_kvb, vsize)| {
+                    let rate_sat_per_vb = (rate_kvb as f64) / 1000.0;
+                    json!([rate_sat_per_vb, vsize])
+                })
+                .collect();
             Ok(Value::Array(arr))
         }
         "server.peers.subscribe" => Ok(json!([])),
