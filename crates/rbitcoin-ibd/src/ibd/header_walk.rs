@@ -123,6 +123,8 @@ pub struct HeaderWalk {
     pub origin: bool,
     /// Look-ahead tips that every peer left empty before the work floor.
     pub dead_ends: HashSet<BlockHash>,
+    /// `dead_ends` in insertion order, so the cap drops the oldest.
+    pub dead_end_order: std::collections::VecDeque<BlockHash>,
     /// The last header of each refused batch that built on a rejected block.
     /// A batch that builds on one is refused too.
     pub invalid_tips: HashSet<BlockHash>,
@@ -221,6 +223,7 @@ const PRODUCTIVE_HEADER_MISS_DISCONNECT: u8 = 4;
 /// the minimum block-stall window; pings and unrelated bytes do not renew it.
 #[doc(hidden)]
 pub const HEADER_BLOCK_PROGRESS_GRACE_MS: u64 = 30_000;
+/// Past the cap the oldest dead end gives way, so the newest marks are kept.
 #[doc(hidden)]
 pub const DEAD_END_CAP: usize = 1024;
 /// Past the cap the oldest refused tip gives way, so the newest is kept: the
@@ -1066,10 +1069,16 @@ pub fn clear_off_path(st: &mut IbdWorkState) {
 
 #[doc(hidden)]
 pub fn note_dead(st: &mut IbdWorkState, hash: BlockHash) {
-    if st.header_walk.dead_ends.len() >= DEAD_END_CAP {
-        st.header_walk.dead_ends.clear();
+    let walk = &mut st.header_walk;
+    if !walk.dead_ends.insert(hash) {
+        return;
     }
-    st.header_walk.dead_ends.insert(hash);
+    walk.dead_end_order.push_back(hash);
+    if walk.dead_end_order.len() > DEAD_END_CAP {
+        if let Some(oldest) = walk.dead_end_order.pop_front() {
+            walk.dead_ends.remove(&oldest);
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -1672,6 +1681,7 @@ pub fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
     publish_work(st, hub);
     st.header_walk.emptied.clear();
     st.header_walk.dead_ends.clear();
+    st.header_walk.dead_end_order.clear();
     clear_off_path(st);
     save_adopt(st, hub);
     drop_queue_above(st, ch.fork_height, &HashSet::new());
@@ -2024,6 +2034,7 @@ pub fn adopt_heavier(
     publish_work(st, hub);
     st.header_walk.emptied.clear();
     st.header_walk.dead_ends.clear();
+    st.header_walk.dead_end_order.clear();
     clear_off_path(st);
     save_adopt(st, hub);
     let keep: HashSet<BlockHash> = headers.iter().map(|h| h.block_hash()).collect();
@@ -4168,6 +4179,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         },
         origin: true,
         dead_ends: HashSet::new(),
+        dead_end_order: std::collections::VecDeque::new(),
         invalid_tips: HashSet::new(),
         invalid_tip_order: std::collections::VecDeque::new(),
         emptied: HashSet::new(),
