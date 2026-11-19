@@ -749,6 +749,13 @@ fn freeze_releases_an_edge_cap_waiter() {
 /// After a window that reached the cap, the next window's map takes the cap
 /// and a write phase's worth of notes past it (a full `writeq` of runs,
 /// about 450,000) without growing: `notes_ram=` holds still.
+///
+/// This journey takes about 2.5 s in a debug build: it notes 4.45 million
+/// slots. The contract is that the fixed 2,000,000 [`OPEN_EDGE_CAP`] plus a
+/// write phase fits the map one cap window sizes. A smaller window sizes a
+/// smaller map and never reaches the room limit, so no smaller N tests it.
+///
+/// [`OPEN_EDGE_CAP`]: rbitcoin_store::spend_delta::OPEN_EDGE_CAP
 #[test]
 fn a_window_after_the_cap_fills_past_it_without_growing() {
     let d = dir();

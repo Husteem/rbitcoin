@@ -37,8 +37,10 @@
 //! `spent.body`, since nothing reads it there until the commit.
 //!
 //! Confirm notes spend slots in RAM, in a hash map by slot index sized from
-//! the window before it, so a window at [`OPEN_EDGE_CAP`] never regrows its
-//! map. A checkpoint publishes one generation:
+//! the window before it: after a window at [`OPEN_EDGE_CAP`], the map takes
+//! the cap and a full write phase past it without regrowing; after a smaller
+//! window (a timer checkpoint, a failed one, or the first after open) it may
+//! grow once. A checkpoint publishes one generation:
 //!
 //! 1. seal the open notes: under the exclusion confirm and disconnect take,
 //!    swap in a map allocated before it; after a disconnect, a note whose
@@ -403,7 +405,7 @@ impl Hasher for SlotKeyHasher {
 
 /// Frozen notes sorted by slot index, 16 bytes each, so a page's notes are
 /// one run in slot order. `dir[b]` is the first note at or past key-range
-/// bucket `b`: a lookup searches only its bucket. One bucket per 16 to 32
+/// bucket `b`: a lookup searches only its bucket. One bucket per 16 to 64
 /// notes keeps the directory under a quarter byte a note (256 KiB at the
 /// cap) while a bucket search stays a few compares.
 struct SealedNotes {
