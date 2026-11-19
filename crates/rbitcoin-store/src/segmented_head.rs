@@ -5,7 +5,7 @@
 //! store/
 //!   tx.head/
 //!     meta                       # segment descriptors
-//!     000000                     # open OA only (unlinked after seal)
+//!     000000                     # shutdown snapshot of the open tail (absent while live)
 //!     000000.mphf + .fuse8     # sealed: value-assigned MPHF + fuse8
 //!     …
 //! ```
@@ -16,8 +16,9 @@
 //! `fk = first_fk + rel - 1` (1-based relative within the segment).
 //!
 //! **Capacity:** open segment ends at `floor(slots × HEAD_LOAD_START)` (80%);
-//! then open a new head and seal the previous OA on a sidecar (MPHF + fuse8).
-//! Lookup probes every unsealed OA until publish.
+//! then open a new private table and seal the previous one on a sidecar
+//! (MPHF + fuse8). Lookup probes every unsealed table until publish.
+//! The open tail is not a file until shutdown writes one snapshot.
 //!
 //! **Lookup:** unsealed OAs newest-first; then sealed newest→oldest gated by fuse8;
 //! candidates are absolute fks for body-verify by the caller.
@@ -62,6 +63,9 @@ pub struct Segment {
     /// meta v1 head until `TxTable` writes them).
     pub tagged: AtomicBool,
     pub head: Option<Arc<AddressHead>>,
+    /// Snapshot footer generation loaded for this unsealed segment, and only
+    /// when it matched `count` at open. `None` when the slots started empty.
+    pub loaded_generation: Option<u64>,
     pub pack: Option<Arc<TxHeadMphf>>,
     pub fuse: Option<SealedFuse8>,
 }
@@ -80,7 +84,7 @@ pub struct SegmentedTxHead {
     pub max_keys: u64,
     /// Serializes seal/roll + inserts (sole Class A appender still the rule).
     pub write: Mutex<()>,
-    /// Background seal of the previous open OA (not joined on insert).
+    /// Background seal of the previous open segment (not joined on insert).
     pub seal_rx: Mutex<Option<Receiver<Result<SealPublish, StoreError>>>>,
 }
 
@@ -117,7 +121,7 @@ impl SegmentedTxHead {
                     return Err(StoreError::Corrupt("tx.head sealed segment missing mphf"));
                 }
                 if path.is_file() {
-                    // Crash between sealed-meta persist and OA unlink.
+                    // Crash between sealed-meta persist and snapshot unlink.
                     rbitcoin_log::warn!(
                         "store: tx.head discarding leftover OA for sealed segment file_id={}",
                         d.file_id
@@ -126,11 +130,11 @@ impl SegmentedTxHead {
                 }
                 (None, Some(Arc::new(TxHeadMphf::open(&path)?)))
             } else {
-                let head = AddressHead::open(&path)?;
-                if head.bits() != bits {
-                    return Err(StoreError::Corrupt("tx.head segment layout mismatch"));
-                }
-                (Some(Arc::new(head)), None)
+                // The tail is loaded below. An unsealed non-tail is loaded
+                // only when a snapshot's generation matches its count (a
+                // failed seal-meta persist). Otherwise it stays headless and
+                // `TxTable::open` seals it from `txid.body`.
+                (None, None)
             };
             let fuse = if sealed {
                 let fp = segment_fuse_path(&dir, d.file_id);
@@ -149,9 +153,58 @@ impl SegmentedTxHead {
                 sealed,
                 tagged: AtomicBool::new(tagged),
                 head,
+                loaded_generation: None,
                 pack,
                 fuse,
             }));
+        }
+        if let Some(last) = segs.last().cloned() {
+            if !last.sealed {
+                let count = last.count.load(Ordering::Relaxed);
+                let path = segment_head_path(&dir, last.file_id);
+                let table = load_open_tail(&path, layout, count)?;
+                let loaded_generation = table.snapshot_generation();
+                segs.pop();
+                segs.push(Arc::new(Segment {
+                    first_fk: last.first_fk,
+                    count: AtomicU64::new(count),
+                    file_id: last.file_id,
+                    sealed: false,
+                    tagged: AtomicBool::new(last.tagged.load(Ordering::Relaxed)),
+                    head: Some(Arc::new(table)),
+                    loaded_generation,
+                    pack: None,
+                    fuse: None,
+                }));
+            }
+        }
+        // One unsealed non-tail is the in-flight seal. Its snapshot exists
+        // only when drop ran after sealed meta failed to persist.
+        let nontail_end = segs.len().saturating_sub(1);
+        for seg in segs.iter_mut().take(nontail_end) {
+            if seg.sealed {
+                continue;
+            }
+            let count = seg.count.load(Ordering::Relaxed);
+            let path = segment_head_path(&dir, seg.file_id);
+            let Some(table) = load_trusted_snapshot(&path, layout, count)? else {
+                continue;
+            };
+            let loaded_generation = table.snapshot_generation();
+            let first_fk = seg.first_fk;
+            let file_id = seg.file_id;
+            let tagged = seg.tagged.load(Ordering::Relaxed);
+            *seg = Arc::new(Segment {
+                first_fk,
+                count: AtomicU64::new(count),
+                file_id,
+                sealed: false,
+                tagged: AtomicBool::new(tagged),
+                head: Some(Arc::new(table)),
+                loaded_generation,
+                pack: None,
+                fuse: None,
+            });
         }
         let unsealed_nontail = segs
             .iter()
@@ -274,7 +327,7 @@ impl SegmentedTxHead {
             .sum()
     }
 
-    /// Mapped slot arrays of the unsealed segments (file-backed, not heap).
+    /// Private slot arrays of the unsealed segments (anonymous RSS).
     pub fn open_map_bytes(&self) -> u64 {
         self.segments_snapshot()
             .iter()
@@ -700,24 +753,50 @@ impl SegmentedTxHead {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        let segs = self.segments_snapshot();
-        for s in segs.iter() {
-            if let Some(h) = s.head.as_ref() {
-                h.flush()?;
-            }
-        }
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
         self.wait_seal_locked()?;
+        self.snapshot_open_heads_locked()?;
         self.persist_meta_locked()?;
         Ok(())
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    /// `Some(first_fk)` when the open tail's slots were not loaded from a
+    /// snapshot whose generation equals its meta count. Call before any
+    /// insert in this process: a later insert leaves `loaded_generation` stale.
+    #[doc(hidden)]
+    pub fn open_tail_rebuild_from(&self) -> Option<u64> {
+        let segs = self.segments_snapshot();
+        let tail = segs.last()?;
+        if tail.sealed {
+            return None;
+        }
+        let count = tail.count.load(Ordering::Relaxed);
+        match tail.loaded_generation {
+            Some(g) if g == count => None,
+            _ if count == 0 => None,
+            _ => Some(tail.first_fk),
+        }
+    }
+
+    fn snapshot_open_heads_locked(&self) -> Result<(), StoreError> {
         let segs = self.segments_snapshot();
         for s in segs.iter() {
-            if let Some(h) = s.head.as_ref() {
-                h.flush_async()?;
+            if s.sealed {
+                continue;
             }
+            let Some(h) = s.head.as_ref() else {
+                continue;
+            };
+            if !h.is_dirty() {
+                continue;
+            }
+            let count = s.count.load(Ordering::Relaxed);
+            let path = segment_head_path(&self.dir, s.file_id);
+            h.write_snapshot(&path, count)?;
         }
         Ok(())
     }
@@ -750,6 +829,7 @@ impl SegmentedTxHead {
             sealed: false,
             tagged: AtomicBool::new(true),
             head: Some(Arc::new(head)),
+            loaded_generation: None,
             pack: None,
             fuse: None,
         });
@@ -839,6 +919,7 @@ impl SegmentedTxHead {
                 sealed: true,
                 tagged: AtomicBool::new(true),
                 head: None,
+                loaded_generation: None,
                 pack: Some(Arc::new(p.pack)),
                 fuse: Some(map_segment_fuse(&self.dir, file_id)?),
             });
@@ -848,13 +929,16 @@ impl SegmentedTxHead {
         if !found {
             return Err(StoreError::Corrupt("tx.head seal publish: file_id missing"));
         }
+        // Keep the private table alive until sealed meta is durable. A failed
+        // persist puts that table back so drop can snapshot it.
+        let previous = Arc::clone(&*guard);
         *guard = Arc::new(new_list);
         drop(guard);
-        // Sealed meta must be durable before the OA is unlinked: a crash after
-        // unlink with meta still "open" would force a full head rebuild. A
-        // leftover OA after persist is discarded on open (Windows also lands
-        // here when a lookup still holds the OA map).
-        self.persist_meta_locked()?;
+        if let Err(e) = self.persist_meta_locked() {
+            let mut guard = self.segments.write().unwrap_or_else(|err| err.into_inner());
+            *guard = previous;
+            return Err(e);
+        }
         let base = segment_head_path(&self.dir, p.file_id);
         let _ = std::fs::remove_file(&base);
         Ok(())
@@ -876,9 +960,6 @@ impl SegmentedTxHead {
         }
         let file_id = last.file_id;
         let first_fk = last.first_fk;
-        if let Some(h) = last.head.as_ref() {
-            h.flush()?;
-        }
         let next_fk = first_fk.saturating_add(count);
         self.open_new_locked(next_fk)?;
         self.persist_meta_locked()?;
@@ -918,9 +999,6 @@ impl SegmentedTxHead {
             return Err(StoreError::Corrupt(
                 "tx.head seal open_keys incomplete (reopen mid-segment without rebuild)",
             ));
-        }
-        if let Some(h) = seg.head.as_ref() {
-            h.flush()?;
         }
         let pubd = build_seal_publish(&self.dir, file_id, seg.first_fk, count, pairs)?;
         self.apply_seal_publish_locked(pubd)
@@ -983,6 +1061,7 @@ impl SegmentedTxHead {
                 sealed: true,
                 tagged: AtomicBool::new(true),
                 head: None,
+                loaded_generation: None,
                 pack: Some(Arc::new(p.pack)),
                 fuse: Some(fuse),
             }));
@@ -1057,7 +1136,39 @@ impl Drop for SegmentedTxHead {
     fn drop(&mut self) {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.wait_seal_locked();
+        if let Err(e) = self.snapshot_open_heads_locked() {
+            rbitcoin_log::warn!("store: tx.head snapshot on drop failed: {e}");
+        }
     }
+}
+
+/// Snapshot whose footer generation equals `count`. Missing, generation 0
+/// (when `count` is not 0), a short image, or a read error is `None`.
+fn load_trusted_snapshot(
+    path: &Path,
+    layout: HeadLayout,
+    count: u64,
+) -> Result<Option<AddressHead>, StoreError> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    match AddressHead::open(path) {
+        Ok(h) if h.bits() != layout.bits => {
+            Err(StoreError::Corrupt("tx.head segment layout mismatch"))
+        }
+        Ok(h) if h.snapshot_generation() == Some(count) => Ok(Some(h)),
+        Ok(_) => Ok(None),
+        Err(e) => {
+            rbitcoin_log::warn!("store: tx.head snapshot ignored ({e})");
+            Ok(None)
+        }
+    }
+}
+
+/// Load the open tail when the snapshot footer names `count`. Anything else
+/// (missing file, generation 0, a short image) is an empty table.
+fn load_open_tail(path: &Path, layout: HeadLayout, count: u64) -> Result<AddressHead, StoreError> {
+    Ok(load_trusted_snapshot(path, layout, count)?.unwrap_or_else(|| AddressHead::empty(layout)))
 }
 
 #[doc(hidden)]

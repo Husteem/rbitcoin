@@ -368,10 +368,9 @@ fn seal_mphf_one_candidate_bip30_unlinks_oa() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Seal publish must persist sealed meta **before** unlinking the open OA.
-/// A meta-persist failure mid-publish (crash model) must leave the OA on
-/// disk so reopen serves the segment unsealed instead of forcing a full
-/// head rebuild.
+/// Seal publish must persist sealed meta before dropping the private table.
+/// A meta-persist failure mid-publish leaves that table's snapshot on disk
+/// so reopen serves the segment unsealed.
 #[test]
 fn seal_publish_keeps_oa_when_meta_persist_fails() {
     let dir = tmp();
@@ -529,7 +528,7 @@ fn roll_does_not_join_seal_open_probes_sealing_oa() {
         "tail + in-flight seal, unsealed={unsealed:?}"
     );
     let oa = dir.join("tx.head").join("000000");
-    assert!(oa.is_file(), "sealing OA stays on disk until publish");
+    assert!(!oa.is_file(), "a roll keeps the sealing table in memory");
     let open = h
         .probe_candidates_batch_wave(
             &[mixed(1)],

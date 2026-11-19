@@ -4319,8 +4319,71 @@ fn copy_tree(src: &Path, dst: &Path) {
     }
 }
 
-/// Kill mid-seal: meta still has an unsealed non-tail OA. Open rebuilds fuse
-/// keys from Class A and seals it before returning.
+/// Clean flush writes one dense snapshot whose footer generation is the
+/// segment count. Generation 0 is the pre-commit image: open ignores it
+/// and rebuilds the tail from `txid.body`.
+#[test]
+fn open_tail_snapshot_generation_and_zero_rebuilds() {
+    let dir = tempfile_dir("head-snap");
+    let n = 4u64;
+    let recs: Vec<TxRecord> = (0..n)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0] = (i + 1) as u8;
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_count: 0,
+                output_count: 0,
+            }
+        })
+        .collect();
+    {
+        let t = create_tiny(&dir);
+        t.put_full_batch_indexed(&meta_only_items(&recs), true)
+            .unwrap();
+        let oa = dir.join("tx.head").join("000000");
+        assert!(!oa.is_file(), "live inserts do not write the open table");
+        t.flush_head().unwrap();
+        let raw = std::fs::read(&oa).unwrap();
+        let gen = u64::from_le_bytes(raw[raw.len() - 8..].try_into().unwrap());
+        assert_eq!(gen, n);
+        let bits = t.head.bits();
+        let body = rbitcoin_store::address_head::HeadLayout::new(bits)
+            .unwrap()
+            .body_bytes() as usize;
+        assert_eq!(raw.len(), body + rbitcoin_store::file::TRAILING_FOOTER_LEN);
+    }
+    {
+        let t = TxTable::open_tiny(&dir).unwrap();
+        for i in 1..=n {
+            let mut txid = [0u8; 32];
+            txid[0] = i as u8;
+            assert_eq!(t.probe_body_match_fk(&txid).unwrap(), Some(Fk(i)));
+        }
+    }
+    let oa = dir.join("tx.head").join("000000");
+    let mut raw = std::fs::read(&oa).unwrap();
+    let gen_at = raw.len() - 8;
+    raw[gen_at..].fill(0);
+    std::fs::write(&oa, &raw).unwrap();
+    let t = TxTable::open_tiny(&dir).unwrap();
+    for i in 1..=n {
+        let mut txid = [0u8; 32];
+        txid[0] = i as u8;
+        assert_eq!(
+            t.probe_body_match_fk(&txid).unwrap(),
+            Some(Fk(i)),
+            "generation 0 rebuilds fk={i}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Kill mid-seal: meta still has an unsealed non-tail. Open rebuilds fuse
+/// keys from Class A and seals it before returning. The copy has no
+/// open-address file.
 #[test]
 fn open_seals_unsealed_nontail_after_copied_roll() {
     let dir = tempfile_dir("bg-seal-live");
@@ -4355,6 +4418,14 @@ fn open_seals_unsealed_nontail_after_copied_roll() {
             t.head.unsealed_ranges()
         );
         copy_tree(&dir, &copy);
+        assert!(
+            !copy.join("tx.head").join("000000").is_file(),
+            "the sealing table is not a file"
+        );
+        assert!(
+            !copy.join("tx.head").join("000001").is_file(),
+            "the open tail is not a file until shutdown"
+        );
     }
     let t2 = TxTable::open_tiny(&copy).unwrap();
     assert!(

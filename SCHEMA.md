@@ -132,7 +132,7 @@ catalogs, or 16-layout Class A with creates is **refused**.
 
 | Policy | Choice |
 |--------|--------|
-| Loc | One loc pair per create; `seqsigwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls at OA 80% slots only. |
+| Loc | One loc pair per create; `seqsigwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls the private table at 80% slots only. |
 | `strong_tx` | Always L2. **`confirmed`** and **`header_txs_*`** stay in RAM up to 256 MiB, then fd. |
 | `RWF_DONTCACHE` | **Not used.** Confirm notes every spend slot in the delta, and Class A writes no `spent.body` bytes; a fold writes whole pages that checkpoints soon read again. |
 
@@ -239,7 +239,7 @@ itself changed.
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     txstat.body / txstat.ovf / txstat.blk            # 8 B/create ULEB econ + per-header tails (schema 25)
     input.loc / input.off / input.body               # spender → parent edges (8 B/input) + n_in (2 B/create)
-    tx.head/                     # meta + open OA NNNNNN; sealed NNNNNN.mphf|.fuse8
+    tx.head/                     # meta + shutdown snapshot NNNNNN; sealed NNNNNN.mphf|.fuse8
     spent.ovf                    # multi-spender overflow (was spenders.body)
     confirmed.body               # Class C: height → header_fk
     strong_tx.body               # Class C: bitset, bit (tx_fk-1) = strong
@@ -689,29 +689,30 @@ bits-widen / shadow-resize path. Module map: [`docs/heads.md`](./docs/heads.md).
 
 | Property | Current |
 |----------|---------|
-| Files | `tx.head/meta` (**v2**: per-segment `sealed` and `tagged` flags) + open `tx.head/NNNNNN`; sealed `NNNNNN.mphf` + `.fuse8` |
+| Files | `tx.head/meta` (**v2**: per-segment `sealed` and `tagged` flags) + shutdown snapshot `tx.head/NNNNNN` while that segment is unsealed; sealed `NNNNNN.mphf` + `.fuse8` |
 | Default | **BITS=25**, **4 B** entries → **128 MiB** per segment (`2^25` slots) |
 | Bits | Tiny **16**, otherwise **25**. No process env. The entry is always 4 B; a footer that says 8 B **refuses** (`tx.head footer entry width`) |
 | Entry | LE u32 word `rel \| fp << bits`. Low `bits`: **relative** create id, **0 = empty**, `fk = first_fk + rel − 1`. Spare high bits: fingerprint of the mixed key, `1..=2^(32−bits)−1`; **0 = untagged**, matches every key. No fingerprint at bits 32 |
-| Meta v1 → v2 | A v1 meta **opens** (no refuse). Its unsealed OA slots carry fingerprint 0; open writes each slot's fingerprint from `txid.body` (one 4 B `pwrite` per row), flushes, then persists meta v2 with the segment `tagged`. A v1 binary refuses v2 meta (`tx.head.meta version`) and rebuilds `tx.head` from Class A |
-| Capacity | Segment ends at **80% of head slots** (`max_keys`) → open next OA, seal previous on a sidecar. Class A loc/body size does **not** cut `tx.head`. |
+| Meta v1 → v2 | A v1 meta **opens** (no refuse). Its unsealed slots carry fingerprint 0; open writes each slot's fingerprint from `txid.body` into the private table, writes the snapshot, then persists meta v2 with the segment `tagged`. A v1 binary refuses v2 meta (`tx.head.meta version`) and rebuilds `tx.head` from Class A |
+| Capacity | Segment ends at **80% of head slots** (`max_keys`) → open the next private table, seal the previous on a sidecar. Class A loc/body size does **not** cut `tx.head`. |
 | Seal filter | **Binary fuse8** (~9 bits/key, no false negatives, FP ≈ 0.39%) built **once on seal**; open segment has **no** filter |
 | Fuse file | `BF8R` + **version** + body. **v2** = in-tree LE layout (current). **v1** = historical xorf+bincode — **refused** (wipe `store/tx.head` and `store/scripthash*`; Class A kept) |
-| Probe | Open OA: page-local double-hash (1024 slots/page) through a read-only `MAP_SHARED` view of the slot file (no syscall); a slot whose fingerprint differs is skipped; `txid.body` verifies the rest. Sealed: RAM fuse skip, then unique 4 KiB packed BDZ `g` pages (not loaded into process heap); MPHF output is `rel−1` |
+| Probe | Open tail: page-local double-hash (1024 slots/page) through a private slot table (no syscall); a slot whose fingerprint differs is skipped; `txid.body` verifies the rest. Sealed: RAM fuse skip, then unique 4 KiB packed BDZ `g` pages (not loaded into process heap); MPHF output is `rel−1` |
 | Insert | First empty in-page (or same relative id idempotent); second same-txid goes **deeper** |
 | Lookup | Pin by txid → **hot** (open + ages ≤3) → ID/idx → **cold** (ages ≥4) if needed; fuse-gate sealed; body-verify ([`docs/heads.md`](./docs/heads.md)) |
 | Legacy | Monolithic `tx.head` / `tx.head.new` / `tx.head.resize` / `tx.head.overflow` **refused on open** — reindex |
 
-**Publish order on seal:** flush the full OA → open the next head and persist
+**Publish order on seal:** open the next private table and persist
 `tx.head.meta` (two unsealed) → sidecar writes fuse8 + value-assigned MPHF → mark the
-previous segment sealed in meta → unlink the OA. Insert does not join the
-sidecar. Lookup Open-wave probes every unsealed OA until publish.
+previous segment sealed in meta → unlink a leftover snapshot. Insert does not join the
+sidecar and does not write the open table. Lookup probes every unsealed table until publish.
+Shutdown writes the open tail once; footer `generation` is the segment count.
 
-**Probe note:** open OA candidates for a key share one page (single IO).
+**Probe note:** open-tail candidates for a key share one page of the private table (no IO).
 Keyless slots cannot Robin-Hood. Sealed: RAM fuse skip, then unique 4 KiB
 BDZ `g` pages (`KIND_MPHF_G`). Kill mid-seal leaves at most
-one unsealed non-tail OA; open rebuilds its fuse keys from Class A and
-seals it. Two unsealed non-tails is **Corrupt**.
+one unsealed non-tail; open rebuilds its fuse keys from Class A and
+seals it, and rebuilds an unsnapshotted tail from `txid.body`. Two unsealed non-tails is **Corrupt**.
 
 **Capacity @ 0.80 load (25-bit):** ≈ **26.8 M creates/segment**, ~29 MiB fuse8 when sealed (~6.1 B total sealed storage per create including head slots).
 
@@ -719,8 +720,8 @@ seals it. Two unsealed non-tails is **Corrupt**.
 (no historical OA). Ranges seal in parallel: min(CPUs, free RAM / 1 GiB,
 range count); `RBITCOIN_TX_HEAD_REBUILD_WORKERS` overrides (`1` = serial).
 Default range **2²⁵ keys** (`RBITCOIN_TX_HEAD_REBUILD_SEAL_BITS=25`); **26** is
-wider. Remainder is sealed; an empty open tail is created. Live IBD rolls OA
-at 80% slots (~26.8 M), so rebuild ranges match live seal size.
+wider. Remainder is sealed; an empty open tail is created. Live IBD rolls the
+private table at 80% slots (~26.8 M), so rebuild ranges match live seal size.
 
 ---
 

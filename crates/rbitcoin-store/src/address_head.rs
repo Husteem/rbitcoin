@@ -4,20 +4,25 @@
 //! **no HAS_NEXT** — probe continues until an empty slot (no Class A deletes).
 //! Callers verify identity via Class A body txid on **lookup**. The spare high
 //! bits of each slot hold a fingerprint of the mixed key, so a probe skips most
-//! foreign occupants before identity. Probes read the slots through a read-only
-//! `MAP_SHARED` map (`AddressHead::slots`); the page cache keeps it coherent
-//! with the sole writer's `pwrite`s.
+//! foreign occupants before identity. The live table is a private `[AtomicU32]`
+//! of `2^bits` slots. Insert `Release`-stores a slot; lookup `Acquire`-loads it.
+//! Nothing publishes a slot page to disk on insert.
 //!
 //! **Insert (sole writer):** probe until the **same fk** is already present
-//! (idempotent) or an **empty** slot — `pwrite` the slot (`0 → fk`; no CAS, no
-//! per-slot atomics). **No body_txid** on insert (no BIP30 displacement on write).
+//! (idempotent) or an **empty** slot — store the slot (`0 → fk`; no CAS).
+//! **No body_txid** on insert (no BIP30 displacement on write).
 //! Foreigners and older same-txid creates are skipped blindly; a second Class A
 //! row for the same txid lands at the next empty slot (deeper on the probe chain).
 //!
 //! **Insert batching:** stable-sort by probe **page** then original index
 //! (preserves call order within a page for rare same-batch duplicate txids). One
-//! page copy from the map + multi-insert + one `pwrite` per dirty page. Readers
-//! see the new slots through the map once the `pwrite` lands.
+//! page copy from the private table + multi-insert + a `Release` store of each
+//! changed slot. Readers see the new slot once that store lands.
+//!
+//! **Snapshot:** [`AddressHead::write_snapshot`] writes the dense image once,
+//! `fsync`s it with footer generation 0, then stores `generation` and `fsync`s
+//! again. A clean shutdown is that write. A crash leaves no trusted image;
+//! the open tail is rebuilt from `txid.body`.
 //!
 //! **Concurrency:** at most **one** thread may insert into a given head segment
 //! (archive writer in IBD; single tip accept path after). Multi-writer races are
@@ -30,8 +35,7 @@
 //! **Probe (page-local open address):** high bits of the txid select a **page** of
 //! [`PAGE_SLOTS`] (2¹⁰) slots; within the page, **double hashing** with the next
 //! key bits (`h1` / odd `h2`). Depth is capped at [`MAX_PROBE`] (= page size).
-//! Lookup and insert hop the mapped slots; insert then writes **one page** (4 KiB)
-//! per dirty page. Foreign occupants with the same fingerprint (or none yet):
+//! Lookup and insert hop the private slots. Foreign occupants with the same fingerprint (or none yet):
 //! body mismatch ⇒ continue. Keyless slots cannot Robin-Hood. First insert at depth > [`PROBE_DEPTH_WARN`] requests online
 //!
 //! **Segment default:** BITS=**25** → **128 MiB** @ 4 B relative create ids per
@@ -42,11 +46,10 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, TRAILING_FOOTER_LEN};
 use crate::hashhead::HeadScale;
-use crate::readonly_map::ReadonlyMap;
 use rbitcoin_primitives::{le_u16, le_u64, Fk, TableKind};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// In-page slot index width (1024 slots / page @ any entry width).
 pub const PAGE_SLOT_BITS: u32 = 10;
@@ -559,41 +562,47 @@ pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError
 }
 
 /// Fixed-width keyless txid → dense create_fk table.
+///
+/// The slot array is anonymous memory. A slot is `rel | fp << bits`. The
+/// on-disk image is only the shutdown snapshot ([`Self::write_snapshot`]).
 pub struct AddressHead {
-    pub file: TableFile,
     pub layout: HeadLayout,
-    /// Read-only `MAP_SHARED` view of the slot array. Probes and inserts hop
-    /// it; the sole writer `pwrite`s pages through `file` and the page cache
-    /// keeps the view coherent. A slot is `rel | fp << bits`.
-    map: ReadonlyMap,
+    slots: Box<[AtomicU32]>,
+    /// Footer generation of a snapshot this table was loaded from.
+    /// `None` for a table created empty in this process.
+    snapshot_generation: Option<u64>,
+    dirty: AtomicBool,
 }
 
 impl AddressHead {
+    /// Private zeroed table. Does not create a file.
+    pub fn empty(layout: HeadLayout) -> Self {
+        let n = layout.slots() as usize;
+        Self {
+            layout,
+            slots: zero_slots(n),
+            snapshot_generation: None,
+            dirty: AtomicBool::new(false),
+        }
+    }
+
     pub fn create_with_layout(
         path: impl Into<PathBuf>,
         layout: HeadLayout,
     ) -> Result<Self, StoreError> {
-        // Trailing footer: slots at offset 0 so each 4 KiB probe page is OS-aligned.
-        // Layout (bits/entry/generation) lives in the footer extension — no sidecar.
         let path = path.into();
         if path.is_dir() {
             return Err(StoreError::Corrupt(
                 "tx.head is a directory (legacy shards); wipe datadir for address head",
             ));
         }
-        let mut file = TableFile::create_trailing_header(&path, TableKind::HashHead)?;
-        let body_bytes = layout.body_bytes();
-        let need = body_bytes + TRAILING_FOOTER_LEN as u64;
-        file.ensure_capacity(need)?;
-        // Layout ext must be set before set_logical_len so the footer at EOF
-        // carries bits/generation (no sidecar).
-        file.set_trailing_ext(encode_layout_ext(layout, 0))?;
-        file.set_logical_len(need)?;
-        file.zero_range(0, body_bytes)?;
+        let _ = std::fs::remove_file(&path);
         remove_legacy_meta_sidecar(&path);
-        Self::with_map(file, layout, &path)
+        Ok(Self::empty(layout))
     }
 
+    /// Load a snapshot image. The caller trusts it only when
+    /// [`Self::snapshot_generation`] equals the segment's meta count.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let path = path.into();
         if path.is_dir() {
@@ -601,10 +610,8 @@ impl AddressHead {
                 "tx.head is a directory (legacy shards); wipe datadir for address head",
             ));
         }
-        // Layout is in the trailing footer (v5). Sidecar-only or older footers fail
-        // here → TxTable recreates + rebuilds from Class A.
         let (file, ext) = TableFile::open_trailing_header_from_end(&path, TableKind::HashHead)?;
-        let (layout, _generation) = decode_layout_ext(&ext)?;
+        let (layout, generation) = decode_layout_ext(&ext)?;
         let expect_body = layout.body_bytes();
         let body = file.data_len();
         if body == 0 {
@@ -616,39 +623,90 @@ impl AddressHead {
             ));
         }
         remove_legacy_meta_sidecar(&path);
-        Self::with_map(file, layout, &path)
+        let head = Self::empty(layout);
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut off = 0u64;
+        while off < body {
+            let n = ((body - off) as usize).min(buf.len());
+            file.read_at(off, &mut buf[..n])?;
+            let start = (off / 4) as usize;
+            let words = n / 4;
+            for i in 0..words {
+                head.slots[start + i].store(word_at(&buf, i), Ordering::Relaxed);
+            }
+            off += n as u64;
+        }
+        Ok(Self {
+            snapshot_generation: Some(generation),
+            ..head
+        })
     }
 
-    fn with_map(file: TableFile, layout: HeadLayout, path: &Path) -> Result<Self, StoreError> {
-        let map = ReadonlyMap::map_prefix(path, layout.body_bytes() as usize)?;
-        Ok(Self { file, layout, map })
+    /// Footer generation of the image [`Self::open`] loaded. `None` on a
+    /// table that was created empty.
+    #[inline]
+    pub fn snapshot_generation(&self) -> Option<u64> {
+        self.snapshot_generation
     }
 
-    /// The mapped slot array. The bytes are not frozen: the sole writer
-    /// publishes slots by `pwrite` through `file`, and the page cache changes
-    /// them under this view. So every read is an atomic load, and no `&[u8]`
-    /// of the map is ever formed (`as_file_bytes` is for sealed files).
+    #[inline]
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
+    /// Write the dense slot image, then commit `generation` in the footer.
+    ///
+    /// The image is synced while the footer generation is still 0. A crash
+    /// before the second sync leaves generation 0, which segment open does
+    /// not trust. `generation` is the segment key count.
+    #[doc(hidden)]
+    pub fn write_snapshot(&self, path: &Path, generation: u64) -> Result<(), StoreError> {
+        let _ = std::fs::remove_file(path);
+        let mut file = TableFile::create_trailing_header(path, TableKind::HashHead)?;
+        let body = self.layout.body_bytes();
+        let need = body + TRAILING_FOOTER_LEN as u64;
+        file.ensure_capacity(need)?;
+        file.set_trailing_ext(encode_layout_ext(self.layout, 0))?;
+        file.set_logical_len(need)?;
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut off = 0u64;
+        while off < body {
+            let n = ((body - off) as usize).min(buf.len());
+            let start = (off / 4) as usize;
+            let words = n / 4;
+            for i in 0..words {
+                let w = self.slots[start + i].load(Ordering::Relaxed);
+                buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+            }
+            file.write_at(off, &buf[..n])?;
+            off += n as u64;
+        }
+        file.flush()?;
+        file.set_trailing_ext(encode_layout_ext(self.layout, generation))?;
+        file.flush()?;
+        self.dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
     #[inline]
     fn slots(&self) -> &[AtomicU32] {
-        // SAFETY: a page-aligned live `MAP_SHARED` mapping of `body_bytes()`
-        // bytes (a multiple of 4), held for `self`'s lifetime. Nothing in this
-        // process writes through the mapping; concurrent file writes are
-        // observed only by atomic loads, never by a plain reference.
-        unsafe {
-            std::slice::from_raw_parts(
-                self.map.as_ptr() as *const AtomicU32,
-                self.map.map_len() / 4,
-            )
-        }
+        &self.slots
+    }
+
+    /// Occupied-or-not raw slot word (`rel | fp << bits`).
+    #[inline]
+    #[doc(hidden)]
+    pub fn slot_word(&self, slot: u64) -> u32 {
+        self.slots[slot as usize].load(Ordering::Acquire)
     }
 
     pub fn bits(&self) -> u32 {
         self.layout.bits
     }
 
-    /// Bytes of the mapped slot array (file-backed, reclaimable; not heap).
+    /// Bytes of the private slot array (anonymous RSS, not a mapped file).
     pub fn map_bytes(&self) -> u64 {
-        self.map.map_len() as u64
+        self.layout.body_bytes()
     }
 
     /// Global slot at probe depth `d` of `mixed`.
@@ -711,9 +769,8 @@ impl AddressHead {
     }
 
     /// Write the fingerprint of rows that predate tags: `(mixed, rel)` whose
-    /// rel sits on the key's chain. One 4-byte `pwrite` per row; a rel not on
-    /// its chain is left alone. Callers running in parallel must pass
-    /// disjoint rels.
+    /// rel sits on the key's chain. One store per row; a rel not on its chain
+    /// is left alone. Callers running in parallel must pass disjoint rels.
     #[doc(hidden)]
     pub fn fill_fingerprints(&self, keys: &[([u8; 32], Fk)]) -> Result<(), StoreError> {
         let bits = self.layout.bits;
@@ -727,8 +784,9 @@ impl AddressHead {
             if let Some(d) = depth {
                 let v = tag_entry(rel.0, fingerprint(mixed, bits), bits)
                     .ok_or(StoreError::Corrupt("tx.head rel wider than bits"))?;
-                let off = entry_file_off(self.slot_at(mixed, d) as u64);
-                self.file.write_at(off, &v.to_le_bytes())?;
+                let slot = self.slot_at(mixed, d);
+                self.slots[slot].store(v, Ordering::Release);
+                self.dirty.store(true, Ordering::Release);
             }
         }
         Ok(())
@@ -738,11 +796,11 @@ impl AddressHead {
     #[cfg(debug_assertions)]
     pub fn strip_tags_for_test(&self) -> Result<(), StoreError> {
         let rel_mask = (1u32 << self.layout.bits) - 1;
-        for (i, s) in self.slots().iter().enumerate() {
+        for s in self.slots().iter() {
             let raw = s.load(Ordering::Relaxed);
             if raw != 0 {
-                self.file
-                    .write_at(entry_file_off(i as u64), &(raw & rel_mask).to_le_bytes())?;
+                s.store(raw & rel_mask, Ordering::Release);
+                self.dirty.store(true, Ordering::Release);
             }
         }
         Ok(())
@@ -800,19 +858,37 @@ impl AddressHead {
                 }
             }
             if dirty {
-                self.file.write_at(entry_file_off(page_base), &buf[..n])?;
+                let base = page_base as usize;
+                for s in 0..page_slots {
+                    let new = word_at(&buf, s);
+                    let slot = &self.slots[base + s];
+                    if slot.load(Ordering::Relaxed) != new {
+                        slot.store(new, Ordering::Release);
+                    }
+                }
+                self.dirty.store(true, Ordering::Release);
             }
             i = j;
         }
 
         Ok(())
     }
+}
 
-    pub fn flush(&self) -> Result<(), StoreError> {
-        self.file.flush()
-    }
+#[inline]
+fn word_at(buf: &[u8], i: usize) -> u32 {
+    let off = i * 4;
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
 
-    pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.file.flush_async()
+/// Zeroed `AtomicU32` words. A zero bit-pattern is a valid empty slot.
+fn zero_slots(n: usize) -> Box<[AtomicU32]> {
+    let mut v: Vec<AtomicU32> = Vec::with_capacity(n);
+    // SAFETY: `AtomicU32`'s zero value is `0`, and the allocation is
+    // `n` words. `set_len` publishes only those initialized words.
+    unsafe {
+        std::ptr::write_bytes(v.as_mut_ptr(), 0u8, n);
+        v.set_len(n);
     }
+    v.into_boxed_slice()
 }

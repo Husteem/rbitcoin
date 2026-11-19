@@ -15,7 +15,7 @@
 //! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: stops after
 //! loc, returns `(fk, body_range)` so prep denserels-loads by offset.
 //!
-//! **IO shape:** the open OA probe hops a read-only map of its slots (no
+//! **IO shape:** the open-tail probe hops a private slot table (no
 //! syscall); sealed `g` pages may use one TLS [`UringSession`]; sidefile ID is
 //! page-grouped bulk pread (one read per OS page of `txid.body`). Nested TLS
 //! uring remains a hard error.

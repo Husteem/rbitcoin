@@ -2316,6 +2316,9 @@ impl Store {
         rbitcoin_log::info!("store: shutdown flush — fsync tip tables…");
         self.headers.flush()?;
         self.flush_class_c_tip()?;
+        // One dense image of the open tx.head tail. Not Store::flush: that
+        // fsyncs every Class A body.
+        self.txs.flush_head()?;
         rbitcoin_log::info!(
             "store: shutdown flush — async Class A… elapsed={:?}",
             t0.elapsed()
