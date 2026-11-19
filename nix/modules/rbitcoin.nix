@@ -48,6 +48,22 @@ let
   needI2pSam = cfg.i2p.sam != null;
   needCjdns = cfg.cjdns.reachable;
   rpcListening = cfg.rpc.enable || cfg.rpc.unixSocket || cfg.rpc.socketPath != null;
+  # systemd reads the secret as root and hands the service a private copy,
+  # so the file need not be readable by the service user (/run/keys is not).
+  sv2SecretCredential = "/run/credentials/rbitcoin.service/sv2-authority";
+  # A v1 listener on a port Tor or I2P inbound forwards to would serve them v1.
+  v1BindPorts = lib.filter (p: p != null) (
+    map whitebindPort (
+      lib.filter (
+        spec:
+        lib.hasInfix "@" spec && builtins.elem "v1" (lib.splitString "," (lib.head (lib.splitString "@" spec)))
+      ) cfg.netPermissionBind
+    )
+  );
+  forwardedPorts =
+    [ cfg.p2p.port ]
+    ++ optional cfg.electrum.enable cfg.electrum.port
+    ++ optional (cfg.esplora.enable && cfg.esplora.socketPath == null) cfg.esplora.port;
   # Port after the last @. IPv6 is `[addr]:port`. A grant with no port is left out;
   # the node rejects it at start.
   whitebindPort = spec:
@@ -254,7 +270,7 @@ let
   ++ optional (cfg.rpc.unixSocket && !cfg.rpc.enable && cfg.rpc.socketPath == null) "--rpc"
   ++ optional cfg.rpc.enable "--rpc-listen"
   ++ optional cfg.rpc.enable (socket cfg.rpc.address cfg.rpc.port)
-  ++ optional (cfg.rpc.enable && cfg.rpc.rest) "--rest"
+  ++ optional (rpcListening && cfg.rpc.rest) "--rest"
   ++ optional (cfg.rpc.socketPath != null) "--rpc-socket"
   ++ optional (cfg.rpc.socketPath != null) cfg.rpc.socketPath
   ++ optional (cfg.rpc.cookieFile != null) "--rpc-cookie-file"
@@ -382,7 +398,7 @@ let
     "--sv2-tp-listen"
     (socket cfg.sv2.tp.address cfg.sv2.tp.port)
     "--sv2-tp-authority-sec-file"
-    (toString cfg.sv2.tp.authoritySecretFile)
+    sv2SecretCredential
     "--sv2-tp-cert-validity"
     (toString cfg.sv2.tp.certValidity)
     "--sv2-tp-stale-grace"
@@ -1313,7 +1329,7 @@ in
         type = types.nullOr types.str;
         default = null;
         example = "/run/keys/sv2-authority";
-        description = "Runtime path to the secp256k1 authority secret (64 hex or SRI key-utils base58check), readable by the service user. Passed as --sv2-tp-authority-sec-file so the key stays out of argv. A store path (including an interpolated `./key`) is refused: the store is world-readable.";
+        description = "Runtime path to the secp256k1 authority secret (64 hex or SRI key-utils base58check). systemd loads it as a credential (`LoadCredential`), so it only needs to be readable by root, and the node reads its private copy through --sv2-tp-authority-sec-file so the key stays out of argv. A store path (including an interpolated `./key`) is refused: the store is world-readable.";
       };
 
       certValidity = mkOption {
@@ -1456,10 +1472,6 @@ in
         message = "services.rbitcoin.sv2.tp.authoritySecretFile must not be a store path (the store is world-readable)";
       }
       {
-        assertion = !cfg.silentPaymentIndex || !cfg.pruneSeqSigWit;
-        message = "services.rbitcoin.silentPaymentIndex cannot be combined with pruneSeqSigWit";
-      }
-      {
         assertion = cfg.signet.challenge == null || cfg.network == "signet";
         message = "services.rbitcoin.signet.challenge requires network = \"signet\"";
       }
@@ -1483,6 +1495,14 @@ in
       {
         assertion = cfg.netPermissionBind == [ ] || cfg.p2p.listen;
         message = "services.rbitcoin.netPermissionBind requires p2p.listen";
+      }
+      {
+        assertion = lib.all (p: !builtins.elem p forwardedPorts) v1BindPorts;
+        message = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, Electrum, or Esplora port";
+      }
+      {
+        assertion = v1BindPorts == [ ] || cfg.p2p.maxInbound > 0;
+        message = "services.rbitcoin.netPermissionBind v1 needs p2p.maxInbound greater than 0";
       }
       {
         assertion = cfg.trustPeer == null || cfg.netPermissionBind == [ ];
@@ -1654,10 +1674,11 @@ in
       environment = cfg.environment;
 
       serviceConfig = {
-        # systemd expands % in ExecStart before it splits words, quotes included.
-        # %% is one percent, so the node still sees %s in alert-notify.
+        # systemd expands % specifiers and $VAR in ExecStart before it splits
+        # words, quotes included. %% and $$ are literal, so the node still sees
+        # %s in alert-notify and a $ in a shell command.
         ExecStart = concatStringsSep " " (
-          map (arg: escapeShellArg (lib.replaceStrings [ "%" ] [ "%%" ] arg)) command
+          map (arg: escapeShellArg (lib.replaceStrings [ "%" "$" ] [ "%%" "$$" ] arg)) command
         );
         User = cfg.user;
         Group = cfg.group;
@@ -1684,6 +1705,9 @@ in
       }
       // lib.optionalAttrs (needTorControl || cfg.tor.controlCookie != null) {
         SupplementaryGroups = [ "tor" ];
+      }
+      // lib.optionalAttrs (cfg.sv2.tp.enable && cfg.sv2.tp.authoritySecretFile != null) {
+        LoadCredential = "sv2-authority:${cfg.sv2.tp.authoritySecretFile}";
       };
     };
 
