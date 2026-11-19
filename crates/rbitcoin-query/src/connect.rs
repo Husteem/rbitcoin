@@ -18,6 +18,28 @@ pub fn index_sh_ram_head(head: &mut HashMap<[u8; 32], Vec<Fk>>, job: &ShPendingJ
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static SH_INCLUDE_HWM_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One-shot failure of the next inclusion-watermark advance that would sync.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_sh_include_hwm_fail_for_test(fail: bool) {
+    SH_INCLUDE_HWM_FAIL.with(|slot| slot.set(fail));
+}
+
+#[cfg(debug_assertions)]
+fn take_sh_include_hwm_fail() -> bool {
+    SH_INCLUDE_HWM_FAIL.with(|slot| slot.replace(false))
+}
+
+#[cfg(not(debug_assertions))]
+fn take_sh_include_hwm_fail() -> bool {
+    false
+}
+
 struct ShPublishGuard<'a>(&'a std::sync::atomic::AtomicU64);
 
 impl<'a> ShPublishGuard<'a> {
@@ -1208,6 +1230,9 @@ impl Query {
         }
         if want <= self.store.scripthash.include_hwm() {
             return Ok(());
+        }
+        if take_sh_include_hwm_fail() {
+            return Err(StoreError::Corrupt("scripthash include_hwm advance failed"));
         }
         let t0 = std::time::Instant::now();
         self.store.scripthash.flush()?;

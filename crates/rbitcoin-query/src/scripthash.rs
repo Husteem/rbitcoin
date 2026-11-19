@@ -14,26 +14,30 @@ thread_local! {
 
 #[cfg(debug_assertions)]
 thread_local! {
-    static SH_POSTING_GAP: std::cell::Cell<Option<fn(&Query)>> = const { std::cell::Cell::new(None) };
+    static SH_POSTING_GAP: std::cell::Cell<Option<fn(&Query) -> Result<(), QueryError>>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// One-shot hook after the durable posting list is read and before the
 /// pending RAM list. Tests commit write-behind in that gap.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
-pub fn set_sh_posting_gap_for_test(hook: Option<fn(&Query)>) {
+pub fn set_sh_posting_gap_for_test(hook: Option<fn(&Query) -> Result<(), QueryError>>) {
     SH_POSTING_GAP.with(|slot| slot.set(hook));
 }
 
 #[cfg(debug_assertions)]
-fn note_sh_posting_gap(query: &Query) {
+fn note_sh_posting_gap(query: &Query) -> Result<(), QueryError> {
     if let Some(hook) = SH_POSTING_GAP.with(|slot| slot.take()) {
-        hook(query);
+        hook(query)?;
     }
+    Ok(())
 }
 
 #[cfg(not(debug_assertions))]
-fn note_sh_posting_gap(_query: &Query) {}
+fn note_sh_posting_gap(_query: &Query) -> Result<(), QueryError> {
+    Ok(())
+}
 
 /// While held, an unpaged join on this thread skips `--max-sh-creates`.
 /// `--heavy-sh-creates` still applies. The Esplora unix socket's
@@ -1361,7 +1365,7 @@ impl Query {
     fn stable_sh_postings(&self, scripthash: &[u8; 32]) -> Result<(Vec<Fk>, Vec<Fk>), QueryError> {
         self.read_stable_sh_publish(|query| {
             let durable = query.store.scripthash.create_fks(scripthash)?;
-            note_sh_posting_gap(query);
+            note_sh_posting_gap(query)?;
             Ok((durable, query.pending_sh_create_fks(scripthash)))
         })
     }
