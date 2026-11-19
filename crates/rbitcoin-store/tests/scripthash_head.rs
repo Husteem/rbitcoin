@@ -52,7 +52,7 @@ fn head_insert_get_clear() {
     assert!(h.get(&key).unwrap().is_none());
     // Sidecar tracks occupied; reopen without full scan path for tiny files.
     drop(h);
-    let h2 = ScriptHashHead::open(&path).unwrap();
+    let h2 = ScriptHashHead::open(&path).unwrap().expect("live head");
     assert!(h2.is_known_empty() || h2.occupied() >= 1); // soft-clear keeps slot
     assert!(h2.get(&key).unwrap().is_none());
     let _ = std::fs::remove_file(&path);
@@ -85,7 +85,7 @@ fn open_large_without_occ_skips_scan_not_empty() {
     // Drop sidecar only — reopen must not scan body and must not claim empty.
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
     let t0 = Instant::now();
-    let h2 = ScriptHashHead::open(&path).unwrap();
+    let h2 = ScriptHashHead::open(&path).unwrap().expect("live head");
     let open_ms = t0.elapsed().as_millis();
     assert!(
         !h2.is_known_empty(),
@@ -126,7 +126,7 @@ fn zero_occ_sidecar_does_not_bulk_fill_over_live_slots() {
     assert_eq!(h.get(&key_a).unwrap().unwrap(), val_a);
     drop(h);
     store_occ_sidecar(&path, 0).unwrap();
-    let h = ScriptHashHead::open(&path).unwrap();
+    let h = ScriptHashHead::open(&path).unwrap().expect("live head");
     assert!(
         !h.is_known_empty(),
         "a zero .occ on a live head reported empty"
@@ -144,6 +144,37 @@ fn zero_occ_sidecar_does_not_bulk_fill_over_live_slots() {
     assert_eq!(h.get(&key_b).unwrap().unwrap().inline_fks(), vec![Fk(9)]);
     assert_eq!(h.occupied(), 2, "open count plus the new key");
     assert_eq!(load_occ_sidecar(&path), Some(2));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+}
+
+/// A large ingest this process created and never filled is still `.occ` 0.
+/// Open must remove it so the next start has no table to scan.
+#[test]
+fn open_removes_a_large_empty_zero_occ() {
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-shhead-empty-occ-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    let min_slots = (OCC_SCAN_BYTE_CAP / SH_HEAD_SLOT_SIZE as u64) + 1;
+    let slots = min_slots.next_power_of_two();
+    assert!(slots * SH_HEAD_SLOT_SIZE as u64 > OCC_SCAN_BYTE_CAP);
+    let h = ScriptHashHead::create_with_slots(&path, slots).unwrap();
+    assert!(h.is_known_empty());
+    drop(h);
+    assert!(path.exists());
+    let opened = ScriptHashHead::open(&path).unwrap();
+    assert!(opened.is_none(), "open kept a large empty ingest");
+    assert!(!path.exists(), "open left a large empty ingest on disk");
+    assert!(
+        !occ_sidecar_path(&path).exists(),
+        "open left a zero occupancy sidecar on disk"
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
 }
@@ -213,7 +244,7 @@ fn scripthash_head_insert_many_full_without_rehash() {
     h.flush().unwrap();
     h.flush_async().unwrap();
     drop(h);
-    let h2 = ScriptHashHead::open(&path).unwrap();
+    let h2 = ScriptHashHead::open(&path).unwrap().expect("live head");
     let mut key = [0u8; 32];
     key[0..8].copy_from_slice(&5u64.to_le_bytes());
     assert!(h2.get(&key).unwrap().is_some());

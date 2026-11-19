@@ -397,7 +397,14 @@ fn incremental_absent_lands_on_ingest() {
     put_create(&t, rec(sh, 3, 0));
     assert_eq!(t.entries(&sh).unwrap().len(), 1);
     assert!(
-        t.ingest.lock().unwrap().get(&sh).unwrap().is_some(),
+        t.ingest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get(&sh)
+            .unwrap()
+            .is_some(),
         "new key must live on ingest, not live OA main"
     );
     assert!(
@@ -861,7 +868,15 @@ fn ingest_batch_update_and_new_keys() {
     }
     assert_eq!(put_create_batch(&t, batch), 21);
     assert_eq!(t.entries(&sh0).unwrap().len(), 2);
-    assert!(t.ingest.lock().unwrap().get(&sh0).unwrap().is_some());
+    assert!(t
+        .ingest
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&sh0)
+        .unwrap()
+        .is_some());
     let mut n = 0u64;
     t.for_each_live_create(|_| n += 1).unwrap();
     assert_eq!(n, 22);
@@ -1383,25 +1398,63 @@ fn pack_one_shard() {
     }
 }
 
+/// Store create must not plant `scripthash.ovf/ingest`. That file stays empty
+/// through IBD and materialize, and a zero sidecar makes every later open scan it.
+#[test]
+fn create_leaves_no_empty_ingest() {
+    let dir = tmp();
+    let _t = ScriptHashTable::create_tiny(&dir).unwrap();
+    assert!(
+        !ingest_path(dir.path()).exists(),
+        "store create planted an empty scripthash ingest"
+    );
+}
+
+/// Seal drains the ingest. The replacement file is created by the next insert,
+/// not by the seal itself.
+#[test]
+fn seal_does_not_leave_an_empty_ingest() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    t.ingest_insert_many(&[([0x22u8; 32], ShHeadValue::inline_one(Fk(9)))])
+        .unwrap();
+    assert!(ingest_path(dir.path()).exists());
+    t.seal_ingest().unwrap();
+    assert!(
+        !ingest_path(dir.path()).exists(),
+        "seal recreated an empty scripthash ingest"
+    );
+    assert_eq!(
+        t.entries(&[0x22u8; 32]).unwrap().len(),
+        1,
+        "seal dropped the key it had just written"
+    );
+    t.ingest_insert_many(&[([0x33u8; 32], ShHeadValue::inline_one(Fk(10)))])
+        .unwrap();
+    assert_eq!(
+        t.entries(&[0x33u8; 32]).unwrap().len(),
+        1,
+        "the insert after seal missed the new key"
+    );
+    assert!(ingest_path(dir.path()).exists());
+}
+
 /// Mainnet ingest is 2^25 slots. Sealing a shard must not walk that table when
-/// occupancy is already known to be zero: one pass per shard holds tip entry
-/// past the RPC cookie window. A truncated ingest file makes a walk fail.
+/// no ingest file exists: one pass per shard holds tip entry past the RPC
+/// cookie window. Store create leaves the file absent, which is known empty.
 #[test]
 fn empty_ingest_shard_seal_does_not_walk_slots() {
     let dir = tmp();
     let t = ScriptHashTable::create(dir.path()).unwrap();
     assert!(t.head_is_empty());
-    let ingest = ingest_path(dir.path());
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&ingest)
-        .unwrap()
-        .set_len(0)
-        .unwrap();
+    assert!(
+        !ingest_path(dir.path()).exists(),
+        "an absent ingest is the known-empty head"
+    );
     let session = t.pack_shard_session(0).unwrap();
     let pack = session.finish_pack().unwrap();
     t.publish_packed_shard(0, pack)
-        .expect("known-empty ingest is not scanned");
+        .expect("absent ingest is not scanned");
 }
 
 fn shard0_key(i: u8) -> [u8; 32] {

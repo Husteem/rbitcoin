@@ -354,7 +354,9 @@ impl ScriptHashTable {
             .iter()
             .any(|job| matches!(job.home, LocatedHome::SealedOvf));
         if ingest {
-            self.ingest.lock().unwrap().flush()?;
+            if let Some(h) = self.ingest.lock().unwrap().as_ref() {
+                h.flush()?;
+            }
         }
         if ovf {
             for h in self.sealed_ovf.lock().unwrap().iter() {
@@ -820,6 +822,9 @@ impl ScriptHashTable {
         scripthash: &[u8; 32],
     ) -> Result<Option<HeadWord>, StoreError> {
         let ingest = self.ingest.lock().unwrap();
+        let Some(ingest) = ingest.as_ref() else {
+            return Ok(None);
+        };
         let Some(off) = ingest.value_word_offset(scripthash)? else {
             return Ok(None);
         };
@@ -850,6 +855,9 @@ impl ScriptHashTable {
             }
             HEAD_INGEST => {
                 let ingest = self.ingest.lock().unwrap();
+                let Some(ingest) = ingest.as_ref() else {
+                    return Err(StoreError::Corrupt("scripthash undo: ingest missing"));
+                };
                 ingest.write_value_word(word.off, &word.old)?;
                 ingest.flush()
             }
@@ -883,9 +891,18 @@ impl ScriptHashTable {
                         h.flush()?;
                     }
                 }
-                self.ingest.lock().unwrap().flush()
+                if let Some(h) = self.ingest.lock().unwrap().as_ref() {
+                    h.flush()?;
+                }
+                Ok(())
             }
-            LocatedHome::Ingest => self.ingest.lock().unwrap().flush(),
+            LocatedHome::Ingest => {
+                let g = self.ingest.lock().unwrap();
+                let Some(h) = g.as_ref() else {
+                    return Err(StoreError::Corrupt("scripthash: ingest missing"));
+                };
+                h.flush()
+            }
             LocatedHome::SealedOvf => {
                 for h in self.sealed_ovf.lock().unwrap().iter() {
                     h.flush()?;

@@ -11,8 +11,10 @@
 //! reinit, cold install, and inserts). Large shards without a sidecar skip
 //! the scan and mark occupancy **unknown** (never treated as empty, never bulk-fill).
 //! A zero sidecar on a large shard is not proof the slots are empty: the table
-//! write can land before the sidecar rename. Open scans that head and keeps
-//! the count it finds. A head this process just created is still empty.
+//! write can land before the sidecar rename. Open scans that head. Rows keep
+//! the count. An empty table is removed, so the next open has no file to scan.
+//! A head this process just created is still empty. The ingest file itself is
+//! created on the first insert, not when the store is created.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -79,6 +81,20 @@ pub struct HashState {
     /// When false, `occupied` is not authoritative (large open without `.occ`).
     /// Never treat as empty / never bulk-fill from this state.
     pub occ_known: bool,
+}
+
+/// Drop the slot table and its sidecar. The caller must have closed the head
+/// first so Windows can unlink the open file.
+#[doc(hidden)]
+pub fn remove_ingest_files(head_path: &Path) -> Result<(), StoreError> {
+    if head_path.exists() {
+        std::fs::remove_file(head_path).map_err(|e| StoreError::io(head_path, e))?;
+    }
+    let occ = occ_sidecar_path(head_path);
+    if occ.exists() {
+        std::fs::remove_file(&occ).map_err(|e| StoreError::io(&occ, e))?;
+    }
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -174,9 +190,26 @@ impl ScriptHashHead {
         })
     }
 
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        let file = TableFile::open(path, TableKind::HashHead)?;
-        Self::from_file(file)
+    pub fn open(path: impl Into<PathBuf>) -> Result<Option<Self>, StoreError> {
+        let path = path.into();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let file = TableFile::open(&path, TableKind::HashHead)?;
+        let head = Self::from_file(file)?;
+        if !head.large_and_empty() {
+            return Ok(Some(head));
+        }
+        let path = head.file.path().to_path_buf();
+        drop(head);
+        remove_ingest_files(&path)?;
+        Ok(None)
+    }
+
+    fn large_and_empty(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        let body = st.slots.saturating_mul(SH_HEAD_SLOT_SIZE as u64);
+        st.occ_known && st.occupied == 0 && body > OCC_SCAN_BYTE_CAP
     }
 
     #[doc(hidden)]
@@ -200,8 +233,14 @@ impl ScriptHashHead {
             // Torn sidecar: the slot table can be durable while `.occ` is still 0.
             if occ == 0 {
                 let live = scan_occupied(&file, slots)?;
-                store_occ_sidecar(file.path(), live)?;
-                (live, true)
+                if live == 0 {
+                    // `open` deletes this file. Rewriting 0 would make the next
+                    // start scan the same empty table.
+                    (0, true)
+                } else {
+                    store_occ_sidecar(file.path(), live)?;
+                    (live, true)
+                }
             } else {
                 (occ, true)
             }
@@ -441,8 +480,17 @@ impl ScriptHashHead {
         if !st.occ_known || st.slots == 0 {
             return 0;
         }
-        let cap = ((st.slots as f64) * Self::SH_SEAL_LOAD).ceil() as u64;
-        cap.saturating_sub(st.occupied)
+        Self::seal_room(st.slots, st.occupied)
+    }
+
+    /// Room in a table that is not on disk yet. That table is known empty.
+    #[doc(hidden)]
+    pub fn seal_room(slots: u64, occupied: u64) -> u64 {
+        if slots == 0 {
+            return 0;
+        }
+        let cap = ((slots as f64) * Self::SH_SEAL_LOAD).ceil() as u64;
+        cap.saturating_sub(occupied)
     }
 
     #[doc(hidden)]
