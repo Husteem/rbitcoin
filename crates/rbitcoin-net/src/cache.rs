@@ -8,6 +8,7 @@ use bitcoin::block::{Block, Header};
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use std::collections::HashMap;
+#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
