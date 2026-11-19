@@ -141,3 +141,5 @@ Private, **not** Class A. RAM graph is source of truth; files may lag.
   records; no fuse). Sealed **ovf** loads `.idx` + BF8R. Occupancy scan is not
   used on those files. A schema-14 page-era durable index is **refused** (wipe
   `store/scripthash*` and rematerialize). Ingest OA still uses `{ingest}.occ`.
+  A missing ingest file is empty. Open deletes a large ingest whose sidecar is
+  0 and whose slots are empty, so a later start does not scan that hole.

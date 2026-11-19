@@ -277,8 +277,9 @@ pub struct ScriptHashTable {
     /// Sealed MPHF main shards (set when a cold bulk shard is installed).
     /// Per-shard slot so Electrum `get` does not take a process-wide mutex.
     pub sorted_main: Box<[RwLock<Option<MphfHead>>]>,
-    /// Global ingest OA for keys first seen after main seal (`scripthash.ovf/ingest`).
-    pub ingest: Mutex<ScriptHashHead>,
+    /// Global ingest OA (`scripthash.ovf/ingest`). Absent until the first insert
+    /// and after a seal drains it. Missing means known empty: no scan, no walk.
+    pub ingest: Mutex<Option<ScriptHashHead>>,
     /// L0 sealed global ovf (`SHSR`+fuse), newest last.
     pub sealed_ovf: Mutex<Vec<SortedHead>>,
     /// L1 promoted ovf (at most one MPHF+fuse per rematerialize lifetime).
@@ -606,16 +607,14 @@ pub fn open_sealed_sorted_ovf(dir: &Path) -> Result<Vec<SortedHead>, StoreError>
 }
 
 #[doc(hidden)]
-pub fn open_or_create_ingest(dir: &Path, scale: HeadScale) -> Result<ScriptHashHead, StoreError> {
+/// Open an ingest left by an earlier insert. A missing file, and a large file
+/// whose sidecar is 0 and whose slots are empty, are both `None`.
+pub fn open_ingest(dir: &Path) -> Result<Option<ScriptHashHead>, StoreError> {
     let p = ingest_path(dir);
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
     }
-    if p.exists() {
-        ScriptHashHead::open(p)
-    } else {
-        ScriptHashHead::create_with_slots(p, ingest_oa_slots(scale))
-    }
+    ScriptHashHead::open(p)
 }
 
 #[doc(hidden)]
@@ -977,7 +976,7 @@ impl ScriptHashTable {
             n_shards,
             scale,
             sorted_main: wrap_sorted_slots((0..n_shards).map(|_| None).collect()),
-            ingest: Mutex::new(open_or_create_ingest(dir, scale)?),
+            ingest: Mutex::new(open_ingest(dir)?),
             sealed_ovf: Mutex::new(Vec::new()),
             ovf_l1: Mutex::new(None),
             l1_frozen_warned: AtomicBool::new(false),
@@ -1061,7 +1060,7 @@ impl ScriptHashTable {
             n_shards,
             scale,
             sorted_main: wrap_sorted_slots(sorted_main),
-            ingest: Mutex::new(open_or_create_ingest(dir, scale)?),
+            ingest: Mutex::new(open_ingest(dir)?),
             sealed_ovf: Mutex::new(sealed_ovf),
             ovf_l1: Mutex::new(ovf_l1),
             l1_frozen_warned: AtomicBool::new(false),
@@ -1249,7 +1248,11 @@ impl ScriptHashTable {
         if self.ovf_l1.lock().unwrap().is_some() {
             return false;
         }
-        self.ingest.lock().unwrap().is_known_empty()
+        self.ingest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|h| h.is_known_empty())
     }
 
     /// Wipe body alloc + all head slots for a full cold rematerialize.
@@ -1345,7 +1348,13 @@ impl ScriptHashTable {
         }) {
             return true;
         }
-        if self.ingest.lock().unwrap().occupied() > 0 {
+        if self
+            .ingest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|h| h.occupied() > 0)
+        {
             return true;
         }
         if !self.sealed_ovf.lock().unwrap().is_empty() {
@@ -1418,8 +1427,10 @@ impl ScriptHashTable {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Option<(ShHeadValue, LocatedHome)>, StoreError> {
-        if let Some(v) = self.ingest.lock().unwrap().get(scripthash)? {
-            return Ok(Some((v, LocatedHome::Ingest)));
+        if let Some(h) = self.ingest.lock().unwrap().as_ref() {
+            if let Some(v) = h.get(scripthash)? {
+                return Ok(Some((v, LocatedHome::Ingest)));
+            }
         }
         let hk = head_key_from_full(scripthash);
         for h in self.sealed_ovf.lock().unwrap().iter().rev() {
@@ -1527,13 +1538,15 @@ impl ScriptHashTable {
                 })?;
             }
         }
-        self.ingest.lock().unwrap().for_each_occupied(|_key, val| {
-            let entries = self.collect_entries_from(self.ovf_file(), &val)?;
-            for fk in entries {
-                f(fk);
-            }
-            Ok(())
-        })?;
+        if let Some(h) = self.ingest.lock().unwrap().as_ref() {
+            h.for_each_occupied(|_key, val| {
+                let entries = self.collect_entries_from(self.ovf_file(), &val)?;
+                for fk in entries {
+                    f(fk);
+                }
+                Ok(())
+            })?;
+        }
         Ok(())
     }
 
@@ -1859,18 +1872,43 @@ impl ScriptHashTable {
     }
 
     #[doc(hidden)]
+    fn ingest_room(&self) -> u64 {
+        let g = self.ingest.lock().unwrap();
+        match g.as_ref() {
+            Some(h) => h.room_before_seal(),
+            None => ScriptHashHead::seal_room(ingest_oa_slots(self.scale), 0),
+        }
+    }
+
+    /// The first insert creates the slot table. Store open does not.
+    fn ensure_ingest(&self) -> Result<(), StoreError> {
+        let mut g = self.ingest.lock().unwrap();
+        if g.is_some() {
+            return Ok(());
+        }
+        *g = Some(ScriptHashHead::create_with_slots(
+            ingest_path(&self.store_dir),
+            ingest_oa_slots(self.scale),
+        )?);
+        Ok(())
+    }
+
     pub fn ingest_insert_many(&self, ups: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
         let mut i = 0usize;
         while i < ups.len() {
-            let room = self.ingest.lock().unwrap().room_before_seal();
+            let room = self.ingest_room();
             if room == 0 {
                 self.seal_ingest()?;
                 continue;
             }
+            self.ensure_ingest()?;
             let n = (room as usize).min(ups.len() - i);
             {
                 let g = self.ingest.lock().unwrap();
-                g.insert_many(&ups[i..i + n])?;
+                let Some(h) = g.as_ref() else {
+                    return Err(StoreError::Corrupt("scripthash: ingest missing"));
+                };
+                h.insert_many(&ups[i..i + n])?;
             }
             i += n;
             self.maybe_seal_ingest()?;
@@ -1882,7 +1920,7 @@ impl ScriptHashTable {
     pub fn maybe_seal_ingest(&self) -> Result<(), StoreError> {
         let load = {
             let g = self.ingest.lock().unwrap();
-            g.load_ratio().unwrap_or(0.0)
+            g.as_ref().and_then(|h| h.load_ratio()).unwrap_or(0.0)
         };
         if load < ScriptHashHead::SH_SEAL_LOAD {
             return Ok(());
@@ -1894,6 +1932,9 @@ impl ScriptHashTable {
     pub fn seal_ingest(&self) -> Result<(), StoreError> {
         let mut recs = {
             let g = self.ingest.lock().unwrap();
+            let Some(g) = g.as_ref() else {
+                return Ok(());
+            };
             let mut recs = Vec::new();
             g.for_each_occupied(|full, val| {
                 recs.push((head_key_from_full(&full), pack8_bytes(&val)?));
@@ -1915,14 +1956,9 @@ impl ScriptHashTable {
         let sealed = SortedHead::write(&path, &recs)?;
         self.sealed_ovf.lock().unwrap().push(sealed);
         let p = ingest_path(&self.store_dir);
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file({
-            let mut s = p.as_os_str().to_os_string();
-            s.push(".occ");
-            PathBuf::from(s)
-        });
-        *self.ingest.lock().unwrap() =
-            ScriptHashHead::create_with_slots(p, ingest_oa_slots(self.scale))?;
+        // Drop the fd before unlink so the name can go away on Windows.
+        *self.ingest.lock().unwrap() = None;
+        crate::scripthash_head::remove_ingest_files(&p)?;
         self.maybe_compact_sealed_ovf()?;
         Ok(())
     }
@@ -2431,6 +2467,9 @@ impl ScriptHashTable {
         new_val: &ShHeadValue,
     ) -> Result<(), StoreError> {
         let g = self.ingest.lock().unwrap();
+        let Some(g) = g.as_ref() else {
+            return Err(StoreError::Corrupt("scripthash: ingest missing"));
+        };
         if new_val.is_empty() {
             g.clear_key(scripthash)?;
         } else {
@@ -2496,7 +2535,9 @@ impl ScriptHashTable {
     pub fn flush(&self) -> Result<(), StoreError> {
         self.persist_all_allocs()?;
         self.flush_all_bodies()?;
-        self.ingest.lock().unwrap().flush()?;
+        if let Some(h) = self.ingest.lock().unwrap().as_ref() {
+            h.flush()?;
+        }
         for slot in self.sorted_main.iter() {
             if let Some(h) = slot.read().unwrap().as_ref() {
                 h.flush()?;
@@ -2514,7 +2555,9 @@ impl ScriptHashTable {
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.persist_all_allocs()?;
         self.flush_all_bodies_async()?;
-        self.ingest.lock().unwrap().flush_async()?;
+        if let Some(h) = self.ingest.lock().unwrap().as_ref() {
+            h.flush_async()?;
+        }
         for h in self.sealed_ovf.lock().unwrap().iter() {
             h.flush()?;
         }
@@ -2628,8 +2671,13 @@ impl ScriptHashTable {
         // Mainnet ingest is 2^25 slots. Known-empty has no row that can hide
         // the packed chain. Walking it once per shard holds tip entry past
         // the RPC cookie window.
-        if self.ingest.lock().unwrap().is_known_empty() {
-            return Ok(());
+        {
+            let g = self.ingest.lock().unwrap();
+            match g.as_ref() {
+                None => return Ok(()),
+                Some(h) if h.is_known_empty() => return Ok(()),
+                Some(_) => {}
+            }
         }
         let Some(slot) = self.sorted_main.get(shard) else {
             return Ok(());
@@ -2639,21 +2687,29 @@ impl ScriptHashTable {
             return Ok(());
         };
         let mut covered = Vec::new();
-        self.ingest.lock().unwrap().for_each_occupied(|key, _val| {
-            if self.shard_index(&key) != shard {
-                return Ok(());
-            }
-            let hk = head_key_from_full(&key);
-            if head.get(&hk)?.is_some() {
-                covered.push(key);
-            }
-            Ok(())
-        })?;
+        self.ingest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or(StoreError::Corrupt("scripthash: ingest missing"))?
+            .for_each_occupied(|key, _val| {
+                if self.shard_index(&key) != shard {
+                    return Ok(());
+                }
+                let hk = head_key_from_full(&key);
+                if head.get(&hk)?.is_some() {
+                    covered.push(key);
+                }
+                Ok(())
+            })?;
         drop(main);
         if covered.is_empty() {
             return Ok(());
         }
         let ingest = self.ingest.lock().unwrap();
+        let Some(ingest) = ingest.as_ref() else {
+            return Err(StoreError::Corrupt("scripthash: ingest missing"));
+        };
         for key in &covered {
             ingest.clear_key(key)?;
         }

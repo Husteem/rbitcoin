@@ -2453,13 +2453,9 @@ fn kill_first_start_interrupted_creation_reopens_empty_chain() {
         let s = Store::create_tiny(&ingest).unwrap();
         s.flush().unwrap();
     }
+    // A finished create leaves no ingest file. A short one is still a torn create.
     let ingest_path = ingest.join("scripthash.ovf").join("ingest");
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(&ingest_path)
-        .unwrap()
-        .set_len(8)
-        .unwrap();
+    std::fs::write(&ingest_path, [0u8; 8]).unwrap();
     let s = Store::open_or_create_tiny(&ingest).unwrap();
     assert!(s.tip_height().is_none());
     drop(s);

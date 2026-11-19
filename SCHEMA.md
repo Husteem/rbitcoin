@@ -783,7 +783,9 @@ pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
 - Sharded **64-way** on mainnet (prefix of `scripthash[0]`). Cold load writes
   packed locators (no OA image). No `scripthash.head.oa_stub`.
 - **Overflow:** one **global** ingest OA (`scripthash.ovf/ingest`, 256 slots tiny /
-  **2²⁵ slots mainnet = 768 MiB** at 24 B). Load ≥ ~0.80 **seals** to L0
+  **2²⁵ slots mainnet = 768 MiB** at 24 B). The file is absent until the first
+  insert. Seal deletes it. Open deletes a large ingest whose sidecar is 0 and
+  whose slots are empty. Load ≥ ~0.80 **seals** to L0
   `SHSR`+fuse (`scripthash.ovf/NNNNNN`, FORMAT_VER=2, rec = key16‖pack8).
   ≥8 L0 files **compact once** to L1 MPHF+val+fuse8. L1 is **never rewritten**.
   A later L0 stack of 8 **warns** (`wipe store/scripthash*` + rematerialize).
