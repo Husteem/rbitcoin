@@ -4395,14 +4395,15 @@ fn leaving_unproved_lead(st: &IbdWorkState, hub: &ChainHub) -> bool {
 }
 
 /// The [`rewind_depth_cap`] a heavier-fork selection walk must cover. It is
-/// read under `shared`, so only the in-memory chain-work prefix decides. A
-/// cold prefix keeps the walk wide; the rewind reads its own cap after
-/// selection and refuses a path deeper than that.
+/// read under `shared`, so only the in-memory chain-work prefix decides, and
+/// a fill that holds it is not waited on. A cold or busy prefix keeps the
+/// walk wide; the rewind reads its own cap after selection and refuses a
+/// path deeper than that.
 #[doc(hidden)]
 pub fn walk_depth_cap(st: &IbdWorkState, hub: &ChainHub) -> u32 {
     let wide = st.header_walk.origin
         && hub
-            .cached_chain_work()
+            .try_cached_chain_work()
             .is_none_or(|work| below_floor(hub, &work.to_be_bytes()));
     if wide {
         UNPROVEN_LEAD_BLOCKS

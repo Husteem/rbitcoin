@@ -714,8 +714,9 @@ fn selection_walk_covers_every_rewind_cap() {
 }
 
 /// Selection reads its walk bound under `shared`, so only the in-memory
-/// chain-work prefix decides it. A cold prefix keeps a proved walk wide; a
-/// warm one narrows it once the confirmed tip meets the floor.
+/// chain-work prefix decides it, without waiting on a fill. A cold or busy
+/// prefix keeps a proved walk wide; a warm one narrows it once the confirmed
+/// tip meets the floor.
 #[test]
 fn the_walk_bound_reads_no_header_under_shared() {
     use rbitcoin_ibd::ibd::header_walk::{walk_depth_cap, UNPROVEN_LEAD_BLOCKS};
@@ -737,6 +738,10 @@ fn the_walk_bound_reads_no_header_under_shared() {
     assert!(hub.cached_chain_work().is_none(), "the prefix stays cold");
     hub.ensure_chain_work_prefix().unwrap();
     assert_eq!(walk_depth_cap(&st, &hub), REWIND_MAX_DEPTH);
+    {
+        let _fill = hub.chain_work_prefix.write().unwrap();
+        assert_eq!(walk_depth_cap(&st, &hub), UNPROVEN_LEAD_BLOCKS);
+    }
     hub.milestone = floor_just_above(hub.chain_work().unwrap());
     assert_eq!(walk_depth_cap(&st, &hub), UNPROVEN_LEAD_BLOCKS);
     let _ = std::fs::remove_dir_all(dir);
