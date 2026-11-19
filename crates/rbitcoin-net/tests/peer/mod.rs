@@ -60,7 +60,7 @@ fn p2p_serve_line_names_tx_bytes_wall() {
     let gen = hub.tip_hash().unwrap();
     let (served_n, served_bytes) = rbitcoin_net::serve_perf::serve_perf_totals();
     let _ = rbitcoin_net::serve_perf::sample_reset_serve_perf();
-    let encoded = encode_served_witness_block(&hub.cache, &hub.query, &gen)
+    let encoded = encode_served_block(&hub.cache, &hub.query, &gen, true)
         .unwrap()
         .expect("genesis Class A body");
     assert_eq!(encoded.first().copied(), Some(2), "v2 block short id");
@@ -8066,7 +8066,7 @@ fn hb_compact_announce_serves_the_missing_tx() {
     };
     assert_eq!(bt.transactions.len(), 1);
     assert_eq!(bt.transactions[0].compute_txid(), extra.compute_txid());
-    let encoded = encode_served_witness_block(&hub.cache, &hub.query, &hash)
+    let encoded = encode_served_block(&hub.cache, &hub.query, &hash, true)
         .expect("getdata")
         .expect("full-block getdata serves the announced body");
     assert_eq!(encoded.first().copied(), Some(2), "v2 block short id");
@@ -9231,10 +9231,14 @@ fn month_old_side_block_is_not_rebuilt_for_getdata() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let served = serve_getdata_full_block(&hub, &out_tx, None, &side_hash)
+        let served = serve_getdata_full_block(&hub, &out_tx, None, &side_hash, true)
             .await
             .unwrap();
-        assert!(served, "a known stale block is silent, not notfound");
+        assert_eq!(
+            served,
+            FullBlockReply::Withheld,
+            "a known stale block is silent, not notfound"
+        );
     });
     assert!(
         out_rx.try_recv().is_err(),
@@ -9280,10 +9284,14 @@ fn month_old_side_block_is_not_rebuilt_for_getdata() {
     );
 
     rt.block_on(async {
-        let served = serve_getdata_full_block(&hub, &out_tx, None, &tip_hash)
+        let served = serve_getdata_full_block(&hub, &out_tx, None, &tip_hash, true)
             .await
             .unwrap();
-        assert!(served, "the connected tip is served");
+        assert_eq!(
+            served,
+            FullBlockReply::Queued,
+            "the connected tip is served"
+        );
     });
     assert!(
         out_rx.try_recv().map(served_block).is_ok(),

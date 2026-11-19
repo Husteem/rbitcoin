@@ -250,6 +250,328 @@ fn tip_announce_ibd_feefilter_and_empty_inv() {
     assert!(out_rx.try_recv().is_err(), "no headers means no inv");
 }
 
+/// Run one `getblocks` and return its `inv` (empty when nothing was sent).
+fn getblocks_inv(
+    hub: &ChainHub,
+    follow: &mut PeerFollowState,
+    gb: &GetBlocksMessage,
+) -> Vec<Inventory> {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getblocks runtime")
+        .block_on(on_getblocks(hub, &out_tx, follow, None, gb))
+        .expect("getblocks");
+    let Ok(out) = out_rx.try_recv() else {
+        return Vec::new();
+    };
+    let NetworkMessage::Inv(inv) = out.expect_msg() else {
+        panic!("getblocks must be answered with inv");
+    };
+    assert!(out_rx.try_recv().is_err(), "getblocks sends one inv");
+    inv
+}
+
+/// Best-chain hashes at heights `1..=n`, read through header prev links from the tip.
+fn best_chain_from_1(hub: &ChainHub, n: usize) -> Vec<BlockHash> {
+    let mut out = vec![hub.tip_hash().expect("tip")];
+    while out.len() < n {
+        let prev = hub
+            .header_of(out.last().unwrap())
+            .expect("header")
+            .prev_blockhash;
+        out.push(prev);
+    }
+    out.reverse();
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+    assert_eq!(
+        hub.header_of(&out[0]).expect("height 1").prev_blockhash,
+        genesis,
+        "chain walk ends at height 1"
+    );
+    out
+}
+
+/// `getblocks` from genesis is answered as Core answers it: an `inv` of `MSG_BLOCK`, one per block after the
+/// locator, in chain order. `MSG_WITNESS_BLOCK` is a `getdata` type; bitcoinj rejects it in an `inv`.
+#[test]
+fn getblocks_answers_msg_block_inv() {
+    let (_dir, hub) = open_tip_announce_hub("getblocks-inv");
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+    let gb = GetBlocksMessage::new(vec![genesis], BlockHash::all_zeros());
+    let inv = getblocks_inv(&hub, &mut PeerFollowState::new(), &gb);
+    let want: Vec<Inventory> = best_chain_from_1(&hub, 102)
+        .into_iter()
+        .map(Inventory::Block)
+        .collect();
+    assert_eq!(inv, want, "heights 1..=102 as MSG_BLOCK, in order");
+}
+
+/// Core's `getblocks` loop breaks before `hashStop`; `getheaders` includes it.
+/// A stop at height 50 is answered with heights 1..=49.
+#[test]
+fn getblocks_stops_before_hash_stop() {
+    let (_dir, hub) = open_tip_announce_hub("getblocks-stop");
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+    let chain = best_chain_from_1(&hub, 102);
+    let gb = GetBlocksMessage::new(vec![genesis], chain[49]);
+    let inv = getblocks_inv(&hub, &mut PeerFollowState::new(), &gb);
+    let want: Vec<Inventory> = chain[..49].iter().copied().map(Inventory::Block).collect();
+    assert_eq!(inv, want, "hashStop is not announced");
+}
+
+/// Serve one block `getdata` and return everything it queued.
+fn getdata_out(
+    rt: &tokio::runtime::Runtime,
+    hub: &ChainHub,
+    follow: &mut PeerFollowState,
+    item: Inventory,
+) -> Vec<PeerOut> {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    rt.block_on(serve_getdata(hub, &out_tx, follow, None, vec![item]))
+        .expect("getdata");
+    std::iter::from_fn(|| out_rx.try_recv().ok()).collect()
+}
+
+/// Core's full 500-entry `getblocks` page saves its last hash
+/// (`m_continuation_block`). The `getdata` of that block is followed by one
+/// `MSG_BLOCK` inv of the tip. bitcoinj asks for the next page only after that
+/// inv, so without it a chain past 500 blocks stops on the first page.
+#[test]
+fn getblocks_full_page_continues_with_a_tip_inv() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getblocks-continue");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(510, op_true(), vec![]).unwrap();
+    let chain = best_chain_from_1(&hub, 510);
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+    let mut follow = PeerFollowState::new();
+    let inv = getblocks_inv(
+        &hub,
+        &mut follow,
+        &GetBlocksMessage::new(vec![genesis], BlockHash::all_zeros()),
+    );
+    let want: Vec<Inventory> = chain[..500].iter().copied().map(Inventory::Block).collect();
+    assert_eq!(inv, want, "a full page is heights 1..=500");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getdata runtime");
+
+    let out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(chain[498]));
+    assert_eq!(out.len(), 1, "a block inside the page is served alone");
+    assert_eq!(
+        served_block(out.into_iter().next().unwrap()).block_hash(),
+        chain[498]
+    );
+
+    let mut out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(chain[499])).into_iter();
+    assert_eq!(
+        served_block(out.next().expect("block")).block_hash(),
+        chain[499]
+    );
+    let NetworkMessage::Inv(tip) = out
+        .next()
+        .expect("tip inv after the last page block")
+        .expect_msg()
+    else {
+        panic!("the continuation is an inv");
+    };
+    assert_eq!(
+        tip,
+        vec![Inventory::Block(chain[509])],
+        "one MSG_BLOCK inv of the tip"
+    );
+    assert!(out.next().is_none());
+
+    let out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(chain[499]));
+    assert_eq!(out.len(), 1, "the continuation fires once");
+}
+
+/// A tx that left the pool between the ready check and the inv is not
+/// announced, as Core skips it. The old fallback was `MSG_WITNESS_TX`, a
+/// `getdata`-only type.
+#[test]
+fn tx_announce_skips_a_tx_gone_from_the_pool() {
+    let (_dir, hub) = open_tip_announce_hub("tx-announce-gone");
+    let mp = hub.mempool().expect("mempool");
+    let gone = bitcoin::Txid::from_byte_array([0x5a; 32]);
+    assert!(!mp.try_contains(&gone));
+    assert_eq!(tx_announce_inv(mp, &gone), None);
+}
+
+/// Core fires the continuation only after it sends the block. A body that is
+/// withheld (a month-old side block) sends nothing, so the tip inv waits and
+/// the continuation stays set. A later served block still fires it.
+#[test]
+fn getblocks_continuation_waits_for_a_served_block() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getblocks-continue-withheld");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = 1_700_000_000u32;
+    hub.clock.set_mock(i64::from(t0));
+    let side = rbitcoin_consensus::mine_empty_regtest(gen, t0, 1);
+    let side_hash = side.block_hash();
+    hub.accept_block(side).unwrap();
+    hub.invalidate_block(side_hash).unwrap();
+    let best_time = t0 + rbitcoin_net::chain::STALE_RELAY_AGE_LIMIT_SECS as u32;
+    hub.clock.set_mock(i64::from(best_time));
+    let tip = rbitcoin_consensus::mine_empty_regtest(gen, best_time, 1);
+    let tip_hash = tip.block_hash();
+    hub.accept_block(tip).unwrap();
+    assert!(!hub.stale_relay_allowed(&side_hash));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getdata runtime");
+    let mut follow = PeerFollowState::new();
+
+    follow.continuation_block = Some(side_hash);
+    let out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(side_hash));
+    assert!(
+        out.is_empty(),
+        "a withheld body sends no block and no tip inv"
+    );
+    assert_eq!(
+        follow.continuation_block,
+        Some(side_hash),
+        "the continuation stays set"
+    );
+
+    follow.continuation_block = Some(tip_hash);
+    let mut out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(tip_hash)).into_iter();
+    assert_eq!(
+        served_block(out.next().expect("block")).block_hash(),
+        tip_hash
+    );
+    let NetworkMessage::Inv(inv) = out.next().expect("tip inv").expect_msg() else {
+        panic!("the continuation is an inv");
+    };
+    assert_eq!(inv, vec![Inventory::Block(tip_hash)]);
+    assert_eq!(follow.continuation_block, None);
+}
+
+/// A `MSG_BLOCK` serve strips the stored witness bytes with a wire walk and
+/// decodes no `Block`, so, like `MSG_WITNESS_BLOCK`, it takes no block
+/// decode permit. With every permit held it still finishes.
+#[test]
+fn getdata_msg_block_takes_no_decode_permit() {
+    let (_dir, hub) = open_tip_announce_hub("getdata-permit");
+    let tip = hub.tip_hash().expect("tip");
+    let sem = Arc::clone(rbitcoin_net::msg_decode::block_decode_semaphore());
+    let all = u32::try_from(rbitcoin_net::msg_decode::block_decode_permits()).unwrap();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getdata runtime")
+        .block_on(async {
+            let held = sem
+                .acquire_many_owned(all)
+                .await
+                .expect("hold every permit");
+            let serve = serve_getdata(
+                &hub,
+                &out_tx,
+                &mut follow,
+                None,
+                vec![Inventory::Block(tip)],
+            );
+            tokio::time::timeout(Duration::from_secs(10), serve)
+                .await
+                .expect("MSG_BLOCK serve does not wait for a decode permit")
+                .expect("getdata");
+            drop(held);
+        });
+    assert_eq!(
+        served_block(out_rx.try_recv().expect("served")).block_hash(),
+        tip
+    );
+}
+
+/// The `block` payload of a served `getdata`, as it goes on the wire.
+fn served_block_payload(p: PeerOut) -> Vec<u8> {
+    match p {
+        PeerOut::Encoded(bytes) => {
+            assert_eq!(bytes.first().copied(), Some(2), "v2 block short id");
+            bytes[1..].to_vec()
+        }
+        PeerOut::Served(NetworkMessage::Block(b)) => serialize(&b),
+        other => panic!("expected served block, got {other:?}"),
+    }
+}
+
+/// Core serves `MSG_BLOCK` without witness data and `MSG_WITNESS_BLOCK` with
+/// it. A decoder that reads `block` without the witness flag cannot parse a
+/// segwit body sent for `MSG_BLOCK`.
+#[test]
+fn getdata_msg_block_is_served_without_witness() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getdata-strip");
+    hub.ensure_genesis().unwrap();
+    let ws = op_true();
+    let p2wsh = ScriptBuf::new_p2wsh(&ws.wscript_hash());
+    hub.generate_to_script(101, p2wsh, vec![]).unwrap();
+    let cb = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap()
+        .txdata[0]
+        .clone();
+    let spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cb.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::from_slice(&[ws.as_bytes()]),
+        }],
+        output: vec![TxOut {
+            value: cb.output[0].value - Amount::from_sat(1_000),
+            script_pubkey: op_true(),
+        }],
+    };
+    let h = hub.generate_to_script(1, op_true(), vec![spend]).unwrap()[0];
+    let full = hub.query.reconstruct_block_at_height(Height(102)).unwrap();
+    assert_eq!(full.block_hash(), h);
+    let mut stripped = full.clone();
+    for tx in &mut stripped.txdata {
+        for input in &mut tx.input {
+            input.witness.clear();
+        }
+    }
+    let stripped = serialize(&stripped);
+    assert!(
+        full.total_size() > stripped.len(),
+        "the block carries witness data"
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getdata runtime");
+    let mut follow = PeerFollowState::new();
+
+    let out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(h));
+    assert_eq!(out.len(), 1);
+    let plain = served_block_payload(out.into_iter().next().unwrap());
+    assert_eq!(plain, stripped, "MSG_BLOCK has no witness data");
+
+    let out = getdata_out(&rt, &hub, &mut follow, Inventory::WitnessBlock(h));
+    assert_eq!(out.len(), 1);
+    let witness = served_block_payload(out.into_iter().next().unwrap());
+    assert_eq!(
+        witness,
+        serialize(&full),
+        "MSG_WITNESS_BLOCK keeps the witness"
+    );
+}
+
 /// Headers peer gets one header. Inv peer gets `MSG_BLOCK`, not a witness inv.
 #[test]
 fn tip_announce_headers_versus_inv() {

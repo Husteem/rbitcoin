@@ -2092,7 +2092,9 @@ pub fn on_tx_announce_ok(
     if !tx_announce_peer_ready(session, mp, &txid) {
         return Ok(());
     }
-    let inv = tx_announce_inv(mp, &txid);
+    let Some(inv) = tx_announce_inv(mp, &txid) else {
+        return Ok(());
+    };
     // Core erases a below-filter tx from this peer's to-send set. A later
     // lower feefilter does not announce it (`p2p_feefilter.py`).
     if tx_announce_below_feefilter(session, mp, &txid) {
@@ -2172,12 +2174,15 @@ pub fn tx_announce_should_queue(
     tx_announce_peer_ready(session, mp, txid) && !tx_announce_below_feefilter(session, mp, txid)
 }
 
+/// `None` when the tx left the pool after the ready check. Core skips such a
+/// tx; `MSG_WITNESS_TX` is a `getdata` type and never goes in an `inv`.
 #[doc(hidden)]
-pub fn tx_announce_inv(mp: &crate::tx_relay::MempoolHub, txid: &bitcoin::Txid) -> Inventory {
-    match mp.try_get_tx(txid) {
-        Some(tx) => Inventory::WTx(tx.compute_wtxid()),
-        None => Inventory::WitnessTransaction(*txid),
-    }
+pub fn tx_announce_inv(
+    mp: &crate::tx_relay::MempoolHub,
+    txid: &bitcoin::Txid,
+) -> Option<Inventory> {
+    mp.try_get_tx(txid)
+        .map(|tx| Inventory::WTx(tx.compute_wtxid()))
 }
 
 #[doc(hidden)]
@@ -3620,6 +3625,10 @@ pub struct PeerFollowState {
     /// earlier lets it leave before the rest of that reply. A later ping
     /// replaces this nonce.
     pub parked_pong: Option<u64>,
+    /// Last hash of a full 500-entry `getblocks` page (Core
+    /// `m_continuation_block`). Serving that block queues one `MSG_BLOCK` inv
+    /// of the tip, which makes the peer send the next `getblocks`.
+    pub continuation_block: Option<BlockHash>,
 }
 
 /// A live session's follow state. Dropping it, including when
@@ -3668,6 +3677,7 @@ impl PeerFollowState {
             getdata_tail: VecDeque::new(),
             getblocktxn_tail: VecDeque::new(),
             parked_pong: None,
+            continuation_block: None,
         }
     }
 }
@@ -4578,6 +4588,9 @@ fn getheaders_apply(
     Ok((headers, withhold_stale, empty_tip))
 }
 
+/// Core's `getblocks` page (`nLimit`).
+const GETBLOCKS_PAGE: usize = 500;
+
 #[doc(hidden)]
 pub async fn on_getblocks(
     hub: &ChainHub,
@@ -4599,11 +4612,20 @@ pub async fn on_getblocks(
         headers_for_peer(hub.cache.as_ref(), hub.query.as_ref(), &gh)
     })
     .await??;
+    // The header walk is `getheaders`', which includes `hashStop`. Core's
+    // `getblocks` loop breaks before it.
     let inv: Vec<Inventory> = headers
         .into_iter()
-        .take(500)
-        .map(|h| Inventory::WitnessBlock(h.block_hash()))
+        .map(|h| h.block_hash())
+        .take_while(|h| *h != gb.stop_hash)
+        .take(GETBLOCKS_PAGE)
+        .map(Inventory::Block)
         .collect();
+    if inv.len() == GETBLOCKS_PAGE {
+        if let Some(Inventory::Block(last)) = inv.last() {
+            follow.continuation_block = Some(*last);
+        }
+    }
     if !inv.is_empty() {
         queue_accounted(session, out_tx, NetworkMessage::Inv(inv))?;
     }
@@ -4657,11 +4679,26 @@ pub async fn serve_getdata_tail(
             // Unknown hash: Core ProcessGetData answers notfound. Silence
             // holds the requester's getdata until the stall floor.
             // The header check and the body reconstruct both run on the
-            // blocking pool. A missing header or body is `false`.
-            Inventory::Block(h) | Inventory::WitnessBlock(h)
-                if !serve_getdata_full_block(hub, out_tx, session, h).await? =>
-            {
-                notfound.push(item);
+            // blocking pool. A missing header or body is `NotFound`.
+            Inventory::Block(h) | Inventory::WitnessBlock(h) => {
+                let witness = matches!(item, Inventory::WitnessBlock(_));
+                match serve_getdata_full_block(hub, out_tx, session, h, witness).await? {
+                    FullBlockReply::NotFound => notfound.push(item),
+                    // Core returns before the continuation when it sends nothing.
+                    FullBlockReply::Withheld => {}
+                    FullBlockReply::Queued if follow.continuation_block == Some(*h) => {
+                        // Core sends this right after the block, even when redundant.
+                        follow.continuation_block = None;
+                        if let Some(tip) = hub.tip_hash() {
+                            queue_accounted(
+                                session,
+                                out_tx,
+                                NetworkMessage::Inv(vec![Inventory::Block(tip)]),
+                            )?;
+                        }
+                    }
+                    FullBlockReply::Queued => {}
+                }
             }
             Inventory::CompactBlock(h) => {
                 serve_getdata_compact(hub, out_tx, follow, session, h).await?;
@@ -4689,7 +4726,8 @@ pub async fn serve_getdata_full_block(
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     session: Option<&crate::peers::LivePeer>,
     h: &bitcoin::BlockHash,
-) -> Result<bool, NetError> {
+    witness: bool,
+) -> Result<FullBlockReply, NetError> {
     let query = Arc::clone(&hub.query);
     let cache = Arc::clone(&hub.cache);
     let hash = *h;
@@ -4708,7 +4746,7 @@ pub async fn serve_getdata_full_block(
                 FullBlockServe::Missing
             });
         }
-        match encode_served_witness_block(cache.as_ref(), query.as_ref(), &hash)? {
+        match encode_served_block(cache.as_ref(), query.as_ref(), &hash, witness)? {
             Some(bytes) => Ok(FullBlockServe::Bytes(bytes)),
             None => Ok(FullBlockServe::Missing),
         }
@@ -4716,17 +4754,29 @@ pub async fn serve_getdata_full_block(
     .await
     .map_err(|_| NetError::Protocol("serve reconstruct join failed"))??;
     match served {
-        FullBlockServe::Missing => Ok(false),
+        FullBlockServe::Missing => Ok(FullBlockReply::NotFound),
         // A body we have but will not relay (month-old side block) stays silent.
-        FullBlockServe::Withheld => Ok(true),
+        FullBlockServe::Withheld => Ok(FullBlockReply::Withheld),
         FullBlockServe::Bytes(bytes) => {
             if !hub.stale_relay_allowed(h) {
-                return Ok(true);
+                return Ok(FullBlockReply::Withheld);
             }
             queue_served(session, out_tx, PeerOut::Encoded(bytes))?;
-            Ok(true)
+            Ok(FullBlockReply::Queued)
         }
     }
+}
+
+/// What a full-block `getdata` did.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullBlockReply {
+    /// Unknown, header-only, or pruned: the caller answers `notfound`.
+    NotFound,
+    /// A body we have but will not relay (month-old side block): silent.
+    Withheld,
+    /// The block bytes are queued.
+    Queued,
 }
 
 enum FullBlockServe {
@@ -8818,34 +8868,52 @@ pub fn payload_tx_count(payload: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
+/// A getdata `block` body as v2 contents. Core serves `MSG_WITNESS_BLOCK`
+/// with witness data and `MSG_BLOCK` without (`TX_NO_WITNESS`). Both start
+/// from the witness serialization; `MSG_BLOCK` then drops the marker, flag
+/// and witness stacks with a wire walk, so no `Block` is decoded for it.
 #[doc(hidden)]
-pub fn encode_served_witness_block(
+pub fn encode_served_block(
     cache: &BlockCache,
     query: &Query,
     hash: &BlockHash,
+    witness: bool,
 ) -> Result<Option<Vec<u8>>, NetError> {
     #[cfg(debug_assertions)]
     cache.note_body_load();
     crate::reactor::assert_not_reactor("getdata reconstruct");
     let t0 = std::time::Instant::now();
-    if let Some(block) = cache.get_block(hash).or_else(|| cache.servable(hash)) {
-        let tx_count = block.txdata.len() as u32;
-        let encoded = crate::v2::encode_v2_contents(NetworkMessage::Block(block))?;
-        let payload_len = encoded.len().saturating_sub(1);
-        crate::serve_perf::note_serve(tx_count, payload_len, t0.elapsed().as_nanos());
-        return Ok(Some(encoded));
-    }
-    match query.witness_block_bytes_by_hash(&hash.to_byte_array()) {
-        Ok(Some(payload)) => {
-            let tx_count = payload_tx_count(&payload);
-            crate::serve_perf::note_serve(tx_count, payload.len(), t0.elapsed().as_nanos());
-            let mut contents = Vec::with_capacity(1 + payload.len());
-            contents.push(2);
-            contents.extend_from_slice(&payload);
-            Ok(Some(contents))
-        }
-        Ok(None) => Ok(None),
-        Err(rbitcoin_store::StoreError::Pruned { .. }) => Ok(None),
-        Err(e) => Err(NetError::Consensus(e.to_string())),
-    }
+    let (tx_count, contents) =
+        if let Some(block) = cache.get_block(hash).or_else(|| cache.servable(hash)) {
+            let tx_count = block.txdata.len() as u32;
+            (
+                tx_count,
+                crate::v2::encode_v2_contents(NetworkMessage::Block(block))?,
+            )
+        } else {
+            match query.witness_block_bytes_by_hash(&hash.to_byte_array()) {
+                Ok(Some(payload)) => {
+                    let mut contents = Vec::with_capacity(1 + payload.len());
+                    contents.push(2);
+                    contents.extend_from_slice(&payload);
+                    (payload_tx_count(&payload), contents)
+                }
+                Ok(None) => return Ok(None),
+                Err(rbitcoin_store::StoreError::Pruned { .. }) => return Ok(None),
+                Err(e) => return Err(NetError::Consensus(e.to_string())),
+            }
+        };
+    let contents = if witness {
+        contents
+    } else {
+        let stripped = rbitcoin_store::block_wire::block_wire_strip_witness(&contents[1..])
+            .ok_or_else(|| NetError::Consensus(format!("served block {hash} does not walk")))?;
+        let mut plain = Vec::with_capacity(1 + stripped.len());
+        plain.push(2);
+        plain.extend_from_slice(&stripped);
+        plain
+    };
+    let payload_len = contents.len().saturating_sub(1);
+    crate::serve_perf::note_serve(tx_count, payload_len, t0.elapsed().as_nanos());
+    Ok(Some(contents))
 }

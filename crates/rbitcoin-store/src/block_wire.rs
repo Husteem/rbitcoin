@@ -33,6 +33,50 @@ pub fn block_wire_input_count(payload: &[u8]) -> Option<u32> {
     Some(inputs)
 }
 
+/// A serialized block without witness data (Core `TX_NO_WITNESS`), copied
+/// from its witness serialization without a `Block` decode. A segwit tx loses
+/// its marker, flag and witness stacks; every other byte is copied.
+///
+/// `None` on the payloads [`block_wire_input_count`] refuses. Trailing bytes
+/// are dropped.
+pub fn block_wire_strip_witness(payload: &[u8]) -> Option<Vec<u8>> {
+    if payload.len() < HEADER_LEN {
+        return None;
+    }
+    let mut off = HEADER_LEN;
+    let n_tx = read_count(payload, &mut off)?;
+    if n_tx as usize > (payload.len() - off) / 10 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(payload.len());
+    out.extend_from_slice(&payload[..off]);
+    for _ in 0..n_tx {
+        let start = off;
+        // Validates the whole tx, witness stacks included.
+        skip_tx(payload, &mut off)?;
+        // `skip_tx` accepted it, so a 0 then 1 after the version is the
+        // BIP144 marker and flag. A 0 then 0 is Core's empty legacy tx.
+        if payload[start + 4] != 0 || payload[start + 5] != 1 {
+            out.extend_from_slice(&payload[start..off]);
+            continue;
+        }
+        out.extend_from_slice(&payload[start..start + 4]);
+        let io_start = start + 6;
+        let mut io_end = io_start;
+        let n_in = read_count(payload, &mut io_end)?;
+        for _ in 0..n_in {
+            skip_input(payload, &mut io_end)?;
+        }
+        let n_out = read_count(payload, &mut io_end)?;
+        for _ in 0..n_out {
+            skip_output(payload, &mut io_end)?;
+        }
+        out.extend_from_slice(&payload[io_start..io_end]);
+        out.extend_from_slice(&payload[off - 4..off]);
+    }
+    Some(out)
+}
+
 #[doc(hidden)]
 pub fn read_compact(buf: &[u8], off: &mut usize) -> Option<u64> {
     let (v, n) = read_compact_size(buf.get(*off..)?).ok()?;
