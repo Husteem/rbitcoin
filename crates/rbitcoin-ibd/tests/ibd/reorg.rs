@@ -277,13 +277,13 @@ fn heavier_disconnected_path_names_connecting_hashes() {
     let l3 = mine(l2.block_hash(), 1_500_060_300, 3);
     hub.ensure_header(&l3.header).unwrap();
     assert!(
-        connecting_hashes_heavier_disconnected_n(&hub, l3.block_hash(), ANCESTOR_WALK_MAX)
+        connecting_hashes_heavier_disconnected(&hub, l3.block_hash())
             .unwrap()
             .is_none(),
         "child of current tip is a normal extension, not a connecting search"
     );
 
-    let path = connecting_hashes_heavier_disconnected_n(&hub, w4.block_hash(), ANCESTOR_WALK_MAX)
+    let path = connecting_hashes_heavier_disconnected(&hub, w4.block_hash())
         .unwrap()
         .expect("heavier winner that does not connect at tip must name a path");
     assert_eq!(
@@ -602,7 +602,7 @@ fn linear_ahead_headers_are_not_a_disconnected_fork() {
     }
     let last = ahead.last().unwrap().1;
     assert!(
-        connecting_hashes_heavier_disconnected_n(&hub, last, ANCESTOR_WALK_MAX)
+        connecting_hashes_heavier_disconnected(&hub, last)
             .unwrap()
             .is_none(),
         "far header on the same chain as tip is not a disconnected fork"
@@ -629,7 +629,7 @@ fn linear_ahead_headers_are_not_a_disconnected_fork() {
 /// cap on a header-only mid, so join is not a confirmed LCA. That is still
 /// a linear extension, not a connecting search.
 ///
-/// Production walk is 10_000; a smaller cap plus ~20 headers hits the same
+/// Production walk is [`ANCESTOR_WALK_MAX`]; a smaller cap plus ~20 headers hits the same
 /// branch without mining a mainnet-scale horizon.
 #[test]
 fn capped_walk_on_linear_headers_is_not_a_disconnected_fork() {
@@ -680,14 +680,13 @@ fn fork_three_under_a_two_block_tip(hub: &ChainHub, time0: u32) -> [BlockHash; 3
 fn selection_walk_reaches_an_lca_one_past_its_depth() {
     let (dir, hub) = tmp_hub();
     let fork = fork_three_under_a_two_block_tip(&hub, 1_500_093_100);
-    let none = std::collections::HashSet::new();
     assert_eq!(
-        select_heavier_path(&hub, &[fork[2]], &none, 2).unwrap(),
+        connecting_hashes_heavier_disconnected_n(&hub, fork[2], 2).unwrap(),
         None,
         "a walk of two ends on a header-only row"
     );
     assert_eq!(
-        select_heavier_path(&hub, &[fork[2]], &none, 3).unwrap(),
+        connecting_hashes_heavier_disconnected_n(&hub, fork[2], 3).unwrap(),
         Some(fork.to_vec())
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -703,16 +702,15 @@ fn selection_walk_covers_every_rewind_cap() {
         rbitcoin_ibd::ibd::header_walk::UNPROVEN_LEAD_BLOCKS,
     ] {
         assert!(
-            ancestor_walk_max(cap) > cap as usize,
-            "cap {cap} walk {}",
-            ancestor_walk_max(cap)
+            ANCESTOR_WALK_MAX > cap as usize,
+            "cap {cap} walk {ANCESTOR_WALK_MAX}"
         );
     }
 }
 
-/// An unplanted walk tip as far above the confirmed tip as the widest walk
-/// is not walked: that walk ends before any connected header. One height
-/// lower it is. The recorded height alone decides, so a short fork stands in
+/// An unplanted walk tip [`ANCESTOR_WALK_MAX`] above the confirmed tip is
+/// not walked: that walk ends before any connected header. One height lower
+/// it is. The recorded height alone decides, so a short fork stands in
 /// for a far one.
 #[test]
 fn a_walk_tip_out_of_walk_reach_is_not_a_candidate() {
@@ -720,9 +718,8 @@ fn a_walk_tip_out_of_walk_reach_is_not_a_candidate() {
     let fork = fork_three_under_a_two_block_tip(&hub, 1_500_094_100);
     let mut st =
         rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
-    let reach = ancestor_walk_max(rbitcoin_ibd::ibd::header_walk::UNPROVEN_LEAD_BLOCKS);
     st.header_walk.tip.hash = Some(fork[2]);
-    st.header_walk.tip.height = 2 + reach as u32;
+    st.header_walk.tip.height = 2 + ANCESTOR_WALK_MAX as u32;
     let shared = Mutex::new(st);
     assert!(!consider_disconnected_heavier(&shared, &hub).unwrap());
     assert_eq!(hub.tip_height(), Some(2));
@@ -766,7 +763,7 @@ fn connecting_search_skips_linear_tip_plus_one() {
     st.max_ordered_height = 20;
     assert!(
         connecting_search_candidates(&st, &hub).unwrap().is_empty(),
-        "linear tip+1 must not be a connecting-search candidate (avoids a 10k max_ordered walk)"
+        "linear tip+1 must not be a connecting-search candidate (avoids a long max_ordered walk)"
     );
     let shared = Mutex::new(st);
     let rewound = consider_disconnected_heavier(&shared, &hub).unwrap();
