@@ -18,10 +18,11 @@ use rbitcoin_net::peer::{
     connect_and_handshake_timed, HandshakePolicy, BAN_SCORE_THRESHOLD, HANDSHAKE_TIMEOUT,
 };
 use rbitcoin_net::peer_dos::{PeerRateLimiter, RATE_LIMIT_BAN_SCORE};
+use rbitcoin_net::peers::PongSlot;
 use rbitcoin_net::v2::{read_v2_frame_with_progress, write_v2_msg_offload, V2Reader, V2Writer};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
@@ -717,63 +718,6 @@ pub fn decoy_hook(
     }
 }
 
-/// One queued pong. The reader stores the latest nonce; the writer emits it.
-#[doc(hidden)]
-pub struct IbdPong {
-    nonce: AtomicU64,
-    pending: AtomicBool,
-}
-
-impl Default for IbdPong {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl IbdPong {
-    pub fn new() -> Self {
-        Self {
-            nonce: AtomicU64::new(0),
-            pending: AtomicBool::new(false),
-        }
-    }
-
-    /// Store `n`. `true` when the caller should queue the single pong.
-    pub fn note(&self, n: u64) -> bool {
-        self.nonce.store(n, Ordering::Release);
-        self.pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    /// Nonce to write for a queued pong. `queued` is the fallback when this
-    /// slot is not tracking a session pong.
-    pub fn wire_nonce(&self, queued: u64) -> u64 {
-        if self.pending.load(Ordering::Acquire) {
-            self.nonce.load(Ordering::Acquire)
-        } else {
-            queued
-        }
-    }
-
-    /// Clear the slot after the write. A ping that landed during the write
-    /// is claimed again.
-    pub fn finish(&self, written: u64) -> Option<u64> {
-        self.pending.store(false, Ordering::Release);
-        let now = self.nonce.load(Ordering::Acquire);
-        if now != written
-            && self
-                .pending
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            Some(now)
-        } else {
-            None
-        }
-    }
-}
-
 /// Reader state for one IBD peer. The socket loop only pulls frames.
 #[doc(hidden)]
 pub struct IbdReadCtx {
@@ -792,7 +736,7 @@ pub struct IbdReadCtx {
     pub rate: PeerRateLimiter,
     pub logged_invalid_v2: bool,
     pub ban_score: u32,
-    pub pong: Arc<IbdPong>,
+    pub pong: Arc<PongSlot>,
 }
 
 #[doc(hidden)]
@@ -1016,7 +960,7 @@ pub async fn read_ibd_peer(
     any_rx_ms: Arc<AtomicU64>,
     solicited_ms: Arc<AtomicU64>,
     light_decode: Arc<Semaphore>,
-    pong: Arc<IbdPong>,
+    pong: Arc<PongSlot>,
 ) {
     let mut prog_mark = 0usize;
     let requested_progress = Arc::clone(&requested);
@@ -1081,11 +1025,11 @@ pub trait IbdPongEmit {
 /// The pending slot is clear when this returns `Ok`.
 #[doc(hidden)]
 pub async fn write_ibd_pong<E: IbdPongEmit>(
-    pong: &IbdPong,
+    pong: &PongSlot,
     queued: u64,
     emit: &mut E,
 ) -> Result<(), NetError> {
-    let mut nonce = pong.wire_nonce(queued);
+    let mut nonce = pong.claimed_nonce_or(queued);
     loop {
         emit.emit(nonce).await?;
         match pong.finish(nonce) {
@@ -1116,7 +1060,7 @@ pub async fn write_ibd_peer(
     mut writer: V2Writer,
     sinks_w: PeerEventSinks,
     wire: Arc<GetdataWire>,
-    pong: Arc<IbdPong>,
+    pong: Arc<PongSlot>,
 ) {
     loop {
         tokio::select! {
@@ -1247,7 +1191,7 @@ pub async fn spawn_peer(
     // Reader → writer for pongs (must not write on the read task — that would
     // stall the receive half and look like a peer stall).
     let (out_tx, out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
-    let pong = Arc::new(IbdPong::new());
+    let pong = Arc::new(PongSlot::new());
     let pong_r = Arc::clone(&pong);
     let bytes_rx_total = Arc::new(AtomicU64::new(0));
     let bytes_io = Arc::clone(&bytes_rx_total);

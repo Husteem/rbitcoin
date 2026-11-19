@@ -384,6 +384,72 @@ impl PendingSendCmpct {
     }
 }
 
+/// The one pong a peer is owed. The reader stores the latest ping nonce
+/// and claims the slot; the writer sends the nonce and clears the claim.
+/// Zero is a real nonce.
+///
+/// Every access to the claim and the nonce is SeqCst. The reader stores
+/// then claims, the writer clears then loads: with release/acquire each
+/// side can miss the other's store (x86 keeps the clear in the store buffer
+/// past the load), and a ping that lands during the write is never
+/// answered. Both the session writer and IBD use this one type.
+#[derive(Debug, Default)]
+pub struct PongSlot {
+    nonce: AtomicU64,
+    pending: AtomicBool,
+}
+
+impl PongSlot {
+    pub const fn new() -> Self {
+        Self {
+            nonce: AtomicU64::new(0),
+            pending: AtomicBool::new(false),
+        }
+    }
+
+    pub fn store_nonce(&self, n: u64) {
+        self.nonce.store(n, Ordering::SeqCst);
+    }
+
+    /// `true` when the caller should queue the one pong.
+    pub fn claim(&self) -> bool {
+        self.pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Store `n`, then claim. `true` when the caller should queue the pong.
+    pub fn note(&self, n: u64) -> bool {
+        self.store_nonce(n);
+        self.claim()
+    }
+
+    pub fn nonce(&self) -> u64 {
+        self.nonce.load(Ordering::SeqCst)
+    }
+
+    /// The nonce to write while the slot is claimed, else `idle`.
+    pub fn claimed_nonce_or(&self, idle: u64) -> u64 {
+        if self.pending.load(Ordering::SeqCst) {
+            self.nonce()
+        } else {
+            idle
+        }
+    }
+
+    /// Clear the claim after `written` went out. A ping that landed during
+    /// the write is claimed again and its nonce returned.
+    pub fn finish(&self, written: u64) -> Option<u64> {
+        self.pending.store(false, Ordering::SeqCst);
+        let now = self.nonce();
+        if now != written && self.claim() {
+            Some(now)
+        } else {
+            None
+        }
+    }
+}
+
 /// One live session (RPC snapshot + disconnect flag + byte counters).
 pub struct LivePeer {
     pub id: u64,
@@ -459,10 +525,8 @@ pub struct LivePeer {
     pub ping_start_secs: AtomicU64,
     /// RPC `ping` queued a probe.
     pub ping_queued: AtomicBool,
-    /// Latest nonce to put on the pong. Zero is a real nonce.
-    pub pong_nonce: AtomicU64,
-    /// A pong is already sitting on this session's outbound queue.
-    pub pong_pending: AtomicBool,
+    /// The one pong this session owes.
+    pub pong: PongSlot,
     pub pingtime: Mutex<Option<f64>>,
     pub minping: Mutex<Option<f64>>,
     pub owner: std::sync::Weak<PeerHub>,
@@ -1185,38 +1249,22 @@ impl LivePeer {
     }
 
     /// Remember the nonce a pong must carry. Does not queue the message.
-    ///
-    /// SeqCst with [`Self::claim_pong_send`] and [`Self::finish_pong_write`].
-    /// A release store on one atomic can stay invisible while the writer
-    /// loads the old nonce and the session still sees the claim held.
     pub fn store_pong_nonce(&self, n: u64) {
-        self.pong_nonce.store(n, Ordering::SeqCst);
+        self.pong.store_nonce(n);
     }
 
     /// `true` when this call should queue the one pending pong.
     pub fn claim_pong_send(&self) -> bool {
-        self.pong_pending
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+        self.pong.claim()
     }
 
     pub fn pong_nonce(&self) -> u64 {
-        self.pong_nonce.load(Ordering::Acquire)
+        self.pong.nonce()
     }
 
-    /// Drop the pending slot after the pong is written. A ping that landed
-    /// during the write is claimed again so its nonce is not dropped.
-    ///
-    /// The clear happens before the load. Both are SeqCst, matching
-    /// [`Self::store_pong_nonce`] then [`Self::claim_pong_send`].
+    /// See [`PongSlot::finish`].
     pub fn finish_pong_write(&self, written: u64) -> Option<u64> {
-        self.pong_pending.store(false, Ordering::SeqCst);
-        let now = self.pong_nonce.load(Ordering::SeqCst);
-        if now != written && self.claim_pong_send() {
-            Some(now)
-        } else {
-            None
-        }
+        self.pong.finish(written)
     }
 
     pub fn queue_msg(&self, msg: NetworkMessage) -> bool {
@@ -3475,8 +3523,7 @@ impl PeerHub {
             ping_nonce_sent: AtomicU64::new(0),
             ping_start_secs: AtomicU64::new(0),
             ping_queued: AtomicBool::new(false),
-            pong_nonce: AtomicU64::new(0),
-            pong_pending: AtomicBool::new(false),
+            pong: PongSlot::new(),
             pingtime: Mutex::new(None),
             minping: Mutex::new(None),
             owner: Arc::downgrade(self),
