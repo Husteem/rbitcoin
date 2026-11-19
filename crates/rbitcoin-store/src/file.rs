@@ -89,7 +89,8 @@ pub(crate) fn restore_kept_tail(path: &Path) -> Result<(), StoreError> {
         return Ok(());
     }
     handle_pwrite_all(&file, path, image.block, image.bytes)?;
-    file.sync_data().map_err(|e| StoreError::io(path, e))?;
+    file.durable_sync_data()
+        .map_err(|e| StoreError::io(path, e))?;
     discard_kept_tail(&side)
 }
 
