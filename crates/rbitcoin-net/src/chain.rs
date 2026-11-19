@@ -4907,20 +4907,6 @@ impl ChainHub {
         }
     }
 
-    /// [`Self::cached_chain_work`] without waiting on the prefix lock: `None`
-    /// also while a fill holds it.
-    pub fn try_cached_chain_work(&self) -> Option<Work> {
-        let Some(tip) = self.tip_height() else {
-            return Some(Work::from_be_bytes([0u8; 32]));
-        };
-        let prefix = self.chain_work_prefix.try_read().ok()?;
-        if prefix.len() == tip as usize + 1 {
-            prefix.last().copied()
-        } else {
-            None
-        }
-    }
-
     /// Sum wire-header work on the best chain from `fork_height+1` through tip.
     ///
     /// `fork_height = None` means from genesis (height 0) through tip.

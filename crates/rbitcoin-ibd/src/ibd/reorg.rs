@@ -34,6 +34,10 @@ pub struct IbdReorgState {
     pub explore_need: Vec<BlockHash>,
     /// Candidate tips on an exploration path (for proactive most-work apply).
     pub explore_tips: Vec<BlockHash>,
+    /// Candidates a selection under `shared` passed over. Its walk stops at
+    /// [`ANCESTOR_WALK_MAX`], so the coordinator's next off-lock turn walks
+    /// each once with the rewind cap in force.
+    pub deferred: Vec<BlockHash>,
 }
 
 impl IbdReorgState {
@@ -59,6 +63,19 @@ impl IbdReorgState {
 
     /// Cap on each explore list. Small enough that membership stays a scan.
     pub const EXPLORE_CAP: usize = 64;
+
+    /// Keep `cands` for one off-lock retry, at most [`Self::EXPLORE_CAP`].
+    pub fn defer(&mut self, cands: &[BlockHash]) {
+        for h in cands {
+            if self.deferred.contains(h) {
+                continue;
+            }
+            if self.deferred.len() >= Self::EXPLORE_CAP {
+                self.deferred.remove(0);
+            }
+            self.deferred.push(*h);
+        }
+    }
 
     /// Register hashes (and optional path tip) for exploration densify / apply.
     ///
@@ -123,13 +140,12 @@ pub const ANCESTOR_WALK_MAX: usize = 10_000;
 #[doc(hidden)]
 pub const REWIND_MAX_DEPTH: u32 = 1_024;
 
-/// Prev-walk cap for a selection whose rewind may disconnect `rewind_cap`
-/// blocks. A competing tip+1 walks `rewind_cap + 1` headers to the deepest
-/// LCA that rewind takes. Under the floor that is 65,537 header reads; a
-/// proved walk keeps [`ANCESTOR_WALK_MAX`], so it selects no fork deeper
-/// than it did before. Selection takes `rewind_cap` from
-/// [`super::header_walk::walk_depth_cap`], which reads no header under
-/// `shared`.
+/// Prev-walk cap for an off-lock selection whose rewind may disconnect
+/// `rewind_cap` blocks. A competing tip+1 walks `rewind_cap + 1` headers to
+/// the deepest LCA that rewind takes: 65,537 header reads under the floor,
+/// [`ANCESTOR_WALK_MAX`] above it. A selection under `shared` walks
+/// [`ANCESTOR_WALK_MAX`] whatever the cap and defers what it passes over
+/// ([`IbdReorgState::defer`]).
 #[doc(hidden)]
 pub fn ancestor_walk_max(rewind_cap: u32) -> usize {
     ANCESTOR_WALK_MAX.max(rewind_cap as usize + 1)
@@ -156,6 +172,8 @@ pub fn header_hashes_to_best_ancestor_n(
     walk_max: usize,
 ) -> Result<Vec<BlockHash>, NetError> {
     use bitcoin::hashes::Hash as _;
+    #[cfg(debug_assertions)]
+    LONGEST_WALK.with(|c| c.set(c.get().max(walk_max)));
     let mut rev = Vec::new();
     let mut cur = tip;
     for _ in 0..walk_max {
@@ -185,6 +203,23 @@ pub fn header_hashes_to_best_ancestor_n(
 
 thread_local! {
     static PARENT_HASH_OF_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static LONGEST_WALK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Forget the longest prev-walk bound this thread has used.
+#[cfg(debug_assertions)]
+pub fn reset_longest_walk() {
+    LONGEST_WALK.with(|c| c.set(0));
+}
+
+/// Longest prev-walk bound this thread has used since the last reset.
+#[cfg(debug_assertions)]
+pub fn longest_walk() -> usize {
+    LONGEST_WALK.with(|c| c.get())
 }
 
 #[cfg(debug_assertions)]
@@ -366,15 +401,21 @@ pub fn connecting_search_candidates(
 }
 
 /// Competing tip+1, or the walk candidate while nothing is planted above the
-/// confirmed tip. Collecting these does not read the header store.
+/// confirmed tip, then the candidates a selection under `shared` deferred.
+/// Collecting these does not read the header store.
 #[doc(hidden)]
 pub fn heavier_fork_candidates(
-    st: &super::state::IbdWorkState,
+    st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
 ) -> Result<(Vec<BlockHash>, HashSet<[u8; 32]>), NetError> {
     let mut cands = connecting_search_candidates(st, hub)?;
     if cands.is_empty() {
         cands.extend(unplanted_walk_tip(st, hub));
+    }
+    for h in std::mem::take(&mut st.reorg.deferred) {
+        if !cands.contains(&h) {
+            cands.push(h);
+        }
     }
     let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
     Ok((cands, invalid))
@@ -392,8 +433,8 @@ pub fn consider_disconnected_heavier(
     hub: &ChainHub,
 ) -> Result<bool, NetError> {
     let (cands, invalid) = {
-        let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-        heavier_fork_candidates(&st, hub)?
+        let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
+        heavier_fork_candidates(&mut st, hub)?
     };
     apply_off_lock_rewind(shared, hub, &cands, &invalid)
 }
@@ -514,17 +555,34 @@ pub fn extend_valid_header_tip(
 
 /// If a strictly heavier header branch is known, disconnect to its LCA and
 /// plant that branch as the linear work path. No side-channel body gather.
+///
+/// The caller holds `shared`, so the walk stays at [`ANCESTOR_WALK_MAX`].
+/// When nothing is selected the candidates are deferred to the next
+/// off-lock turn, which walks as far as the rewind cap.
 pub fn maybe_rewind_to_best_work(
     st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
 ) -> Result<bool, NetError> {
+    maybe_rewind_to_best_work_n(st, hub, ANCESTOR_WALK_MAX)
+}
+
+#[doc(hidden)]
+pub fn maybe_rewind_to_best_work_n(
+    st: &mut super::state::IbdWorkState,
+    hub: &ChainHub,
+    walk_max: usize,
+) -> Result<bool, NetError> {
     let cands = rewind_candidate_hashes(st, hub)?;
     let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
-    let walk_max = ancestor_walk_max(super::header_walk::walk_depth_cap(st, hub));
-    let Some(path) = select_heavier_path(hub, &cands, &invalid, walk_max)? else {
+    let mut cap = None;
+    let picked = select_heavier_path(hub, &cands, &invalid, walk_max, &mut || {
+        *cap.get_or_insert_with(|| super::header_walk::rewind_depth_cap(st, hub))
+    })?;
+    let Some((path, cap)) = picked else {
+        st.reorg.defer(&cands);
         return Ok(false);
     };
-    apply_header_rewind(st, hub, &path)
+    apply_header_rewind(st, hub, &path, cap)
 }
 
 #[doc(hidden)]
@@ -547,25 +605,53 @@ pub fn rewind_candidate_hashes(
     Ok(cands)
 }
 
+/// First heavier path among `cands` that a rewind under `rewind_cap` takes,
+/// with that cap. A path whose LCA is deeper than the cap is passed over, so
+/// a later candidate still gets its turn. `rewind_cap` is read at most once,
+/// when the first heavier path is found.
 #[doc(hidden)]
 pub fn select_heavier_path(
     hub: &ChainHub,
     cands: &[BlockHash],
     invalid: &HashSet<[u8; 32]>,
     walk_max: usize,
-) -> Result<Option<Vec<BlockHash>>, NetError> {
+    rewind_cap: &mut dyn FnMut() -> u32,
+) -> Result<Option<(Vec<BlockHash>, u32)>, NetError> {
     for cand in cands {
         if invalid.contains(&cand.to_byte_array()) {
             continue;
         }
-        if let Some(path) = connecting_hashes_heavier_disconnected_n(hub, *cand, walk_max)? {
-            if path.iter().any(|h| invalid.contains(&h.to_byte_array())) {
-                continue;
-            }
-            return Ok(Some(path));
+        let Some(path) = connecting_hashes_heavier_disconnected_n(hub, *cand, walk_max)? else {
+            continue;
+        };
+        if path.iter().any(|h| invalid.contains(&h.to_byte_array())) {
+            continue;
         }
+        let Some((_, lca_h)) = path_lca(hub, &path)? else {
+            continue;
+        };
+        let cap = rewind_cap();
+        if hub.tip_height().unwrap_or(0).saturating_sub(lca_h) > cap {
+            continue;
+        }
+        return Ok(Some((path, cap)));
     }
     Ok(None)
+}
+
+/// The confirmed parent of `path[0]` and its height.
+fn path_lca(hub: &ChainHub, path: &[BlockHash]) -> Result<Option<(BlockHash, u32)>, NetError> {
+    let Some(first) = path.first() else {
+        return Ok(None);
+    };
+    let Some(lca) = parent_hash_of(hub, *first)? else {
+        return Ok(None);
+    };
+    let lca_h = hub
+        .query
+        .height_of_hash(&lca.to_byte_array())
+        .map_err(NetError::store)?;
+    Ok(lca_h.map(|h| (lca, h.0)))
 }
 
 /// Disconnect to the path's LCA and re-point height slots at `path`
@@ -589,18 +675,7 @@ pub fn prepare_header_rewind(
     path: &[BlockHash],
     max_depth: u32,
 ) -> Result<Option<RewindPrep>, NetError> {
-    if path.is_empty() {
-        return Ok(None);
-    }
-    let Some(lca) = parent_hash_of(hub, path[0])? else {
-        return Ok(None);
-    };
-    let Some(lca_h) = hub
-        .query
-        .height_of_hash(&lca.to_byte_array())
-        .map_err(NetError::store)?
-        .map(|h| h.0)
-    else {
+    let Some((lca, lca_h)) = path_lca(hub, path)? else {
         return Ok(None);
     };
     let tip_h = hub.tip_height().unwrap_or(0);
@@ -695,12 +770,13 @@ pub fn commit_header_rewind(
     st.quiesce_refund();
 }
 
+/// Rewind to `path` under the cap its selection used.
 pub fn apply_header_rewind(
     st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
     path: &[BlockHash],
+    cap: u32,
 ) -> Result<bool, NetError> {
-    let cap = super::header_walk::rewind_depth_cap(st, hub);
     let Some(prep) = prepare_header_rewind(hub, path, cap)? else {
         return Ok(false);
     };
@@ -784,18 +860,16 @@ pub(crate) fn apply_off_lock_rewind(
     let _gate = rewind_exclusion()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    let walk_max = {
+    let (origin, proven) = {
         let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-        ancestor_walk_max(super::header_walk::walk_depth_cap(&st, hub))
+        (st.header_walk.origin, st.header_walk.proven)
     };
-    let Some(path) = select_heavier_path(hub, cands, invalid, walk_max)? else {
+    let cap = super::header_walk::rewind_depth_cap_of(origin, proven, hub);
+    let walk_max = ancestor_walk_max(cap);
+    let Some((path, cap)) = select_heavier_path(hub, cands, invalid, walk_max, &mut || cap)? else {
         return Ok(false);
     };
     let tip_before = tip_pair(hub);
-    let cap = {
-        let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-        super::header_walk::rewind_depth_cap(&st, hub)
-    };
     let Some(prep) = prepare_header_rewind(hub, &path, cap)? else {
         return Ok(false);
     };

@@ -32,7 +32,7 @@ fn unproved_lead_rewinds_past_1024_and_a_proved_walk_does_not() {
         rbitcoin_ibd::ibd::header_walk::rewind_depth_cap(&proved, &hub),
         REWIND_MAX_DEPTH
     );
-    assert!(!apply_header_rewind(&mut proved, &hub, &path).unwrap());
+    assert!(!rewind_under_own_cap(&mut proved, &hub, &path).unwrap());
     assert_eq!(hub.tip_height(), Some(1_025));
     let mut unproved =
         rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(1_025));
@@ -43,7 +43,7 @@ fn unproved_lead_rewinds_past_1024_and_a_proved_walk_does_not() {
         rbitcoin_ibd::ibd::header_walk::rewind_depth_cap(&unproved, &hub),
         rbitcoin_ibd::ibd::header_walk::UNPROVEN_LEAD_BLOCKS
     );
-    assert!(apply_header_rewind(&mut unproved, &hub, &path).unwrap());
+    assert!(rewind_under_own_cap(&mut unproved, &hub, &path).unwrap());
     assert_eq!(hub.tip_height(), Some(0));
     assert!(
         hub.query
@@ -73,7 +73,7 @@ fn proved_headers_still_rewind_a_tip_under_the_floor() {
     assert!(proved.header_walk.proven);
     assert_eq!(REWIND_MAX_DEPTH, 1_024);
     assert!(
-        !apply_header_rewind(&mut proved, &hub, &[side]).unwrap(),
+        !rewind_under_own_cap(&mut proved, &hub, &[side]).unwrap(),
         "once the confirmed tip meets the floor, 1,025 is past the cap"
     );
     assert_eq!(hub.tip_height(), Some(1_025));
@@ -90,7 +90,7 @@ fn proved_headers_still_rewind_a_tip_under_the_floor() {
         "the heavier headers are proved before the tip moves"
     );
     assert!(
-        apply_header_rewind(&mut st, &hub, &[side]).unwrap(),
+        rewind_under_own_cap(&mut st, &hub, &[side]).unwrap(),
         "a proved header fork still moves a confirmed tip that is under the floor"
     );
     assert_eq!(hub.tip_height(), Some(0));
@@ -140,6 +140,16 @@ fn floor_just_above(work: bitcoin::Work) -> rbitcoin_consensus::Milestone {
             min_work_be,
         }),
     }
+}
+
+/// [`apply_header_rewind`] under the cap this state puts in force.
+fn rewind_under_own_cap(
+    st: &mut rbitcoin_ibd::ibd::state::IbdWorkState,
+    hub: &ChainHub,
+    path: &[BlockHash],
+) -> Result<bool, NetError> {
+    let cap = rbitcoin_ibd::ibd::header_walk::rewind_depth_cap(st, hub);
+    apply_header_rewind(st, hub, path, cap)
 }
 
 fn tmp_hub() -> (rbitcoin_query::testutil::TempDir, ChainHub) {
@@ -681,14 +691,15 @@ fn selection_walk_reaches_an_lca_one_past_its_depth() {
     let (dir, hub) = tmp_hub();
     let fork = fork_three_under_a_two_block_tip(&hub, 1_500_093_100);
     let none = std::collections::HashSet::new();
+    let mut cap = || REWIND_MAX_DEPTH;
     assert_eq!(
-        select_heavier_path(&hub, &[fork[2]], &none, 2).unwrap(),
+        select_heavier_path(&hub, &[fork[2]], &none, 2, &mut cap).unwrap(),
         None,
         "a walk of two ends on a header-only row"
     );
     assert_eq!(
-        select_heavier_path(&hub, &[fork[2]], &none, 3).unwrap(),
-        Some(fork.to_vec())
+        select_heavier_path(&hub, &[fork[2]], &none, 3, &mut cap).unwrap(),
+        Some((fork.to_vec(), REWIND_MAX_DEPTH))
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -713,37 +724,104 @@ fn selection_walk_covers_every_rewind_cap() {
     assert_eq!(ancestor_walk_max(REWIND_MAX_DEPTH), ANCESTOR_WALK_MAX);
 }
 
-/// Selection reads its walk bound under `shared`, so only the in-memory
-/// chain-work prefix decides it, without waiting on a fill. A cold or busy
-/// prefix keeps a proved walk wide; a warm one narrows it once the confirmed
-/// tip meets the floor.
+/// A heavier fork deeper than the rewind cap is passed over, not returned.
+/// The later candidate the rewind takes is selected, and the rewind under
+/// that same cap disconnects to it.
 #[test]
-fn the_walk_bound_reads_no_header_under_shared() {
-    use rbitcoin_ibd::ibd::header_walk::{walk_depth_cap, UNPROVEN_LEAD_BLOCKS};
-    let (dir, mut hub) = tmp_hub();
+fn a_fork_deeper_than_the_cap_does_not_end_selection() {
+    let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
-    hub.confirm_empty_regtest(3).unwrap();
-    hub.milestone = floor_at(hub.chain_work().unwrap());
-    hub.test_clear_chain_work_prefix();
+    let gen = hub.tip_hash().unwrap();
+    let t = 1_500_095_100;
+    let l1 = mine(gen, t, 1);
+    hub.accept_block(l1.clone()).unwrap();
+    let l2 = mine(l1.block_hash(), t + 100, 2);
+    hub.accept_block(l2.clone()).unwrap();
+    hub.accept_block(mine(l2.block_hash(), t + 200, 3)).unwrap();
+    let side = |from: BlockHash, avoid: BlockHash, h0: u32, n: u32, dt: u32| {
+        let mut out = Vec::new();
+        let mut prev = from;
+        for h in h0..h0 + n {
+            let b = distinct_sib(mine(prev, t + dt + 100 * (h - 1), h), avoid);
+            hub.ensure_header(&b.header).unwrap();
+            prev = b.block_hash();
+            out.push(prev);
+        }
+        out
+    };
+    let deep = side(gen, l1.block_hash(), 1, 4, 1);
+    let shallow = side(l1.block_hash(), l2.block_hash(), 2, 3, 2);
+    let none = std::collections::HashSet::new();
+    assert_eq!(
+        select_heavier_path(&hub, &[deep[3], shallow[2]], &none, 10, &mut || 2).unwrap(),
+        Some((shallow.clone(), 2)),
+        "the fork 3 under the tip is past a cap of 2"
+    );
+    let prep = prepare_header_rewind(&hub, &shallow, 2)
+        .unwrap()
+        .expect("the rewind takes the path selection returned");
+    assert_eq!(prep.lca_h, 1);
+    assert_eq!(hub.tip_height(), Some(1));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A selection under `shared` stops at its walk. A heavier fork past that
+/// walk is deferred, and the coordinator's off-lock turn selects it after
+/// the explore tip that named it is cleared, as a missed exploration does.
+#[test]
+fn a_fork_past_the_under_lock_walk_is_selected_off_lock() {
+    let (dir, hub) = tmp_hub();
+    let fork = fork_three_under_a_two_block_tip(&hub, 1_500_096_100);
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[2]));
+    assert!(!maybe_rewind_to_best_work_n(&mut st, &hub, 2).unwrap());
+    assert_eq!(
+        hub.tip_height(),
+        Some(2),
+        "a walk of two does not reach the LCA"
+    );
+    st.reorg.clear_explore();
+    let shared = Mutex::new(st);
+    rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, &hub);
+    assert_eq!(
+        hub.tip_height(),
+        Some(0),
+        "the off-lock turn rewinds to the fork"
+    );
+    let st = shared.into_inner().unwrap_or_else(|err| err.into_inner());
+    assert_eq!(st.height_to_hash.get(&3), Some(&fork[2]));
+    assert!(
+        st.reorg.deferred.is_empty(),
+        "a deferred candidate is retried once"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Under the floor the rewind cap is 65,536, but a selection under `shared`
+/// walks no further than [`ANCESTOR_WALK_MAX`]. The coordinator's off-lock
+/// turn is the one that walks as far as the cap.
+#[test]
+fn the_under_lock_walk_stays_at_ancestor_walk_max() {
+    use rbitcoin_ibd::ibd::header_walk::{rewind_depth_cap, UNPROVEN_LEAD_BLOCKS};
+    let (dir, mut hub) = tmp_hub();
+    let fork = fork_three_under_a_two_block_tip(&hub, 1_500_097_100);
+    hub.milestone = floor_just_above(hub.chain_work().unwrap());
     let mut st =
         rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
     st.header_walk.origin = true;
-    st.header_walk.proven = true;
-    let _probe = rbitcoin_store::HeaderThreadProbe::arm();
-    {
-        let _held = rbitcoin_store::CoordSharedLock::enter();
-        assert_eq!(walk_depth_cap(&st, &hub), UNPROVEN_LEAD_BLOCKS);
-    }
-    assert_eq!(rbitcoin_store::coord_lock_store_reads(), 0);
-    assert!(hub.cached_chain_work().is_none(), "the prefix stays cold");
-    hub.ensure_chain_work_prefix().unwrap();
-    assert_eq!(walk_depth_cap(&st, &hub), REWIND_MAX_DEPTH);
-    {
-        let _fill = hub.chain_work_prefix.write().unwrap();
-        assert_eq!(walk_depth_cap(&st, &hub), UNPROVEN_LEAD_BLOCKS);
-    }
-    hub.milestone = floor_just_above(hub.chain_work().unwrap());
-    assert_eq!(walk_depth_cap(&st, &hub), UNPROVEN_LEAD_BLOCKS);
+    assert_eq!(rewind_depth_cap(&st, &hub), UNPROVEN_LEAD_BLOCKS);
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[2]));
+    reset_longest_walk();
+    assert!(maybe_rewind_to_best_work(&mut st, &hub).unwrap());
+    assert_eq!(longest_walk(), ANCESTOR_WALK_MAX);
+    st.reorg.defer(&[fork[2]]);
+    let shared = Mutex::new(st);
+    reset_longest_walk();
+    rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, &hub);
+    assert_eq!(longest_walk(), ancestor_walk_max(UNPROVEN_LEAD_BLOCKS));
     let _ = std::fs::remove_dir_all(dir);
 }
 

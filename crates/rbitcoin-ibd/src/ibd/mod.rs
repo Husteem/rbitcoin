@@ -191,11 +191,11 @@ pub fn settle_off_path_for_test(shared: &std::sync::Mutex<state::IbdWorkState>, 
 /// is out of its own rewind, and it is skipped when that thread already
 /// moved the tip.
 fn settle_disconnected_heavier<'a>(
-    st_guard: HeldShared<'a>,
+    mut st_guard: HeldShared<'a>,
     shared: &'a std::sync::Mutex<state::IbdWorkState>,
     hub: &ChainHub,
 ) -> HeldShared<'a> {
-    let (cands, invalid) = match reorg::heavier_fork_candidates(&st_guard, hub) {
+    let (cands, invalid) = match reorg::heavier_fork_candidates(&mut st_guard, hub) {
         Ok(pair) => pair,
         Err(_) => return st_guard,
     };

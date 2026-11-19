@@ -4377,7 +4377,14 @@ pub fn note_header_witness(
 /// headers proved while that tip is still under the floor.
 #[doc(hidden)]
 pub fn rewind_depth_cap(st: &IbdWorkState, hub: &ChainHub) -> u32 {
-    if st.header_walk.origin && leaving_unproved_lead(st, hub) {
+    rewind_depth_cap_of(st.header_walk.origin, st.header_walk.proven, hub)
+}
+
+/// [`rewind_depth_cap`] from the walk's `origin` and `proven`, so the
+/// chain-work read can run after the caller drops `shared`.
+#[doc(hidden)]
+pub fn rewind_depth_cap_of(origin: bool, proven: bool, hub: &ChainHub) -> u32 {
+    if origin && leaving_unproved_lead(proven, hub) {
         UNPROVEN_LEAD_BLOCKS
     } else {
         super::reorg::REWIND_MAX_DEPTH
@@ -4387,28 +4394,10 @@ pub fn rewind_depth_cap(st: &IbdWorkState, hub: &ChainHub) -> u32 {
 /// True while a rewind would leave the unproved lead. The confirmed chain's
 /// own work decides, including when a refused clock has cleared `proven`.
 /// If that work cannot be read, an unproved walk stays wide.
-fn leaving_unproved_lead(st: &IbdWorkState, hub: &ChainHub) -> bool {
+fn leaving_unproved_lead(proven: bool, hub: &ChainHub) -> bool {
     match hub.chain_work() {
         Ok(work) => below_floor(hub, &work.to_be_bytes()),
-        Err(_) => !st.header_walk.proven,
-    }
-}
-
-/// The [`rewind_depth_cap`] a heavier-fork selection walk must cover. It is
-/// read under `shared`, so only the in-memory chain-work prefix decides, and
-/// a fill that holds it is not waited on. A cold or busy prefix keeps the
-/// walk wide; the rewind reads its own cap after selection and refuses a
-/// path deeper than that.
-#[doc(hidden)]
-pub fn walk_depth_cap(st: &IbdWorkState, hub: &ChainHub) -> u32 {
-    let wide = st.header_walk.origin
-        && hub
-            .try_cached_chain_work()
-            .is_none_or(|work| below_floor(hub, &work.to_be_bytes()));
-    if wide {
-        UNPROVEN_LEAD_BLOCKS
-    } else {
-        super::reorg::REWIND_MAX_DEPTH
+        Err(_) => !proven,
     }
 }
 
