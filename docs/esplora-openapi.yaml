@@ -1405,7 +1405,7 @@ components:
       required: [chain_stats, mempool_stats]
       properties:
         address: { type: string, description: present on /address/ }
-        scripthash: { $ref: "#/components/schemas/Hash" }
+        scripthash: { $ref: "#/components/schemas/Scripthash" }
         chain_stats: { $ref: "#/components/schemas/Stats" }
         mempool_stats: { $ref: "#/components/schemas/Stats" }
     TxSummary:
