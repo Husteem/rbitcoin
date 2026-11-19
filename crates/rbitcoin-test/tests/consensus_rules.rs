@@ -1129,7 +1129,7 @@ fn respend_of_a_same_block_spend_rejects_in_any_split() {
 /// Class A for 1..=103 stays and IBD retries one block at a time on that
 /// store. Core 31.1 still rejects h103 (`bad-txns-inputs-missingorspent`), and
 /// any later re-spend of P:0. `fill` same-block txs between P and S1 move the
-/// spender fks, so either spender can be the overlay's last entry for P:0.
+/// spender fks, so either spender can be the last note for P:0.
 #[test]
 fn respend_of_a_same_block_spend_rejects_on_single_block_retry() {
     let x = pre_bip34_x();

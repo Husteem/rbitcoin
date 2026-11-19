@@ -14,8 +14,8 @@ Changed
   segments under twice the delta's share of `spent.body` live (at least
   5%), reading only their live records: a record whose spends cover half
   its page's unset slots folds into `spent.body`, others are copied
-  forward. A first fold of a page writes it once; a later one copies it
-  through `spent.delta/fold` first. Folds run in rounds of 4,096 pages.
+  forward. A fold onto a page `spent.body` already holds copies it through
+  `spent.delta/fold` first; one onto a page nothing wrote writes it once. Folds run in rounds of 4,096 pages.
   Each page's filled-slot count sits in the directory and only a fold
   changes it, so deciding reads no page. The directory costs 12 bytes per
   page on disk and 8 in RAM. No write touches a 4 KiB block holding bytes
@@ -31,7 +31,5 @@ Changed
   per-step reads, writes and times (`store: spend delta … timing`);
   `ibd: perf` gains `spend_room_wait_ms`. Opening a schema-29 datadir reads
   its `spent.body` once, publishes it and its `spend.pages` log as the
-  first delta generation and removes the 29 files; a held log is no longer
-  refused. `spent.body` and `create.loc` offsets are unchanged, so there is
-  no Class A reindex. A 29 binary refuses 30 `meta`. A datadir from an
-  earlier build of schema 30 refuses open with a wipe line.
+  first delta generation and removes the 29 files. `spent.body` and `create.loc` offsets are unchanged, so there is
+  no Class A reindex. A 29 binary refuses 30 `meta`.

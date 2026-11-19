@@ -80,7 +80,8 @@ share while that share is under a threshold of twice the delta's share of
 `spent.body`, and never under 5%: a delta at 10% of `spent.body` takes
 segments under 20% live, one at 25% those under half, and past 50% any
 segment. It never goes below two segments, and reclaims at most twice the
-checkpoint's own record bytes, so a delta above the threshold drains. A
+larger of the checkpoint's own record bytes and one 16 MiB segment, so a
+delta above the threshold drains. A
 record in a reclaimed segment is folded into `spent.body` once its spends
 cover half the slots its page still has unset, so a page folds again each
 time half of what is left gets spent; another record is copied forward to
@@ -89,9 +90,10 @@ the newest segment, which costs far less than writing a whole page. Past
 its committed record already spends half its unset slots, so a hot page
 costs one page write instead of a rewrite of its whole record every
 checkpoint. The decision reads no page: the directory holds each page's
-count of filled `spent.body` slots, which only a fold changes. A first fold
-of a page writes it once; a later one also writes it to `spent.delta/fold`
-first. Folds run in rounds of 4,096 pages and wait for the durable spend
+count of filled `spent.body` slots, which only a fold changes. A fold onto
+a page `spent.body` already holds, adopted from an older schema or folded
+before, also writes it to `spent.delta/fold` first; one onto a page nothing
+wrote goes straight to `spent.body`. Folds run in rounds of 4,096 pages and wait for the durable spend
 marker. The directory is a base of 12 bytes per body page plus a log of 16
 bytes per entry a checkpoint writes; once the log outgrows the base, a
 checkpoint writes a new base. It costs 8 bytes per page in RAM (about 50 MB
@@ -101,12 +103,12 @@ for a 25 GB `spent.body`). A checkpoint runs every 10 minutes, or as soon as
 Every checkpoint logs two lines:
 
 ```text
-store: spend delta gen=… new_records=… dense_records=… folded_segments=… carried=… carried_bytes=… durable=… folds_through=… reclaim_below_permille=… segments=… bytes=… live=… spent_body=… written=… records=… idx=… folded=… fold_records=… written_per_body_permille=…
+store: spend delta gen=… new_record_bytes=… dense_record_bytes=… folded_segments=… carried=… carried_bytes=… durable=… folds_through=… reclaim_below_permille=… segments=… bytes=… live=… spent_body=… written=… records=… idx=… folded=… fold_records=… written_per_body_permille=…
 store: spend delta gen=… timing total_ms=… since_ms=… sealed_pages=… sealed_edges=… merge_reads=… merge_read_bytes=… merge_ms=… hot_folds=… hot_fold_record_bytes=… dense_kept_gen=… dense_kept_tail=… reclaim_read_bytes=… reclaim_read_ms=… folded_now=… dropped=… fold_rounds=… fold_compose_ms=… fold_file_ms=… body_write_ms=… body_sync_ms=… record_bytes=… seg_write_ms=… seg_sync_ms=… idx_entries=… idx_write_ms=… idx_sync_ms=… commit_ms=… install_ms=… unlink_ms=…
 ```
 
 `bytes` is the delta on disk and `spent_body` the published `spent.body` length.
-`dense_records` is the part of `new_records` for pages whose delta already
+`dense_record_bytes` is the part of `new_record_bytes` for pages whose delta already
 spends half their unset slots, rewritten whole because they are still hot.
 `reclaim_below_permille` is the live share, in thousandths, under which a
 segment is reclaimed at the delta's current size (1000 or more: any). `carried` and `carried_bytes` are
@@ -147,7 +149,7 @@ names the dirs. Corrupt files are **not** repaired in-process.
 |-----------------|------------------------|
 | **30** | Open. `spent.delta/` records every spend; `spent.body` holds only folded pages. A datadir from an earlier build of schema 30 refuses with a wipe line. |
 | **29** | Rewrite `meta` to 30, read `spent.body` once to take its pages as folded, publish them with a committed `spend.pages` log as the first spend delta generation, and remove the 29 files. `spent.body` is not written. No Class A rewrite. |
-| **28** | Rewrite `meta` to 30 and sync the store directory, then read `spent.body` once to take its pages as folded spend delta pages. No table rewrite. A schema-28 binary then refuses the directory. |
+| **28** | Rewrite `meta` to 30 and sync the store directory, then read `spent.body` once to take its pages as folded, publish them with a committed `spend.pages` log, if any, as the first spend delta generation, and remove the 28 files. No table rewrite. A schema-28 binary then refuses the directory. |
 | **27** | Rewrite `meta` to 30 and sync the store directory, then read `spent.body` once to take its pages as folded spend delta pages. No table rewrite. A schema-27 binary then refuses the directory. |
 | **26** | Rewrite `meta` to 30 and sync the store directory, then read `spent.body` once to take its pages as folded spend delta pages. No table rewrite. A 0.9.0 binary then refuses the directory. |
 | **25** | If `header.body` is still 96 B, rewrite each row to 88 B (`header.body.grow`, then rename), dropping trailing size and weight. An 88 B body is left alone. Then rewrite `meta` to 30. |

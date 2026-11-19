@@ -274,7 +274,7 @@ fn spender_below_its_create_height_is_corrupt() {
     let (multi, field, vin) = q.store().txs.get_output_spender_meta(early_fk, 0).unwrap();
     assert!(
         !field.is_null(),
-        "the early spend is in the page log until a checkpoint folds it"
+        "the early spend is in the spend delta until a checkpoint folds it"
     );
     let flags = if multi {
         rbitcoin_store::output_flags::MULTI_SPENDER
@@ -671,7 +671,7 @@ fn read_slot(store: &std::path::Path, abs: u64) -> [u8; 8] {
 /// A store this small never folds, so this does not pin the fold.
 #[test]
 fn historical_page_stays_unwritten_while_in_the_delta() {
-    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-page-log");
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-delta");
     q.set_spend_index(true);
     let params = ChainParams::regtest();
     let ms = Milestone::NONE;
@@ -767,7 +767,7 @@ fn historical_page_stays_unwritten_while_in_the_delta() {
     q.set_spend_index(true);
     assert!(
         q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap(),
-        "a zeroed body slot stays spent after reopen while the page log exists"
+        "a zeroed body slot stays spent after reopen while the spend delta holds it"
     );
     assert!(q.is_outpoint_spent(created_id.as_byte_array(), 1).unwrap());
     assert!(!q.is_outpoint_spent(created_id.as_byte_array(), 2).unwrap());
@@ -1244,10 +1244,10 @@ fn in_block_spend_after_reconnect(
     (spent, res)
 }
 
-/// A reconnect of an archived block has no Class A wave to pre-fill the
-/// same-block spend. A checkpoint while X was active copied that pre-filled
-/// slot into the page log, and the checkpoint after the disconnect zeroed
-/// it. The output must still read spent after X is back.
+/// A reconnect of an archived block notes its same-block spend again. A
+/// checkpoint while X was active sealed that note into the spend delta,
+/// and the checkpoint after the disconnect zeroed it. The output must still
+/// read spent after X is back.
 #[test]
 fn reconnected_block_keeps_its_in_block_spend_across_checkpoints() {
     let (spent, res) = in_block_spend_after_reconnect("spend-inblock-reconnect", true, true);
