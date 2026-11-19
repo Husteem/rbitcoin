@@ -1079,16 +1079,18 @@ fn answer_probe(
 /// A `notfound` is an answer, not a block: it frees the hashes this peer
 /// owed but leaves the stall clock alone, so a peer that owes another block
 /// still stalls. The peer is not asked for a freed block again for one stall
-/// window. A hash it was not asked for is ignored.
+/// window. A hash it was not asked for is ignored, and so is one its full
+/// record cannot take: that block stays owed, as in Core.
 pub fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
     let mut freed = Vec::new();
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
+        let now = super::peer_io::ibd_mono_ms();
         for h in &hashes {
-            if !s.in_flight.contains(h) && !s.late_answers.contains_key(h) {
+            let owed = s.in_flight.contains(h) || s.late_answers.contains_key(h);
+            if !owed || !s.chain.note_notfound(*h, now) {
                 continue;
             }
             s.note_answer(h);
-            s.chain.note_notfound(*h, super::peer_io::ibd_mono_ms());
             let empty = st
                 .inflight
                 .get_mut(h)

@@ -843,17 +843,43 @@ fn assert_block_goes_elsewhere(
     assert!(sent[1].0.contains(&h(1)), "peer 1 takes h(1)");
 }
 
-/// Hashes this peer was never asked for do not push the block it gave up
-/// out of its `notfound` record.
+/// A `notfound` for a block this peer was never asked for is ignored: it
+/// does not keep the peer off that block.
 #[test]
-fn padded_notfound_does_not_hand_the_block_back() {
+fn notfound_for_a_block_not_asked_is_ignored() {
+    let (dir, hub) = tmp_hub();
+    let (mut st, _wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
+    owe_on_wire(&mut st, 0, h(1), 0);
+    apply_notfound(&mut st, 0, vec![h(1), h(2)]);
+    let now = ibd_mono_ms();
+    assert!(!st.slots[0].may_take_block(&h(1), now), "h(1) was owed");
+    assert!(
+        st.slots[0].may_take_block(&h(2), now),
+        "h(2) was never asked of peer 0"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// When the peer's `notfound` record is full of unexpired answers, a
+/// `notfound` cannot keep it off the block, so it does not release the
+/// block either: the block stays owed and the stall window runs on.
+#[test]
+fn notfound_into_a_full_record_keeps_the_block_owed() {
     let (dir, hub) = tmp_hub();
     let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
     owe_on_wire(&mut st, 0, h(1), 0);
-    let mut hashes = vec![h(1)];
-    hashes.extend((0..2_000).map(junk));
-    apply_notfound(&mut st, 0, hashes);
-    assert_block_goes_elsewhere(&mut st, &hub, &mut wire);
+    let now = ibd_mono_ms();
+    let mut i = 0;
+    while st.slots[0].chain.note_notfound(junk(i), now) {
+        i += 1;
+    }
+    apply_notfound(&mut st, 0, vec![h(1)]);
+    assert!(st.slots[0].in_flight.contains(&h(1)), "h(1) is still owed");
+    assert_eq!(st.slots[0].getdata_wire.window_ms(), Some(0));
+    st.slots[0].rate.note_any_rx(30_000);
+    stall_pass(&mut st, &hub, 30_001);
+    assert!(!st.slots[0].alive, "the peer stalls out on h(1)");
+    assert!(drain_wire(&mut wire)[0].1);
     let _ = std::fs::remove_dir_all(dir);
 }
 

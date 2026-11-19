@@ -66,15 +66,17 @@ pub struct PeerChain {
 }
 
 impl PeerChain {
-    pub fn note_notfound(&mut self, hash: BlockHash, now_ms: u64) {
-        self.note_notfound_capped(hash, now_ms, LACKS_CAP);
+    /// Keep this peer off `hash` for one stall window. `false` when the
+    /// record is full of unexpired answers and did not take it.
+    pub fn note_notfound(&mut self, hash: BlockHash, now_ms: u64) -> bool {
+        self.note_notfound_capped(hash, now_ms, LACKS_CAP)
     }
 
     /// [`Self::note_notfound`] with at most `cap` answers kept. Expired and
     /// repeated answers leave from the front, so each costs O(1) amortized.
     /// A repeat moves to the back with its new time.
     #[doc(hidden)]
-    pub fn note_notfound_capped(&mut self, hash: BlockHash, now_ms: u64, cap: usize) {
+    pub fn note_notfound_capped(&mut self, hash: BlockHash, now_ms: u64, cap: usize) -> bool {
         while let Some(&(front, at)) = self.lacks_order.front() {
             let current = self.lacks.get(&front) == Some(&at);
             if current && now_ms.saturating_sub(at) < LACKS_TTL_MS {
@@ -86,10 +88,11 @@ impl PeerChain {
             }
         }
         if self.lacks_order.len() >= cap {
-            return;
+            return false;
         }
         self.lacks.insert(hash, now_ms);
         self.lacks_order.push_back((hash, now_ms));
+        true
     }
 
     pub fn lacks(&self, hash: &BlockHash, now_ms: u64) -> bool {

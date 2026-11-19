@@ -275,9 +275,12 @@ fn a_notfound_lasts_one_stall_window() {
 fn a_full_notfound_record_keeps_its_fresh_lacks() {
     let mut peer = PeerChain::default();
     let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
-    peer.note_notfound_capped(hash(1), 0, 2);
-    peer.note_notfound_capped(hash(2), 1, 2);
-    peer.note_notfound_capped(hash(3), 2, 2);
+    assert!(peer.note_notfound_capped(hash(1), 0, 2));
+    assert!(peer.note_notfound_capped(hash(2), 1, 2));
+    assert!(
+        !peer.note_notfound_capped(hash(3), 2, 2),
+        "a full record says it refused"
+    );
     assert!(
         peer.lacks(&hash(1), 29_999),
         "the first stays until its TTL"
