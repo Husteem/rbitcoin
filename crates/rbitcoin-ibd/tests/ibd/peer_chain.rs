@@ -355,19 +355,21 @@ fn an_announcement_lifts_only_the_lacks_it_lists() {
     assert!(peer.lacks(&hash(2), 2) && peer.lacks(&hash(3), 2));
 }
 
-/// Repeats inside one millisecond still leave one answer per hash after the
-/// record drops its skipped answers, so it stays within twice the cap.
+/// Repeats inside one millisecond behind an unexpired front still leave
+/// one answer per hash once the record drops its skipped answers, so it
+/// stays within twice the cap.
 #[test]
 fn same_ms_repeats_stay_within_the_bound() {
     let mut peer = PeerChain::default();
-    let hash = BlockHash::from_byte_array([1; 32]);
+    let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+    assert!(peer.note_notfound_capped(hash(1), 0, 2));
     for _ in 0..10 {
-        assert!(peer.note_notfound_capped(hash, 0, 1));
+        assert!(peer.note_notfound_capped(hash(2), 0, 2));
     }
     assert!(
-        peer.lacks_answers() <= 2,
+        peer.lacks_answers() <= 4,
         "{} answers",
         peer.lacks_answers()
     );
-    assert!(peer.lacks(&hash, 0));
+    assert!(peer.lacks(&hash(1), 0) && peer.lacks(&hash(2), 0));
 }
