@@ -41,17 +41,21 @@ fn put_n_outs(t: &TxTable, n_out: u32, txid_byte: u8) -> (Fk, u64, u64) {
     (fk, off, len)
 }
 
-/// Fill `spent.body` out to its published end and take every page as one a
-/// fold wrote, as a schema-29 open does.
-#[cfg(debug_assertions)]
-fn adopt_body(t: &TxTable) {
-    let path = t.spent.body_file_path().to_path_buf();
+/// Reopen with `spent.body` filled out to its published end and no
+/// `spent.delta/`, as a datadir from before schema 30: open takes every page
+/// as one a fold wrote.
+fn reopen_as_older_schema(dir: &std::path::Path, t: TxTable) -> TxTable {
     let end = t.spent.body_published_len();
-    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    drop(t);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("spent.body"))
+        .unwrap();
     if f.metadata().unwrap().len() < end {
         f.set_len(end).unwrap();
     }
-    t.adopt_spent_body().unwrap();
+    std::fs::remove_dir_all(dir.join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR)).unwrap();
+    TxTable::open_tiny(dir).unwrap()
 }
 
 fn put_one(t: &TxTable) -> (Fk, u64, u64) {
@@ -360,7 +364,7 @@ fn batched_annotate_refuses_a_corrupt_body_slot() {
     t.spent
         .write_body_abs(abs, &[0xff, 0, 0, 0, 0, 0, 0, 0])
         .unwrap();
-    adopt_body(&t);
+    let t = reopen_as_older_schema(&dir, t);
     let err = t
         .put_spend_batch_by_abs_meta(&spenders, &[(abs, fk, 0, Fk(10), 1)])
         .unwrap_err();

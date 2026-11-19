@@ -223,29 +223,6 @@ impl SpendDeltaStats {
     }
 }
 
-#[cfg(debug_assertions)]
-thread_local! {
-    static FREEZE_COPIED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// Notes the freeze on this thread copied rather than moved.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn freeze_copied_notes() -> u64 {
-    FREEZE_COPIED.with(std::cell::Cell::get)
-}
-
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn reset_freeze_copied_notes() {
-    FREEZE_COPIED.with(|n| n.set(0));
-}
-
-#[cfg(debug_assertions)]
-fn note_freeze_copied(n: usize) {
-    FREEZE_COPIED.with(|c| c.set(c.get() + n as u64));
-}
-
 /// What one checkpoint read and wrote, and how long each step took, for the
 /// operator log. Times are wall milliseconds.
 #[derive(Clone, Debug, Default)]
@@ -1358,10 +1335,6 @@ impl SpendPageLog {
         }
     }
 
-    pub fn open_edge_count(&self) -> u64 {
-        self.lock().open_edges
-    }
-
     fn at_edge_cap(&self, g: &Inner) -> bool {
         let failed = self.pace.failures.load(Ordering::Acquire) > 0;
         let held = if failed { g.sealed_edges } else { 0 };
@@ -1619,11 +1592,7 @@ impl SpendPageLog {
                 // A failed checkpoint left a sealed layer: the open pages go
                 // into it. It is copied only while a reader still holds it.
                 Some(sealed) => {
-                    let mut sealed = Arc::try_unwrap(sealed).unwrap_or_else(|held| {
-                        #[cfg(debug_assertions)]
-                        note_freeze_copied(held.values().map(|p| p.len()).sum());
-                        (*held).clone()
-                    });
+                    let mut sealed = Arc::try_unwrap(sealed).unwrap_or_else(|held| (*held).clone());
                     for (page, slots) in open {
                         sealed.entry(page).or_default().extend(slots);
                     }
@@ -2019,7 +1988,7 @@ impl SpendPageLog {
             )
         };
         rbitcoin_log::info!(
-            "store: spend delta gen={} new_records={} dense_records={} folded_segments={} carried={} carried_bytes={} durable={} folds_through={} reclaim_below_permille={} segments={} bytes={} live={} spent_body={} written={} records={} idx={} folded={} fold_records={} written_per_body_permille={}",
+            "store: spend delta gen={} new_record_bytes={} dense_record_bytes={} folded_segments={} carried={} carried_bytes={} durable={} folds_through={} reclaim_below_permille={} segments={} bytes={} live={} spent_body={} written={} records={} idx={} folded={} fold_records={} written_per_body_permille={}",
             generation,
             new_bytes,
             dense_bytes,

@@ -4742,33 +4742,45 @@ fn spent_span_matches_slot_len_times_n_out() {
     }
 }
 
-#[cfg(debug_assertions)]
+/// Slot reads of an adopted `spent.body` that need more peeks than one
+/// ring holds still land each slot. Each tx's spend range is over 64 KiB,
+/// so its two slots never merge with the next tx's.
 #[test]
 fn spend_meta_batch_reads_merged_slots_past_one_ring() {
     let dir = tempfile_dir("spend-merge");
     let t = create_tiny(&dir);
-    let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
     let groups = rbitcoin_store::uring_session::DEFAULT_ENTRIES as usize + 2;
-    let gap = 64 * 1024 + 128;
-    let mut offs = Vec::with_capacity(groups * 2 + 2);
-    let mut expect: Vec<Option<(Fk, u8, u32)>> = Vec::with_capacity(groups * 2 + 2);
-    let mut file_end = header;
+    let n_out = 8_250u32;
+    let mut slots = Vec::with_capacity(groups * 2);
     for i in 0..groups {
-        let off0 = header + (i as u64) * gap;
-        let off1 = off0 + 16;
-        let a = encode_spent_slot(0, Fk(i as u64 + 1), 1).unwrap();
-        let b = encode_spent_slot(0, Fk(10_000 + i as u64), 2).unwrap();
-        t.spent.write_body_abs(off0, &a).unwrap();
-        t.spent.write_body_abs(off1, &b).unwrap();
-        file_end = off1 + OutputRecord::SPENT_SLOT_LEN as u64;
-        offs.push(off1);
-        expect.push(Some((Fk(10_000 + i as u64), 0, 2)));
-        offs.push(off0);
-        expect.push(Some((Fk(i as u64 + 1), 0, 1)));
+        let mut txid = [0x5au8; 32];
+        txid[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        let tx = TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: n_out,
+        };
+        let inputs = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+        let outputs = vec![OutputRecord::unspent(50, vec![0x51]); n_out as usize];
+        let fk = t
+            .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
+            .unwrap()[0];
+        let (off, _) = t.spent_range(fk).unwrap();
+        slots.push((spent_abs(off, 2), Fk(10_000 + i as u64), 2u32));
+        slots.push((spent_abs(off, 0), Fk(i as u64 + 1), 1u32));
     }
-    t.spent.truncate_body_to(0, file_end).unwrap();
-    t.adopt_spent_body().unwrap();
-    offs.push(file_end);
+    for &(abs, field, vin) in &slots {
+        let meta = encode_spent_slot(0, field, vin).unwrap();
+        t.spent.write_body_abs(abs, &meta).unwrap();
+    }
+    let end = t.spent.body_published_len();
+    let t = reopen_as_older_schema(&dir, t);
+    let mut offs: Vec<u64> = slots.iter().map(|s| s.0).collect();
+    let mut expect: Vec<Option<(Fk, u8, u32)>> =
+        slots.iter().map(|&(_, f, v)| Some((f, 0, v))).collect();
+    offs.push(end);
     expect.push(None);
     offs.reverse();
     expect.reverse();
@@ -5195,6 +5207,22 @@ fn spent_body_is_not_extended_by_class_a() {
     let t = TxTable::open_tiny(&dir).unwrap();
     assert_eq!(t.count(), 40);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reopen with `spent.body` filled out to its published end and no
+/// `spent.delta/`, as a datadir from before schema 30.
+fn reopen_as_older_schema(dir: &Path, t: TxTable) -> TxTable {
+    let end = t.spent.body_published_len();
+    drop(t);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("spent.body"))
+        .unwrap();
+    if f.metadata().unwrap().len() < end {
+        f.set_len(end).unwrap();
+    }
+    std::fs::remove_dir_all(dir.join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR)).unwrap();
+    TxTable::open_tiny(dir).unwrap()
 }
 
 /// Write `spent.body` as an older schema's Class A did: every byte up to the

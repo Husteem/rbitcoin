@@ -1969,12 +1969,6 @@ impl Store {
         self.txs.spend_log_slot(abs)
     }
 
-    /// Open slot deltas the edge-cap wait is blocked on.
-    #[doc(hidden)]
-    pub fn open_spend_edge_count(&self) -> u64 {
-        self.txs.open_spend_edge_count()
-    }
-
     pub fn bind_spend_sync_wake(&self, wake: crate::spend_delta::SpendSyncWake) {
         self.txs.bind_spend_sync_wake(wake);
     }

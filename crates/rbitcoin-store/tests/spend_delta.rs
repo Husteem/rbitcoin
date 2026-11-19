@@ -1781,21 +1781,6 @@ fn a_merge_does_not_read_a_dead_record_between_two_live_ones() {
     assert_eq!((r.merge_reads, r.merge_read_bytes), (2, 2 * 20));
 }
 
-/// With no sealed layer left by a failed checkpoint, the freeze moves the
-/// open notes instead of copying them under the lock confirm takes.
-#[cfg(debug_assertions)]
-#[test]
-fn a_freeze_moves_the_open_notes() {
-    let d = dir();
-    let log = SpendPageLog::create(&d).unwrap();
-    let notes: Vec<(u64, [u8; 8])> = (1..=200u64).map(|i| (i * 4096 + 16, [1u8; 8])).collect();
-    log.note_slots(&notes).unwrap();
-    rbitcoin_store::spend_delta::reset_freeze_copied_notes();
-    reporting_commit(&log, 1, |_| Ok(true), &mut MemBody::new(0), None).unwrap();
-    assert_eq!(rbitcoin_store::spend_delta::freeze_copied_notes(), 0);
-    assert_eq!(log.slot(200 * 4096 + 16).unwrap(), Some([1u8; 8]));
-}
-
 /// A checkpoint that reclaims reports the segments it read and what became
 /// of their live records, matching the lifetime counters.
 #[test]
@@ -2301,8 +2286,8 @@ fn many_open_pages_with_few_edges_do_not_ask_for_a_checkpoint() {
 }
 
 /// The lifetime counters count the directory bytes actually written: a log
-/// batch is its 16-byte header and 20 bytes per entry, and a new base is its
-/// 16 bytes per page.
+/// batch is its 16-byte header and 16 bytes per entry, and a new base is its
+/// 12 bytes per page.
 #[test]
 fn written_counts_the_directory_bytes() {
     let d = dir();

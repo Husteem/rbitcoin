@@ -2645,16 +2645,6 @@ impl TxTable {
             .collect()
     }
 
-    /// Take every page of `spent.body` as one a fold wrote, as a schema-29
-    /// open does with a body Class A filled. Tests use it to stand up pages
-    /// whose slots `spent.body` holds.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn adopt_spent_body(&self) -> Result<(), StoreError> {
-        self.spend_pages
-            .adopt_v29(Vec::new(), 0, &SpentFold(&self.spent))
-    }
-
     pub(crate) fn note_spend_slots(
         &self,
         slots: &[(u64, [u8; OutputRecord::SPENT_SLOT_LEN])],
@@ -2694,11 +2684,6 @@ impl TxTable {
 
     pub(crate) fn wait_spend_edge_room(&self) -> Result<(), StoreError> {
         self.spend_pages.wait_open_edge_room()
-    }
-
-    #[doc(hidden)]
-    pub fn open_spend_edge_count(&self) -> u64 {
-        self.spend_pages.open_edge_count()
     }
 
     #[doc(hidden)]
