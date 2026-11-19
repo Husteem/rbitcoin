@@ -1143,7 +1143,7 @@ components:
       in: path
       required: true
       description: SHA256 of the scriptPubKey, hex in digest order, as electrs reads it. Not reversed like an Electrum scripthash.
-      schema: { $ref: "#/components/schemas/Hash" }
+      schema: { $ref: "#/components/schemas/Scripthash" }
     LastSeenTxid:
       { name: last_seen_txid, in: path, required: true, schema: { $ref: "#/components/schemas/Hash" } }
     AfterTxid:
@@ -1181,7 +1181,7 @@ components:
       required: true
       content:
         application/json:
-          schema: { type: array, maxItems: 300, items: { $ref: "#/components/schemas/Hash" } }
+          schema: { type: array, maxItems: 300, items: { $ref: "#/components/schemas/Scripthash" } }
     TxidArray:
       required: true
       content:
@@ -1270,6 +1270,10 @@ components:
     Hash:
       type: string
       description: Display-order hex. Uppercase and an optional `0x` / `0X` prefix are accepted.
+      pattern: "^(?:0[xX])?[0-9a-fA-F]{64}$"
+    Scripthash:
+      type: string
+      description: SHA256 of the scriptPubKey, hex in digest order (not reversed). Uppercase and an optional `0x` / `0X` prefix are accepted.
       pattern: "^(?:0[xX])?[0-9a-fA-F]{64}$"
     Block:
       type: object
