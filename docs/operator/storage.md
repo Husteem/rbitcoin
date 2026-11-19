@@ -98,12 +98,22 @@ marker. The directory is a base of 12 bytes per body page plus a log of 16
 bytes per entry a checkpoint writes; once the log outgrows the base, a
 checkpoint writes a new base. It costs 8 bytes per page in RAM (about 50 MB
 for a 25 GB `spent.body`). A checkpoint runs every 10 minutes, or as soon as
-2,000,000 slot notes are open.
+2,000,000 slot notes are open. Open notes sit in one hash map by slot
+index. Each checkpoint allocates the next window's map before the freeze,
+sized from the window it closes: about 68 MiB after a window at the cap,
+enough for the cap and a full write phase past it without regrowing, and a
+few hundred KiB at the tip. It then sorts the frozen notes into an array of
+16 bytes a note (about 32 MiB at the cap, plus a directory of 256 KiB)
+that it reads and merges in page order, until the commit. While the sort
+runs, the frozen map is still live beside the next window's map, so a
+checkpoint at the cap peaks near 170 MiB of notes, and more when a failed
+checkpoint left sorted notes behind. `notes_ram` is logged after the
+commit and does not show that peak.
 
 Every checkpoint logs two lines:
 
 ```text
-store: spend delta gen=… new_record_bytes=… dense_record_bytes=… folded_segments=… carried=… carried_bytes=… durable=… folds_through=… reclaim_below_permille=… segments=… bytes=… live=… spent_body=… written=… records=… idx=… folded=… fold_records=… written_per_body_permille=…
+store: spend delta gen=… new_record_bytes=… dense_record_bytes=… folded_segments=… carried=… carried_bytes=… durable=… folds_through=… reclaim_below_permille=… segments=… bytes=… live=… spent_body=… written=… records=… idx=… folded=… fold_records=… written_per_body_permille=… notes_ram=…
 store: spend delta gen=… timing total_ms=… since_ms=… sealed_pages=… sealed_edges=… merge_reads=… merge_read_bytes=… merge_ms=… hot_folds=… hot_fold_record_bytes=… dense_kept_gen=… dense_kept_tail=… reclaim_read_bytes=… reclaim_read_ms=… folded_now=… dropped=… fold_rounds=… fold_compose_ms=… fold_file_ms=… body_write_ms=… body_sync_ms=… record_bytes=… seg_write_ms=… seg_sync_ms=… idx_entries=… idx_write_ms=… idx_sync_ms=… commit_ms=… install_ms=… unlink_ms=…
 ```
 
@@ -116,7 +126,8 @@ the records this checkpoint copied forward; they count in `records`.
 `written` is every byte written for historical spend tracking since the
 datadir was created (record bytes, directory bytes, and the composed pages a
 fold wrote, to `spent.body` and, for a page a fold already wrote, to `spent.delta/fold` first), and `written_per_body_permille` is that total per thousand
-bytes of `spent.body`. Open logs the same totals once.
+bytes of `spent.body`. `notes_ram` is the RAM the open and sealed slot notes
+allocate. Open logs the same totals once.
 
 The `timing` line is one checkpoint: `since_ms` since the previous one
 started, the sealed pages and slot notes, the preads and bytes that read back
