@@ -432,6 +432,44 @@ fn the_oldest_refused_tip_stays_until_the_cap_is_passed() {
 }
 
 #[test]
+fn the_oldest_dead_end_gives_way_past_the_cap() {
+    let (_dir, _hub, mut st, _gen) = opened("dead-end-cap");
+    let hashes: Vec<BlockHash> = (1..=DEAD_END_CAP + 1)
+        .map(|n| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            BlockHash::from_byte_array(bytes)
+        })
+        .collect();
+    for hash in &hashes[..DEAD_END_CAP] {
+        note_dead(&mut st, *hash);
+    }
+    assert_eq!(st.header_walk.dead_ends.len(), DEAD_END_CAP);
+    assert!(
+        st.header_walk.dead_ends.contains(&hashes[0]),
+        "the oldest dead end stays at the cap"
+    );
+    note_dead(&mut st, hashes[0]);
+    assert_eq!(st.header_walk.dead_ends.len(), DEAD_END_CAP);
+    assert!(
+        st.header_walk.dead_ends.contains(&hashes[0]),
+        "a dead end already kept drops nothing"
+    );
+    note_dead(&mut st, hashes[DEAD_END_CAP]);
+    assert_eq!(st.header_walk.dead_ends.len(), DEAD_END_CAP);
+    assert!(
+        !st.header_walk.dead_ends.contains(&hashes[0]),
+        "past the cap the oldest dead end gives way"
+    );
+    assert!(
+        hashes[1..]
+            .iter()
+            .all(|h| st.header_walk.dead_ends.contains(h)),
+        "every newer dead end is kept"
+    );
+}
+
+#[test]
 fn a_refused_batch_releases_only_the_sender_reservation() {
     let (_dir, _hub, mut st, gen) = opened("refuse-reserve");
     let bad = mine(gen.block_hash(), 1);
