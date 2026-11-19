@@ -350,7 +350,27 @@ let
       blockTime = 120;
     };
   };
-  spAndPruneMsg = "services.rbitcoin.silentPaymentIndex cannot be combined with pruneSeqSigWit";
+  v1PortMsg = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, Electrum, or Esplora port";
+  v1InboundMsg = "services.rbitcoin.netPermissionBind v1 needs p2p.maxInbound greater than 0";
+  spPruneExec = execOf {
+    silentPaymentIndex = true;
+    pruneSeqSigWit = true;
+  };
+  restSocketExec = execOf {
+    rpc.unixSocket = true;
+    rpc.rest = true;
+  };
+  dollarExec = execOf {
+    alertNotify = "echo $HOME %s";
+  };
+  sv2Opts = {
+    sv2.tp = {
+      enable = true;
+      authoritySecretFile = "/run/keys/sv2-authority";
+    };
+  };
+  sv2Exec = execOf sv2Opts;
+  sv2Service = (moduleOnly sv2Opts).config.systemd.services.rbitcoin;
   signetChallengeMsg = "services.rbitcoin.signet.challenge requires network = \"signet\"";
   signetTimeMsg = "services.rbitcoin.signet.blockTime requires signet.challenge";
   trustSeedMsg = "services.rbitcoin.trustPeer cannot be combined with p2p.seedNodes";
@@ -778,7 +798,7 @@ assert builtins.match ".*--i2p-sam 127.0.0.1:7656.*" execStart != null;
 assert builtins.match ".*--i2p-accept-incoming.*" execStart != null;
 assert builtins.match ".*--listen-onion.*" execStart != null;
 assert builtins.match ".*--cjdns-reachable.*" execStart != null;
-assert builtins.match ".*--prune-seqsigwit.*" execStart != null;
+assert builtins.match ".*--prune-seqsigwit( .*|$)" execStart != null;
 assert builtins.match ".*--datadir-hdd.*" execStart != null;
 assert builtins.match ".*--datadir-hdd.*" (
   defaultSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart
@@ -792,7 +812,7 @@ assert builtins.match ".*--metrics.*" (
   defaultSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart
 ) == null;
 assert builtins.match ".*--sv2-tp-listen 127.0.0.1:18447.*" execStart != null;
-assert builtins.match ".*--sv2-tp-authority-sec-file /run/keys/sv2-authority.*" execStart != null;
+assert builtins.match ".*--sv2-tp-authority-sec-file '?/run/credentials/rbitcoin.service/sv2-authority.*" execStart != null;
 assert builtins.match ".*--sv2-tp-authority-sec .*" execStart == null;
 assert builtins.match ".*--sv2-tp-cert-validity 600.*" execStart != null;
 assert builtins.match ".*--sv2-tp-stale-grace 0.*" execStart != null;
@@ -859,10 +879,25 @@ assert builtins.match ".*--esplora-onion.*" onionOffExec == null;
 assert builtins.match ".*--network signet.*" signetExec != null;
 assert builtins.match ".*--signet-challenge 51.*" signetExec != null;
 assert builtins.match ".*--signet-block-time 120.*" signetExec != null;
-assert builtins.elem spAndPruneMsg (failedAssertions (badSystem {
+assert rbitcoinFailures (moduleOnly {
   silentPaymentIndex = true;
   pruneSeqSigWit = true;
+}) == [ ];
+assert builtins.match ".*--sp-tweaks .*--prune-seqsigwit( .*|$)" spPruneExec != null;
+assert builtins.match ".*--rest( .*|$)" restSocketExec != null;
+assert builtins.match ".*\\$\\$HOME.*" dollarExec != null;
+assert builtins.match ".*--sv2-tp-authority-sec-file '?/run/credentials/rbitcoin.service/sv2-authority.*" sv2Exec != null;
+assert sv2Service.serviceConfig.LoadCredential == "sv2-authority:/run/keys/sv2-authority";
+assert builtins.elem v1PortMsg (failedAssertions (badSystem {
+  netPermissionBind = [ "v1,noban@127.0.0.1:8333" ];
 }));
+assert builtins.elem v1InboundMsg (failedAssertions (badSystem {
+  p2p.maxInbound = 0;
+  netPermissionBind = [ "v1,noban@127.0.0.1:8335" ];
+}));
+assert rbitcoinFailures (moduleOnly {
+  netPermissionBind = [ "v1,noban@127.0.0.1:8335" ];
+}) == [ ];
 assert builtins.elem signetChallengeMsg (failedAssertions (badSystem {
   signet.challenge = "51";
 }));
@@ -1054,7 +1089,6 @@ assert builtins.match ".*--tor-control.*" (execOf {
 assert !builtins.elem "tor.service" (badSystem {
   electrum.hiddenService = true;
 }).config.systemd.services.rbitcoin.wants;
-assert !builtins.elem spAndPruneMsg (failedAssertions system);
 assert builtins.elem connectCjdnsMsg (failedAssertions (badSystem {
   p2p.connect = [ "[fc00::1]:8333" ];
 }));
