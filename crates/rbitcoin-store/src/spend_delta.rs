@@ -2241,7 +2241,11 @@ impl SpendPageLog {
         report.commit_ms = ms_since(t);
         if let Some(idx) = new_idx {
             let old = std::mem::replace(&mut w.idx, idx);
-            self.unlink_idx(old);
+            // A rename that landed before an error may not be durable, and
+            // the old commit still names the old pair: open removes it.
+            if landed_err.is_none() {
+                self.unlink_idx(old);
+            }
         }
         let t = Instant::now();
         {

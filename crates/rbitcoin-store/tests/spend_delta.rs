@@ -2365,6 +2365,28 @@ fn a_commit_that_landed_before_an_error_is_built_on() {
     assert_eq!(log.slot(b.0).unwrap(), Some(b.1));
 }
 
+/// A rename that lands before an error may not be durable, so the old base
+/// and log stay until the next open: if the old commit is the one that
+/// survives, it still finds them.
+#[cfg(debug_assertions)]
+#[test]
+fn a_landed_rebase_keeps_the_old_base_until_its_rename_is_durable() {
+    let d = dir();
+    let pub_len = 8 * 4096u64;
+    let a = (4096 + 16, [1u8; 8]);
+    let log = SpendPageLog::create_with(&d, REBASE).unwrap();
+    log.note_slots(&[a]).unwrap();
+    commit(&log, 1, pub_len, |_| Ok(true));
+    let old = std::fs::read(commit_path(&d)).unwrap();
+    log.note_slots(&[(2 * 4096 + 16, [2u8; 8])]).unwrap();
+    rbitcoin_store::spend_delta::fail_after_next_commit_rename(&d);
+    assert!(try_commit(&log, 2, |_| Ok(true)).is_err());
+    drop(log);
+    std::fs::write(commit_path(&d), old).unwrap();
+    let log = reload(&d, pub_len).unwrap();
+    assert_eq!(log.slot(a.0).unwrap(), Some(a.1));
+}
+
 /// An earlier build's commit refuses open before its `fold` file touches
 /// `spent.body`.
 #[test]
