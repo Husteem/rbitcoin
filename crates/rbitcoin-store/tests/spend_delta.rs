@@ -838,7 +838,8 @@ fn the_newest_note_wins_across_failed_checkpoints() {
 }
 
 /// A checkpoint that fails after its freeze holds the frozen notes sorted,
-/// about sixteen bytes a note, reads them, and a retry publishes them.
+/// sixteen bytes a note plus a directory of well under one byte a note,
+/// reads them, and a retry publishes them.
 #[test]
 fn a_failed_checkpoint_holds_its_notes_sorted() {
     let d = dir();
@@ -863,7 +864,7 @@ fn a_failed_checkpoint_holds_its_notes_sorted() {
     assert_eq!(log.slots_at(&abs).unwrap(), want);
     commit(&log, 2, 0, |_| Ok(true));
     let held = failed_ram - log.stats().notes_bytes;
-    assert!(held >= 16 * n && held <= 20 * n, "{held}");
+    assert!(held >= 16 * n && held <= 16 * n + n / 2, "{held}");
     assert_eq!(log.slots_at(&abs).unwrap(), want);
 }
 

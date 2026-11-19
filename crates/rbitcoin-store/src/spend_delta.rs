@@ -403,7 +403,9 @@ impl Hasher for SlotKeyHasher {
 
 /// Frozen notes sorted by slot index, 16 bytes each, so a page's notes are
 /// one run in slot order. `dir[b]` is the first note at or past key-range
-/// bucket `b`: a lookup searches only its bucket.
+/// bucket `b`: a lookup searches only its bucket. One bucket per 16 to 32
+/// notes keeps the directory under a quarter byte a note (256 KiB at the
+/// cap) while a bucket search stays a few compares.
 struct SealedNotes {
     notes: Box<[(u64, Slot)]>,
     dir: Box<[u32]>,
@@ -433,7 +435,7 @@ impl SealedNotes {
                 shift: 0,
             };
         };
-        let buckets = (notes.len().next_power_of_two() / 2).max(1) as u64;
+        let buckets = (notes.len().next_power_of_two() / 32).max(1) as u64;
         let mut shift = 0;
         while ((last - base) >> shift) + 1 > buckets {
             shift += 1;
@@ -1772,9 +1774,14 @@ impl SpendPageLog {
     /// checkpoint the sealed notes still count, so a retry releases none.
     ///
     /// Only inside [`Self::checkpoint`]'s `before_freeze`: the freeze swaps
-    /// in the map the checkpoint allocated before it, so nothing under the
-    /// exclusion allocates, and the checkpoint sorts the frozen notes after
-    /// it.
+    /// in the map the checkpoint allocated before it, and the checkpoint
+    /// sorts the frozen notes after it. Without `keep`, nothing under the
+    /// exclusion allocates. With `keep` (only after a disconnect), the
+    /// caller still holds the exclusion while every sealed and open note is
+    /// copied for `keep` (about 32 MiB at the cap) and each rejected note is
+    /// written into the frozen map as a zero. The copy cannot move before
+    /// the exclusion: a disconnect between the copy and the freeze would
+    /// leave spends it made stale unjudged.
     pub fn freeze_open<K>(&self, tip: u32, keep: Option<K>) -> Result<(), StoreError>
     where
         K: FnMut(&Slot) -> Result<bool, StoreError>,

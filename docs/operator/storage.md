@@ -103,8 +103,12 @@ index. Each checkpoint allocates the next window's map before the freeze,
 sized from the window it closes: about 68 MiB after a window at the cap,
 enough for the cap and a full write phase past it without regrowing, and a
 few hundred KiB at the tip. It then sorts the frozen notes into an array of
-16 bytes a note (about 32 MiB at the cap, plus a directory of up to 4 MiB)
-that it reads and merges in page order, until the commit.
+16 bytes a note (about 32 MiB at the cap, plus a directory of 256 KiB)
+that it reads and merges in page order, until the commit. While the sort
+runs, the frozen map is still live beside the next window's map, so a
+checkpoint at the cap peaks near 170 MiB of notes, and more when a failed
+checkpoint left sorted notes behind. `notes_ram` is logged after the
+commit and does not show that peak.
 
 Every checkpoint logs two lines:
 
