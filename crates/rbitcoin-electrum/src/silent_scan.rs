@@ -80,15 +80,16 @@ pub fn parse_sub(
     {
         for v in arr {
             if let Some(n) = v.as_u64() {
-                let n = n as u32;
+                let n = u32::try_from(n).map_err(|_| "silent payment label must fit in u32")?;
                 if !labels.contains(&n) {
                     labels.push(n);
                 }
+                // Stop at the eleventh: the dedup scan stays at most ten wide.
+                if labels.len() > 10 {
+                    return Err("too many silent payment labels".into());
+                }
             }
         }
-    }
-    if labels.len() > 10 {
-        return Err("too many silent payment labels".into());
     }
     let mut spend_keys = labels
         .iter()

@@ -720,3 +720,34 @@ fn range_start_is_a_closed_range() {
     .unwrap();
     assert_eq!((empty.start, empty.end), (3, Some(9)));
 }
+
+/// A label is a BIP-352 `m`: a u32. 2^32 is not label 0. A long list
+/// stops at the eleventh distinct label instead of deduplicating it all.
+#[test]
+fn labels_are_u32_and_capped_while_read() {
+    let parse = |labels: serde_json::Value| {
+        parse_sub(
+            &json!([SYNTH_SCAN, SYNTH_SPEND, 0, labels]),
+            Network::Regtest,
+            Some(100),
+            &no_times,
+        )
+    };
+    let wide = parse(json!([4_294_967_296u64])).err();
+    assert!(
+        wide.as_deref().is_some_and(|e| e.contains("label")),
+        "{wide:?}"
+    );
+    assert!(parse(json!([4_294_967_295u64])).is_ok());
+    let repeated: Vec<u64> = std::iter::repeat_n(1, 1000).collect();
+    assert!(parse(json!(repeated)).is_ok(), "duplicates are one label");
+    // The eleventh distinct label stops the read before a later bad entry
+    // is reached; a cap checked after the loop would report the u32 error.
+    let mut many: Vec<u64> = (1..=10).collect();
+    many.push(4_294_967_296);
+    let err = parse(json!(many)).err();
+    assert!(
+        err.as_deref().is_some_and(|e| e.contains("too many")),
+        "{err:?}"
+    );
+}
