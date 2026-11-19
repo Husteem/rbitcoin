@@ -60,8 +60,9 @@ let
       ) cfg.netPermissionBind
     )
   );
+  # The node counts the P2P port only while it listens there.
   forwardedPorts =
-    [ cfg.p2p.port ]
+    optional cfg.p2p.listen cfg.p2p.port
     ++ optional cfg.electrum.enable cfg.electrum.port
     ++ optional (cfg.esplora.enable && cfg.esplora.socketPath == null) cfg.esplora.port;
   # Port after the last @. IPv6 is `[addr]:port`. A grant with no port is left out;
@@ -1127,8 +1128,9 @@ in
         default = false;
         description = ''
           Pass `--rest` so unauthenticated `/rest/` is served on the RPC listener.
-          Off by default. Requires `enable` (TCP). The route uses its own queue,
-          not the RPC work queue.
+          Off by default. Rendered with any RPC listener: `enable` (TCP),
+          `unixSocket`, or `socketPath`. The route uses its own queue, not the
+          RPC work queue.
         '';
       };
 

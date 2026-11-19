@@ -898,6 +898,34 @@ assert builtins.elem v1InboundMsg (failedAssertions (badSystem {
 assert rbitcoinFailures (moduleOnly {
   netPermissionBind = [ "v1,noban@127.0.0.1:8335" ];
 }) == [ ];
+assert builtins.elem v1PortMsg (failedAssertions (badSystem {
+  electrum = {
+    enable = true;
+    port = 50001;
+  };
+  netPermissionBind = [ "v1,noban@127.0.0.1:50001" ];
+}));
+assert builtins.elem v1PortMsg (failedAssertions (badSystem {
+  esplora = {
+    enable = true;
+    port = 3002;
+  };
+  netPermissionBind = [ "v1,noban@127.0.0.1:3002" ];
+}));
+# With P2P off nothing listens on its port: only the listen refusal fires.
+assert !builtins.elem v1PortMsg (failedAssertions (badSystem {
+  p2p.listen = false;
+  netPermissionBind = [ "v1,noban@127.0.0.1:8333" ];
+}));
+# Esplora on a unix socket does not hold its TCP port.
+assert !builtins.elem v1PortMsg (rbitcoinFailures (moduleOnly {
+  esplora = {
+    enable = true;
+    port = 3002;
+    socketPath = "/run/rbitcoin/esplora.sock";
+  };
+  netPermissionBind = [ "v1,noban@127.0.0.1:3002" ];
+}));
 assert builtins.elem signetChallengeMsg (failedAssertions (badSystem {
   signet.challenge = "51";
 }));
