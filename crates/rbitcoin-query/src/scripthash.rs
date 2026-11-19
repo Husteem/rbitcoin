@@ -12,6 +12,26 @@ thread_local! {
     static MAX_SH_CREATES_LIFTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static SH_POSTING_GAP: std::cell::Cell<Option<fn(&Query)>> = const { std::cell::Cell::new(None) };
+}
+
+/// One-shot hook after the durable posting list is read and before the
+/// pending RAM list. Tests commit write-behind in that gap.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_sh_posting_gap_for_test(hook: Option<fn(&Query)>) {
+    SH_POSTING_GAP.with(|slot| slot.set(hook));
+}
+
+fn note_sh_posting_gap(query: &Query) {
+    #[cfg(debug_assertions)]
+    if let Some(hook) = SH_POSTING_GAP.with(|slot| slot.take()) {
+        hook(query);
+    }
+}
+
 /// While held, an unpaged join on this thread skips `--max-sh-creates`.
 /// `--heavy-sh-creates` still applies. The Esplora unix socket's
 /// `/internal/{address,scripthash}` totals hold one for the request: the
@@ -1321,6 +1341,7 @@ impl Query {
                 fks.push(fk);
             }
         }
+        note_sh_posting_gap(self);
         for fk in self.pending_sh_create_fks(scripthash) {
             if Some(fk) == genesis || !self.confirmed_strong_in(fk, view)? {
                 continue;

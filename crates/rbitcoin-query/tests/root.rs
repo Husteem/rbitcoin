@@ -2345,9 +2345,79 @@ fn torn_scripthash_slab_on_apply_marks_a_rebuild() {
         q.apply_sh_pending().is_err(),
         "the torn slab must fail the apply"
     );
-    assert!(rbitcoin_store::scripthash::sh_rebuild_marked(
-        q.store.path()
-    ));
+    assert!(rbitcoin_store::scripthash::sh_rebuild_marked(q.store.path()));
     assert!(q.sh_force_rebuild(), "the next start rebuilds the index");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn apply_sh_pending_in_posting_gap(q: &Query) {
+    q.apply_sh_pending()
+        .expect("commit between the durable list and the pending list");
+}
+
+/// History reads the durable posting list, then a commit drops the RAM copy,
+/// then history reads the pending list. That commit's creates stay in the
+/// result once. A later read of the same script does not repeat them.
+#[test]
+fn sh_history_keeps_a_create_committed_between_the_lists() {
+    let (dir, q) = temp_query("sh-posting-gap");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let txid0 = t0.tx.txid;
+    let hash0 = h0.hash;
+    q.commit_class_a_only(&h0, &[t0]).unwrap();
+    let hfk0 = q.confirm_block(Height(0), &hash0).unwrap();
+    q.release_index_writebehind(Height(0));
+    q.apply_sh_pending().unwrap();
+
+    let (h1, t1) = coinbase_block(1, hfk0, Some(hash0));
+    let txid1 = t1.tx.txid;
+    q.commit_class_a_only(&h1, &[t1]).unwrap();
+    q.confirm_block(Height(1), &h1.hash).unwrap();
+
+    let sh = script_hash(&[0x51]);
+    assert_eq!(
+        q.store.scripthash.create_fks(&sh).unwrap().len(),
+        1,
+        "only the first create is durable"
+    );
+    assert_eq!(
+        q.pending_sh_create_fks(&sh).len(),
+        1,
+        "the second create is still only in RAM"
+    );
+
+    struct ClearGap;
+    impl Drop for ClearGap {
+        fn drop(&mut self) {
+            rbitcoin_query::scripthash::set_sh_posting_gap_for_test(None);
+        }
+    }
+    let _clear = ClearGap;
+    rbitcoin_query::scripthash::set_sh_posting_gap_for_test(Some(apply_sh_pending_in_posting_gap));
+
+    let first = q.scripthash_history(&sh).unwrap();
+    assert!(
+        q.pending_sh_create_fks(&sh).is_empty(),
+        "the gap commit dropped the RAM copy"
+    );
+    assert_eq!(
+        q.store.scripthash.create_fks(&sh).unwrap().len(),
+        2,
+        "the gap commit appended the second create"
+    );
+    let mut want = vec![txid0, txid1];
+    want.sort();
+    let txids = |rows: &[rbitcoin_query::ScriptHashHistoryItem]| {
+        let mut got: Vec<[u8; 32]> = rows.iter().map(|row| row.txid).collect();
+        got.sort();
+        got
+    };
+    assert_eq!(
+        txids(&first),
+        want,
+        "creates committed between the two lists stay in that read"
+    );
+    let again = q.scripthash_history(&sh).unwrap();
+    assert_eq!(txids(&again), want, "a later read does not duplicate them");
     let _ = std::fs::remove_dir_all(&dir);
 }
