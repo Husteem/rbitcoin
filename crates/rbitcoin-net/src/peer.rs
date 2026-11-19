@@ -4679,21 +4679,25 @@ pub async fn serve_getdata_tail(
             // Unknown hash: Core ProcessGetData answers notfound. Silence
             // holds the requester's getdata until the stall floor.
             // The header check and the body reconstruct both run on the
-            // blocking pool. A missing header or body is `false`.
+            // blocking pool. A missing header or body is `NotFound`.
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                 let witness = matches!(item, Inventory::WitnessBlock(_));
-                if !serve_getdata_full_block(hub, out_tx, session, h, witness).await? {
-                    notfound.push(item);
-                } else if follow.continuation_block == Some(*h) {
-                    // Core sends this right after the block, even when redundant.
-                    follow.continuation_block = None;
-                    if let Some(tip) = hub.tip_hash() {
-                        queue_accounted(
-                            session,
-                            out_tx,
-                            NetworkMessage::Inv(vec![Inventory::Block(tip)]),
-                        )?;
+                match serve_getdata_full_block(hub, out_tx, session, h, witness).await? {
+                    FullBlockReply::NotFound => notfound.push(item),
+                    // Core returns before the continuation when it sends nothing.
+                    FullBlockReply::Withheld => {}
+                    FullBlockReply::Queued if follow.continuation_block == Some(*h) => {
+                        // Core sends this right after the block, even when redundant.
+                        follow.continuation_block = None;
+                        if let Some(tip) = hub.tip_hash() {
+                            queue_accounted(
+                                session,
+                                out_tx,
+                                NetworkMessage::Inv(vec![Inventory::Block(tip)]),
+                            )?;
+                        }
                     }
+                    FullBlockReply::Queued => {}
                 }
             }
             Inventory::CompactBlock(h) => {
@@ -4723,7 +4727,7 @@ pub async fn serve_getdata_full_block(
     session: Option<&crate::peers::LivePeer>,
     h: &bitcoin::BlockHash,
     witness: bool,
-) -> Result<bool, NetError> {
+) -> Result<FullBlockReply, NetError> {
     let query = Arc::clone(&hub.query);
     let cache = Arc::clone(&hub.cache);
     let hash = *h;
@@ -4750,17 +4754,29 @@ pub async fn serve_getdata_full_block(
     .await
     .map_err(|_| NetError::Protocol("serve reconstruct join failed"))??;
     match served {
-        FullBlockServe::Missing => Ok(false),
+        FullBlockServe::Missing => Ok(FullBlockReply::NotFound),
         // A body we have but will not relay (month-old side block) stays silent.
-        FullBlockServe::Withheld => Ok(true),
+        FullBlockServe::Withheld => Ok(FullBlockReply::Withheld),
         FullBlockServe::Bytes(bytes) => {
             if !hub.stale_relay_allowed(h) {
-                return Ok(true);
+                return Ok(FullBlockReply::Withheld);
             }
             queue_served(session, out_tx, PeerOut::Encoded(bytes))?;
-            Ok(true)
+            Ok(FullBlockReply::Queued)
         }
     }
+}
+
+/// What a full-block `getdata` did.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullBlockReply {
+    /// Unknown, header-only, or pruned: the caller answers `notfound`.
+    NotFound,
+    /// A body we have but will not relay (month-old side block): silent.
+    Withheld,
+    /// The block bytes are queued.
+    Queued,
 }
 
 enum FullBlockServe {

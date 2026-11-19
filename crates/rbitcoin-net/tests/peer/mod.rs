@@ -9234,7 +9234,11 @@ fn month_old_side_block_is_not_rebuilt_for_getdata() {
         let served = serve_getdata_full_block(&hub, &out_tx, None, &side_hash, true)
             .await
             .unwrap();
-        assert!(served, "a known stale block is silent, not notfound");
+        assert_eq!(
+            served,
+            FullBlockReply::Withheld,
+            "a known stale block is silent, not notfound"
+        );
     });
     assert!(
         out_rx.try_recv().is_err(),
@@ -9283,7 +9287,11 @@ fn month_old_side_block_is_not_rebuilt_for_getdata() {
         let served = serve_getdata_full_block(&hub, &out_tx, None, &tip_hash, true)
             .await
             .unwrap();
-        assert!(served, "the connected tip is served");
+        assert_eq!(
+            served,
+            FullBlockReply::Queued,
+            "the connected tip is served"
+        );
     });
     assert!(
         out_rx.try_recv().map(served_block).is_ok(),

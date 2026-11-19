@@ -400,6 +400,57 @@ fn tx_announce_skips_a_tx_gone_from_the_pool() {
     assert_eq!(tx_announce_inv(mp, &gone), None);
 }
 
+/// Core fires the continuation only after it sends the block. A body that is
+/// withheld (a month-old side block) sends nothing, so the tip inv waits and
+/// the continuation stays set. A later served block still fires it.
+#[test]
+fn getblocks_continuation_waits_for_a_served_block() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getblocks-continue-withheld");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = 1_700_000_000u32;
+    hub.clock.set_mock(i64::from(t0));
+    let side = rbitcoin_consensus::mine_empty_regtest(gen, t0, 1);
+    let side_hash = side.block_hash();
+    hub.accept_block(side).unwrap();
+    hub.invalidate_block(side_hash).unwrap();
+    let best_time = t0 + rbitcoin_net::chain::STALE_RELAY_AGE_LIMIT_SECS as u32;
+    hub.clock.set_mock(i64::from(best_time));
+    let tip = rbitcoin_consensus::mine_empty_regtest(gen, best_time, 1);
+    let tip_hash = tip.block_hash();
+    hub.accept_block(tip).unwrap();
+    assert!(!hub.stale_relay_allowed(&side_hash));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getdata runtime");
+    let mut follow = PeerFollowState::new();
+
+    follow.continuation_block = Some(side_hash);
+    let out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(side_hash));
+    assert!(
+        out.is_empty(),
+        "a withheld body sends no block and no tip inv"
+    );
+    assert_eq!(
+        follow.continuation_block,
+        Some(side_hash),
+        "the continuation stays set"
+    );
+
+    follow.continuation_block = Some(tip_hash);
+    let mut out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(tip_hash)).into_iter();
+    assert_eq!(
+        served_block(out.next().expect("block")).block_hash(),
+        tip_hash
+    );
+    let NetworkMessage::Inv(inv) = out.next().expect("tip inv").expect_msg() else {
+        panic!("the continuation is an inv");
+    };
+    assert_eq!(inv, vec![Inventory::Block(tip_hash)]);
+    assert_eq!(follow.continuation_block, None);
+}
+
 /// A `MSG_BLOCK` serve strips the stored witness bytes with a wire walk and
 /// decodes no `Block`, so, like `MSG_WITNESS_BLOCK`, it takes no block
 /// decode permit. With every permit held it still finishes.

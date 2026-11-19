@@ -143,7 +143,7 @@ claim that still applies.
 **Fixed.** `serve_getdata_tail` used to call `ChainHub::knows_header` on
 the session worker for every block `getdata`. An unknown hash took
 `get_header_by_hash` there. `serve_getdata_full_block` already
-reconstructs on the blocking pool and returns false when the header or
+reconstructs on the blocking pool and answers `NotFound` when the header or
 the body is missing, so the session check is gone.
 `getdata_block_lookup_stays_off_the_reactor` is the pin.
 
