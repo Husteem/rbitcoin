@@ -558,6 +558,7 @@ fn join_only_state(q: Arc<Query>, cache: Arc<Mutex<JoinCache>>) -> AppState {
         join_header_trusted: true,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        send_stall: Duration::from_secs(120),
     }
 }
 
@@ -883,6 +884,7 @@ fn app_with_join(q: Arc<Query>, cache: Arc<Mutex<JoinCache>>, trusted: bool) -> 
         join_header_trusted: trusted,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        send_stall: Duration::from_secs(120),
     };
     Router::new()
         .route("/scripthash/{hash}", get(handlers::scripthash_info))
@@ -923,6 +925,81 @@ fn get_with_client(path: &str, client: &str) -> axum::http::Request<axum::body::
         .unwrap()
 }
 
+/// Five coinbase blocks paying `0x51`, and a one-create-per-wave walk over
+/// that script at the tip.
+#[cfg(unix)]
+fn five_block_history(
+    label: &str,
+) -> (
+    rbitcoin_query::testutil::TempDir,
+    Arc<Query>,
+    rbitcoin_query::scripthash::ShHistoryWalk,
+) {
+    let (dir, q) = temp_query(label);
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for h in 0..5 {
+        let (header, cb) = coinbase(h, prev, parent);
+        parent = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[cb]).unwrap();
+    }
+    q.apply_sh_pending().unwrap();
+    let view = q.pin_sh_chain_view().unwrap().expect("sh view");
+    let walk = rbitcoin_query::scripthash::ShHistoryWalk::new(&script_hash(&[0x51]), &view, 1);
+    (dir, Arc::new(q), walk)
+}
+
+/// A reader that leaves a history body unread past the stall limit ends the
+/// walk, and what it then reads is not a complete body.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn stalled_history_reader_ends_the_walk() {
+    use rbitcoin_esplora::internal::{write_history, ChunkBody};
+    let (_dir, q, walk) = five_block_history("esplora-history-stall");
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let (start, started) = tokio::sync::oneshot::channel();
+    start.send(()).unwrap();
+    write_history(q, walk, tx, Duration::from_secs(120), started).await;
+    let body = axum::body::Body::new(ChunkBody::new(rx, tokio::sync::oneshot::channel().0));
+    assert!(axum::body::to_bytes(body, 1 << 20).await.is_err());
+}
+
+/// The walk reads nothing until its body is first polled, so the create scan
+/// never runs while the response is still inside the middleware and the
+/// request timeout. A body dropped unpolled ends the walk with no rows.
+#[cfg(unix)]
+#[tokio::test(start_paused = true)]
+async fn history_walk_waits_for_the_first_body_poll() {
+    use rbitcoin_esplora::internal::{write_history, ChunkBody};
+    let (_dir, q, walk) = five_block_history("esplora-history-unpolled");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let (start, started) = tokio::sync::oneshot::channel::<()>();
+    drop(start);
+    write_history(q, walk, tx, Duration::from_secs(120), started).await;
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
+
+    let (_dir, q, walk) = five_block_history("esplora-history-polled");
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let (start, started) = tokio::sync::oneshot::channel();
+    let producer = tokio::spawn(write_history(
+        q,
+        walk,
+        tx,
+        Duration::from_secs(120),
+        started,
+    ));
+    let body = axum::body::Body::new(ChunkBody::new(rx, start));
+    let bytes = axum::body::to_bytes(body, 1 << 20)
+        .await
+        .expect("whole body");
+    let rows: Vec<Value> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(rows.len(), 5);
+    producer.await.unwrap();
+}
+
 /// TCP mounts no `/internal` route, so with the SH index off an internal
 /// stats path is still the unknown-path 404 while the public twin is 503.
 #[tokio::test]
@@ -961,6 +1038,7 @@ async fn address_without_sh_index_is_503_disabled() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        send_stall: Duration::from_secs(120),
     };
     let app = Router::new()
         .route("/address/{addr}/utxo", get(handlers::address_utxo))
@@ -1006,6 +1084,7 @@ async fn http_503_chain_view_moved_omits_tip_header() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        send_stall: Duration::from_secs(120),
     };
     async fn die_tip(State(st): State<AppState>) -> &'static str {
         st.query.disconnect_tip().unwrap();
@@ -1062,6 +1141,7 @@ async fn asof_of_a_moved_view_is_404() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        send_stall: Duration::from_secs(120),
     };
     async fn pin_then_move(State(st): State<AppState>, AsOf(asof): AsOf) -> Response {
         let view = match pin_or_reject(&st.query, rbitcoin_query::ChainViewKind::Tip, asof) {
@@ -1112,6 +1192,7 @@ async fn body_at_max_is_not_413_and_300_slots_fit() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        send_stall: Duration::from_secs(120),
     };
     let at = Bytes::new();
     let over = Bytes::from_static(b"x");
@@ -1918,6 +1999,7 @@ async fn block_template_does_not_lock_the_cache_across_template_prev() {
             Ok(json!({"height": 1}))
         }))),
         gbt_cache: Arc::new(Mutex::new(None)),
+        send_stall: Duration::from_secs(120),
     };
     let cache = Arc::clone(&st.gbt_cache);
     let task = tokio::spawn(async move { handlers::block_template(State(st)).await });

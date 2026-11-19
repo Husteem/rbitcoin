@@ -269,6 +269,8 @@ pub fn path_accepts_asof(path: &str) -> bool {
             | ["scripthash", _]
             | ["internal", "address", _]
             | ["internal", "scripthash", _]
+            | ["internal", "address", _, "history"]
+            | ["internal", "scripthash", _, "history"]
             | ["address", _, "utxo"]
             | ["scripthash", _, "utxo"]
             | ["address", _, "txs"]
@@ -629,6 +631,9 @@ pub struct AppState {
     pub join_header_trusted: bool,
     pub block_template: Option<BlockTemplateFn>,
     pub gbt_cache: Arc<Mutex<Option<GbtCache>>>,
+    /// How long a streamed body waits on a reader that leaves its next
+    /// chunk unread before it fails the body (the listener idle timeout).
+    pub send_stall: Duration,
 }
 
 #[doc(hidden)]
@@ -1012,6 +1017,14 @@ pub fn internal_routes() -> Router<AppState> {
             "/internal/scripthash/{hash}",
             get(crate::internal::get_internal_scripthash),
         )
+        .route(
+            "/internal/address/{addr}/history",
+            get(crate::internal::get_internal_address_history),
+        )
+        .route(
+            "/internal/scripthash/{hash}/history",
+            get(crate::internal::get_internal_scripthash_history),
+        )
 }
 
 #[cfg(unix)]
@@ -1177,6 +1190,7 @@ pub async fn run_esplora(
         },
         block_template: config.block_template,
         gbt_cache: Arc::new(Mutex::new(None)),
+        send_stall: timeout,
     };
 
     // axum 0.8 path params use `{name}` (not `:name`).

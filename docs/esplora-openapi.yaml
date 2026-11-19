@@ -26,7 +26,8 @@ info:
     Pinned responses carry `X-Bitcoin-Chain-Tip` (block hash) and
     `X-Bitcoin-Chain-Tip-Height`. Both are CORS-exposed. Block, tx, and header
     routes stamp the live tip. `/address/*`, `/scripthash/*`, `/addresses/*`,
-    `/scripthashes/*`, `/internal/address/*`, and `/internal/scripthash/*` stamp
+    `/scripthashes/*`, `/internal/address/*`, and `/internal/scripthash/*` (with
+    their `/history`) stamp
     the scripthash-index watermark, so the JSON matches
     the join that produced it, except `/address/{address}/txs/mempool` and
     `/scripthash/{scripthash}/txs/mempool`, which are not stamped. With `?asof=`,
@@ -56,7 +57,7 @@ info:
       `/tx/{txid}/status`, `/tx/{txid}/outspend/{vout}`, `/tx/{txid}/outspends`,
       and address/scripthash `/`, `/utxo`, `/txs`, `/txs/chain[/{last}]`,
       `/txs/summary[/{last}]`, plus the unix-socket `/internal/address/{address}`
-      and `/internal/scripthash/{scripthash}`.
+      and `/internal/scripthash/{scripthash}` and their `/history`.
     - On any other route, `?asof=` is **404** (for example `/tx/{txid}`,
       `/mempool`, `/address/{addr}/txs/mempool`, and the POST multi-script routes).
     - An empty value, bad hex, an unknown hash, a hash that is not on the best
@@ -948,6 +949,54 @@ paths:
         "404": { $ref: "#/components/responses/AsOfNotFound" }
         "503": { $ref: "#/components/responses/Unavailable" }
 
+  /internal/scripthash/{scripthash}/history:
+    get:
+      tags: [internal]
+      summary: Every confirmed transaction of the script, without `--max-sh-creates`
+      description: |
+        Electrum `blockchain.scripthash.get_history` rows for the confirmed chain
+        as of the pinned view, in its order: height ascending, then txid bytes
+        (internal byte order, the reverse of the hex). One row per confirmed
+        instance: a BIP30 duplicate coinbase (one txid in two blocks) is listed
+        at both heights, where `get_history` keeps only the first. No mempool rows. `?asof=`
+        and the chain-tip headers are those of `/internal/scripthash/{scripthash}`,
+        and the row count equals its `chain_stats.tx_count` at the same pin.
+        The body is chunked and written one wave of creates at a time, each
+        wave under the `--heavy-sh-creates` turn. If the pinned block leaves the
+        best chain, a read fails, or the reader leaves a chunk unread for the
+        idle timeout, the body is aborted without its final chunk or `]`. Unix socket only;
+        TCP is 404. Probe: 64 zeros as the scripthash is 200 `[]` here and
+        404 on a node without the route.
+      parameters:
+        - { $ref: "#/components/parameters/Scripthash" }
+        - { $ref: "#/components/parameters/AsOf" }
+      responses:
+        "200":
+          description: Confirmed history, oldest first
+          headers: { X-Bitcoin-Chain-Tip: { $ref: "#/components/headers/ChainTip" }, X-Bitcoin-Chain-Tip-Height: { $ref: "#/components/headers/ChainTipHeight" }, X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  required: [tx_hash, height]
+                  properties:
+                    tx_hash: { $ref: "#/components/schemas/Hash" }
+                    height: { type: integer }
+        "404": { $ref: "#/components/responses/AsOfNotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /internal/address/{address}/history:
+    get:
+      tags: [internal]
+      summary: "`/internal/scripthash/{scripthash}/history` for an address"
+      parameters:
+        - { $ref: "#/components/parameters/Address" }
+        - { $ref: "#/components/parameters/AsOf" }
+      responses:
+        "200": { description: "See `/internal/scripthash/{scripthash}/history`" }
+        "404": { $ref: "#/components/responses/AsOfNotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
 components:
   headers:
     ChainTip:
