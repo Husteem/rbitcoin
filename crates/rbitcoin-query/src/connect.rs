@@ -211,7 +211,7 @@ impl Query {
         };
         self.published_tip
             .store(Some(std::sync::Arc::new(PublishedTip { height, hash })));
-        let expected = self.with_height_index(|index| index.tip);
+        let expected = self.read_height_index(|index| index.tip);
         let start = match expected {
             None => {
                 if rows.len() == 1 && height == 0 {

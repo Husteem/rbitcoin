@@ -179,6 +179,9 @@ pub fn push_resolve_keys(
             keys.insert(p.txid);
         }
     }
+    // One key per parent txid: inputs spending the same parent share it.
+    spends.sort_unstable();
+    spends.dedup();
     spends
 }
 

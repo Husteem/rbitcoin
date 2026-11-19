@@ -366,8 +366,8 @@ pub type ResumeSibPick = (Fk, [u8; 32], bool, u32, [u8; 32]);
 ///
 /// Children are a counting sort over `prevs`: `child_fks[child_start[p] ..
 /// child_start[p + 1]]` are the children of fk `p` (`0` = no parent), in fk
-/// order. That is ~48 bytes per header, against a hash-map entry and a heap
-/// `Vec` per parent.
+/// order. That is 52 bytes per header (~48 MiB at ~962k headers), against a
+/// hash-map entry and a heap `Vec` per parent.
 #[doc(hidden)]
 pub struct ResumeHeaderIndex {
     pub bits: Vec<u32>,
@@ -379,7 +379,7 @@ pub struct ResumeHeaderIndex {
 
 impl ResumeHeaderIndex {
     /// Index fk `i + 1` from slot `i` of each vec. A header in `excluded`
-    /// (by fk) keeps its bits and parent but is no parent's child, and a
+    /// (fks, ascending) keeps its bits and parent but is no parent's child, and a
     /// parent past the last fk links nothing.
     pub fn new(
         bits: Vec<u32>,
@@ -393,7 +393,10 @@ impl ResumeHeaderIndex {
         }
         let parent_of = |i: usize| -> Option<usize> {
             let p = usize::try_from(prevs[i]).ok().filter(|&p| p <= n)?;
-            (!excluded.contains(&(i as u64 + 1))).then_some(p)
+            excluded
+                .binary_search(&(i as u64 + 1))
+                .is_err()
+                .then_some(p)
         };
         let mut child_start = vec![0u32; n + 2];
         for i in 0..n {
@@ -558,10 +561,10 @@ pub struct Query {
     /// One header read returns [`StoreError::Cancelled`]. Tests only.
     #[cfg(debug_assertions)]
     pub header_read_cancel: std::sync::atomic::AtomicBool,
-    /// Confirmed best-chain `hash → height` (kept for process life; ~60 MiB mainnet).
+    /// Confirmed best-chain `hash → height` (kept for process life; ~74 MiB at a ~962k tip).
     ///
     /// Avoids O(tip) header walks on Esplora/P2P `height_of_hash`.
-    pub height_by_hash: Mutex<HeightByHashIndex>,
+    pub height_by_hash: std::sync::RwLock<HeightByHashIndex>,
     /// `reconstruct_archived_block` calls (`/raw` and Esplora size/weight).
     pub reconstruct_archived: AtomicU64,
     /// Network genesis coinbase txid ([`Self::set_genesis_coinbase_txid`]).
@@ -966,7 +969,7 @@ impl Query {
             trust_peer: std::sync::atomic::AtomicBool::new(false),
             #[cfg(debug_assertions)]
             header_read_cancel: std::sync::atomic::AtomicBool::new(false),
-            height_by_hash: Mutex::new(HeightByHashIndex::default()),
+            height_by_hash: std::sync::RwLock::new(HeightByHashIndex::default()),
             reconstruct_archived: AtomicU64::new(0),
             genesis_coinbase_txid: std::sync::OnceLock::new(),
             genesis_coinbase_fk: std::sync::OnceLock::new(),
@@ -2854,7 +2857,7 @@ impl Query {
         let mem = process_mem_stats::load();
         let h2h_keys = self
             .height_by_hash
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .map
             .len();

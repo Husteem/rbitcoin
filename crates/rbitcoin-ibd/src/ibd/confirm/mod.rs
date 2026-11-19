@@ -2833,11 +2833,7 @@ pub fn spawn_confirm_engine(
                 let mut carried_header_fks = Vec::with_capacity(wire_batch.len());
                 let mut carried_header_hashes = Vec::with_capacity(wire_batch.len());
                 for (_, ha, w) in &wire_batch {
-                    for &txid in w.spend_keys.iter() {
-                        if txid != [0u8; 32] {
-                            carried_need.push(txid);
-                        }
-                    }
+                    carried_need.extend_from_slice(&w.spend_keys);
                     carried_header_fks.push(rbitcoin_primitives::Fk(w.header_fk));
                     carried_header_hashes.push(ha.to_byte_array());
                 }

@@ -1408,8 +1408,8 @@ impl ChainHub {
     /// True if `hash` is connected on the best chain (has a height).
     ///
     /// Download / fork-start decisions must use this, not [`Self::has_block`]:
-    /// the RAM body cache can evict. A stale "we have it" would permanently
-    /// suppress getdata.
+    /// `has_block` also counts a body in the RAM tip cache, which can be a
+    /// side-branch block and can be evicted.
     /// The check is the published height index only. A lagging index is a
     /// miss, not a header-store walk.
     pub fn is_connected(&self, hash: &BlockHash) -> bool {

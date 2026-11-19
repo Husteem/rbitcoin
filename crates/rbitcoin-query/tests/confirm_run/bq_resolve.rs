@@ -196,7 +196,11 @@ fn push_resolve_keys_dedups_same_prev_txid() {
     let spends = push_resolve_keys(&params, height, &block, &pres, &skip, &mut keys, 1);
     assert_eq!(keys.len(), 1);
     assert!(keys.contains(&prev.to_byte_array()));
-    assert_eq!(spends, vec![prev.to_byte_array(), prev.to_byte_array()]);
+    assert_eq!(
+        spends,
+        vec![prev.to_byte_array()],
+        "one key per parent txid"
+    );
     let mut skip_same = HashSet::with_hasher(BuildHasherDefault::default());
     skip_same.insert(prev.to_byte_array());
     let mut keys2: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
@@ -205,7 +209,7 @@ fn push_resolve_keys_dedups_same_prev_txid() {
     assert!(keys2.is_empty(), "same-wave creates are not TipOnly need");
     assert_eq!(
         skipped,
-        vec![prev.to_byte_array(), prev.to_byte_array()],
+        vec![prev.to_byte_array()],
         "spend_keys must still carry same-wave prevs for in-flight stamp"
     );
 

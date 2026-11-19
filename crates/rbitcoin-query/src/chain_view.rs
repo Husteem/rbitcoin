@@ -329,7 +329,7 @@ impl Query {
     /// Archive may contain orphan header rows (partial connect failures). Those are
     /// not reported here — only hashes reachable as `confirmed[height]`.
     ///
-    /// Uses an in-process `hash → height` map (~60 MiB at mainnet tip). Any
+    /// Uses an in-process `hash → height` map (~74 MiB at a ~962k tip). Any
     /// tip extend/shrink is incremental; a full `0..=tip` walk runs only on
     /// open or after [`Self::invalidate_height_by_hash_index`].
     /// Confirmed height when the in-memory index already has this hash.
@@ -338,14 +338,12 @@ impl Query {
     /// Hashes at or below the indexed tip still count. Anything the index
     /// has not recorded is a miss.
     pub fn published_height_of_hash(&self, hash: &[u8; 32]) -> Option<Height> {
-        let live = self.tip_height().map(|h| h.0);
-        self.with_height_index(|index| {
+        let live = self.tip_height()?.0;
+        self.read_height_index(|index| {
             let height = index.map.get(hash).copied()?;
-            let indexed = index.tip?;
-            if live.is_some_and(|tip| indexed > tip) {
-                return None;
-            }
-            (height <= indexed).then_some(Height(height))
+            // A disconnect lowers the store tip before it shrinks the index.
+            // Heights at or below both tips are still connected.
+            (height <= index.tip?.min(live)).then_some(Height(height))
         })
     }
 
@@ -381,7 +379,7 @@ impl Query {
             return Ok(None);
         }
         self.ensure_height_by_hash_index(tip)?;
-        Ok(self.with_height_index(|index| index.map.get(hash).copied().map(Height)))
+        Ok(self.read_height_index(|index| index.map.get(hash).copied().map(Height)))
     }
 
     /// Active-chain height of a hash already loaded from the header archive.
@@ -393,7 +391,7 @@ impl Query {
             return Ok(None);
         };
         self.ensure_height_by_hash_index(tip)?;
-        Ok(self.with_height_index(|index| index.map.get(hash).copied().map(Height)))
+        Ok(self.read_height_index(|index| index.map.get(hash).copied().map(Height)))
     }
 
     /// Ensure height index matches `tip`.
@@ -414,7 +412,7 @@ impl Query {
         &self,
         tip: Height,
     ) -> Result<Option<Height>, QueryError> {
-        let plan = self.with_height_index(|index| {
+        let plan = self.read_height_index(|index| {
             if index.tip == Some(tip.0) {
                 HeightIndexPlan::Current
             } else if let Some(prev) = index.tip {
@@ -497,7 +495,7 @@ impl Query {
 
     #[doc(hidden)]
     pub fn indexed_height(&self, hash: &[u8; 32], tip: u32) -> Option<Option<Height>> {
-        self.with_height_index(|index| {
+        self.read_height_index(|index| {
             if index.tip == Some(tip) {
                 Some(index.map.get(hash).copied().map(Height))
             } else {
@@ -511,9 +509,21 @@ impl Query {
         let _held = IndexLockFlag::enter();
         let mut index = self
             .height_by_hash
-            .lock()
+            .write()
             .unwrap_or_else(|poison| poison.into_inner());
         f(&mut index)
+    }
+
+    /// Shared read of the height index. `has_block` and assign read it per
+    /// hash, so lookups must not serialize on each other.
+    pub fn read_height_index<R>(&self, f: impl FnOnce(&HeightByHashIndex) -> R) -> R {
+        #[cfg(debug_assertions)]
+        let _held = IndexLockFlag::enter();
+        let index = self
+            .height_by_hash
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        f(&index)
     }
 
     pub fn extend_height_index(

@@ -256,6 +256,32 @@ fn strong_bitset_range_and_clear() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An open that reads the body in several chunks sets the same bits as one
+/// that reads it whole, including a short last chunk.
+#[test]
+fn strong_open_in_chunks_reads_every_bit() {
+    let dir = tmp();
+    let t = StrongTxTable::create(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let set = [0u64, 7, 8, 63, 64, 65, 200, 511, 640, 1_001];
+    for &bit in &set {
+        t.set_bit(&write, bit, true).unwrap();
+    }
+    t.flush().unwrap();
+    drop(t);
+    for chunk in [8usize, 24, 16 << 20] {
+        let t = StrongTxTable::open_chunked(&dir, chunk).unwrap();
+        for bit in 0..1_100u64 {
+            assert_eq!(
+                t.get_bit(bit).unwrap(),
+                set.contains(&bit),
+                "bit {bit} with a {chunk}-byte chunk"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn count_strong_in_fk_range_skips_zero_bytes() {
     let dir = tmp();

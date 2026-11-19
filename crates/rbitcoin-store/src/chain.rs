@@ -147,6 +147,9 @@ impl ConfirmedTable {
 /// Always in RAM, ignoring [`crate::array_table::class_c_inram_max_bytes`].
 /// The words are [`ArrayTable`]'s slot buffer. Its length is body bytes, not
 /// rounded up to a word. Flush is that table's flush.
+/// Bytes [`StrongTxTable::open`] reads per chunk.
+pub const STRONG_OPEN_CHUNK: usize = 16 << 20;
+
 pub struct StrongTxTable {
     pub table: ArrayTable,
     /// Number of bits allocated (covers tx fks 1..=n_bits).
@@ -163,19 +166,29 @@ impl StrongTxTable {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        Self::open_chunked(dir, STRONG_OPEN_CHUNK)
+    }
+
+    /// [`Self::open`] reading the body `chunk` bytes at a time (a multiple
+    /// of 8). Read straight into the reservation: a whole-body buffer would
+    /// double the open peak (~177 MiB at mainnet).
+    #[doc(hidden)]
+    pub fn open_chunked(dir: &Path, chunk: usize) -> Result<Self, StoreError> {
+        if chunk == 0 || !chunk.is_multiple_of(8) {
+            return Err(StoreError::Rejected(
+                "strong_tx open chunk is not whole words",
+            ));
+        }
         let bits = TableFile::open(dir.join("strong_tx.body"), TableKind::StrongTx)?;
         let body = bits.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
         let table = ArrayTable::bit_image(bits, body)?;
         if body > 0 {
             table.slots.grow((body as usize).div_ceil(8))?;
-            // Read in chunks straight into the reservation: a whole-body Vec
-            // would double the open peak (~177 MiB at mainnet).
-            const CHUNK: usize = 16 << 20;
             let words = table.slots.slots(Ordering::Relaxed);
-            let mut buf = vec![0u8; CHUNK.min(body as usize)];
+            let mut buf = vec![0u8; chunk.min(body as usize)];
             let mut done = 0usize;
             while done < body as usize {
-                let len = CHUNK.min(body as usize - done);
+                let len = chunk.min(body as usize - done);
                 table
                     .file
                     .read_at(FILE_HEADER_LEN as u64 + done as u64, &mut buf[..len])?;

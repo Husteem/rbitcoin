@@ -161,6 +161,30 @@ fn extend_refuses_a_height_the_store_already_left() {
 }
 
 #[test]
+fn published_height_answers_below_the_store_tip_before_the_index_shrinks() {
+    let (dir, q) = temp_query("pub-h-shrink");
+    let hashes = h2h_pad_0_4(&q);
+    assert_eq!(q.published_height_of_hash(&hashes[4]), Some(Height(4)));
+    // A disconnect lowers the store tip before it shrinks the index.
+    q.store()
+        .confirmed
+        .disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(4))
+        .unwrap();
+    assert_eq!(q.tip_height(), Some(Height(3)));
+    assert_eq!(
+        q.published_height_of_hash(&hashes[1]),
+        Some(Height(1)),
+        "a hash below the live tip is still connected"
+    );
+    assert_eq!(
+        q.published_height_of_hash(&hashes[4]),
+        None,
+        "the height the store left is not connected"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn published_height_does_not_fill_a_lagging_index() {
     let (dir, q) = temp_query("pub-h-lag");
     let hashes = h2h_pad_0_4(&q);

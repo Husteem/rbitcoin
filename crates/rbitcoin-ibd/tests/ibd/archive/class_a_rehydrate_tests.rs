@@ -147,11 +147,13 @@ fn bq_rehydrate_residue_keep_drop_gap_and_unknown() {
     let mut prev = gen;
     let mut hashes = Vec::new();
     let mut fks = Vec::new();
+    let mut blocks = Vec::new();
     for h in 1u32..=4 {
         let b = mine(prev, time + h * 600, h);
         fks.push(hub.ensure_header_fk(&b.header).unwrap());
         hashes.push(b.block_hash());
         prev = b.block_hash();
+        blocks.push(b);
     }
 
     let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
@@ -172,9 +174,11 @@ fn bq_rehydrate_residue_keep_drop_gap_and_unknown() {
     hub.query
         .block_queue_enqueue(2, hashes[1].to_byte_array(), fks[1].0, b"wire2")
         .unwrap();
+    // A cached body above the store tip reads as had.
+    hub.cache.push_best(3, blocks[2].clone());
     assert!(
-        !hub.has_block(&hashes[2]),
-        "a stored header that is not connected is not a held block"
+        hub.has_block(&hashes[2]),
+        "a cached body must not dequeue above-tip wire"
     );
     assert_eq!(hub.tip_height(), Some(0));
     hub.query
