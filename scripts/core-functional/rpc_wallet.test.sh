@@ -597,7 +597,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
-from rpc_proxy import RpcError
+from rpc_util import RpcError  # puts Core's test_framework on sys.path
 from rpc_wallet import WalletHub
 
 
