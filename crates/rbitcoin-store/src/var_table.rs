@@ -104,6 +104,7 @@ impl VarTable {
         body_kind: TableKind,
     ) -> Result<Self, StoreError> {
         let body = TableFile::create(Self::body_path(dir, stem), body_kind)?;
+        body.arm_synced_tail();
         Ok(Self {
             body,
             count: AtomicU64::new(0),
@@ -119,6 +120,7 @@ impl VarTable {
         count: u64,
     ) -> Result<Self, StoreError> {
         let body = TableFile::open(Self::body_path(dir, stem), body_kind)?;
+        body.arm_synced_tail();
         let body_end = body.logical_len().max(FILE_HEADER_LEN as u64);
         Ok(Self {
             body,
@@ -136,6 +138,7 @@ impl VarTable {
         body_kind: TableKind,
     ) -> Result<Self, StoreError> {
         let body = TableFile::create_sparse(Self::body_path(dir, stem), body_kind)?;
+        body.arm_synced_tail();
         Ok(Self {
             body,
             count: AtomicU64::new(0),
@@ -152,6 +155,7 @@ impl VarTable {
         count: u64,
     ) -> Result<Self, StoreError> {
         let body = TableFile::open_sparse(Self::body_path(dir, stem), body_kind)?;
+        body.arm_synced_tail();
         let body_end = body.logical_len().max(FILE_HEADER_LEN as u64);
         Ok(Self {
             body,
@@ -323,6 +327,7 @@ impl VarTable {
         }
         let end = start.saturating_add(body_blob.len() as u64);
         self.body.ensure_capacity(end)?;
+        self.body.preserve_synced_tail(start, body_blob.len())?;
         use crate::bulk_io::{self, WriteOp};
         let mut ops = [WriteOp {
             fd: self.body.read_fd(),
@@ -376,6 +381,9 @@ pub fn write_prepared_bodies_one_wave(
         }
         let end = prep.start.saturating_add(prep.body_blob.len() as u64);
         table.ensure_body_end(end)?;
+        table
+            .body
+            .preserve_synced_tail(prep.start, prep.body_blob.len())?;
     }
     use crate::bulk_io::{self, WriteOp};
     let mut ops: Vec<WriteOp<'_>> = Vec::with_capacity(jobs.len());

@@ -255,6 +255,9 @@ impl TxStat {
         if !bpad.is_empty() {
             blk.write_at_pwrite(FILE_HEADER_LEN as u64, &bpad)?;
         }
+        body.arm_synced_tail();
+        ovf.arm_synced_tail();
+        blk.arm_synced_tail();
         Ok(Self {
             body,
             ovf,
@@ -311,6 +314,9 @@ impl TxStat {
             }
             f
         };
+        body.arm_synced_tail();
+        ovf.arm_synced_tail();
+        blk.arm_synced_tail();
         Ok(Self {
             body,
             ovf,

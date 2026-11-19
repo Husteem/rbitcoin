@@ -45,6 +45,51 @@ use std::sync::Mutex;
 
 pub const FILE_HEADER_LEN: usize = 16;
 
+/// Device block a power cut can tear to zeroes when a write overlaps it.
+pub(crate) const TAIL_BLOCK: u64 = 4096;
+
+/// `magic[4] | block_off:u64 | image_len:u32 | image`.
+const KEPT_MAGIC: &[u8; 4] = b"CATK";
+const KEPT_HEAD: usize = 16;
+
+/// Write a leftover `.kept` image back over `path` and remove the copy.
+///
+/// A missing copy is the synced case. The image is the published prefix from
+/// before the rewrite, so a torn block does not stay zeroes.
+pub(crate) fn restore_kept_tail(path: &Path) -> Result<(), StoreError> {
+    let side = TableFile::kept_tail_path(path);
+    let raw = match std::fs::read(&side) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(&side, e)),
+    };
+    if raw.len() < KEPT_HEAD || raw[0..4] != *KEPT_MAGIC {
+        return Err(StoreError::Corrupt("class A tail keep"));
+    }
+    let block = u64::from_le_bytes(raw[4..12].try_into().unwrap());
+    let n = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
+    if !block.is_multiple_of(TAIL_BLOCK)
+        || n == 0
+        || n > TAIL_BLOCK as usize
+        || raw.len() != KEPT_HEAD + n
+    {
+        return Err(StoreError::Corrupt("class A tail keep"));
+    }
+    if !path.try_exists().map_err(|e| StoreError::io(path, e))? {
+        return Err(StoreError::Corrupt(
+            "class A tail keep names a missing file",
+        ));
+    }
+    let file = table_open_opts()
+        .open(path)
+        .map_err(|e| StoreError::io(path, e))?;
+    handle_pwrite_all(&file, path, block, &raw[KEPT_HEAD..])?;
+    file.sync_data().map_err(|e| StoreError::io(path, e))?;
+    std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
+    let parent = side.parent().unwrap_or_else(|| Path::new("."));
+    fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))
+}
+
 /// Bytes [`TableFile::create`] leaves past the header. A longer file is payload.
 pub(crate) const CREATE_FILE_SLACK: u64 = 64;
 
@@ -354,6 +399,8 @@ pub struct TableFile {
     pub kind: TableKind,
     /// Payload/HWM written since last successful `sync_data` (Class C barrier skip).
     pub needs_sync: AtomicBool,
+    /// Class A: copy a synced partial 4 KiB tail aside before a write overlaps it.
+    keep_tail: AtomicBool,
     /// Header still names a longer end than `published_len`. A grow must store
     /// the short end before it extends the file, or open loads the old end.
     hwm_behind: AtomicBool,
@@ -515,6 +562,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(false),
+            keep_tail: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(false),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
@@ -546,6 +594,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(false),
+            keep_tail: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(false),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
@@ -600,6 +649,7 @@ impl TableFile {
                 trailing_ext,
                 kind,
                 needs_sync: AtomicBool::new(false),
+                keep_tail: AtomicBool::new(false),
                 hwm_behind: AtomicBool::new(false),
                 flush_lock: Mutex::new(()),
                 grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
@@ -752,6 +802,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(hwm_behind),
+            keep_tail: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(hwm_behind),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
@@ -928,7 +979,83 @@ impl TableFile {
     /// Complete pwrite of all bytes or error (no partial success returned).
     #[doc(hidden)]
     pub fn pwrite_all(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        self.preserve_synced_tail(offset, bytes.len())?;
         handle_pwrite_all(&self.read_file, &self.path, offset, bytes)
+    }
+
+    /// Class A files copy a synced partial tail aside before rewriting it.
+    pub(crate) fn arm_synced_tail(&self) {
+        self.keep_tail.store(true, Ordering::Release);
+    }
+
+    /// Sibling `{filename}.kept` holding the published prefix of a partial tail block.
+    pub(crate) fn kept_tail_path(path: &Path) -> PathBuf {
+        let mut name = path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("file"))
+            .to_os_string();
+        name.push(".kept");
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+            _ => PathBuf::from(name),
+        }
+    }
+
+    /// Before `bytes` overlap the partial last 4 KiB block, copy that block's
+    /// published prefix to [`Self::kept_tail_path`] and sync it.
+    ///
+    /// A crash can tear the rewritten block to zeroes. The copy is the bytes
+    /// a durable record already names. One copy stands until the next data sync.
+    pub(crate) fn preserve_synced_tail(&self, offset: u64, len: usize) -> Result<(), StoreError> {
+        if !self.keep_tail.load(Ordering::Acquire) || len == 0 {
+            return Ok(());
+        }
+        let published = self.published_len.load(Ordering::Acquire);
+        if published == 0 || published.is_multiple_of(TAIL_BLOCK) {
+            return Ok(());
+        }
+        let block = published & !(TAIL_BLOCK - 1);
+        let write_end = offset.saturating_add(len as u64);
+        if write_end <= block || offset >= block + TAIL_BLOCK {
+            return Ok(());
+        }
+        let side = Self::kept_tail_path(&self.path);
+        if side.try_exists().map_err(|e| StoreError::io(&side, e))? {
+            return Ok(());
+        }
+        let file_len = self
+            .read_file
+            .metadata()
+            .map_err(|e| StoreError::io(&self.path, e))?
+            .len();
+        // A sparse logical end (`spent.body`) is not bytes this block holds.
+        if published > file_len {
+            return Ok(());
+        }
+        let n = (published - block) as usize;
+        if n == 0 || n > TAIL_BLOCK as usize {
+            return Ok(());
+        }
+        let mut image = vec![0u8; n];
+        self.pread_at(block, &mut image)?;
+        let mut buf = Vec::with_capacity(KEPT_HEAD + n);
+        buf.extend_from_slice(KEPT_MAGIC);
+        buf.extend_from_slice(&block.to_le_bytes());
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+        buf.extend_from_slice(&image);
+        write_synced_tmp_rename(&side, &buf)
+    }
+
+    /// Remove the tail copy after the rewritten bytes are synced.
+    ///
+    /// Returns whether a file was removed. The caller syncs the parent directory.
+    pub(crate) fn drop_kept_tail(&self) -> Result<bool, StoreError> {
+        let side = Self::kept_tail_path(&self.path);
+        match std::fs::remove_file(&side) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(StoreError::io(&side, e)),
+        }
     }
 
     /// Pread `buf` with no logical-end load.

@@ -7,6 +7,7 @@ mod block_queue;
 mod block_wire;
 mod bulk_io;
 mod chain;
+mod class_a_tail;
 mod compact;
 mod create_loc;
 mod delta_loc;

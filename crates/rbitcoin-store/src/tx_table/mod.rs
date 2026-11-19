@@ -735,6 +735,54 @@ pub fn class_a_body_occupied(dir: &Path, stem: &str) -> bool {
 /// commit, a scripthash mark). See [`TxTable::sync_class_a_named`].
 pub const CLASS_A_SYNCED_NAME: &str = "class_a.synced";
 
+/// Class A stems whose append can rewrite a synced partial 4 KiB block.
+const CLASS_A_KEPT_TAILS: &[&str] = &[
+    "txout.body",
+    "spent.body",
+    "txid.body",
+    "create.loc",
+    "create.loc.ovf",
+    "create.off",
+    "seqsigwit.body",
+    "seqsigwit.loc",
+    "seqsigwit.loc.ovf",
+    "seqsigwit.off",
+    "txstat.body",
+    "txstat.ovf",
+    "txstat.blk",
+    "input.loc",
+    "input.off",
+    "input.body",
+];
+
+/// Put a torn partial tail back before any stem is opened.
+fn restore_class_a_kept_tails(dir: &Path) -> Result<(), StoreError> {
+    for name in CLASS_A_KEPT_TAILS {
+        crate::file::restore_kept_tail(&dir.join(name))?;
+    }
+    Ok(())
+}
+
+/// Drop tail copies after their files are synced, then sync each parent once.
+fn drop_kept_tails(files: &[&crate::file::TableFile]) -> Result<(), StoreError> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for file in files {
+        if !file.drop_kept_tail()? {
+            continue;
+        }
+        let Some(parent) = file.path.parent() else {
+            continue;
+        };
+        if !dirs.iter().any(|d| d == parent) {
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    for dir in dirs {
+        crate::file::fsync_parent_dir(&dir).map_err(|e| StoreError::io(&dir, e))?;
+    }
+    Ok(())
+}
+
 /// [`CLASS_A_SYNCED_NAME`], or 0 when absent.
 pub fn read_class_a_synced(dir: &Path) -> Result<u64, StoreError> {
     let path = dir.join(CLASS_A_SYNCED_NAME);
@@ -1531,6 +1579,10 @@ impl TxTable {
         opts: HeadOpenOpts,
         committed: Option<u64>,
     ) -> Result<Self, StoreError> {
+        restore_class_a_kept_tails(dir)?;
+        if seqsigwit_dir != dir {
+            restore_class_a_kept_tails(seqsigwit_dir)?;
+        }
         crate::store::rename_legacy_inwit_files(dir)?;
         crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
@@ -4079,7 +4131,7 @@ impl TxTable {
     }
 
     fn sync_class_a_stems(&self) -> Result<(), StoreError> {
-        crate::file::TableFile::sync_data_all(&[
+        let files: [&crate::file::TableFile; 16] = [
             &self.body.body,
             &self.seqsigwit.body,
             &self.spent.body,
@@ -4096,7 +4148,9 @@ impl TxTable {
             &self.input.loc,
             &self.input.off,
             &self.input.body,
-        ])
+        ];
+        crate::file::TableFile::sync_data_all(&files)?;
+        drop_kept_tails(&files)
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {

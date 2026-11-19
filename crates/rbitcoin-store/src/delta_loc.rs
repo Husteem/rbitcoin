@@ -187,6 +187,7 @@ pub fn ovf_lookup_strides(
 pub fn open_loc_file(path: &Path, kind: TableKind) -> Result<TableFile, StoreError> {
     let f = TableFile::open(path, kind)?;
     f.set_grow_policy(GrowPolicy::Tight1MiB);
+    f.arm_synced_tail();
     Ok(f)
 }
 
@@ -194,6 +195,7 @@ pub fn open_loc_file(path: &Path, kind: TableKind) -> Result<TableFile, StoreErr
 pub fn create_loc_file(path: &Path, kind: TableKind) -> Result<TableFile, StoreError> {
     let f = TableFile::create(path, kind)?;
     f.set_grow_policy(GrowPolicy::Tight1MiB);
+    f.arm_synced_tail();
     Ok(f)
 }
 
