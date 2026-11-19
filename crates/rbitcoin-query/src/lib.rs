@@ -398,8 +398,10 @@ pub struct ShWriteBehind {
     /// Serializes Class B `put_create_batch_append`: write-behind, the
     /// generate drain, and the Class A tail backfill.
     pub appender: Mutex<()>,
-    /// Even while the durable posting list and `ram_head` agree.
-    /// Odd across the append and the RAM drop in `apply_sh_job_inner`.
+    /// Even while no apply is moving creates from `ram_head` into the
+    /// durable list. Odd from that append through the RAM drop in
+    /// `apply_sh_job_inner`. Write-behind lag leaves creates only in
+    /// `ram_head` while this stays even.
     pub publish_seq: AtomicU64,
     /// Max create fk applied to the SH tables (may lead `include_hwm`).
     pub applied_max_fk: AtomicU64,

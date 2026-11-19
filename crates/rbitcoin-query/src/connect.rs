@@ -1170,9 +1170,10 @@ impl Query {
             return Ok(false);
         }
 
-        // Odd for the whole publish. Readers that sampled an even seq
-        // before this cannot pair that durable list with the post-drop RAM list.
-        let _publish = ShPublishGuard::enter(&self.sh.publish_seq);
+        // Odd across the append and the RAM drop. Readers that sampled an
+        // even seq before this cannot pair that durable list with the
+        // post-drop RAM list. The inclusion sync stays outside this window.
+        let publish = ShPublishGuard::enter(&self.sh.publish_seq);
         let sh_creates = &job.records;
 
         if !sh_creates.is_empty() {
@@ -1198,12 +1199,13 @@ impl Query {
             st.add_sh_part(&st.sh_head_ns, timing.head_ns);
         }
 
+        unindex_sh_ram_head(&mut self.sh.ram_head.lock().unwrap(), job);
+        drop(publish);
         self.set_sh_indexed_through_height(Some(job.height.0));
         self.sh
             .applied_max_fk
             .fetch_max(tip_sh_max_fk, Ordering::AcqRel);
         self.advance_sh_include_hwm()?;
-        unindex_sh_ram_head(&mut self.sh.ram_head.lock().unwrap(), job);
         Ok(true)
     }
 

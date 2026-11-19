@@ -13,8 +13,11 @@ thread_local! {
 }
 
 #[cfg(debug_assertions)]
+type ShPostingGapHook = fn(&Query) -> Result<(), QueryError>;
+
+#[cfg(debug_assertions)]
 thread_local! {
-    static SH_POSTING_GAP: std::cell::Cell<Option<fn(&Query) -> Result<(), QueryError>>> =
+    static SH_POSTING_GAP: std::cell::Cell<Option<ShPostingGapHook>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -22,7 +25,7 @@ thread_local! {
 /// pending RAM list. Tests commit write-behind in that gap.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
-pub fn set_sh_posting_gap_for_test(hook: Option<fn(&Query) -> Result<(), QueryError>>) {
+pub fn set_sh_posting_gap_for_test(hook: Option<ShPostingGapHook>) {
     SH_POSTING_GAP.with(|slot| slot.set(hook));
 }
 
@@ -1335,6 +1338,7 @@ impl Query {
 
     /// Runs `body` while `publish_seq` stays even.
     /// A commit between the durable list and the RAM list runs `body` again.
+    /// An error is returned only when that sequence did not move.
     fn read_stable_sh_publish<T>(
         &self,
         body: impl Fn(&Self) -> Result<T, QueryError>,
@@ -1349,16 +1353,28 @@ impl Query {
                 continue;
             }
             std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-            let value = body(self)?;
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-            let seq2 = self
-                .sh
-                .publish_seq
-                .load(std::sync::atomic::Ordering::Acquire);
-            if seq1 == seq2 {
+            let value = match body(self) {
+                Ok(value) => value,
+                Err(err) => {
+                    if self.sh_publish_unchanged(seq1) {
+                        return Err(err);
+                    }
+                    continue;
+                }
+            };
+            if self.sh_publish_unchanged(seq1) {
                 return Ok(value);
             }
         }
+    }
+
+    /// Acquire fence, then the counter. Same closing check as `seq_holds`.
+    fn sh_publish_unchanged(&self, seq1: u64) -> bool {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        self.sh
+            .publish_seq
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == seq1
     }
 
     /// Durable creates and pending RAM creates from one even `publish_seq`.
