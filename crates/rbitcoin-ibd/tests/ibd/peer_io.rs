@@ -329,8 +329,6 @@ fn test_ctx(
         sinks: PeerEventSinks {
             body: body_tx,
             ctrl: ctrl_tx,
-
-            header_fks: empty_header_fk_bus(),
         },
         requested: Arc::new(Mutex::new(HashSet::new())),
         solicited_bytes: Arc::new(AtomicU64::new(0)),
@@ -541,8 +539,6 @@ fn ping_and_solicited_block_stay_on_their_channels() {
             peer,
             hash: got,
             payload,
-
-            header_fk: _,
         } => {
             assert_eq!(peer, 3);
             assert_eq!(got, hash);
@@ -753,8 +749,6 @@ fn sinks() -> (
         PeerEventSinks {
             body: body_tx,
             ctrl: ctrl_tx,
-
-            header_fks: empty_header_fk_bus(),
         },
         body_rx,
         ctrl_rx,
@@ -869,8 +863,6 @@ fn event_sinks_send_body_and_ctrl() {
     let sinks = PeerEventSinks {
         body: body_tx,
         ctrl: ctrl_tx,
-
-        header_fks: empty_header_fk_bus(),
     };
     sinks.send_body(PeerEvent::Dead {
         peer: 1,

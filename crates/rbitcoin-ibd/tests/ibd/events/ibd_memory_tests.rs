@@ -167,7 +167,6 @@ fn unsolicited_body_is_not_copied_into_the_queue() {
             peer: 0,
             hash,
             payload: payload.clone(),
-            header_fk: None,
         },
     );
     assert_eq!(
@@ -187,7 +186,6 @@ fn unsolicited_body_is_not_copied_into_the_queue() {
             peer: 0,
             hash,
             payload,
-            header_fk: None,
         },
     );
     assert!(
@@ -206,7 +204,6 @@ fn unsolicited_body_is_not_copied_into_the_queue() {
             peer: 0,
             hash,
             payload: serialize(&block),
-            header_fk: None,
         },
     );
     assert_eq!(
@@ -245,7 +242,6 @@ fn undecodable_body_at_occupied_height_keeps_the_peer() {
             peer: 0,
             hash,
             payload: serialize(&block),
-            header_fk: None,
         },
     );
     let queued = hub.query.block_queue_stats().0;
@@ -271,7 +267,6 @@ fn undecodable_body_at_occupied_height_keeps_the_peer() {
             peer: 0,
             hash: other,
             payload: b"not a block".to_vec(),
-            header_fk: None,
         },
     );
     assert!(

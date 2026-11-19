@@ -473,7 +473,6 @@ pub fn apply_peer_event(
             peer,
             hash,
             payload,
-            header_fk,
         } => apply_block_framed(
             st,
             hub,
@@ -483,7 +482,6 @@ pub fn apply_peer_event(
                 peer,
                 hash,
                 payload,
-                header_fk,
             },
         ),
         PeerEvent::BlockDecodeFailed { peer, hash } => apply_block_decode_failed(st, peer, hash),
@@ -533,8 +531,7 @@ pub fn apply_headers_event(
     }
     let owned = std::mem::replace(st, IbdWorkState::new(Vec::new(), None, None));
     let shared = std::sync::Mutex::new(owned);
-    let bus = super::peer_io::empty_header_fk_bus();
-    run_header_batch(&shared, hub, peer, headers, &bus);
+    run_header_batch(&shared, hub, peer, headers);
     *st = shared.into_inner().unwrap_or_else(|err| err.into_inner());
 }
 
@@ -581,7 +578,6 @@ pub fn run_header_batch(
     hub: &ChainHub,
     peer: usize,
     headers: Vec<bitcoin::block::Header>,
-    bus: &super::peer_io::HeaderFkBus,
 ) {
     let (mark, plan) = {
         let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
@@ -595,16 +591,11 @@ pub fn run_header_batch(
                 st.reorg.invalid.iter().collect()
             };
             let path = super::path::load_resume_entries(hub, &exclude);
-            let pairs: Vec<(BlockHash, rbitcoin_primitives::Fk)> = path
-                .iter()
-                .map(|e| (BlockHash::from_byte_array(e.hash), e.header_fk))
-                .collect();
             {
                 let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
                 super::path::stage_resumed_path(&mut st, hub, &path);
             }
-            super::peer_io::publish_header_fks(bus, &pairs);
-            let rewound = match super::reorg::rewind_off_coord_lock(shared, hub, Some(bus)) {
+            let rewound = match super::reorg::rewind_off_coord_lock(shared, hub) {
                 Ok(rewound) => rewound,
                 Err(e) => {
                     rbitcoin_log::warn!("ibd: header-thread rewind failed: {e}");
@@ -625,12 +616,6 @@ pub fn run_header_batch(
         } => {
             let (fks, work) = fks_for_kept(&known, hub, &headers[known.len()..]);
             let n = fks.len().min(headers.len());
-            let pairs: Vec<(BlockHash, rbitcoin_primitives::Fk)> = headers
-                .iter()
-                .take(n)
-                .map(|h| h.block_hash())
-                .zip(fks.iter().copied())
-                .collect();
             let ask = {
                 let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
                 let added = on_headers_batch(&mut st, hub, peer, headers, &fks, work);
@@ -638,9 +623,7 @@ pub fn run_header_batch(
                 finish_mark(&mut st, hub, peer, &mark);
                 ask
             };
-            super::peer_io::publish_header_fks(bus, &pairs);
-            let rewound =
-                super::reorg::rewind_off_coord_lock(shared, hub, Some(bus)).unwrap_or(false);
+            let rewound = super::reorg::rewind_off_coord_lock(shared, hub).unwrap_or(false);
             if rewound {
                 let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
                 let _ = try_apply_exploration(&mut st, hub);
@@ -860,7 +843,6 @@ pub struct FramedBody {
     pub peer: usize,
     pub hash: BlockHash,
     pub payload: Vec<u8>,
-    pub header_fk: Option<rbitcoin_primitives::Fk>,
 }
 
 #[doc(hidden)]
@@ -875,7 +857,6 @@ pub fn apply_block_framed(
         peer,
         hash,
         payload,
-        header_fk,
     } = body;
     let wire_bytes = payload.len();
     // Unsolicited wire is not a body we asked for. Drop it before any copy
@@ -895,10 +876,7 @@ pub fn apply_block_framed(
     if st.body.is_rejected(&hash) || hub.has_block(&hash) {
         return;
     }
-    let header_fk = if let Some(fk) = header_fk {
-        st.header_fks.insert(hash, fk);
-        fk
-    } else if let Some(&fk) = st.header_fks.get(&hash) {
+    let header_fk = if let Some(&fk) = st.header_fks.get(&hash) {
         fk
     } else {
         st.body.mark_missing(hash);

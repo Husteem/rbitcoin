@@ -534,7 +534,6 @@ fn offer_framed(
             peer: 0,
             hash,
             payload: payload.to_vec(),
-            header_fk: Some(Fk(1)),
         },
     );
 }

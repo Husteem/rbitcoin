@@ -1,6 +1,5 @@
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
-use rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus;
 use rbitcoin_ibd::ibd::state::IbdWorkState;
 
 use rbitcoin_ibd::ibd::events::run_header_batch;
@@ -35,7 +34,7 @@ fn stray_batch_is_not_persisted() {
     let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
     let _ = rbitcoin_ibd::ibd::header_walk::send_getheaders(&mut st, &hub);
     let shared = Mutex::new(st);
-    run_header_batch(&shared, &hub, 0, vec![header], &empty_header_fk_bus());
+    run_header_batch(&shared, &hub, 0, vec![header]);
     assert_eq!(side_count(&hub), 0);
     let _ = std::fs::remove_dir_all(dir);
 }

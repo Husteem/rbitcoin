@@ -5,7 +5,7 @@
 #![cfg(target_os = "linux")]
 
 use rbitcoin_ibd::ibd::published::IBD_HEADER_THREAD_NAME;
-use rbitcoin_ibd::ibd::{empty_header_fk_bus, spawn_header_thread, IbdWorkState};
+use rbitcoin_ibd::ibd::{spawn_header_thread, IbdWorkState};
 use rbitcoin_store::HeaderThreadProbe;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,7 +21,6 @@ fn header_thread_comm_is_ibd_header() {
         Arc::new(Mutex::new(state)),
         hub,
         rx,
-        empty_header_fk_bus(),
         HeaderThreadProbe::new(),
     );
     assert_eq!(IBD_HEADER_THREAD_NAME, "ibd-header");
