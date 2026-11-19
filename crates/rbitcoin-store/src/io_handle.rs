@@ -2,6 +2,8 @@
 //!
 //! Unix: raw fd. Windows: `HANDLE`. The session never closes the handle.
 
+use crate::durability::Durable;
+
 /// Borrowed OS handle for one positional pread/pwrite. Copy, not an owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct IoHandle {
@@ -82,10 +84,10 @@ impl IoHandle {
         }
     }
 
-    /// `File::sync_data` on the borrowed handle: `fdatasync` on Linux,
-    /// `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows. Returns 0 or
-    /// negated errno.
-    pub fn sync_data(self) -> i32 {
+    /// [`Durable::durable_sync_data`] on the borrowed handle: `fdatasync` on
+    /// Linux, `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows. Returns 0
+    /// or negated errno.
+    pub fn durable_sync_data(self) -> i32 {
         #[cfg(debug_assertions)]
         if let Some(r) = injected_sync(self) {
             return r;
@@ -102,7 +104,7 @@ impl IoHandle {
                 self.handle as _,
             )
         });
-        match file.sync_data() {
+        match file.durable_sync_data() {
             Ok(()) => 0,
             Err(e) => -e.raw_os_error().unwrap_or(5),
         }

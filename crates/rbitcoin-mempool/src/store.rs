@@ -31,6 +31,7 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid, Wtxid};
 use rbitcoin_primitives::{bytes, le_u16, le_u32, le_u64};
+use rbitcoin_store::durability::Durable as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -347,7 +348,7 @@ impl Mempool {
                 .map_err(|e| MempoolError::io(&path, e))?;
         }
         self.slots_file
-            .sync_data()
+            .durable_sync_data()
             .map_err(|e| MempoolError::io(&path, e))?;
         Ok(())
     }
@@ -866,7 +867,7 @@ impl Mempool {
             .set_len(logical)
             .map_err(|e| MempoolError::io(&body_path, e))?;
         self.body_file
-            .sync_data()
+            .durable_sync_data()
             .map_err(|e| MempoolError::io(&body_path, e))?;
         self.body_persisted_len = logical;
         Ok(())
@@ -905,7 +906,8 @@ impl Mempool {
             .map_err(|e| MempoolError::io(path, e))?;
         file.write_all(bytes)
             .map_err(|e| MempoolError::io(path, e))?;
-        file.sync_data().map_err(|e| MempoolError::io(path, e))?;
+        file.durable_sync_data()
+            .map_err(|e| MempoolError::io(path, e))?;
         Ok(())
     }
 
@@ -946,7 +948,7 @@ impl Mempool {
             .write_all(&meta)
             .map_err(|e| MempoolError::io(&meta_path, e))?;
         self.meta_file
-            .sync_data()
+            .durable_sync_data()
             .map_err(|e| MempoolError::io(&meta_path, e))?;
         #[cfg(debug_assertions)]
         {
@@ -980,7 +982,7 @@ impl Mempool {
         }
         let path = self.dir.join("slots");
         self.slots_file
-            .sync_data()
+            .durable_sync_data()
             .map_err(|e| MempoolError::io(&path, e))?;
         #[cfg(debug_assertions)]
         {
@@ -1050,7 +1052,8 @@ pub fn body_logical_len(body: &[u8]) -> Result<usize, MempoolError> {
 pub fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<(), MempoolError> {
     let mut f = File::create(path).map_err(|e| MempoolError::io(path, e))?;
     f.write_all(bytes).map_err(|e| MempoolError::io(path, e))?;
-    f.sync_all().map_err(|e| MempoolError::io(path, e))?;
+    f.durable_sync_all()
+        .map_err(|e| MempoolError::io(path, e))?;
     Ok(())
 }
 

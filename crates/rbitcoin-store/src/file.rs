@@ -33,6 +33,7 @@
 //! - Roles (see `docs/concurrency.md`): at most one appender and
 //!   one annotator; N concurrent readers of published ranges.
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
 use rbitcoin_primitives::{le_u64, schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
@@ -149,7 +150,7 @@ where
         let mut f = open_tmp(&tmp, private).map_err(|e| StoreError::io(&tmp, e))?;
         write(&mut f)?;
         if sync != TmpSync::None {
-            f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+            f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
         }
     }
     std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
@@ -189,7 +190,7 @@ pub fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
         if fail_dir_sync() {
             return Err(std::io::Error::other("injected directory sync failure"));
         }
-        let result = std::fs::File::open(dir)?.sync_all();
+        let result = std::fs::File::open(dir)?.durable_sync_all();
         #[cfg(debug_assertions)]
         if result.is_ok() {
             note_fsynced_dir(dir);
@@ -1387,7 +1388,7 @@ impl TableFile {
             ));
         }
         self.read_file
-            .sync_data()
+            .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))
     }
 
@@ -1421,7 +1422,7 @@ impl TableFile {
                 // Never submitted: sync it here.
                 i32::MIN => f
                     .read_file
-                    .sync_data()
+                    .durable_sync_data()
                     .map_err(|e| StoreError::io(&f.path, e))?,
                 r => {
                     return Err(StoreError::io(
@@ -1465,7 +1466,7 @@ impl TableFile {
         self.file
             .lock()
             .unwrap()
-            .sync_data()
+            .durable_sync_data()
             .map_err(|e| StoreError::io(&self.path, e))
     }
 
