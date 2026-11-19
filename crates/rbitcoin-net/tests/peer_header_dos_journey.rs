@@ -796,6 +796,10 @@ async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub)
         follow.ban_score >= BAN_SCORE_THRESHOLD,
         "time-too-old must disconnect a requested block"
     );
+    assert!(
+        hub.is_block_invalid(&too_old.block_hash()),
+        "a too-old block message is marked failed"
+    );
     let mut follow = PeerFollowState::new();
     push(
         hub,
@@ -824,6 +828,7 @@ async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub)
         "a stamp past the two-hour window is temporary: {time_err}"
     );
     let mut follow = PeerFollowState::new();
+    assert!(hub.claim_block_ask(&future.block_hash()));
     follow.requested_blocks.insert(future.block_hash());
     push(
         hub,
@@ -836,6 +841,10 @@ async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub)
     assert_eq!(
         follow.ban_score, 0,
         "time-too-new must not disconnect a requested block"
+    );
+    assert!(
+        !hub.already_have_or_asked_block(&future.block_hash()),
+        "a temporary reject releases the block ask"
     );
     let mut follow = PeerFollowState::new();
     push(hub, &out_tx, &mut follow, None, NetworkMessage::Block(future)).await;

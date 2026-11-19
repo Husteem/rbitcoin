@@ -2660,8 +2660,19 @@ fn ensure_header_fork_child_rejects_old_time_and_wrong_bits() {
     assert!(hub
         .stored_header_height(&BlockHash::from_byte_array([0xab; 32]))
         .is_none());
-    let mtp = hub.mtp_off_tip(&b1.header, &empty);
+    let mtp = hub
+        .mtp_off_tip(&b1.header, &empty)
+        .expect("the walk from b1 reaches genesis");
     assert!(mtp <= b1.header.time);
+    let mut orphan = b1.header;
+    orphan.prev_blockhash = BlockHash::from_byte_array([0xab; 32]);
+    let err = hub
+        .mtp_off_tip(&orphan, &empty)
+        .expect_err("an unknown ancestor leaves the median window incomplete");
+    assert!(
+        err.is_local_fault(),
+        "an incomplete median window is a local fault: {err}"
+    );
     let child_bits = hub
         .expected_bits_off_tip(&h2, &b1.header, 1, None, &empty)
         .unwrap();

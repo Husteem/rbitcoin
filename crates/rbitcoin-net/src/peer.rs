@@ -6196,8 +6196,14 @@ pub async fn on_block(
         return Ok(());
     }
     if let Err(e) = ensure_peer_header(hub, &block.header) {
-        if !crate::chain::accept_err_is_temporary_time(&e) {
-            misbehaving(&mut follow.ban_score, session);
+        if e.is_local_fault() || crate::chain::accept_err_is_temporary_time(&e) {
+            follow.requested_blocks.remove(&hash);
+            hub.forget_asked_block(&hash);
+            return Ok(());
+        }
+        misbehaving(&mut follow.ban_score, session);
+        if e.consensus_rules().is_some() {
+            hub.remember_failed_accept(hash, &e);
         }
         return Ok(());
     }
@@ -6233,8 +6239,14 @@ pub fn on_block_unrequested_skip(
         return Ok(true);
     }
     if let Err(e) = ensure_peer_header(hub, &block.header) {
-        if !crate::chain::accept_err_is_temporary_time(&e) {
-            misbehaving(&mut follow.ban_score, session);
+        if e.is_local_fault() || crate::chain::accept_err_is_temporary_time(&e) {
+            follow.requested_blocks.remove(&hash);
+            hub.forget_asked_block(&hash);
+            return Ok(true);
+        }
+        misbehaving(&mut follow.ban_score, session);
+        if e.consensus_rules().is_some() {
+            hub.remember_failed_accept(hash, &e);
         }
         return Ok(true);
     }
