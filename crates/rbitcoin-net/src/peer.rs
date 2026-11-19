@@ -2092,7 +2092,9 @@ pub fn on_tx_announce_ok(
     if !tx_announce_peer_ready(session, mp, &txid) {
         return Ok(());
     }
-    let inv = tx_announce_inv(mp, &txid);
+    let Some(inv) = tx_announce_inv(mp, &txid) else {
+        return Ok(());
+    };
     // Core erases a below-filter tx from this peer's to-send set. A later
     // lower feefilter does not announce it (`p2p_feefilter.py`).
     if tx_announce_below_feefilter(session, mp, &txid) {
@@ -2172,12 +2174,15 @@ pub fn tx_announce_should_queue(
     tx_announce_peer_ready(session, mp, txid) && !tx_announce_below_feefilter(session, mp, txid)
 }
 
+/// `None` when the tx left the pool after the ready check. Core skips such a
+/// tx; `MSG_WITNESS_TX` is a `getdata` type and never goes in an `inv`.
 #[doc(hidden)]
-pub fn tx_announce_inv(mp: &crate::tx_relay::MempoolHub, txid: &bitcoin::Txid) -> Inventory {
-    match mp.try_get_tx(txid) {
-        Some(tx) => Inventory::WTx(tx.compute_wtxid()),
-        None => Inventory::WitnessTransaction(*txid),
-    }
+pub fn tx_announce_inv(
+    mp: &crate::tx_relay::MempoolHub,
+    txid: &bitcoin::Txid,
+) -> Option<Inventory> {
+    mp.try_get_tx(txid)
+        .map(|tx| Inventory::WTx(tx.compute_wtxid()))
 }
 
 #[doc(hidden)]

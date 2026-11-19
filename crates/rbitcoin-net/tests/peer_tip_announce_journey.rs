@@ -251,7 +251,11 @@ fn tip_announce_ibd_feefilter_and_empty_inv() {
 }
 
 /// Run one `getblocks` and return its `inv` (empty when nothing was sent).
-fn getblocks_inv(hub: &ChainHub, follow: &mut PeerFollowState, gb: &GetBlocksMessage) -> Vec<Inventory> {
+fn getblocks_inv(
+    hub: &ChainHub,
+    follow: &mut PeerFollowState,
+    gb: &GetBlocksMessage,
+) -> Vec<Inventory> {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -273,7 +277,10 @@ fn getblocks_inv(hub: &ChainHub, follow: &mut PeerFollowState, gb: &GetBlocksMes
 fn best_chain_from_1(hub: &ChainHub, n: usize) -> Vec<BlockHash> {
     let mut out = vec![hub.tip_hash().expect("tip")];
     while out.len() < n {
-        let prev = hub.header_of(out.last().unwrap()).expect("header").prev_blockhash;
+        let prev = hub
+            .header_of(out.last().unwrap())
+            .expect("header")
+            .prev_blockhash;
         out.push(prev);
     }
     out.reverse();
@@ -353,18 +360,44 @@ fn getblocks_full_page_continues_with_a_tip_inv() {
 
     let out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(chain[498]));
     assert_eq!(out.len(), 1, "a block inside the page is served alone");
-    assert_eq!(served_block(out.into_iter().next().unwrap()).block_hash(), chain[498]);
+    assert_eq!(
+        served_block(out.into_iter().next().unwrap()).block_hash(),
+        chain[498]
+    );
 
     let mut out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(chain[499])).into_iter();
-    assert_eq!(served_block(out.next().expect("block")).block_hash(), chain[499]);
-    let NetworkMessage::Inv(tip) = out.next().expect("tip inv after the last page block").expect_msg() else {
+    assert_eq!(
+        served_block(out.next().expect("block")).block_hash(),
+        chain[499]
+    );
+    let NetworkMessage::Inv(tip) = out
+        .next()
+        .expect("tip inv after the last page block")
+        .expect_msg()
+    else {
         panic!("the continuation is an inv");
     };
-    assert_eq!(tip, vec![Inventory::Block(chain[509])], "one MSG_BLOCK inv of the tip");
+    assert_eq!(
+        tip,
+        vec![Inventory::Block(chain[509])],
+        "one MSG_BLOCK inv of the tip"
+    );
     assert!(out.next().is_none());
 
     let out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(chain[499]));
     assert_eq!(out.len(), 1, "the continuation fires once");
+}
+
+/// A tx that left the pool between the ready check and the inv is not
+/// announced, as Core skips it. The old fallback was `MSG_WITNESS_TX`, a
+/// `getdata`-only type.
+#[test]
+fn tx_announce_skips_a_tx_gone_from_the_pool() {
+    let (_dir, hub) = open_tip_announce_hub("tx-announce-gone");
+    let mp = hub.mempool().expect("mempool");
+    let gone = bitcoin::Txid::from_byte_array([0x5a; 32]);
+    assert!(!mp.try_contains(&gone));
+    assert_eq!(tx_announce_inv(mp, &gone), None);
 }
 
 /// The `block` payload of a served `getdata`, as it goes on the wire.
@@ -424,7 +457,10 @@ fn getdata_msg_block_is_served_without_witness() {
         }
     }
     let stripped = serialize(&stripped);
-    assert!(full.total_size() > stripped.len(), "the block carries witness data");
+    assert!(
+        full.total_size() > stripped.len(),
+        "the block carries witness data"
+    );
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -439,7 +475,11 @@ fn getdata_msg_block_is_served_without_witness() {
     let out = getdata_out(&rt, &hub, &mut follow, Inventory::WitnessBlock(h));
     assert_eq!(out.len(), 1);
     let witness = served_block_payload(out.into_iter().next().unwrap());
-    assert_eq!(witness, serialize(&full), "MSG_WITNESS_BLOCK keeps the witness");
+    assert_eq!(
+        witness,
+        serialize(&full),
+        "MSG_WITNESS_BLOCK keeps the witness"
+    );
 }
 
 /// Headers peer gets one header. Inv peer gets `MSG_BLOCK`, not a witness inv.
