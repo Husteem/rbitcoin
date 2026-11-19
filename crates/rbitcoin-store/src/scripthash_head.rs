@@ -10,6 +10,9 @@
 //! unacceptable. Durable sidecar `{shard}.occ` holds the count (written on create,
 //! reinit, cold install, and inserts). Large shards without a sidecar skip
 //! the scan and mark occupancy **unknown** (never treated as empty, never bulk-fill).
+//! A zero sidecar on a large shard is not proof the slots are empty: the table
+//! write can land before the sidecar rename. A bulk fill scans first and keeps
+//! any live slots.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
@@ -217,18 +220,18 @@ impl ScriptHashHead {
     }
 
     #[doc(hidden)]
-    pub fn persist_occ(&self, occupied: u64) {
-        let _ = store_occ_sidecar(self.file.path(), occupied);
+    pub fn persist_occ(&self, occupied: u64) -> Result<(), StoreError> {
+        store_occ_sidecar(self.file.path(), occupied)
     }
 
     #[doc(hidden)]
-    pub fn set_occupied_known(&self, occupied: u64) {
+    pub fn set_occupied_known(&self, occupied: u64) -> Result<(), StoreError> {
         {
             let mut state = self.state.lock().unwrap();
             state.occupied = occupied;
             state.occ_known = true;
         }
-        self.persist_occ(occupied);
+        self.persist_occ(occupied)
     }
 
     #[doc(hidden)]
@@ -352,12 +355,24 @@ impl ScriptHashHead {
             return Ok(());
         }
         // Bulk-fill only when occupancy is known empty — never when open skipped
-        // the scan (would overwrite a live multi‑GiB table). Does not grow.
+        // the scan (would overwrite a live multi‑GiB table). A large head whose
+        // sidecar is still 0 may already hold slots; scan before replacing them.
         {
             let state = self.state.lock().unwrap();
             if state.occ_known && state.occupied == 0 {
+                let slots = state.slots;
                 drop(state);
-                return self.bulk_fill_empty(&upserts);
+                let body = slots.saturating_mul(SH_HEAD_SLOT_SIZE as u64);
+                if body > OCC_SCAN_BYTE_CAP {
+                    let live = scan_occupied(&self.file, slots)?;
+                    if live > 0 {
+                        self.set_occupied_known(live)?;
+                    } else {
+                        return self.bulk_fill_empty(&upserts);
+                    }
+                } else {
+                    return self.bulk_fill_empty(&upserts);
+                }
             }
         }
 
@@ -410,7 +425,7 @@ impl ScriptHashHead {
             if state.occ_known {
                 let occ = state.occupied;
                 drop(state);
-                self.persist_occ(occ);
+                self.persist_occ(occ)?;
             }
         }
         Ok(())
@@ -470,7 +485,7 @@ impl ScriptHashHead {
             }
         }
         self.file.write_at(FILE_HEADER_LEN as u64, &table)?;
-        self.set_occupied_known(occupied);
+        self.set_occupied_known(occupied)?;
         Ok(())
     }
 
