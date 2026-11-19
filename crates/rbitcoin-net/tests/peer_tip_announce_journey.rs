@@ -250,6 +250,33 @@ fn tip_announce_ibd_feefilter_and_empty_inv() {
     assert!(out_rx.try_recv().is_err(), "no headers means no inv");
 }
 
+/// `getblocks` from genesis is answered as Core answers it: an `inv` of `MSG_BLOCK`, one per block after the
+/// locator. `MSG_WITNESS_BLOCK` is a `getdata` type; bitcoinj rejects it in an `inv`.
+#[test]
+fn getblocks_answers_msg_block_inv() {
+    let (_dir, hub) = open_tip_announce_hub("getblocks-inv");
+    let hub = &hub;
+    let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
+    let gb = GetBlocksMessage::new(vec![genesis], BlockHash::all_zeros());
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getblocks runtime")
+        .block_on(on_getblocks(hub, &out_tx, &mut follow, None, &gb))
+        .expect("getblocks");
+    let NetworkMessage::Inv(inv) = out_rx.try_recv().unwrap().expect_msg() else {
+        panic!("getblocks must be answered with inv");
+    };
+    assert_eq!(inv.len(), 102, "one entry per block above genesis");
+    assert!(
+        inv.iter().all(|i| matches!(i, Inventory::Block(_))),
+        "getblocks inv must be MSG_BLOCK, got {:?}",
+        inv.first()
+    );
+}
+
 /// Headers peer gets one header. Inv peer gets `MSG_BLOCK`, not a witness inv.
 #[test]
 fn tip_announce_headers_versus_inv() {

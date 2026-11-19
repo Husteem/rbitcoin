@@ -4602,7 +4602,7 @@ pub async fn on_getblocks(
     let inv: Vec<Inventory> = headers
         .into_iter()
         .take(500)
-        .map(|h| Inventory::WitnessBlock(h.block_hash()))
+        .map(|h| Inventory::Block(h.block_hash()))
         .collect();
     if !inv.is_empty() {
         queue_accounted(session, out_tx, NetworkMessage::Inv(inv))?;
