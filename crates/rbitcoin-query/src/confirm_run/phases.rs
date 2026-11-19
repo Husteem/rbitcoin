@@ -376,8 +376,12 @@ pub fn structural_run(
     }
     let mut tot = StructuralPhaseNs::default();
     let bip34_ancestor = bip34_ancestor_for_write(query, params, prepared);
-    reuse.scratch.meta_offs =
-        crate::block_pipeline::write_meta_abs_offs(abs_jobs.iter().map(Vec::as_slice));
+    // Each block reads its slice of this one prefetch.
+    reuse.scratch.meta_offs = abs_jobs
+        .iter()
+        .flatten()
+        .map(|&(_, _, abs, _, _)| abs)
+        .collect();
     if !reuse.scratch.meta_offs.is_empty() {
         let meta_backend = rbitcoin_store::spend_meta_backend();
         let t_meta = Instant::now();

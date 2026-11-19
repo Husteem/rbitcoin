@@ -181,18 +181,16 @@ pub struct ArchivePlanNs {
 /// started from, which only moves back at open, so no note names them.
 #[derive(Debug, Default)]
 pub struct Appended {
-    fks: Vec<rbitcoin_primitives::Fk>,
+    /// The first appended row. Class A allocates the rest after it in order.
+    first: u64,
     loc: Vec<rbitcoin_store::CreateLocPair>,
 }
 
 impl Appended {
     /// `spent.body` range of `fk` when this batch appended it.
     fn spent(&self, fk: rbitcoin_primitives::Fk) -> Option<(u64, u64)> {
-        let base = self.fks.first()?.get()?;
-        let at = usize::try_from(fk.get()?.checked_sub(base)?).ok()?;
-        (self.fks.get(at) == Some(&fk))
-            .then(|| self.loc.get(at).map(|pair| pair.spent))
-            .flatten()
+        let at = usize::try_from(fk.get()?.checked_sub(self.first)?).ok()?;
+        self.loc.get(at).map(|pair| pair.spent)
     }
 }
 
@@ -267,7 +265,7 @@ pub fn apply_archive_plan(
         query.set_class_a_hi(Some(last.height.0));
     }
     ns.appended = Appended {
-        fks: planned_fks,
+        first: planned_fks.first().and_then(|fk| fk.get()).unwrap_or(0),
         loc,
     };
     Ok(ns)

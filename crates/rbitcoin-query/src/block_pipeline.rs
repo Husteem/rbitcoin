@@ -631,7 +631,6 @@ pub struct StructuralScratch {
     pub abs_jobs: Vec<StructuralAbsJob>,
     pub unique_fks: Vec<rbitcoin_primitives::Fk>,
     pub height_by_id: U64Map<u32>,
-    pub disk_jobs: Vec<StructuralAbsJob>,
     pub abs_offs: Vec<u64>,
     pub field_fks: Vec<rbitcoin_primitives::Fk>,
     pub field_seen: crate::U64Set,
@@ -659,7 +658,6 @@ impl Default for StructuralScratch {
             abs_jobs: Vec::new(),
             unique_fks: Vec::new(),
             height_by_id: U64Map::default(),
-            disk_jobs: Vec::new(),
             abs_offs: Vec::new(),
             field_fks: Vec::new(),
             field_seen: crate::U64Set::default(),
@@ -695,7 +693,6 @@ impl StructuralScratch {
         self.abs_jobs.clear();
         self.unique_fks.clear();
         self.height_by_id.clear();
-        self.disk_jobs.clear();
         self.abs_offs.clear();
         self.field_fks.clear();
         self.field_seen.clear();
@@ -888,18 +885,6 @@ pub fn contiguous_create_spans(
 #[doc(hidden)]
 pub type DurableSpentSet =
     std::collections::HashSet<(u64, u32), BuildHasherDefault<rbitcoin_consensus::OutPointHasher>>;
-/// Disk offsets of every abs job in this write, in write order: each block
-/// reads its slice of one prefetch.
-#[doc(hidden)]
-pub fn write_meta_abs_offs<'a>(
-    blocks: impl IntoIterator<Item = &'a [StructuralAbsJob]>,
-) -> Vec<u64> {
-    blocks
-        .into_iter()
-        .flatten()
-        .map(|&(_, _, abs, _, _)| abs)
-        .collect()
-}
 
 #[doc(hidden)]
 pub fn structural_abs_heights(
@@ -966,10 +951,9 @@ pub fn structural_load_durable_spent(
     scratch: &mut StructuralScratch,
 ) -> Result<(u64, u64), ConfirmError> {
     use std::time::Instant;
-    for &(id, vout, abs, sfk, vin) in &scratch.abs_jobs {
-        scratch.disk_jobs.push((id, vout, abs, sfk, vin));
-        scratch.abs_offs.push(abs);
-    }
+    scratch
+        .abs_offs
+        .extend(scratch.abs_jobs.iter().map(|&(_, _, abs, _, _)| abs));
     if scratch.abs_offs.is_empty() {
         return Ok((0, 0));
     }
@@ -1000,7 +984,7 @@ pub fn structural_load_durable_spent(
         let _ = meta_backend;
         (0, Some(metas))
     };
-    let n = scratch.disk_jobs.len();
+    let n = scratch.abs_jobs.len();
     if read.as_ref().is_some_and(|rows| rows.len() != n) {
         return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
             "invariant: structural meta batch length",
@@ -1030,14 +1014,14 @@ pub fn structural_load_durable_spent(
             scratch.field_h_by_id.insert(id, h);
         }
     }
-    let jobs = std::mem::take(&mut scratch.disk_jobs);
+    let jobs = std::mem::take(&mut scratch.abs_jobs);
     let applied = (0..n).try_fold(0u64, |acc, i| {
         let meta = structural_meta_row(&scratch.meta_prefetch, read.as_deref(), prefetch_at, i);
         let (id, vout, abs, sfk, vin) = jobs[i];
         let ns = structural_apply_one_meta(query, meta, id, vout, abs, sfk, vin, tip, scratch)?;
         Ok::<u64, ConfirmError>(acc.saturating_add(ns))
     });
-    scratch.disk_jobs = jobs;
+    scratch.abs_jobs = jobs;
     let multi_list_ns = applied?;
     let spent_strong_ns = t_strong
         .elapsed()
