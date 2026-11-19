@@ -273,7 +273,7 @@ pub enum Style {
     Bold,
 }
 
-/// Peer- and client-driven info lines that must not append once per event.
+/// Peer- and client-driven lines that must not append once per event.
 ///
 /// The slot is the event class. A distinct header hash, peer address, or
 /// client address does not open a new slot.
@@ -282,18 +282,23 @@ pub enum RepeatedInfo {
     ConnectedToSelf = 0,
     HeaderReject = 1,
     RpcAtMaxConnections = 2,
+    /// A listener refused a socket to keep descriptors for the store and RPC.
+    DescriptorReserve = 3,
+    HealthAtMaxConnections = 4,
 }
 
+const REPEATED_INFO_SLOTS: usize = RepeatedInfo::HealthAtMaxConnections as usize + 1;
 const REPEATED_INFO_GAP_MS: u64 = 1_000;
 
 thread_local! {
-    static REPEATED_INFO_AT: RefCell<[Option<Instant>; 3]> = const { RefCell::new([None; 3]) };
+    static REPEATED_INFO_AT: RefCell<[Option<Instant>; REPEATED_INFO_SLOTS]> =
+        const { RefCell::new([None; REPEATED_INFO_SLOTS]) };
 }
 
 /// Forget this thread's last emit time. Tests start a burst from an empty window.
 #[doc(hidden)]
 pub fn reset_repeated_info() {
-    REPEATED_INFO_AT.with(|slot| *slot.borrow_mut() = [None; 3]);
+    REPEATED_INFO_AT.with(|slot| *slot.borrow_mut() = [None; REPEATED_INFO_SLOTS]);
 }
 
 /// [`log_at`] at info, at most once per second for `which` on this thread.
@@ -302,6 +307,15 @@ pub fn reset_repeated_info() {
 /// The slot is the event class, so a new header hash does not open a new line.
 /// The clock is monotonic, so a wall-clock step does not silence the line.
 pub fn info_repeated(which: RepeatedInfo, args: fmt::Arguments<'_>) {
+    log_repeated(Level::Info, which, args);
+}
+
+/// [`info_repeated`] at warn.
+pub fn warn_repeated(which: RepeatedInfo, args: fmt::Arguments<'_>) {
+    log_repeated(Level::Warn, which, args);
+}
+
+fn log_repeated(level: Level, which: RepeatedInfo, args: fmt::Arguments<'_>) {
     let now = Instant::now();
     let emit = REPEATED_INFO_AT.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -315,7 +329,7 @@ pub fn info_repeated(which: RepeatedInfo, args: fmt::Arguments<'_>) {
         true
     });
     if emit {
-        log_at(Level::Info, args);
+        log_at(level, args);
     }
 }
 

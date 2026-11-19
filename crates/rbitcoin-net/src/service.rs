@@ -531,7 +531,10 @@ pub fn spawn_inbound_accept(
                         continue;
                     }
                     if !crate::listen::listener_fd_room() {
-                        rbitcoin_log::warn!("p2p: reject inbound {peer_addr} (descriptor reserve)");
+                        rbitcoin_log::warn_repeated(
+                            rbitcoin_log::RepeatedInfo::DescriptorReserve,
+                            format_args!("p2p: reject inbound {peer_addr} (descriptor reserve)"),
+                        );
                         drop(stream);
                         continue;
                     }
