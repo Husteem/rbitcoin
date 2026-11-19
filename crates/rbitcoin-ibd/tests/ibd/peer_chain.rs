@@ -268,25 +268,51 @@ fn a_notfound_lasts_one_stall_window() {
     );
 }
 
-/// Past the cap the oldest `notfound` gives way to the newest: the record
-/// keeps the blocks the peer was asked about last. A repeat refreshes its
-/// time and keeps its place.
+/// A `notfound` lasts its full stall window even when the record is full:
+/// a new hash is refused while every kept one is fresh, and takes the place
+/// of one that expired.
 #[test]
-fn a_full_notfound_record_drops_its_oldest() {
+fn a_full_notfound_record_keeps_its_fresh_lacks() {
     let mut peer = PeerChain::default();
     let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
-    peer.note_notfound_capped(hash(1), 1_000, 2);
-    peer.note_notfound_capped(hash(2), 1_001, 2);
-    peer.note_notfound_capped(hash(1), 20_000, 2);
+    peer.note_notfound_capped(hash(1), 0, 2);
+    peer.note_notfound_capped(hash(2), 1, 2);
+    peer.note_notfound_capped(hash(3), 2, 2);
     assert!(
-        peer.lacks(&hash(1), 40_000),
-        "the repeat moved its time to 20 s"
+        peer.lacks(&hash(1), 29_999),
+        "the first stays until its TTL"
     );
-    peer.note_notfound_capped(hash(3), 20_001, 2);
-    assert!(peer.lacks(&hash(3), 20_001), "the newest is kept");
-    assert!(peer.lacks(&hash(2), 20_001));
+    assert!(peer.lacks(&hash(2), 29_999));
     assert!(
-        !peer.lacks(&hash(1), 20_001),
-        "the first answered gave way despite its repeat"
+        !peer.lacks(&hash(3), 2),
+        "a full record refuses the new hash"
+    );
+    peer.note_notfound_capped(hash(3), 30_000, 2);
+    assert!(peer.lacks(&hash(3), 30_000), "it takes the expired place");
+    assert!(peer.lacks(&hash(2), 30_000));
+    assert!(!peer.lacks(&hash(1), 30_000));
+}
+
+/// A repeat `notfound` lasts one stall window from the repeat, and expires
+/// after the hashes answered before it.
+#[test]
+fn a_repeated_notfound_holds_from_its_last_answer() {
+    let mut peer = PeerChain::default();
+    let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+    peer.note_notfound_capped(hash(1), 0, 3);
+    peer.note_notfound_capped(hash(2), 1, 3);
+    peer.note_notfound_capped(hash(1), 20_000, 3);
+    peer.note_notfound_capped(hash(3), 30_001, 3);
+    peer.note_notfound_capped(hash(4), 30_002, 3);
+    peer.note_notfound_capped(hash(5), 30_003, 3);
+    assert!(
+        peer.lacks(&hash(1), 30_003),
+        "the repeat holds until 50 s and kept its place over a newer hash"
+    );
+    assert!(!peer.lacks(&hash(2), 30_003), "the hash before it expired");
+    assert!(peer.lacks(&hash(3), 30_003) && peer.lacks(&hash(4), 30_003));
+    assert!(
+        !peer.lacks(&hash(5), 30_003),
+        "the record is full of fresh lacks"
     );
 }

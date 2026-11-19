@@ -3,7 +3,8 @@
 //! Core asks a peer only for blocks on that peer's best known chain
 //! (`pindexBestKnownBlock`). A peer whose announced headers leave the
 //! download path is not asked for blocks above that point, and a peer that
-//! answered `notfound` for a block is not asked for it again for a while.
+//! answered `notfound` for a block it was asked for is not asked for it again
+//! for one stall window. An announcement does not shorten that.
 
 use super::state::HeightOccupants;
 use bitcoin::block::Header;
@@ -11,8 +12,9 @@ use bitcoin::BlockHash;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// `notfound` hashes kept per peer. Past the cap the first answered gives
-/// way and the peer may be asked for it again.
+/// `notfound` hashes kept per peer. Each is kept until it expires. A full
+/// record of unexpired hashes refuses a new one, and the peer may be asked
+/// for that block again.
 const LACKS_CAP: usize = 1024;
 /// How long a `notfound` keeps a peer off that block: one stall window. A
 /// peer that answered `notfound` everywhere is asked again after it.
@@ -27,10 +29,11 @@ const PROBE_REFRESH: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Default)]
 pub struct PeerChain {
-    /// `notfound` hashes, with the mono ms they were answered.
+    /// `notfound` hashes, with the mono ms they were last answered.
     lacks: HashMap<BlockHash, u64>,
-    /// The same hashes, in the order first answered.
-    lacks_order: VecDeque<BlockHash>,
+    /// Each answer as `(hash, ms)`, oldest first. An entry whose ms no longer
+    /// matches `lacks` was answered again later and is skipped.
+    lacks_order: VecDeque<(BlockHash, u64)>,
     /// This peer's announced chain above the confirmed tip, oldest first.
     announced: VecDeque<BlockHash>,
     /// Height of `announced[0]`.
@@ -67,31 +70,32 @@ impl PeerChain {
         self.note_notfound_capped(hash, now_ms, LACKS_CAP);
     }
 
-    /// [`Self::note_notfound`] with at most `cap` hashes kept. A new hash
-    /// past the cap drops the first answered, so each costs O(1).
+    /// [`Self::note_notfound`] with at most `cap` answers kept. Expired and
+    /// repeated answers leave from the front, so each costs O(1) amortized.
+    /// A repeat moves to the back with its new time.
     #[doc(hidden)]
     pub fn note_notfound_capped(&mut self, hash: BlockHash, now_ms: u64, cap: usize) {
-        if self.lacks.insert(hash, now_ms).is_some() {
-            return;
-        }
-        self.lacks_order.push_back(hash);
-        if self.lacks_order.len() > cap {
-            if let Some(oldest) = self.lacks_order.pop_front() {
-                self.lacks.remove(&oldest);
+        while let Some(&(front, at)) = self.lacks_order.front() {
+            let current = self.lacks.get(&front) == Some(&at);
+            if current && now_ms.saturating_sub(at) < LACKS_TTL_MS {
+                break;
+            }
+            self.lacks_order.pop_front();
+            if current {
+                self.lacks.remove(&front);
             }
         }
+        if self.lacks_order.len() >= cap {
+            return;
+        }
+        self.lacks.insert(hash, now_ms);
+        self.lacks_order.push_back((hash, now_ms));
     }
 
     pub fn lacks(&self, hash: &BlockHash, now_ms: u64) -> bool {
         self.lacks
             .get(hash)
             .is_some_and(|at| now_ms.saturating_sub(*at) < LACKS_TTL_MS)
-    }
-
-    /// A headers message or a block inv: the peer may have those blocks now.
-    pub fn note_announcement(&mut self) {
-        self.lacks.clear();
-        self.lacks_order.clear();
     }
 
     pub fn probed(&self) -> bool {

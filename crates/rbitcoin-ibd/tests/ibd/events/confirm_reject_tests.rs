@@ -1096,10 +1096,10 @@ fn apply_peer_event_body_and_control_surface() {
     assert!(st.known_headers.contains(&hash));
     assert!(st.ordered_set.contains(&hash) || st.hash_height.contains_key(&hash));
     assert!(
-        rbitcoin_ibd::ibd::assign::issue_one(&mut st, 1, notfound_hash, &mut room, &mut issued),
-        "a peer that announces again may be asked again"
+        !rbitcoin_ibd::ibd::assign::issue_one(&mut st, 1, notfound_hash, &mut room, &mut issued),
+        "an announcement does not reopen a block the peer answered notfound"
     );
-    assert!(st.slots[0].in_flight.contains(&notfound_hash));
+    assert!(!st.slots[0].in_flight.contains(&notfound_hash));
 
     // Empty headers with lag → keep headers_done false.
     st.max_peer_height = 100;

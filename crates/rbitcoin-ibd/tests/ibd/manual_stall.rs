@@ -11,9 +11,9 @@ use rbitcoin_ibd::ibd::assign::{assign_work_ordered, inflight_add_peer, AssignDe
 use rbitcoin_ibd::ibd::dial::{
     dial_batch, disconnect_stalled_block_peers_at, release_peer_block_work,
 };
-use rbitcoin_ibd::ibd::events::{apply_block_framed, apply_notfound, FramedBody};
+use rbitcoin_ibd::ibd::events::{apply_block_framed, apply_notfound, apply_peer_event, FramedBody};
 use rbitcoin_ibd::ibd::peer_io::{
-    IbdReadCtx, LightDecodes, PeerCmd, PeerEvent, PeerEventSinks, LATE_ANSWER_MS,
+    ibd_mono_ms, IbdReadCtx, LightDecodes, PeerCmd, PeerEvent, PeerEventSinks, LATE_ANSWER_MS,
 };
 use rbitcoin_ibd::ibd::state::IbdWorkState;
 use rbitcoin_ibd::ibd::status::LoopStats;
@@ -799,6 +799,79 @@ fn notfound_does_not_hold_off_a_block_stall() {
     st.slots.retain(|s| s.alive);
     assign(&mut st, &hub);
     assert!(drain_wire(&mut wire)[1].0.contains(&h(1)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Peer `peer` sends a block `inv` for `hashes`.
+fn blocks_inv(st: &mut IbdWorkState, hub: &ChainHub, peer: usize, hashes: Vec<BlockHash>) {
+    apply_peer_event(
+        st,
+        hub,
+        PeerEvent::BlocksInv { peer, hashes },
+        &AtomicU32::new(0),
+        &mut rbitcoin_net::seeds::AddrMan::new(),
+        std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+        None,
+    );
+}
+
+/// A block hash on no chain, for padding.
+fn junk(i: u32) -> BlockHash {
+    let mut b = [0xaa; 32];
+    b[..4].copy_from_slice(&i.to_le_bytes());
+    BlockHash::from_byte_array(b)
+}
+
+/// After a `notfound` the next assign gives the block to the other peer,
+/// not back to the one that gave it up: that peer cannot open a fresh
+/// stall window on the block it would not send.
+fn assert_block_goes_elsewhere(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    wire: &mut [mpsc::UnboundedReceiver<PeerCmd>],
+) {
+    assert!(
+        !st.slots[0].may_take_block(&h(1), ibd_mono_ms()),
+        "peer 0 still lacks h(1)"
+    );
+    assign(st, hub);
+    let sent = drain_wire(wire);
+    assert!(
+        !sent[0].0.contains(&h(1)),
+        "h(1) is not asked of peer 0 again"
+    );
+    assert!(sent[1].0.contains(&h(1)), "peer 1 takes h(1)");
+}
+
+/// Hashes this peer was never asked for do not push the block it gave up
+/// out of its `notfound` record.
+#[test]
+fn padded_notfound_does_not_hand_the_block_back() {
+    let (dir, hub) = tmp_hub();
+    let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
+    owe_on_wire(&mut st, 0, h(1), 0);
+    let mut hashes = vec![h(1)];
+    hashes.extend((0..2_000).map(junk));
+    apply_notfound(&mut st, 0, hashes);
+    assert_block_goes_elsewhere(&mut st, &hub, &mut wire);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A block `inv` after the `notfound` does not reopen the block, whether it
+/// lists a block this node already has or the block itself.
+#[test]
+fn an_inv_after_notfound_does_not_hand_the_block_back() {
+    let (dir, hub) = tmp_hub();
+    let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
+    owe_on_wire(&mut st, 0, h(1), 0);
+    apply_notfound(&mut st, 0, vec![h(1)]);
+    blocks_inv(&mut st, &hub, 0, vec![h(5)]);
+    assert!(
+        !st.slots[0].may_take_block(&h(1), ibd_mono_ms()),
+        "an inv of another block leaves the lack"
+    );
+    blocks_inv(&mut st, &hub, 0, vec![h(1)]);
+    assert_block_goes_elsewhere(&mut st, &hub, &mut wire);
     let _ = std::fs::remove_dir_all(dir);
 }
 
