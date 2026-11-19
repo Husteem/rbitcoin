@@ -117,7 +117,7 @@ pub struct BqResolveWave {
     pub items: Vec<(u32, [u8; 32], ResolvedWire)>,
     /// [`Query::drain_and_fence_hi`] immediately before this wave's TipOnly read.
     pub drain_fence_hi: Option<u32>,
-    /// TipOnly hits for this wave (`need_vouts` filled per load chunk at send).
+    /// TipOnly hits for this wave, shared by every load chunk.
     pub parent_ids: BatchParentIds,
     /// `(height, hash)` of a raw row that did not decode. The wave stops
     /// there and the row is already off the body queue; the caller rejects
@@ -158,7 +158,7 @@ pub fn push_resolve_keys(
     skip: &HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
     keys: &mut HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
     n_inputs: u32,
-) -> Vec<([u8; 32], u32)> {
+) -> Vec<[u8; 32]> {
     let bip34 = params.bip34_active_at(height);
     let mut spends = Vec::with_capacity(n_inputs as usize);
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
@@ -170,7 +170,7 @@ pub fn push_resolve_keys(
             if prev == [0u8; 32] {
                 continue;
             }
-            spends.push((prev, inp.previous_output.vout));
+            spends.push(prev);
             if !skip.contains(&prev) {
                 keys.insert(prev);
             }
@@ -179,6 +179,9 @@ pub fn push_resolve_keys(
             keys.insert(p.txid);
         }
     }
+    // One key per parent txid: inputs spending the same parent share it.
+    spends.sort_unstable();
+    spends.dedup();
     spends
 }
 
@@ -383,7 +386,6 @@ pub fn confirm_bq_resolve_wave_capped(
         ids: Arc::new(layer),
         spent: Arc::new(spent),
         n_out: Arc::new(n_out),
-        need_vouts: U64Map::default(),
     };
 
     let mut items = Vec::with_capacity(wires.len());

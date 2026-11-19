@@ -198,7 +198,8 @@ fn push_resolve_keys_dedups_same_prev_txid() {
     assert!(keys.contains(&prev.to_byte_array()));
     assert_eq!(
         spends,
-        vec![(prev.to_byte_array(), 0), (prev.to_byte_array(), 1),]
+        vec![prev.to_byte_array()],
+        "one key per parent txid"
     );
     let mut skip_same = HashSet::with_hasher(BuildHasherDefault::default());
     skip_same.insert(prev.to_byte_array());
@@ -208,7 +209,7 @@ fn push_resolve_keys_dedups_same_prev_txid() {
     assert!(keys2.is_empty(), "same-wave creates are not TipOnly need");
     assert_eq!(
         skipped,
-        vec![(prev.to_byte_array(), 0), (prev.to_byte_array(), 1),],
+        vec![prev.to_byte_array()],
         "spend_keys must still carry same-wave prevs for in-flight stamp"
     );
 
@@ -277,7 +278,7 @@ fn same_wave_create_is_not_tiponly_need() {
         "same-wave create is not a TipOnly skeleton id"
     );
     assert!(
-        wave.items[1].2.spend_keys.iter().any(|&(t, _)| t == h1),
+        wave.items[1].2.spend_keys.contains(&h1),
         "h=2 spend_keys must name the same-wave parent so load stamp can in-flight bind"
     );
     let _ = std::fs::remove_dir_all(&path);

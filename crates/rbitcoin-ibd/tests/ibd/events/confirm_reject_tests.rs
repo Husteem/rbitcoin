@@ -988,8 +988,6 @@ fn apply_peer_event_body_and_control_surface() {
             peer: 1,
             hash: h(9),
             payload: vec![0u8; 80],
-
-            header_fk: None,
         },
         &write_next,
         &mut book,
@@ -1019,8 +1017,6 @@ fn apply_peer_event_body_and_control_surface() {
             peer: 1,
             hash: class_a_hash,
             payload,
-
-            header_fk: None,
         },
         &write_next,
         &mut book,
@@ -1374,8 +1370,6 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
             peer: 1,
             hash: h1,
             payload: ser(&b1),
-
-            header_fk: None,
         },
         &write_next,
         &mut book,
@@ -1392,8 +1386,6 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
             peer: 1,
             hash: h1,
             payload: ser(&b1),
-
-            header_fk: None,
         },
         &write_next,
         &mut book,
@@ -1417,8 +1409,6 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
             peer: 1,
             hash: h2,
             payload: ser(&b2),
-
-            header_fk: None,
         },
         &write_next,
         &mut book,
@@ -1445,8 +1435,6 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
             peer: 1,
             hash: far_hash,
             payload: ser(&far),
-
-            header_fk: None,
         },
         &write_next,
         &mut book,
@@ -1738,8 +1726,6 @@ fn ibd_bad_prev_fork() {
             peer: 2,
             hash: a1,
             payload: junk,
-
-            header_fk: None,
         },
         &write_next,
         &mut book,
@@ -1764,8 +1750,6 @@ fn ibd_bad_prev_fork() {
                 peer: 1,
                 hash: a1,
                 payload: serialize(&a[0]),
-
-                header_fk: None,
             },
             &write_next,
             &mut book,
@@ -2115,8 +2099,6 @@ fn ibd_bad_prev_fork() {
             peer: 0,
             hash: w1,
             payload: serialize(&w[0]),
-
-            header_fk: None,
         },
         &write_next,
         &mut book,
@@ -2308,7 +2290,7 @@ struct WireRig {
 }
 
 struct WirePad {
-    // The confirmed-set seed still reads this store after `WireRig::new` returns.
+    // `_hub` reads this store for as long as it lives.
     _dir: rbitcoin_query::testutil::TempDir,
     _hub: std::sync::Arc<rbitcoin_net::chain::ChainHub>,
     tip: BlockHash,
@@ -2523,8 +2505,6 @@ impl WireRig {
                 peer,
                 hash: body.block_hash(),
                 payload: bitcoin::consensus::serialize(body),
-
-                header_fk: None,
             },
             &self.write_next,
             &mut self.book,
@@ -4261,8 +4241,6 @@ fn ibd_flag_zero_tx_block_is_consensus_invalid() {
             peer: 1,
             hash,
             payload: wire,
-
-            header_fk: None,
         },
         &AtomicU32::new(1),
         &mut AddrMan::new(),
@@ -4387,7 +4365,6 @@ fn a_block_too_far_ahead_waits_and_then_connects() {
             peer: 1,
             hash,
             payload: serialize(&block),
-            header_fk: None,
         },
         &AtomicU32::new(1),
         &mut AddrMan::new(),
@@ -4941,7 +4918,6 @@ fn ibd_refused_body_is_asked_again() {
                 peer,
                 hash,
                 payload,
-                header_fk: None,
             },
             &AtomicU32::new(1),
             &mut book,
@@ -5121,6 +5097,7 @@ fn coord_loop_body_and_reject_do_not_read_headers() {
     let mut book = AddrMan::new();
     let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1);
     st.record_height(h1, 1);
+    st.header_fks.insert(h1, fk);
     st.inflight
         .insert(h1, rbitcoin_ibd::ibd::state::InflightReq::new(1));
     apply_peer_event(
@@ -5130,7 +5107,6 @@ fn coord_loop_body_and_reject_do_not_read_headers() {
             peer: 1,
             hash: h1,
             payload: ser(&b1),
-            header_fk: Some(fk),
         },
         &write_next,
         &mut book,
@@ -5151,7 +5127,6 @@ fn coord_loop_body_and_reject_do_not_read_headers() {
             peer: 1,
             hash: absent,
             payload: ser(&b1),
-            header_fk: None,
         },
         &write_next,
         &mut book,

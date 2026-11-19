@@ -66,7 +66,6 @@ fn archived_stamp_matches_shared_helper_on_skeleton() {
         ids: std::sync::Arc::new(m),
         spent: std::sync::Arc::new(rbitcoin_query::U64Map::default()),
         n_out: Default::default(),
-        need_vouts: rbitcoin_query::U64Map::default(),
     };
 
     let helper = rbitcoin_query::stamp_external_parents(

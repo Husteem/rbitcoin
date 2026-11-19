@@ -32,8 +32,6 @@ pub struct BatchParentIds {
     pub spent: Arc<U64Map<(u64, u64)>>,
     /// Wave `create_fk_id → loc n_out`.
     pub n_out: Arc<U64Map<u32>>,
-    /// Per-chunk `create_fk_id → vouts` spent in this load batch.
-    pub need_vouts: U64Map<Vec<u32>>,
 }
 
 impl BatchParentIds {

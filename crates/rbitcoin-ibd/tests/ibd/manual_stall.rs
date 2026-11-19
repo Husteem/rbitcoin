@@ -274,7 +274,6 @@ fn reader_of(st: &IbdWorkState, id: usize) -> (IbdReadCtx, mpsc::UnboundedReceiv
         sinks: PeerEventSinks {
             body: body_tx,
             ctrl: ctrl_tx,
-            header_fks: rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus(),
         },
         requested: std::sync::Arc::clone(&slot.requested),
         solicited_bytes: std::sync::Arc::clone(&slot.solicited_bytes),
@@ -310,12 +309,10 @@ fn framed_body(ev: PeerEvent) -> FramedBody {
             peer,
             hash,
             payload,
-            header_fk,
         } => FramedBody {
             peer,
             hash,
             payload,
-            header_fk,
         },
         _ => panic!("expected a framed block"),
     }
@@ -358,7 +355,6 @@ fn paused_connect_peer_late_blocks_are_accepted_not_scored() {
             peer: 1,
             hash: b1,
             payload: bitcoin::consensus::encode::serialize(&blocks[0]),
-            header_fk: None,
         },
     );
     let queued = hub.query.block_queue_stats().1;
@@ -795,7 +791,6 @@ async fn ibd_dial_of_a_connect_target_is_manual() {
     let sinks = PeerEventSinks {
         body: body_tx,
         ctrl: ctrl_tx,
-        header_fks: rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus(),
     };
     let clock = rbitcoin_consensus::NodeClock::new();
     for (connect, want, label) in [

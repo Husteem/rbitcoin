@@ -10,8 +10,6 @@ fn op_true() -> ScriptBuf {
 
 struct TipAnnouncePad {
     store: rbitcoin_query::testutil::TempDir,
-    // Confirmed-set seed still reads the builder store after that hub drops.
-    _built: rbitcoin_query::testutil::TempDir,
 }
 
 /// Height-102 regtest, built once. Each announce case opens a private copy.
@@ -28,10 +26,7 @@ fn tip_announce_pad() -> &'static TipAnnouncePad {
         let store = rbitcoin_query::testutil::TempDir::labeled("tip-announce-pad")
             .expect("tip pad");
         copy_store_tree(built.path(), store.path());
-        TipAnnouncePad {
-            store,
-            _built: built,
-        }
+        TipAnnouncePad { store }
     })
 }
 

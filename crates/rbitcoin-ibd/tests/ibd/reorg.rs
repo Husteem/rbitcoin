@@ -327,7 +327,7 @@ fn consider_disconnected_from_work_path_without_resume_seed() {
     st.record_height(w4.block_hash(), 4);
     st.max_ordered_height = 4;
     let shared = std::sync::Mutex::new(st);
-    assert!(rewind_off_coord_lock(&shared, &hub, None).unwrap());
+    assert!(rewind_off_coord_lock(&shared, &hub).unwrap());
     let st = shared.into_inner().unwrap_or_else(|err| err.into_inner());
     assert_eq!(
         hub.tip_height(),

@@ -389,7 +389,7 @@ pub fn consider_disconnected_heavier(
         let st = shared.lock().unwrap_or_else(|err| err.into_inner());
         heavier_fork_candidates(&st, hub)?
     };
-    Ok(apply_off_lock_rewind(shared, hub, &cands, &invalid)?.is_some())
+    apply_off_lock_rewind(shared, hub, &cands, &invalid)
 }
 
 /// The walk's candidate while nothing is planted above the confirmed tip. A
@@ -768,12 +768,12 @@ pub(crate) fn apply_off_lock_rewind(
     hub: &ChainHub,
     cands: &[BlockHash],
     invalid: &HashSet<[u8; 32]>,
-) -> Result<Option<Vec<(BlockHash, Fk)>>, NetError> {
+) -> Result<bool, NetError> {
     let _gate = rewind_exclusion()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     let Some(path) = select_heavier_path(hub, cands, invalid)? else {
-        return Ok(None);
+        return Ok(false);
     };
     let tip_before = tip_pair(hub);
     let cap = {
@@ -781,7 +781,7 @@ pub(crate) fn apply_off_lock_rewind(
         super::header_walk::rewind_depth_cap(&st, hub)
     };
     let Some(prep) = prepare_header_rewind(hub, &path, cap)? else {
-        return Ok(None);
+        return Ok(false);
     };
     // Re-selecting here would see the LCA we just rewound to and return
     // none. The fresh select is the one above, after the other rewind has
@@ -792,29 +792,20 @@ pub(crate) fn apply_off_lock_rewind(
         .iter()
         .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()))
     {
-        return Ok(None);
+        return Ok(false);
     }
     if !rewind_tip_still(hub, &prep, tip_before) {
-        return Ok(None);
+        return Ok(false);
     }
     commit_header_rewind(&mut st, hub, &path, &prep);
-    let pairs = path
-        .iter()
-        .zip(prep.fks.iter())
-        .filter_map(|(hash, fk)| fk.map(|fk| (*hash, fk)))
-        .collect();
-    Ok(Some(pairs))
+    Ok(true)
 }
 
-/// Most-work rewind with the store reads outside `shared`.
-///
-/// `bus` receives the path's header fks after the lock drops. Those fks are
-/// also in `header_fks`, so a body that arrives before the publish still
-/// resolves.
+/// Most-work rewind with the store reads outside `shared`. The commit puts
+/// the path's header fks in `header_fks`.
 pub fn rewind_off_coord_lock(
     shared: &Mutex<super::state::IbdWorkState>,
     hub: &ChainHub,
-    bus: Option<&super::peer_io::HeaderFkBus>,
 ) -> Result<bool, NetError> {
     let (cands, invalid) = {
         let st = shared.lock().unwrap_or_else(|err| err.into_inner());
@@ -822,11 +813,5 @@ pub fn rewind_off_coord_lock(
         let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
         (cands, invalid)
     };
-    let Some(pairs) = apply_off_lock_rewind(shared, hub, &cands, &invalid)? else {
-        return Ok(false);
-    };
-    if let Some(bus) = bus {
-        super::peer_io::publish_header_fks(bus, &pairs);
-    }
-    Ok(true)
+    apply_off_lock_rewind(shared, hub, &cands, &invalid)
 }

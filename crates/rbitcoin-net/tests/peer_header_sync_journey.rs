@@ -4,7 +4,7 @@
 
 use rbitcoin_ibd::ibd::{
     apply_confirm_reject, apply_headers_event, assign_work_ordered, candidate_tip, candidate_work,
-    drain_ready_peer_and_body_events, empty_header_fk_bus, forget_walk_peer, header_poll,
+    drain_ready_peer_and_body_events, forget_walk_peer, header_poll,
     header_status_view, install_origin, load_origin, log_progress_tick, need_ready_headroom,
     note_block_inv, note_reservation, origin_input, read_progress_published,
     send_getheaders, settle_walk_peer, take_header_ask,
@@ -611,7 +611,6 @@ fn ctrl_headers_are_applied_while_the_header_thread_has_room() {
         Arc::clone(&shared),
         Arc::clone(&hub),
         rx,
-        empty_header_fk_bus(),
         rbitcoin_store::HeaderThreadProbe::new(),
     );
     let gen = hub.tip_hash().unwrap();

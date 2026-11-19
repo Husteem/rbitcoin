@@ -58,8 +58,6 @@ pub enum PeerEvent {
         hash: BlockHash,
         /// Consensus-serialized block (frame payload).
         payload: Vec<u8>,
-        /// Header fk already resolved. Absent means the loop does not store.
-        header_fk: Option<rbitcoin_primitives::Fk>,
     },
     /// Framed as `block` but unusable (e.g. truncated header) — re-request.
     BlockDecodeFailed {
@@ -90,31 +88,6 @@ pub enum PeerEvent {
     },
 }
 
-/// Header hash → fk for the peer thread. Inserts add keys; readers copy one fk.
-/// A `Mutex` so a publish does not clone the whole map.
-pub type HeaderFkBus = Arc<Mutex<std::collections::HashMap<BlockHash, rbitcoin_primitives::Fk>>>;
-
-pub fn empty_header_fk_bus() -> HeaderFkBus {
-    Arc::new(Mutex::new(std::collections::HashMap::new()))
-}
-
-pub fn header_fk_of(bus: &HeaderFkBus, hash: &BlockHash) -> Option<rbitcoin_primitives::Fk> {
-    bus.lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .get(hash)
-        .copied()
-}
-
-pub fn publish_header_fks(bus: &HeaderFkBus, rows: &[(BlockHash, rbitcoin_primitives::Fk)]) {
-    if rows.is_empty() {
-        return;
-    }
-    let mut map = bus.lock().unwrap_or_else(|err| err.into_inner());
-    for (hash, fk) in rows {
-        map.insert(*hash, *fk);
-    }
-}
-
 /// Dual fan-out so body delivery is never stuck behind header floods on one FIFO.
 ///
 /// - **body**: `BlockFramed` / fail / `NotFound` / `Dead` — drain first
@@ -123,7 +96,6 @@ pub fn publish_header_fks(bus: &HeaderFkBus, rows: &[(BlockHash, rbitcoin_primit
 pub struct PeerEventSinks {
     pub body: mpsc::UnboundedSender<PeerEvent>,
     pub ctrl: mpsc::UnboundedSender<PeerEvent>,
-    pub header_fks: HeaderFkBus,
 }
 
 impl PeerEventSinks {
@@ -928,12 +900,10 @@ impl IbdReadCtx {
                     &hash,
                     n,
                 ) {
-                    let header_fk = header_fk_of(&self.sinks.header_fks, &hash);
                     self.sinks.send_body(PeerEvent::BlockFramed {
                         peer: self.id,
                         hash,
                         payload: frame.payload,
-                        header_fk,
                     });
                     false
                 } else {

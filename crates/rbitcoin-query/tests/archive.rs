@@ -1574,7 +1574,6 @@ fn plan_batch_from_wire_hits_skeleton() {
         ids: Arc::new(m),
         spent: Arc::new(rbitcoin_query::U64Map::default()),
         n_out: Default::default(),
-        need_vouts: rbitcoin_query::U64Map::default(),
     };
     let child = child_spend(parent_txid, 0x66);
     let need = vec![(Fk(1), vec![child])];
@@ -1611,7 +1610,6 @@ fn plan_batch_skeleton_empty_carried_does_not_walk_ins() {
         ids: Arc::new(m),
         spent: Arc::new(rbitcoin_query::U64Map::default()),
         n_out: Default::default(),
-        need_vouts: rbitcoin_query::U64Map::default(),
     };
     let child = child_spend(parent_txid, 0x66);
     let (block, txids) = rbitcoin_query::testutil::block_from_applies(std::slice::from_ref(&child));
@@ -1665,7 +1663,6 @@ fn stamp_external_parents_matches_plan_batch_on_skeleton() {
         ids: Arc::new(m),
         spent: Arc::new(rbitcoin_query::U64Map::default()),
         n_out: Default::default(),
-        need_vouts: rbitcoin_query::U64Map::default(),
     };
 
     let helper = rbitcoin_query::stamp_external_parents(

@@ -971,7 +971,6 @@ fn dial_batch_exempts_connect_targets_from_the_group_rule() {
     let sinks = PeerEventSinks {
         body: body_tx,
         ctrl: ctrl_tx,
-        header_fks: rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1062,8 +1061,6 @@ fn dial_batch_empty_count_or_book() {
     let sinks = PeerEventSinks {
         body: body_tx,
         ctrl: ctrl_tx,
-
-        header_fks: rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1126,7 +1123,6 @@ async fn ibd_dial_refuses_a_discouraged_net() {
     let sinks = PeerEventSinks {
         body: body_tx,
         ctrl: ctrl_tx,
-        header_fks: rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus(),
     };
     let result = tokio::time::timeout(
         Duration::from_millis(200),
