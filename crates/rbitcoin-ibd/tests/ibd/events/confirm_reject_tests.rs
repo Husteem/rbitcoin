@@ -2635,6 +2635,16 @@ impl WireRig {
     fn pump(
         &mut self,
         mut serve: impl FnMut(usize, BlockHash) -> bitcoin::Block,
+        stop: impl FnMut(&IbdWorkState, &rbitcoin_net::chain::ChainHub, &[Reject]) -> bool,
+    ) -> Vec<Reject> {
+        self.pump_opt(|peer, hash| Some(serve(peer, hash)), stop)
+    }
+
+    /// [`Self::pump`], but a getdata that `serve` maps to `None` is not
+    /// answered.
+    fn pump_opt(
+        &mut self,
+        mut serve: impl FnMut(usize, BlockHash) -> Option<bitcoin::Block>,
         mut stop: impl FnMut(&IbdWorkState, &rbitcoin_net::chain::ChainHub, &[Reject]) -> bool,
     ) -> Vec<Reject> {
         use rbitcoin_ibd::ibd::confirm::ConfirmEvent;
@@ -2687,8 +2697,9 @@ impl WireRig {
                 .filter(|(_, p)| self.st.slots.iter().any(|s| s.id == *p && s.alive))
                 .collect();
             for (hash, peer) in asks {
-                let body = serve(peer, hash);
-                self.deliver(peer, &body);
+                if let Some(body) = serve(peer, hash) {
+                    self.deliver(peer, &body);
+                }
             }
         }
     }
@@ -2871,7 +2882,17 @@ fn ibd_mutated_body_is_refetched_not_blacklisted() {
         up(&mut rig.st, peer);
         rig.st.perms = noban.then(|| Arc::clone(&peers));
         let body = under_header(txdata);
-        let rejects = rig.pump(|_, _| body.clone(), |_, _, r| !r.is_empty());
+        // Load drops a rejected body before IBD applies the reject, so assign
+        // can ask the sender again. A second copy's reject would land in the
+        // next round, so only the sender's first getdata for `hash` is answered.
+        let mut answered = false;
+        let rejects = rig.pump_opt(
+            |p, h| {
+                (p == peer && h == hash && !std::mem::replace(&mut answered, true))
+                    .then(|| body.clone())
+            },
+            |_, _, r| !r.is_empty(),
+        );
         assert_eq!(rejects, [(hash, ConfirmRejectClass::SoftWire, 1)], "{what}");
         let st = &mut rig.st;
         assert!(!st.body.is_rejected(&hash), "{what}");
