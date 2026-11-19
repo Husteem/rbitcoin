@@ -101,6 +101,46 @@ fn open_large_without_occ_skips_scan_not_empty() {
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
 }
 
+/// A kill after the table write and before the sidecar rename leaves live
+/// slots with `.occ` still 0. The next `insert_many` must not bulk-fill
+/// over those slots.
+#[test]
+fn zero_occ_sidecar_does_not_bulk_fill_over_live_slots() {
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-shhead-zero-occ-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    let min_slots = (OCC_SCAN_BYTE_CAP / SH_HEAD_SLOT_SIZE as u64) + 1;
+    let slots = min_slots.next_power_of_two();
+    assert!(slots * SH_HEAD_SLOT_SIZE as u64 > OCC_SCAN_BYTE_CAP);
+    let h = ScriptHashHead::create_with_slots(&path, slots).unwrap();
+    let mut key_a = [0u8; 32];
+    key_a[0] = 0x11;
+    let val_a = ShHeadValue::inline_one(Fk(7));
+    h.insert_many(&[(key_a, val_a.clone())]).unwrap();
+    assert_eq!(h.get(&key_a).unwrap().unwrap(), val_a);
+    drop(h);
+    store_occ_sidecar(&path, 0).unwrap();
+    let h = ScriptHashHead::open(&path).unwrap();
+    let mut key_b = [0u8; 32];
+    key_b[0] = 0x22;
+    let val_b = ShHeadValue::inline_one(Fk(9));
+    h.insert_many(&[(key_b, val_b.clone())]).unwrap();
+    assert_eq!(
+        h.get(&key_a).unwrap().map(|v| v.inline_fks()),
+        Some(vec![Fk(7)]),
+        "a zero .occ let the next insert overwrite the live head"
+    );
+    assert_eq!(h.get(&key_b).unwrap().unwrap().inline_fks(), vec![Fk(9)]);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+}
+
 #[test]
 fn scripthash_head_insert_many_full_without_rehash() {
     let path = std::env::temp_dir().join(format!(
