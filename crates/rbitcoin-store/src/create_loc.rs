@@ -84,6 +84,12 @@ impl CreateLoc {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        Self::open_above(dir, 0)
+    }
+
+    /// [`Self::open`] that refuses, before it cuts anything, to keep fewer
+    /// than `floor` creates.
+    pub fn open_above(dir: &Path, floor: u64) -> Result<Self, StoreError> {
         let loc = open_table_file(&dir.join("create.loc"), TableKind::DeltaLoc)?;
         let ovf_path = dir.join("create.loc.ovf");
         if ovf_path.exists() {
@@ -122,6 +128,9 @@ impl CreateLoc {
             ovf_rows: RwLock::new(ovf_rows),
             count: AtomicU64::new(full),
         };
+        if full > 0 {
+            crate::tx_table::refuse_below_committed(count, floor)?;
+        }
         opened.truncate_to_count(count)?;
         // A row past the overflow header belongs to a create this file does not name.
         let last_ovf = opened
@@ -134,6 +143,7 @@ impl CreateLoc {
         if let Some(cut) =
             unresolved_ovf_cut(&opened.loc, &opened.ovf, opened.count(), last_ovf, true)?
         {
+            crate::tx_table::refuse_below_committed(cut, floor)?;
             opened.truncate_to_count(cut)?;
         }
         Ok(opened)

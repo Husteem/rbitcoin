@@ -266,7 +266,8 @@ pub fn persist_unbroadcast_file(dir: &Path, set: &HashSet<Txid>) {
     for t in set {
         buf.extend_from_slice(&t.to_byte_array());
     }
-    let _ = std::fs::write(dir.join("unbroadcast"), buf);
+    // Replaced whole: a crash keeps the previous set, never a truncated one.
+    let _ = rbitcoin_store::file::write_synced_tmp_rename(&dir.join("unbroadcast"), &buf);
 }
 
 /// Depths the refresh evaluates. Every other confirm target is
@@ -2341,6 +2342,7 @@ impl MempoolHub {
         let store = self.query.store();
         let mut op_fk: HashMap<OutPoint, Fk> = HashMap::new();
         let mut need_id: Vec<[u8; 32]> = Vec::new();
+        let mut cached: Vec<(OutPoint, Fk)> = Vec::new();
         for tid in remain {
             let Some(tx) = g.get_tx(tid) else { continue };
             let aux = g.vin_aux(tid);
@@ -2354,10 +2356,22 @@ impl MempoolHub {
                 }
                 match aux.get(i).and_then(|a| a.create_fk) {
                     Some(fk) if store.is_confirmed_strong(fk).map_err(|_| ())? => {
-                        op_fk.insert(op, fk);
+                        cached.push((op, fk));
                     }
                     _ => need_id.push(op.txid.to_byte_array()),
                 }
+            }
+        }
+        // A cached create is the parent only while it still holds the
+        // parent's txid: a power cut can lose the create, and open hands the
+        // number to a later block. One page-grouped read checks them all.
+        let fks: Vec<Fk> = cached.iter().map(|(_, fk)| *fk).collect();
+        let ids = store.txs.txids.get_many(&fks).map_err(|_| ())?;
+        for ((op, fk), id) in cached.into_iter().zip(ids) {
+            if id == Some(op.txid.to_byte_array()) {
+                op_fk.insert(op, fk);
+            } else {
+                need_id.push(op.txid.to_byte_array());
             }
         }
         if need_id.is_empty() {

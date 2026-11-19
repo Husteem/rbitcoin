@@ -166,79 +166,6 @@ fn prune_life_watermark(q: Query, dir: &rbitcoin_query::testutil::TempDir, hashe
     let _ = (prev, std::fs::remove_dir_all(dir));
 }
 
-/// Chain taller than the keep window. Two withheld locator headers leave
-/// the new blocks confirmed in RAM. Prune must stay on the last sealed tip,
-/// so the block at `sealed - 288` still has its witness.
-fn withheld_locator_keeps_prune(direct: bool) {
-    let (dir, q) = temp_query(if direct {
-        "withheld-locator-prune-ibd"
-    } else {
-        "withheld-locator-prune"
-    });
-    let mut hashes = Vec::new();
-    connect_range(&q, Fk::NULL, None, 290, &[0x55; 8], &mut hashes);
-    assert_eq!(q.tip_height(), Some(Height(289)));
-    q.set_prune_seqsigwit(true).unwrap();
-    q.apply_prune_seqsigwit_tip().unwrap();
-    assert_eq!(q.pruneheight(), Some(Height(1)));
-    let kept = q.block_tx_fks(Height(2)).unwrap()[0];
-    q.clear_seqsigwit_ram_window();
-    assert_eq!(witness_of(&q, kept), vec![vec![0x55; 8]]);
-    if direct {
-        q.enter_direct_index_mode_sh(false).unwrap();
-    }
-
-    let loc = q.store().txs.create_loc.loc.read_fd();
-    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(loc, 16);
-    let _disarm = Disarm(loc);
-    let (prev, parent) = resume(&q, &mut hashes);
-    connect_range(&q, prev, Some(parent), 2, &[0x66; 8], &mut hashes);
-    assert_eq!(q.tip_height(), Some(Height(291)));
-    assert_eq!(
-        q.pruneheight(),
-        Some(Height(1)),
-        "a second withheld locator header does not move seqsigwit.prune"
-    );
-    q.clear_seqsigwit_ram_window();
-    assert_eq!(witness_of(&q, kept), vec![vec![0x55; 8]]);
-    if !direct {
-        // Drop one unsealed block. The shrink flush must not become the
-        // prune anchor, and the next withheld connect must not move it.
-        q.disconnect_tip().unwrap();
-        assert_eq!(q.tip_height(), Some(Height(290)));
-        rbitcoin_store::io_handle::arm_fail_hwm_pwrites(loc, 16);
-        let (prev, parent) = resume(&q, &mut hashes);
-        connect_range(&q, prev, Some(parent), 1, &[0x77; 8], &mut hashes);
-        assert_eq!(q.tip_height(), Some(Height(291)));
-        assert_eq!(
-            q.pruneheight(),
-            Some(Height(1)),
-            "disconnect of an unsealed tip does not move seqsigwit.prune"
-        );
-        q.clear_seqsigwit_ram_window();
-        assert_eq!(witness_of(&q, kept), vec![vec![0x55; 8]]);
-    }
-    let _ = dir;
-}
-
-#[test]
-fn withheld_locator_does_not_prune_a_confirmed_witness() {
-    withheld_locator_keeps_prune(false);
-}
-
-#[test]
-fn withheld_locator_during_ibd_does_not_prune_a_confirmed_witness() {
-    withheld_locator_keeps_prune(true);
-}
-
-struct Disarm(rbitcoin_store::io_handle::IoHandle);
-
-impl Drop for Disarm {
-    fn drop(&mut self) {
-        rbitcoin_store::io_handle::disarm_pwrite(self.0);
-    }
-}
-
 fn assert_witness_stem_unwritten(q: &Query, body_len: u64) {
     let path = q.store().path().join("seqsigwit.body");
     assert_eq!(std::fs::metadata(&path).unwrap().len(), body_len);
@@ -446,31 +373,41 @@ fn open_finishes_cut_when_locator_is_already_zero() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// The create locator landed and the witness locator stopped short. Open
-/// drops that tail, then copies the keep window from the rows that remain.
+/// Turning prune on flushes `input` before the witness stem is cut. That
+/// fd is a Class A fd: after a failed Class A sync the release refuses
+/// instead of retrying a sync that can return 0 over dropped pages.
 #[test]
-fn open_truncates_a_short_witness_locator_before_the_cut() {
+fn prune_release_refuses_after_a_failed_class_a_sync() {
+    let (dir, q) = temp_query("prune-latched");
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 20, &[0x47], &mut hashes);
+    let spent = q.store().txs.spent.body.io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync(spent, 1);
+    assert!(q.store().txs.sync_class_a_data().is_err());
+    rbitcoin_store::io_handle::disarm_sync(spent);
+    assert!(
+        q.set_prune_seqsigwit(true).is_err(),
+        "the prune release synced Class A after a failed sync"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The create locator landed and the witness locator stopped short below
+/// the sealed tip. Only an older binary leaves that image: open refuses and
+/// asks for a reindex rather than free numbers the sealed blocks name.
+#[test]
+fn short_witness_locator_below_the_tip_refuses() {
     let (dir, q) = temp_query("prune-loc-prefix");
     let mut hashes = Vec::new();
     connect_range(&q, Fk::NULL, None, 20, &[0x47], &mut hashes);
-    let kept = 12u64;
-    q.store()
-        .txs
-        .seqsigwit_loc
-        .truncate_to_count(kept)
-        .unwrap();
+    q.store().txs.seqsigwit_loc.truncate_to_count(12).unwrap();
     q.persist_pruneheight(u32::MAX).unwrap();
     q.store().sync_spend_durable(19).unwrap();
     drop(q);
-    let q = Query::open_or_create_tiny(dir.path()).unwrap();
-    assert_eq!(q.store().txs.count(), kept);
-    assert_eq!(q.tip_height(), Some(Height(11)));
-    assert_witness_stem_cut(&q);
-    let block = q.reconstruct_block_at_height(Height(11)).unwrap();
-    assert_eq!(
-        block.txdata[0].input[0].witness.to_vec(),
-        vec![vec![0x47]]
-    );
+    match Query::open_or_create_tiny(dir.path()) {
+        Err(e) => assert!(e.to_string().contains("reindex"), "open returned {e}"),
+        Ok(q) => panic!("open cut committed creates: count {}", q.store().txs.count()),
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -787,6 +787,39 @@ fn apply_sh_pending_writes_creates_and_advances_watermark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Tip mode: block 1's locator header write fails. The append fails and
+/// latches, so the inline barrier never seals block 1 and the write-behind
+/// never names its create in `include_hwm`: a power cut would cut it.
+#[cfg(debug_assertions)]
+#[test]
+fn write_behind_does_not_name_a_create_whose_header_write_failed() {
+    let (dir, q) = temp_query("sh-wb-failed-header");
+    assert!(q.index_mode().expect("index mode cell").is_tip());
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let fk0 = q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    q.apply_sh_pending().unwrap();
+    let include = q.store().scripthash.include_hwm();
+    assert_eq!(include, q.store().txs.count());
+
+    let loc = q.store().txs.create_loc.loc.read_fd();
+    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(loc, 8);
+    let (h1, t1) = coinbase_block(1, fk0, Some(h0.hash));
+    let connected = q.connect_block(Height(1), &h1, &[t1]);
+    rbitcoin_store::io_handle::disarm_pwrite(loc);
+    let _ = q.apply_sh_pending();
+    let _ = q.advance_sh_include_hwm();
+    assert_eq!(
+        q.store().scripthash.include_hwm(),
+        include,
+        "the write-behind named a create whose header write failed"
+    );
+    assert!(
+        connected.is_err(),
+        "block 1 connected after its append failed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `apply_sh_pending` must wait out an in-flight job (worker vs generate drain).
 #[test]
 fn apply_sh_pending_waits_for_in_flight_job() {
@@ -999,6 +1032,29 @@ fn recover_sh_writebehind_fails_open_on_interior_missing_header_txs() {
     assert!(
         msg.contains("invariant:") || msg.contains("missing"),
         "expected invariant/missing body, got {msg}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The clear flushes every dirty `header_txs` row, including another
+/// block's range whose creates are not synced yet. It runs the Class A sync
+/// first, like every other `header_txs` flush.
+#[test]
+fn clear_archived_body_syncs_class_a_before_header_txs() {
+    let (dir, q) = temp_query("clear-syncs-class-a");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let hash0 = h0.hash;
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let prev0 = q.tip_header_fk().unwrap().unwrap();
+    let (h1, t1) = coinbase_block(1, prev0, Some(hash0));
+    q.commit_class_a_only(&h1, &[t1]).unwrap();
+    let body = q.store().txs.body.body.io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync(body, 1);
+    let cleared = q.clear_archived_body_here(&hash0);
+    rbitcoin_store::io_handle::disarm_sync(body);
+    assert!(
+        cleared.is_err(),
+        "header_txs reached disk without the Class A sync"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2257,5 +2313,41 @@ fn sh_views_skip_the_genesis_coinbase() {
     assert_eq!(q.sh_indexed_through_height(), Some(1));
     assert!(q.pending_sh_create_fks(&sh).is_empty(), "creates durable");
     check("durable");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A torn scripthash slab found by the write-behind apply schedules a full
+/// rebuild for the next start instead of a crash loop.
+///
+/// The apply is the single writer under `sh.appender`, so a framing fault it
+/// reads is on disk, not a reader racing an append. The replay after a power
+/// cut re-applies the jobs above `include_hwm`, which are the ones that tore.
+#[test]
+fn torn_scripthash_slab_on_apply_marks_a_rebuild() {
+    let (dir, q) = temp_query("sh-torn-slab-marks-rebuild");
+    let mut prev = Fk::NULL;
+    let mut parent = None;
+    for h in 0..8u32 {
+        let (hdr, tx) = coinbase_block(h, prev, parent);
+        q.commit_class_a_only(&hdr, &[tx]).unwrap();
+        prev = q.confirm_block(Height(h), &hdr.hash).unwrap();
+        parent = Some(hdr.hash);
+    }
+    q.apply_sh_pending().unwrap();
+    assert!(!q.sh_force_rebuild());
+    let body = q.store.scripthash.ovf_file();
+    body.set_logical_len(rbitcoin_store::file::FILE_HEADER_LEN as u64)
+        .unwrap();
+    let (hdr, tx) = coinbase_block(8, prev, parent);
+    q.commit_class_a_only(&hdr, &[tx]).unwrap();
+    q.confirm_block(Height(8), &hdr.hash).unwrap();
+    assert!(
+        q.apply_sh_pending().is_err(),
+        "the torn slab must fail the apply"
+    );
+    assert!(rbitcoin_store::scripthash::sh_rebuild_marked(
+        q.store.path()
+    ));
+    assert!(q.sh_force_rebuild(), "the next start rebuilds the index");
     let _ = std::fs::remove_dir_all(&dir);
 }

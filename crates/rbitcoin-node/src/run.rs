@@ -809,8 +809,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
 
-    let shutdown = Shutdown::new();
-    spawn_signal_handler(shutdown.clone());
+    let shutdown = node_shutdown(&node.hub.query);
     let tor_ctl = shutdown
         .run_until_cancelled(crate::tor_control::TorControl::connect_if_configured(
             config.tor.control,
@@ -3138,6 +3137,26 @@ pub fn sh_tip_ready_gates(query: &Query) -> TipModeGates {
         tip_follow_ready: true,
         sh_tip_ready: ready,
     }
+}
+
+/// The node's shutdown: signals stop it, and so does a failed Class A write
+/// or sync.
+///
+/// The latch already refuses every later commit after that failure; running
+/// on would only fail each block until someone restarts. Stopping exits
+/// non-zero, so the operator (or `Restart=on-failure`) checks the disk and
+/// restarts, and open then fits the archive to what reached the device.
+pub fn node_shutdown(query: &Query) -> Arc<Shutdown> {
+    let shutdown = Shutdown::new();
+    spawn_signal_handler(shutdown.clone());
+    let sd = Arc::clone(&shutdown);
+    query.store().txs.on_class_a_failure(move || {
+        sd.fail(NodeError::Init(
+            "an archive write or sync failed, so no later block can commit; check the disk and restart"
+                .into(),
+        ));
+    });
+    shutdown
 }
 
 /// Start the Class B appender once. A second call does not spawn another thread.

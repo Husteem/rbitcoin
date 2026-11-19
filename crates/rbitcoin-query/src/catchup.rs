@@ -89,8 +89,10 @@ impl Query {
         self.sh_force_rebuild.store(on, Ordering::SeqCst);
     }
 
+    /// The operator flag, or a torn slab the write-behind apply found.
     pub fn sh_force_rebuild(&self) -> bool {
         self.sh_force_rebuild.load(Ordering::SeqCst)
+            || rbitcoin_store::scripthash::sh_rebuild_marked(self.store.path())
     }
 
     /// Enter **direct** IBD with scripthash indexing **on** (library / test default).
@@ -152,11 +154,13 @@ impl Query {
     /// Tip mode on restart — no Direct recollect / bulk materialize).
     ///
     /// Requires a non-empty durable head, no residual on-disk runs, and
-    /// `include_hwm`/SEAL **≥** tip create HWM (strict; not memtable lag).
+    /// `include_hwm`/SEAL **≥** the settled create count (strict; not
+    /// memtable lag). An append still in flight, or one that failed after
+    /// its bodies published, is not a create the index can name yet.
     pub fn sh_is_tip_ready(&self) -> bool {
         use crate::sh_builder::durable_sh_inclusion_floor;
 
-        let tip_max = self.store.txs.count();
+        let tip_max = self.store.txs.settled_count();
         if tip_max == 0 {
             // Empty / genesis-only store: not "tip ready" for SH (nothing to serve).
             return false;
@@ -216,31 +220,48 @@ impl Query {
     }
 
     /// Delete a pack-complete head that has neither an include mark nor a
-    /// SEAL, so the next materialize scans Class A.
+    /// SEAL, or any head or unfinished collect whose marks name creates the
+    /// archive does not hold, so the next materialize scans Class A.
     ///
     /// Append only adds creates past each key's tail. Replaying every height
     /// from 0 cannot fill a hole under a later append, and on a long chain it
     /// is the slow path. A SEAL still names the prefix when the mark file is
-    /// missing. `--sh-index` off leaves the files in place.
+    /// missing. A mark past the create count comes from an older binary that
+    /// named creates no block range committed, which open then cut: their
+    /// postings would attach to the creates that take those numbers, and a
+    /// resumed collect would skip them. Start runs this before any append
+    /// reuses a cut number. `--sh-index` off leaves the files in place.
     pub fn discard_unproven_scripthash_head(&self) -> Result<(), QueryError> {
-        if !self.sh_index_enabled() || !self.store.scripthash.has_durable_index() {
+        if !self.sh_index_enabled() {
             return Ok(());
         }
-        if self.store.txs.count() == 0 {
-            return Ok(());
-        }
+        let count = self.store.txs.count();
+        let unsorted = rbitcoin_store::unsorted_shard_dir(self.store.path());
+        let collected = rbitcoin_store::unsorted_marks_last_fk(
+            &unsorted,
+            self.store.scripthash.head_shard_count(),
+        );
+        let durable = self.store.scripthash.has_durable_index();
         self.sh_run.refresh_seal();
         let floor = crate::sh_builder::durable_sh_inclusion_floor(
             self.store.scripthash.include_hwm(),
             self.sh_run.sealed_max_create_fk(),
         );
-        if floor > 0 {
+        let named = floor.max(collected);
+        if named > count {
+            rbitcoin_log::warn!(
+                "scripthash index names creates through {named} but the archive \
+                 holds {count}; deleting it so tip entry can materialize from Class A"
+            );
+        } else if !durable || count == 0 || floor > 0 {
             return Ok(());
+        } else {
+            rbitcoin_log::warn!(
+                "scripthash head has no include mark and no SEAL; deleting it so \
+                 tip entry can materialize from Class A"
+            );
         }
-        rbitcoin_log::warn!(
-            "scripthash head has no include mark and no SEAL; deleting it so \
-             tip entry can materialize from Class A"
-        );
+        rbitcoin_store::clear_unsorted_shard_dir(&unsorted);
         self.sh_run.prepare_force_full_rebuild(&self.store)?;
         self.set_sh_indexed_through_height(None);
         self.sh.applied_max_fk.store(0, Ordering::Release);
@@ -321,6 +342,19 @@ impl Query {
         &self,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<u64, QueryError> {
+        let forced = self.sh_force_rebuild();
+        let n = self.finalize_sh_unsorted_inner(cancel)?;
+        if forced {
+            // The rebuild finished; a crash before this wipes and rebuilds again.
+            rbitcoin_store::scripthash::clear_sh_rebuild(self.store.path())?;
+        }
+        Ok(n)
+    }
+
+    fn finalize_sh_unsorted_inner(
+        &self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<u64, QueryError> {
         if self.sh_force_rebuild() {
             rbitcoin_log::info!(
                 "node: scripthash FORCE_REBUILD + unsorted-shards — wipe head then Class A collect"
@@ -342,14 +376,14 @@ impl Query {
         if tip_max > 0 {
             let mut n = n;
             // A create can land after the chase samples readiness and before
-            // this check. The watermark is then behind `txs.count()`, so scan
-            // again. A watermark that already covers the count is a real gap.
+            // this check. The watermark is then behind the settled count, so
+            // scan again. A watermark that already covers it is a real gap.
             const GAP: &str =
                 "scripthash unsorted-shards create gap remain after materialize drain \
                      (refuse tip-follow / Electrum)";
             while !self.sh_is_tip_ready() {
                 if !self.store.scripthash.has_durable_index()
-                    || self.store.scripthash.include_hwm() >= self.store.txs.count()
+                    || self.store.scripthash.include_hwm() >= self.store.txs.settled_count()
                 {
                     return Err(StoreError::Corrupt(GAP));
                 }
@@ -380,7 +414,7 @@ impl Query {
                 }
                 return Ok(n);
             }
-            if self.store.scripthash.include_hwm() >= self.store.txs.count() {
+            if self.store.scripthash.include_hwm() >= self.store.txs.settled_count() {
                 return Err(StoreError::Corrupt(gap));
             }
         }
@@ -389,7 +423,7 @@ impl Query {
     /// Append Class A creates after the durable inclusion floor onto a live SH head.
     ///
     /// Confirm keeps appending while this runs (`submitblock` during
-    /// materialize). Each pass samples `txs.count()` and, when that count
+    /// materialize). Each pass samples `txs.settled_count()` and, when that count
     /// grew, scans the new tail before publishing the watermark.
     ///
     /// The chunk append holds `sh.appender`, the same mutex as
@@ -404,7 +438,9 @@ impl Query {
         const CHUNK: u64 = 64_000;
         let mut total = 0u64;
         loop {
-            let last = self.store.txs.count();
+            let last = self.store.txs.settled_count();
+            // `include_hwm` names creates through `last`; they reach the device first.
+            self.store.txs.sync_class_a_named(last)?;
             self.sh_run.refresh_seal();
             let floor = durable_sh_inclusion_floor(
                 self.store.scripthash.include_hwm(),
@@ -420,7 +456,7 @@ impl Query {
                 hook(self);
             }
             if last < first {
-                if self.store.txs.count() <= last {
+                if self.store.txs.settled_count() <= last {
                     return Ok(total);
                 }
                 continue;
@@ -450,7 +486,7 @@ impl Query {
             self.store.scripthash.flush()?;
             self.store.scripthash.note_include_hwm(last)?;
             self.sh_run.publish_seal_watermark(last)?;
-            if self.store.txs.count() <= last {
+            if self.store.txs.settled_count() <= last {
                 return Ok(total);
             }
         }
@@ -505,7 +541,7 @@ fn sh_backfill_after_sample_hook() -> Option<fn(&Query)> {
     SH_BACKFILL_AFTER_SAMPLE.with(|c| c.take())
 }
 
-/// One-shot hook invoked after a Class A tail backfill samples `txs.count()`.
+/// One-shot hook invoked after a Class A tail backfill samples `txs.settled_count()`.
 /// Tests use it to confirm another create in that window.
 #[cfg(debug_assertions)]
 #[doc(hidden)]

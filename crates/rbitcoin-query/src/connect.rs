@@ -311,8 +311,8 @@ impl Query {
     /// Tip mode returns after it. IBD returns before it and may dequeue the
     /// RAM body queue: a kill then loses at most one more batch to download
     /// again. Returns the last sealed tip. IBD returns that height while
-    /// this batch's flush is still running. A withheld locator header does
-    /// not move it. Seqsigwit prune keeps its window below that tip.
+    /// this batch's flush is still running. Seqsigwit prune keeps its window
+    /// below that tip.
     #[doc(hidden)]
     pub fn flush_tip(&self, before: Option<Height>) -> Result<Option<Height>, QueryError> {
         self.require_pruned_keep_spills()?;
@@ -1098,7 +1098,20 @@ impl Query {
     }
 
     pub fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
-        let applied = self.apply_sh_job_inner(&job)?;
+        let applied = match self.apply_sh_job_inner(&job) {
+            Ok(applied) => applied,
+            // The single appender read a torn slab: it is on disk, not a
+            // reader racing an append. The next start rebuilds the index.
+            Err(e @ StoreError::Corrupt(_)) => {
+                rbitcoin_log::warn!(
+                    "node: scripthash apply at height {} hit {e} — full rebuild on next start",
+                    job.height.0
+                );
+                rbitcoin_store::scripthash::mark_sh_rebuild(self.store.path())?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
         if applied {
             unindex_sh_ram_head(&mut self.sh.ram_head.lock().unwrap(), &job);
         }

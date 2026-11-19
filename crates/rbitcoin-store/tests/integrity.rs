@@ -625,85 +625,30 @@ fn on_disk_hwm(path: &std::path::Path) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Genesis is sealed. The next connect's locator header does not land.
-/// The sealed tip and the spend marker stay at genesis. Reopen's create
-/// count is that prefix, and the withheld height has no body association.
-#[test]
-fn withheld_locator_header_does_not_seal_the_tip() {
-    let dir = tmp();
-    let s = Store::create_tiny(&dir).unwrap();
-    let write = rbitcoin_store::ClassCWrite::for_test();
-    let (prev, parent_hash) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
-    s.flush_class_c_tip().unwrap();
-    s.note_spend_snapshot(0);
-    s.checkpoint_spend_through(0).unwrap();
-    let sealed = on_disk_hwm(&dir.join("confirmed.body"));
-    let seal = std::fs::read(dir.join("tip_seal")).unwrap();
-    let genesis = s.confirmed.get(Height(0)).unwrap().unwrap();
-
-    let loc = s.txs.create_loc.loc.read_fd();
-    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(loc, 8);
-    let disarm = Disarm(loc);
-    let (withheld, _) = connect_coinbase(&s, &write, 1, prev, parent_hash);
-    drop(disarm);
-    s.flush_class_c_tip().unwrap();
-    s.txs.flush().unwrap();
-    s.note_spend_snapshot(1);
-    s.checkpoint_spend_through(1).unwrap();
-    assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
-    assert_eq!(
-        on_disk_hwm(&dir.join("confirmed.body")),
-        sealed,
-        "a withheld locator header does not seal the new tip"
-    );
-    assert_eq!(std::fs::read(dir.join("tip_seal")).unwrap(), seal);
-    let marker = rbitcoin_store::spend_durable::SpendDurable::load(s.path())
-        .unwrap()
-        .expect("checkpoint publishes");
-    assert_eq!(marker.durable_through(), 0);
-    drop(s);
-
-    let s = Store::open_tiny(&dir).unwrap();
-    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
-    assert_eq!(s.txs.count(), 1);
-    assert!(s.header_txs.has_body(genesis).unwrap());
-    assert!(!s.header_txs.has_body(withheld).unwrap());
-    assert!(s.txs.get_meta_and_outputs(Fk(1)).is_ok());
-    assert!(s.txs.get_meta_and_outputs(Fk(2)).is_err());
-    let marker = rbitcoin_store::spend_durable::SpendDurable::load(s.path())
-        .unwrap()
-        .unwrap();
-    assert_eq!(marker.durable_through(), 0);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Open cuts a create whose locator header never landed. A committed delta
-/// spend of its output, by a spender still on the chain, goes with it: the
-/// delta is clipped to the cut `spent.body` end, so the next create at the
-/// same offsets reads unspent.
+/// A delta commit syncs Class A and names its creates, so open keeps them. An
+/// older binary's datadir has no sync mark: open cuts a create no block range
+/// names, though a committed delta spend of its output, by a spender still on
+/// the chain, may remain. The delta is clipped to the cut `spent.body` end,
+/// so the next create at the same offsets reads unspent.
 #[test]
 fn a_spend_of_a_cut_create_does_not_mark_the_create_that_reuses_its_slot() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();
     let write = rbitcoin_store::ClassCWrite::for_test();
-    let (prev, parent_hash) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
     s.flush_class_c_tip().unwrap();
+    let (rec, ins, outs) = coinbase(8);
+    let unranged = s
+        .put_tx_full_batch_indexed(&[(rec, ins, outs)], false)
+        .unwrap()[0];
+    assert_eq!(unranged, Fk(2));
+    let cut = s.txs.spent_range(unranged).unwrap();
+    s.put_spend_create(unranged, 0, Fk(1), 0).unwrap();
     s.note_spend_snapshot(0);
     s.checkpoint_spend_through(0).unwrap();
-
-    let loc = s.txs.create_loc.loc.read_fd();
-    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(loc, 8);
-    let disarm = Disarm(loc);
-    connect_coinbase(&s, &write, 1, prev, parent_hash);
-    drop(disarm);
-    let cut = s.txs.spent_range(Fk(2)).unwrap();
-    s.put_spend_create(Fk(2), 0, Fk(1), 0).unwrap();
-    s.flush_class_c_tip().unwrap();
-    s.txs.flush().unwrap();
-    s.note_spend_snapshot(1);
-    s.checkpoint_spend_through(1).unwrap();
-    assert_eq!(s.txs.get_output_spender_meta(Fk(2), 0).unwrap().1, Fk(1));
+    assert_eq!(s.txs.get_output_spender_meta(unranged, 0).unwrap().1, Fk(1));
     drop(s);
+    std::fs::remove_file(dir.join(rbitcoin_store::tx_table::CLASS_A_SYNCED_NAME)).unwrap();
 
     let s = Store::open_tiny(&dir).unwrap();
     assert_eq!(s.txs.count(), 1, "open cuts the create");
@@ -721,195 +666,139 @@ fn a_spend_of_a_cut_create_does_not_mark_the_create_that_reuses_its_slot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn assert_withheld_overflow_stays_unsealed(dir: &std::path::Path, genesis: Fk, withheld: Fk) {
-    let s = Store::open_tiny(dir).unwrap();
-    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
-    assert_eq!(s.txs.count(), 1);
-    assert!(s.header_txs.has_body(genesis).unwrap());
-    assert!(!s.header_txs.has_body(withheld).unwrap());
-    assert!(s.txs.get_meta_and_outputs(Fk(1)).is_ok());
-    assert!(s.txs.get_meta_and_outputs(Fk(2)).is_err());
-    let marker = rbitcoin_store::spend_durable::SpendDurable::load(s.path())
-        .unwrap()
-        .unwrap();
-    assert_eq!(marker.durable_through(), 0);
-    drop(s);
-}
-
-/// Genesis is sealed. The next connect's locator headers land and its
-/// overflow header does not. The sealed tip and the spend marker stay at
-/// genesis. Reopen drops that create.
-#[test]
-fn withheld_overflow_header_does_not_seal_the_tip() {
-    let dir = tmp();
-    let s = Store::create_tiny(&dir).unwrap();
-    let write = rbitcoin_store::ClassCWrite::for_test();
-    let (prev, parent_hash) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
-    s.flush_class_c_tip().unwrap();
-    s.note_spend_snapshot(0);
-    s.checkpoint_spend_through(0).unwrap();
-    let sealed = on_disk_hwm(&dir.join("confirmed.body"));
-    let seal = std::fs::read(dir.join("tip_seal")).unwrap();
-    let genesis = s.confirmed.get(Height(0)).unwrap().unwrap();
-
-    let ovf = s.txs.seqsigwit_loc.ovf.read_fd();
-    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(ovf, 8);
-    let disarm = Disarm(ovf);
-    let (withheld, _) = connect_fat_witness(&s, &write, 1, prev, parent_hash);
-    drop(disarm);
-    s.flush_class_c_tip().unwrap();
-    s.txs.flush().unwrap();
-    s.note_spend_snapshot(1);
-    s.checkpoint_spend_through(1).unwrap();
-    assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
-    assert_eq!(
-        on_disk_hwm(&dir.join("confirmed.body")),
-        sealed,
-        "a withheld overflow header does not seal the new tip"
-    );
-    assert_eq!(std::fs::read(dir.join("tip_seal")).unwrap(), seal);
-    let marker = rbitcoin_store::spend_durable::SpendDurable::load(s.path())
-        .unwrap()
-        .expect("checkpoint publishes");
-    assert_eq!(marker.durable_through(), 0);
-    drop(s);
-    assert_withheld_overflow_stays_unsealed(&dir, genesis, withheld);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The overflow row was written and its header did not land. A failed read
-/// of that row does not seal the tip. Reopen drops that create.
-#[test]
-fn unreadable_withheld_overflow_row_does_not_seal_the_tip() {
-    let dir = tmp();
-    let s = Store::create_tiny(&dir).unwrap();
-    let write = rbitcoin_store::ClassCWrite::for_test();
-    let (prev, parent_hash) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
-    s.flush_class_c_tip().unwrap();
-    s.note_spend_snapshot(0);
-    s.checkpoint_spend_through(0).unwrap();
-    let sealed = on_disk_hwm(&dir.join("confirmed.body"));
-    let genesis = s.confirmed.get(Height(0)).unwrap().unwrap();
-
-    let ovf = s.txs.seqsigwit_loc.ovf.read_fd();
-    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(ovf, 8);
-    let disarm = Disarm(ovf);
-    let (withheld, _) = connect_fat_witness(&s, &write, 1, prev, parent_hash);
-    drop(disarm);
-    rbitcoin_store::io_handle::arm_fail_preads(ovf, 1);
-    let err = s
-        .flush_class_c_tip()
-        .expect_err("an unreadable overflow row does not seal");
-    rbitcoin_store::io_handle::disarm_pwrite(ovf);
-    assert!(
-        matches!(err, rbitcoin_store::error::StoreError::Io { .. }),
-        "{err}"
-    );
-    assert_eq!(
-        on_disk_hwm(&dir.join("confirmed.body")),
-        sealed,
-        "a failed overflow read sealed the tip"
-    );
-    drop(s);
-    assert_withheld_overflow_stays_unsealed(&dir, genesis, withheld);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// `--prune-seqsigwit` does not publish a witness locator. A withheld
-/// `create.loc.ovf` header is then the only short file. The tip stays at
-/// the sealed prefix.
-#[test]
-fn withheld_create_overflow_header_does_not_seal_when_pruned() {
-    let dir = tmp();
-    let s = Store::create_tiny(&dir).unwrap();
-    let write = rbitcoin_store::ClassCWrite::for_test();
-    let (prev, parent_hash) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
-    s.flush_class_c_tip().unwrap();
-    s.note_spend_snapshot(0);
-    s.checkpoint_spend_through(0).unwrap();
-    let sealed = on_disk_hwm(&dir.join("confirmed.body"));
-    let seal = std::fs::read(dir.join("tip_seal")).unwrap();
-    let genesis = s.confirmed.get(Height(0)).unwrap().unwrap();
-    s.set_prune_seqsigwit_mode(true);
-
-    let ovf = s.txs.create_loc.ovf.read_fd();
-    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(ovf, 8);
-    let disarm = Disarm(ovf);
-    let (withheld, _) = connect_wide_coinbase(&s, &write, 1, prev, parent_hash);
-    drop(disarm);
-    s.flush_class_c_tip().unwrap();
-    s.txs.flush().unwrap();
-    s.note_spend_snapshot(1);
-    s.checkpoint_spend_through(1).unwrap();
-    assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
-    assert_eq!(
-        on_disk_hwm(&dir.join("confirmed.body")),
-        sealed,
-        "a withheld create overflow header does not seal the new tip"
-    );
-    assert_eq!(std::fs::read(dir.join("tip_seal")).unwrap(), seal);
-    drop(s);
-    assert_withheld_overflow_stays_unsealed(&dir, genesis, withheld);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-fn connect_fat_witness(
-    s: &Store,
-    write: &rbitcoin_store::ClassCWrite,
-    h: u8,
-    prev: Fk,
-    parent_hash: [u8; 32],
-) -> (Fk, [u8; 32]) {
-    let txid = [h; 32];
-    let (mut rec, mut ins, outs) = coinbase(h);
-    rec.txid = txid;
+fn fat_witness(salt: u8) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
+    let (rec, mut ins, outs) = coinbase(salt);
     // Strides at or above 65536 spill to seqsigwit.loc.ovf.
     ins[0].witness = vec![vec![0u8; 65536 * 8]];
-    let tx_fk = s
-        .put_tx_full_batch_indexed(&[(rec, ins, outs)], false)
-        .unwrap()[0];
-    let merkle = rbitcoin_primitives::merkle_root_from_txids(&[txid]);
-    let header = hdr_merkle(prev, parent_hash, h, merkle);
-    let hash = header.hash;
-    let header_fk = s.put_header(&header).unwrap();
-    s.header_txs.put_range(write, header_fk, tx_fk, 1).unwrap();
-    s.strong_tx.set_strong(write, tx_fk, header_fk).unwrap();
-    s.confirmed
-        .set(write, Height(u32::from(h)), header_fk)
-        .unwrap();
-    (header_fk, hash)
+    (rec, ins, outs)
 }
 
-fn connect_wide_coinbase(
-    s: &Store,
-    write: &rbitcoin_store::ClassCWrite,
-    h: u8,
-    prev: Fk,
-    parent_hash: [u8; 32],
-) -> (Fk, [u8; 32]) {
-    let txid = [h; 32];
+fn wide_coinbase(salt: u8) -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
     let rec = TxRecord {
-        txid,
+        txid: [salt; 32],
         version: 1,
         locktime: 0,
         input_count: 1,
         output_count: 256,
     };
-    let ins = vec![InputRecord::coinbase(u32::MAX, vec![h], vec![])];
-    let outs = vec![OutputRecord::unspent(1, vec![0x51]); 256];
-    let tx_fk = s
-        .put_tx_full_batch_indexed(&[(rec, ins, outs)], false)
-        .unwrap()[0];
-    let merkle = rbitcoin_primitives::merkle_root_from_txids(&[txid]);
-    let header = hdr_merkle(prev, parent_hash, h, merkle);
-    let hash = header.hash;
-    let header_fk = s.put_header(&header).unwrap();
-    s.header_txs.put_range(write, header_fk, tx_fk, 1).unwrap();
-    s.strong_tx.set_strong(write, tx_fk, header_fk).unwrap();
-    s.confirmed
-        .set(write, Height(u32::from(h)), header_fk)
-        .unwrap();
-    (header_fk, hash)
+    let ins = vec![InputRecord::coinbase(u32::MAX, vec![salt], vec![])];
+    (rec, ins, vec![OutputRecord::unspent(1, vec![0x51]); 256])
+}
+
+/// Genesis is sealed and named by a spend commit. The next append's header
+/// write on `file` fails. The append returns an error and latches Class A:
+/// the hook fires, and no later barrier or mark runs, so nothing durable
+/// names a create the device may not hold. Reopen keeps genesis and needs
+/// no reindex.
+fn failed_header_write_stops_class_a(
+    file: fn(&Store) -> rbitcoin_store::io_handle::IoHandle,
+    tx: (TxRecord, Vec<InputRecord>, Vec<OutputRecord>),
+    prune: bool,
+) {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, _) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(0)));
+    s.note_spend_snapshot(0);
+    s.checkpoint_spend_through(0).unwrap();
+    s.set_prune_seqsigwit_mode(prune);
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&fired);
+    s.txs.on_class_a_failure(move || {
+        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    let fd = file(&s);
+    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(fd, 8);
+    let disarm = Disarm(fd);
+    assert!(
+        s.put_tx_full_batch_indexed(&[tx], false).is_err(),
+        "an append whose header write failed returned Ok"
+    );
+    drop(disarm);
+    assert!(fired.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        s.flush_class_c_tip().is_err(),
+        "the barrier ran after a failed write"
+    );
+    assert!(s.txs.sync_class_a_named(1).is_err());
+    assert!(
+        s.put_tx_full_batch_indexed(&[coinbase(9)], false).is_err(),
+        "an append ran on top of a failed one"
+    );
+    drop(s);
+
+    let s = Store::open_tiny(&dir).expect("reopen after a failed header write");
+    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    assert_eq!(s.txs.count(), 1);
+    assert!(s.header_txs.has_body(genesis).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn failed_locator_header_write_stops_class_a() {
+    failed_header_write_stops_class_a(|s| s.txs.create_loc.loc.read_fd(), coinbase(1), false);
+}
+
+#[test]
+fn failed_create_overflow_header_write_stops_class_a() {
+    failed_header_write_stops_class_a(|s| s.txs.create_loc.ovf.read_fd(), wide_coinbase(1), true);
+}
+
+#[test]
+fn failed_witness_overflow_header_write_stops_class_a() {
+    failed_header_write_stops_class_a(|s| s.txs.seqsigwit_loc.ovf.read_fd(), fat_witness(1), false);
+}
+
+#[test]
+fn failed_txid_header_write_stops_class_a() {
+    failed_header_write_stops_class_a(|s| s.txs.txids.file.read_fd(), coinbase(1), false);
+}
+
+#[test]
+fn failed_input_header_write_stops_class_a() {
+    failed_header_write_stops_class_a(|s| s.txs.input.loc.read_fd(), coinbase(1), false);
+}
+
+#[test]
+fn failed_txstat_header_write_stops_class_a() {
+    failed_header_write_stops_class_a(|s| s.txs.txstat.body.read_fd(), coinbase(1), false);
+}
+
+/// An append publishes its bodies and locator before it writes `txid.body`,
+/// `txstat`, and `input`. A spend commit in that window names only finished
+/// creates: a later open keeps create 1 and cuts the unnamed create 2.
+#[cfg(debug_assertions)]
+#[test]
+fn spend_commit_does_not_name_an_unfinished_append() {
+    let dir = tmp();
+    let s = std::sync::Arc::new(Store::create_tiny(&dir).unwrap());
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, _) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.height_fence_extend(Height(0), genesis).unwrap();
+    assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(0)));
+    let inside = std::sync::Arc::clone(&s);
+    rbitcoin_store::tx_table::set_after_bodies_for_test(Some(Box::new(move || {
+        assert_eq!(
+            inside.txs.count(),
+            2,
+            "the bodies published before txid.body"
+        );
+        inside.note_spend_snapshot(0);
+        inside.checkpoint_spend_through(0).unwrap();
+    })));
+    s.put_tx_full_batch_indexed(&[coinbase(1)], false).unwrap();
+    rbitcoin_store::tx_table::set_after_bodies_for_test(None);
+    drop(s);
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(
+        s.txs.count(),
+        1,
+        "the spend commit named an unfinished create"
+    );
+    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Prune mode already knows the short input is the crash tail. Repair must
@@ -940,7 +829,7 @@ fn pruned_short_input_skips_the_witness_locator() {
         txstat: &s.txs.txstat,
         input: &s.txs.input,
     };
-    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true).unwrap();
+    rbitcoin_store::tx_table::repair_class_a_count_skew(stems, true, true, None).unwrap();
     drop(disarm);
     assert_eq!(s.txs.count(), 1, "repair stops at the short input");
     assert_eq!(s.txs.input.count(), 1);
@@ -954,11 +843,11 @@ fn write_hwm(path: &std::path::Path, logical: u64) {
     f.write_all(&logical.to_le_bytes()).unwrap();
 }
 
-/// The loc header was shortened across a 1024-create window. Off and the
-/// overflow file were not. Open keeps a shorter prefix and does not leave
-/// the tip sealed past it.
+/// The loc header was shortened across a 1024-create window below a sealed
+/// tip. Off and the overflow file were not. Open refuses rather than free
+/// numbers the sealed block names.
 #[test]
-fn truncate_across_window_does_not_keep_a_sealed_tip() {
+fn loc_cut_across_a_window_below_a_sealed_tip_refuses() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();
     let write = rbitcoin_store::ClassCWrite::for_test();
@@ -1005,105 +894,9 @@ fn truncate_across_window_does_not_keep_a_sealed_tip() {
         rbitcoin_store::file::FILE_HEADER_LEN as u64 + 1023 * rbitcoin_store::create_loc::SLOT;
     write_hwm(&dir.join("create.loc"), short);
 
-    let s = Store::open_tiny(&dir).expect("a mid-truncate crash opens");
-    assert_eq!(s.txs.count(), 1023, "open kept the short loc prefix");
-    assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
+    // Height 1 names creates 1024 and 1025: only an older binary cuts them.
+    assert_refuses_committed_cut(&dir, 0);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Height 1 ends on the fitted locator count. The next block's overflow row
-/// is past that count and its header does not land. The spend marker stays
-/// on height 1.
-#[test]
-fn withheld_overflow_past_the_fitted_count_keeps_height_one() {
-    let dir = tmp();
-    let s = Store::create_tiny(&dir).unwrap();
-    let write = rbitcoin_store::ClassCWrite::for_test();
-    let (prev, parent_hash) = connect_wide_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
-    s.flush_class_c_tip().unwrap();
-    s.note_spend_snapshot(0);
-    s.checkpoint_spend_through(0).unwrap();
-
-    let (prev, parent_hash) = connect_plain_block(&s, &write, 1, prev, parent_hash, 1022);
-    assert_eq!(s.txs.count(), 1023);
-    s.flush_class_c_tip().unwrap();
-    s.note_spend_snapshot(1);
-    s.checkpoint_spend_through(1).unwrap();
-    let marker = rbitcoin_store::spend_durable::SpendDurable::load(s.path())
-        .unwrap()
-        .expect("height 1 publishes");
-    assert_eq!(marker.durable_through(), 1);
-
-    let ovf = s.txs.create_loc.ovf.read_fd();
-    rbitcoin_store::io_handle::arm_fail_hwm_pwrites(ovf, 8);
-    let disarm = Disarm(ovf);
-    let _withheld = connect_wide_coinbase(&s, &write, 2, prev, parent_hash);
-    drop(disarm);
-    s.flush_class_c_tip().unwrap();
-    s.txs.flush().unwrap();
-    s.note_spend_snapshot(2);
-    s.checkpoint_spend_through(2).unwrap();
-    let marker = rbitcoin_store::spend_durable::SpendDurable::load(s.path())
-        .unwrap()
-        .expect("checkpoint publishes");
-    assert_eq!(
-        marker.durable_through(),
-        1,
-        "a withheld row past the fitted count unsealed height 1"
-    );
-    drop(s);
-
-    let s = Store::open_tiny(&dir).unwrap();
-    assert_eq!(s.txs.count(), 1023);
-    assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
-    let marker = rbitcoin_store::spend_durable::SpendDurable::load(s.path())
-        .unwrap()
-        .unwrap();
-    assert_eq!(marker.durable_through(), 1);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-fn connect_plain_block(
-    s: &Store,
-    write: &rbitcoin_store::ClassCWrite,
-    h: u8,
-    prev: Fk,
-    parent_hash: [u8; 32],
-    n: u16,
-) -> (Fk, [u8; 32]) {
-    let mut batch = Vec::with_capacity(usize::from(n));
-    let mut txids = Vec::with_capacity(usize::from(n));
-    for i in 0..n {
-        let mut txid = [h; 32];
-        txid[0] = (i & 0xff) as u8;
-        txid[1] = (i >> 8) as u8;
-        txids.push(txid);
-        let rec = TxRecord {
-            txid,
-            version: 1,
-            locktime: 0,
-            input_count: 1,
-            output_count: 1,
-        };
-        let ins = vec![InputRecord::coinbase(u32::MAX, vec![txid[0]], vec![])];
-        let outs = vec![OutputRecord::unspent(1, vec![0x51])];
-        batch.push((rec, ins, outs));
-    }
-    let fks = s.put_tx_full_batch_indexed(&batch, false).unwrap();
-    let merkle = rbitcoin_primitives::merkle_root_from_txids(&txids);
-    let header = hdr_merkle(prev, parent_hash, h, merkle);
-    let hash = header.hash;
-    let header_fk = s.put_header(&header).unwrap();
-    s.header_txs
-        .put_range(write, header_fk, fks[0], u32::from(n))
-        .unwrap();
-    for fk in &fks {
-        s.strong_tx.set_strong(write, *fk, header_fk).unwrap();
-    }
-    s.confirmed
-        .set(write, Height(u32::from(h)), header_fk)
-        .unwrap();
-    (header_fk, hash)
 }
 
 fn shorten_creates(s: &Store, n: u64) {
@@ -1284,4 +1077,710 @@ fn failed_read_in_tip_window_shrinks_nothing_but_a_torn_record_does() {
         "a locator past the read cap still shrinks"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every Class A file a commit names is device-synced before Class C.
+///
+/// A failed `sync_data` on any of them fails the barrier, and the on-disk
+/// tip stays where it was. Power loss then cannot leave `confirmed[]` or a
+/// `header_txs` range naming creates that never reached the device. The
+/// failure latches: a retried fsync can succeed after the kernel dropped
+/// the dirty pages, so every later barrier refuses until a restart.
+#[test]
+fn class_a_sync_failure_stops_the_class_c_commit() {
+    for (name, pick) in CLASS_A_FILES {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+        s.flush_class_c_tip().unwrap();
+        let sealed = on_disk_hwm(&dir.join("confirmed.body"));
+        connect_coinbase(&s, &write, 1, genesis, parent);
+        rbitcoin_store::io_handle::arm_fail_sync(pick(&s), 1);
+        assert!(
+            s.flush_class_c_tip().is_err(),
+            "{name}: the barrier committed without syncing it"
+        );
+        assert!(
+            s.flush_class_c_tip().is_err(),
+            "{name}: a retried barrier committed over a failed sync"
+        );
+        assert_eq!(
+            on_disk_hwm(&dir.join("confirmed.body")),
+            sealed,
+            "{name}: confirmed[] reached disk ahead of Class A"
+        );
+        drop(s);
+        let s = Store::open_tiny(&dir).unwrap();
+        assert_eq!(s.confirmed.tip_height(), Some(Height(0)), "{name}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A barrier in flight when another caller's Class A sync fails must not
+/// commit after it. The failed fsync took the writeback error for the shared
+/// file description, so the in-flight one can return 0 over dropped pages.
+/// The tip barrier and the spend checkpoint can run together.
+#[test]
+fn class_a_sync_in_flight_does_not_pass_a_latched_failure() {
+    use std::time::{Duration, Instant};
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    // The pre-check walks the files in order: hold the first caller on the
+    // last one, and fail the second on the first, which the first has passed.
+    let last = CLASS_A_FILES[CLASS_A_FILES.len() - 1].1(&s);
+    let first = CLASS_A_FILES[0].1(&s);
+    let hold = Duration::from_millis(400);
+    let start = Instant::now();
+    rbitcoin_store::io_handle::arm_sync_delay(last, hold);
+    let (a_ok, b_ok, b_done) = std::thread::scope(|sc| {
+        let a = sc.spawn(|| s.txs.sync_class_a_data().is_ok());
+        std::thread::sleep(Duration::from_millis(100));
+        rbitcoin_store::io_handle::arm_fail_sync(first, 1);
+        let b_ok = s.txs.sync_class_a_data().is_ok();
+        let b_done = start.elapsed();
+        (a.join().unwrap(), b_ok, b_done)
+    });
+    assert!(!b_ok, "the armed sync did not fail");
+    // A succeeded only if its sync ran before the failure: the failing
+    // caller then returned after A's held sync, not during it. (If A started
+    // late, the failure latched first and A refused.)
+    assert!(
+        !a_ok || b_done >= hold,
+        "a sync in flight succeeded while another failed beside it ({b_done:?})"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The spend fold syncs `spent.body` on the fd the barrier syncs. If that
+/// sync fails it may have taken the writeback error, so the Class A latch
+/// closes: a later barrier sync on the fd can return 0.
+#[test]
+fn failed_fold_sync_latches_class_a() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let spent = s.txs.spent.body.io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync(spent, 1);
+    assert!(s.txs.sync_folded_spent().is_err());
+    rbitcoin_store::io_handle::disarm_sync(spent);
+    assert!(
+        s.txs.sync_class_a_data().is_err(),
+        "a Class A sync passed after the fold's sync of the same fd failed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The table flush (shutdown, input backfill, prune release) syncs Class A
+/// fds too. After a failed Class A sync it refuses: `TableFile::flush`
+/// retries, and a retry can return 0 over pages the kernel dropped.
+#[test]
+fn failed_class_a_sync_refuses_the_table_flush() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let spent = s.txs.spent.body.io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync(spent, 1);
+    assert!(s.txs.sync_class_a_data().is_err());
+    rbitcoin_store::io_handle::disarm_sync(spent);
+    assert!(
+        s.txs.flush().is_err(),
+        "the table flush synced Class A after a failed sync"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed Class A sync tells the store's watcher once, so the node can
+/// stop instead of failing every later commit.
+#[test]
+fn failed_class_a_sync_notifies_the_watcher_once() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let seen = std::sync::Arc::clone(&hits);
+    s.txs.on_class_a_failure(move || {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert!(s.txs.sync_class_a_data().is_ok());
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let spent = s.txs.spent.body.io_handle();
+    rbitcoin_store::io_handle::arm_fail_sync(spent, 1);
+    assert!(s.txs.sync_class_a_data().is_err());
+    rbitcoin_store::io_handle::disarm_sync(spent);
+    assert!(s.txs.sync_class_a_data().is_err());
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+type ClassAPick = fn(&Store) -> rbitcoin_store::io_handle::IoHandle;
+
+/// Every Class A file the barrier syncs.
+const CLASS_A_FILES: [(&str, ClassAPick); 16] = [
+    ("txout.body", |s| s.txs.body.body.io_handle()),
+    ("seqsigwit.body", |s| s.txs.seqsigwit.body.io_handle()),
+    ("spent.body", |s| s.txs.spent.body.io_handle()),
+    ("create.loc", |s| s.txs.create_loc.loc.io_handle()),
+    ("create.loc.ovf", |s| s.txs.create_loc.ovf.io_handle()),
+    ("create.off", |s| s.txs.create_loc.off.io_handle()),
+    ("seqsigwit.loc", |s| s.txs.seqsigwit_loc.loc.io_handle()),
+    ("seqsigwit.loc.ovf", |s| s.txs.seqsigwit_loc.ovf.io_handle()),
+    ("seqsigwit.off", |s| s.txs.seqsigwit_loc.off.io_handle()),
+    ("txid.body", |s| s.txs.txids.file.io_handle()),
+    ("txstat.body", |s| s.txs.txstat.body.io_handle()),
+    ("txstat.ovf", |s| s.txs.txstat.ovf.io_handle()),
+    ("txstat.blk", |s| s.txs.txstat.blk.io_handle()),
+    ("input.loc", |s| s.txs.input.loc.io_handle()),
+    ("input.off", |s| s.txs.input.off.io_handle()),
+    ("input.body", |s| s.txs.input.body.io_handle()),
+];
+
+/// The barrier puts every Class A `sync_data` on the configured bulk-IO
+/// session at once (io_uring, the pool, or IOCP). In flight together, the
+/// filesystem can share journal commits and device cache flushes between
+/// them. One at a time, a Tip-mode block waits for sixteen in a row.
+#[test]
+fn class_a_barrier_submits_its_syncs_in_one_batch() {
+    if !rbitcoin_store::bulk_io::io_uring_enabled() {
+        eprintln!("skip: no bulk-IO session (RBITCOIN_IO=pread or macOS default)");
+        return;
+    }
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    rbitcoin_store::io_handle::watch_sync_batch(
+        CLASS_A_FILES.iter().map(|(_, pick)| pick(&s)).collect(),
+    );
+    let flushed = s.flush_class_c_tip();
+    let seen = rbitcoin_store::io_handle::take_sync_batch_seen();
+    flushed.unwrap();
+    assert!(seen, "the Class A syncs were not submitted together");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Create 3 of the archive models: a spend of create 1 with a witness, so
+/// the input stem holds a parent edge and the witness stem a real row.
+fn spend_of_create_1() -> (TxRecord, Vec<InputRecord>, Vec<OutputRecord>) {
+    (
+        TxRecord {
+            txid: [2u8; 32],
+            version: 2,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        vec![InputRecord::prevout(
+            [0u8; 32],
+            Fk(1),
+            0,
+            7,
+            vec![],
+            vec![vec![9; 3]],
+        )],
+        vec![OutputRecord::unspent(40, vec![0x51])],
+    )
+}
+
+/// Every kept create reads back whole: outputs, txid, stats, and each
+/// input's parent edge, sequence, and witness.
+fn assert_creates_read_back(
+    s: &Store,
+    written: &[(TxRecord, Vec<InputRecord>, Vec<OutputRecord>)],
+    case: &str,
+) {
+    for fk in 1..=s.txs.count() {
+        let (rec, ins, _) = &written[fk as usize - 1];
+        let (_, got, _) = s
+            .get_tx_full(Fk(fk))
+            .unwrap_or_else(|e| panic!("{case}: kept create {fk} full read: {e}"));
+        let edges = |ins: &[InputRecord]| -> Vec<_> {
+            ins.iter()
+                .map(|i| (i.parent(), i.sequence, i.witness.clone()))
+                .collect()
+        };
+        assert_eq!(edges(&got), edges(ins), "{case}: kept create {fk} inputs");
+        assert_eq!(
+            s.txs.body_txid(Fk(fk)).unwrap(),
+            rec.txid,
+            "{case}: create {fk} txid"
+        );
+        if let Err(e) = s.txstat_row(Fk(fk)) {
+            panic!("{case}: kept create {fk} stats: {e}");
+        }
+    }
+}
+
+fn store_image(dir: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for ent in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                let rel = p.strip_prefix(dir).unwrap().to_path_buf();
+                out.insert(rel, std::fs::read(&p).unwrap());
+            }
+        }
+    }
+    out
+}
+
+fn write_image(dir: &std::path::Path, image: &std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+    let _ = std::fs::remove_dir_all(dir);
+    for (rel, bytes) in image {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+    }
+}
+
+/// Power-loss model for the connect barrier.
+///
+/// Height 0 is sealed. The next block's archive is written with no barrier.
+/// Each archive file then keeps either every write since the seal or none of
+/// them. Every single dropped file, and every single kept file, is one
+/// image. A file can also keep its header page and lose the rows behind it.
+/// Each reopens at the sealed tip with exactly the sealed creates: nothing
+/// durable names the rest, so open cuts it without reading it. Every kept
+/// create reads back whole, and the next block seals on top. `tx.head`
+/// keeps what it wrote: its `meta` is synced on insert and open repairs a
+/// head that leads.
+#[test]
+fn each_unsynced_archive_file_reopens_at_the_sealed_tip() {
+    archive_power_loss_model(false);
+}
+
+/// The same model after a spend commit named spender 3, whose block is still
+/// in flight: no `header_txs` range covers creates 2 and 3. Create 4 is the
+/// unsynced write. Open keeps exactly creates 1 to 3, whole.
+#[test]
+fn each_unsynced_archive_file_past_a_sync_mark_reopens_at_the_mark() {
+    archive_power_loss_model(true);
+}
+
+fn archive_power_loss_model(marked: bool) {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(0)));
+    s.txs.head.flush().unwrap();
+    let mut written = vec![coinbase(0), coinbase(1), spend_of_create_1()];
+    let kept = if marked {
+        s.put_tx_full_batch_indexed(&written[1..], false).unwrap();
+        s.put_spend_create(Fk(1), 0, Fk(3), 0).unwrap();
+        s.note_spend_snapshot(0);
+        s.checkpoint_spend_through(0).unwrap();
+        s.txs.head.flush().unwrap();
+        3
+    } else {
+        1
+    };
+    let sealed = store_image(&dir);
+    let mut later = spend_of_create_1();
+    later.0.txid = [3u8; 32];
+    let tail = if marked {
+        written.push(later.clone());
+        vec![later]
+    } else {
+        written[1..].to_vec()
+    };
+    s.put_tx_full_batch_indexed(&tail, false).unwrap();
+    drop(s);
+    let torn = store_image(&dir);
+    let changed: Vec<&PathBuf> = torn
+        .iter()
+        .filter(|(rel, bytes)| sealed.get(*rel) != Some(*bytes))
+        .filter(|(rel, _)| !rel.starts_with("tx.head"))
+        .map(|(rel, _)| rel)
+        .collect();
+    assert!(changed.len() >= 8, "archive files written: {changed:?}");
+    let n = changed.len();
+    let all = (1u32 << n) - 1;
+    // (dropped files, file whose header page landed without its new rows)
+    let mut cases = vec![(0, None), (all, None)];
+    for bit in 0..n {
+        cases.extend([(1u32 << bit, None), (all & !(1u32 << bit), None)]);
+        cases.extend([(0, Some(bit)), (all & !(1u32 << bit), Some(bit))]);
+    }
+    let header = rbitcoin_store::file::FILE_HEADER_LEN;
+    let img = tmp();
+    for (mask, header_only) in cases {
+        let mut image = torn.clone();
+        let mut dropped = Vec::new();
+        for (bit, rel) in changed.iter().enumerate() {
+            if header_only == Some(bit) {
+                dropped.push(format!("{} rows", rel.display()));
+                let new = &torn[*rel];
+                let old = sealed.get(*rel).cloned().unwrap_or_default();
+                let mut bytes = vec![0u8; new.len()];
+                let keep = old.len().min(new.len());
+                bytes[..keep].copy_from_slice(&old[..keep]);
+                let head = header.min(new.len());
+                bytes[..head].copy_from_slice(&new[..head]);
+                image.insert((*rel).clone(), bytes);
+                continue;
+            }
+            if mask & (1 << bit) == 0 {
+                continue;
+            }
+            dropped.push(rel.display().to_string());
+            match sealed.get(*rel) {
+                Some(bytes) => image.insert((*rel).clone(), bytes.clone()),
+                None => image.remove(*rel),
+            };
+        }
+        let case = format!("marked={marked} dropped {dropped:?}");
+        write_image(&img, &image);
+        let s = Store::open_tiny(&img).unwrap_or_else(|e| panic!("{case}: open failed: {e}"));
+        assert_eq!(s.confirmed.tip_height(), Some(Height(0)), "{case}");
+        assert_eq!(
+            s.txs.count(),
+            kept,
+            "{case}: open keeps exactly the creates a durable row names"
+        );
+        assert_creates_read_back(&s, &written, &case);
+        connect_coinbase(&s, &write, 1, genesis, parent);
+        assert_eq!(
+            s.flush_class_c_tip()
+                .unwrap_or_else(|e| panic!("{case}: next seal: {e}")),
+            Some(Height(1)),
+            "{case}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&img);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A row big enough to need an overflow tail: fee, base, and witness ULEBs
+/// past the 8-byte cell.
+fn wide_txstat() -> rbitcoin_store::TxStatRow {
+    rbitcoin_store::TxStatRow {
+        fee_sat: u64::MAX >> 1,
+        base: u32::MAX,
+        wit_extra: 7,
+    }
+}
+
+/// A stats stamp after the barrier (`getblockstats` fills unstamped rows)
+/// writes the cells, then the overflow blob, then its slot in `txstat.blk`,
+/// with no sync until the next barrier. Power loss can keep any of them.
+/// Each image reopens and reads the row as unstamped or as the stamp, never
+/// an error, so the RPC falls back and restamps; the restamp reads back.
+#[test]
+fn every_torn_txstat_stamp_reads_unstamped_and_restamps() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let (h1, _) = connect_coinbase(&s, &write, 1, genesis, parent);
+    assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(1)));
+    let fk = s.header_txs.get_list(h1).unwrap().unwrap()[0];
+    drop(s);
+    let sealed = store_image(&dir);
+    let wide = wide_txstat();
+    assert!(rbitcoin_store::txstat::pack_cell(&wide)
+        .unwrap()
+        .1
+        .is_some());
+    let s = Store::open_tiny(&dir).unwrap();
+    s.write_txstat_block(h1, fk.0, &[wide]).unwrap();
+    assert_eq!(s.txstat_row(fk).unwrap(), Some(wide), "control");
+    drop(s);
+    let stamped = store_image(&dir);
+    let changed: Vec<PathBuf> = stamped
+        .iter()
+        .filter(|(rel, bytes)| sealed.get(*rel) != Some(*bytes))
+        .filter(|(rel, _)| rel.to_string_lossy().starts_with("txstat."))
+        .map(|(rel, _)| rel.clone())
+        .collect();
+    assert_eq!(changed.len(), 3, "stamp writes: {changed:?}");
+    let header = rbitcoin_store::file::FILE_HEADER_LEN;
+    let mut cases: Vec<(u32, Option<usize>)> = (0..8).map(|mask| (mask, None)).collect();
+    cases.extend((0..3).map(|bit| (0, Some(bit))));
+    let img = tmp();
+    for (dropped, header_only) in cases {
+        let mut image = stamped.clone();
+        let mut case = Vec::new();
+        for (bit, rel) in changed.iter().enumerate() {
+            let old = sealed.get(rel).cloned().unwrap_or_default();
+            if header_only == Some(bit) {
+                let new = &stamped[rel];
+                let mut bytes = vec![0u8; new.len()];
+                let keep = old.len().min(new.len());
+                bytes[..keep].copy_from_slice(&old[..keep]);
+                let head = header.min(new.len());
+                bytes[..head].copy_from_slice(&new[..head]);
+                image.insert(rel.clone(), bytes);
+                case.push(format!("{} rows", rel.display()));
+            } else if dropped & (1 << bit) != 0 {
+                image.insert(rel.clone(), old);
+                case.push(rel.display().to_string());
+            }
+        }
+        write_image(&img, &image);
+        let s = Store::open_tiny(&img).unwrap_or_else(|e| panic!("lost {case:?}: open: {e}"));
+        let row = s
+            .txstat_row(fk)
+            .unwrap_or_else(|e| panic!("lost {case:?}: row read: {e}"));
+        assert!(row.is_none() || row == Some(wide), "lost {case:?}: {row:?}");
+        let range = s
+            .txstat_range(h1, fk.0, fk.0)
+            .unwrap_or_else(|e| panic!("lost {case:?}: range read: {e}"));
+        assert_eq!(range, vec![row], "lost {case:?}");
+        s.write_txstat_block(h1, fk.0, &[wide]).unwrap();
+        assert_eq!(
+            s.txstat_row(fk).unwrap(),
+            Some(wide),
+            "lost {case:?}: restamp"
+        );
+        assert_eq!(s.txstat_range(h1, fk.0, fk.0).unwrap(), vec![Some(wide)]);
+    }
+    let _ = std::fs::remove_dir_all(&img);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A create open keeps past the committed floor can carry a stamped cell
+/// whose tail was in a block that never committed. It has no confirmed
+/// height to find that tail by, so its row reads as unstamped.
+#[test]
+fn stamped_txstat_of_an_unconfirmed_create_reads_unstamped() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    let (rec, ins, outs) = coinbase(1);
+    let fk = s
+        .put_tx_full_batch_indexed(&[(rec, ins, outs)], false)
+        .unwrap()[0];
+    let (cell, tail) = rbitcoin_store::txstat::pack_cell(&wide_txstat()).unwrap();
+    assert!(tail.is_some());
+    let off = rbitcoin_store::txstat::TxStat::entry_offset(fk.0).unwrap();
+    s.txs.txstat.body.write_at_pwrite(off, &cell).unwrap();
+    assert_eq!(s.txstat_row(fk).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Power loss during the Class C flush, after the Class A barrier.
+///
+/// `header_txs.first`, `header_txs.count`, `confirmed[]` and the strong
+/// bits are separate files flushed one after another. Each one's new block
+/// row may land, not land, or land as a length header over zeroed rows.
+/// Every mix must reopen at tip 0 or 1, keep create 2 exactly when a
+/// durable row still names it, leave no strong bit past what it keeps, and
+/// seal the next blocks.
+#[test]
+fn every_class_c_subset_after_the_barrier_reopens_and_seals() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(0)));
+    s.txs.head.flush().unwrap();
+    let sealed = store_image(&dir);
+    let (one, one_hash) = connect_coinbase(&s, &write, 1, genesis, parent);
+    assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(1)));
+    drop(s);
+    let committed = store_image(&dir);
+    let class_c = [
+        "confirmed.body",
+        "header_txs_first.body",
+        "header_txs_count.body",
+        "strong_tx.body",
+        "tip_seal",
+    ];
+    let changed: Vec<&PathBuf> = committed
+        .iter()
+        .filter(|(rel, bytes)| sealed.get(*rel) != Some(*bytes))
+        .filter(|(rel, _)| class_c.iter().any(|c| rel.ends_with(c)))
+        .map(|(rel, _)| rel)
+        .collect();
+    assert_eq!(
+        changed.len(),
+        class_c.len(),
+        "Class C files written: {changed:?}"
+    );
+    let n = changed.len();
+    let all = (1u32 << n) - 1;
+    let header = rbitcoin_store::file::FILE_HEADER_LEN;
+    let img = tmp();
+    for mask in 0..=all {
+        for header_only in std::iter::once(None).chain((0..n).map(Some)) {
+            if header_only.is_some_and(|b| mask & (1 << b) != 0) {
+                continue;
+            }
+            let mut image = committed.clone();
+            let mut torn = Vec::new();
+            for (bit, rel) in changed.iter().enumerate() {
+                let old = sealed.get(*rel).cloned().unwrap_or_default();
+                if header_only == Some(bit) {
+                    torn.push(format!("{} rows", rel.display()));
+                    let new = &committed[*rel];
+                    let mut bytes = vec![0u8; new.len()];
+                    let keep = old.len().min(new.len());
+                    bytes[..keep].copy_from_slice(&old[..keep]);
+                    let head = header.min(new.len());
+                    bytes[..head].copy_from_slice(&new[..head]);
+                    image.insert((*rel).clone(), bytes);
+                } else if mask & (1 << bit) != 0 {
+                    torn.push(rel.display().to_string());
+                    image.insert((*rel).clone(), old);
+                }
+            }
+            write_image(&img, &image);
+            let s = Store::open_tiny(&img)
+                .unwrap_or_else(|e| panic!("lost {torn:?}: open failed: {e}"));
+            let tip = s.confirmed.tip_height();
+            assert!(
+                tip == Some(Height(0)) || tip == Some(Height(1)),
+                "lost {torn:?}: tip {tip:?}"
+            );
+            // Create 2 stays exactly when a durable row names it. A cut
+            // number leaves no strong bit for the next create to inherit.
+            let named = !torn.iter().any(|t| t.starts_with("header_txs"));
+            assert_eq!(s.txs.count(), if named { 2 } else { 1 }, "lost {torn:?}");
+            assert!(
+                !s.is_confirmed_strong(Fk(s.txs.count() + 1)).unwrap(),
+                "lost {torn:?}: a strong bit past the kept creates"
+            );
+            let (two_prev, two_parent) = if tip == Some(Height(0)) {
+                let (fk, hash) = connect_coinbase(&s, &write, 1, genesis, parent);
+                assert_eq!(
+                    s.flush_class_c_tip()
+                        .unwrap_or_else(|e| panic!("lost {torn:?}: reseal 1: {e}")),
+                    Some(Height(1)),
+                    "lost {torn:?}"
+                );
+                (fk, hash)
+            } else {
+                (one, one_hash)
+            };
+            connect_coinbase(&s, &write, 2, two_prev, two_parent);
+            assert_eq!(
+                s.flush_class_c_tip()
+                    .unwrap_or_else(|e| panic!("lost {torn:?}: seal 2: {e}")),
+                Some(Height(2)),
+                "lost {torn:?}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&img);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A spend delta commit never names a spender whose archive is not synced.
+///
+/// In IBD the spender is strong on the RAM tip while its barrier is still in
+/// flight. If its archive bytes are lost, open cuts that create and another
+/// block can reuse the number; the reopen filter then sees a strong spender
+/// and keeps the stale spend. The checkpoint syncs Class A after it freezes
+/// the notes and before it renames the commit.
+#[test]
+fn spend_commit_waits_for_the_spender_archive_sync() {
+    for fail in [false, true] {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        let (genesis, parent_hash) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+        s.height_fence_extend(Height(0), genesis).unwrap();
+        assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(0)));
+        let parent = s.header_txs.get_list(genesis).unwrap().unwrap()[0];
+        let (h1, _) = connect_coinbase(&s, &write, 1, genesis, parent_hash);
+        s.height_fence_extend(Height(1), h1).unwrap();
+        let spender = s.header_txs.get_list(h1).unwrap().unwrap()[0];
+        assert!(s.is_confirmed_strong(spender).unwrap());
+        s.put_spend_create(parent, 0, spender, 0).unwrap();
+        s.note_spend_snapshot(1);
+        let commit = dir
+            .join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR)
+            .join(rbitcoin_store::spend_delta::SPEND_DELTA_COMMIT_NAME);
+        let before = std::fs::read(&commit).ok();
+        if fail {
+            rbitcoin_store::io_handle::arm_fail_sync(s.txs.txids.file.io_handle(), 1);
+            assert!(s.checkpoint_spend_through(1).is_err());
+            assert_eq!(
+                std::fs::read(&commit).ok(),
+                before,
+                "the delta commit named spender {spender:?} before its archive was synced"
+            );
+        } else {
+            s.checkpoint_spend_through(1).unwrap();
+            assert_ne!(
+                std::fs::read(&commit).ok(),
+                before,
+                "control: the checkpoint wrote no commit"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Class C sealed height 1, then its body headers fell back to height 0.
+///
+/// The barrier rules this out for this binary, so an older one tore it.
+/// Its committed rows name create 2: cutting it would let a later
+/// transaction reuse that number under stale spends and postings. Open
+/// refuses and asks for a reindex, and keeps refusing on the next try.
+#[test]
+fn body_header_short_of_a_committed_create_refuses() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let (genesis, parent) = connect_coinbase(&s, &write, 0, Fk::NULL, [0u8; 32]);
+    s.flush_class_c_tip().unwrap();
+    let tx_end = on_disk_hwm(&dir.join("txout.body"));
+    let sp_end = on_disk_hwm(&dir.join("spent.body"));
+    let in_end = on_disk_hwm(&dir.join("seqsigwit.body"));
+    connect_coinbase(&s, &write, 1, genesis, parent);
+    assert_eq!(s.flush_class_c_tip().unwrap(), Some(Height(1)));
+    drop(s);
+    write_hwm(&dir.join("txout.body"), tx_end);
+    write_hwm(&dir.join("spent.body"), sp_end);
+    write_hwm(&dir.join("seqsigwit.body"), in_end);
+    for attempt in 0..2 {
+        assert_refuses_committed_cut(&dir, attempt);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Open refuses before it changes any Class A file: on this binary the
+/// image is the evidence of a device that lost synced writes.
+fn assert_refuses_committed_cut(dir: &std::path::Path, attempt: u32) {
+    let class_a = |dir: &std::path::Path| {
+        let mut image = store_image(dir);
+        image.retain(|rel, _| {
+            CLASS_A_FILES
+                .iter()
+                .any(|(name, _)| rel == std::path::Path::new(name))
+        });
+        image
+    };
+    let before = class_a(dir);
+    assert_eq!(
+        before.len(),
+        CLASS_A_FILES.len(),
+        "Class A files: {:?}",
+        before.keys()
+    );
+    let opened = Store::open_tiny(dir);
+    for (rel, bytes) in class_a(dir) {
+        assert!(
+            before.get(&rel) == Some(&bytes),
+            "open {attempt} changed {} before it refused",
+            rel.display()
+        );
+    }
+    match opened {
+        Err(rbitcoin_store::StoreError::Corrupt(m)) if m.contains("reindex") => {}
+        Err(e) => panic!("open {attempt} returned {e}"),
+        Ok(s) => panic!(
+            "open {attempt} cut committed creates: count {} tip {:?}",
+            s.txs.count(),
+            s.confirmed.tip_height()
+        ),
+    }
 }

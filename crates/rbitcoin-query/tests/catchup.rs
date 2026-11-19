@@ -21,15 +21,14 @@ fn coinbase_block(
     let timestamp = h + 1;
     let bits = 0x207fffff;
     let nonce = h;
-    let mut merkle = [0u8; 32];
-    merkle[0..4].copy_from_slice(&h.to_le_bytes());
-    merkle[4] = 0xcd;
-    let hash = match parent_hash {
-        None => merkle,
-        Some(ph) => {
-            rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce)
-        }
-    };
+    let mut txid = [0u8; 32];
+    txid[0..4].copy_from_slice(&h.to_le_bytes());
+    txid[31] = 0xcb;
+    // One transaction: the merkle root is its txid, so a reopen's tip
+    // revalidation keeps the chain.
+    let merkle = txid;
+    let ph = parent_hash.unwrap_or([0u8; 32]);
+    let hash = rbitcoin_store::block_header_hash(version, &ph, &merkle, timestamp, bits, nonce);
     let header = HeaderRecord {
         prev_fk: prev,
         version,
@@ -41,9 +40,6 @@ fn coinbase_block(
         size: 0,
         weight: 0,
     };
-    let mut txid = [0u8; 32];
-    txid[0..4].copy_from_slice(&h.to_le_bytes());
-    txid[31] = 0xcb;
     let ta = rbitcoin_query::TxApply {
         tx: TxRecord {
             txid,
@@ -125,7 +121,8 @@ fn finalize_sh_runs_durable_head_missing_hwm_keeps_seal() {
 
     let runs_dir = dir.join("scripthash.runs");
     std::fs::create_dir_all(&runs_dir).unwrap();
-    let high_seal = 1_411_000_000u64;
+    // A SEAL past the archive is an index past it, which is recollected.
+    let high_seal = q.store.txs.count();
     store_seal(&runs_dir, high_seal).unwrap();
     q.sh_run.refresh_seal();
     let _ = std::fs::remove_file(dir.join(rbitcoin_store::INCLUDE_HWM_NAME));
@@ -462,5 +459,340 @@ fn finalize_chases_a_create_that_lands_after_the_ready_sample() {
     );
     assert!(q.sh_is_tip_ready());
     assert!(q.store.scripthash.include_hwm() >= q.store.txs.count());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The tail backfill syncs the Class A creates it scans before
+/// `include_hwm` names them. A failed sync leaves the watermark where it was
+/// (and latches until restart).
+#[test]
+fn backfill_syncs_the_scanned_creates_before_the_watermark() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-backfill-sync");
+    seed_direct_chain(&q, 3);
+    let _ = q.finalize_sh_runs().unwrap();
+    extend_direct_chain(&q, 1);
+    // The Direct barrier also syncs Class A; let it finish before arming.
+    q.join_tip_flush().unwrap();
+    let before = q.store.scripthash.include_hwm();
+    assert!(before < q.store.txs.count());
+    rbitcoin_store::io_handle::arm_fail_sync(q.store.txs.txids.file.io_handle(), 1);
+    assert!(
+        q.backfill_sh_creates_from_class_a().is_err(),
+        "the backfill published creates whose archive did not sync"
+    );
+    assert_eq!(q.store.scripthash.include_hwm(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn in_flight_create(q: &rbitcoin_query::Query, salt: u8) {
+    q.store
+        .put_tx_full_batch_indexed(
+            &[(
+                rbitcoin_store::TxRecord {
+                    txid: [salt; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                vec![rbitcoin_store::InputRecord::coinbase(
+                    u32::MAX,
+                    vec![0x01],
+                    vec![],
+                )],
+                vec![rbitcoin_store::OutputRecord::unspent(50, vec![0x51, salt])],
+            )],
+            true,
+        )
+        .unwrap();
+}
+
+/// Confirm appends a block's creates before its range commits. The backfill
+/// names that create in `include_hwm`, so a reopen keeps it: a later
+/// transaction never takes a number the scripthash index already holds.
+#[test]
+fn reopen_keeps_a_create_the_backfill_names() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-backfill-mark");
+    seed_direct_chain(&q, 3);
+    let _ = q.finalize_sh_runs().unwrap();
+    q.join_tip_flush().unwrap();
+    in_flight_create(&q, 0xa1);
+    let last = q.store.txs.count();
+    q.backfill_sh_creates_from_class_a().unwrap();
+    assert_eq!(q.store.scripthash.include_hwm(), last);
+    let path = q.store.path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    assert_eq!(
+        q.store.txs.count(),
+        last,
+        "open cut a create include_hwm names"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An append publishes its bodies and locator before it writes `txid.body`,
+/// `txstat`, and `input`. A backfill in that window names only finished
+/// creates: a later open keeps them and cuts the unnamed one.
+#[cfg(debug_assertions)]
+#[test]
+fn backfill_does_not_name_an_unfinished_append() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-backfill-unfinished");
+    let q = Arc::new(q);
+    seed_direct_chain(&q, 3);
+    let _ = q.finalize_sh_runs().unwrap();
+    q.join_tip_flush().unwrap();
+    in_flight_create(&q, 0xa3);
+    let finished = q.store.txs.count();
+    let inside = Arc::clone(&q);
+    rbitcoin_store::tx_table::set_after_bodies_for_test(Some(Box::new(move || {
+        assert_eq!(inside.store.txs.count(), finished + 1);
+        inside.backfill_sh_creates_from_class_a().unwrap();
+    })));
+    in_flight_create(&q, 0xa4);
+    rbitcoin_store::tx_table::set_after_bodies_for_test(None);
+    assert_eq!(q.store.scripthash.include_hwm(), finished);
+    let path = q.store.path().to_path_buf();
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    assert_eq!(q.store.txs.count(), finished);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// After a failed append, `count` stays one past the settled creates: every
+/// later append refuses on the stem count. Materialize compares readiness
+/// against the settled count, so it returns instead of chasing a create no
+/// pass can name. A shutdown joins this thread.
+#[cfg(debug_assertions)]
+#[test]
+fn materialize_returns_after_a_failed_append() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-failed-append");
+    let q = Arc::new(q);
+    seed_direct_chain(&q, 3);
+    let _ = q.finalize_sh_runs().unwrap();
+    q.join_tip_flush().unwrap();
+    in_flight_create(&q, 0xa5);
+    let finished = q.store.txs.count();
+    let txids = q.store.txs.txids.file.io_handle();
+    rbitcoin_store::io_handle::arm_short_pwrite(txids);
+    let failed = q.store.put_tx_full_batch_indexed(
+        &[(
+            rbitcoin_store::TxRecord {
+                txid: [0xa6; 32],
+                version: 1,
+                locktime: 0,
+                input_count: 1,
+                output_count: 1,
+            },
+            vec![rbitcoin_store::InputRecord::coinbase(
+                u32::MAX,
+                vec![0x01],
+                vec![],
+            )],
+            vec![rbitcoin_store::OutputRecord::unspent(50, vec![0x51, 0xa6])],
+        )],
+        true,
+    );
+    rbitcoin_store::io_handle::disarm_pwrite(txids);
+    assert!(failed.is_err());
+    assert_eq!(q.store.txs.count(), finished + 1);
+    let q2 = Arc::clone(&q);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(q2.finalize_sh_unsorted_cancellable(None).is_ok());
+    });
+    rx.recv_timeout(Duration::from_secs(20))
+        .expect("materialize did not return after a failed append");
+    assert!(q.store.scripthash.include_hwm() <= finished);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A datadir from a binary without `class_a.synced`, after a clean
+/// shutdown. Every create has a block range, so the floor is the last range
+/// and open cuts nothing: the address index, `include_hwm`, and `tx.head`
+/// all stay as they were, with no rebuild.
+#[test]
+fn clean_datadir_without_the_synced_mark_opens_whole() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-upgrade-no-synced");
+    seed_direct_chain(&q, 4);
+    let _ = q.finalize_sh_runs().unwrap();
+    q.join_tip_flush().unwrap();
+    q.flush_for_shutdown().unwrap();
+    let count = q.store.txs.count();
+    let include = q.store.scripthash.include_hwm();
+    assert_eq!(include, count);
+    let head = q.store.txs.head.last_inserted_fk();
+    let path = q.store.path().to_path_buf();
+    drop(q);
+    let _ = std::fs::remove_file(path.join(rbitcoin_store::tx_table::CLASS_A_SYNCED_NAME));
+
+    rbitcoin_log::capture_logs(true);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert_eq!(
+        q.store.txs.count(),
+        count,
+        "open cut a create every range names"
+    );
+    assert_eq!(q.store.scripthash.include_hwm(), include);
+    assert_eq!(q.store.txs.head.last_inserted_fk(), head);
+    assert!(
+        !logs
+            .iter()
+            .any(|(_, l)| l.contains("tx.head rebuild") || l.contains("tx.head leads")),
+        "open rebuilt tx.head: {logs:?}"
+    );
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An older binary's backfill named a create whose block range never
+/// committed, then the process died. That datadir has no `class_a.synced`,
+/// so open cuts the create while `include_hwm` still names it. The index is
+/// past the archive: the next finalize deletes it and recollects from Class
+/// A, so the cut create's posting cannot attach to the create that takes its
+/// number.
+#[test]
+fn index_past_the_archive_is_recollected() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-past-archive");
+    seed_direct_chain(&q, 3);
+    let _ = q.finalize_sh_runs().unwrap();
+    q.join_tip_flush().unwrap();
+    in_flight_create(&q, 0xb1);
+    let last = q.store.txs.count();
+    q.backfill_sh_creates_from_class_a().unwrap();
+    assert_eq!(q.store.scripthash.include_hwm(), last);
+    let path = q.store.path().to_path_buf();
+    drop(q);
+    let _ = std::fs::remove_file(path.join(rbitcoin_store::tx_table::CLASS_A_SYNCED_NAME));
+
+    let q = rbitcoin_query::Query::open_or_create_tiny(&path).unwrap();
+    assert_eq!(
+        q.store.txs.count(),
+        last - 1,
+        "open cut the unranged create"
+    );
+    let _ = q.finalize_sh_runs().unwrap();
+    assert!(
+        q.store.scripthash.include_hwm() <= q.store.txs.count(),
+        "the index still names a create the archive cut"
+    );
+    let cut = rbitcoin_store::script_hash(&[0x51, 0xb1]);
+    assert!(q.scripthash_history(&cut).unwrap_or_default().is_empty());
+    assert!(q.sh_is_tip_ready());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Collect the unsorted keys, and with `posts` the postings, through the
+/// whole archive, then reopen as after an older binary: no synced mark, so
+/// open cuts every create no block range committed.
+fn collect_then_reopen_without_the_synced_mark(q: Query, posts: bool) -> Query {
+    use rbitcoin_store::scripthash_materialize as sm;
+    let usd = sm::unsorted_shard_dir(q.store.path());
+    std::fs::create_dir_all(&usd).unwrap();
+    let n_shards = q.store.scripthash.head_shard_count();
+    let keys =
+        sm::collect_unsorted_covering_class_a(&q.store, &usd, n_shards, 1, false, None).unwrap();
+    assert_eq!(keys.last_fk, q.store.txs.count());
+    if posts {
+        sm::collect_posts_covering(&q.store.txs, &q.store.scripthash, &usd, 1, false, None)
+            .unwrap();
+    }
+    let path = q.store.path().to_path_buf();
+    drop(q);
+    let _ = std::fs::remove_file(path.join(rbitcoin_store::tx_table::CLASS_A_SYNCED_NAME));
+    Query::open_or_create_tiny(&path).unwrap()
+}
+
+/// An older binary collected keys through a create no block range named, then
+/// stopped before the pack. Open cuts that create and the next block reuses
+/// its number. Start must drop the collect before Direct catchup appends:
+/// resuming it would skip the new create, and its confirmed output would
+/// never be indexed.
+#[test]
+fn collect_past_the_archive_is_recollected() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-collect-past");
+    seed_direct_chain(&q, 3);
+    q.join_tip_flush().unwrap();
+    q.store.flush_class_c_tip().unwrap();
+    in_flight_create(&q, 0xb2);
+    let last = q.store.txs.count();
+    let q = collect_then_reopen_without_the_synced_mark(q, false);
+    assert_eq!(
+        q.store.txs.count(),
+        last - 1,
+        "open cut the unranged create"
+    );
+    // Node start: the guard runs before the index mode is chosen.
+    q.discard_unproven_scripthash_head().unwrap();
+    q.enter_direct_index_mode().unwrap();
+    extend_direct_chain(&q, 1);
+    assert_eq!(
+        q.store.txs.count(),
+        last,
+        "the next block reused the number"
+    );
+    let reused = rbitcoin_store::script_hash(&[0x51, 3]);
+    assert!(
+        q.scripthash_history(&reused).unwrap_or_default().is_empty(),
+        "Direct catchup indexes nothing before finalize"
+    );
+    let _ = q.finalize_sh_runs().unwrap();
+    assert!(q.sh_is_tip_ready());
+    let path = q.store.path().to_path_buf();
+    drop(q);
+    let q = Query::open_or_create_tiny(&path).unwrap();
+    assert!(
+        !q.scripthash_history(&reused).unwrap_or_default().is_empty(),
+        "the confirmed output on the reused create is missing"
+    );
+    let cut = rbitcoin_store::script_hash(&[0x51, 0xb2]);
+    assert!(q.scripthash_history(&cut).unwrap_or_default().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Collect marks an older binary left past the archive must not reach
+/// `include_hwm` or SEAL on the next finalize.
+#[test]
+fn collect_marks_past_the_archive_do_not_publish() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-done-past");
+    seed_direct_chain(&q, 3);
+    q.join_tip_flush().unwrap();
+    in_flight_create(&q, 0xb3);
+    let q = collect_then_reopen_without_the_synced_mark(q, true);
+    let _ = q.finalize_sh_runs().unwrap();
+    let count = q.store.txs.count();
+    assert!(
+        q.store.scripthash.include_hwm() <= count,
+        "include_hwm names a create the archive cut"
+    );
+    assert!(
+        q.sh_run.sealed_max_create_fk() <= count,
+        "SEAL names a create the archive cut"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rebuild mark wipes and recollects the index on the next finalize, then
+/// is dropped so the start after that keeps the head.
+#[test]
+fn rebuild_mark_recollects_then_clears() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-rebuild-mark");
+    seed_direct_chain(&q, 3);
+    let _ = q.finalize_sh_runs().unwrap();
+    assert!(q.sh_is_tip_ready());
+    rbitcoin_store::scripthash::mark_sh_rebuild(q.store.path()).unwrap();
+    assert!(q.sh_force_rebuild());
+    let _ = q.finalize_sh_runs().unwrap();
+    assert!(!rbitcoin_store::scripthash::sh_rebuild_marked(
+        q.store.path()
+    ));
+    assert!(!q.sh_force_rebuild());
+    assert!(q.sh_is_tip_ready());
+    assert!(
+        q.store.scripthash.entry_count() > 0,
+        "the rebuild recollected Class A"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

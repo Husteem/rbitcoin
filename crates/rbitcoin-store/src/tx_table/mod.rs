@@ -8,7 +8,7 @@ use crate::hashhead::HeadOpenOpts;
 use crate::segmented_head::SegmentedTxHead;
 use crate::var_table::VarTable;
 use rbitcoin_primitives::{le_i32, read_uleb128, write_uleb128, Fk, TableKind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Host RAM budget per parallel `tx.head` rebuild worker (not SH extract's 1.5 GiB).
@@ -687,6 +687,24 @@ pub struct TxTable {
     pub datadir_hdd: std::sync::atomic::AtomicBool,
     /// Schema-30 spend delta: every spend slot, over the pages folds wrote.
     spend_pages: crate::spend_delta::SpendPageLog,
+    /// Held across every Class A sync. One sync at a time, so a sync that
+    /// returns 0 because another took the writeback error cannot commit
+    /// after that failure.
+    class_a_sync: std::sync::Mutex<()>,
+    /// Set once a Class A sync or append write failed. The kernel may have
+    /// dropped those dirty pages, and RAM may name rows the device does not
+    /// hold, so a retry that succeeds proves nothing: every later sync and
+    /// append refuses until restart.
+    class_a_failed: std::sync::atomic::AtomicBool,
+    /// Told once when [`Self::class_a_failed`] latches.
+    class_a_on_fail: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Hot store directory, where [`CLASS_A_SYNCED_NAME`] lives.
+    hot_dir: PathBuf,
+    /// The value in [`CLASS_A_SYNCED_NAME`]. Written under the latch.
+    synced_named: std::sync::atomic::AtomicU64,
+    /// Creates whose every Class A row is written. [`Self::count`] moves
+    /// when the bodies publish, before `txid.body`, `txstat`, and `input`.
+    settled: std::sync::atomic::AtomicU64,
     /// Per-fk packed `txout` decodes for an outs reader
     /// ([`Self::get_meta_and_outputs`], and [`Self::get`] through it), the
     /// decode the mempool and block-proposal pins count. [`Self::get_full`] is
@@ -712,10 +730,67 @@ pub fn class_a_body_occupied(dir: &Path, stem: &str) -> bool {
     }
 }
 
+/// Sidecar in the hot store: every create through this count was synced
+/// before a durable record named it without a `header_txs` range (a spend
+/// commit, a scripthash mark). See [`TxTable::sync_class_a_named`].
+pub const CLASS_A_SYNCED_NAME: &str = "class_a.synced";
+
+/// [`CLASS_A_SYNCED_NAME`], or 0 when absent.
+pub fn read_class_a_synced(dir: &Path) -> Result<u64, StoreError> {
+    let path = dir.join(CLASS_A_SYNCED_NAME);
+    match std::fs::read(&path) {
+        Ok(b) => b
+            .try_into()
+            .map(u64::from_le_bytes)
+            .map_err(|_| StoreError::Corrupt("class_a.synced size")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(StoreError::io(&path, e)),
+    }
+}
+
+/// `create` leaves [`crate::file::CREATE_FILE_SLACK`] bytes. Anything past
+/// that was a payload, including after a truncate that did not shrink the
+/// allocation. Header-only and Class C stores stay at the slack.
+fn allocated_past_slack(bodies: &[&VarTable]) -> bool {
+    bodies.iter().any(|t| {
+        let published = t.body.logical_len();
+        let cap = t.body.file_cap.load(std::sync::atomic::Ordering::Acquire);
+        cap > published.saturating_add(crate::file::CREATE_FILE_SLACK)
+    })
+}
+
+/// Refuse to keep fewer than `committed` creates.
+///
+/// This binary syncs Class A before a durable Class C row names a create,
+/// so a fit below that row was left by an older binary or by a device that
+/// lost synced writes. Cutting would hand those numbers to later
+/// transactions under stale spends and postings. Open checks before each
+/// cut that could go below the floor.
+pub(crate) fn refuse_below_committed(count: u64, committed: u64) -> Result<(), StoreError> {
+    if count >= committed {
+        return Ok(());
+    }
+    rbitcoin_log::error!(
+        "store: Class A ends at create {count} and committed rows name {committed} \
+         (an older binary, or the device lost synced writes)"
+    );
+    Err(StoreError::Corrupt(
+        "Class A ends below a committed create (an older binary, or the device lost synced \
+         writes); wipe the datadir and reindex",
+    ))
+}
+
 #[doc(hidden)]
 pub fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::CreateLoc, StoreError> {
+    open_or_create_create_loc_above(dir, 0)
+}
+
+fn open_or_create_create_loc_above(
+    dir: &Path,
+    floor: u64,
+) -> Result<crate::create_loc::CreateLoc, StoreError> {
     if dir.join("create.loc").exists() {
-        crate::create_loc::CreateLoc::open(dir)
+        crate::create_loc::CreateLoc::open_above(dir, floor)
     } else if class_a_body_occupied(dir, "txout") {
         Err(StoreError::Corrupt("invariant: create.loc missing"))
     } else {
@@ -727,8 +802,15 @@ pub fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::Create
 pub fn open_or_create_seqsigwit_loc(
     seqsigwit_dir: &Path,
 ) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
+    open_or_create_seqsigwit_loc_above(seqsigwit_dir, 0)
+}
+
+fn open_or_create_seqsigwit_loc_above(
+    seqsigwit_dir: &Path,
+    floor: u64,
+) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
     if seqsigwit_dir.join("seqsigwit.loc").exists() {
-        crate::delta_loc::DeltaLoc::open(seqsigwit_dir, "seqsigwit")
+        crate::delta_loc::DeltaLoc::open_above(seqsigwit_dir, "seqsigwit", floor)
     } else if class_a_body_occupied(seqsigwit_dir, "seqsigwit") {
         Err(StoreError::Corrupt("invariant: seqsigwit.loc missing"))
     } else {
@@ -957,31 +1039,66 @@ pub fn class_a_skew_assert_aligned(
 }
 
 #[doc(hidden)]
+///
+/// `named` is the highest create a durable record names: a `header_txs`
+/// range, or [`CLASS_A_SYNCED_NAME`]. Every such record was written after a
+/// Class A sync, so every create through `named` is on the device and every
+/// one past it is named by nothing durable. Open keeps exactly `named`
+/// creates and cuts the rest without reading it: a torn row can decode (a
+/// zeroed input edge is a coinbase edge), so reading proves nothing. A file
+/// short of `named` was left by a binary without the barrier, or a device
+/// that lost synced writes: open refuses before it cuts a body
+/// ([`refuse_below_committed`]). `None` (a table opened alone) keeps the
+/// prefix every file covers.
 pub fn repair_class_a_count_skew(
     stems: ClassASkewStems<'_>,
     prune_seqsigwit_mode: bool,
     input_existed: bool,
+    named: Option<u64>,
 ) -> Result<bool, StoreError> {
+    let committed = named.unwrap_or(0);
     let n_loc = stems.create_loc.count();
     let n_txids = stems.txids.count();
     let n_seqsigwit_loc = stems.seqsigwit_loc.count();
-    let short_input = match pruned_uncovered_input_floor(
-        &stems,
-        n_loc,
-        n_txids,
-        n_seqsigwit_loc,
-        prune_seqsigwit_mode,
-        input_existed,
-    ) {
-        Some(n) => Some(n),
-        None => short_new_layout_input(
+    let stem =
+        class_a_skew_target_count(n_loc, n_txids, n_seqsigwit_loc, prune_seqsigwit_mode, None)
+            .unwrap_or(n_loc);
+    refuse_below_committed(stem, committed)?;
+    let stem = named.unwrap_or(stem);
+    // A range read decodes its whole locator window up to the count, so a
+    // zeroed row past `stem` would fail reads of the creates kept below it.
+    if stems.create_loc.count() > stem {
+        stems.create_loc.truncate_to_count(stem)?;
+    }
+    if !prune_seqsigwit_mode && stems.seqsigwit_loc.count() > stem {
+        stems.seqsigwit_loc.truncate_to_count(stem)?;
+    }
+    // Those cuts were above `named`. Nothing below it is cut.
+    let covered = body_headers_cover(&stems, stem, prune_seqsigwit_mode)?;
+    refuse_below_committed(covered, committed)?;
+    // The short-input probe reads the witness row past the input count. Run
+    // it only inside the covered prefix, where that row is on disk.
+    let short_input = if stems.input.count() < covered {
+        match pruned_uncovered_input_floor(
             &stems,
             n_loc,
             n_txids,
             n_seqsigwit_loc,
             prune_seqsigwit_mode,
             input_existed,
-        )?,
+        ) {
+            Some(n) => Some(n),
+            None => short_new_layout_input(
+                &stems,
+                n_loc,
+                n_txids,
+                n_seqsigwit_loc,
+                prune_seqsigwit_mode,
+                input_existed,
+            )?,
+        }
+    } else {
+        None
     };
     let skewed = class_a_skew_target_count(
         n_loc,
@@ -990,18 +1107,15 @@ pub fn repair_class_a_count_skew(
         prune_seqsigwit_mode,
         short_input,
     );
-    let n = skewed.unwrap_or(n_loc);
+    let n = skewed.unwrap_or(n_loc).min(covered);
+    refuse_below_committed(n, committed)?;
+    let skewed = skewed.or((n < n_loc).then_some(n));
     let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(&stems, n, prune_seqsigwit_mode)?;
-    // The locator count is the commit. A body header ahead of it is the crash
-    // before the locator pwrite. A body header short of it was not published.
-    require_body_header(stems.body.body_logical_len(), tx_end)?;
-    require_body_header(stems.spent.body_logical_len(), sp_end)?;
-    if !prune_seqsigwit_mode {
-        require_body_header(stems.seqsigwit.body_logical_len(), in_end)?;
-    }
+    // An input stem past the count is that same unpublished tail.
     let ahead = stems.body.body_logical_len() > tx_end
         || stems.spent.body_logical_len() > sp_end
-        || (!prune_seqsigwit_mode && stems.seqsigwit.body_logical_len() > in_end);
+        || (!prune_seqsigwit_mode && stems.seqsigwit.body_logical_len() > in_end)
+        || stems.input.count() > n;
     if skewed.is_none() && !ahead {
         return Ok(false);
     }
@@ -1023,39 +1137,34 @@ pub fn repair_class_a_count_skew(
     Ok(true)
 }
 
-fn require_body_header(header: u64, end: u64) -> Result<(), StoreError> {
-    if header < end {
-        Err(StoreError::Corrupt(
-            "invariant: body header short of locator",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn file_header_behind(file: &crate::file::TableFile) -> bool {
-    file.header_persist_len() < file.logical_len()
-}
-
-fn durable_loc_count(
-    loc: &crate::file::TableFile,
-    off: &crate::file::TableFile,
-    ovf: &crate::file::TableFile,
-    slot: u64,
-    off_slot: u64,
-    pair: bool,
+/// Largest create count `<= n` whose stem ends every body header still covers.
+///
+/// Stem ends grow with the count, so the covered counts are a prefix.
+fn body_headers_cover(
+    stems: &ClassASkewStems<'_>,
+    n: u64,
+    prune_seqsigwit_mode: bool,
 ) -> Result<u64, StoreError> {
-    let data = loc
-        .header_persist_len()
-        .saturating_sub(crate::file::FILE_HEADER_LEN as u64);
-    if slot == 0 || !data.is_multiple_of(slot) {
-        return Ok(0);
+    let fits = |count: u64| -> Result<bool, StoreError> {
+        let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(stems, count, prune_seqsigwit_mode)?;
+        Ok(tx_end <= stems.body.body_logical_len()
+            && sp_end <= stems.spent.body_logical_len()
+            && (prune_seqsigwit_mode || in_end <= stems.seqsigwit.body_logical_len()))
+    };
+    if fits(n)? {
+        return Ok(n);
     }
-    let off_data = off
-        .header_persist_len()
-        .saturating_sub(crate::file::FILE_HEADER_LEN as u64);
-    let fitted = crate::delta_loc::checkpoint_fit(data / slot, off_data, off_slot).unwrap_or(0);
-    crate::delta_loc::withheld_ovf_limit(loc, ovf, fitted, pair)
+    // Invariant: fits(lo) and !fits(hi). Count 0 is the file headers.
+    let (mut lo, mut hi) = (0u64, n);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid)? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
 }
 
 fn class_a_loc_pairs(
@@ -1093,6 +1202,28 @@ fn spent_lens(n_outs: &[u32]) -> Vec<u64> {
         .iter()
         .map(|&n| u64::from(n) * OutputRecord::SPENT_SLOT_LEN as u64)
         .collect()
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static AFTER_BODIES: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// One-shot hook run inside the next Class A append on this thread, after
+/// its bodies and locators publish and before `txid.body`, `txstat`, and
+/// `input`. Tests run a spend commit or scripthash mark in that window.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_after_bodies_for_test(hook: Option<Box<dyn FnOnce()>>) {
+    AFTER_BODIES.with(|c| *c.borrow_mut() = hook);
+}
+
+fn run_after_bodies_hook() {
+    #[cfg(debug_assertions)]
+    if let Some(hook) = AFTER_BODIES.with(|c| c.borrow_mut().take()) {
+        hook();
+    }
 }
 
 fn publish_prepared_body(
@@ -1133,6 +1264,26 @@ thread_local! {
     static SPEND_META_PEEK_GROUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static BODY_TXID_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Zero the debug count of single-create [`TxTable::body_txid`] reads.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_body_txid_reads() {
+    BODY_TXID_READS.with(|n| n.set(0));
+}
+
+/// Single-create [`TxTable::body_txid`] reads on this thread since the last
+/// reset. A walk over many creates batches them through `txid.body` pages.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn body_txid_reads() -> u64 {
+    BODY_TXID_READS.with(|n| n.get())
+}
+
 /// Zero the debug counters [`spend_meta_read_counts`] returns.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
@@ -1168,26 +1319,48 @@ fn note_spend_meta_read(groups: usize) {
 
 /// `spent.body` as the spend delta folds into it. Every folded slot is below
 /// the published end.
-struct SpentFold<'a>(&'a VarTable);
+/// `spent.body` as the spend delta's fold target. After open, `table` is
+/// the table whose Class A latch the sync runs under: the barrier syncs the
+/// same fd. Open has no table yet, and no barrier runs before it returns.
+struct SpentFold<'a> {
+    spent: &'a VarTable,
+    table: Option<&'a TxTable>,
+}
+
+impl<'a> SpentFold<'a> {
+    fn at_open(spent: &'a VarTable) -> Self {
+        Self { spent, table: None }
+    }
+
+    fn of(table: &'a TxTable) -> Self {
+        Self {
+            spent: &table.spent,
+            table: Some(table),
+        }
+    }
+}
 
 impl crate::spend_delta::SpentBody for SpentFold<'_> {
     fn published_len(&self) -> u64 {
-        self.0.body_published_len()
+        self.spent.body_published_len()
     }
 
     fn read(&self, abs: u64, buf: &mut [u8]) -> Result<(), StoreError> {
-        let end = self.0.body_published_len();
-        self.0
+        let end = self.spent.body_published_len();
+        self.spent
             .read_prefix_at_published(end, abs, buf.len() as u64, buf)?;
         Ok(())
     }
 
     fn write(&mut self, abs: u64, bytes: &[u8]) -> Result<(), StoreError> {
-        self.0.write_body_pwrite(abs, bytes)
+        self.spent.write_body_pwrite(abs, bytes)
     }
 
     fn sync(&mut self) -> Result<(), StoreError> {
-        self.0.sync_data_only()
+        match self.table {
+            Some(table) => table.sync_folded_spent(),
+            None => self.spent.sync_data_only(),
+        }
     }
 }
 
@@ -1218,13 +1391,13 @@ fn open_spend_delta(
     }
     let log = crate::spend_delta::SpendPageLog::load_with(
         dir,
-        &mut SpentFold(spent),
+        &mut SpentFold::at_open(spent),
         crate::spend_delta::Policy::DEFAULT,
     )?;
     let v29 = crate::spend_pages_v29::read(dir, body_end)?;
     if populated && filled_by_class_a {
         let (images, tip) = v29.map_or((Vec::new(), 0), |v| (v.images, v.tip));
-        log.adopt_v29(images, tip, &SpentFold(spent))?;
+        log.adopt_v29(images, tip, &SpentFold::at_open(spent))?;
     }
     crate::spend_pages_v29::remove(dir)?;
     Ok(log)
@@ -1292,6 +1465,12 @@ impl TxTable {
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages: crate::spend_delta::SpendPageLog::create(dir)?,
+            class_a_sync: std::sync::Mutex::new(()),
+            class_a_failed: std::sync::atomic::AtomicBool::new(false),
+            class_a_on_fail: std::sync::OnceLock::new(),
+            hot_dir: dir.to_path_buf(),
+            synced_named: std::sync::atomic::AtomicU64::new(0),
+            settled: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1336,14 +1515,21 @@ impl TxTable {
     }
 
     pub fn open_with_opts(dir: &Path, opts: HeadOpenOpts) -> Result<Self, StoreError> {
-        Self::open_seqsigwit(dir, dir, opts)
+        Self::open_seqsigwit(dir, dir, opts, None)
     }
 
     /// Open Class A stems; `seqsigwit` may live in a different directory.
+    ///
+    /// `committed` is the highest create a durable `header_txs` range
+    /// names. A `Store` passes it; open keeps exactly the creates through it
+    /// or [`CLASS_A_SYNCED_NAME`], whichever is higher. `None` (a table
+    /// opened alone) keeps the prefix every file covers. See
+    /// [`repair_class_a_count_skew`].
     pub fn open_seqsigwit(
         dir: &Path,
         seqsigwit_dir: &Path,
         opts: HeadOpenOpts,
+        committed: Option<u64>,
     ) -> Result<Self, StoreError> {
         crate::store::rename_legacy_inwit_files(dir)?;
         crate::store::rename_legacy_input_files(dir)?;
@@ -1360,8 +1546,13 @@ impl TxTable {
         let had_txout = dir.join("txout.body").exists();
         let had_seqsigwit = seqsigwit_dir.join("seqsigwit.body").exists();
         let had_spent = dir.join("spent.body").exists();
-        let create_loc = open_or_create_create_loc(dir)?;
-        let seqsigwit_loc = open_or_create_seqsigwit_loc(seqsigwit_dir)?;
+        let synced_named = read_class_a_synced(dir)?;
+        let named = committed.map(|c| c.max(synced_named));
+        let at_least = named.unwrap_or(0);
+        let create_loc = open_or_create_create_loc_above(dir, at_least)?;
+        // A pruned witness locator is cut on purpose: no floor.
+        let witness_floor = if prune_seqsigwit_mode { 0 } else { at_least };
+        let seqsigwit_loc = open_or_create_seqsigwit_loc_above(seqsigwit_dir, witness_floor)?;
         let loc_count = create_loc.count();
         // The sidecar is prune mode for reads and later appends. The witness
         // stem still seals the tip until its locator no longer covers creates.
@@ -1426,6 +1617,10 @@ impl TxTable {
         } else {
             crate::input::Input::create(seqsigwit_dir)?
         };
+        // A Class C fixture names creates with no archive behind it. Only an
+        // archive has creates to refuse over.
+        let archive = create_loc.count() > 0 || allocated_past_slack(&[&body, &spent, &seqsigwit]);
+        let named = named.map(|n| if archive { n } else { 0 });
         repair_class_a_count_skew(
             ClassASkewStems {
                 create_loc: &create_loc,
@@ -1439,6 +1634,7 @@ impl TxTable {
             },
             stem_retired,
             input_existed,
+            named,
         )?;
         let n_bodies = create_loc.count();
         if txstat.count() != n_bodies {
@@ -1467,9 +1663,18 @@ impl TxTable {
             match SegmentedTxHead::open(dir) {
                 Ok(h) => {
                     let covered = h.last_inserted_fk();
-                    if covered > n_bodies {
-                        // Torn Class A truncate: stale head entries past the
-                        // bodies would fail a later seal — rebuild instead.
+                    if covered > n_bodies && h.drop_segments_past(n_bodies)? {
+                        // Inserts ran ahead of the barrier, and open cut
+                        // their creates. The segments below the cut stay;
+                        // the backfill below refills from the last kept fk.
+                        rbitcoin_log::warn!(
+                            "store: tx.head leads Class A covered={covered} n={n_bodies} \
+                             — dropped segments past the cut, kept through {}",
+                            h.last_inserted_fk()
+                        );
+                        h
+                    } else if covered > n_bodies {
+                        // No segment ends inside the cut: rebuild it all.
                         rbitcoin_log::warn!(
                             "store: tx.head leads Class A covered={covered} n={n_bodies} \
                              — wipe + rebuild"
@@ -1530,6 +1735,12 @@ impl TxTable {
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
             spend_pages,
+            class_a_sync: std::sync::Mutex::new(()),
+            class_a_failed: std::sync::atomic::AtomicBool::new(false),
+            class_a_on_fail: std::sync::OnceLock::new(),
+            hot_dir: dir.to_path_buf(),
+            synced_named: std::sync::atomic::AtomicU64::new(synced_named),
+            settled: std::sync::atomic::AtomicU64::new(n_bodies),
         };
         match input_open_tail(t.input.count(), n_bodies, t.seqsigwit.count()) {
             InputOpenTail::Backfill { from } => {
@@ -1657,11 +1868,6 @@ impl TxTable {
     pub fn prune_seqsigwit_mode(&self) -> bool {
         self.prune_seqsigwit_mode
             .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Witness locator no longer names every create. Seal and skew ignore it.
-    fn seqsigwit_stem_retired(&self) -> bool {
-        self.prune_seqsigwit_mode() && self.seqsigwit_loc.count() < self.count()
     }
 
     pub fn set_prune_seqsigwit_mode(&self, on: bool) {
@@ -1852,73 +2058,18 @@ impl TxTable {
         self.body.count()
     }
 
-    /// `create` leaves [`crate::file::CREATE_FILE_SLACK`] bytes. Anything past
-    /// that was a payload, including after a truncate that did not shrink the
-    /// allocation. Header-only and Class C stores stay at the slack.
-    pub(crate) fn bodies_allocated_past_header(&self) -> bool {
-        fn past(file: &crate::file::TableFile) -> bool {
-            let published = file.logical_len();
-            let cap = file.file_cap.load(std::sync::atomic::Ordering::Acquire);
-            cap > published.saturating_add(crate::file::CREATE_FILE_SLACK)
-        }
-        past(&self.body.body) || past(&self.spent.body) || past(&self.seqsigwit.body)
+    /// Creates an append has finished: every Class A row, not just the
+    /// bodies [`Self::count`] covers. A record that names creates samples
+    /// this, so an append still in flight is never named.
+    pub fn settled_count(&self) -> u64 {
+        self.settled.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Creates whose locator headers have landed.
-    ///
-    /// No header is behind: two loads per file and the RAM count. A withheld
-    /// header is the length those headers still name.
-    pub(crate) fn durable_create_count(&self) -> Result<u64, StoreError> {
-        if !self.class_a_header_behind() {
-            return Ok(self.count());
-        }
-        self.locator_header_count()
-    }
-
-    /// Create count named by the locator headers, including a withheld
-    /// overflow header. A body header is not part of this count: open
-    /// truncates a body that ran ahead and refuses one that fell short.
-    fn locator_header_count(&self) -> Result<u64, StoreError> {
-        let prune = self.seqsigwit_stem_retired();
-        let mut hi = durable_loc_count(
-            &self.create_loc.loc,
-            &self.create_loc.off,
-            &self.create_loc.ovf,
-            crate::create_loc::SLOT,
-            crate::create_loc::OFF_SLOT,
-            true,
-        )?;
-        hi = hi.min(self.create_loc.count());
-        if !prune {
-            hi = hi.min(durable_loc_count(
-                &self.seqsigwit_loc.loc,
-                &self.seqsigwit_loc.off,
-                &self.seqsigwit_loc.ovf,
-                2,
-                8,
-                false,
-            )?);
-            hi = hi.min(self.seqsigwit_loc.count());
-        }
-        Ok(hi)
-    }
-
-    pub(crate) fn class_a_header_behind(&self) -> bool {
-        let loc = file_header_behind(&self.create_loc.loc)
-            || file_header_behind(&self.create_loc.ovf)
-            || file_header_behind(&self.create_loc.off)
-            || file_header_behind(&self.body.body)
-            || file_header_behind(&self.spent.body);
-        if loc {
-            return true;
-        }
-        if self.seqsigwit_stem_retired() {
-            return false;
-        }
-        file_header_behind(&self.seqsigwit_loc.loc)
-            || file_header_behind(&self.seqsigwit_loc.ovf)
-            || file_header_behind(&self.seqsigwit_loc.off)
-            || file_header_behind(&self.seqsigwit.body)
+    fn settle(&self, base: u64, n: usize) {
+        self.settled.store(
+            base.saturating_add(n as u64),
+            std::sync::atomic::Ordering::Release,
+        );
     }
 
     /// Current `tx.body` logical length (including file header).
@@ -2120,6 +2271,8 @@ impl TxTable {
     /// Thin I/O: one 32-byte sidefile pread — no idx / body.
     pub fn body_txid(&self, fk: Fk) -> Result<[u8; 32], StoreError> {
         use std::time::Instant;
+        #[cfg(debug_assertions)]
+        BODY_TXID_READS.with(|n| n.set(n.get().saturating_add(1)));
         let t = Instant::now();
         let id = self.txids.get(fk)?;
         crate::head_resolve_stats::add_body(t.elapsed().as_nanos() as u64);
@@ -2327,7 +2480,7 @@ impl TxTable {
         rbitcoin_log::info!("store: input backfill complete n={n}");
         // The witness stem can be cut after this open returns. The edges
         // have to be durable first, or the next open has no way to rebuild them.
-        self.input.flush()?;
+        self.flush_input()?;
         Ok(())
     }
 
@@ -2652,6 +2805,13 @@ impl TxTable {
         self.spend_pages.note_slots(slots)
     }
 
+    /// The fold's `spent.body` sync. It shares the barrier's fd, so it runs
+    /// under the Class A latch.
+    #[doc(hidden)]
+    pub fn sync_folded_spent(&self) -> Result<(), StoreError> {
+        self.class_a_latched(|| self.spent.sync_data_only())
+    }
+
     pub(crate) fn checkpoint_spend_pages<B>(
         &self,
         before_freeze: B,
@@ -2661,7 +2821,7 @@ impl TxTable {
         B: FnOnce(&crate::spend_delta::SpendPageLog) -> Result<(), StoreError>,
     {
         self.spend_pages
-            .checkpoint(before_freeze, &mut SpentFold(&self.spent), durable)
+            .checkpoint(before_freeze, &mut SpentFold::of(self), durable)
             .map(|_| ())
     }
 
@@ -3061,6 +3221,7 @@ impl TxTable {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        self.refuse_if_class_a_failed()?;
         if txstat.len() != items.len() {
             return Err(StoreError::Corrupt("txstat batch length"));
         }
@@ -3086,28 +3247,33 @@ impl TxTable {
             return Err(StoreError::Corrupt("invariant: create n_out"));
         }
         let n_outs: Vec<u32> = items.iter().map(|(_, _, o)| o.len() as u32).collect();
-        let spent = self.spent.prepare_sized(&spent_lens(&n_outs))?;
-        let (fks, _loc) = self.append_stems_one_wave(
-            items.len(),
-            est_out,
-            est_seqsigwit,
-            &n_outs,
-            |i, buf| {
-                let (tx, ins, outs) = &items[i];
-                encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
-            },
-            |i, buf| encode_seqsigwit_with_secret(&items[i].1, buf, Some(&self.secret)),
-            spent,
-        )?;
-        let ids: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
-        self.txids.append_batch(base, &ids)?;
-        let tails = self.txstat.append_batch(base, txstat)?;
-        if !tails.is_empty() {
-            return Err(StoreError::Corrupt("txstat overflow needs header blob"));
-        }
-        let edges: Vec<Vec<crate::input::InputEdge>> =
-            items.iter().map(|(_, ins, _)| input_edges(ins)).collect();
-        self.input.append(&edges)?;
+        let fks = self.class_a_append(|| {
+            let spent = self.spent.prepare_sized(&spent_lens(&n_outs))?;
+            let (fks, _loc) = self.append_stems_one_wave(
+                items.len(),
+                est_out,
+                est_seqsigwit,
+                &n_outs,
+                |i, buf| {
+                    let (tx, ins, outs) = &items[i];
+                    encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
+                },
+                |i, buf| encode_seqsigwit_with_secret(&items[i].1, buf, Some(&self.secret)),
+                spent,
+            )?;
+            run_after_bodies_hook();
+            let ids: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
+            self.txids.append_batch(base, &ids)?;
+            let tails = self.txstat.append_batch(base, txstat)?;
+            if !tails.is_empty() {
+                return Err(StoreError::Corrupt("txstat overflow needs header blob"));
+            }
+            let edges: Vec<Vec<crate::input::InputEdge>> =
+                items.iter().map(|(_, ins, _)| input_edges(ins)).collect();
+            self.input.append(&edges)?;
+            Ok(fks)
+        })?;
+        self.settle(base, items.len());
         if index {
             let heads: Vec<([u8; 32], Fk)> = items
                 .iter()
@@ -3197,6 +3363,7 @@ impl TxTable {
         if pins.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
+        self.refuse_if_class_a_failed()?;
         if txstat.len() != pins.len() {
             return Err(StoreError::Corrupt("txstat batch length"));
         }
@@ -3220,24 +3387,29 @@ impl TxTable {
             }
             n_outs.push(n_out);
         }
-        let spent = self.spent.prepare_sized(&spent_lens(&n_outs))?;
-        let (fks, loc) = self.append_stems_one_wave(
-            pins.len(),
-            est_out,
-            est_seqsigwit,
-            &n_outs,
-            |i, buf| {
-                pins[i].encode_txout_body(buf, Some(&self.secret));
-            },
-            encode_in,
-            spent,
-        )?;
-        let ids: Vec<[u8; 32]> = pins.iter().map(|pin| pin.packed_txid()).collect();
-        self.txids.append_batch(base, &ids)?;
-        let tails = self.txstat.append_batch(base, txstat)?;
-        self.txstat
-            .put_overflows_for_headers(header_ranges, &tails)?;
-        self.input.append(input_edges)?;
+        let (fks, loc) = self.class_a_append(|| {
+            let spent = self.spent.prepare_sized(&spent_lens(&n_outs))?;
+            let (fks, loc) = self.append_stems_one_wave(
+                pins.len(),
+                est_out,
+                est_seqsigwit,
+                &n_outs,
+                |i, buf| {
+                    pins[i].encode_txout_body(buf, Some(&self.secret));
+                },
+                encode_in,
+                spent,
+            )?;
+            run_after_bodies_hook();
+            let ids: Vec<[u8; 32]> = pins.iter().map(|pin| pin.packed_txid()).collect();
+            self.txids.append_batch(base, &ids)?;
+            let tails = self.txstat.append_batch(base, txstat)?;
+            self.txstat
+                .put_overflows_for_headers(header_ranges, &tails)?;
+            self.input.append(input_edges)?;
+            Ok((fks, loc))
+        })?;
+        self.settle(base, pins.len());
         if index {
             let heads: Vec<([u8; 32], Fk)> = pins
                 .iter()
@@ -3305,6 +3477,18 @@ impl TxTable {
         Ok((fks, loc))
     }
 
+    /// A body or locator header pwrite that failed is an append that failed:
+    /// RAM names creates the on-disk headers do not.
+    fn headers_landed(&self, landed: bool) -> Result<(), StoreError> {
+        if landed {
+            return Ok(());
+        }
+        Err(StoreError::io(
+            self.create_loc.loc.path(),
+            std::io::Error::other("a Class A header write failed"),
+        ))
+    }
+
     fn commit_pruned_wave(
         &self,
         p_out: crate::var_table::PreparedAppend,
@@ -3317,7 +3501,8 @@ impl TxTable {
         )?;
         self.create_loc.write_staged(&staged_loc)?;
         let (fks, bodies) = publish_body_pair(&self.body, p_out, &self.spent, p_sp, true)?;
-        let _durable = self.create_loc.commit_staged(staged_loc, bodies);
+        let landed = self.create_loc.commit_staged(staged_loc, bodies);
+        self.headers_landed(landed)?;
         Ok(fks)
     }
 
@@ -3348,7 +3533,8 @@ impl TxTable {
         let (fks, pair_ok) = publish_body_pair(&self.body, p_out, &self.spent, p_sp, in_ok)?;
         expect_same_fks(&fks, &fks_in)?;
         let durable = self.create_loc.commit_staged(staged_loc, in_ok && pair_ok);
-        let _durable = self.seqsigwit_loc.commit_staged(staged_seq, durable);
+        let landed = self.seqsigwit_loc.commit_staged(staged_seq, durable);
+        self.headers_landed(landed)?;
         Ok(fks)
     }
 
@@ -3763,14 +3949,23 @@ impl TxTable {
         self.head.flush()
     }
 
+    /// Publish every Class A high-water mark and sync, then `tx.head`.
+    ///
+    /// These are the barrier's fds, so the flush runs under the Class A
+    /// latch: `TableFile::flush` retries a failed sync, and a retry can
+    /// return 0 over pages the kernel dropped.
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.sync_replay_bodies()?;
+        self.class_a_latched(|| self.flush_class_a_files())?;
         self.head.flush()?;
         Ok(())
     }
 
-    /// Bodies the tip-window check and spend replay read. Not `tx.head`.
-    pub fn sync_replay_bodies(&self) -> Result<(), StoreError> {
+    /// [`Self::flush`] for `input` alone: the backfill and the prune release.
+    pub fn flush_input(&self) -> Result<(), StoreError> {
+        self.class_a_latched(|| self.input.flush())
+    }
+
+    fn flush_class_a_files(&self) -> Result<(), StoreError> {
         self.body.flush()?;
         self.seqsigwit.flush()?;
         self.spent.flush()?;
@@ -3780,15 +3975,118 @@ impl TxTable {
         Ok(())
     }
 
-    /// Device barrier for those bodies. Does not publish their high-water marks.
-    pub fn sync_replay_data(&self) -> Result<(), StoreError> {
-        self.body.sync_data_only()?;
-        self.seqsigwit.sync_data_only()?;
-        self.spent.sync_data_only()?;
-        self.txids.sync_data_only()?;
-        self.txstat.sync_data_only()?;
-        self.input.sync_data_only()?;
+    /// Device barrier for every Class A stem a commit names: the bodies, both
+    /// locator families, `txid.body`, `txstat`, and `input`. Not `tx.head`.
+    /// Does not publish high-water marks; headers already written are in
+    /// the file and land with it.
+    ///
+    /// A failure latches: every later call refuses until restart. Calls run
+    /// one at a time (the tip barrier and the spend checkpoint can overlap).
+    pub fn sync_class_a_data(&self) -> Result<(), StoreError> {
+        self.class_a_latched(|| self.sync_class_a_stems())
+    }
+
+    /// Call `on_fail` once, when a Class A sync or append write first fails.
+    pub fn on_class_a_failure(&self, on_fail: impl Fn() + Send + Sync + 'static) {
+        let _ = self.class_a_on_fail.set(Box::new(on_fail));
+    }
+
+    /// [`Self::sync_class_a_data`] for a record that names creates through
+    /// `named` without a `header_txs` range (a spend delta commit, the
+    /// scripthash `DONE.keys` / `DONE.post` marks, `include_hwm`). Open
+    /// keeps every create through the highest mark.
+    ///
+    /// `named` is at most [`Self::settled_count`]: every row of those
+    /// creates was written, and a failed write latched before this sync.
+    pub fn sync_class_a_named(&self, named: u64) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
+        self.class_a_latched(|| {
+            self.sync_class_a_stems()?;
+            // Synced first, then named: the mark never passes a create the
+            // device may not hold. One writer at a time under the latch.
+            if named > self.synced_named.load(Ordering::Acquire) {
+                crate::file::write_synced_tmp_rename(
+                    &self.hot_dir.join(CLASS_A_SYNCED_NAME),
+                    &named.to_le_bytes(),
+                )?;
+                self.synced_named.store(named, Ordering::Release);
+            }
+            Ok(())
+        })
+    }
+
+    /// Run `sync` on Class A fds under the latch: refuse once one failed,
+    /// one at a time, and latch a failure.
+    fn class_a_latched(
+        &self,
+        sync: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<(), StoreError> {
+        let _one = self.class_a_sync.lock().unwrap_or_else(|e| e.into_inner());
+        self.refuse_if_class_a_failed()?;
+        let synced = sync();
+        if synced.is_err() {
+            self.latch_class_a_failure();
+        }
+        synced
+    }
+
+    fn refuse_if_class_a_failed(&self) -> Result<(), StoreError> {
+        if self
+            .class_a_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(StoreError::io(
+                self.body.body.path(),
+                std::io::Error::other("an earlier Class A write or sync failed; restart the node"),
+            ));
+        }
         Ok(())
+    }
+
+    fn latch_class_a_failure(&self) {
+        let first = !self
+            .class_a_failed
+            .swap(true, std::sync::atomic::Ordering::AcqRel);
+        if first {
+            if let Some(on_fail) = self.class_a_on_fail.get() {
+                on_fail();
+            }
+        }
+    }
+
+    /// Run the writes of one Class A append. A failed write latches: the
+    /// append's rows may be in RAM and not on the device, so no barrier or
+    /// mark may name them, and no later append may stack on them.
+    fn class_a_append<T>(
+        &self,
+        write: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let written = write();
+        if written.is_err() {
+            self.latch_class_a_failure();
+        }
+        written
+    }
+
+    fn sync_class_a_stems(&self) -> Result<(), StoreError> {
+        crate::file::TableFile::sync_data_all(&[
+            &self.body.body,
+            &self.seqsigwit.body,
+            &self.spent.body,
+            &self.create_loc.loc,
+            &self.create_loc.ovf,
+            &self.create_loc.off,
+            &self.seqsigwit_loc.loc,
+            &self.seqsigwit_loc.ovf,
+            &self.seqsigwit_loc.off,
+            &self.txids.file,
+            &self.txstat.body,
+            &self.txstat.ovf,
+            &self.txstat.blk,
+            &self.input.loc,
+            &self.input.off,
+            &self.input.body,
+        ])
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {

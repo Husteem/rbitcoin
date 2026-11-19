@@ -525,6 +525,8 @@ fn schema_29_store(d: &std::path::Path) {
         vec![OutputRecord::unspent(1, vec![0x51])],
     );
     s.put_tx_full_batch_indexed(&[item], false).unwrap();
+    // No block range names the create; the sync mark keeps it at open.
+    s.txs.sync_class_a_named(1).unwrap();
     s.flush().unwrap();
     drop(s);
     std::fs::remove_dir_all(delta_dir(d)).unwrap();

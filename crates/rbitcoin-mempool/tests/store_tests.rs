@@ -221,6 +221,19 @@ fn tmp_dir() -> rbitcoin_store::testutil::TempDir {
     rbitcoin_store::testutil::TempDir::labeled("mempool").unwrap()
 }
 
+/// A new `meta` is published whole: a synced rename, not a create and a write.
+#[test]
+fn new_meta_is_published_through_a_synced_rename() {
+    let dir = tmp_dir();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let _ = open_or_init_meta(&dir.join("meta")).unwrap();
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|d| d == dir.path()),
+        "mempool meta name not synced: {synced:?}"
+    );
+}
+
 fn tiny_tx() -> bitcoin::Transaction {
     bitcoin::Transaction {
         version: bitcoin::transaction::Version::TWO,

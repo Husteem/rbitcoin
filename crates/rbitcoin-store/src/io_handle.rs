@@ -82,6 +82,32 @@ impl IoHandle {
         }
     }
 
+    /// `File::sync_data` on the borrowed handle: `fdatasync` on Linux,
+    /// `F_FULLFSYNC` on macOS, `FlushFileBuffers` on Windows. Returns 0 or
+    /// negated errno.
+    pub fn sync_data(self) -> i32 {
+        #[cfg(debug_assertions)]
+        if let Some(r) = injected_sync(self) {
+            return r;
+        }
+        #[cfg(unix)]
+        // SAFETY: the caller keeps the fd open; `ManuallyDrop` never closes it.
+        let file = std::mem::ManuallyDrop::new(unsafe {
+            <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(self.fd)
+        });
+        #[cfg(windows)]
+        // SAFETY: the caller keeps the handle open; `ManuallyDrop` never closes it.
+        let file = std::mem::ManuallyDrop::new(unsafe {
+            <std::fs::File as std::os::windows::io::FromRawHandle>::from_raw_handle(
+                self.handle as _,
+            )
+        });
+        match file.sync_data() {
+            Ok(()) => 0,
+            Err(e) => -e.raw_os_error().unwrap_or(5),
+        }
+    }
+
     /// One-shot positional write. Returns bytes transferred or negated errno.
     pub fn pwrite(self, offset: u64, buf: &[u8]) -> i32 {
         if buf.is_empty() {
@@ -143,6 +169,11 @@ static FAIL_HWM: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(
 /// Next N `sync_data` calls on these read fds fail before the syscall.
 #[cfg(debug_assertions)]
 static FAIL_SYNC: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The next `sync_data` on these fds sleeps this long first.
+#[cfg(debug_assertions)]
+static SYNC_DELAY: std::sync::Mutex<Vec<(IoHandle, std::time::Duration)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// `(fd, limit, keep_partial)`: a `fallocate` past `limit` bytes fails with
 /// ENOSPC. With `keep_partial` it first really allocates up to `limit`, the
@@ -246,6 +277,7 @@ pub fn disarm_short_pwrite() {
         .clear();
     FAIL_HWM.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_SYNC.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SYNC_DELAY.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_PREAD.lock().unwrap_or_else(|e| e.into_inner()).clear();
     disarm_fail_pread_len();
 }
@@ -271,6 +303,10 @@ pub fn disarm_pwrite(handle: IoHandle) {
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(h, _)| *h != handle);
     FAIL_SYNC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _)| *h != handle);
+    SYNC_DELAY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(h, _)| *h != handle);
@@ -341,7 +377,7 @@ pub fn arm_fail_preads(handle: IoHandle, n: u32) {
     }
 }
 
-/// Drop one fd's sync arm.
+/// Drop one fd's sync arms.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn disarm_sync(handle: IoHandle) {
@@ -349,6 +385,37 @@ pub fn disarm_sync(handle: IoHandle) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(h, _)| *h != handle);
+    SYNC_DELAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _)| *h != handle);
+}
+
+/// The next `sync_data` on `handle` sleeps `delay` first, so a test can hold
+/// a barrier or a batch in flight.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_sync_delay(handle: IoHandle, delay: std::time::Duration) {
+    let mut slots = SYNC_DELAY.lock().unwrap_or_else(|e| e.into_inner());
+    slots.retain(|(h, _)| *h != handle);
+    slots.push((handle, delay));
+}
+
+/// Consume one armed delay on `handle`, if any.
+#[cfg(debug_assertions)]
+pub(crate) fn take_sync_delay(handle: IoHandle) -> Option<std::time::Duration> {
+    let mut slots = SYNC_DELAY.lock().unwrap_or_else(|e| e.into_inner());
+    let i = slots.iter().position(|(h, _)| *h == handle)?;
+    Some(slots.swap_remove(i).1)
+}
+
+/// Armed delay and failure for one `sync_data` on a session worker.
+#[cfg(debug_assertions)]
+fn injected_sync(handle: IoHandle) -> Option<i32> {
+    if let Some(d) = take_sync_delay(handle) {
+        std::thread::sleep(d);
+    }
+    take_fail_sync(handle).then_some(-5)
 }
 
 /// One armed `sync_data` on `handle` is consumed. Unarmed fds are untouched.
@@ -367,6 +434,38 @@ pub(crate) fn take_fail_sync(handle: IoHandle) -> bool {
         slots.swap_remove(i);
     }
     true
+}
+
+/// Watched fds, and whether one submitted sync batch held all of them.
+#[cfg(debug_assertions)]
+static SYNC_BATCH_WATCH: std::sync::Mutex<Option<(Vec<IoHandle>, bool)>> =
+    std::sync::Mutex::new(None);
+
+/// Watch for one `sync_data` batch that submits every fd in `handles`
+/// together. [`take_sync_batch_seen`] reports it.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn watch_sync_batch(handles: Vec<IoHandle>) {
+    *SYNC_BATCH_WATCH.lock().unwrap_or_else(|e| e.into_inner()) = Some((handles, false));
+}
+
+/// Stop watching. True when one batch held every watched fd.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_sync_batch_seen() -> bool {
+    SYNC_BATCH_WATCH
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .is_some_and(|(_, seen)| seen)
+}
+
+#[cfg(debug_assertions)]
+pub(crate) fn note_sync_batch(batch: &[IoHandle]) {
+    let mut watch = SYNC_BATCH_WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((handles, seen)) = watch.as_mut() {
+        *seen |= handles.iter().all(|h| batch.contains(h));
+    }
 }
 
 #[cfg(debug_assertions)]

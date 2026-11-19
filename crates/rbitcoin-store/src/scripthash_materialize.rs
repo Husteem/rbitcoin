@@ -337,6 +337,19 @@ pub fn unsorted_done_last_fk(dir: &Path, n_shards: usize) -> Option<u64> {
     read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards).map(|d| d.last_fk)
 }
 
+/// Highest create a `DONE.keys` or `DONE.post` mark names, `0` for none.
+pub fn unsorted_marks_last_fk(dir: &Path, n_shards: usize) -> u64 {
+    [
+        (KEYS_DONE_NAME, KEYS_DONE_MAGIC),
+        (POST_DONE_NAME, POST_DONE_MAGIC),
+    ]
+    .into_iter()
+    .filter_map(|(name, magic)| read_phase_done(dir, name, magic, n_shards))
+    .map(|d| d.last_fk)
+    .max()
+    .unwrap_or(0)
+}
+
 #[doc(hidden)]
 pub fn leftover_legacy_unsorted(dir: &Path) -> bool {
     if !dir.is_dir() {
@@ -1453,7 +1466,9 @@ pub fn collect_unsorted_covering_txs(
     any_sealed_shards: bool,
     cancel: Option<&AtomicBool>,
 ) -> Result<UnsortedCollect, StoreError> {
-    let last = txs.count();
+    let last = txs.settled_count();
+    // `DONE.keys` names creates through `last`; they reach the device first.
+    txs.sync_class_a_named(last)?;
     if leftover_legacy_unsorted(dir)
         && read_phase_done(dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, n_shards).is_none()
     {
@@ -1825,7 +1840,9 @@ pub fn collect_posts_covering(
         return Err(refuse_posts_leftover());
     }
     let n_shards = table.head_shard_count().max(1);
-    let last = txs.count();
+    let last = txs.settled_count();
+    // `DONE.post` names creates through `last`; they reach the device first.
+    txs.sync_class_a_named(last)?;
     let done = read_phase_done(dir, POST_DONE_NAME, POST_DONE_MAGIC, n_shards);
     let action = plan_unsorted_collect(
         done.as_ref().map(|d| d.last_fk),

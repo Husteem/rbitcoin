@@ -936,6 +936,26 @@ fn unbroadcast_survives_reopen_and_logs_confirm_before_broadcast() {
     let _ = std::fs::remove_dir_all(&mp);
 }
 
+/// The unbroadcast set is replaced by a synced rename, never truncated in place.
+#[test]
+fn unbroadcast_set_is_published_through_a_synced_rename() {
+    let dir =
+        std::env::temp_dir().join(format!("rbitcoin-unbroadcast-sync-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut set = std::collections::HashSet::new();
+    set.insert(Txid::from_byte_array([1u8; 32]));
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    persist_unbroadcast_file(&dir, &set);
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    assert!(
+        synced.iter().any(|d| d == &dir),
+        "unbroadcast name not synced: {synced:?}"
+    );
+    assert_eq!(load_unbroadcast_file(&dir), set);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `importmempool` logs each Core `LoadMempool` outcome: a fresh admit, a
 /// duplicate, an expired entry, and a tx that cannot enter.
 #[test]
@@ -2481,6 +2501,87 @@ fn purge_fault_unindexes_txs_that_already_left() {
     assert!(!hub.contains(&confirmed_id));
     assert!(!hub.relay_indexed(&confirmed_id));
     assert!(!hub.relay_indexed(&conflict_id));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// The pool caches each confirmed parent's create number. A power cut can
+/// lose that create before any durable row names it: open cuts it, and a
+/// later block takes the number. A cached number whose `txid.body` row is
+/// not the parent's is not trusted; the parent is looked up by txid again.
+#[test]
+fn a_cached_create_holding_another_txid_is_not_trusted() {
+    use rbitcoin_consensus::{mine_regtest_paying, ChainParams, Milestone};
+    use rbitcoin_query::accept_and_connect_block;
+
+    let (store, q, cbs) = copy_maturity_pad(12);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = spend_true(cbs[0], 1_000, spk.clone());
+    let tip_h = q.tip_height().unwrap().0;
+    let rec = q.get_header(q.tip_header_fk().unwrap().unwrap()).unwrap();
+    let block = mine_regtest_paying(
+        bitcoin::BlockHash::from_byte_array(rec.hash),
+        rec.timestamp + 600,
+        tip_h + 1,
+        spk.clone(),
+        vec![parent.clone()],
+    );
+    accept_and_connect_block(
+        &q,
+        &ChainParams::regtest(),
+        Height(tip_h + 1),
+        &block,
+        Milestone::NONE,
+    )
+    .expect("confirm the parent");
+    let child = spend_vout(
+        OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        parent.output[0].value.to_sat() - 2_000,
+    );
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.accept_tx(&child)
+        .expect("admit a child of the confirmed parent");
+    let g = hub.lock_write();
+    #[cfg(debug_assertions)]
+    rbitcoin_store::tx_table::reset_body_txid_reads();
+    assert_eq!(
+        hub.dead_chain_prevouts(&g, &[child.compute_txid()], &Default::default()),
+        Ok(Vec::new()),
+        "the cached create is the parent"
+    );
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        rbitcoin_store::tx_table::body_txid_reads(),
+        0,
+        "the cached parent check read txid.body one create at a time"
+    );
+    let pfk = q
+        .tx_fk_by_txid(&parent.compute_txid().to_byte_array())
+        .unwrap()
+        .expect("parent create");
+    // The number now holds another transaction, still strong.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(store.join("txid.body"))
+            .unwrap();
+        f.seek(SeekFrom::Start(
+            rbitcoin_store::txid_body::TxidBody::entry_offset(pfk.0).unwrap(),
+        ))
+        .unwrap();
+        f.write_all(&[0xee; 32]).unwrap();
+    }
+    assert_ne!(
+        hub.dead_chain_prevouts(&g, &[child.compute_txid()], &Default::default()),
+        Ok(Vec::new()),
+        "a cached create holding another txid was trusted as the parent"
+    );
+    drop(g);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&store);
 }
