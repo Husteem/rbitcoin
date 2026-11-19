@@ -277,13 +277,13 @@ fn heavier_disconnected_path_names_connecting_hashes() {
     let l3 = mine(l2.block_hash(), 1_500_060_300, 3);
     hub.ensure_header(&l3.header).unwrap();
     assert!(
-        connecting_hashes_heavier_disconnected(&hub, l3.block_hash())
+        connecting_hashes_heavier_disconnected_n(&hub, l3.block_hash(), ANCESTOR_WALK_MAX)
             .unwrap()
             .is_none(),
         "child of current tip is a normal extension, not a connecting search"
     );
 
-    let path = connecting_hashes_heavier_disconnected(&hub, w4.block_hash())
+    let path = connecting_hashes_heavier_disconnected_n(&hub, w4.block_hash(), ANCESTOR_WALK_MAX)
         .unwrap()
         .expect("heavier winner that does not connect at tip must name a path");
     assert_eq!(
@@ -602,7 +602,7 @@ fn linear_ahead_headers_are_not_a_disconnected_fork() {
     }
     let last = ahead.last().unwrap().1;
     assert!(
-        connecting_hashes_heavier_disconnected(&hub, last)
+        connecting_hashes_heavier_disconnected_n(&hub, last, ANCESTOR_WALK_MAX)
             .unwrap()
             .is_none(),
         "far header on the same chain as tip is not a disconnected fork"
@@ -653,6 +653,87 @@ fn capped_walk_on_linear_headers_is_not_a_disconnected_fork() {
         path.is_none(),
         "capped walk whose join is header-only must not start connecting search; got {path:?}"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Tip on a 2-block loser; a 3-header heavier fork from genesis is stored as
+/// headers only. Its tip w3 sits at tip+1.
+fn fork_three_under_a_two_block_tip(hub: &ChainHub, time0: u32) -> [BlockHash; 3] {
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let l1 = mine(gen, time0, 1);
+    hub.accept_block(l1.clone()).unwrap();
+    let l2 = mine(l1.block_hash(), time0 + 100, 2);
+    hub.accept_block(l2).unwrap();
+    let w1 = distinct_sib(mine(gen, time0 + 1, 1), l1.block_hash());
+    let w2 = mine(w1.block_hash(), time0 + 101, 2);
+    let w3 = mine(w2.block_hash(), time0 + 201, 3);
+    for w in [&w1, &w2, &w3] {
+        hub.ensure_header(&w.header).unwrap();
+    }
+    [w1.block_hash(), w2.block_hash(), w3.block_hash()]
+}
+
+/// A tip+1 candidate whose LCA is `d` blocks under the tip needs a walk of
+/// `d + 1`. One header short, the fork is not selected.
+#[test]
+fn selection_walk_reaches_an_lca_one_past_its_depth() {
+    let (dir, hub) = tmp_hub();
+    let fork = fork_three_under_a_two_block_tip(&hub, 1_500_093_100);
+    let none = std::collections::HashSet::new();
+    assert_eq!(
+        select_heavier_path(&hub, &[fork[2]], &none, 2).unwrap(),
+        None,
+        "a walk of two ends on a header-only row"
+    );
+    assert_eq!(
+        select_heavier_path(&hub, &[fork[2]], &none, 3).unwrap(),
+        Some(fork.to_vec())
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Each rewind cap in force has a selection walk that reaches its deepest
+/// LCA from tip+1. A 10,000 walk under the 65,536 unproved cap dropped a
+/// heavier fork the rewind would take.
+#[test]
+fn selection_walk_covers_every_rewind_cap() {
+    for cap in [
+        REWIND_MAX_DEPTH,
+        rbitcoin_ibd::ibd::header_walk::UNPROVEN_LEAD_BLOCKS,
+    ] {
+        assert!(
+            ancestor_walk_max(cap) > cap as usize,
+            "cap {cap} walk {}",
+            ancestor_walk_max(cap)
+        );
+    }
+}
+
+/// An unplanted walk tip as far above the confirmed tip as the widest walk
+/// is not walked: that walk ends before any connected header. One height
+/// lower it is. The recorded height alone decides, so a short fork stands in
+/// for a far one.
+#[test]
+fn a_walk_tip_out_of_walk_reach_is_not_a_candidate() {
+    let (dir, hub) = tmp_hub();
+    let fork = fork_three_under_a_two_block_tip(&hub, 1_500_094_100);
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let reach = ancestor_walk_max(rbitcoin_ibd::ibd::header_walk::UNPROVEN_LEAD_BLOCKS);
+    st.header_walk.tip.hash = Some(fork[2]);
+    st.header_walk.tip.height = 2 + reach as u32;
+    let shared = Mutex::new(st);
+    assert!(!consider_disconnected_heavier(&shared, &hub).unwrap());
+    assert_eq!(hub.tip_height(), Some(2));
+    shared
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .header_walk
+        .tip
+        .height -= 1;
+    assert!(consider_disconnected_heavier(&shared, &hub).unwrap());
+    assert_eq!(hub.tip_height(), Some(0), "rewound to the fork");
     let _ = std::fs::remove_dir_all(dir);
 }
 
