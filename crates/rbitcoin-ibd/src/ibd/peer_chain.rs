@@ -28,12 +28,15 @@ const PROBE_REFRESH: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Default)]
 pub struct PeerChain {
-    /// `notfound` hashes, with the mono ms they were last answered.
-    lacks: HashMap<BlockHash, u64>,
-    /// Each answer as `(hash, ms)`, oldest first. An entry whose ms no longer
-    /// matches `lacks` was answered again later or announced, and is skipped.
-    /// At most twice the cap.
+    /// `notfound` hashes, with the mono ms and the number of their last
+    /// answer.
+    lacks: HashMap<BlockHash, (u64, u64)>,
+    /// Each answer as `(hash, number)`, oldest first. An answer whose number
+    /// no longer matches `lacks` was answered again later or announced, and
+    /// is skipped. At most twice the cap.
     lacks_order: VecDeque<(BlockHash, u64)>,
+    /// The next answer number.
+    lacks_next: u64,
     /// This peer's announced chain above the confirmed tip, oldest first.
     announced: VecDeque<BlockHash>,
     /// Height of `announced[0]`.
@@ -79,24 +82,28 @@ impl PeerChain {
     /// call costs O(1) amortized.
     #[doc(hidden)]
     pub fn note_notfound_capped(&mut self, hash: BlockHash, now_ms: u64, cap: usize) -> bool {
-        while let Some(&(front, at)) = self.lacks_order.front() {
-            let current = self.lacks.get(&front) == Some(&at);
-            if current && now_ms.saturating_sub(at) < LACKS_TTL_MS {
-                break;
+        while let Some(&(front, n)) = self.lacks_order.front() {
+            if let Some(&(at, kept)) = self.lacks.get(&front) {
+                if kept == n {
+                    if now_ms.saturating_sub(at) < LACKS_TTL_MS {
+                        break;
+                    }
+                    self.lacks.remove(&front);
+                }
             }
             self.lacks_order.pop_front();
-            if current {
-                self.lacks.remove(&front);
-            }
         }
         if !self.lacks.contains_key(&hash) && self.lacks.len() >= cap {
             return false;
         }
-        self.lacks.insert(hash, now_ms);
-        self.lacks_order.push_back((hash, now_ms));
+        let n = self.lacks_next;
+        self.lacks_next = n.wrapping_add(1);
+        self.lacks.insert(hash, (now_ms, n));
+        self.lacks_order.push_back((hash, n));
         if self.lacks_order.len() > cap.saturating_mul(2) {
             let lacks = &self.lacks;
-            self.lacks_order.retain(|(h, at)| lacks.get(h) == Some(at));
+            self.lacks_order
+                .retain(|(h, n)| lacks.get(h).is_some_and(|&(_, kept)| kept == *n));
         }
         true
     }
@@ -112,10 +119,16 @@ impl PeerChain {
         }
     }
 
+    /// Answers held in the record, skipped ones included.
+    #[doc(hidden)]
+    pub fn lacks_answers(&self) -> usize {
+        self.lacks_order.len()
+    }
+
     pub fn lacks(&self, hash: &BlockHash, now_ms: u64) -> bool {
         self.lacks
             .get(hash)
-            .is_some_and(|at| now_ms.saturating_sub(*at) < LACKS_TTL_MS)
+            .is_some_and(|&(at, _)| now_ms.saturating_sub(at) < LACKS_TTL_MS)
     }
 
     pub fn probed(&self) -> bool {
