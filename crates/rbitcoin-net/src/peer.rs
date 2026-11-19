@@ -4668,23 +4668,46 @@ pub async fn serve_getdata_full_block(
     let query = Arc::clone(&hub.query);
     let cache = Arc::clone(&hub.cache);
     let hash = *h;
-    let encoded = tokio::task::spawn_blocking(move || {
+    let served = tokio::task::spawn_blocking(move || -> Result<FullBlockServe, NetError> {
         let _g = crate::reactor::BlockingRegion::enter();
-        encode_served_witness_block(cache.as_ref(), query.as_ref(), &hash)
+        // A known stale body is not read. A header with no body is notfound.
+        if header_outside_relay_window(query.as_ref(), &hash) {
+            let have = cache.has_body(&hash)
+                || cache.has_servable(&hash)
+                || query
+                    .is_block_archived(&hash.to_byte_array())
+                    .unwrap_or(false);
+            return Ok(if have {
+                FullBlockServe::Withheld
+            } else {
+                FullBlockServe::Missing
+            });
+        }
+        match encode_served_witness_block(cache.as_ref(), query.as_ref(), &hash)? {
+            Some(bytes) => Ok(FullBlockServe::Bytes(bytes)),
+            None => Ok(FullBlockServe::Missing),
+        }
     })
     .await
     .map_err(|_| NetError::Protocol("serve reconstruct join failed"))??;
-    let Some(bytes) = encoded else {
-        // Header-only or pruned. Notfound comes from this blocking encode,
-        // not from reconstructing the block on the async task.
-        return Ok(false);
-    };
-    // A body we have but will not relay (month-old side block) stays silent.
-    if !hub.stale_relay_allowed(h) {
-        return Ok(true);
+    match served {
+        FullBlockServe::Missing => Ok(false),
+        // A body we have but will not relay (month-old side block) stays silent.
+        FullBlockServe::Withheld => Ok(true),
+        FullBlockServe::Bytes(bytes) => {
+            if !hub.stale_relay_allowed(h) {
+                return Ok(true);
+            }
+            queue_served(session, out_tx, PeerOut::Encoded(bytes))?;
+            Ok(true)
+        }
     }
-    queue_served(session, out_tx, PeerOut::Encoded(bytes))?;
-    Ok(true)
+}
+
+enum FullBlockServe {
+    Missing,
+    Withheld,
+    Bytes(Vec<u8>),
 }
 
 #[doc(hidden)]
@@ -4705,6 +4728,9 @@ pub fn compact_serve_outcome(
     ver: u32,
     pref: Vec<usize>,
 ) -> Result<CompactServe, NetError> {
+    if header_outside_relay_window(query, hash) {
+        return Ok(CompactServe::Missing);
+    }
     let Some(block) = block_for_peer(cache, query, hash)? else {
         return Ok(CompactServe::Missing);
     };
@@ -4794,18 +4820,7 @@ pub async fn serve_getdata_wtx(
     let announced = session.is_some_and(|s| s.has_announced_wtx(wtxid));
     if announced {
         if let Some(hash) = hub.tip_hash() {
-            let permit = block_reconstruct_permit().await?;
-            let cache = Arc::clone(&hub.cache);
-            let query = Arc::clone(&hub.query);
-            let wtxid = *wtxid;
-            let found = tokio::task::spawn_blocking(move || {
-                let _region = crate::reactor::BlockingRegion::enter();
-                let _permit = permit;
-                tx_from_stored_block(cache.as_ref(), query.as_ref(), &hash, &wtxid)
-            })
-            .await
-            .map_err(|_| NetError::Protocol("tip wtxid serve join failed"))?;
-            if let Some(tx) = announced_wtx_from_reconstruct(found) {
+            if let Some(tx) = tx_from_tip_index(hub, hash, wtxid).await? {
                 queue_accounted(session, out_tx, NetworkMessage::Tx(tx))?;
                 return Ok(());
             }
@@ -4813,6 +4828,41 @@ pub async fn serve_getdata_wtx(
     }
     notfound.push(item);
     Ok(())
+}
+
+/// One tip index for every announced wtxid in this message. A warm index
+/// does not take a reconstruct permit and does not read the body again.
+async fn tx_from_tip_index(
+    hub: &ChainHub,
+    hash: BlockHash,
+    wtxid: &bitcoin::Wtxid,
+) -> Result<Option<Transaction>, NetError> {
+    if let Some(found) = hub.cached_tip_wtx(&hash, wtxid) {
+        return Ok(found);
+    }
+    let permit = block_reconstruct_permit().await?;
+    if let Some(found) = hub.cached_tip_wtx(&hash, wtxid) {
+        return Ok(found);
+    }
+    let cache = Arc::clone(&hub.cache);
+    let query = Arc::clone(&hub.query);
+    let built = tokio::task::spawn_blocking(move || {
+        let _region = crate::reactor::BlockingRegion::enter();
+        let _permit = permit;
+        block_for_peer(cache.as_ref(), query.as_ref(), &hash)
+            .map(|block| crate::chain::TipWtxIndex::from_block(hash, block))
+    })
+    .await
+    .map_err(|_| NetError::Protocol("tip wtxid serve join failed"))?;
+    let index = match built {
+        Ok(index) => index,
+        Err(_) => return Ok(None),
+    };
+    #[cfg(debug_assertions)]
+    hub.note_tip_wtx_scan();
+    let tx = index.tx(wtxid);
+    hub.install_tip_wtx(Arc::new(index));
+    Ok(tx)
 }
 
 /// Core: past this depth a `getblocktxn` is answered with the full block.
@@ -4862,13 +4912,35 @@ fn within_relay_window(query: &Query, block: &Block) -> bool {
         Ok(Some(_)) | Err(_) => return true,
         Ok(None) => {}
     }
+    header_time_in_relay_window(query, block.header.time)
+}
+
+/// The header is stored and the body must not be relayed. An unknown header
+/// is `false`: the caller still looks up the body, which is how a missing
+/// block becomes notfound.
+fn header_outside_relay_window(query: &Query, hash: &BlockHash) -> bool {
+    let Ok(Some((_, rec))) = query.get_header_by_hash(&hash.to_byte_array()) else {
+        return false;
+    };
+    match query.height_of_hash(&hash.to_byte_array()) {
+        Ok(Some(_)) | Err(_) => false,
+        Ok(None) => {
+            let Ok(wire) = query.wire_header_from_record(&rec) else {
+                return true;
+            };
+            !header_time_in_relay_window(query, wire.time)
+        }
+    }
+}
+
+fn header_time_in_relay_window(query: &Query, block_time: u32) -> bool {
     let Some(tip_h) = query.tip_height() else {
         return false;
     };
     let Ok(best) = query.wire_header_at_height(tip_h) else {
         return false;
     };
-    u64::from(best.time).saturating_sub(u64::from(block.header.time))
+    u64::from(best.time).saturating_sub(u64::from(block_time))
         < crate::chain::STALE_RELAY_AGE_LIMIT_SECS
 }
 
@@ -4967,6 +5039,9 @@ pub fn getblocktxn_reply(
     tip_h: u32,
 ) -> Result<Option<GetBlockTxnServe>, NetError> {
     let hash = txs_request.block_hash;
+    if header_outside_relay_window(query, &hash) {
+        return Ok(None);
+    }
     let block = match block_for_peer(cache, query, &hash) {
         Ok(b) => b,
         Err(e) => {
@@ -8679,6 +8754,8 @@ pub fn block_for_peer(
     query: &Query,
     hash: &BlockHash,
 ) -> Result<Option<bitcoin::Block>, NetError> {
+    #[cfg(debug_assertions)]
+    cache.note_body_load();
     crate::reactor::assert_not_reactor("block reconstruct");
     if let Some(block) = cache.get_block(hash) {
         return Ok(Some(block));
@@ -8710,6 +8787,8 @@ pub fn encode_served_witness_block(
     query: &Query,
     hash: &BlockHash,
 ) -> Result<Option<Vec<u8>>, NetError> {
+    #[cfg(debug_assertions)]
+    cache.note_body_load();
     crate::reactor::assert_not_reactor("getdata reconstruct");
     let t0 = std::time::Instant::now();
     if let Some(block) = cache.get_block(hash).or_else(|| cache.servable(hash)) {

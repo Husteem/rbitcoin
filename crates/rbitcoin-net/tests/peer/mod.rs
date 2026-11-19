@@ -9066,6 +9066,178 @@ fn compact_and_wtxid_serve_run_off_the_reactor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Several announced wtxid getdatas, including ones the tip does not contain,
+/// walk that tip once. A later getdata for the same tip does not walk again.
+#[test]
+fn announced_wtxid_getdata_scans_the_tip_once() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("tip-wtx-once");
+    hub.ensure_genesis().unwrap();
+    let hash = hub.tip_hash().unwrap();
+    let block = block_for_peer(&hub.cache, &hub.query, &hash)
+        .unwrap()
+        .expect("genesis body");
+    let real = block.txdata[0].compute_wtxid();
+    let _ = hub.cache.take_body_loads();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let session = live_peer(&peers, 18570, 90, false);
+    session.note_announced_wtx(real);
+    let missing: Vec<bitcoin::Wtxid> = (1..5u8)
+        .map(|n| {
+            let mut bytes = [0u8; 32];
+            bytes[0] = n;
+            bitcoin::Wtxid::from_byte_array(bytes)
+        })
+        .collect();
+    for wtxid in &missing {
+        session.note_announced_wtx(*wtxid);
+    }
+    let _ = hub.take_tip_wtx_scans();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        serve_getdata(
+            &hub,
+            &out_tx,
+            &mut PeerFollowState::new(),
+            Some(session.as_ref()),
+            vec![
+                Inventory::WTx(missing[0]),
+                Inventory::WTx(real),
+                Inventory::WTx(missing[1]),
+                Inventory::WTx(missing[2]),
+            ],
+        )
+        .await
+        .expect("first getdata");
+        serve_getdata(
+            &hub,
+            &out_tx,
+            &mut PeerFollowState::new(),
+            Some(session.as_ref()),
+            vec![Inventory::WTx(missing[3])],
+        )
+        .await
+        .expect("second getdata");
+    });
+    assert_eq!(
+        hub.take_tip_wtx_scans(),
+        1,
+        "one tip builds one wtxid index"
+    );
+    let mut saw_tx = false;
+    let mut notfound = Vec::new();
+    while let Ok(msg) = out_rx.try_recv() {
+        match PeerOut::expect_msg(msg) {
+            NetworkMessage::Tx(tx) => {
+                assert_eq!(tx.compute_wtxid(), real);
+                saw_tx = true;
+            }
+            NetworkMessage::NotFound(items) => notfound.extend(items),
+            other => panic!("unexpected getdata reply {other:?}"),
+        }
+    }
+    assert!(saw_tx, "the announced tip transaction is served");
+    assert_eq!(
+        notfound.len(),
+        4,
+        "each missing wtxid is notfound: {notfound:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stored side block a month behind the best header is not reconstructed
+/// for a full-block getdata, a compact getdata, or getblocktxn. The tip still is.
+#[test]
+fn month_old_side_block_is_not_rebuilt_for_getdata() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("stale-getdata-nobody");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = 1_700_000_000u32;
+    hub.clock.set_mock(i64::from(t0));
+    let side = rbitcoin_consensus::mine_empty_regtest(gen, t0, 1);
+    let side_hash = side.block_hash();
+    hub.accept_block(side).unwrap();
+    hub.invalidate_block(side_hash).unwrap();
+    let best_time = t0 + rbitcoin_net::chain::STALE_RELAY_AGE_LIMIT_SECS as u32;
+    hub.clock.set_mock(i64::from(best_time));
+    let tip = rbitcoin_consensus::mine_empty_regtest(gen, best_time, 1);
+    let tip_hash = tip.block_hash();
+    hub.accept_block(tip).unwrap();
+    assert!(!hub.stale_relay_allowed(&side_hash));
+    assert!(hub.header_of(&side_hash).is_some());
+    let _ = hub.cache.take_body_loads();
+
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let served = serve_getdata_full_block(&hub, &out_tx, None, &side_hash)
+            .await
+            .unwrap();
+        assert!(served, "a known stale block is silent, not notfound");
+    });
+    assert!(
+        out_rx.try_recv().is_err(),
+        "no block bytes for the stale body"
+    );
+    assert_eq!(
+        hub.cache.take_body_loads(),
+        0,
+        "full getdata must not read a body it will not relay"
+    );
+
+    let cmpct = compact_serve_outcome(
+        &hub.cache,
+        &hub.query,
+        &side_hash,
+        hub.tip_height().unwrap(),
+        2,
+        vec![0],
+    )
+    .unwrap();
+    assert!(matches!(cmpct, CompactServe::Missing));
+    assert_eq!(
+        hub.cache.take_body_loads(),
+        0,
+        "compact getdata must not read it either"
+    );
+
+    let reply = getblocktxn_reply(
+        &hub.cache,
+        &hub.query,
+        BlockTransactionsRequest {
+            block_hash: side_hash,
+            indexes: vec![0],
+        },
+        hub.tip_height().unwrap(),
+    )
+    .unwrap();
+    assert!(reply.is_none(), "getblocktxn is silent for the stale body");
+    assert_eq!(
+        hub.cache.take_body_loads(),
+        0,
+        "getblocktxn must not read it either"
+    );
+
+    rt.block_on(async {
+        let served = serve_getdata_full_block(&hub, &out_tx, None, &tip_hash)
+            .await
+            .unwrap();
+        assert!(served, "the connected tip is served");
+    });
+    assert!(
+        out_rx.try_recv().map(served_block).is_ok(),
+        "the tip body is queued"
+    );
+    assert_eq!(hub.cache.take_body_loads(), 1, "the tip body is read once");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `PrepareBlockFilterRequest`: start past stop, or a range of 1000+
 /// cfilters / 2000+ cfheaders, disconnects instead of being clamped.
 #[test]
