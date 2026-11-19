@@ -708,6 +708,8 @@ pub struct ChainHub {
     pub blocks_only: AtomicBool,
     /// A follow-session block inv during IBD. The walk asks its header peer.
     pub header_inv_challenge: AtomicBool,
+    /// Wtxids of one tip body. Announced `getdata` builds this once per tip.
+    tip_wtx: std::sync::Mutex<Option<std::sync::Arc<TipWtxIndex>>>,
     #[cfg(debug_assertions)]
     pub block_at_height_calls: AtomicU64,
     /// Side branches assembled from the hold or the archive.
@@ -728,6 +730,45 @@ pub struct ChainHub {
     /// Store reads asking whether a header is stored.
     #[cfg(debug_assertions)]
     pub stored_header_lookups: AtomicU64,
+    /// Tip-block walks while answering announced wtxid getdata. One tip
+    /// builds one index; later items in the message must not walk again.
+    #[cfg(debug_assertions)]
+    pub tip_wtx_scans: AtomicU64,
+}
+
+/// Wtxids in one tip body. Absent when that tip has no stored body.
+#[doc(hidden)]
+pub struct TipWtxIndex {
+    hash: BlockHash,
+    block: Option<std::sync::Arc<Block>>,
+    at: HashMap<bitcoin::Wtxid, u32>,
+}
+
+impl TipWtxIndex {
+    pub(crate) fn from_block(hash: BlockHash, block: Option<Block>) -> Self {
+        let Some(block) = block else {
+            return Self {
+                hash,
+                block: None,
+                at: HashMap::new(),
+            };
+        };
+        let block = std::sync::Arc::new(block);
+        let mut at = HashMap::with_capacity(block.txdata.len());
+        for (i, tx) in block.txdata.iter().enumerate() {
+            at.entry(tx.compute_wtxid()).or_insert(i as u32);
+        }
+        Self {
+            hash,
+            block: Some(block),
+            at,
+        }
+    }
+
+    pub(crate) fn tx(&self, wtxid: &bitcoin::Wtxid) -> Option<Transaction> {
+        let i = *self.at.get(wtxid)?;
+        Some(self.block.as_ref()?.txdata[i as usize].clone())
+    }
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -864,6 +905,7 @@ impl ChainHub {
             finished_ibd: AtomicBool::new(false),
             blocks_only: AtomicBool::new(false),
             header_inv_challenge: AtomicBool::new(false),
+            tip_wtx: std::sync::Mutex::new(None),
             #[cfg(debug_assertions)]
             block_at_height_calls: AtomicU64::new(0),
             #[cfg(debug_assertions)]
@@ -878,6 +920,8 @@ impl ChainHub {
             path_work_steps: AtomicU64::new(0),
             #[cfg(debug_assertions)]
             stored_header_lookups: AtomicU64::new(0),
+            #[cfg(debug_assertions)]
+            tip_wtx_scans: AtomicU64::new(0),
         }
     }
 
@@ -4805,6 +4849,35 @@ impl ChainHub {
     #[cfg(debug_assertions)]
     pub fn take_stored_header_lookups(&self) -> u64 {
         self.stored_header_lookups.swap(0, Ordering::Relaxed)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn note_tip_wtx_scan(&self) {
+        self.tip_wtx_scans.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn take_tip_wtx_scans(&self) -> u64 {
+        self.tip_wtx_scans.swap(0, Ordering::Relaxed)
+    }
+
+    /// `Some` when `hash` is the indexed tip: `Some(tx)` or `Some(None)` if
+    /// that wtxid is not in the body. `None` means this tip is not indexed.
+    pub(crate) fn cached_tip_wtx(
+        &self,
+        hash: &BlockHash,
+        wtxid: &bitcoin::Wtxid,
+    ) -> Option<Option<Transaction>> {
+        let guard = self.tip_wtx.lock().unwrap_or_else(|e| e.into_inner());
+        let index = guard.as_ref()?;
+        if index.hash != *hash {
+            return None;
+        }
+        Some(index.tx(wtxid))
+    }
+
+    pub(crate) fn install_tip_wtx(&self, index: std::sync::Arc<TipWtxIndex>) {
+        *self.tip_wtx.lock().unwrap_or_else(|e| e.into_inner()) = Some(index);
     }
 
     #[cfg(debug_assertions)]

@@ -8,6 +8,8 @@ use bitcoin::block::{Block, Header};
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
 use std::collections::HashMap;
+#[cfg(debug_assertions)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// How many recent full block bodies to retain (compact/`getblocktxn` serve
@@ -19,6 +21,10 @@ pub struct BlockCache {
     pub inner: RwLock<Inner>,
     /// Max full bodies in `by_hash` (hashes in `chain` are always kept).
     pub body_depth: usize,
+    /// Times a serve path entered a full-body read. One getdata must not
+    /// read a body it already knows it will not send.
+    #[cfg(debug_assertions)]
+    pub body_loads: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -49,7 +55,19 @@ impl BlockCache {
         Self {
             inner: RwLock::new(Inner::default()),
             body_depth: body_depth.max(1),
+            #[cfg(debug_assertions)]
+            body_loads: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn note_body_load(&self) {
+        self.body_loads.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn take_body_loads(&self) -> u64 {
+        self.body_loads.swap(0, Ordering::Relaxed)
     }
 
     pub fn tip_height(&self) -> Option<u32> {
@@ -76,6 +94,12 @@ impl BlockCache {
     #[doc(hidden)]
     pub fn has_body(&self, hash: &BlockHash) -> bool {
         self.inner.read().unwrap().by_hash.contains_key(hash)
+    }
+
+    /// Whether a compact announce left this body staged. Does not copy it.
+    #[doc(hidden)]
+    pub fn has_servable(&self, hash: &BlockHash) -> bool {
+        self.inner.read().unwrap().servable.contains_key(hash)
     }
 
     pub fn get_header(&self, hash: &BlockHash) -> Option<Header> {

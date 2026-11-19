@@ -342,6 +342,9 @@ pub struct Store {
     /// Disconnects since process start. A checkpoint publishes only when this
     /// word is unchanged across its `sync_data` window.
     pub spend_reorg_gen: std::sync::atomic::AtomicU64,
+    /// [`Self::spend_reorg_gen`] at the last spend delta freeze: a freeze
+    /// that sees it move filters its notes by spender.
+    spend_freeze_reorg_gen: std::sync::atomic::AtomicU64,
     /// Even while confirmed spentness is stable. Odd while a confirm annotate
     /// or a disconnect is publishing a change.
     pub utxo_view: crate::sync::atomic::AtomicU64,
@@ -450,25 +453,6 @@ pub fn keep_unspent_vout_subsequence<T>(
     });
 }
 
-#[cfg(debug_assertions)]
-type SpendFreezeProbe = fn(&SpenderTable, &crate::spend_page_log::SpendPageLog);
-
-#[cfg(debug_assertions)]
-type SpendFoldProbe = fn();
-
-#[cfg(debug_assertions)]
-type SpendInstallProbe = fn();
-
-#[cfg(debug_assertions)]
-thread_local! {
-    static SPEND_FREEZE_PROBE: std::cell::Cell<Option<SpendFreezeProbe>> =
-        const { std::cell::Cell::new(None) };
-    static SPEND_FOLD_PROBE: std::cell::Cell<Option<SpendFoldProbe>> =
-        const { std::cell::Cell::new(None) };
-    static SPEND_INSTALL_PROBE: std::cell::Cell<Option<SpendInstallProbe>> =
-        const { std::cell::Cell::new(None) };
-}
-
 impl Store {
     pub fn create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         Self::create_layout(StoreLayout::single(path.into()))
@@ -517,6 +501,7 @@ impl Store {
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
+            spend_freeze_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: crate::sync::atomic::AtomicU64::new(0),
             utxo_publish: std::sync::Mutex::new(()),
             spend_marker: std::sync::Mutex::new(()),
@@ -585,6 +570,7 @@ impl Store {
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
+            spend_freeze_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: crate::sync::atomic::AtomicU64::new(0),
             utxo_publish: std::sync::Mutex::new(()),
             spend_marker: std::sync::Mutex::new(()),
@@ -1155,14 +1141,13 @@ impl Store {
 
     /// Append Class A rows from shared pin Arc + inputs (no outs reclone).
     ///
-    /// `pin` is `(TxRecord, outs)`. `spent` is the exact `spent.body` image.
+    /// `pin` is `(TxRecord, outs)`.
     pub fn put_tx_full_batch_from_pins<P: crate::tx_table::PackedCreate>(
         &self,
         items: &[(P, Vec<crate::InputRecord>)],
         index: bool,
-        spent: crate::tx_table::SpentBodyImage,
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
-        self.txs.put_full_batch_from_pins(items, index, spent)
+        self.txs.put_full_batch_from_pins(items, index)
     }
 
     #[allow(clippy::too_many_arguments)] // same wave as append_stems_one_wave
@@ -1172,7 +1157,6 @@ impl Store {
         &self,
         pins: &[&P],
         index: bool,
-        spent: crate::tx_table::SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
         input_edges: &[Vec<crate::input::InputEdge>],
@@ -1182,7 +1166,6 @@ impl Store {
         self.txs.put_pins_encoded(
             pins,
             index,
-            spent,
             txstat,
             header_ranges,
             input_edges,
@@ -1301,7 +1284,7 @@ impl Store {
         &self,
         slots: &[(u64, [u8; crate::tx_table::OutputRecord::SPENT_SLOT_LEN])],
     ) -> Result<(), StoreError> {
-        self.txs.note_historical_spend_slots(slots)
+        self.txs.note_spend_slots(slots)
     }
 
     /// Resolve txid → Class A fk without full body decode (head probe + body txid).
@@ -1620,8 +1603,8 @@ impl Store {
         self.spenders.count()
     }
 
-    /// A sole-spender slot stays in the page log only while that spender is
-    /// still best-chain. Multi-list slots stay; `is_confirmed_strong` filters
+    /// A sole-spender slot stays in the spend delta only while that spender
+    /// is still best-chain. Multi-list slots stay; `is_confirmed_strong` filters
     /// each list member at read time.
     fn spend_slot_still_live(&self, meta: &[u8; 8]) -> Result<bool, StoreError> {
         let (flags, field, _) = crate::tx_table::decode_spent_slot(meta)?;
@@ -1913,7 +1896,6 @@ impl Store {
         self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
         self.txs.sync_replay_data()?;
         self.store_spend_marker(tip, tip, gen)?;
-        self.fold_sealed_spend_pages()?;
         Ok(t.elapsed().as_nanos() as u64)
     }
 
@@ -1977,23 +1959,17 @@ impl Store {
     }
 
     /// Block a confirm insert while the open spend directory is still at the edge cap.
-    pub fn wait_spend_edge_room(&self) {
-        self.txs.wait_spend_edge_room();
+    pub fn wait_spend_edge_room(&self) -> Result<(), StoreError> {
+        self.txs.wait_spend_edge_room()
     }
 
     /// Directory answer for one absolute spend slot, when the log serves it.
     #[doc(hidden)]
-    pub fn spend_directory_slot(&self, abs: u64) -> Option<[u8; 8]> {
+    pub fn spend_directory_slot(&self, abs: u64) -> Result<Option<[u8; 8]>, StoreError> {
         self.txs.spend_log_slot(abs)
     }
 
-    /// Open slot deltas the edge-cap wait is blocked on.
-    #[doc(hidden)]
-    pub fn open_spend_edge_count(&self) -> u64 {
-        self.txs.open_spend_edge_count()
-    }
-
-    pub fn bind_spend_sync_wake(&self, wake: crate::spend_page_log::SpendSyncWake) {
+    pub fn bind_spend_sync_wake(&self, wake: crate::spend_delta::SpendSyncWake) {
         self.txs.bind_spend_sync_wake(wake);
     }
 
@@ -2001,73 +1977,20 @@ impl Store {
         self.txs.spend_checkpoint_early()
     }
 
-    /// The page-log commit or its freeze tip names a height above `tip`.
+    /// Zero delta spends whose spender is not on the confirmed chain, on the
+    /// pages a checkpoint wrote while sealing spends above the tip.
     ///
-    /// Open uses this when the spend marker is not above the tip. The marker
-    /// can lag the commit, and the freeze tip can sit above the snapshot height.
-    pub fn spend_log_above(&self, tip: u32) -> bool {
-        self.txs.spend_log_above(tip)
+    /// Open runs this before replay and before any append. A crash can cut
+    /// the blocks those spenders came from, and the next create to take one
+    /// of their fks must not read as spending the output.
+    pub fn drop_spends_above_tip(&self) -> Result<(), StoreError> {
+        let tip = self.confirmed.tip_height().map_or(0, |h| h.0);
+        self.txs
+            .drop_spends_above(tip, |meta| self.spend_slot_still_live(meta))
     }
 
     pub fn relax_spend_pace(&self) {
         self.txs.relax_spend_pace();
-    }
-
-    /// Run once inside the spend freeze, after the early `spent.ovf` sync.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn arm_spend_freeze_probe(probe: SpendFreezeProbe) {
-        SPEND_FREEZE_PROBE.with(|slot| slot.set(Some(probe)));
-    }
-
-    /// Drop a probe [`arm_spend_freeze_probe`] has not consumed.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn disarm_spend_freeze_probe() {
-        SPEND_FREEZE_PROBE.with(|slot| slot.set(None));
-    }
-
-    #[cfg(debug_assertions)]
-    fn take_spend_freeze_probe() -> Option<SpendFreezeProbe> {
-        SPEND_FREEZE_PROBE.with(|slot| slot.take())
-    }
-
-    /// Run once inside the cooled-page body copy, while the spindle is held.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn arm_spend_fold_probe(probe: SpendFoldProbe) {
-        SPEND_FOLD_PROBE.with(|slot| slot.set(Some(probe)));
-    }
-
-    /// Drop a probe [`arm_spend_fold_probe`] has not consumed.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn disarm_spend_fold_probe() {
-        SPEND_FOLD_PROBE.with(|slot| slot.set(None));
-    }
-
-    #[cfg(debug_assertions)]
-    fn take_spend_fold_probe() -> Option<SpendFoldProbe> {
-        SPEND_FOLD_PROBE.with(|slot| slot.take())
-    }
-
-    /// Run once beside the checkpoint's generation-file unlink.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn arm_spend_install_probe(probe: SpendInstallProbe) {
-        SPEND_INSTALL_PROBE.with(|slot| slot.set(Some(probe)));
-    }
-
-    /// Drop a probe [`arm_spend_install_probe`] has not consumed.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn disarm_spend_install_probe() {
-        SPEND_INSTALL_PROBE.with(|slot| slot.set(None));
-    }
-
-    #[cfg(debug_assertions)]
-    fn take_spend_install_probe() -> Option<SpendInstallProbe> {
-        SPEND_INSTALL_PROBE.with(|slot| slot.take())
     }
 
     fn publish_open_spend_pages(
@@ -2075,83 +1998,29 @@ impl Store {
         height: u32,
         keep: impl FnMut(&[u8; 8]) -> Result<bool, StoreError>,
     ) -> Result<(), StoreError> {
-        // Swap the open pages into `frozen`, and wake an edge-cap waiter,
-        // before the cooled-page copy. Do not stamp the tip here: a disconnect
-        // below this checkpoint, and at or above the sealed generation, must
-        // still fold. Do not clone a snapshot. The callback freeze records the
-        // one compose publishes, after the copy. That freeze is a reuse, and
-        // does not notify, when this swap moved pages. An empty swap leaves
-        // `frozen` empty, so the callback freeze is a fresh swap: it resets
-        // the edge count and notifies.
-        self.txs.widen_for_checkpoint(height);
         let publish = &self.utxo_publish;
         let view = &self.utxo_view;
         let confirmed = &self.confirmed;
         let spenders = &self.spenders;
-        {
-            let _g = hold_view(publish, view);
-            self.txs.freeze_open_spend_pages();
-        }
-        self.fold_sealed_spend_pages()?;
-        self.txs.prepare_open_spend_pages(
-            height,
-            keep,
-            |log, len| {
+        let durable =
+            crate::spend_durable::SpendDurable::load(self.path())?.map(|m| m.durable_through());
+        let reorgs = &self.spend_reorg_gen;
+        let filtered = &self.spend_freeze_reorg_gen;
+        self.txs.checkpoint_spend_pages(
+            |log| {
                 {
+                    use std::sync::atomic::Ordering;
                     let _g = hold_view(publish, view);
-                    #[cfg(debug_assertions)]
-                    if let Some(probe) = Self::take_spend_freeze_probe() {
-                        probe(spenders, log);
-                    }
                     let tip = confirmed.tip_height().map(|h| h.0).unwrap_or(height);
-                    log.cover_confirmed_tip(tip);
-                    log.freeze_open();
-                    log.cover_published_len(len());
+                    let seen = reorgs.load(Ordering::Acquire);
+                    let disconnected = filtered.load(Ordering::Acquire) != seen;
+                    log.freeze_open(tip, disconnected.then_some(keep))?;
+                    filtered.store(seen, Ordering::Release);
                 }
-                spenders.sync_data_only()?;
-                Ok(())
+                spenders.sync_data_only()
             },
-            |_log| {
-                let _g = hold_view(publish, view);
-                Ok(confirmed.tip_height().map(|h| h.0).unwrap_or(height))
-            },
-        )?;
-        self.install_prepared_spend_pages()
-    }
-
-    fn install_prepared_spend_pages(&self) -> Result<(), StoreError> {
-        // Readers and confirm wait on the view. List and unlink generation
-        // files after it drops, with the live set captured under it.
-        let live = {
-            let _g = hold_view(&self.utxo_publish, &self.utxo_view);
-            self.txs.install_open_spend_pages()
-        };
-        if let Some(live) = live {
-            #[cfg(debug_assertions)]
-            if let Some(probe) = Self::take_spend_install_probe() {
-                probe();
-            }
-            self.txs.unlink_spend_generations_if_synced(&live);
-        }
-        Ok(())
-    }
-
-    fn fold_sealed_spend_pages(&self) -> Result<(), StoreError> {
-        // Readers still see the committed image, so the copy does not take
-        // the utxo view. Drop the spindle before that view: disconnect takes
-        // the view and must not wait on this lock.
-        {
-            let _spindle = self.spindle_hold();
-            #[cfg(debug_assertions)]
-            if let Some(probe) = Self::take_spend_fold_probe() {
-                probe();
-            }
-            self.txs.copy_cooled_spend_pages()?;
-        }
-        // Disconnect holds this view and then sets the fold hold. Take it only
-        // to drop directory entries after the copy is durable.
-        let _g = hold_view(&self.utxo_publish, &self.utxo_view);
-        self.txs.finish_cooled_spend_pages()
+            durable,
+        )
     }
 
     /// `Some` even generation, or `None` while [`Self::hold_utxo_view`] is held.
@@ -2270,7 +2139,6 @@ impl Store {
             let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
             self.spenders.sync_data_only()?;
             self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
-            self.fold_sealed_spend_pages()?;
             return Ok(());
         };
         self.sync_spend_checkpoint(height, gen, during_sync)
@@ -2322,7 +2190,7 @@ impl Store {
             return Ok(());
         };
         self.store_spend_marker(height, height, gen)?;
-        self.fold_sealed_spend_pages()
+        Ok(())
     }
 
     /// [`Self::checkpoint_observed_spend`] with hooks around the two reads
@@ -2353,13 +2221,11 @@ impl Store {
     /// annotated until its write finishes, so the checkpoint must not publish
     /// the old snapshot over it. The generation bump is what the in-flight
     /// checkpoint observes, including when this datadir has no marker file yet.
-    /// A failed commit patch still lowers both. The tip is already durable,
-    /// and the patch error is returned after that.
+    /// The spend delta is left alone: its checkpoint is the commit's only
+    /// writer, and readers already require a best-chain spender.
     pub fn clamp_spend_durable(&self) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         self.spend_reorg_gen.fetch_add(1, Ordering::AcqRel);
-        let tip_now = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
-        let hold = self.txs.hold_spend_fold_above(tip_now);
         let _ = self
             .spend_snapshot
             .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
@@ -2369,8 +2235,7 @@ impl Store {
                     .map_or(0, |h| cur.min(u64::from(h.0) + 1));
                 (low != cur).then_some(low)
             });
-        self.clamp_spend_marker()?;
-        hold
+        self.clamp_spend_marker()
     }
 
     /// Write the spend marker down to the confirmed tip.
@@ -2500,7 +2365,13 @@ fn file_has_payload(path: &Path, kind: rbitcoin_primitives::TableKind, header: u
     if !path.is_file() {
         return false;
     }
-    match crate::file::TableFile::open(path, kind) {
+    // `spent.body` is sparse: its header names an end the file need not reach.
+    let file = if kind == rbitcoin_primitives::TableKind::Spent {
+        crate::file::TableFile::open_sparse(path, kind)
+    } else {
+        crate::file::TableFile::open(path, kind)
+    };
+    match file {
         Ok(file) => file.logical_len() > header,
         Err(_) => unreadable_body_has_payload(path, header),
     }

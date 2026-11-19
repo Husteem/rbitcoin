@@ -164,9 +164,7 @@ fn put_full_batch_from_pins_roundtrip() {
     let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
-    let (fks, loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, SpentBodyImage::zeros(&[1]))
-        .unwrap();
+    let (fks, loc) = t.put_full_batch_from_pins(&[(pin, ins)], true).unwrap();
     assert_eq!(loc.len(), 1);
     assert_eq!(loc[0].txout, t.body_range(fks[0]).unwrap());
     assert_eq!(loc[0].spent, t.spent_range(fks[0]).unwrap());
@@ -613,76 +611,13 @@ fn put_full_batch_roundtrips_one_output() {
     let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
-    let (fks, _loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, SpentBodyImage::zeros(&[1]))
-        .unwrap();
+    let (fks, _loc) = t.put_full_batch_from_pins(&[(pin, ins)], true).unwrap();
     assert_eq!(fks.len(), 1);
     let (tx, got_ins, got_outs) = t.get_full(fks[0]).unwrap();
     assert_eq!(tx.output_count, 1);
     assert_eq!(got_ins.len(), 1);
     assert_eq!(got_outs[0].value, 7);
     assert_eq!(got_outs[0].script, vec![0x51]);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn put_full_batch_from_pins_same_batch_spent_slot() {
-    let dir = tempfile_dir("same-batch-spent");
-    let t = create_tiny(&dir);
-    let parent_tx = TxRecord {
-        txid: [1u8; 32],
-        version: 1,
-        locktime: 0,
-        input_count: 1,
-        output_count: 2,
-    };
-    let child_tx = TxRecord {
-        txid: [2u8; 32],
-        version: 1,
-        locktime: 0,
-        input_count: 1,
-        output_count: 1,
-    };
-    let parent_pin = std::sync::Arc::new((
-        parent_tx,
-        vec![
-            OutputRecord::unspent(7, vec![0x51]),
-            OutputRecord::unspent(8, vec![0x52]),
-        ],
-    ));
-    let child_pin = std::sync::Arc::new((child_tx, vec![OutputRecord::unspent(5, vec![0x51])]));
-    let parent_ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
-    let child_ins = vec![InputRecord {
-        prev_txid: [1u8; 32],
-        parent: InputParent::Prevout {
-            create_fk: Fk(1),
-            vout: 0,
-        },
-        sequence: u32::MAX,
-        script_sig: vec![0x01],
-        witness: vec![],
-    }];
-    let overlay = SpentBodyImage::from_pairs(&[2, 1], &[vec![(0u32, Fk(2), 0)], vec![]]).unwrap();
-    let (fks, loc) = t
-        .put_full_batch_from_pins(
-            &[(parent_pin, parent_ins), (child_pin, child_ins)],
-            false,
-            overlay,
-        )
-        .unwrap();
-    assert_eq!(fks, vec![Fk(1), Fk(2)]);
-    assert_eq!(loc[0].spent, t.spent_range(fks[0]).unwrap());
-    assert_eq!(loc[0].n_out, 2);
-    let (off, _len) = t.spent_range(fks[0]).unwrap();
-    let abs0 = spent_abs(off, 0);
-    let abs1 = spent_abs(off, 1);
-    let bulk = t.get_spender_meta_at_abs_batch(&[abs0, abs1]).unwrap();
-    assert_eq!(bulk[0].unwrap().0, Fk(2));
-    assert!(bulk[1].unwrap().0.is_null());
-    let (coff, _) = t.spent_range(fks[1]).unwrap();
-    let cabs = spent_abs(coff, 0);
-    let cbulk = t.get_spender_meta_at_abs_batch(&[cabs]).unwrap();
-    assert!(cbulk[0].unwrap().0.is_null());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2493,85 +2428,6 @@ fn put_spends_on_create_at_batch_patches_all_vouts() {
     assert!(!m2 && f2 == s2 && v2 == 5);
     let (m1, f1, v1) = t.get_output_spender_meta_at(off, len, 1).unwrap();
     assert!(!m1 && f1.is_null() && v1 == 0);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn pwrite_spend_batch_records_sole_multi_and_cold() {
-    let dir = tempfile_dir("pwrite-spend");
-    let t = create_tiny(&dir);
-    let spenders = rbitcoin_store::spender_table::SpenderTable::create(&dir).unwrap();
-    let empty = t
-        .put_spend_batch_by_abs_meta_pwrite(&spenders, &[])
-        .unwrap();
-    assert!(empty.is_empty());
-
-    let tx = TxRecord {
-        txid: [0xee; 32],
-        version: 1,
-        locktime: 0,
-        input_count: 1,
-        output_count: 1,
-    };
-    let inputs = vec![InputRecord {
-        prev_txid: [0u8; 32],
-        parent: InputParent::Coinbase,
-        sequence: u32::MAX,
-        script_sig: vec![0x01],
-        witness: vec![],
-    }];
-    let outputs = vec![OutputRecord::unspent(1, vec![0x51])];
-    let fks = t
-        .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
-        .unwrap();
-    let create = fks[0];
-    let (off, len) = t.spent_range(create).unwrap();
-    let abs = spent_abs(off, 0);
-    let s1 = Fk(10);
-    let sole = [(abs, create, 0u32, s1, 3u32)];
-    assert!(t
-        .put_spend_batch_by_abs_meta_pwrite(&spenders, &sole)
-        .unwrap()
-        .is_empty());
-    let (multi, field, vin) = t.get_output_spender_meta_at(off, len, 0).unwrap();
-    assert!(!multi && field == s1 && vin == 3);
-    assert_eq!(spenders.count(), 0);
-
-    assert!(t
-        .put_spend_batch_by_abs_meta_pwrite(&spenders, &sole)
-        .unwrap()
-        .is_empty());
-    let (multi, field, vin) = t.get_output_spender_meta_at(off, len, 0).unwrap();
-    assert!(!multi && field == s1 && vin == 3);
-    assert_eq!(spenders.count(), 0);
-
-    let s2 = Fk(20);
-    let second = [(abs, create, 0u32, s2, 1u32)];
-    assert!(t
-        .put_spend_batch_by_abs_meta_pwrite(&spenders, &second)
-        .unwrap()
-        .is_empty());
-    let (multi, head, vin) = t.get_output_spender_meta_at(off, len, 0).unwrap();
-    assert!(multi && vin == 0);
-    let (tx2, vin2, next) = spenders.get(head).unwrap();
-    assert_eq!((tx2, vin2), (s2, 1));
-    let (tx1, vin1, end) = spenders.get(next).unwrap();
-    assert_eq!((tx1, vin1, end), (s1, 3, Fk::NULL));
-    assert_eq!(spenders.count(), 2);
-
-    let past = t.spent.body_published_len();
-    let cold_edge = (create, 0u32, Fk(30), 0u32);
-    assert_eq!(
-        t.put_spend_batch_by_abs_meta_pwrite(
-            &spenders,
-            &[(past, cold_edge.0, cold_edge.1, cold_edge.2, cold_edge.3)]
-        )
-        .unwrap(),
-        vec![cold_edge]
-    );
-    let (multi_after, head_after, vin_after) = t.get_output_spender_meta_at(off, len, 0).unwrap();
-    assert_eq!((multi_after, head_after, vin_after), (multi, head, vin));
-    assert_eq!(spenders.count(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4869,42 +4725,6 @@ fn spent_body_image_starts_follow_an_aligned_cursor() {
 }
 
 #[test]
-fn spent_body_image_keeps_the_lower_fk() {
-    let mut image = SpentBodyImage::zeros(&[2, 1]);
-    assert_eq!(image.offs(), &[0, 16, 24]);
-    assert_eq!(image.bytes().len(), 24);
-    assert!(image.bytes().iter().all(|&b| b == 0));
-
-    image.place(0, 1, Fk(9), 3).unwrap();
-    let want = encode_spent_slot(0, Fk(9), 3).unwrap();
-    assert_eq!(&image.bytes()[8..16], &want);
-    assert!(image.bytes()[0..8].iter().all(|&b| b == 0));
-    assert!(image.bytes()[16..24].iter().all(|&b| b == 0));
-
-    let before = image.bytes().to_vec();
-    image.place(0, 1, Fk(4), 1).unwrap();
-    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
-    assert_eq!((fk, vin), (Fk(4), 1));
-    image.place(0, 1, Fk(8), 7).unwrap();
-    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
-    assert_eq!((fk, vin), (Fk(4), 1), "higher fk must not replace");
-    image.place(0, 1, Fk(4), 2).unwrap();
-    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
-    assert_eq!((fk, vin), (Fk(4), 1), "equal fk keeps the first vin");
-
-    let snap = image.bytes().to_vec();
-    match image.place(0, 2, Fk(1), 0) {
-        Err(StoreError::Corrupt(m)) => assert!(m.contains("vout"), "{m}"),
-        other => panic!("expected Corrupt vout, got {other:?}"),
-    }
-    assert!(image.place(0, 1, Fk(1u64 << 40), 0).is_err());
-    assert!(image.place(0, 1, Fk(1), 1u32 << 16).is_err());
-    assert!(image.place(2, 0, Fk(1), 0).is_err());
-    assert_eq!(image.bytes(), &snap);
-    assert_ne!(before, snap);
-}
-
-#[test]
 fn spent_span_matches_slot_len_times_n_out() {
     for n_out in [0u32, 1, 4, 500] {
         let mut buf = Vec::new();
@@ -4922,31 +4742,45 @@ fn spent_span_matches_slot_len_times_n_out() {
     }
 }
 
+/// Slot reads of an adopted `spent.body` that need more peeks than one
+/// ring holds still land each slot. Each tx's spend range is over 64 KiB,
+/// so its two slots never merge with the next tx's.
 #[test]
 fn spend_meta_batch_reads_merged_slots_past_one_ring() {
     let dir = tempfile_dir("spend-merge");
     let t = create_tiny(&dir);
-    let header = rbitcoin_store::file::FILE_HEADER_LEN as u64;
     let groups = rbitcoin_store::uring_session::DEFAULT_ENTRIES as usize + 2;
-    let gap = 64 * 1024 + 128;
-    let mut offs = Vec::with_capacity(groups * 2 + 2);
-    let mut expect: Vec<Option<(Fk, u8, u32)>> = Vec::with_capacity(groups * 2 + 2);
-    let mut file_end = header;
+    let n_out = 8_250u32;
+    let mut slots = Vec::with_capacity(groups * 2);
     for i in 0..groups {
-        let off0 = header + (i as u64) * gap;
-        let off1 = off0 + 16;
-        let a = encode_spent_slot(0, Fk(i as u64 + 1), 1).unwrap();
-        let b = encode_spent_slot(0, Fk(10_000 + i as u64), 2).unwrap();
-        t.spent.write_body_abs(off0, &a).unwrap();
-        t.spent.write_body_abs(off1, &b).unwrap();
-        file_end = off1 + OutputRecord::SPENT_SLOT_LEN as u64;
-        offs.push(off1);
-        expect.push(Some((Fk(10_000 + i as u64), 0, 2)));
-        offs.push(off0);
-        expect.push(Some((Fk(i as u64 + 1), 0, 1)));
+        let mut txid = [0x5au8; 32];
+        txid[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        let tx = TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: n_out,
+        };
+        let inputs = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
+        let outputs = vec![OutputRecord::unspent(50, vec![0x51]); n_out as usize];
+        let fk = t
+            .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
+            .unwrap()[0];
+        let (off, _) = t.spent_range(fk).unwrap();
+        slots.push((spent_abs(off, 2), Fk(10_000 + i as u64), 2u32));
+        slots.push((spent_abs(off, 0), Fk(i as u64 + 1), 1u32));
     }
-    t.spent.truncate_body_to(0, file_end).unwrap();
-    offs.push(file_end);
+    for &(abs, field, vin) in &slots {
+        let meta = encode_spent_slot(0, field, vin).unwrap();
+        t.spent.write_body_abs(abs, &meta).unwrap();
+    }
+    let end = t.spent.body_published_len();
+    let t = reopen_as_older_schema(&dir, t);
+    let mut offs: Vec<u64> = slots.iter().map(|s| s.0).collect();
+    let mut expect: Vec<Option<(Fk, u8, u32)>> =
+        slots.iter().map(|&(_, f, v)| Some((f, 0, v))).collect();
+    offs.push(end);
     expect.push(None);
     offs.reverse();
     expect.reverse();
@@ -5333,4 +5167,114 @@ fn txid_pread_pairs_keep_the_written_id_and_reject_short() {
         Err(err) => panic!("{err}"),
         Ok(_) => panic!("a short txid body collected"),
     }
+}
+
+/// Class A writes no `spent.body` bytes: the file is not extended while
+/// its published end covers every create, and a reopen keeps every create.
+#[test]
+fn spent_body_is_not_extended_by_class_a() {
+    let dir = tempfile_dir("spent-sparse");
+    let outs = 4096usize;
+    let items: Vec<_> = (1..=40u8)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0] = i;
+            (
+                TxRecord {
+                    txid,
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: outs as u32,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![i], vec![])],
+                vec![OutputRecord::unspent(1, vec![0x51]); outs],
+            )
+        })
+        .collect();
+    {
+        let t = create_tiny(&dir);
+        t.put_full_batch_indexed(&items, true).unwrap();
+        t.flush().unwrap();
+        let published = t.spent.body_published_len();
+        assert!(published > (outs * 8 * 39) as u64);
+        let physical = std::fs::metadata(dir.join("spent.body")).unwrap().len();
+        assert!(
+            physical < published / 2,
+            "spent.body is {physical} bytes for a {published}-byte end"
+        );
+    }
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 40);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reopen with `spent.body` filled out to its published end and no
+/// `spent.delta/`, as a datadir from before schema 30.
+fn reopen_as_older_schema(dir: &Path, t: TxTable) -> TxTable {
+    let end = t.spent.body_published_len();
+    drop(t);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("spent.body"))
+        .unwrap();
+    if f.metadata().unwrap().len() < end {
+        f.set_len(end).unwrap();
+    }
+    std::fs::remove_dir_all(dir.join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR)).unwrap();
+    TxTable::open_tiny(dir).unwrap()
+}
+
+/// Write `spent.body` as an older schema's Class A did: every byte up to the
+/// published end, with one spend at `abs`, and no `spent.delta/`.
+#[cfg(unix)]
+fn as_an_older_schema_body(dir: &Path, t: TxTable, abs: u64, meta: [u8; 8]) {
+    let end = t.spent.body_published_len();
+    drop(t);
+    let path = dir.join("spent.body");
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(end).unwrap();
+    use std::os::unix::fs::FileExt;
+    f.write_all_at(&meta, abs).unwrap();
+    std::fs::remove_dir_all(dir.join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR)).unwrap();
+}
+
+/// A datadir from before schema 30 has a `spent.body` Class A filled and no
+/// spend delta. Open takes its pages as folded, so its spends read.
+#[cfg(unix)]
+#[test]
+fn an_older_schema_spent_body_is_adopted_at_open() {
+    let dir = tempfile_dir("spent-older-adopt");
+    let t = create_tiny(&dir);
+    let fks = t
+        .put_full_batch_indexed(&coinbase_batch(200), true)
+        .unwrap();
+    let (off, _) = t.spent_range(fks[150]).unwrap();
+    let meta = encode_spent_slot(0, Fk(7), 3).unwrap();
+    as_an_older_schema_body(&dir, t, off, meta);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    let (_, field, vin) = t.get_output_spender_meta(fks[150], 0).unwrap();
+    assert_eq!((field, vin), (Fk(7), 3));
+    drop(t);
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.get_output_spender_meta(fks[150], 0).unwrap().1, Fk(7));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A schema-30 store whose `spent.delta/` is gone refuses open: its spends
+/// were only there.
+#[test]
+fn a_populated_store_without_its_spend_delta_refuses_open() {
+    let dir = tempfile_dir("spent-delta-missing");
+    let t = create_tiny(&dir);
+    t.put_full_batch_indexed(&coinbase_batch(200), true)
+        .unwrap();
+    t.flush().unwrap();
+    drop(t);
+    std::fs::remove_dir_all(dir.join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR)).unwrap();
+    let err = TxTable::open_tiny(&dir)
+        .err()
+        .expect("a lost delta refuses");
+    assert!(err.to_string().contains("wipe datadir"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

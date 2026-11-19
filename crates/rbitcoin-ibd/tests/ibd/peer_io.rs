@@ -578,6 +578,39 @@ fn second_unsolicited_block_past_the_window_stops_the_reader() {
 }
 
 #[test]
+fn short_block_frames_score_like_other_frames() {
+    let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(1);
+    // One message per window: three frames reach the threshold without a wait.
+    ctx.rate = PeerRateLimiter::new(1, rbitcoin_net::peer_dos::DEFAULT_MAX_BYTES_PER_SEC);
+    let short = || framed(*b"block\0\0\0\0\0\0\0", vec![1, 2, 3]);
+    assert!(
+        !ctx.handle(Ok(short())),
+        "the first short block fits the window"
+    );
+    assert_eq!(ctx.ban_score, 0, "a frame inside the window scores nothing");
+    assert!(
+        !ctx.handle(Ok(short())),
+        "the first overflow stays connected"
+    );
+    assert_eq!(
+        ctx.ban_score, RATE_LIMIT_BAN_SCORE,
+        "a short block past the window scores like any other frame"
+    );
+    assert!(body_rx.try_recv().is_err(), "the first overflow stays");
+    assert!(
+        ctx.handle(Ok(short())),
+        "the next short block reaches the threshold"
+    );
+    match recv_body(&mut body_rx) {
+        PeerEvent::Dead { peer, reason } => {
+            assert_eq!(peer, 3);
+            assert_eq!(reason, "peer misbehavior threshold");
+        }
+        _ => panic!("short block frames must stop the reader"),
+    }
+}
+
+#[test]
 fn light_permit_exhaustion_scores_like_other_frames() {
     let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(0);
     let n = (rbitcoin_net::peer_dos::DEFAULT_MAX_BYTES_PER_SEC as usize) + 1;

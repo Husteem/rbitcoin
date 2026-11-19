@@ -218,6 +218,89 @@ fn sh_history_caps() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A newest-first page whose gap is wider than the 8064-block history window joins
+/// spend slots of every older create. That join is the unpaged cap: over
+/// `--max-sh-creates` it refuses, and with the cap off it still returns the
+/// spend of the create below the page bound. A gap inside the window still
+/// scans blocks and still serves the same spend above the cap.
+#[test]
+fn wide_gap_newest_page_obeys_create_cap() {
+    let (dir, q) = temp_query("sh-wide-gap-cap");
+    let sh = script_hash(&[0x51]);
+    let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
+    let create0_txid = cb0.tx.txid;
+    let prev = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let create0 = q.block_tx_fks(Height(0)).unwrap()[0];
+    let (h1, cb1) = coinbase_block(1, prev, Some(h0.hash));
+    let prev = q.connect_block(Height(1), &h1, &[cb1]).unwrap();
+    let (h2, cb2) = coinbase_block(2, prev, Some(h1.hash));
+    let mut spend = cb2.clone();
+    spend.tx.txid[31] = 0x5e;
+    spend.outputs = vec![OutputRecord::unspent(1, vec![0x54])];
+    spend.inputs = vec![InputRecord {
+        prev_txid: create0_txid,
+        parent: rbitcoin_store::InputParent::Prevout {
+            create_fk: create0,
+            vout: 0,
+        },
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    q.commit_class_a_only(&h2, &[cb2, spend]).unwrap();
+    q.confirm_block(Height(2), &h2.hash).unwrap();
+    let pending_only = script_hash(&[0x54]);
+    assert!(
+        q.pending_sh_create_fks(&pending_only).len() == 1,
+        "the pending output is not durable yet"
+    );
+    assert!(
+        q.scripthash_has_postings(&pending_only).unwrap(),
+        "a pending-only scripthash still has postings"
+    );
+    assert!(!q.scripthash_has_postings(&script_hash(&[0x00])).unwrap());
+    q.apply_sh_pending().unwrap();
+    assert!(q.scripthash_has_postings(&sh).unwrap());
+    assert_eq!(q.scripthash_create_count(&sh).unwrap(), 3);
+
+    let view = q.pin_sh_chain_view().unwrap().expect("sh view");
+    let members = q.strong_sh_creates(&sh, &view).unwrap();
+    let window = rbitcoin_query::scripthash::NewestWindow {
+        bound: Some(1),
+        creates: Vec::new(),
+    };
+    let spend_of_oldest = |hits: Vec<rbitcoin_query::scripthash::SpendHit>| {
+        hits.into_iter()
+            .any(|hit| hit.parent == create0 && hit.height == 2)
+    };
+
+    q.set_max_sh_creates(2);
+    match q.spends_for_newest_page(&sh, &members, &window, 8_066, &view) {
+        Err(err) => assert!(
+            err.to_string() == "scripthash join exceeds --max-sh-creates (3 creates, cap 2)",
+            "{err}"
+        ),
+        Ok(_) => panic!("a wide gap over the cap must refuse the join"),
+    }
+    let short = q
+        .spends_for_newest_page(&sh, &members, &window, 2, &view)
+        .expect("a gap inside the history window still scans");
+    assert!(
+        spend_of_oldest(short),
+        "the in-window scan still returns the spend above the cap"
+    );
+
+    q.set_max_sh_creates(0);
+    let open = q
+        .spends_for_newest_page(&sh, &members, &window, 8_066, &view)
+        .expect("cap 0 still joins the wide gap");
+    assert!(
+        spend_of_oldest(open),
+        "the wide gap returns the spend of the create below the page bound"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Newest-first pages stay on the page path above, at, and below the cap.
 /// Same-height order is txid, a sibling output's spend is not a row, and the
 /// page after the tip creates is the spend of an older coin.

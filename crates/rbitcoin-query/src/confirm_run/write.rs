@@ -2,6 +2,7 @@
 
 use super::phases::{class_c_commit, post_commit, structural_run};
 use super::*;
+use rbitcoin_primitives::Fk;
 use std::cell::RefCell;
 
 thread_local! {
@@ -167,12 +168,30 @@ pub fn finish_already_committed_write(
 #[doc(hidden)]
 pub struct ArchivePlanNs {
     pub pins: FkMap<crate::CreatePin>,
-    pub class_a_wave: crate::block_pipeline::ClassAWave,
     pub header_ranges: Vec<(rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)>,
     pub class_a_ns: u64,
     pub ensure_ns: u64,
     pub plan_take_ns: u64,
     pub create_map_ns: u64,
+    pub appended: Appended,
+}
+
+/// The rows this batch's Class A appended, with the ranges the append gave
+/// them. Their spent slots lie at or past the published end the batch
+/// started from, which only moves back at open, so no note names them.
+#[derive(Debug, Default)]
+pub struct Appended {
+    /// The first appended row. Class A allocates the rest after it in order.
+    first: u64,
+    loc: Vec<rbitcoin_store::CreateLocPair>,
+}
+
+impl Appended {
+    /// `spent.body` range of `fk` when this batch appended it.
+    fn spent(&self, fk: rbitcoin_primitives::Fk) -> Option<(u64, u64)> {
+        let at = usize::try_from(fk.get()?.checked_sub(self.first)?).ok()?;
+        self.loc.get(at).map(|pair| pair.spent)
+    }
 }
 
 #[doc(hidden)]
@@ -182,12 +201,12 @@ pub fn apply_archive_plan(
 ) -> Result<ArchivePlanNs, ConfirmError> {
     let mut ns = ArchivePlanNs {
         pins: FkMap::default(),
-        class_a_wave: crate::block_pipeline::ClassAWave::default(),
         header_ranges: Vec::new(),
         class_a_ns: 0,
         ensure_ns: 0,
         plan_take_ns: 0,
         create_map_ns: 0,
+        appended: Appended::default(),
     };
     let Some(mut plan) = batch.archive_plan.take() else {
         return Ok(ns);
@@ -245,11 +264,10 @@ pub fn apply_archive_plan(
     if let Some(last) = batch.prepared.last() {
         query.set_class_a_hi(Some(last.height.0));
     }
-    // The overlay is proven only for rows this commit wrote. A plan trimmed
-    // at commit wrote fewer rows than `planned_fks` names.
-    if loc.len() == planned_fks.len() {
-        ns.class_a_wave = crate::block_pipeline::ClassAWave::new(planned_fks);
-    }
+    ns.appended = Appended {
+        first: planned_fks.first().and_then(|fk| fk.get()).unwrap_or(0),
+        loc,
+    };
     Ok(ns)
 }
 
@@ -330,12 +348,12 @@ fn write_phase_inner(
 
     let ArchivePlanNs {
         pins: write_create_pins,
-        class_a_wave,
         header_ranges,
         class_a_ns,
         mut ensure_ns,
         plan_take_ns,
         create_map_ns,
+        appended,
     } = apply_archive_plan(query, batch)?;
     let t_ens = Instant::now();
     let abs_jobs = match super::collect_spend_abs_after_fill(&batch.batch_parents, &batch.prepared)
@@ -383,17 +401,11 @@ fn write_phase_inner(
                 &batch.wire_blocks,
                 &batch.batch_parents,
                 &abs_jobs,
-                &class_a_wave,
                 &mut reuse.borrow_mut(),
             )
         })?;
         let structural_ns = t_struct.elapsed().as_nanos() as u64;
-        push_same_block_spends_of_archived_bodies(
-            query,
-            &batch.prepared,
-            &class_a_wave,
-            &mut slots,
-        )?;
+        push_same_block_spends(query, &batch.prepared, &appended, &mut slots)?;
 
         let n_blocks = batch.prepared.len();
         let pending_token = batch
@@ -632,6 +644,12 @@ pub const REPLAY_STATUS_MS: u64 = 10_000;
 /// Returns how many heights were rewritten. Call this on process open after
 /// tip-window revalidation.
 pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConfirmError> {
+    // Before any return: a crash can leave no block at all, and every delta
+    // spend is then above the tip.
+    query
+        .store()
+        .drop_spends_above_tip()
+        .map_err(ConfirmError::from)?;
     let Some(tip) = query.tip_height().map(|h| h.0) else {
         return Ok(0);
     };
@@ -643,9 +661,7 @@ pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConfirmError> {
         .store()
         .spend_annotated_through()
         .map_err(ConfirmError::from)?;
-    // The page-log commit can name a higher height than the marker, and its
-    // freeze tip can sit above both. Hold before replay folds that image.
-    if annotated.is_some_and(|h| h > tip) || query.store().spend_log_above(tip) {
+    if annotated.is_some_and(|h| h > tip) {
         query
             .store()
             .clamp_spend_durable()
@@ -855,33 +871,27 @@ pub fn annotate_slots_from_connected_hash(
     Ok(())
 }
 
-/// Annotate slots for the same-block spends of each block whose body this
-/// wave did not append.
+/// Annotate slots for the same-block spends of each block.
 ///
 /// Structural has no job for a parent earlier in the same block. Class A
-/// pre-fills that slot only when it appends the body, and a checkpoint after
-/// a disconnect may have zeroed that pre-fill. A block connected again from
-/// the archive writes it here, as open replay does from `input_edges`.
-fn push_same_block_spends_of_archived_bodies(
+/// writes no `spent.body` bytes, so the delta note this writes is the only
+/// record of that spend, as open replay writes it from `input_edges`.
+///
+/// A parent this batch appended takes its range from the append and an
+/// empty slot, reading nothing. A parent archived earlier (a reconnect)
+/// reads its range from `create.loc` and its slot, which may hold that
+/// block's note from when it was last connected.
+fn push_same_block_spends(
     query: &Query,
     prepared: &[Prepared],
-    class_a_wave: &crate::block_pipeline::ClassAWave,
+    appended: &Appended,
     slots: &mut crate::block_pipeline::AnnotateSlots,
 ) -> Result<(), ConfirmError> {
     if !query.spend_index_enabled() {
         return Ok(());
     }
-    let mut edges = Vec::new();
+    let mut archived = Vec::new();
     for p in prepared {
-        // Class A appends a body whole, and a trimmed plan leaves the wave
-        // empty, so the coinbase stands for the block.
-        let body_appended = p
-            .tx_fks
-            .first()
-            .is_some_and(|&fk| class_a_wave.contains(fk));
-        if body_appended {
-            continue;
-        }
         if !p
             .spends
             .iter()
@@ -902,32 +912,30 @@ fn push_same_block_spends_of_archived_bodies(
                 .ok_or(ConfirmError::Store(StoreError::Corrupt(
                     "invariant: same-block spend parent not in its block",
                 )))?;
-            edges.push((parent, vout, spend_fk, vin));
+            match appended.spent(parent) {
+                Some(range) => {
+                    let abs = same_block_slot(range, vout)?;
+                    slots.push((abs, parent, vout, spend_fk, vin), (Fk::NULL, 0, 0));
+                }
+                None => archived.push((parent, vout, spend_fk, vin)),
+            }
         }
     }
-    if edges.is_empty() {
+    if archived.is_empty() {
         return Ok(());
     }
     let t_meta = Instant::now();
-    let parents: Vec<rbitcoin_primitives::Fk> = edges.iter().map(|e| e.0).collect();
+    let parents: Vec<Fk> = archived.iter().map(|e| e.0).collect();
     let ranges = query
         .store()
         .tx_spent_range_batch(&parents)
         .map_err(ConfirmError::from)?;
-    let mut offs = Vec::with_capacity(edges.len());
-    for (&(_, vout, _, _), range) in edges.iter().zip(ranges) {
-        let (off, len) = range.ok_or(ConfirmError::Store(StoreError::Corrupt(
+    let mut offs = Vec::with_capacity(archived.len());
+    for (&(_, vout, _, _), range) in archived.iter().zip(ranges) {
+        let range = range.ok_or(ConfirmError::Store(StoreError::Corrupt(
             "invariant: same-block spend parent without spent range",
         )))?;
-        let abs = rbitcoin_store::spent_abs(off, vout);
-        if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
-            > off.saturating_add(len)
-        {
-            return Err(ConfirmError::Store(StoreError::Corrupt(
-                "invariant: same-block spent slot OOB",
-            )));
-        }
-        offs.push(abs);
+        offs.push(same_block_slot(range, vout)?);
     }
     let metas = query
         .store()
@@ -936,13 +944,26 @@ fn push_same_block_spends_of_archived_bodies(
     let meta_ns = t_meta.elapsed().as_nanos() as u64;
     crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
     crate::note_confirm(&query.confirm_stats().spend_meta_n, offs.len() as u64);
-    for (((parent, vout, spend_fk, vin), abs), meta) in edges.into_iter().zip(offs).zip(metas) {
+    for (((parent, vout, spend_fk, vin), abs), meta) in archived.into_iter().zip(offs).zip(metas) {
         let known = meta.ok_or(ConfirmError::Store(StoreError::Corrupt(
             "invariant: same-block spent slot short, undecodable, or past the published body",
         )))?;
         slots.push((abs, parent, vout, spend_fk, vin), known);
     }
     Ok(())
+}
+
+/// Absolute slot of `vout` in a parent's `spent.body` range.
+fn same_block_slot((off, len): (u64, u64), vout: u32) -> Result<u64, ConfirmError> {
+    let abs = rbitcoin_store::spent_abs(off, vout);
+    if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
+        > off.saturating_add(len)
+    {
+        return Err(ConfirmError::Store(StoreError::Corrupt(
+            "invariant: same-block spent slot OOB",
+        )));
+    }
+    Ok(abs)
 }
 
 /// After Class A commit, stamp spend creates from append RAM loc

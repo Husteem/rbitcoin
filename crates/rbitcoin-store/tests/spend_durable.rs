@@ -100,12 +100,12 @@ fn clamp_drops_a_stale_height() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The tip is already flushed when the commit patch fails. The marker still
-/// has to drop, or a later block passes the old height and replay skips it.
+/// A disconnect lowers the marker and the snapshot and leaves the spend
+/// delta commit alone: the checkpoint is that file's only writer, so a clamp
+/// cannot rename an older commit over a newer one.
 #[test]
-fn clamp_lowers_the_marker_when_the_hold_patch_fails() {
+fn clamp_lowers_the_marker_and_leaves_the_delta_commit() {
     use rbitcoin_primitives::{Fk, Height};
-    use rbitcoin_store::spend_page_log::SPEND_PAGES_COMMIT_NAME;
     use rbitcoin_store::Store;
 
     let dir = std::env::temp_dir().join(format!(
@@ -142,7 +142,9 @@ fn clamp_lowers_the_marker_when_the_hold_patch_fails() {
     }
     s.note_spend_snapshot(4);
     s.checkpoint_spend_through(4).unwrap();
-    let commit = dir.join(SPEND_PAGES_COMMIT_NAME);
+    let commit = dir
+        .join(rbitcoin_store::spend_delta::SPEND_DELTA_DIR)
+        .join(rbitcoin_store::spend_delta::SPEND_DELTA_COMMIT_NAME);
     assert!(commit.is_file(), "the checkpoint must leave a commit file");
     for h in (1..=4u32).rev() {
         s.confirmed
@@ -150,24 +152,12 @@ fn clamp_lowers_the_marker_when_the_hold_patch_fails() {
             .unwrap();
     }
     assert_eq!(s.tip_height().map(|h| h.0), Some(0));
-    std::fs::remove_file(&commit).unwrap();
-    std::fs::create_dir(&commit).unwrap();
-    let err = s.clamp_spend_durable().unwrap_err();
-    assert!(
-        matches!(err, rbitcoin_store::error::StoreError::Io { .. }),
-        "the failed commit patch must still surface, got {err:?}"
-    );
+    let before = std::fs::read(&commit).unwrap();
+    s.clamp_spend_durable().unwrap();
+    assert_eq!(std::fs::read(&commit).unwrap(), before);
     let m = SpendDurable::load(s.path()).unwrap().unwrap();
-    assert_eq!(
-        (m.annotated_through(), m.durable_through()),
-        (0, 0),
-        "a failed hold patch must still lower the marker"
-    );
-    assert_eq!(
-        s.spend_snapshot_height(),
-        Some(0),
-        "a failed hold patch must still lower the snapshot"
-    );
+    assert_eq!((m.annotated_through(), m.durable_through()), (0, 0));
+    assert_eq!(s.spend_snapshot_height(), Some(0));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

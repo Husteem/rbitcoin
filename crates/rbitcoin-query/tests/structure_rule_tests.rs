@@ -11,8 +11,8 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::confirm_error::ConfirmError;
 
 use rbitcoin_query::block_pipeline::{
-    assemble_block_prevouts, structural_validate_spends, AsmPrevoutAcc, ClassAWave,
-    RunCreateHeight, StructuralScratch,
+    assemble_block_prevouts, structural_validate_spends, AsmPrevoutAcc, RunCreateHeight,
+    StructuralScratch,
 };
 
 use bitcoin::block::{Header, Version};
@@ -403,7 +403,6 @@ fn bip30_queries_the_given_txids() {
             &parents,
             &mut rbitcoin_query::U32Map::default(),
             &RunCreateHeight::Spans(Vec::new()),
-            &ClassAWave::default(),
             &mut StructuralScratch::default(),
             &abs_jobs,
             None,
@@ -447,7 +446,6 @@ fn rejects_unspent_overwrite(q: &rbitcoin_query::Query, first: &Transaction) {
             &parents,
             &mut U32Map::default(),
             &heights,
-            &ClassAWave::default(),
             &mut StructuralScratch::default(),
             &abs_jobs,
             None,
@@ -582,7 +580,6 @@ fn bip30_message_at_mainnet_above_bip34(
         &parents,
         &mut U32Map::default(),
         &heights,
-        &ClassAWave::default(),
         &mut StructuralScratch::default(),
         &abs_jobs,
         q.confirmed_bip34_ancestor(main.btc.bip34_height),
@@ -2696,7 +2693,6 @@ fn bip30_ignores_unspendable_outputs() {
             &parents,
             &mut mtp_cache,
             &RunCreateHeight::Spans(Vec::new()),
-            &ClassAWave::default(),
             &mut StructuralScratch::default(),
             &abs_jobs,
             None,

@@ -70,9 +70,74 @@ counts, ingest OA, and refuse lines: [`SCHEMA.md`](../../SCHEMA.md) and
 [Schema upgrade](#schema-upgrade). Working-set sizes: SCHEMA census and
 [`docs/ibd-memory.md`](../ibd-memory.md).
 
+## Spend delta size
+
+Schema 30 records every spend in `store/spent.delta/`, in 16 MiB
+segments. Class A writes no `spent.body` bytes, so `spent.body` is a sparse
+file: it holds only the pages a fold wrote, and `du` shows less than its
+length. Each checkpoint reclaims segments with the smallest live byte
+share while that share is under a threshold of twice the delta's share of
+`spent.body`, and never under 5%: a delta at 10% of `spent.body` takes
+segments under 20% live, one at 25% those under half, and past 50% any
+segment. It never goes below two segments, and reclaims at most twice the
+larger of the checkpoint's own record bytes and one 16 MiB segment, so a
+delta above the threshold drains. A
+record in a reclaimed segment is folded into `spent.body` once its spends
+cover half the slots its page still has unset, so a page folds again each
+time half of what is left gets spent; another record is copied forward to
+the newest segment, which costs far less than writing a whole page. Past
+50% every record folds. A page a checkpoint touches folds right away when
+its committed record already spends half its unset slots, so a hot page
+costs one page write instead of a rewrite of its whole record every
+checkpoint. The decision reads no page: the directory holds each page's
+count of filled `spent.body` slots, which only a fold changes. A fold onto
+a page `spent.body` already holds, adopted from an older schema or folded
+before, also writes it to `spent.delta/fold` first; one onto a page nothing
+wrote goes straight to `spent.body`. Folds run in rounds of 4,096 pages and wait for the durable spend
+marker. The directory is a base of 12 bytes per body page plus a log of 16
+bytes per entry a checkpoint writes; once the log outgrows the base, a
+checkpoint writes a new base. It costs 8 bytes per page in RAM (about 50 MB
+for a 25 GB `spent.body`). A checkpoint runs every 10 minutes, or as soon as
+2,000,000 slot notes are open.
+
+Every checkpoint logs two lines:
+
+```text
+store: spend delta gen=… new_record_bytes=… dense_record_bytes=… folded_segments=… carried=… carried_bytes=… durable=… folds_through=… reclaim_below_permille=… segments=… bytes=… live=… spent_body=… written=… records=… idx=… folded=… fold_records=… written_per_body_permille=…
+store: spend delta gen=… timing total_ms=… since_ms=… sealed_pages=… sealed_edges=… merge_reads=… merge_read_bytes=… merge_ms=… hot_folds=… hot_fold_record_bytes=… dense_kept_gen=… dense_kept_tail=… reclaim_read_bytes=… reclaim_read_ms=… folded_now=… dropped=… fold_rounds=… fold_compose_ms=… fold_file_ms=… body_write_ms=… body_sync_ms=… record_bytes=… seg_write_ms=… seg_sync_ms=… idx_entries=… idx_write_ms=… idx_sync_ms=… commit_ms=… install_ms=… unlink_ms=…
+```
+
+`bytes` is the delta on disk and `spent_body` the published `spent.body` length.
+`dense_record_bytes` is the part of `new_record_bytes` for pages whose delta already
+spends half their unset slots, rewritten whole because they are still hot.
+`reclaim_below_permille` is the live share, in thousandths, under which a
+segment is reclaimed at the delta's current size (1000 or more: any). `carried` and `carried_bytes` are
+the records this checkpoint copied forward; they count in `records`.
+`written` is every byte written for historical spend tracking since the
+datadir was created (record bytes, directory bytes, and the composed pages a
+fold wrote, to `spent.body` and, for a page a fold already wrote, to `spent.delta/fold` first), and `written_per_body_permille` is that total per thousand
+bytes of `spent.body`. Open logs the same totals once.
+
+The `timing` line is one checkpoint: `since_ms` since the previous one
+started, the sealed pages and slot notes, the preads and bytes that read back
+the committed records they merge into (records touching in a segment
+share one pread), `hot_folds` (touched pages folded) and `hot_fold_record_bytes`
+(what rewriting those records would have written), the dense touched pages
+kept because their segment is newer than the durable marker
+(`dense_kept_gen`) or they reach the body's end (`dense_kept_tail`), the
+bytes reclaim read from victim segments, the reclaim folds (`folded_now`),
+records dropped because this checkpoint rewrites their page, and the
+milliseconds of each step: composing folds, the `fold` file, the
+`spent.body` writes and sync, the segment writes and sync, the directory
+write and sync, the commit rename, installing in RAM, and unlinking.
+`spend_room_wait_ms` on the `ibd: perf` line is the time confirm waited at
+the 2,000,000-note cap for a checkpoint to start. After 60 failed checkpoints
+in a row (the sync thread retries about once a second at the cap), that wait
+returns a store error and confirm stops instead of stalling.
+
 ## Schema upgrade
 
-Live bytes: [`SCHEMA.md`](../../SCHEMA.md) (`SCHEMA_VERSION = 29`). This section is
+Live bytes: [`SCHEMA.md`](../../SCHEMA.md) (`SCHEMA_VERSION = 30`). This section is
 the operator copy-paste only — do not treat it as a second layout map.
 
 Open **never silently wipes** a populated store (policy:
@@ -82,15 +147,16 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **29** | Open. Each historical spend page stays in the generation file that holds it until fold. |
-| **28** | Rewrite `meta` to 29 and sync the store directory. No table rewrite. A schema-28 binary then refuses the directory. |
-| **27** | Rewrite `meta` to 29 and sync the store directory. No table rewrite. A schema-27 binary then refuses the directory. |
-| **26** | Rewrite `meta` to 29 and sync the store directory. No table rewrite. A 0.9.0 binary then refuses the directory. |
-| **25** | If `header.body` is still 96 B, rewrite each row to 88 B (`header.body.grow`, then rename), dropping trailing size and weight. An 88 B body is left alone. Then rewrite `meta` to 29. |
-| **24** | Same header shrink as 25. Zero-extend `txstat.body` to the `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. Rewrite `meta` to 29. |
-| **23** | Headers stay 88 B. Rewrite `meta` to 29. `txstat.body` is created and aligned to the loc count when it is missing or short. |
+| **30** | Open. `spent.delta/` records every spend; `spent.body` holds only folded pages. A datadir from an earlier build of schema 30 refuses with a wipe line. |
+| **29** | Rewrite `meta` to 30, read `spent.body` once to take its pages as folded, publish them with a committed `spend.pages` log as the first spend delta generation, and remove the 29 files. `spent.body` is not written. No Class A rewrite. |
+| **28** | Rewrite `meta` to 30 and sync the store directory, then read `spent.body` once to take its pages as folded, publish them with a committed `spend.pages` log, if any, as the first spend delta generation, and remove the 28 files. No table rewrite. A schema-28 binary then refuses the directory. |
+| **27** | Rewrite `meta` to 30 and sync the store directory, then read `spent.body` once to take its pages as folded spend delta pages. No table rewrite. A schema-27 binary then refuses the directory. |
+| **26** | Rewrite `meta` to 30 and sync the store directory, then read `spent.body` once to take its pages as folded spend delta pages. No table rewrite. A 0.9.0 binary then refuses the directory. |
+| **25** | If `header.body` is still 96 B, rewrite each row to 88 B (`header.body.grow`, then rename), dropping trailing size and weight. An 88 B body is left alone. Then rewrite `meta` to 30. |
+| **24** | Same header shrink as 25. Zero-extend `txstat.body` to the `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. Rewrite `meta` to 30. |
+| **23** | Headers stay 88 B. Rewrite `meta` to 30. `txstat.body` is created and aligned to the loc count when it is missing or short. |
 | **22**, occupied Class A | Rewrite `create.loc.ovf` 12 B→16 B. Headers stay 88 B. Then the same `meta` rewrite and `txstat` align as 23. |
-| **22**, empty Class A | Rewrite `meta` to 29, then open. |
+| **22**, empty Class A | Rewrite `meta` to 30, then open. |
 | **Below 22**, empty or occupied | **Refuse.** One line: `schema before 22 refuses this datadir; wipe datadir and redo IBD`. Wipe the datadir and redo IBD. No per-version rewrite. |
 
 On every open of meta 22–25 the node also renames leftover `inwit.*` to `seqsigwit.*` and `inputs.*` to `input.*`. A missing `input.loc` with seqsigwit prevouts backfills parent edges. A crash during the 96 B→88 B rewrite leaves the old `meta`; the next open retries the shrink. Size and weight after that come from `txstat`.

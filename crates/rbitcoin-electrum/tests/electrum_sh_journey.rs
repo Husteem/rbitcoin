@@ -471,6 +471,42 @@ pub fn listunspent_skips_unused(q: &Arc<Query>, hub: &MempoolHub, spent_cb: &bit
     );
 }
 
+#[doc(hidden)]
+pub fn fee_histogram_is_sat_per_vbyte_by_bin(q: &Arc<Query>, hub: &MempoolHub) {
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let mut header_sub = false;
+    let mut sh_subs = HashSet::new();
+    let reply = dispatch(
+        "mempool.get_fee_histogram",
+        &json!([]),
+        q,
+        &cfg,
+        &params,
+        Some(hub),
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap();
+    let want = hub.fee_histogram();
+    assert!(
+        want.len() >= 2,
+        "need several bins so a running total differs from the bin sizes: {want:?}"
+    );
+    let rows = reply.as_array().expect("histogram array");
+    assert_eq!(rows.len(), want.len(), "{reply}");
+    for (row, (rate_kvb, vsize)) in rows.iter().zip(want) {
+        let rate = row[0].as_f64().expect("rate is a number");
+        let expect = (rate_kvb as f64) / 1000.0;
+        assert!((rate - expect).abs() < 1e-9, "{row} vs {rate_kvb}");
+        assert_eq!(
+            row[1].as_u64(),
+            Some(vsize),
+            "each bin carries its own vsize: {row}"
+        );
+    }
+}
+
 pub async fn read_push(stream: &mut TcpStream) -> Value {
     let mut reader = BufReader::new(&mut *stream);
     let mut resp = String::new();
@@ -647,6 +683,103 @@ pub fn from_height_window_is_served_above_the_create_cap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `blockchain.scripthash.subscribe` keeps a hash only after its status is
+/// computed. A status that hits `--max-sh-creates` does not add the hash,
+/// and a hash already subscribed stays when a later status fails.
+#[test]
+fn refused_scripthash_subscribe_is_not_kept() {
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let sh = electrum_scripthash_hex(&[0x51]);
+    let sh_bytes = rbitcoin_primitives::parse_display_hash32(&sh).unwrap();
+    let quiet = electrum_scripthash_hex(&[0x00]);
+    let quiet_bytes = rbitcoin_primitives::parse_display_hash32(&quiet).unwrap();
+    let mut prev = Fk::NULL;
+    let mut parent = [0u8; 32];
+    for h in 0..3u32 {
+        let (fk, hash, _) = connect_script_block(&q, h, prev, parent, Vec::new());
+        prev = fk;
+        parent = hash;
+    }
+    assert!(q.scripthash_create_count(&sh_bytes).unwrap() > 2);
+
+    q.set_max_sh_creates(2);
+    let mut header_sub = false;
+    let mut sh_subs = HashSet::new();
+    let err = dispatch(
+        "blockchain.scripthash.subscribe",
+        &json!([sh]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("scripthash join exceeds --max-sh-creates"),
+        "{err}"
+    );
+    assert!(
+        sh_subs.is_empty(),
+        "a refused subscribe must not stay watched: {sh_subs:?}"
+    );
+
+    let quiet_status = dispatch(
+        "blockchain.scripthash.subscribe",
+        &json!([quiet]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .expect("an empty scripthash still subscribes under the cap");
+    assert!(quiet_status.is_null(), "{quiet_status}");
+    assert!(sh_subs.contains(&quiet_bytes));
+
+    q.set_max_sh_creates(0);
+    let status = dispatch(
+        "blockchain.scripthash.subscribe",
+        &json!([sh]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .expect("cap 0 serves the status");
+    assert!(status.is_string(), "{status}");
+    assert!(sh_subs.contains(&sh_bytes));
+    assert!(sh_subs.contains(&quiet_bytes));
+
+    q.set_max_sh_creates(2);
+    let again = dispatch(
+        "blockchain.scripthash.subscribe",
+        &json!([sh]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert!(
+        again.contains("scripthash join exceeds --max-sh-creates"),
+        "{again}"
+    );
+    assert!(
+        sh_subs.contains(&sh_bytes) && sh_subs.contains(&quiet_bytes),
+        "a later refused status leaves the subscriptions already held: {sh_subs:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A later spend of a different output of a payment is not this script's
 /// history. The output that does pay the script still is.
 #[test]
@@ -764,6 +897,7 @@ pub async fn electrum_sh_join() {
             .expect("accept spend");
     }
     listunspent_skips_unused(&q, &hub, &coinbase_txids[0]);
+    fee_histogram_is_sat_per_vbyte_by_bin(&q, &hub);
     tip_push_two_clients_and_late(Arc::clone(&q), Some(hub)).await;
     let _ = std::fs::remove_dir_all(&dir);
 }

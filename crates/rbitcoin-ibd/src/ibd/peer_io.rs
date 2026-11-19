@@ -955,7 +955,8 @@ impl IbdReadCtx {
                     "ibd: peer[{}] block frame without usable header hash",
                     self.id
                 );
-                false
+                // No header to hash, but the frame still costs the window.
+                self.score_overflow(frame.payload.len())
             }
         }
     }
