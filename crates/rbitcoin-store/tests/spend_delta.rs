@@ -746,6 +746,127 @@ fn freeze_releases_an_edge_cap_waiter() {
     .unwrap();
 }
 
+/// After a window that reached the cap, the next window's map takes the cap
+/// and a write phase's worth of notes past it (a full `writeq` of runs,
+/// about 450,000) without growing: `notes_ram=` holds still.
+#[test]
+fn a_window_after_the_cap_fills_past_it_without_growing() {
+    let d = dir();
+    let log = SpendPageLog::create(&d).unwrap();
+    let cap = rbitcoin_store::spend_delta::OPEN_EDGE_CAP;
+    let note = |from: u64, n: u64| {
+        let slots: Vec<(u64, [u8; 8])> = (from..from + n)
+            .map(|i| (16 + i * 56, (i + 1).to_le_bytes()))
+            .collect();
+        for batch in slots.chunks(8_000) {
+            log.note_slots(batch).unwrap();
+        }
+    };
+    note(0, cap);
+    commit(&log, 1, 0, |_| Ok(true));
+    let sized = log.stats().notes_bytes;
+    assert!(sized <= 72 << 20, "{sized}");
+    note(cap, cap + 450_000);
+    assert_eq!(log.stats().notes_bytes, sized);
+    assert_eq!(
+        log.slot(16 + 56 * cap).unwrap(),
+        Some((cap + 1).to_le_bytes())
+    );
+}
+
+/// A node at the tip notes a block or so a window: its notes stay small,
+/// not the size of a window at the cap.
+#[test]
+fn a_tip_window_keeps_a_small_map() {
+    let d = dir();
+    let log = SpendPageLog::create(&d).unwrap();
+    for (tip, from) in [(1u32, 0u64), (2, 5_000)] {
+        let slots: Vec<(u64, [u8; 8])> = (from..from + 5_000)
+            .map(|i| (16 + i * 4096, (i + 1).to_le_bytes()))
+            .collect();
+        log.note_slots(&slots).unwrap();
+        commit(&log, tip, 0, |_| Ok(true));
+        let ram = log.stats().notes_bytes;
+        assert!(ram <= 256 << 10, "{ram}");
+    }
+}
+
+/// Across two checkpoints that fail after their freeze, the newest note for
+/// a slot wins in every layer: a frozen note over the sealed one while the
+/// checkpoint runs and after it merges them, an open note over both. After
+/// a disconnect, a rejected note held only in the sealed notes becomes a
+/// zero, and that survives a reload.
+#[test]
+fn the_newest_note_wins_across_failed_checkpoints() {
+    let d = dir();
+    let log = SpendPageLog::create(&d).unwrap();
+    let (a, b) = (16u64, 4096 * 5 + 24);
+    let (x, y, z) = ([1u8; 8], [2u8; 8], [3u8; 8]);
+    let injected = || Err(rbitcoin_store::error::StoreError::Corrupt("injected"));
+    log.note_slots(&[(a, x), (b, x)]).unwrap();
+    let first = log.checkpoint(
+        |l| {
+            l.freeze_open(1, None::<fn(&[u8; 8]) -> _>)?;
+            injected()
+        },
+        &mut MemBody::new(0),
+        None,
+    );
+    assert!(first.is_err());
+    log.note_slots(&[(a, y)]).unwrap();
+    let second = log.checkpoint(
+        |l| {
+            l.freeze_open(2, None::<fn(&[u8; 8]) -> _>)?;
+            assert_eq!(l.slot(a).unwrap(), Some(y), "frozen over sealed");
+            injected()
+        },
+        &mut MemBody::new(0),
+        None,
+    );
+    assert!(second.is_err());
+    assert_eq!(log.slot(a).unwrap(), Some(y), "merged: frozen over sealed");
+    assert_eq!(log.slot(b).unwrap(), Some(x));
+    log.note_slots(&[(a, z)]).unwrap();
+    assert_eq!(log.slot(a).unwrap(), Some(z), "open over sealed");
+    commit(&log, 3, 0, |m| Ok(*m != x));
+    assert_eq!(log.slot(a).unwrap(), Some(z));
+    assert_eq!(log.slot(b).unwrap(), Some([0u8; 8]), "rejected sealed note");
+    drop(log);
+    let log = reload(&d, 1 << 20).unwrap();
+    assert_eq!(log.slot(a).unwrap(), Some(z));
+    assert_eq!(log.slot(b).unwrap(), Some([0u8; 8]));
+}
+
+/// A checkpoint that fails after its freeze holds the frozen notes sorted,
+/// about sixteen bytes a note, reads them, and a retry publishes them.
+#[test]
+fn a_failed_checkpoint_holds_its_notes_sorted() {
+    let d = dir();
+    let log = SpendPageLog::create(&d).unwrap();
+    let n = 100_000u64;
+    let slots: Vec<(u64, [u8; 8])> = (0..n)
+        .map(|i| (16 + i * 4096 * 3 + (i % 7) * 8, (i + 1).to_le_bytes()))
+        .collect();
+    log.note_slots(&slots).unwrap();
+    let failed = log.checkpoint(
+        |l| {
+            l.freeze_open(1, None::<fn(&[u8; 8]) -> _>)?;
+            Err(rbitcoin_store::error::StoreError::Corrupt("injected"))
+        },
+        &mut MemBody::new(0),
+        None,
+    );
+    assert!(failed.is_err());
+    let failed_ram = log.stats().notes_bytes;
+    let abs: Vec<u64> = slots.iter().map(|&(a, _)| a).collect();
+    let want: Vec<Option<[u8; 8]>> = slots.iter().map(|&(_, m)| Some(m)).collect();
+    assert_eq!(log.slots_at(&abs).unwrap(), want);
+    commit(&log, 2, 0, |_| Ok(true));
+    let held = failed_ram - log.stats().notes_bytes;
+    assert!(held >= 16 * n && held <= 20 * n, "{held}");
+    assert_eq!(log.slots_at(&abs).unwrap(), want);
+}
+
 /// A commit from an earlier schema-30 build refuses open with a wipe line
 /// instead of being read with this layout.
 #[test]

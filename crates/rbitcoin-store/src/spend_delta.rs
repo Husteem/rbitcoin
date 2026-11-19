@@ -36,11 +36,14 @@
 //! through `fold`; one onto a page no fold wrote goes straight to
 //! `spent.body`, since nothing reads it there until the commit.
 //!
-//! Confirm notes spend slots in RAM. A checkpoint publishes one generation:
+//! Confirm notes spend slots in RAM, in a hash map by slot index sized from
+//! the window before it, so a window at [`OPEN_EDGE_CAP`] never regrows its
+//! map. A checkpoint publishes one generation:
 //!
-//! 1. seal the open notes, under the exclusion confirm and disconnect take;
-//!    after a disconnect, a note whose spender left the best chain becomes
-//!    an explicit zero;
+//! 1. seal the open notes: under the exclusion confirm and disconnect take,
+//!    swap in a map allocated before it; after a disconnect, a note whose
+//!    spender left the best chain becomes an explicit zero. Then, outside
+//!    the exclusion, sort the frozen notes into slot order, 16 bytes a note;
 //! 2. merge each sealed page's notes over its committed record, folding
 //!    instead a committed record that already spends half its page's unset
 //!    slots, so the page's new record holds only the notes;
@@ -85,6 +88,7 @@ use crate::file::{
 use crate::tx_table::BODY_PAGE_SIZE;
 use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -115,6 +119,13 @@ pub fn log_name(id: u32) -> String {
 /// next confirm insert wait for it. The only early trigger: a record holds
 /// only its page's entries, so open pages cost what their edges cost.
 pub const OPEN_EDGE_CAP: u64 = 2_000_000;
+
+/// The most notes an open map is sized for: 2^22 buckets at hashbrown's 7/8
+/// load, 17 bytes a bucket (about 68 MiB). Confirm waits for room once per
+/// write phase, which can merge a full `writeq` of runs, each 8,000 inputs
+/// plus one block (about 450,000 notes past the cap at most), so a window
+/// that fills to the cap never regrows a map of this size.
+const OPEN_NOTES_ROOM: usize = (1 << 22) / 8 * 7;
 
 /// Checkpoints that fail in a row before a confirm waiting at
 /// [`OPEN_EDGE_CAP`] gives up with an error instead of parking: a disk that
@@ -212,6 +223,8 @@ pub struct SpendDeltaStats {
     pub segment_bytes: u64,
     /// Bytes of records an entry names.
     pub live_bytes: u64,
+    /// RAM the open, frozen and sealed notes allocate.
+    pub notes_bytes: u64,
 }
 
 impl SpendDeltaStats {
@@ -327,7 +340,185 @@ pub const SEGMENT_CAP_MAX: u64 = 2 << OFF_BITS;
 
 type Slot = [u8; SLOT];
 type PageSlots = BTreeMap<u16, Slot>;
-type Layer = HashMap<u64, PageSlots>;
+
+/// A note's key: the index of the slot holding byte `abs`, as
+/// [`page_of`] and [`rel_of`] place it.
+fn slot_key(abs: u64) -> u64 {
+    abs / SLOT as u64
+}
+
+fn key_page(key: u64) -> u64 {
+    key / SLOTS_PER_PAGE as u64 * PAGE
+}
+
+fn key_rel(key: u64) -> u16 {
+    (key % SLOTS_PER_PAGE as u64) as u16
+}
+
+/// Slot index to note, for the notes confirm adds between freezes.
+type OpenNotes = HashMap<u64, Slot, BuildHasherDefault<SlotKeyHasher>>;
+
+/// A map for the next window, sized from the `recent` notes the window
+/// ending now holds plus a quarter: a window at the cap gets
+/// [`OPEN_NOTES_ROOM`] and never regrows, one at the tip stays small.
+fn open_notes_after(recent: usize) -> OpenNotes {
+    let notes = recent.saturating_add(recent / 4).min(OPEN_NOTES_ROOM);
+    OpenNotes::with_capacity_and_hasher(notes, BuildHasherDefault::default())
+}
+
+/// What an [`OpenNotes`] allocates: its buckets and their control bytes.
+fn open_notes_bytes(m: &OpenNotes) -> u64 {
+    if m.capacity() == 0 {
+        return 0;
+    }
+    let buckets = (m.capacity() * 8 / 7).next_power_of_two() as u64;
+    buckets * (std::mem::size_of::<(u64, Slot)>() as u64 + 1) + 16
+}
+
+/// One multiply and a fold. Slot indexes sit far below 2^57, so an identity
+/// hash would leave hashbrown's 7-bit tag (the top bits) zero in every
+/// bucket and each probe would compare keys across its whole group. The
+/// bucket comes from the low bits, which a product alone takes only from
+/// the key's low bits: keys a power-of-two stride apart would share
+/// buckets, so the product's high half folds down.
+#[derive(Default, Clone, Copy)]
+struct SlotKeyHasher(u64);
+
+impl Hasher for SlotKeyHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64((self.0 << 8) | u64::from(b));
+        }
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        let h = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Frozen notes sorted by slot index, 16 bytes each, so a page's notes are
+/// one run in slot order. `dir[b]` is the first note at or past key-range
+/// bucket `b`: a lookup searches only its bucket.
+struct SealedNotes {
+    notes: Box<[(u64, Slot)]>,
+    dir: Box<[u32]>,
+    base: u64,
+    shift: u32,
+}
+
+impl SealedNotes {
+    /// `frozen` over `prior`, the notes a failed checkpoint left sealed.
+    fn seal(frozen: &OpenNotes, prior: Option<&SealedNotes>) -> Self {
+        let mut fresh: Vec<(u64, Slot)> = Vec::with_capacity(frozen.len());
+        fresh.extend(frozen.iter().map(|(&k, &m)| (k, m)));
+        fresh.sort_unstable_by_key(|&(k, _)| k);
+        let notes = match prior {
+            None => fresh,
+            Some(p) => newer_over(&p.notes, &fresh),
+        };
+        Self::index(notes.into_boxed_slice())
+    }
+
+    fn index(notes: Box<[(u64, Slot)]>) -> Self {
+        let (Some(&(base, _)), Some(&(last, _))) = (notes.first(), notes.last()) else {
+            return Self {
+                notes,
+                dir: Box::new([0]),
+                base: 0,
+                shift: 0,
+            };
+        };
+        let buckets = (notes.len().next_power_of_two() / 2).max(1) as u64;
+        let mut shift = 0;
+        while ((last - base) >> shift) + 1 > buckets {
+            shift += 1;
+        }
+        let n = ((last - base) >> shift) as usize + 1;
+        let mut dir = Vec::with_capacity(n + 1);
+        let mut i = 0usize;
+        for b in 0..=n {
+            while i < notes.len() && (((notes[i].0 - base) >> shift) as usize) < b {
+                i += 1;
+            }
+            dir.push(i as u32);
+        }
+        Self {
+            notes,
+            dir: dir.into_boxed_slice(),
+            base,
+            shift,
+        }
+    }
+
+    /// Index of the first note at or past `key`.
+    fn lower_bound(&self, key: u64) -> usize {
+        if key <= self.base {
+            return 0;
+        }
+        let b = ((key - self.base) >> self.shift) as usize;
+        if b + 1 >= self.dir.len() {
+            return self.notes.len();
+        }
+        let (lo, hi) = (self.dir[b] as usize, self.dir[b + 1] as usize);
+        lo + self.notes[lo..hi].partition_point(|&(k, _)| k < key)
+    }
+
+    fn get(&self, key: u64) -> Option<Slot> {
+        self.notes
+            .get(self.lower_bound(key))
+            .filter(|&&(k, _)| k == key)
+            .map(|&(_, m)| m)
+    }
+
+    fn has_page(&self, page_off: u64) -> bool {
+        let first = slot_key(page_off);
+        self.notes
+            .get(self.lower_bound(first))
+            .is_some_and(|&(k, _)| k < first + SLOTS_PER_PAGE as u64)
+    }
+
+    /// Each page's notes, pages ascending.
+    fn pages(&self) -> impl Iterator<Item = (u64, &[(u64, Slot)])> {
+        self.notes
+            .chunk_by(|a, b| key_page(a.0) == key_page(b.0))
+            .map(|run| (key_page(run[0].0), run))
+    }
+
+    fn len(&self) -> usize {
+        self.notes.len()
+    }
+
+    fn bytes(&self) -> u64 {
+        (std::mem::size_of_val(&*self.notes) + std::mem::size_of_val(&*self.dir)) as u64
+    }
+}
+
+/// Two sorted note runs as one; `newer` wins a key both hold.
+fn newer_over(older: &[(u64, Slot)], newer: &[(u64, Slot)]) -> Vec<(u64, Slot)> {
+    let mut out = Vec::with_capacity(older.len() + newer.len());
+    let (mut i, mut j) = (0, 0);
+    while i < older.len() && j < newer.len() {
+        let (o, n) = (older[i], newer[j]);
+        if o.0 < n.0 {
+            out.push(o);
+            i += 1;
+            continue;
+        }
+        out.push(n);
+        j += 1;
+        if o.0 == n.0 {
+            i += 1;
+        }
+    }
+    out.extend_from_slice(&older[i..]);
+    out.extend_from_slice(&newer[j..]);
+    out
+}
 
 /// `spend_durable` sync thread wakes on this.
 pub type SpendSyncWake = Arc<(Mutex<bool>, Condvar)>;
@@ -1076,20 +1267,46 @@ impl Seg {
 
 /// RAM state readers and confirm share. Never held across IO.
 struct Inner {
-    open: Layer,
-    sealed: Option<Arc<Layer>>,
+    open: OpenNotes,
+    /// The map the next freeze installs as `open`, allocated by the
+    /// checkpoint before it takes the exclusion the freeze runs under.
+    next_open: Option<OpenNotes>,
+    /// Open notes a freeze moved out, until its checkpoint sorts them into
+    /// `sealed`, outside this lock.
+    frozen: Option<Arc<OpenNotes>>,
+    sealed: Option<Arc<SealedNotes>>,
     /// Highest confirmed tip a freeze moved into `sealed`.
     sealed_tip: Option<u32>,
     directory: Vec<Placed>,
     segs: BTreeMap<u32, Seg>,
     commit: Commit,
-    open_edges: u64,
-    /// Notes in `sealed`. After a failed checkpoint they count toward
-    /// [`OPEN_EDGE_CAP`], so a retry that fails again releases no waiter.
-    sealed_edges: u64,
 }
 
 impl Inner {
+    /// Notes frozen or sealed. After a failed checkpoint they count toward
+    /// [`OPEN_EDGE_CAP`], so a retry that fails again releases no waiter.
+    fn held_notes(&self) -> u64 {
+        (self.frozen.as_ref().map_or(0, |f| f.len()) + self.sealed.as_ref().map_or(0, |s| s.len()))
+            as u64
+    }
+
+    fn notes_bytes(&self) -> u64 {
+        open_notes_bytes(&self.open)
+            + self.next_open.as_ref().map_or(0, open_notes_bytes)
+            + self.frozen.as_deref().map_or(0, open_notes_bytes)
+            + self.sealed.as_ref().map_or(0, |s| s.bytes())
+    }
+
+    /// Newest note for the slot at `abs`: open, then frozen, then sealed.
+    fn note_at(&self, abs: u64) -> Option<Slot> {
+        let key = slot_key(abs);
+        self.open
+            .get(&key)
+            .or_else(|| self.frozen.as_ref()?.get(&key))
+            .copied()
+            .or_else(|| self.sealed.as_ref()?.get(key))
+    }
+
     fn stats(&self) -> SpendDeltaStats {
         SpendDeltaStats {
             record_bytes: self.commit.record_bytes,
@@ -1099,6 +1316,7 @@ impl Inner {
             segments: self.segs.len() as u64,
             segment_bytes: self.segs.values().map(|s| s.size).sum(),
             live_bytes: self.segs.values().map(|s| s.live_bytes).sum(),
+            notes_bytes: self.notes_bytes(),
         }
     }
 
@@ -1205,7 +1423,7 @@ impl SpendPageLog {
         log.clip(body, body_end)?;
         let s = log.stats();
         rbitcoin_log::info!(
-            "store: spend delta open segments={} bytes={} live={} spent_body={} written={} records={} idx={} folded={} fold_records={}",
+            "store: spend delta open segments={} bytes={} live={} spent_body={} written={} records={} idx={} folded={} fold_records={} notes_ram={}",
             s.segments,
             s.segment_bytes,
             s.live_bytes,
@@ -1214,7 +1432,8 @@ impl SpendPageLog {
             s.record_bytes,
             s.idx_bytes,
             s.fold_bytes,
-            s.fold_records
+            s.fold_records,
+            s.notes_bytes
         );
         Ok(log)
     }
@@ -1288,14 +1507,14 @@ impl SpendPageLog {
                 dir_unsynced: false,
             }),
             inner: Mutex::new(Inner {
-                open: HashMap::new(),
+                open: open_notes_after(0),
+                next_open: None,
+                frozen: None,
                 sealed: None,
                 sealed_tip: None,
                 directory,
                 segs,
                 commit,
-                open_edges: 0,
-                sealed_edges: 0,
             }),
             pace: Pace::new(),
         }
@@ -1336,8 +1555,8 @@ impl SpendPageLog {
 
     fn at_edge_cap(&self, g: &Inner) -> bool {
         let failed = self.pace.failures.load(Ordering::Acquire) > 0;
-        let held = if failed { g.sealed_edges } else { 0 };
-        g.open_edges.saturating_add(held) >= OPEN_EDGE_CAP
+        let held = if failed { g.held_notes() } else { 0 };
+        (g.open.len() as u64).saturating_add(held) >= OPEN_EDGE_CAP
     }
 
     /// Wait while the open notes, and the sealed ones once a checkpoint
@@ -1476,7 +1695,7 @@ impl SpendPageLog {
             let g = self.lock();
             for (i, &off) in abs.iter().enumerate() {
                 let (page_off, rel) = (page_of(off), rel_of(off));
-                if let Some(meta) = layer_get(&g, page_off, rel) {
+                if let Some(meta) = g.note_at(off) {
                     out[i] = Some(meta);
                     continue;
                 }
@@ -1527,11 +1746,7 @@ impl SpendPageLog {
             let mut g = self.lock();
             let mut added = false;
             for &(abs, meta) in slots {
-                let page = g.open.entry(page_of(abs)).or_default();
-                if page.insert(rel_of(abs), meta).is_none() {
-                    g.open_edges = g.open_edges.saturating_add(1);
-                    added = true;
-                }
+                added |= g.open.insert(slot_key(abs), meta).is_none();
             }
             added && self.at_edge_cap(&g)
         };
@@ -1555,6 +1770,11 @@ impl SpendPageLog {
     /// The open edge count drops to zero here, so a confirm thread parked at
     /// the edge cap is released now, not after the publish. After a failed
     /// checkpoint the sealed notes still count, so a retry releases none.
+    ///
+    /// Only inside [`Self::checkpoint`]'s `before_freeze`: the freeze swaps
+    /// in the map the checkpoint allocated before it, so nothing under the
+    /// exclusion allocates, and the checkpoint sorts the frozen notes after
+    /// it.
     pub fn freeze_open<K>(&self, tip: u32, keep: Option<K>) -> Result<(), StoreError>
     where
         K: FnMut(&Slot) -> Result<bool, StoreError>,
@@ -1562,57 +1782,72 @@ impl SpendPageLog {
         // `keep` runs on a copy, outside the lock: it may read the delta.
         let mut rejected = Vec::new();
         if let Some(mut keep) = keep {
-            let notes: Vec<(u64, u16, Slot)> = {
+            let notes: Vec<(u64, Slot)> = {
                 let g = self.lock();
                 g.sealed
                     .iter()
-                    .flat_map(|s| s.iter())
-                    .chain(g.open.iter())
-                    .flat_map(|(&p, slots)| slots.iter().map(move |(&r, &m)| (p, r, m)))
-                    .filter(|&(_, _, m)| m != ZERO)
+                    .flat_map(|s| s.notes.iter().copied())
+                    .chain(g.open.iter().map(|(&k, &m)| (k, m)))
+                    .filter(|&(_, m)| m != ZERO)
                     .collect()
             };
-            for (page, rel, meta) in notes {
+            for (key, meta) in notes {
                 if !keep(&meta)? {
-                    rejected.push((page, rel, meta));
+                    rejected.push((key, meta));
                 }
             }
         }
-        {
+        let unused = {
             let mut g = self.lock();
-            let open = std::mem::take(&mut g.open);
-            let moved = std::mem::take(&mut g.open_edges);
-            g.sealed_edges = match g.sealed {
-                Some(_) => g.sealed_edges.saturating_add(moved),
-                None => moved,
+            if g.frozen.is_some() {
+                return Err(StoreError::Corrupt(
+                    "invariant: spend notes frozen twice before one checkpoint sorted them",
+                ));
+            }
+            let Some(fresh) = g.next_open.take() else {
+                return Err(StoreError::Corrupt(
+                    "invariant: spend notes frozen outside a checkpoint",
+                ));
             };
-            let mut merged = match g.sealed.take() {
-                None => open,
-                // A failed checkpoint left a sealed layer: the open pages go
-                // into it. It is copied only while a reader still holds it.
-                Some(sealed) => {
-                    let mut sealed = Arc::try_unwrap(sealed).unwrap_or_else(|held| (*held).clone());
-                    for (page, slots) in open {
-                        sealed.entry(page).or_default().extend(slots);
-                    }
-                    sealed
-                }
-            };
+            let mut frozen = std::mem::replace(&mut g.open, fresh);
             // A note rewritten since the copy was not judged; keep it.
-            for (page, rel, meta) in rejected {
-                if let Some(m) = merged.get_mut(&page).and_then(|p| p.get_mut(&rel)) {
-                    if *m == meta {
-                        *m = ZERO;
-                    }
+            for (key, meta) in rejected {
+                let newest = frozen
+                    .get(&key)
+                    .copied()
+                    .or_else(|| g.sealed.as_ref()?.get(key));
+                if newest == Some(meta) {
+                    frozen.insert(key, ZERO);
                 }
             }
             g.sealed_tip = Some(g.sealed_tip.map_or(tip, |prev| prev.max(tip)));
-            if !merged.is_empty() {
-                g.sealed = Some(Arc::new(merged));
+            if frozen.is_empty() {
+                // Nothing to seal: the empty window keeps its map.
+                Some(std::mem::replace(&mut g.open, frozen))
+            } else {
+                g.frozen = Some(Arc::new(frozen));
+                None
             }
-        }
+        };
+        drop(unused);
         self.pace.notify_room();
         Ok(())
+    }
+
+    /// Sort the frozen notes over any sealed ones, outside the lock; readers
+    /// use the frozen map until the sorted notes replace it.
+    fn seal_frozen(&self) {
+        let (frozen, prior) = {
+            let g = self.lock();
+            (g.frozen.clone(), g.sealed.clone())
+        };
+        let Some(frozen) = frozen else {
+            return;
+        };
+        let sealed = Arc::new(SealedNotes::seal(&frozen, prior.as_deref()));
+        let mut g = self.lock();
+        g.sealed = Some(sealed);
+        g.frozen = None;
     }
 
     /// Zero every committed slot `keep` rejects on pages a generation wrote
@@ -1825,7 +2060,14 @@ impl SpendPageLog {
             ..CheckpointReport::default()
         };
         w.last_checkpoint = Some(started);
-        before_freeze(self)?;
+        let recent = self.lock().open.len();
+        let fresh = open_notes_after(recent);
+        self.lock().next_open = Some(fresh);
+        let froze = before_freeze(self);
+        let unused = self.lock().next_open.take();
+        drop(unused);
+        self.seal_frozen();
+        froze?;
         let (sealed, tip) = {
             let g = self.lock();
             let Some(sealed) = g.sealed.clone() else {
@@ -1898,14 +2140,13 @@ impl SpendPageLog {
     /// record every checkpoint it is touched.
     fn merge_sealed(
         &self,
-        sealed: &Layer,
+        sealed: &SealedNotes,
         touch: TouchCtx,
         body: &mut dyn SpentBody,
         rounds: &mut Rounds,
         report: &mut CheckpointReport,
     ) -> Result<Merged, StoreError> {
-        let mut page_offs: Vec<u64> = sealed.keys().copied().collect();
-        page_offs.sort_unstable();
+        let page_offs: Vec<u64> = sealed.pages().map(|(page_off, _)| page_off).collect();
         report.sealed_pages = page_offs.len() as u64;
         let mut out = Merged {
             pages: Vec::with_capacity(page_offs.len()),
@@ -1913,7 +2154,7 @@ impl SpendPageLog {
             dense_bytes: 0,
         };
         let mut committed = self.committed_records(&page_offs, report)?;
-        for page_off in page_offs {
+        for (page_off, notes) in sealed.pages() {
             let mut merged = BTreeMap::new();
             let mut base = placed_at(&self.lock(), page_off).base();
             if let Some(c) = committed.remove(&page_off) {
@@ -1925,9 +2166,9 @@ impl SpendPageLog {
                     merged = c.record.slots()?;
                 }
             }
-            for (&rel, &meta) in &sealed[&page_off] {
+            for &(key, meta) in notes {
                 report.sealed_edges += 1;
-                merged.insert(rel, meta);
+                merged.insert(key_rel(key), meta);
             }
             let bytes = (REC_HEAD + merged.len() * REC_ENTRY) as u64;
             out.new_bytes += bytes;
@@ -1987,7 +2228,7 @@ impl SpendPageLog {
             )
         };
         rbitcoin_log::info!(
-            "store: spend delta gen={} new_record_bytes={} dense_record_bytes={} folded_segments={} carried={} carried_bytes={} durable={} folds_through={} reclaim_below_permille={} segments={} bytes={} live={} spent_body={} written={} records={} idx={} folded={} fold_records={} written_per_body_permille={}",
+            "store: spend delta gen={} new_record_bytes={} dense_record_bytes={} folded_segments={} carried={} carried_bytes={} durable={} folds_through={} reclaim_below_permille={} segments={} bytes={} live={} spent_body={} written={} records={} idx={} folded={} fold_records={} written_per_body_permille={} notes_ram={}",
             generation,
             new_bytes,
             dense_bytes,
@@ -2007,7 +2248,8 @@ impl SpendPageLog {
             s.idx_bytes,
             s.fold_bytes,
             s.fold_records,
-            s.written().saturating_mul(1000) / body_len.max(1)
+            s.written().saturating_mul(1000) / body_len.max(1),
+            s.notes_bytes
         );
         rbitcoin_log::info!(
             "store: spend delta gen={} timing total_ms={} since_ms={} sealed_pages={} sealed_edges={} merge_reads={} merge_read_bytes={} merge_ms={} hot_folds={} hot_fold_record_bytes={} dense_kept_gen={} dense_kept_tail={} reclaim_read_bytes={} reclaim_read_ms={} folded_now={} dropped={} fold_rounds={} fold_compose_ms={} fold_file_ms={} body_write_ms={} body_sync_ms={} record_bytes={} seg_write_ms={} seg_sync_ms={} idx_entries={} idx_write_ms={} idx_sync_ms={} commit_ms={} install_ms={} unlink_ms={}",
@@ -2077,7 +2319,7 @@ impl SpendPageLog {
     fn fold(
         &self,
         w: &Writer,
-        sealed: &Layer,
+        sealed: &SealedNotes,
         new_bytes: u64,
         body: &mut dyn SpentBody,
         durable: Option<u32>,
@@ -2136,7 +2378,7 @@ impl SpendPageLog {
     fn pick_victims(
         &self,
         w: &Writer,
-        sealed: &Layer,
+        sealed: &SealedNotes,
         new_bytes: u64,
         published: u64,
         durable: u32,
@@ -2146,7 +2388,7 @@ impl SpendPageLog {
             let g = self.lock();
             let through = g.commit.folds_through(durable);
             let mut dying: HashMap<u32, u64> = HashMap::new();
-            for &page_off in sealed.keys() {
+            for (page_off, _) in sealed.pages() {
                 if let At::Rec { seg, len, .. } = placed_at(&g, page_off).at() {
                     *dying.entry(seg).or_default() += len as u64;
                 }
@@ -2217,7 +2459,7 @@ impl SpendPageLog {
     fn live_records(
         &self,
         victims: &[Victim],
-        sealed: &Layer,
+        sealed: &SealedNotes,
     ) -> (HashMap<u32, Vec<LiveRecord>>, u64) {
         let mut out: HashMap<u32, Vec<LiveRecord>> = HashMap::new();
         let mut dropped = 0;
@@ -2241,7 +2483,7 @@ impl SpendPageLog {
                     if !ids.contains(&seg) {
                         continue;
                     }
-                    if sealed.contains_key(&page_off) {
+                    if sealed.has_page(page_off) {
                         dropped += 1;
                     } else {
                         out.entry(seg).or_default().push(LiveRecord {
@@ -2363,7 +2605,6 @@ impl SpendPageLog {
                 if g.sealed.as_ref().is_some_and(|s| Arc::ptr_eq(s, r)) {
                     g.sealed = None;
                     g.sealed_tip = None;
-                    g.sealed_edges = 0;
                 }
             }
             let empty: Vec<u32> = g
@@ -2681,7 +2922,7 @@ struct Plan {
     dir_pages: u32,
     seal: Seal,
     /// The sealed layer this publishes; dropped from RAM on install.
-    retire: Option<Arc<Layer>>,
+    retire: Option<Arc<SealedNotes>>,
     wrote: Wrote,
 }
 
@@ -2968,14 +3209,6 @@ fn remove_fold_file(dir: &Path) -> Result<(), StoreError> {
     }
     remove_if_present(dir, SPEND_DELTA_FOLD_NAME)?;
     sync_dir(dir)
-}
-
-fn layer_get(g: &Inner, page_off: u64, rel: u16) -> Option<Slot> {
-    g.open
-        .get(&page_off)
-        .and_then(|p| p.get(&rel))
-        .or_else(|| g.sealed.as_ref()?.get(&page_off)?.get(&rel))
-        .copied()
 }
 
 fn placed_at(g: &Inner, page_off: u64) -> Placed {
