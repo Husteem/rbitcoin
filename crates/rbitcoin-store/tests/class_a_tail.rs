@@ -84,6 +84,83 @@ fn torn_synced_tail_keeps_the_named_txid() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 128 creates, one synced tail, then one more append so `txid.body.kept` exists.
+fn synced_partial_txid_tail() -> (std::path::PathBuf, u64, [u8; 32]) {
+    let dir = tmp();
+    let named = 128u64;
+    let txid = [0x80u8; 32];
+    let s = Store::create_tiny(&dir).unwrap();
+    let batch: Vec<_> = (1..=named)
+        .map(|i| {
+            let mut id = [i as u8; 32];
+            if i == named {
+                id = txid;
+            }
+            coinbase(id)
+        })
+        .collect();
+    s.put_tx_full_batch_indexed(&batch, false).unwrap();
+    s.txs.sync_class_a_named(named).unwrap();
+    s.put_tx_full_batch_indexed(&[coinbase([0x81u8; 32])], false)
+        .unwrap();
+    assert!(dir.join("txid.body.kept").is_file());
+    drop(s);
+    (dir, named, txid)
+}
+
+/// A truncated copy no longer names the prefix. The torn block stays zeroes,
+/// so open must stop instead of serving the named txid as zeroes.
+#[test]
+fn torn_tail_with_truncated_kept_refuses_open() {
+    let (dir, _named, _txid) = synced_partial_txid_tail();
+    let kept = dir.join("txid.body.kept");
+    let file = std::fs::OpenOptions::new().write(true).open(&kept).unwrap();
+    file.set_len(16).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    zero_published_tail_block(&dir.join("txid.body"));
+    let err = match Store::open_tiny(&dir) {
+        Ok(_) => panic!("open kept a zeroed named tail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("does not decode"),
+        "open kept a zeroed named tail: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A planted sidecar that is not a tail copy is the same missing image.
+#[test]
+fn torn_tail_with_planted_kept_refuses_open() {
+    let (dir, _named, _txid) = synced_partial_txid_tail();
+    std::fs::write(dir.join("txid.body.kept"), b"not-a-tail-copy").unwrap();
+    zero_published_tail_block(&dir.join("txid.body"));
+    match Store::open_tiny(&dir) {
+        Ok(_) => panic!("open kept a zeroed named tail"),
+        Err(err) => assert!(
+            err.to_string().contains("does not decode"),
+            "open kept a zeroed named tail: {err}"
+        ),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A rewrite that landed keeps its bytes. A truncated copy is removed.
+#[test]
+fn landed_tail_drops_a_truncated_kept() {
+    let (dir, named, txid) = synced_partial_txid_tail();
+    let kept = dir.join("txid.body.kept");
+    let file = std::fs::OpenOptions::new().write(true).open(&kept).unwrap();
+    file.set_len(16).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let opened = Store::open_tiny(&dir).unwrap();
+    assert_eq!(opened.txs.txids.get(Fk(named)).unwrap(), txid);
+    assert!(!kept.is_file(), "a landed prefix left the truncated copy");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The next append runs while `sync_class_a_stems` has finished `sync_data_all`
 /// and has not yet unlinked `.kept`. Zeroing the tail is that append's torn
 /// rewrite. Open must still return the txid the earlier sync named.
@@ -140,7 +217,10 @@ fn torn_tail_during_class_a_sync_keeps_the_named_txid() {
     });
     // The broken unlink lets this append finish while the sync is still paused.
     // The fix holds the tail across that pause, so the append waits there.
-    let _ = done_rx.recv_timeout(Duration::from_secs(2));
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(2)).is_err(),
+        "append finished while the class A sync still held the tail lock"
+    );
     release.release();
     sync_thread
         .join()
@@ -150,6 +230,10 @@ fn torn_tail_during_class_a_sync_keeps_the_named_txid() {
         .join()
         .expect("append thread")
         .expect("append during the class A sync");
+    assert!(
+        dir.join("txid.body.kept").is_file(),
+        "the append after the unlink did not copy the named prefix"
+    );
     drop(s);
 
     zero_published_tail_block(&dir.join("txid.body"));

@@ -58,8 +58,9 @@ const KEPT_HEAD: usize = 16;
 /// non-zero, including a header publish after the copy, so open leaves those
 /// bytes and keeps the sidecar until the data sync removes it. Only an
 /// all-zero range is the torn block: writing the image there puts the named
-/// prefix back. A sidecar that does not decode, or whose file is gone, is
-/// removed and open continues with the stem that is actually on disk.
+/// prefix back. A sidecar that does not decode cannot put that prefix back.
+/// When the file's published tail is all zeroes, open stops. When that tail
+/// still holds bytes, or the data file is gone, the sidecar is removed.
 pub(crate) fn restore_kept_tail(path: &Path) -> Result<(), StoreError> {
     let side = TableFile::kept_tail_path(path);
     let raw = match std::fs::read(&side) {
@@ -69,7 +70,7 @@ pub(crate) fn restore_kept_tail(path: &Path) -> Result<(), StoreError> {
     };
     let image = match kept_tail_image(&raw) {
         Some(image) => image,
-        None => return discard_kept_tail(&side),
+        None => return undecodable_kept_tail(path, &side),
     };
     if !path.try_exists().map_err(|e| StoreError::io(path, e))? {
         return discard_kept_tail(&side);
@@ -114,6 +115,43 @@ fn kept_tail_image(raw: &[u8]) -> Option<KeptTailImage<'_>> {
         block,
         bytes: &raw[KEPT_HEAD..],
     })
+}
+
+/// The published tail is the partial block the copy was meant to save.
+///
+/// A zeroed prefix with no usable image is the named rows gone. Leaving the
+/// sidecar in place makes the next open stop the same way. A prefix that
+/// still holds bytes, a length that is not a partial tail, or a missing
+/// file is not that tear: the sidecar is removed and open continues.
+fn undecodable_kept_tail(path: &Path, side: &Path) -> Result<(), StoreError> {
+    if !path.try_exists().map_err(|e| StoreError::io(path, e))? {
+        return discard_kept_tail(side);
+    }
+    let file = table_open_opts()
+        .open(path)
+        .map_err(|e| StoreError::io(path, e))?;
+    let file_len = file.metadata().map_err(|e| StoreError::io(path, e))?.len();
+    if file_len < FILE_HEADER_LEN as u64 {
+        return discard_kept_tail(side);
+    }
+    let mut header = [0u8; FILE_HEADER_LEN];
+    handle_pread_all(&file, path, 0, &mut header)?;
+    let mut len_bytes = [0u8; 8];
+    len_bytes.copy_from_slice(&header[8..16]);
+    let logical = u64::from_le_bytes(len_bytes);
+    let block = logical & !(TAIL_BLOCK - 1);
+    let n = logical.saturating_sub(block);
+    if logical == 0 || n == 0 || n > TAIL_BLOCK || logical > file_len {
+        return discard_kept_tail(side);
+    }
+    let mut current = vec![0u8; n as usize];
+    handle_pread_all(&file, path, block, &mut current)?;
+    if current.iter().all(|b| *b == 0) {
+        return Err(StoreError::Corrupt(
+            "class A tail keep does not decode over a zeroed block",
+        ));
+    }
+    discard_kept_tail(side)
 }
 
 fn discard_kept_tail(side: &Path) -> Result<(), StoreError> {
