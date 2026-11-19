@@ -52,10 +52,14 @@ pub(crate) const TAIL_BLOCK: u64 = 4096;
 const KEPT_MAGIC: &[u8; 4] = b"CATK";
 const KEPT_HEAD: usize = 16;
 
-/// Write a leftover `.kept` image back over `path` and remove the copy.
+/// Write a leftover `.kept` image back over a block that tore to zeroes.
 ///
-/// A missing copy is the synced case. The image is the published prefix from
-/// before the rewrite, so a torn block does not stay zeroes.
+/// A missing copy is the synced case. A successful rewrite leaves the prefix
+/// non-zero, including a header publish after the copy, so open leaves those
+/// bytes and keeps the sidecar until the data sync removes it. Only an
+/// all-zero range is the torn block: writing the image there puts the named
+/// prefix back. A sidecar that does not decode, or whose file is gone, is
+/// removed and open continues with the stem that is actually on disk.
 pub(crate) fn restore_kept_tail(path: &Path) -> Result<(), StoreError> {
     let side = TableFile::kept_tail_path(path);
     let raw = match std::fs::read(&side) {
@@ -63,29 +67,61 @@ pub(crate) fn restore_kept_tail(path: &Path) -> Result<(), StoreError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(StoreError::io(&side, e)),
     };
-    if raw.len() < KEPT_HEAD || raw[0..4] != *KEPT_MAGIC {
-        return Err(StoreError::Corrupt("class A tail keep"));
+    let image = match kept_tail_image(&raw) {
+        Some(image) => image,
+        None => return discard_kept_tail(&side),
+    };
+    if !path.try_exists().map_err(|e| StoreError::io(path, e))? {
+        return discard_kept_tail(&side);
     }
-    let block = u64::from_le_bytes(raw[4..12].try_into().unwrap());
-    let n = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
+    let file = table_open_opts()
+        .open(path)
+        .map_err(|e| StoreError::io(path, e))?;
+    let file_len = file.metadata().map_err(|e| StoreError::io(path, e))?.len();
+    let end = image.block.saturating_add(image.bytes.len() as u64);
+    if end > file_len {
+        return Ok(());
+    }
+    let mut current = vec![0u8; image.bytes.len()];
+    handle_pread_all(&file, path, image.block, &mut current)?;
+    if current.iter().any(|b| *b != 0) {
+        return Ok(());
+    }
+    handle_pwrite_all(&file, path, image.block, image.bytes)?;
+    file.sync_data().map_err(|e| StoreError::io(path, e))?;
+    discard_kept_tail(&side)
+}
+
+struct KeptTailImage<'a> {
+    block: u64,
+    bytes: &'a [u8],
+}
+
+fn kept_tail_image(raw: &[u8]) -> Option<KeptTailImage<'_>> {
+    if raw.len() < KEPT_HEAD || raw[0..4] != *KEPT_MAGIC {
+        return None;
+    }
+    let block = u64::from_le_bytes(raw[4..12].try_into().ok()?);
+    let n = u32::from_le_bytes(raw[12..16].try_into().ok()?) as usize;
     if !block.is_multiple_of(TAIL_BLOCK)
         || n == 0
         || n > TAIL_BLOCK as usize
         || raw.len() != KEPT_HEAD + n
     {
-        return Err(StoreError::Corrupt("class A tail keep"));
+        return None;
     }
-    if !path.try_exists().map_err(|e| StoreError::io(path, e))? {
-        return Err(StoreError::Corrupt(
-            "class A tail keep names a missing file",
-        ));
+    Some(KeptTailImage {
+        block,
+        bytes: &raw[KEPT_HEAD..],
+    })
+}
+
+fn discard_kept_tail(side: &Path) -> Result<(), StoreError> {
+    match std::fs::remove_file(side) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(side, e)),
     }
-    let file = table_open_opts()
-        .open(path)
-        .map_err(|e| StoreError::io(path, e))?;
-    handle_pwrite_all(&file, path, block, &raw[KEPT_HEAD..])?;
-    file.sync_data().map_err(|e| StoreError::io(path, e))?;
-    std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
     let parent = side.parent().unwrap_or_else(|| Path::new("."));
     fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))
 }
