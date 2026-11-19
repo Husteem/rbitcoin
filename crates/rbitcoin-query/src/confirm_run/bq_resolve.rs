@@ -343,12 +343,18 @@ pub fn confirm_bq_resolve_wave_capped(
             &mut all_keys,
             n_inputs_at.get(&h).copied().unwrap_or(0),
         );
-        if let Some((_, _, w)) = wires.last_mut() {
-            w.spend_keys = Arc::from(spends);
-        }
         stats.collect_ns = stats
             .collect_ns
             .saturating_add(t_col.elapsed().as_nanos() as u64);
+        if let Some((_, _, w)) = wires.last_mut() {
+            w.spend_keys = Arc::from(spends);
+            // The raw row is dead once decoded. Promote now so its bytes do
+            // not wait on the TipOnly read below.
+            let charge = w.block.total_size() as u64;
+            query
+                .block_queue_promote_wave(vec![(h, w.clone(), charge)])
+                .map_err(ConfirmError::from)?;
+        }
         done.push(h);
     }
 
@@ -388,19 +394,7 @@ pub fn confirm_bq_resolve_wave_capped(
         n_out: Arc::new(n_out),
     };
 
-    let mut items = Vec::with_capacity(wires.len());
-    let mut promote = Vec::with_capacity(wires.len());
-    for (h, hash, wire) in wires {
-        let charge = wire.block.total_size() as u64;
-        promote.push((h, wire.clone(), charge));
-        items.push((h, hash, wire));
-    }
-    if !promote.is_empty() {
-        query
-            .block_queue_promote_wave(promote)
-            .map_err(ConfirmError::from)?;
-    }
-    stats.heights = items.len() as u32;
+    stats.heights = wires.len() as u32;
     stats.work_ns = t0.elapsed().as_nanos() as u64;
     query.confirm_stats().note_wave_decode(
         stats.decode_ns,
@@ -411,7 +405,7 @@ pub fn confirm_bq_resolve_wave_capped(
     );
     Ok(BqResolveWave {
         stats,
-        items,
+        items: wires,
         drain_fence_hi,
         parent_ids,
         undecodable,

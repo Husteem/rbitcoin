@@ -945,9 +945,10 @@ fn take_after_a_rearm_leaves_its_rows_queued() {
 
 /// IBD teardown sets the confirm cancel, then joins the lookup thread. A wave
 /// under that flag returns cancelled instead of resolving its TipOnly need: a
-/// full wave is up to 64k cold reads, most of an hour on a busy HDD.
+/// full wave is up to 64k cold reads, most of an hour on a busy HDD. Each
+/// height is promoted as it decodes, so its raw bytes never wait on that read.
 #[test]
-fn wave_under_confirm_cancel_returns_cancelled() {
+fn wave_under_confirm_cancel_returns_cancelled_and_keeps_the_decode() {
     let (path, q) = tmp_query();
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -974,9 +975,22 @@ fn wave_under_confirm_cancel_returns_cancelled() {
         Err(e) => e,
     };
     assert!(err.is_cancelled(), "want cancelled, got {err:?}");
-    // Promote and dequeue sit after the `?`, so a cancelled wave leaves the
-    // height queued for the next session.
+    // Dequeue sits after the `?`, so a cancelled wave leaves the height
+    // queued for the next session. Promote runs at decode, so the row holds
+    // only the decoded block and the next wave does not decode it again.
     assert!(q.block_queue_has_height(1));
+    assert!(
+        q.block_queue_raw_payload(1).unwrap().is_none(),
+        "a decoded height drops its raw row before TipOnly"
+    );
+    assert!(q.block_queue_resolved(1).is_some());
+    q.clear_confirm_cancel();
+    let wave = resolve_wave(&q, &params, Milestone::NONE, &[1]);
+    assert_eq!(wave.items.len(), 1);
+    assert_eq!(
+        wave.stats.decode_ns, 0,
+        "the promoted row is not decoded again"
+    );
     let _ = std::fs::remove_dir_all(&path);
 }
 
