@@ -319,3 +319,38 @@ fn a_repeated_notfound_holds_from_its_last_answer() {
         "the record is full of fresh lacks"
     );
 }
+
+/// Only unexpired hashes take places in the record: an earlier answer to a
+/// hash that was answered again does not.
+#[test]
+fn a_repeat_takes_one_place() {
+    let mut peer = PeerChain::default();
+    let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+    assert!(peer.note_notfound_capped(hash(1), 0, 3));
+    assert!(peer.note_notfound_capped(hash(2), 1, 3));
+    assert!(peer.note_notfound_capped(hash(2), 2, 3));
+    assert!(
+        peer.note_notfound_capped(hash(3), 3, 3),
+        "two hashes are kept, so a third fits"
+    );
+    assert!(peer.lacks(&hash(1), 3) && peer.lacks(&hash(2), 3) && peer.lacks(&hash(3), 3));
+    assert!(!peer.note_notfound_capped(hash(4), 4, 3));
+}
+
+/// An announcement lifts the lacks for the blocks it lists and frees their
+/// places. The others stay.
+#[test]
+fn an_announcement_lifts_only_the_lacks_it_lists() {
+    let mut peer = PeerChain::default();
+    let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+    assert!(peer.note_notfound_capped(hash(1), 0, 2));
+    assert!(peer.note_notfound_capped(hash(2), 1, 2));
+    peer.note_announcement([hash(1), hash(9)]);
+    assert!(!peer.lacks(&hash(1), 2), "the listed block is lifted");
+    assert!(peer.lacks(&hash(2), 2), "the other stays");
+    assert!(
+        peer.note_notfound_capped(hash(3), 2, 2),
+        "the lifted block's place is free"
+    );
+    assert!(peer.lacks(&hash(2), 2) && peer.lacks(&hash(3), 2));
+}

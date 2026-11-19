@@ -868,11 +868,11 @@ fn notfound_into_a_full_record_keeps_the_block_owed() {
     let (dir, hub) = tmp_hub();
     let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
     owe_on_wire(&mut st, 0, h(1), 0);
-    let now = ibd_mono_ms();
-    let mut i = 0;
-    while st.slots[0].chain.note_notfound(junk(i), now) {
-        i += 1;
-    }
+    // Answers stamped far ahead of the test clock stay unexpired however
+    // long the test runs, so the record is still full below.
+    let ahead = u64::MAX / 2;
+    let refused = (0..100_000).find(|&i| !st.slots[0].chain.note_notfound(junk(i), ahead));
+    assert!(refused.is_some(), "the record fills");
     apply_notfound(&mut st, 0, vec![h(1)]);
     assert!(st.slots[0].in_flight.contains(&h(1)), "h(1) is still owed");
     assert_eq!(st.slots[0].getdata_wire.window_ms(), Some(0));
@@ -883,21 +883,22 @@ fn notfound_into_a_full_record_keeps_the_block_owed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A block `inv` after the `notfound` does not reopen the block, whether it
-/// lists a block this node already has or the block itself.
+/// A block `inv` lifts a `notfound` lack only for the blocks it lists. One
+/// for another block, even one this node already has, leaves the lack, and
+/// the block goes to the other peer.
 #[test]
-fn an_inv_after_notfound_does_not_hand_the_block_back() {
+fn an_inv_lifts_only_the_lacks_it_lists() {
     let (dir, hub) = tmp_hub();
     let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
     owe_on_wire(&mut st, 0, h(1), 0);
     apply_notfound(&mut st, 0, vec![h(1)]);
     blocks_inv(&mut st, &hub, 0, vec![h(5)]);
-    assert!(
-        !st.slots[0].may_take_block(&h(1), ibd_mono_ms()),
-        "an inv of another block leaves the lack"
-    );
-    blocks_inv(&mut st, &hub, 0, vec![h(1)]);
     assert_block_goes_elsewhere(&mut st, &hub, &mut wire);
+    blocks_inv(&mut st, &hub, 0, vec![h(1)]);
+    assert!(
+        st.slots[0].may_take_block(&h(1), ibd_mono_ms()),
+        "an inv of h(1) itself lifts the lack"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

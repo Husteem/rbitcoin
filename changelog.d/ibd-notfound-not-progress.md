@@ -1,3 +1,3 @@
 Fixed
 
-- **An IBD `notfound` is no longer block progress.** A peer that withholds a requested block now stalls out even while it keeps sending `notfound`. A `notfound` records only blocks the peer was asked for, and keeps it off each for the full 30 s: padding the message or a later `inv` or `headers` no longer hands the block straight back. The per-peer record expires its oldest answers in O(1) instead of scanning the whole map for every hash.
+- **An IBD `notfound` is no longer block progress.** A peer that still owes a requested block now stalls out even while it keeps sending `notfound`. A `notfound` counts only for blocks the peer was asked for, and keeps the peer off each for 30 s unless it announces that block: padding the message or announcing other blocks no longer hands the block straight back. When the per-peer record is full, the block stays owed. The record expires its oldest answers in O(1) instead of scanning the whole map for every hash.
