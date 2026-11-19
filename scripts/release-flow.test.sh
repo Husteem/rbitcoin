@@ -219,6 +219,16 @@ assert_ok "release-notes omit detailed Unreleased body" \
   bash -c "! grep -q 'ship this' <<<'$out'"
 assert_ok "release-notes name CHANGELOG section" \
   grep -q '## \[0.6.0\]' <<<"$out"
+# release.yml runs the notes after the tag exists. That tag, and a newer tag
+# on another line, are not where this release's range starts.
+git_c -C "$MINOR" tag -a v0.6.0 -m v0.6.0
+git_c -C "$MINOR" switch -q -c side
+git_c -C "$MINOR" commit -q --allow-empty -m 'later line'
+git_c -C "$MINOR" tag -a v0.7.0 -m v0.7.0
+git_c -C "$MINOR" switch -q -
+out="$(bash "$NOTES" --root "$MINOR")"
+assert_ok "release-notes thank contributors once this version is tagged" \
+  grep -q '@Hero-Gamer' <<<"$out"
 
 # --- one-shot thanks is consumed by the cut ---
 ONCE="$WORKDIR/once"

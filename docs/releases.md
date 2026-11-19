@@ -69,7 +69,7 @@ One fragment per pull. A stack adds one file on each branch.
 `thanks.md` is not a category fragment. It is one release's thanks
 paragraph. The cut places it under `### Highlights` and deletes it.
 Write it as prose, not a `- ` bullet, so it does not count toward the
-ten. There is no `### Thanks` section.
+eleven. There is no `### Thanks` section.
 
 `./scripts/release-cut.sh --minor`, `--major`, and `--patch` fold every
 fragment into `## [Unreleased]` under the matching `###` heading, delete
@@ -235,8 +235,9 @@ From current `origin/master` at `X.Y.99`:
 2. Write **`### Highlights`** (brief, operator-facing; at most eleven bullets).
    Leave the thanks paragraph from `changelog.d/thanks.md` at the end of
    that section. `release-notes.sh` keeps thanks in Highlights. When a
-   commit since the previous tag is by someone other than `reardencode`
-   and `rearden-grok[bot]`, and that login is not already named there, the
+   commit since the newest release tag the ship commit descends from (not
+   its own tag) is by someone other than `reardencode` and
+   `rearden-grok[bot]`, and that login is not already named there, the
    notes add `Thanks to @login for changes in this release.` in the same
    block. A login counts when its commit email is a GitHub noreply address,
    or when a merge commit says `from login/`. The maintainer, the bot, and
@@ -247,7 +248,12 @@ From current `origin/master` at `X.Y.99`:
    succeed (preview the GitHub Release text).
 4. PR → `master`. Label `release`. Poll **required +
    `core-functional` + `overlay-functional` + `warnet-example` +
-   `release-extra`**.
+   `release-extra`**. Also run `release.yml` on the ship branch
+   (`gh workflow run release.yml --ref release/X.(Y+1).0`, `nightly`
+   off) and wait for it to pass. It builds and smokes the Windows,
+   Darwin, image, and NixOS VM jobs the tag's Release needs, and
+   publishes nothing. A job that only fails after the tag leaves a
+   pushed tag with no Release.
 5. `gh pr merge --merge`. Fetch. Create a throwaway branch at
    `origin/master` (or `origin/vX.Y.x`) — do not steal `master` from
    another worktree (`git switch -C tag/vX.Y.Z origin/master`).
