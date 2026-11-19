@@ -2345,7 +2345,9 @@ fn torn_scripthash_slab_on_apply_marks_a_rebuild() {
         q.apply_sh_pending().is_err(),
         "the torn slab must fail the apply"
     );
-    assert!(rbitcoin_store::scripthash::sh_rebuild_marked(q.store.path()));
+    assert!(rbitcoin_store::scripthash::sh_rebuild_marked(
+        q.store.path()
+    ));
     assert!(q.sh_force_rebuild(), "the next start rebuilds the index");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2356,8 +2358,7 @@ fn apply_sh_pending_in_posting_gap(q: &Query) -> Result<(), rbitcoin_query::Quer
 }
 
 fn torn_posting_read(q: &Query) -> Result<(), rbitcoin_query::QueryError> {
-    q.sh
-        .publish_seq
+    q.sh.publish_seq
         .fetch_add(2, std::sync::atomic::Ordering::Release);
     Err(StoreError::Corrupt(
         "invariant: scripthash slab used != decoded fk count",
