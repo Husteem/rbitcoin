@@ -693,12 +693,12 @@ fn selection_walk_reaches_an_lca_one_past_its_depth() {
     let none = std::collections::HashSet::new();
     let mut cap = || REWIND_MAX_DEPTH;
     assert_eq!(
-        select_heavier_path(&hub, &[fork[2]], &none, 2, &mut cap).unwrap(),
+        select_heavier_path(&hub, &[fork[2]], &none, 2, &mut cap, Pick::First).unwrap(),
         None,
         "a walk of two ends on a header-only row"
     );
     assert_eq!(
-        select_heavier_path(&hub, &[fork[2]], &none, 3, &mut cap).unwrap(),
+        select_heavier_path(&hub, &[fork[2]], &none, 3, &mut cap, Pick::First).unwrap(),
         Some((fork.to_vec(), REWIND_MAX_DEPTH))
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -752,7 +752,15 @@ fn a_fork_deeper_than_the_cap_does_not_end_selection() {
     let shallow = side(l1.block_hash(), l2.block_hash(), 2, 3, 2);
     let none = std::collections::HashSet::new();
     assert_eq!(
-        select_heavier_path(&hub, &[deep[3], shallow[2]], &none, 10, &mut || 2).unwrap(),
+        select_heavier_path(
+            &hub,
+            &[deep[3], shallow[2]],
+            &none,
+            10,
+            &mut || 2,
+            Pick::First
+        )
+        .unwrap(),
         Some((shallow.clone(), 2)),
         "the fork 3 under the tip is past a cap of 2"
     );
@@ -798,75 +806,102 @@ fn a_fork_past_the_under_lock_walk_is_selected_off_lock() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// One pass under `shared` holds a shallow heavier fork its walk reaches
-/// and a deeper, heavier one only the off-lock walk reaches. The pass
-/// rewinds to the shallow one and defers the other, not the path it took.
-/// The coordinator's next turn moves to the deeper fork and leaves nothing
-/// to retry.
-#[test]
-fn a_rewind_under_shared_defers_a_fork_its_walk_could_not_reach() {
-    let (dir, hub) = tmp_hub();
+/// A confirmed chain of `n` blocks above genesis, oldest first from genesis.
+fn confirmed_chain(hub: &ChainHub, n: u32, t: u32) -> Vec<BlockHash> {
     hub.ensure_genesis().unwrap();
-    let gen = hub.tip_hash().unwrap();
-    let t = 1_500_099_100;
-    let l1 = mine(gen, t, 1);
-    hub.accept_block(l1.clone()).unwrap();
-    let l2 = mine(l1.block_hash(), t + 100, 2);
-    hub.accept_block(l2.clone()).unwrap();
-    let side = |from: BlockHash, avoid: BlockHash, h0: u32, n: u32, dt: u32| {
-        let mut out = Vec::new();
-        let mut prev = from;
-        for h in h0..h0 + n {
-            let b = distinct_sib(mine(prev, t + dt + 100 * (h - 1), h), avoid);
-            hub.ensure_header(&b.header).unwrap();
-            prev = b.block_hash();
-            out.push(prev);
+    let mut chain = vec![hub.tip_hash().unwrap()];
+    for h in 1..=n {
+        let b = mine(chain[h as usize - 1], t + 100 * (h - 1), h);
+        hub.accept_block(b.clone()).unwrap();
+        chain.push(b.block_hash());
+    }
+    chain
+}
+
+/// `n` stored headers forking from `chain[from]`, oldest first.
+fn side_headers(hub: &ChainHub, chain: &[BlockHash], from: u32, n: u32, t: u32) -> Vec<BlockHash> {
+    let mut out = Vec::new();
+    let mut prev = chain[from as usize];
+    for h in from + 1..=from + n {
+        let mut b = mine(prev, t + 100 * (h - 1), h);
+        if let Some(sib) = chain.get(h as usize) {
+            b = distinct_sib(b, *sib);
         }
-        out
-    };
-    let shallow = side(l1.block_hash(), l2.block_hash(), 2, 2, 2);
-    let deep = side(gen, l1.block_hash(), 1, 5, 1);
+        hub.ensure_header(&b.header).unwrap();
+        prev = b.block_hash();
+        out.push(prev);
+    }
+    out
+}
+
+/// One pass under `shared` with a walk of 3 sees the 2-header `shallow`
+/// fork but not `deep`, then a missed exploration clears both tips. The
+/// coordinator's next off-lock turn must end on the fork with the most
+/// work against the confirmed chain the pass saw, and leave nothing to
+/// retry.
+fn hand_off_both(
+    hub: &ChainHub,
+    shallow: BlockHash,
+    deep: BlockHash,
+) -> rbitcoin_ibd::ibd::state::IbdWorkState {
     let mut st =
         rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
-    st.reorg
-        .register_explore(std::iter::empty::<BlockHash>(), Some(shallow[1]));
-    st.reorg
-        .register_explore(std::iter::empty::<BlockHash>(), Some(deep[4]));
-    assert!(maybe_rewind_to_best_work_n(&mut st, &hub, 3).unwrap());
-    assert_eq!(
-        hub.tip_height(),
-        Some(1),
-        "a walk of 3 reaches only the shallow fork"
-    );
-    assert_eq!(
-        st.reorg.deferred,
-        vec![deep[4]],
-        "the path taken is not deferred"
-    );
-    let shared = Mutex::new(st);
-    rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, &hub);
-    assert_eq!(
-        hub.tip_height(),
-        Some(0),
-        "the next turn moves to the deeper fork"
-    );
-    {
-        let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
-        assert_eq!(st.height_to_hash.get(&5), Some(&deep[4]));
-        assert!(st.reorg.deferred.is_empty(), "nothing is left to retry");
-        st.reorg.defer(&[shallow[1]]);
+    for tip in [shallow, deep] {
+        st.reorg
+            .register_explore(std::iter::empty::<BlockHash>(), Some(tip));
     }
-    rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, &hub);
+    let _ = maybe_rewind_to_best_work_n(&mut st, hub, 3).unwrap();
+    st.reorg.clear_explore();
+    let shared = Mutex::new(st);
+    rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, hub);
     let st = shared.into_inner().unwrap_or_else(|err| err.into_inner());
-    assert_eq!(
-        st.height_to_hash.get(&5),
-        Some(&deep[4]),
-        "the lighter fork does not displace the deeper one"
-    );
-    assert!(
-        st.reorg.deferred.is_empty(),
-        "a candidate no longer worth a rewind is dropped, not deferred again"
-    );
+    assert!(st.reorg.deferred.is_empty(), "nothing is left to retry");
+    st
+}
+
+/// The deeper fork has the most work and an older ancestor.
+#[test]
+fn a_heavier_fork_past_the_under_lock_walk_wins_the_off_lock_pass() {
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_100;
+    let chain = confirmed_chain(&hub, 2, t);
+    let shallow = side_headers(&hub, &chain, 1, 2, t + 2);
+    let deep = side_headers(&hub, &chain, 0, 5, t + 1);
+    let st = hand_off_both(&hub, shallow[1], deep[4]);
+    assert_eq!(hub.tip_height(), Some(0));
+    assert_eq!(st.height_to_hash.get(&5), Some(&deep[4]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Both forks leave the same confirmed block. Committing the shallow one
+/// first would make that block the tip, and the deeper fork would then read
+/// as a linear extension of it.
+#[test]
+fn forks_from_one_ancestor_rewind_to_the_heavier() {
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_300;
+    let chain = confirmed_chain(&hub, 2, t);
+    let shallow = side_headers(&hub, &chain, 1, 2, t + 2);
+    let deep = side_headers(&hub, &chain, 1, 4, t + 1);
+    let st = hand_off_both(&hub, shallow[1], deep[3]);
+    assert_eq!(hub.tip_height(), Some(1));
+    assert_eq!(st.height_to_hash.get(&5), Some(&deep[3]));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The deeper fork only ties the confirmed chain, so it is no rewind. It
+/// would beat the tip a committed shallow rewind leaves behind, and must not
+/// replace the shallow fork that way.
+#[test]
+fn a_fork_lighter_than_the_confirmed_chain_never_replaces_a_heavier_one() {
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_500;
+    let chain = confirmed_chain(&hub, 4, t);
+    let shallow = side_headers(&hub, &chain, 3, 2, t + 2);
+    let deep = side_headers(&hub, &chain, 0, 4, t + 1);
+    let st = hand_off_both(&hub, shallow[1], deep[3]);
+    assert_eq!(hub.tip_height(), Some(3));
+    assert_eq!(st.height_to_hash.get(&5), Some(&shallow[1]));
     let _ = std::fs::remove_dir_all(dir);
 }
 

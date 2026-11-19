@@ -563,9 +563,10 @@ pub fn extend_valid_header_tip(
 ///
 /// The caller holds `shared`, so the walk stays at [`ANCESTOR_WALK_MAX`].
 /// When nothing is selected the candidates are deferred to the next
-/// off-lock turn, which walks as far as the rewind cap. After a rewind the
-/// candidates off the path it took are deferred too while that walk is
-/// longer: they may be forks this walk did not reach.
+/// off-lock turn, which walks as far as the rewind cap. A path found while
+/// that walk is longer and other candidates remain is not committed here
+/// either: the whole batch is deferred, and the off-lock pass rewinds to the
+/// candidate with the most work, measured against this same confirmed tip.
 pub fn maybe_rewind_to_best_work(
     st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
@@ -582,24 +583,22 @@ pub fn maybe_rewind_to_best_work_n(
     let cands = rewind_candidate_hashes(st, hub)?;
     let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
     let mut cap = None;
-    let picked = select_heavier_path(hub, &cands, &invalid, walk_max, &mut || {
-        *cap.get_or_insert_with(|| super::header_walk::rewind_depth_cap(st, hub))
-    })?;
+    let picked = select_heavier_path(
+        hub,
+        &cands,
+        &invalid,
+        walk_max,
+        &mut || *cap.get_or_insert_with(|| super::header_walk::rewind_depth_cap(st, hub)),
+        Pick::First,
+    )?;
     let Some((path, cap)) = picked else {
         st.reorg.defer(&cands);
         return Ok(false);
     };
-    if !apply_header_rewind(st, hub, &path, cap)? {
+    let others_out_of_reach = walk_max < ancestor_walk_max(cap) && cands.len() > 1;
+    if others_out_of_reach || !apply_header_rewind(st, hub, &path, cap)? {
         st.reorg.defer(&cands);
         return Ok(false);
-    }
-    if walk_max < ancestor_walk_max(cap) {
-        let off_path: Vec<BlockHash> = cands
-            .iter()
-            .copied()
-            .filter(|c| !path.contains(c))
-            .collect();
-        st.reorg.defer(&off_path);
     }
     Ok(true)
 }
@@ -624,9 +623,20 @@ pub fn rewind_candidate_hashes(
     Ok(cands)
 }
 
-/// First heavier path among `cands` that a rewind under `rewind_cap` takes,
-/// with that cap. A path whose LCA is deeper than the cap is passed over, so
-/// a later candidate still gets its turn. `rewind_cap` is read at most once,
+/// Which eligible path a selection returns.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// The first, without walking the rest. Selection under `shared`.
+    First,
+    /// The one with the most chain work through its tip; the first of
+    /// equals. The off-lock pass, which sees every deferred candidate.
+    MostWork,
+}
+
+/// A heavier path among `cands` that a rewind under `rewind_cap` takes, with
+/// that cap. A path whose LCA is deeper than the cap is passed over, so a
+/// later candidate still gets its turn. `rewind_cap` is read at most once,
 /// when the first heavier path is found.
 #[doc(hidden)]
 pub fn select_heavier_path(
@@ -635,7 +645,9 @@ pub fn select_heavier_path(
     invalid: &HashSet<[u8; 32]>,
     walk_max: usize,
     rewind_cap: &mut dyn FnMut() -> u32,
+    pick: Pick,
 ) -> Result<Option<(Vec<BlockHash>, u32)>, NetError> {
+    let mut best: Option<(bitcoin::Work, Vec<BlockHash>, u32)> = None;
     for cand in cands {
         if invalid.contains(&cand.to_byte_array()) {
             continue;
@@ -653,9 +665,33 @@ pub fn select_heavier_path(
         if hub.tip_height().unwrap_or(0).saturating_sub(lca_h) > cap {
             continue;
         }
-        return Ok(Some((path, cap)));
+        if pick == Pick::First {
+            return Ok(Some((path, cap)));
+        }
+        let Some(work) = chain_work_through(hub, lca_h, &path)? else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(most, ..)| work > *most) {
+            best = Some((work, path, cap));
+        }
     }
-    Ok(None)
+    Ok(best.map(|(_, path, cap)| (path, cap)))
+}
+
+/// Chain work of the confirmed chain through `lca_h` plus `path`'s headers.
+fn chain_work_through(
+    hub: &ChainHub,
+    lca_h: u32,
+    path: &[BlockHash],
+) -> Result<Option<bitcoin::Work>, NetError> {
+    let mut work = hub.work_through_height(lca_h)?;
+    for hash in path {
+        let Some(w) = header_work_of(hub, *hash)? else {
+            return Ok(None);
+        };
+        work = work + w;
+    }
+    Ok(Some(work))
 }
 
 /// The confirmed parent of `path[0]` and its height.
@@ -866,9 +902,9 @@ fn fire_after_prepare() {
     }
 }
 
-/// Select, disconnect, and commit one heavier path. Caller does not hold
-/// `shared`. One exclusion covers the select, the disconnect, and the
-/// commit. A moved tip or a hash marked invalid skips the commit, so
+/// Select the heavier path with the most work, disconnect, and commit it.
+/// Caller does not hold `shared`. One exclusion covers the select, the
+/// disconnect, and the commit. A moved tip or a hash marked invalid skips the commit, so
 /// `clear_path_above` and `set_lookup_taken_hi` stay off that stale height.
 /// A selected path that is not committed defers `cands` to the next
 /// coordinator turn. No candidates is no gate and no chain-work read.
@@ -890,7 +926,9 @@ pub(crate) fn apply_off_lock_rewind(
     };
     let cap = super::header_walk::rewind_depth_cap_of(origin, proven, hub);
     let walk_max = ancestor_walk_max(cap);
-    let Some((path, cap)) = select_heavier_path(hub, cands, invalid, walk_max, &mut || cap)? else {
+    let Some((path, cap)) =
+        select_heavier_path(hub, cands, invalid, walk_max, &mut || cap, Pick::MostWork)?
+    else {
         return Ok(false);
     };
     let tip_before = tip_pair(hub);
