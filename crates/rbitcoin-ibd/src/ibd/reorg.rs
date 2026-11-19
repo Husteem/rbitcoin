@@ -116,19 +116,22 @@ impl IbdReorgState {
 /// Cap on prev-walks from a header-horizon candidate. Early IBD can have
 /// hundreds of thousands of headers above a low confirmed tip; walking the
 /// whole gap is CPU + RAM for no reorg.
-///
-/// A competing tip+1 walks `cap + 1` headers to the deepest LCA a rewind
-/// under `cap` takes, so the walk covers the widest
-/// [`super::header_walk::rewind_depth_cap`]. One bound for both caps keeps
-/// that cap's chain-work read out of selection. The trade: once the
-/// confirmed tip meets the floor and the cap is [`REWIND_MAX_DEPTH`], a
-/// walk that finds nothing still reads up to 65,537 headers.
 #[doc(hidden)]
-pub const ANCESTOR_WALK_MAX: usize = super::header_walk::UNPROVEN_LEAD_BLOCKS as usize + 1;
+pub const ANCESTOR_WALK_MAX: usize = 10_000;
 
 /// Max confirmed blocks disconnected in one header-driven rewind.
 #[doc(hidden)]
 pub const REWIND_MAX_DEPTH: u32 = 1_024;
+
+/// Prev-walk cap for a selection whose rewind may disconnect `rewind_cap`
+/// blocks. A competing tip+1 walks `rewind_cap + 1` headers to the deepest
+/// LCA that rewind takes. Under the floor that is 65,537 header reads; a
+/// proved walk keeps [`ANCESTOR_WALK_MAX`], so it selects no fork deeper
+/// than it did before.
+#[doc(hidden)]
+pub fn ancestor_walk_max(rewind_cap: u32) -> usize {
+    ANCESTOR_WALK_MAX.max(rewind_cap as usize + 1)
+}
 
 /// Header hashes from `tip` back to (not including) a best-chain / confirmed
 /// ancestor, **oldest-first**. Used so BadPrev densify requests every mid-path
@@ -280,16 +283,10 @@ pub fn shortest_heavier_header_prefix(
 /// path is already known).
 ///
 /// A walk that does not reach a **connected** LCA is not a fork: early IBD
-/// headers sit tens of thousands above tip, the walk hits [`ANCESTOR_WALK_MAX`],
-/// and the join is header-only. Treating that as connecting-search getdata
-/// storms `ibd: heavier chain does not connect at tip` on a linear chain.
-pub fn connecting_hashes_heavier_disconnected(
-    hub: &ChainHub,
-    candidate: BlockHash,
-) -> Result<Option<Vec<BlockHash>>, NetError> {
-    connecting_hashes_heavier_disconnected_n(hub, candidate, ANCESTOR_WALK_MAX)
-}
-
+/// headers sit tens of thousands above tip, the walk hits `walk_max`
+/// ([`ancestor_walk_max`]), and the join is header-only. Treating that as
+/// connecting-search getdata storms `ibd: heavier chain does not connect at
+/// tip` on a linear chain.
 #[doc(hidden)]
 pub fn connecting_hashes_heavier_disconnected_n(
     hub: &ChainHub,
@@ -404,14 +401,16 @@ pub fn consider_disconnected_heavier(
 /// the tip then takes no path slots, so tip+1 names no fork. The main loop
 /// rewinds to it; the header thread's rewind does not see it. A candidate
 /// that is not stored has no parent, so no rewind is prepared for it. A tip
-/// [`ANCESTOR_WALK_MAX`] or more above the confirmed tip is not named: that
-/// walk ends above every connected header.
+/// as far above the confirmed tip as the widest [`ancestor_walk_max`] is not
+/// named: that walk ends above every connected header. The cap in force is
+/// not read here, since its chain-work read would run under `shared`.
 fn unplanted_walk_tip(st: &super::state::IbdWorkState, hub: &ChainHub) -> Option<BlockHash> {
     let tip_h = hub.tip_height()?;
     let planted =
         !st.ordered.is_empty() || st.height_to_hash.contains_key(&tip_h.saturating_add(1));
     let above = st.header_walk.tip_height().saturating_sub(tip_h) as usize;
-    if planted || above == 0 || above >= ANCESTOR_WALK_MAX {
+    let widest = ancestor_walk_max(super::header_walk::UNPROVEN_LEAD_BLOCKS);
+    if planted || above == 0 || above >= widest {
         return None;
     }
     st.header_walk.tip_hash()
@@ -520,7 +519,8 @@ pub fn maybe_rewind_to_best_work(
 ) -> Result<bool, NetError> {
     let cands = rewind_candidate_hashes(st, hub)?;
     let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
-    let Some(path) = select_heavier_path(hub, &cands, &invalid)? else {
+    let walk_max = ancestor_walk_max(super::header_walk::rewind_depth_cap(st, hub));
+    let Some(path) = select_heavier_path(hub, &cands, &invalid, walk_max)? else {
         return Ok(false);
     };
     apply_header_rewind(st, hub, &path)
@@ -551,12 +551,13 @@ pub fn select_heavier_path(
     hub: &ChainHub,
     cands: &[BlockHash],
     invalid: &HashSet<[u8; 32]>,
+    walk_max: usize,
 ) -> Result<Option<Vec<BlockHash>>, NetError> {
     for cand in cands {
         if invalid.contains(&cand.to_byte_array()) {
             continue;
         }
-        if let Some(path) = connecting_hashes_heavier_disconnected(hub, *cand)? {
+        if let Some(path) = connecting_hashes_heavier_disconnected_n(hub, *cand, walk_max)? {
             if path.iter().any(|h| invalid.contains(&h.to_byte_array())) {
                 continue;
             }
@@ -782,7 +783,12 @@ pub(crate) fn apply_off_lock_rewind(
     let _gate = rewind_exclusion()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    let Some(path) = select_heavier_path(hub, cands, invalid)? else {
+    let (origin, proven) = {
+        let st = shared.lock().unwrap_or_else(|err| err.into_inner());
+        (st.header_walk.origin, st.header_walk.proven)
+    };
+    let walk_cap = super::header_walk::rewind_depth_cap_of(origin, proven, hub);
+    let Some(path) = select_heavier_path(hub, cands, invalid, ancestor_walk_max(walk_cap))? else {
         return Ok(false);
     };
     let tip_before = tip_pair(hub);
