@@ -367,6 +367,81 @@ fn getblocks_full_page_continues_with_a_tip_inv() {
     assert_eq!(out.len(), 1, "the continuation fires once");
 }
 
+/// The `block` payload of a served `getdata`, as it goes on the wire.
+fn served_block_payload(p: PeerOut) -> Vec<u8> {
+    match p {
+        PeerOut::Encoded(bytes) => {
+            assert_eq!(bytes.first().copied(), Some(2), "v2 block short id");
+            bytes[1..].to_vec()
+        }
+        PeerOut::Served(NetworkMessage::Block(b)) => serialize(&b),
+        other => panic!("expected served block, got {other:?}"),
+    }
+}
+
+/// Core serves `MSG_BLOCK` without witness data and `MSG_WITNESS_BLOCK` with
+/// it. A decoder that reads `block` without the witness flag cannot parse a
+/// segwit body sent for `MSG_BLOCK`.
+#[test]
+fn getdata_msg_block_is_served_without_witness() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getdata-strip");
+    hub.ensure_genesis().unwrap();
+    let ws = op_true();
+    let p2wsh = ScriptBuf::new_p2wsh(&ws.wscript_hash());
+    hub.generate_to_script(101, p2wsh, vec![]).unwrap();
+    let cb = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap()
+        .txdata[0]
+        .clone();
+    let spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cb.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::from_slice(&[ws.as_bytes()]),
+        }],
+        output: vec![TxOut {
+            value: cb.output[0].value - Amount::from_sat(1_000),
+            script_pubkey: op_true(),
+        }],
+    };
+    let h = hub.generate_to_script(1, op_true(), vec![spend]).unwrap()[0];
+    let full = hub.query.reconstruct_block_at_height(Height(102)).unwrap();
+    assert_eq!(full.block_hash(), h);
+    let mut stripped = full.clone();
+    for tx in &mut stripped.txdata {
+        for input in &mut tx.input {
+            input.witness.clear();
+        }
+    }
+    let stripped = serialize(&stripped);
+    assert!(full.total_size() > stripped.len(), "the block carries witness data");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getdata runtime");
+    let mut follow = PeerFollowState::new();
+
+    let out = getdata_out(&rt, &hub, &mut follow, Inventory::Block(h));
+    assert_eq!(out.len(), 1);
+    let plain = served_block_payload(out.into_iter().next().unwrap());
+    assert_eq!(plain, stripped, "MSG_BLOCK has no witness data");
+
+    let out = getdata_out(&rt, &hub, &mut follow, Inventory::WitnessBlock(h));
+    assert_eq!(out.len(), 1);
+    let witness = served_block_payload(out.into_iter().next().unwrap());
+    assert_eq!(witness, serialize(&full), "MSG_WITNESS_BLOCK keeps the witness");
+}
+
 /// Headers peer gets one header. Inv peer gets `MSG_BLOCK`, not a witness inv.
 #[test]
 fn tip_announce_headers_versus_inv() {

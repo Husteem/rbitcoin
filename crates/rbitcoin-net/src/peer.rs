@@ -4676,7 +4676,8 @@ pub async fn serve_getdata_tail(
             // The header check and the body reconstruct both run on the
             // blocking pool. A missing header or body is `false`.
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
-                if !serve_getdata_full_block(hub, out_tx, session, h).await? {
+                let witness = matches!(item, Inventory::WitnessBlock(_));
+                if !serve_getdata_full_block(hub, out_tx, session, h, witness).await? {
                     notfound.push(item);
                 } else if follow.continuation_block == Some(*h) {
                     // Core sends this right after the block, even when redundant.
@@ -4716,13 +4717,14 @@ pub async fn serve_getdata_full_block(
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     session: Option<&crate::peers::LivePeer>,
     h: &bitcoin::BlockHash,
+    witness: bool,
 ) -> Result<bool, NetError> {
     let query = Arc::clone(&hub.query);
     let cache = Arc::clone(&hub.cache);
     let hash = *h;
     let encoded = tokio::task::spawn_blocking(move || {
         let _g = crate::reactor::BlockingRegion::enter();
-        encode_served_witness_block(cache.as_ref(), query.as_ref(), &hash)
+        encode_served_block(cache.as_ref(), query.as_ref(), &hash, witness)
     })
     .await
     .map_err(|_| NetError::Protocol("serve reconstruct join failed"))??;
@@ -8756,15 +8758,30 @@ pub fn payload_tx_count(payload: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
+/// A getdata `block` body. Core serves `MSG_WITNESS_BLOCK` with witness data
+/// and `MSG_BLOCK` without (`TX_NO_WITNESS`). Only the witness form can pass
+/// stored bytes through unchanged.
 #[doc(hidden)]
-pub fn encode_served_witness_block(
+pub fn encode_served_block(
     cache: &BlockCache,
     query: &Query,
     hash: &BlockHash,
+    witness: bool,
 ) -> Result<Option<Vec<u8>>, NetError> {
     crate::reactor::assert_not_reactor("getdata reconstruct");
     let t0 = std::time::Instant::now();
-    if let Some(block) = cache.get_block(hash).or_else(|| cache.servable(hash)) {
+    let block = if witness {
+        cache.get_block(hash).or_else(|| cache.servable(hash))
+    } else {
+        let Some(mut block) = block_for_peer(cache, query, hash)? else {
+            return Ok(None);
+        };
+        for input in block.txdata.iter_mut().flat_map(|tx| tx.input.iter_mut()) {
+            input.witness.clear();
+        }
+        Some(block)
+    };
+    if let Some(block) = block {
         let tx_count = block.txdata.len() as u32;
         let encoded = crate::v2::encode_v2_contents(NetworkMessage::Block(block))?;
         let payload_len = encoded.len().saturating_sub(1);

@@ -83,7 +83,7 @@ pub fn outbound_queued_bytes(out: &PeerOut) -> usize {
 #[derive(Debug)]
 pub enum PeerOut {
     Msg(NetworkMessage),
-    /// A getdata witness block, pre-encoded. Holds one serve slot.
+    /// A getdata block, pre-encoded. Holds one serve slot.
     Encoded(Vec<u8>),
     /// A getdata `block` or `cmpctblock`. Holds one serve slot.
     Served(NetworkMessage),
