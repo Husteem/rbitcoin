@@ -69,12 +69,12 @@ impl IbdReorgState {
     /// tip+1, so one pass never evicts its own first candidate.
     pub const DEFER_CAP: usize = Self::EXPLORE_CAP + 1;
 
-    /// Keep `cands` for one off-lock retry, at most [`Self::DEFER_CAP`].
+    /// Keep `cands` for one off-lock retry, at most [`Self::DEFER_CAP`]. A
+    /// hash deferred again moves to the newest end, so a full list drops a
+    /// hash no later pass offered.
     pub fn defer(&mut self, cands: &[BlockHash]) {
         for h in cands {
-            if self.deferred.contains(h) {
-                continue;
-            }
+            self.deferred.retain(|d| d != h);
             if self.deferred.len() >= Self::DEFER_CAP {
                 self.deferred.remove(0);
             }

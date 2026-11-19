@@ -845,6 +845,33 @@ fn deferral_keeps_a_whole_pass() {
     assert_eq!(st.deferred, cands);
 }
 
+/// A hash deferred again is the newest entry, so a full list evicts a hash
+/// no later pass offered, not the fork the last pass selected.
+#[test]
+fn deferring_a_queued_hash_again_keeps_it() {
+    let hash = |i: u32| {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&i.to_le_bytes());
+        BlockHash::from_byte_array(raw)
+    };
+    let mut st = IbdReorgState::new();
+    let full: Vec<BlockHash> = (0..IbdReorgState::DEFER_CAP as u32).map(hash).collect();
+    st.defer(&full);
+    let selected = full[0];
+    let late = hash(IbdReorgState::DEFER_CAP as u32);
+    st.defer(&[selected, late]);
+    assert_eq!(st.deferred.len(), IbdReorgState::DEFER_CAP);
+    assert!(
+        st.deferred.contains(&selected),
+        "the re-deferred fork stays"
+    );
+    assert!(st.deferred.contains(&late));
+    assert!(
+        !st.deferred.contains(&full[1]),
+        "the oldest untouched hash goes"
+    );
+}
+
 /// A header-thread pass with no candidates takes no gate and reads no
 /// chain work, so a cold chain-work prefix stays cold.
 #[test]
