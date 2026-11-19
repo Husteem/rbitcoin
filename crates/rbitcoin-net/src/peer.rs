@@ -4599,10 +4599,14 @@ pub async fn on_getblocks(
         headers_for_peer(hub.cache.as_ref(), hub.query.as_ref(), &gh)
     })
     .await??;
+    // The header walk is `getheaders`', which includes `hashStop`. Core's
+    // `getblocks` loop breaks before it.
     let inv: Vec<Inventory> = headers
         .into_iter()
+        .map(|h| h.block_hash())
+        .take_while(|h| *h != gb.stop_hash)
         .take(500)
-        .map(|h| Inventory::Block(h.block_hash()))
+        .map(Inventory::Block)
         .collect();
     if !inv.is_empty() {
         queue_accounted(session, out_tx, NetworkMessage::Inv(inv))?;
