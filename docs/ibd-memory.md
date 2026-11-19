@@ -43,9 +43,9 @@ ContigPark pipeline).
 A would **double disk write every block**. Process memory + redownload on restart
 is the deliberate tradeoff. Accept stores raw wire only (block hash already known
 from framing). After lookup promotes a height we hold the decoded `Block` +
-pres and **not** the raw bytes. Inside one lookup wave a decoded height keeps
-its raw row until the wave promotes, after the TipOnly read, so that wave holds
-both forms (up to ~64k inputs of blocks). Reorg gather that wants wire re-encodes.
+pres and **not** the raw bytes. Lookup promotes each height as it decodes it,
+before the wave's TipOnly read, so a block holds both forms only during its own
+decode. Reorg gather that wants wire re-encodes.
 
 | Structure | Cap / bound | Production clear / evict |
 |-----------|-------------|---------------------------|
