@@ -142,14 +142,14 @@ impl ConfirmedTable {
     }
 }
 
+/// Bytes [`StrongTxTable::open`] reads per chunk.
+pub const STRONG_OPEN_CHUNK: usize = 16 << 20;
+
 /// Per-tx strong bit (schema v3): bit `(tx_fk - 1)` set ⇒ strong on best chain.
 /// ~64× smaller than a `u64` per tx; the header fk comes from the confirmed range.
 /// Always in RAM, ignoring [`crate::array_table::class_c_inram_max_bytes`].
 /// The words are [`ArrayTable`]'s slot buffer. Its length is body bytes, not
 /// rounded up to a word. Flush is that table's flush.
-/// Bytes [`StrongTxTable::open`] reads per chunk.
-pub const STRONG_OPEN_CHUNK: usize = 16 << 20;
-
 pub struct StrongTxTable {
     pub table: ArrayTable,
     /// Number of bits allocated (covers tx fks 1..=n_bits).
