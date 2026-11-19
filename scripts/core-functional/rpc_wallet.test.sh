@@ -587,3 +587,43 @@ node.shutdown()
 rpc_proxy.ESPLORA_READY_S = _saved_ready
 print("ok - dead esplora is an error, not a zero balance")
 PY
+
+python3 - <<'PY'
+# A 404 from Esplora (a conflicted tx is neither confirmed nor in the
+# mempool) must not leave its response open. Python 3.14 finalizes the
+# HTTPError after the socket is gone and prints to the shim's stderr,
+# which fails Core's stop check (wallet_txn_clone.py).
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
+
+from rpc_util import RpcError  # puts Core's test_framework on sys.path
+from rpc_wallet import WalletHub
+
+
+class NotFound(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        return
+
+    def do_GET(self):
+        body = b"Transaction not found"
+        self.send_response(404)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+srv = HTTPServer(("127.0.0.1", 0), NotFound)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+hub = SimpleNamespace(esplora_url=f"http://127.0.0.1:{srv.server_address[1]}")
+try:
+    WalletHub._esplora_once(hub, "/tx/" + "22" * 32 + "/status")
+    raise AssertionError("a 404 returned a body")
+except RpcError as e:
+    err = e
+cause = err.__cause__
+fp = getattr(cause, "fp", None)
+assert fp is None or fp.closed, f"404 response left open: {cause!r}"
+srv.shutdown()
+print("ok - an Esplora 404 closes its response")
+PY
