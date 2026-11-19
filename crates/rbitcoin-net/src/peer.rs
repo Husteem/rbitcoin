@@ -4724,19 +4724,11 @@ pub async fn serve_getdata_full_block(
     h: &bitcoin::BlockHash,
     witness: bool,
 ) -> Result<bool, NetError> {
-    // `MSG_BLOCK` decodes the whole block to strip it: the same budget as
-    // the compact serve. The witness form passes stored bytes through.
-    let permit = if witness {
-        None
-    } else {
-        Some(block_reconstruct_permit().await?)
-    };
     let query = Arc::clone(&hub.query);
     let cache = Arc::clone(&hub.cache);
     let hash = *h;
     let served = tokio::task::spawn_blocking(move || -> Result<FullBlockServe, NetError> {
         let _g = crate::reactor::BlockingRegion::enter();
-        let _permit = permit;
         // A known stale body is not read. A header with no body is notfound.
         if header_outside_relay_window(query.as_ref(), &hash) {
             let have = cache.has_body(&hash)
@@ -8848,9 +8840,10 @@ pub fn payload_tx_count(payload: &[u8]) -> u32 {
         .unwrap_or(0)
 }
 
-/// A getdata `block` body. Core serves `MSG_WITNESS_BLOCK` with witness data
-/// and `MSG_BLOCK` without (`TX_NO_WITNESS`). Only the witness form can pass
-/// stored bytes through unchanged.
+/// A getdata `block` body as v2 contents. Core serves `MSG_WITNESS_BLOCK`
+/// with witness data and `MSG_BLOCK` without (`TX_NO_WITNESS`). Both start
+/// from the witness serialization; `MSG_BLOCK` then drops the marker, flag
+/// and witness stacks with a wire walk, so no `Block` is decoded for it.
 #[doc(hidden)]
 pub fn encode_served_block(
     cache: &BlockCache,
@@ -8862,35 +8855,37 @@ pub fn encode_served_block(
     cache.note_body_load();
     crate::reactor::assert_not_reactor("getdata reconstruct");
     let t0 = std::time::Instant::now();
-    let block = if witness {
-        cache.get_block(hash).or_else(|| cache.servable(hash))
-    } else {
-        let Some(mut block) = block_for_peer(cache, query, hash)? else {
-            return Ok(None);
+    let (tx_count, contents) =
+        if let Some(block) = cache.get_block(hash).or_else(|| cache.servable(hash)) {
+            let tx_count = block.txdata.len() as u32;
+            (
+                tx_count,
+                crate::v2::encode_v2_contents(NetworkMessage::Block(block))?,
+            )
+        } else {
+            match query.witness_block_bytes_by_hash(&hash.to_byte_array()) {
+                Ok(Some(payload)) => {
+                    let mut contents = Vec::with_capacity(1 + payload.len());
+                    contents.push(2);
+                    contents.extend_from_slice(&payload);
+                    (payload_tx_count(&payload), contents)
+                }
+                Ok(None) => return Ok(None),
+                Err(rbitcoin_store::StoreError::Pruned { .. }) => return Ok(None),
+                Err(e) => return Err(NetError::Consensus(e.to_string())),
+            }
         };
-        for input in block.txdata.iter_mut().flat_map(|tx| tx.input.iter_mut()) {
-            input.witness.clear();
-        }
-        Some(block)
+    let contents = if witness {
+        contents
+    } else {
+        let stripped = rbitcoin_store::block_wire::block_wire_strip_witness(&contents[1..])
+            .ok_or_else(|| NetError::Consensus(format!("served block {hash} does not walk")))?;
+        let mut plain = Vec::with_capacity(1 + stripped.len());
+        plain.push(2);
+        plain.extend_from_slice(&stripped);
+        plain
     };
-    if let Some(block) = block {
-        let tx_count = block.txdata.len() as u32;
-        let encoded = crate::v2::encode_v2_contents(NetworkMessage::Block(block))?;
-        let payload_len = encoded.len().saturating_sub(1);
-        crate::serve_perf::note_serve(tx_count, payload_len, t0.elapsed().as_nanos());
-        return Ok(Some(encoded));
-    }
-    match query.witness_block_bytes_by_hash(&hash.to_byte_array()) {
-        Ok(Some(payload)) => {
-            let tx_count = payload_tx_count(&payload);
-            crate::serve_perf::note_serve(tx_count, payload.len(), t0.elapsed().as_nanos());
-            let mut contents = Vec::with_capacity(1 + payload.len());
-            contents.push(2);
-            contents.extend_from_slice(&payload);
-            Ok(Some(contents))
-        }
-        Ok(None) => Ok(None),
-        Err(rbitcoin_store::StoreError::Pruned { .. }) => Ok(None),
-        Err(e) => Err(NetError::Consensus(e.to_string())),
-    }
+    let payload_len = contents.len().saturating_sub(1);
+    crate::serve_perf::note_serve(tx_count, payload_len, t0.elapsed().as_nanos());
+    Ok(Some(contents))
 }

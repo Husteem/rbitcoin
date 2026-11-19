@@ -400,11 +400,11 @@ fn tx_announce_skips_a_tx_gone_from_the_pool() {
     assert_eq!(tx_announce_inv(mp, &gone), None);
 }
 
-/// A `MSG_BLOCK` serve decodes the whole block to strip it, so it takes a
-/// block decode permit as the compact serve does. With every permit held it
-/// waits, and it finishes once they are released.
+/// A `MSG_BLOCK` serve strips the stored witness bytes with a wire walk and
+/// decodes no `Block`, so, like `MSG_WITNESS_BLOCK`, it takes no block
+/// decode permit. With every permit held it still finishes.
 #[test]
-fn getdata_msg_block_waits_for_a_decode_permit() {
+fn getdata_msg_block_takes_no_decode_permit() {
     let (_dir, hub) = open_tip_announce_hub("getdata-permit");
     let tip = hub.tip_hash().expect("tip");
     let sem = Arc::clone(rbitcoin_net::msg_decode::block_decode_semaphore());
@@ -427,15 +427,11 @@ fn getdata_msg_block_waits_for_a_decode_permit() {
                 None,
                 vec![Inventory::Block(tip)],
             );
-            tokio::pin!(serve);
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), &mut serve)
-                    .await
-                    .is_err(),
-                "MSG_BLOCK serve waits for a decode permit"
-            );
+            tokio::time::timeout(Duration::from_secs(10), serve)
+                .await
+                .expect("MSG_BLOCK serve does not wait for a decode permit")
+                .expect("getdata");
             drop(held);
-            serve.await.expect("getdata");
         });
     assert_eq!(
         served_block(out_rx.try_recv().expect("served")).block_hash(),
