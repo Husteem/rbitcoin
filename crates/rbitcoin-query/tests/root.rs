@@ -2351,3 +2351,176 @@ fn torn_scripthash_slab_on_apply_marks_a_rebuild() {
     assert!(q.sh_force_rebuild(), "the next start rebuilds the index");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn apply_sh_pending_in_posting_gap(q: &Query) -> Result<(), rbitcoin_query::QueryError> {
+    q.apply_sh_pending()?;
+    Ok(())
+}
+
+fn torn_posting_read(q: &Query) -> Result<(), rbitcoin_query::QueryError> {
+    q.sh.publish_seq
+        .fetch_add(2, std::sync::atomic::Ordering::Release);
+    Err(StoreError::Corrupt(
+        "invariant: scripthash slab used != decoded fk count",
+    ))
+}
+
+/// History reads the durable posting list, then a commit drops the RAM copy,
+/// then history reads the pending list. That commit's creates stay in the
+/// result once. A later read of the same script does not repeat them.
+#[test]
+fn sh_history_keeps_a_create_committed_between_the_lists() {
+    let (dir, q) = temp_query("sh-posting-gap");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let txid0 = t0.tx.txid;
+    let hash0 = h0.hash;
+    q.commit_class_a_only(&h0, &[t0]).unwrap();
+    let hfk0 = q.confirm_block(Height(0), &hash0).unwrap();
+    q.release_index_writebehind(Height(0));
+    q.apply_sh_pending().unwrap();
+
+    let (h1, t1) = coinbase_block(1, hfk0, Some(hash0));
+    let txid1 = t1.tx.txid;
+    q.commit_class_a_only(&h1, &[t1]).unwrap();
+    q.confirm_block(Height(1), &h1.hash).unwrap();
+
+    let sh = script_hash(&[0x51]);
+    assert_eq!(
+        q.store.scripthash.create_fks(&sh).unwrap().len(),
+        1,
+        "only the first create is durable"
+    );
+    assert_eq!(
+        q.pending_sh_create_fks(&sh).len(),
+        1,
+        "the second create is still only in RAM"
+    );
+
+    struct ClearGap;
+    impl Drop for ClearGap {
+        fn drop(&mut self) {
+            rbitcoin_query::scripthash::set_sh_posting_gap_for_test(None);
+        }
+    }
+    let _clear = ClearGap;
+    rbitcoin_query::scripthash::set_sh_posting_gap_for_test(Some(apply_sh_pending_in_posting_gap));
+
+    let first = q.scripthash_history(&sh).unwrap();
+    assert!(
+        q.pending_sh_create_fks(&sh).is_empty(),
+        "the gap commit dropped the RAM copy"
+    );
+    assert_eq!(
+        q.store.scripthash.create_fks(&sh).unwrap().len(),
+        2,
+        "the gap commit appended the second create"
+    );
+    let mut want = vec![txid0, txid1];
+    want.sort();
+    let txids = |rows: &[rbitcoin_query::ScriptHashHistoryItem]| {
+        let mut got: Vec<[u8; 32]> = rows.iter().map(|row| row.txid).collect();
+        got.sort();
+        got
+    };
+    assert_eq!(
+        txids(&first),
+        want,
+        "creates committed between the two lists stay in that read"
+    );
+    let again = q.scripthash_history(&sh).unwrap();
+    assert_eq!(txids(&again), want, "a later read does not duplicate them");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn sh_two_blocks(
+    label: &str,
+) -> (
+    rbitcoin_query::testutil::TempDir,
+    Query,
+    [u8; 32],
+    [u8; 32],
+    [u8; 32],
+) {
+    let (dir, q) = temp_query(label);
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let txid0 = t0.tx.txid;
+    let hash0 = h0.hash;
+    q.commit_class_a_only(&h0, &[t0]).unwrap();
+    let hfk0 = q.confirm_block(Height(0), &hash0).unwrap();
+    q.release_index_writebehind(Height(0));
+    q.apply_sh_pending().unwrap();
+    let (h1, t1) = coinbase_block(1, hfk0, Some(hash0));
+    let txid1 = t1.tx.txid;
+    q.commit_class_a_only(&h1, &[t1]).unwrap();
+    q.confirm_block(Height(1), &h1.hash).unwrap();
+    let sh = script_hash(&[0x51]);
+    (dir, q, sh, txid0, txid1)
+}
+
+/// A flush error after the durable append must not leave that create in RAM.
+/// The count is the durable list plus the pending list, so a leftover RAM
+/// copy makes `scripthash_create_count` one high.
+#[test]
+fn sh_create_count_stays_single_when_include_hwm_advance_fails() {
+    let (dir, q, sh, txid0, txid1) = sh_two_blocks("sh-hwm-fail");
+    assert_eq!(q.pending_sh_create_fks(&sh).len(), 1);
+    struct ClearFail;
+    impl Drop for ClearFail {
+        fn drop(&mut self) {
+            rbitcoin_query::connect::set_sh_include_hwm_fail_for_test(false);
+        }
+    }
+    let _clear = ClearFail;
+    rbitcoin_query::connect::set_sh_include_hwm_fail_for_test(true);
+    let err = q.apply_sh_pending().unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(msg) if msg.contains("include_hwm")),
+        "{err}"
+    );
+    assert!(
+        q.pending_sh_create_fks(&sh).is_empty(),
+        "a failed include_hwm advance still drops the RAM copy"
+    );
+    assert_eq!(
+        q.scripthash_create_count(&sh).unwrap(),
+        2,
+        "the create is not counted in both lists"
+    );
+    let rows = q.scripthash_history(&sh).unwrap();
+    let mut got: Vec<[u8; 32]> = rows.iter().map(|row| row.txid).collect();
+    got.sort();
+    let mut want = vec![txid0, txid1];
+    want.sort();
+    assert_eq!(got, want, "history still returns each create once");
+    drop(dir);
+}
+
+/// A posting read that errors while the publish sequence moves tries again.
+/// The second pass returns the creates. A stable sequence still returns the error.
+#[test]
+fn sh_history_retries_when_a_torn_posting_read_errors() {
+    let (dir, q) = temp_query("sh-torn-posting");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let txid0 = t0.tx.txid;
+    let hash0 = h0.hash;
+    q.commit_class_a_only(&h0, &[t0]).unwrap();
+    q.confirm_block(Height(0), &hash0).unwrap();
+    q.release_index_writebehind(Height(0));
+    q.apply_sh_pending().unwrap();
+    let sh = script_hash(&[0x51]);
+
+    struct ClearGap;
+    impl Drop for ClearGap {
+        fn drop(&mut self) {
+            rbitcoin_query::scripthash::set_sh_posting_gap_for_test(None);
+        }
+    }
+    let _clear = ClearGap;
+    rbitcoin_query::scripthash::set_sh_posting_gap_for_test(Some(torn_posting_read));
+    let rows = q
+        .scripthash_history(&sh)
+        .expect("a torn posting read retries once the sequence moves");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].txid, txid0);
+    drop(dir);
+}

@@ -18,6 +18,45 @@ pub fn index_sh_ram_head(head: &mut HashMap<[u8; 32], Vec<Fk>>, job: &ShPendingJ
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static SH_INCLUDE_HWM_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One-shot failure of the next inclusion-watermark advance that would sync.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_sh_include_hwm_fail_for_test(fail: bool) {
+    SH_INCLUDE_HWM_FAIL.with(|slot| slot.set(fail));
+}
+
+#[cfg(debug_assertions)]
+fn take_sh_include_hwm_fail() -> bool {
+    SH_INCLUDE_HWM_FAIL.with(|slot| slot.replace(false))
+}
+
+#[cfg(not(debug_assertions))]
+fn take_sh_include_hwm_fail() -> bool {
+    false
+}
+
+struct ShPublishGuard<'a>(&'a std::sync::atomic::AtomicU64);
+
+impl<'a> ShPublishGuard<'a> {
+    fn enter(seq: &'a std::sync::atomic::AtomicU64) -> Self {
+        seq.fetch_add(1, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        Self(seq)
+    }
+}
+
+impl Drop for ShPublishGuard<'_> {
+    fn drop(&mut self) {
+        std::sync::atomic::fence(Ordering::Release);
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
 #[doc(hidden)]
 pub fn unindex_sh_ram_head(head: &mut HashMap<[u8; 32], Vec<Fk>>, job: &ShPendingJob) {
     for r in &job.records {
@@ -1098,8 +1137,8 @@ impl Query {
     }
 
     pub fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
-        let applied = match self.apply_sh_job_inner(&job) {
-            Ok(applied) => applied,
+        match self.apply_sh_job_inner(&job) {
+            Ok(_) => {}
             // The single appender read a torn slab: it is on disk, not a
             // reader racing an append. The next start rebuilds the index.
             Err(e @ StoreError::Corrupt(_)) => {
@@ -1111,9 +1150,6 @@ impl Query {
                 return Err(e);
             }
             Err(e) => return Err(e),
-        };
-        if applied {
-            unindex_sh_ram_head(&mut self.sh.ram_head.lock().unwrap(), &job);
         }
         Ok(())
     }
@@ -1134,6 +1170,10 @@ impl Query {
             return Ok(false);
         }
 
+        // Odd across the append and the RAM drop. Readers that sampled an
+        // even seq before this cannot pair that durable list with the
+        // post-drop RAM list. The inclusion sync stays outside this window.
+        let publish = ShPublishGuard::enter(&self.sh.publish_seq);
         let sh_creates = &job.records;
 
         if !sh_creates.is_empty() {
@@ -1159,6 +1199,8 @@ impl Query {
             st.add_sh_part(&st.sh_head_ns, timing.head_ns);
         }
 
+        unindex_sh_ram_head(&mut self.sh.ram_head.lock().unwrap(), job);
+        drop(publish);
         self.set_sh_indexed_through_height(Some(job.height.0));
         self.sh
             .applied_max_fk
@@ -1190,6 +1232,9 @@ impl Query {
         }
         if want <= self.store.scripthash.include_hwm() {
             return Ok(());
+        }
+        if take_sh_include_hwm_fail() {
+            return Err(StoreError::Corrupt("scripthash include_hwm advance failed"));
         }
         let t0 = std::time::Instant::now();
         self.store.scripthash.flush()?;
