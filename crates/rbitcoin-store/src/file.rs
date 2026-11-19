@@ -1413,6 +1413,11 @@ impl TableFile {
                 ));
             }
         }
+        // The io_uring `Fsync` ops below never reach `Durable`.
+        #[cfg(debug_assertions)]
+        if crate::durability::flushes_skipped() {
+            return Ok(());
+        }
         let handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
         let res = crate::bulk_io::sync_data_batch(&handles)
             .unwrap_or_else(|| vec![i32::MIN; files.len()]);
