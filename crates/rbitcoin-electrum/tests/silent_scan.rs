@@ -741,7 +741,10 @@ fn labels_are_u32_and_capped_while_read() {
     assert!(parse(json!([4_294_967_295u64])).is_ok());
     let repeated: Vec<u64> = std::iter::repeat_n(1, 1000).collect();
     assert!(parse(json!(repeated)).is_ok(), "duplicates are one label");
-    let many: Vec<u64> = (1..=200_000).collect();
+    // The eleventh distinct label stops the read before a later bad entry
+    // is reached; a cap checked after the loop would report the u32 error.
+    let mut many: Vec<u64> = (1..=10).collect();
+    many.push(4_294_967_296);
     let err = parse(json!(many)).err();
     assert!(
         err.as_deref().is_some_and(|e| e.contains("too many")),
