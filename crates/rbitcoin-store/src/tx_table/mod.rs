@@ -1799,7 +1799,7 @@ impl TxTable {
             t.seal_unsealed_nontail_from_body()?;
             let n = t.count();
             let covered = t.head.last_inserted_fk();
-            if let Some(first) = t.head.open_tail_rebuild_from() {
+            if let Some(first) = t.head.open_tail_rebuild_from()? {
                 rbitcoin_log::info!(
                     "store: tx.head open tail snapshot missing first_fk={first} \
                      covered={covered} n={n} — rebuild tail"

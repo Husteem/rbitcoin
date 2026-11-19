@@ -754,10 +754,12 @@ impl SegmentedTxHead {
 
     pub fn flush(&self) -> Result<(), StoreError> {
         let _w = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        self.wait_seal_locked()?;
+        // A seal error still leaves the open tables on disk. Returning
+        // first would skip the snapshot.
+        let seal = self.wait_seal_locked();
         self.snapshot_open_heads_locked()?;
-        self.persist_meta_locked()?;
-        Ok(())
+        let meta = self.persist_meta_locked();
+        seal.and(meta)
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
@@ -765,21 +767,32 @@ impl SegmentedTxHead {
     }
 
     /// `Some(first_fk)` when the open tail's slots were not loaded from a
-    /// snapshot whose generation equals its meta count. Call before any
-    /// insert in this process: a later insert leaves `loaded_generation` stale.
+    /// snapshot whose generation equals its meta count. Clears that count
+    /// and deletes the untrusted image, so a later snapshot names only rows
+    /// this process stores. Call before any insert in this process.
     #[doc(hidden)]
-    pub fn open_tail_rebuild_from(&self) -> Option<u64> {
+    pub fn open_tail_rebuild_from(&self) -> Result<Option<u64>, StoreError> {
         let segs = self.segments_snapshot();
-        let tail = segs.last()?;
+        let Some(tail) = segs.last() else {
+            return Ok(None);
+        };
         if tail.sealed {
-            return None;
+            return Ok(None);
         }
         let count = tail.count.load(Ordering::Relaxed);
         match tail.loaded_generation {
-            Some(g) if g == count => None,
-            _ if count == 0 => None,
-            _ => Some(tail.first_fk),
+            Some(g) if g == count => return Ok(None),
+            _ if count == 0 => return Ok(None),
+            _ => {}
         }
+        let path = segment_head_path(&self.dir, tail.file_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&path, e)),
+        }
+        tail.count.store(0, Ordering::Relaxed);
+        Ok(Some(tail.first_fk))
     }
 
     fn snapshot_open_heads_locked(&self) -> Result<(), StoreError> {
@@ -929,14 +942,28 @@ impl SegmentedTxHead {
         if !found {
             return Err(StoreError::Corrupt("tx.head seal publish: file_id missing"));
         }
-        // Keep the private table alive until sealed meta is durable. A failed
-        // persist puts that table back so drop can snapshot it.
+        // The sealed list stays. A failed meta write snapshots the private
+        // table so a crash can reopen that segment unsealed. The next
+        // persist records the sealed flag. Putting the unsealed list back
+        // drops the in-flight seal, and the next roll then persists two
+        // unsealed non-tails.
         let previous = Arc::clone(&*guard);
         *guard = Arc::new(new_list);
         drop(guard);
         if let Err(e) = self.persist_meta_locked() {
-            let mut guard = self.segments.write().unwrap_or_else(|err| err.into_inner());
-            *guard = previous;
+            if let Some(seg) = previous.iter().find(|s| s.file_id == p.file_id) {
+                if let Some(h) = seg.head.as_ref() {
+                    if h.is_dirty() {
+                        let count = seg.count.load(Ordering::Relaxed);
+                        let path = segment_head_path(&self.dir, seg.file_id);
+                        if let Err(snap) = h.write_snapshot(&path, count) {
+                            rbitcoin_log::warn!(
+                                "store: tx.head snapshot after failed seal meta: {snap}"
+                            );
+                        }
+                    }
+                }
+            }
             return Err(e);
         }
         let base = segment_head_path(&self.dir, p.file_id);

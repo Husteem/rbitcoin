@@ -4381,6 +4381,52 @@ fn open_tail_snapshot_generation_and_zero_rebuilds() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A tail persisted at `max_keys` with no image must refill and open.
+/// Rolling first rejects every fk in the old span.
+#[test]
+fn open_rebuilds_a_full_untrusted_tail() {
+    let dir = tempfile_dir("full-tail");
+    let layout = HeadLayout::new(8).unwrap();
+    let max_keys = 204u64;
+    let n = max_keys;
+    let recs: Vec<TxRecord> = (0..n)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&(i + 1).to_le_bytes());
+            TxRecord {
+                txid,
+                version: 1,
+                locktime: 0,
+                input_count: 0,
+                output_count: 0,
+            }
+        })
+        .collect();
+    {
+        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        t.put_full_batch_indexed(&meta_only_items(&recs), true)
+            .unwrap();
+    }
+    rbitcoin_store::segmented_head::write_meta(&dir, 8, &[(1, max_keys, 0, 2)]).unwrap();
+    for name in [
+        "000000",
+        "000000.mphf",
+        "000000.fuse8",
+        "000001",
+        "000001.mphf",
+        "000001.fuse8",
+    ] {
+        let _ = std::fs::remove_file(dir.join("tx.head").join(name));
+    }
+    let t = TxTable::open_tiny(&dir).expect("a full untrusted tail rebuilds");
+    for i in 1..=n {
+        let mut txid = [0u8; 32];
+        txid[0..8].copy_from_slice(&i.to_le_bytes());
+        assert_eq!(t.probe_body_match_fk(&txid).unwrap(), Some(Fk(i)), "fk={i}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Kill mid-seal: meta still has an unsealed non-tail. Open rebuilds fuse
 /// keys from Class A and seals it before returning. The copy has no
 /// open-address file.
