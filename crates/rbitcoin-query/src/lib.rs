@@ -398,6 +398,9 @@ pub struct ShWriteBehind {
     /// Serializes Class B `put_create_batch_append`: write-behind, the
     /// generate drain, and the Class A tail backfill.
     pub appender: Mutex<()>,
+    /// Even while the durable posting list and `ram_head` agree.
+    /// Odd across the append and the RAM drop in `apply_sh_job_inner`.
+    pub publish_seq: AtomicU64,
     /// Max create fk applied to the SH tables (may lead `include_hwm`).
     pub applied_max_fk: AtomicU64,
     /// Last durable `include_hwm` advance (throttles table syncs in a burst).
@@ -414,6 +417,7 @@ impl ShWriteBehind {
             applying: Mutex::new(None),
             ram_head: Mutex::new(HashMap::new()),
             appender: Mutex::new(()),
+            publish_seq: AtomicU64::new(0),
             applied_max_fk: AtomicU64::new(0),
             last_durable: Mutex::new(std::time::Instant::now()),
         }

@@ -25,12 +25,15 @@ pub fn set_sh_posting_gap_for_test(hook: Option<fn(&Query)>) {
     SH_POSTING_GAP.with(|slot| slot.set(hook));
 }
 
+#[cfg(debug_assertions)]
 fn note_sh_posting_gap(query: &Query) {
-    #[cfg(debug_assertions)]
     if let Some(hook) = SH_POSTING_GAP.with(|slot| slot.take()) {
         hook(query);
     }
 }
+
+#[cfg(not(debug_assertions))]
+fn note_sh_posting_gap(_query: &Query) {}
 
 /// While held, an unpaged join on this thread skips `--max-sh-creates`.
 /// `--heavy-sh-creates` still applies. The Esplora unix socket's
@@ -1326,6 +1329,43 @@ impl Query {
         }))
     }
 
+    /// Runs `body` while `publish_seq` stays even.
+    /// A commit between the durable list and the RAM list runs `body` again.
+    fn read_stable_sh_publish<T>(
+        &self,
+        body: impl Fn(&Self) -> Result<T, QueryError>,
+    ) -> Result<T, QueryError> {
+        loop {
+            let seq1 = self
+                .sh
+                .publish_seq
+                .load(std::sync::atomic::Ordering::Acquire);
+            if seq1 & 1 == 1 {
+                std::thread::yield_now();
+                continue;
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            let value = body(self)?;
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            let seq2 = self
+                .sh
+                .publish_seq
+                .load(std::sync::atomic::Ordering::Acquire);
+            if seq1 == seq2 {
+                return Ok(value);
+            }
+        }
+    }
+
+    /// Durable creates and pending RAM creates from one even `publish_seq`.
+    fn stable_sh_postings(&self, scripthash: &[u8; 32]) -> Result<(Vec<Fk>, Vec<Fk>), QueryError> {
+        self.read_stable_sh_publish(|query| {
+            let durable = query.store.scripthash.create_fks(scripthash)?;
+            note_sh_posting_gap(query);
+            Ok((durable, query.pending_sh_create_fks(scripthash)))
+        })
+    }
+
     /// Best-chain creates of `scripthash` at `view`, oldest fk first,
     /// without the genesis coinbase ([`Query::set_genesis_coinbase_txid`]).
     #[doc(hidden)]
@@ -1335,14 +1375,14 @@ impl Query {
         view: &ChainView,
     ) -> Result<Vec<Fk>, QueryError> {
         let genesis = self.genesis_coinbase_fk()?;
+        let (durable, pending) = self.stable_sh_postings(scripthash)?;
         let mut fks = Vec::new();
-        for fk in self.store.scripthash.create_fks(scripthash)? {
+        for fk in durable {
             if Some(fk) != genesis && self.confirmed_strong_in(fk, view)? {
                 fks.push(fk);
             }
         }
-        note_sh_posting_gap(self);
-        for fk in self.pending_sh_create_fks(scripthash) {
+        for fk in pending {
             if Some(fk) == genesis || !self.confirmed_strong_in(fk, view)? {
                 continue;
             }
@@ -1998,9 +2038,9 @@ impl Query {
         scripthash: &[u8; 32],
         height: Height,
     ) -> Result<Vec<Fk>, QueryError> {
-        let entries = self.store.scripthash.create_fks(scripthash)?;
+        let (entries, pending) = self.stable_sh_postings(scripthash)?;
         let mut posting: Vec<u64> = entries.iter().filter_map(|fk| fk.get()).collect();
-        for fk in self.pending_sh_create_fks(scripthash) {
+        for fk in pending {
             if let Some(id) = fk.get() {
                 posting.push(id);
             }
@@ -2086,10 +2126,10 @@ impl Query {
         if touch.ids.is_empty() {
             return Ok(false);
         }
-        let entries = self.store.scripthash.create_fks(scripthash)?;
+        let (entries, pending) = self.stable_sh_postings(scripthash)?;
         let hit = entries
             .iter()
-            .chain(self.pending_sh_create_fks(scripthash).iter())
+            .chain(pending.iter())
             .filter_map(|fk| fk.get())
             .any(|id| touch.ids.contains(&id));
         Ok(hit)
@@ -2257,9 +2297,11 @@ impl Query {
 
     /// Durable SH create count plus pending write-behind for this key.
     pub fn scripthash_create_count(&self, scripthash: &[u8; 32]) -> Result<u32, QueryError> {
-        let durable = self.store.scripthash.create_count(scripthash)?;
-        let pending = self.pending_sh_create_fks(scripthash).len() as u32;
-        Ok(durable.saturating_add(pending))
+        self.read_stable_sh_publish(|query| {
+            let durable = query.store.scripthash.create_count(scripthash)?;
+            let pending = query.pending_sh_create_fks(scripthash).len() as u32;
+            Ok(durable.saturating_add(pending))
+        })
     }
 
     /// Confirmed chain_stats for Esplora address/scripthash routes.

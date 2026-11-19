@@ -18,6 +18,23 @@ pub fn index_sh_ram_head(head: &mut HashMap<[u8; 32], Vec<Fk>>, job: &ShPendingJ
     }
 }
 
+struct ShPublishGuard<'a>(&'a std::sync::atomic::AtomicU64);
+
+impl<'a> ShPublishGuard<'a> {
+    fn enter(seq: &'a std::sync::atomic::AtomicU64) -> Self {
+        seq.fetch_add(1, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        Self(seq)
+    }
+}
+
+impl Drop for ShPublishGuard<'_> {
+    fn drop(&mut self) {
+        std::sync::atomic::fence(Ordering::Release);
+        self.0.fetch_add(1, Ordering::Release);
+    }
+}
+
 #[doc(hidden)]
 pub fn unindex_sh_ram_head(head: &mut HashMap<[u8; 32], Vec<Fk>>, job: &ShPendingJob) {
     for r in &job.records {
@@ -1098,8 +1115,8 @@ impl Query {
     }
 
     pub fn apply_sh_job(&self, job: ShPendingJob) -> Result<(), QueryError> {
-        let applied = match self.apply_sh_job_inner(&job) {
-            Ok(applied) => applied,
+        match self.apply_sh_job_inner(&job) {
+            Ok(_) => {}
             // The single appender read a torn slab: it is on disk, not a
             // reader racing an append. The next start rebuilds the index.
             Err(e @ StoreError::Corrupt(_)) => {
@@ -1111,9 +1128,6 @@ impl Query {
                 return Err(e);
             }
             Err(e) => return Err(e),
-        };
-        if applied {
-            unindex_sh_ram_head(&mut self.sh.ram_head.lock().unwrap(), &job);
         }
         Ok(())
     }
@@ -1134,6 +1148,9 @@ impl Query {
             return Ok(false);
         }
 
+        // Odd for the whole publish. Readers that sampled an even seq
+        // before this cannot pair that durable list with the post-drop RAM list.
+        let _publish = ShPublishGuard::enter(&self.sh.publish_seq);
         let sh_creates = &job.records;
 
         if !sh_creates.is_empty() {
@@ -1164,6 +1181,7 @@ impl Query {
             .applied_max_fk
             .fetch_max(tip_sh_max_fk, Ordering::AcqRel);
         self.advance_sh_include_hwm()?;
+        unindex_sh_ram_head(&mut self.sh.ram_head.lock().unwrap(), job);
         Ok(true)
     }
 
