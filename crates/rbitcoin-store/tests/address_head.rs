@@ -62,13 +62,6 @@ fn strip_tags(h: &AddressHead) {
     h.strip_tags_for_test().unwrap();
 }
 
-/// Some slot of the page holds `fk` (tag bits above `bits` ignored).
-fn page_has_fk(buf: &[u8], bits: u32, fk: u64) -> bool {
-    let n = buf.len() / ENTRY_BYTES as usize;
-    let rel_mask = (1u64 << bits) - 1;
-    (0..n).any(|i| entry_from_page_buf(buf, i as u64).unwrap_or(0) & rel_mask == fk)
-}
-
 #[test]
 fn probe_limits_match_policy() {
     assert_eq!(MAX_PROBE, 1024);
@@ -126,20 +119,15 @@ fn hop_scan_page_spills_past_inline_cap() {
 }
 
 #[test]
-fn insert_fk_into_page_buf_empty_idempotent_and_second() {
-    let bits = 16u32;
+fn insert_same_page_is_idempotent_and_keeps_the_second_create() {
+    let h = AddressHead::empty(HeadLayout::new(16).unwrap());
     let mut txid = [0u8; 32];
     txid[0] = 0x42;
-    let page_slots = page_slot_count(bits);
-    let mut buf = vec![0u8; (page_slots as usize) * ENTRY_BYTES as usize];
-    let o1 = insert_fk_into_page_buf(&mut buf, bits, &txid, Fk(7)).unwrap();
-    assert!(o1.wrote_new);
-    assert!(page_has_fk(&buf, bits, 7));
-    let o2 = insert_fk_into_page_buf(&mut buf, bits, &txid, Fk(7)).unwrap();
-    assert!(!o2.wrote_new, "idempotent same fk");
-    let o3 = insert_fk_into_page_buf(&mut buf, bits, &txid, Fk(8)).unwrap();
-    assert!(o3.wrote_new, "second create deeper on chain");
-    assert!(page_has_fk(&buf, bits, 7) && page_has_fk(&buf, bits, 8));
+    h.insert_many_in_place(&mut [(txid, Fk(7)), (txid, Fk(8))])
+        .unwrap();
+    assert_eq!(probe_one(&h, &txid).unwrap(), vec![Fk(7), Fk(8)]);
+    insert_one(&h, &txid, Fk(7)).unwrap();
+    assert_eq!(probe_one(&h, &txid).unwrap(), vec![Fk(7), Fk(8)]);
 }
 
 #[test]
@@ -260,8 +248,8 @@ fn eight_byte_footer_is_refused_not_read_as_pairs() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A probe that races the sole writer's page `pwrite` sees the page
-/// before or after that write, never a miss of a key inserted earlier.
+/// A probe that races the sole writer's slot stores sees every key that
+/// writer has published, never a miss of an earlier key.
 #[test]
 fn probe_during_page_pwrite_keeps_every_published_key() {
     use std::sync::atomic::AtomicBool;
@@ -748,32 +736,33 @@ fn mainnet_default_bits_is_25() {
     assert_eq!(PAGE_SLOTS as usize * 4, 4096);
 }
 
-/// insert_fk_into_page_buf / store_entry error arms + empty page / invalid fk.
+/// A rejected rel writes no slot.
 #[test]
-fn insert_fk_page_buf_error_arms() {
+fn insert_rejects_a_null_or_wide_fk() {
     let txid = [0x11u8; 32];
-    let mut page = vec![0u8; 4096];
+    let h = AddressHead::empty(HeadLayout::new(12).unwrap());
     assert!(matches!(
-        insert_fk_into_page_buf(&mut page, 12, &txid, Fk::NULL),
+        insert_one(&h, &txid, Fk::NULL),
         Err(StoreError::InvalidFk)
     ));
     assert!(matches!(
-        insert_fk_into_page_buf(&mut page, 12, &txid, Fk(u64::from(u32::MAX) + 1)),
+        insert_one(&h, &txid, Fk(u64::from(u32::MAX) + 1)),
         Err(StoreError::InvalidFk)
     ));
     // A rel that does not fit in `bits` would fold into the fingerprint.
     assert!(matches!(
-        insert_fk_into_page_buf(&mut page, 12, &txid, Fk(1 << 12)),
+        insert_one(&h, &txid, Fk(1 << 12)),
         Err(StoreError::InvalidFk)
     ));
+    let n = h.map_bytes() / 4;
     assert!(
-        !page.iter().any(|&b| b != 0),
+        (0..n).all(|s| h.slot_word(s) == 0),
         "a rejected rel writes nothing"
     );
-    let r = insert_fk_into_page_buf(&mut page, 12, &txid, Fk(7)).unwrap();
-    assert!(r.wrote_new);
-    let r2 = insert_fk_into_page_buf(&mut page, 12, &txid, Fk(7)).unwrap();
-    assert!(!r2.wrote_new);
+    insert_one(&h, &txid, Fk(7)).unwrap();
+    assert_eq!(probe_one(&h, &txid).unwrap(), vec![Fk(7)]);
+    insert_one(&h, &txid, Fk(7)).unwrap();
+    assert_eq!(probe_one(&h, &txid).unwrap(), vec![Fk(7)]);
     let _ = probe_index(&txid, 0, MIN_BITS);
     let _ = probe_index(&txid, 3, PAGE_SLOT_BITS);
     let load_ratio = |tx_count: u64, slots: u64| -> f64 {

@@ -14,10 +14,9 @@
 //! Foreigners and older same-txid creates are skipped blindly; a second Class A
 //! row for the same txid lands at the next empty slot (deeper on the probe chain).
 //!
-//! **Insert batching:** stable-sort by probe **page** then original index
-//! (preserves call order within a page for rare same-batch duplicate txids). One
-//! page copy from the private table + multi-insert + a `Release` store of each
-//! changed slot. Readers see the new slot once that store lands.
+//! **Insert batching:** stable-sort by probe **page** (call order stays inside
+//! a page). Each key hops the live slots and `Release`-stores its empty slot.
+//! Readers see that slot before the next key in the batch.
 //!
 //! **Snapshot:** [`AddressHead::write_snapshot`] writes the dense image once,
 //! `fsync`s it with footer generation 0, then stores `generation` and `fsync`s
@@ -393,78 +392,6 @@ pub fn page_base_for_txid(txid: &[u8; 32], bits: u32) -> u64 {
     }
 }
 
-/// Outcome of [`insert_fk_into_page_buf`] (in-buffer only; no file IO).
-#[derive(Debug, Clone, Copy)]
-pub struct InsertPageOutcome {
-    /// Wrote a new empty→fk slot (false if `new_fk` already on the chain).
-    pub wrote_new: bool,
-    /// Probe depth of the empty slot written (or 0 if idempotent).
-    pub depth: u32,
-}
-
-/// Insert `new_fk` into a **loaded** probe page buffer; the new slot carries
-/// the key's fingerprint.
-///
-/// Idempotent if `new_fk` is already present. Does not touch the file or
-/// occupied count — caller applies the buffer via pwrite.
-pub fn insert_fk_into_page_buf(
-    page_buf: &mut [u8],
-    bits: u32,
-    txid: &[u8; 32],
-    new_fk: Fk,
-) -> Result<InsertPageOutcome, StoreError> {
-    if new_fk.is_null() {
-        return Err(StoreError::InvalidFk);
-    }
-    let new_u = new_fk.0;
-    let Some(tagged) = tag_entry(new_u, fingerprint(txid, bits), bits) else {
-        return Err(StoreError::InvalidFk);
-    };
-    let rel_mask = (1u64 << bits) - 1;
-    let nslots = (page_buf.len() / ENTRY_BYTES as usize) as u64;
-    let h1 = h1_in_page(txid, bits);
-    let h2 = h2_in_page(txid, bits);
-    let scan = hop_scan_page(page_buf, h1, h2, nslots, MAX_PROBE);
-    for &(_d, e) in scan.cands.iter() {
-        if e & rel_mask == new_u {
-            return Ok(InsertPageOutcome {
-                wrote_new: false,
-                depth: 0,
-            });
-        }
-    }
-    if !scan.hit_empty {
-        note_probe_exhausted();
-        return Err(StoreError::Corrupt(
-            "address head probe exhausted on insert",
-        ));
-    }
-    store_entry_in_page_buf(page_buf, scan.empty_local, tagged)?;
-    Ok(InsertPageOutcome {
-        wrote_new: true,
-        depth: scan.depth_end,
-    })
-}
-
-/// Write LE create_fk into a page buffer at local slot index.
-#[inline]
-#[doc(hidden)]
-pub fn store_entry_in_page_buf(
-    page_buf: &mut [u8],
-    local: u64,
-    new: u32,
-) -> Result<(), StoreError> {
-    let es = ENTRY_BYTES as usize;
-    let off = (local as usize)
-        .checked_mul(es)
-        .ok_or(StoreError::Corrupt("page buf slot overflow"))?;
-    let slot = page_buf
-        .get_mut(off..off + es)
-        .ok_or(StoreError::Corrupt("page buf slot out of range"))?;
-    slot.copy_from_slice(&new.to_le_bytes());
-    Ok(())
-}
-
 thread_local! {
     static TEST_TX_HEAD_BITS: RefCell<Option<String>> = const { RefCell::new(None) };
 }
@@ -822,56 +749,61 @@ impl AddressHead {
         }
     }
 
-    /// Sort `entries` in place by probe page and insert. No extra pair copy.
+    /// Sort `entries` in place by probe page and insert. Each new create is one
+    /// `Release` store of its empty slot.
     pub fn insert_many_in_place(&self, entries: &mut [([u8; 32], Fk)]) -> Result<(), StoreError> {
         if entries.is_empty() {
             return Ok(());
         }
         let bits = self.layout.bits;
-        let page_slots = page_slot_count(bits) as usize;
-        let n = page_slots * ENTRY_BYTES as usize;
-
         entries.sort_by_key(|a| page_base_for_txid(&a.0, bits));
-
-        let mut buf = [0u8; PROBE_REGION_BYTES];
-        let mut i = 0;
-        while i < entries.len() {
-            let page_base = page_base_for_txid(&entries[i].0, bits);
-            let mut j = i + 1;
-            while j < entries.len() && page_base_for_txid(&entries[j].0, bits) == page_base {
-                j += 1;
+        let mut wrote = false;
+        for (txid, fk) in entries.iter() {
+            if self.insert_one_live(txid, *fk)? {
+                wrote = true;
             }
-
-            // The page (tagged slots) comes from the map, not a pread.
-            let slots = self.slots();
-            for s in 0..page_slots {
-                let e = slots[page_base as usize + s].load(Ordering::Relaxed);
-                buf[s * 4..s * 4 + 4].copy_from_slice(&e.to_le_bytes());
-            }
-
-            let mut dirty = false;
-            for &(ref txid, fk) in &entries[i..j] {
-                let outcome = insert_fk_into_page_buf(&mut buf[..n], bits, txid, fk)?;
-                if outcome.wrote_new {
-                    note_probe_depth_on_insert(outcome.depth);
-                    dirty = true;
-                }
-            }
-            if dirty {
-                let base = page_base as usize;
-                for s in 0..page_slots {
-                    let new = word_at(&buf, s);
-                    let slot = &self.slots[base + s];
-                    if slot.load(Ordering::Relaxed) != new {
-                        slot.store(new, Ordering::Release);
-                    }
-                }
-                self.dirty.store(true, Ordering::Release);
-            }
-            i = j;
         }
-
+        if wrote {
+            self.dirty.store(true, Ordering::Release);
+        }
         Ok(())
+    }
+
+    /// Hop `txid` and store `new_fk` in the first empty slot. `false` when that
+    /// rel is already on the chain. The sole writer, so the walk is `Relaxed`.
+    fn insert_one_live(&self, txid: &[u8; 32], new_fk: Fk) -> Result<bool, StoreError> {
+        if new_fk.is_null() {
+            return Err(StoreError::InvalidFk);
+        }
+        let bits = self.layout.bits;
+        let Some(tagged) = tag_entry(new_fk.0, fingerprint(txid, bits), bits) else {
+            return Err(StoreError::InvalidFk);
+        };
+        let page_slots = page_slot_count(bits);
+        let mask = page_slots - 1;
+        let base = page_base_for_txid(txid, bits) as usize;
+        let h1 = h1_in_page(txid, bits);
+        let h2 = h2_in_page(txid, bits);
+        let max_d = MAX_PROBE.min(page_slots as u32);
+        let rel_mask = (1u64 << bits) - 1;
+        let new_u = new_fk.0;
+        for d in 0..max_d {
+            let local = h1.wrapping_add(u64::from(d).wrapping_mul(h2)) & mask;
+            let slot = &self.slots[base + local as usize];
+            let e = u64::from(slot.load(Ordering::Relaxed));
+            if e == 0 {
+                slot.store(tagged, Ordering::Release);
+                note_probe_depth_on_insert(d);
+                return Ok(true);
+            }
+            if e & rel_mask == new_u {
+                return Ok(false);
+            }
+        }
+        note_probe_exhausted();
+        Err(StoreError::Corrupt(
+            "address head probe exhausted on insert",
+        ))
     }
 }
 
