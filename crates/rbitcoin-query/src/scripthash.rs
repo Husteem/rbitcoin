@@ -1547,7 +1547,8 @@ impl Query {
     ///
     /// A gap inside [`MAX_HISTORY_WINDOW`] still scans those blocks. A wider
     /// gap reads spend slots of the page's creates and of creates below the
-    /// page bound. A spender counts only at a height inside `[low, high]`.
+    /// page bound, and that read is refused above `--max-sh-creates`.
+    /// A spender counts only at a height inside `[low, high]`.
     #[doc(hidden)]
     pub fn spends_for_newest_page(
         &self,
@@ -1563,6 +1564,8 @@ impl Query {
         if high.saturating_sub(low) <= MAX_HISTORY_WINDOW {
             return self.spends_of_members(members, low, high);
         }
+        // Held across the spend-slot read so a heavy script keeps the turn.
+        let _admit = self.unpaged_join_admit(scripthash)?;
         let mut creates = window.creates.clone();
         let mut kept: Vec<u64> = window.creates.iter().map(|(_, fk)| fk.0).collect();
         kept.sort_unstable();
@@ -2050,10 +2053,7 @@ impl Query {
     /// The cheap test that lets callers skip [`Self::block_touch`] when no
     /// subscribed hash could possibly be touched.
     pub fn scripthash_has_postings(&self, scripthash: &[u8; 32]) -> Result<bool, QueryError> {
-        if !self.store.scripthash.create_fks(scripthash)?.is_empty() {
-            return Ok(true);
-        }
-        Ok(!self.pending_sh_create_fks(scripthash).is_empty())
+        Ok(self.scripthash_create_count(scripthash)? > 0)
     }
 
     /// [`Self::scripthash_touched_at_height`] against a prebuilt [`BlockTouch`].
