@@ -34,9 +34,10 @@ pub struct IbdReorgState {
     pub explore_need: Vec<BlockHash>,
     /// Candidate tips on an exploration path (for proactive most-work apply).
     pub explore_tips: Vec<BlockHash>,
-    /// Candidates a selection under `shared` passed over. Its walk stops at
-    /// [`ANCESTOR_WALK_MAX`], so the coordinator's next off-lock turn walks
-    /// each once with the rewind cap in force.
+    /// Candidates of a pass that did not rewind: one under `shared` stops
+    /// its walk at [`ANCESTOR_WALK_MAX`], and a selected path can still be
+    /// refused when confirm holds the tip or moves it. The coordinator's next
+    /// off-lock turn walks each once with the rewind cap in force.
     pub deferred: Vec<BlockHash>,
 }
 
@@ -64,13 +65,17 @@ impl IbdReorgState {
     /// Cap on each explore list. Small enough that membership stays a scan.
     pub const EXPLORE_CAP: usize = 64;
 
-    /// Keep `cands` for one off-lock retry, at most [`Self::EXPLORE_CAP`].
+    /// Cap on [`Self::deferred`]: a full explore list plus the competing
+    /// tip+1, so one pass never evicts its own first candidate.
+    pub const DEFER_CAP: usize = Self::EXPLORE_CAP + 1;
+
+    /// Keep `cands` for one off-lock retry, at most [`Self::DEFER_CAP`].
     pub fn defer(&mut self, cands: &[BlockHash]) {
         for h in cands {
             if self.deferred.contains(h) {
                 continue;
             }
-            if self.deferred.len() >= Self::EXPLORE_CAP {
+            if self.deferred.len() >= Self::DEFER_CAP {
                 self.deferred.remove(0);
             }
             self.deferred.push(*h);
@@ -578,11 +583,14 @@ pub fn maybe_rewind_to_best_work_n(
     let picked = select_heavier_path(hub, &cands, &invalid, walk_max, &mut || {
         *cap.get_or_insert_with(|| super::header_walk::rewind_depth_cap(st, hub))
     })?;
-    let Some((path, cap)) = picked else {
-        st.reorg.defer(&cands);
-        return Ok(false);
+    let rewound = match picked {
+        Some((path, cap)) => apply_header_rewind(st, hub, &path, cap)?,
+        None => false,
     };
-    apply_header_rewind(st, hub, &path, cap)
+    if !rewound {
+        st.reorg.defer(&cands);
+    }
+    Ok(rewound)
 }
 
 #[doc(hidden)]
@@ -851,12 +859,17 @@ fn fire_after_prepare() {
 /// `shared`. One exclusion covers the select, the disconnect, and the
 /// commit. A moved tip or a hash marked invalid skips the commit, so
 /// `clear_path_above` and `set_lookup_taken_hi` stay off that stale height.
+/// A selected path that is not committed defers `cands` to the next
+/// coordinator turn. No candidates is no gate and no chain-work read.
 pub(crate) fn apply_off_lock_rewind(
     shared: &Mutex<super::state::IbdWorkState>,
     hub: &ChainHub,
     cands: &[BlockHash],
     invalid: &HashSet<[u8; 32]>,
 ) -> Result<bool, NetError> {
+    if cands.is_empty() {
+        return Ok(false);
+    }
     let _gate = rewind_exclusion()
         .lock()
         .unwrap_or_else(|err| err.into_inner());
@@ -871,6 +884,11 @@ pub(crate) fn apply_off_lock_rewind(
     };
     let tip_before = tip_pair(hub);
     let Some(prep) = prepare_header_rewind(hub, &path, cap)? else {
+        shared
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .reorg
+            .defer(cands);
         return Ok(false);
     };
     // Re-selecting here would see the LCA we just rewound to and return
@@ -878,13 +896,11 @@ pub(crate) fn apply_off_lock_rewind(
     // either committed or is waiting on this gate.
     fire_after_prepare();
     let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
-    if path
+    let marked_invalid = path
         .iter()
-        .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()))
-    {
-        return Ok(false);
-    }
-    if !rewind_tip_still(hub, &prep, tip_before) {
+        .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()));
+    if marked_invalid || !rewind_tip_still(hub, &prep, tip_before) {
+        st.reorg.defer(cands);
         return Ok(false);
     }
     commit_header_rewind(&mut st, hub, &path, &prep);

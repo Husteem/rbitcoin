@@ -707,8 +707,7 @@ fn selection_walk_reaches_an_lca_one_past_its_depth() {
 /// Each rewind cap in force has a selection walk that reaches its deepest
 /// LCA from tip+1. A 10,000 walk under the 65,536 unproved cap dropped a
 /// heavier fork the rewind would take. The proved walk is no wider than
-/// [`ANCESTOR_WALK_MAX`]: a fork found deeper than the 1,024 cap is refused,
-/// and the first refused path ends that selection pass.
+/// [`ANCESTOR_WALK_MAX`], as before.
 #[test]
 fn selection_walk_covers_every_rewind_cap() {
     for cap in [
@@ -796,6 +795,70 @@ fn a_fork_past_the_under_lock_walk_is_selected_off_lock() {
         st.reorg.deferred.is_empty(),
         "a deferred candidate is retried once"
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A selected fork whose rewind cannot run while confirm holds the tip
+/// commit is deferred again, by the pass under `shared` and by the
+/// coordinator's off-lock turn. Once the commit is free the next turn
+/// rewinds to it.
+#[test]
+fn a_fork_refused_by_a_busy_tip_commit_is_retried() {
+    let (dir, hub) = tmp_hub();
+    let fork = fork_three_under_a_two_block_tip(&hub, 1_500_098_100);
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[2]));
+    let shared = {
+        let _commit = hub.query.lock_tip_commit().unwrap();
+        assert!(!maybe_rewind_to_best_work(&mut st, &hub).unwrap());
+        st.reorg.clear_explore();
+        assert_eq!(st.reorg.deferred, vec![fork[2]]);
+        let shared = Mutex::new(st);
+        rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, &hub);
+        assert_eq!(hub.tip_height(), Some(2), "confirm still holds the tip");
+        shared
+    };
+    rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, &hub);
+    assert_eq!(
+        hub.tip_height(),
+        Some(0),
+        "the next turn rewinds to the fork"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// One pass defers a full explore list and the competing tip+1 without
+/// evicting its own first candidate.
+#[test]
+fn deferral_keeps_a_whole_pass() {
+    let mut st = IbdReorgState::new();
+    let cands: Vec<BlockHash> = (0..=IbdReorgState::EXPLORE_CAP as u32)
+        .map(|i| {
+            let mut raw = [0u8; 32];
+            raw[0..4].copy_from_slice(&i.to_le_bytes());
+            BlockHash::from_byte_array(raw)
+        })
+        .collect();
+    st.defer(&cands);
+    assert_eq!(st.deferred, cands);
+}
+
+/// A header-thread pass with no candidates takes no gate and reads no
+/// chain work, so a cold chain-work prefix stays cold.
+#[test]
+fn an_empty_off_lock_pass_reads_no_chain_work() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    hub.confirm_empty_regtest(3).unwrap();
+    hub.test_clear_chain_work_prefix();
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.header_walk.origin = true;
+    let shared = Mutex::new(st);
+    assert!(!rewind_off_coord_lock(&shared, &hub).unwrap());
+    assert_eq!(hub.test_chain_work_prefix_len(), 0);
     let _ = std::fs::remove_dir_all(dir);
 }
 
