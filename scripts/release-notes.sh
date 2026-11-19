@@ -69,7 +69,10 @@ release_login_from_email() {
 release_thanks_sentence() {
   local skip="${1:-}"
   local prev range line email login
-  prev="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n 1 || true)"
+  # The newest release tag this commit descends from, other than its own
+  # (release.yml runs after the tag exists). A tag on another line is not
+  # this release's start.
+  prev="$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude "v${VER}" HEAD 2>/dev/null || true)"
   if [[ -n "$prev" ]]; then
     range="${prev}..HEAD"
   else
