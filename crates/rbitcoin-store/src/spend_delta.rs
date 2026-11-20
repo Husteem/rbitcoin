@@ -341,7 +341,6 @@ const BASE_UNIT: u16 = 8;
 pub const SEGMENT_CAP_MAX: u64 = 2 << OFF_BITS;
 
 type Slot = [u8; SLOT];
-type PageSlots = BTreeMap<u16, Slot>;
 
 /// A note's key: the index of the slot holding byte `abs`, as
 /// [`page_of`] and [`rel_of`] place it.
@@ -767,15 +766,117 @@ fn rd_u64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-fn encode_record(page_off: u64, slots: &PageSlots) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(REC_HEAD + slots.len() * REC_ENTRY);
-    buf.extend_from_slice(&page_off.to_le_bytes());
-    buf.extend_from_slice(&(slots.len() as u16).to_le_bytes());
-    for (&rel, meta) in slots {
-        buf.extend_from_slice(&rel.to_le_bytes());
-        buf.extend_from_slice(meta);
+/// A generation's new records, encoded back to back in one buffer, each
+/// page naming its bytes. Every producer writes entries straight into it,
+/// so a checkpoint that merges many pages allocates this buffer and its
+/// page list, not a map and a record per page.
+#[derive(Default)]
+struct PlanPages {
+    bytes: Vec<u8>,
+    pages: Vec<PagePlan>,
+}
+
+/// One page's new record and what it lies over.
+struct PagePlan {
+    page_off: u64,
+    base: Base,
+    at: std::ops::Range<usize>,
+}
+
+impl PlanPages {
+    fn with_capacity(pages: usize, bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(bytes),
+            pages: Vec::with_capacity(pages),
+        }
     }
-    buf
+
+    fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// Open `page_off`'s record. [`Self::entry`] appends in `rel` order;
+    /// [`Self::end`] or [`Self::abandon`] closes it.
+    fn begin(&mut self, page_off: u64) -> usize {
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(&page_off.to_le_bytes());
+        self.bytes.extend_from_slice(&0u16.to_le_bytes());
+        start
+    }
+
+    fn entry(&mut self, rel: u16, meta: Slot) {
+        self.bytes.extend_from_slice(&rel.to_le_bytes());
+        self.bytes.extend_from_slice(&meta);
+    }
+
+    /// Close the record [`Self::begin`] opened at `start`. Returns its length.
+    fn end(&mut self, start: usize, page_off: u64, base: Base) -> usize {
+        let len = self.bytes.len() - start;
+        let count = ((len - REC_HEAD) / REC_ENTRY) as u16;
+        self.bytes[start + 8..start + REC_HEAD].copy_from_slice(&count.to_le_bytes());
+        self.pages.push(PagePlan {
+            page_off,
+            base,
+            at: start..start + len,
+        });
+        len
+    }
+
+    /// Drop the record [`Self::begin`] opened at `start`.
+    fn abandon(&mut self, start: usize) {
+        self.bytes.truncate(start);
+    }
+
+    /// One whole record from `slots`, in `rel` order. Returns its length.
+    fn push_slots(
+        &mut self,
+        page_off: u64,
+        base: Base,
+        slots: impl IntoIterator<Item = (u16, Slot)>,
+    ) -> usize {
+        let start = self.begin(page_off);
+        for (rel, meta) in slots {
+            self.entry(rel, meta);
+        }
+        self.end(start, page_off, base)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&PagePlan, &[u8])> + '_ {
+        self.pages.iter().map(|p| (p, &self.bytes[p.at.clone()]))
+    }
+}
+
+/// Append one page's entries to the record open in `pages`: its committed
+/// `kept` entries and its sealed `notes`, both in slot order, as one run in
+/// `rel` order. A note wins over the committed entry for its slot. Returns
+/// how many entries are spends (nonzero).
+fn merge_page(
+    pages: &mut PlanPages,
+    kept: impl Iterator<Item = (u16, Slot)>,
+    notes: &[(u64, Slot)],
+) -> u64 {
+    let mut kept = kept.peekable();
+    let mut spends = 0u64;
+    let mut put = |pages: &mut PlanPages, rel: u16, meta: Slot| {
+        spends += u64::from(meta != ZERO);
+        pages.entry(rel, meta);
+    };
+    for &(key, meta) in notes {
+        let rel = key_rel(key);
+        while let Some((older, old)) = kept.next_if(|&(r, _)| r < rel) {
+            put(pages, older, old);
+        }
+        kept.next_if(|&(r, _)| r == rel);
+        put(pages, rel, meta);
+    }
+    for (rel, meta) in kept {
+        put(pages, rel, meta);
+    }
+    spends
 }
 
 /// Length of the record starting at `buf[0]`, from its header.
@@ -785,25 +886,39 @@ fn record_len(buf: &[u8]) -> Option<usize> {
 }
 
 /// A record read back from a segment, checked against its page.
-struct Record(Vec<u8>);
+#[derive(Clone, Copy)]
+struct Record<'a>(&'a [u8]);
 
-impl Record {
-    fn check(buf: Vec<u8>, page_off: u64) -> Result<Self, StoreError> {
-        if buf.len() < REC_HEAD || rd_u64(&buf, 0) != page_off {
+impl<'a> Record<'a> {
+    fn check(buf: &'a [u8], page_off: u64) -> Result<Self, StoreError> {
+        if buf.len() < REC_HEAD || rd_u64(buf, 0) != page_off {
             return Err(StoreError::Corrupt("spent.delta record names another page"));
         }
-        if record_len(&buf) != Some(buf.len()) {
+        if record_len(buf) != Some(buf.len()) {
             return Err(StoreError::Corrupt("spent.delta bad record length"));
         }
         Ok(Self(buf))
     }
 
-    fn entries(&self) -> impl Iterator<Item = (u16, Slot)> + '_ {
+    fn entries(self) -> impl Iterator<Item = (u16, Slot)> + 'a {
         self.0[REC_HEAD..].chunks_exact(REC_ENTRY).map(|e| {
             let mut meta = [0u8; SLOT];
             meta.copy_from_slice(&e[2..]);
             (rd_u16(e, 0), meta)
         })
+    }
+
+    /// [`Self::entries`], once every `rel` is checked ascending and inside
+    /// the page.
+    fn ordered(self) -> Result<impl Iterator<Item = (u16, Slot)> + 'a, StoreError> {
+        let mut prev = None;
+        for (rel, _) in self.entries() {
+            if prev.is_some_and(|p| rel <= p) || rel as usize >= SLOTS_PER_PAGE {
+                return Err(StoreError::Corrupt("spent.delta rel order"));
+            }
+            prev = Some(rel);
+        }
+        Ok(self.entries())
     }
 
     /// Entries are written in `rel` order, so one lookup is a binary search.
@@ -825,19 +940,6 @@ impl Record {
             }
         }
         None
-    }
-
-    fn slots(&self) -> Result<PageSlots, StoreError> {
-        let mut out = BTreeMap::new();
-        let mut prev = None;
-        for (rel, meta) in self.entries() {
-            if prev.is_some_and(|p| rel <= p) || rel as usize >= SLOTS_PER_PAGE {
-                return Err(StoreError::Corrupt("spent.delta rel order"));
-            }
-            prev = Some(rel);
-            out.insert(rel, meta);
-        }
-        Ok(out)
     }
 }
 
@@ -1592,20 +1694,22 @@ impl SpendPageLog {
         }
     }
 
+    /// One record's bytes, checked against `page_off`.
     fn read_record(
         file: &TableFile,
         page_off: u64,
         offset: u64,
         len: usize,
-    ) -> Result<Record, StoreError> {
+    ) -> Result<Vec<u8>, StoreError> {
         let mut buf = vec![0u8; len];
         file.pread_all(offset, &mut buf)?;
-        Record::check(buf, page_off)
+        Record::check(&buf, page_off)?;
+        Ok(buf)
     }
 
     /// The committed record for a page with its base and the newest
     /// generation its segment holds, a bound on the record's own.
-    fn committed_record(&self, page_off: u64) -> Result<Option<Committed>, StoreError> {
+    fn committed_record(&self, page_off: u64) -> Result<Option<OwnedCommitted>, StoreError> {
         let (file, offset, len, base, seg_gen) = {
             let g = self.lock();
             match placed_at(&g, page_off).at() {
@@ -1621,20 +1725,21 @@ impl SpendPageLog {
                 At::Zero | At::Body => return Ok(None),
             }
         };
-        Ok(Some(Committed {
-            record: Self::read_record(&file, page_off, offset, len)?,
+        Ok(Some(OwnedCommitted {
+            bytes: Self::read_record(&file, page_off, offset, len)?,
             base,
             seg_gen,
         }))
     }
 
-    /// The committed records of `page_offs` that have one, by page. Records
-    /// touching in a segment are read in one pread.
+    /// The committed records of `page_offs` that have one, read into one
+    /// buffer sized from the directory. Records touching in a segment are
+    /// read in one pread.
     fn committed_records(
         &self,
         page_offs: &[u64],
         report: &mut CheckpointReport,
-    ) -> Result<HashMap<u64, Committed>, StoreError> {
+    ) -> Result<CommittedRecords, StoreError> {
         let mut by_seg: HashMap<u32, (Arc<TableFile>, u32, Vec<LiveRecord>)> = HashMap::new();
         {
             let g = self.lock();
@@ -1660,27 +1765,39 @@ impl SpendPageLog {
                 }
             }
         }
-        let mut out = HashMap::new();
+        let (count, total) = by_seg
+            .values()
+            .flat_map(|(_, _, records)| records)
+            .fold((0, 0), |(n, bytes), r| (n + 1, bytes + r.len));
+        let mut out = CommittedRecords {
+            buf: vec![0u8; total],
+            rows: Vec::with_capacity(count),
+            next: 0,
+        };
+        let mut pos = 0;
         for (file, seg_gen, mut records) in by_seg.into_values() {
             records.sort_unstable_by_key(|r| r.offset);
             for run in coalesce(&records) {
-                let buf = read_run(&file, run)?;
+                let first = run[0];
+                let last = run[run.len() - 1];
+                let len = (last.offset + last.len as u64 - first.offset) as usize;
+                file.pread_all(first.offset, &mut out.buf[pos..pos + len])?;
                 report.merge_reads += 1;
-                report.merge_read_bytes += buf.len() as u64;
+                report.merge_read_bytes += len as u64;
                 for rec in run {
-                    let at = (rec.offset - run[0].offset) as usize;
-                    let record = Record::check(buf[at..at + rec.len].to_vec(), rec.page_off)?;
-                    out.insert(
-                        rec.page_off,
-                        Committed {
-                            record,
-                            base: rec.base,
-                            seg_gen,
-                        },
-                    );
+                    let at = pos + (rec.offset - first.offset) as usize;
+                    Record::check(&out.buf[at..at + rec.len], rec.page_off)?;
+                    out.rows.push(CommittedRow {
+                        page_off: rec.page_off,
+                        at: at..at + rec.len,
+                        base: rec.base,
+                        seg_gen,
+                    });
                 }
+                pos += len;
             }
         }
+        out.rows.sort_unstable_by_key(|r| r.page_off);
         Ok(out)
     }
 
@@ -1730,7 +1847,8 @@ impl SpendPageLog {
             }
         }
         for (page_off, (file, offset, len, base, wanted)) in misses {
-            let record = Self::read_record(&file, page_off, offset, len)?;
+            let bytes = Self::read_record(&file, page_off, offset, len)?;
+            let record = Record(&bytes);
             for (rel, i) in wanted {
                 out[i] = match record.get(rel) {
                     Some(meta) => Some(meta),
@@ -1890,29 +2008,27 @@ impl SpendPageLog {
                 "store: every spent.delta generation in the ring sealed spends above tip {tip}; checking every page"
             );
         }
-        let mut pages = Vec::new();
+        let mut pages = PlanPages::default();
         for (page, generation) in self.selected_generations(&w.idx)?.into_iter().enumerate() {
             if generation == 0 || !(every_page || suspect.contains(&generation)) {
                 continue;
             }
             let page_off = page as u64 * PAGE;
-            let Some(c) = self.committed_record(page_off)? else {
+            let Some(owned) = self.committed_record(page_off)? else {
                 continue;
             };
-            let mut slots = c.record.slots()?;
+            let c = owned.view();
+            let start = pages.begin(page_off);
             let mut changed = false;
-            for meta in slots.values_mut() {
-                if *meta != ZERO && !keep(meta)? {
-                    *meta = ZERO;
-                    changed = true;
-                }
+            for (rel, meta) in c.record.ordered()? {
+                let dropped = meta != ZERO && !keep(&meta)?;
+                changed |= dropped;
+                pages.entry(rel, if dropped { ZERO } else { meta });
             }
             if changed {
-                pages.push(PagePlan {
-                    page_off,
-                    slots,
-                    base: c.base,
-                });
+                pages.end(start, page_off, c.base);
+            } else {
+                pages.abandon(start);
             }
         }
         let plan = Plan {
@@ -1959,7 +2075,7 @@ impl SpendPageLog {
             body.read(page_off, &mut chunk[..n])?;
             for (i, page) in chunk[..n].chunks(PAGE as usize).enumerate() {
                 let off = page_off + i as u64 * PAGE;
-                let mut slots = PageSlots::new();
+                let mut slots = BTreeMap::new();
                 if let Some(image) = images.remove(&off) {
                     for (rel, meta) in image.chunks_exact(SLOT).enumerate().skip(first_rel(off)) {
                         let at = rel * SLOT;
@@ -1984,11 +2100,7 @@ impl SpendPageLog {
                     Base::ZERO
                 };
                 if !slots.is_empty() {
-                    plan.pages.push(PagePlan {
-                        page_off: off,
-                        slots,
-                        base,
-                    });
+                    plan.pages.push_slots(off, base, slots);
                 } else if base.is_body() {
                     plan.folded.push((off, Placed::body(base)));
                 }
@@ -2091,9 +2203,9 @@ impl SpendPageLog {
         };
         let mut rounds = Rounds::new(self.policy.fold_round_pages);
         let merge = Instant::now();
-        let mut merged = self.merge_sealed(&sealed, touch, body, &mut rounds, &mut report)?;
+        let merged = self.merge_sealed(&sealed, touch, body, &mut rounds, &mut report)?;
         report.merge_ms = ms_since(merge);
-        let mut fold = self.fold(
+        let fold = self.fold(
             &w,
             &sealed,
             merged.new_bytes,
@@ -2103,14 +2215,10 @@ impl SpendPageLog {
             &mut report,
         )?;
         rounds.finish(&self.dir, body, &mut report)?;
-        let carried_bytes: u64 = fold
-            .carried
-            .iter()
-            .map(|p| (REC_HEAD + p.slots.len() * REC_ENTRY) as u64)
-            .sum();
-        merged.pages.append(&mut fold.carried);
+        let carried_bytes = fold.carried.bytes.len() as u64;
         let plan = Plan {
             pages: merged.pages,
+            carried: fold.carried,
             folded: fold.folded,
             dir_pages: self.lock().commit.dir_pages,
             seal: Seal::Raise(tip),
@@ -2157,40 +2265,35 @@ impl SpendPageLog {
     ) -> Result<Merged, StoreError> {
         let page_offs: Vec<u64> = sealed.pages().map(|(page_off, _)| page_off).collect();
         report.sealed_pages = page_offs.len() as u64;
+        let mut committed = self.committed_records(&page_offs, report)?;
+        // Room for every committed record kept whole plus a header and an
+        // entry for each note: the merge never regrows the buffer.
+        let room = committed.buf.len() + page_offs.len() * REC_HEAD + sealed.len() * REC_ENTRY;
         let mut out = Merged {
-            pages: Vec::with_capacity(page_offs.len()),
+            pages: PlanPages::with_capacity(page_offs.len(), room),
             new_bytes: 0,
             dense_bytes: 0,
         };
-        let mut committed = self.committed_records(&page_offs, report)?;
         for (page_off, notes) in sealed.pages() {
-            let mut merged = BTreeMap::new();
             let mut base = placed_at(&self.lock(), page_off).base();
-            if let Some(c) = committed.remove(&page_off) {
+            let mut kept = None;
+            if let Some(c) = committed.take(page_off) {
                 if self.touch_folds(page_off, &c, touch, report) {
                     base = rounds.push(&self.dir, body, page_off, &c, report)?.base();
                     report.hot_folds += 1;
                     report.hot_fold_record_bytes += c.record.0.len() as u64;
                 } else {
-                    merged = c.record.slots()?;
+                    kept = Some(c.record.ordered()?);
                 }
             }
-            for &(key, meta) in notes {
-                report.sealed_edges += 1;
-                merged.insert(key_rel(key), meta);
-            }
-            let bytes = (REC_HEAD + merged.len() * REC_ENTRY) as u64;
+            report.sealed_edges += notes.len() as u64;
+            let start = out.pages.begin(page_off);
+            let spends = merge_page(&mut out.pages, kept.into_iter().flatten(), notes);
+            let bytes = out.pages.end(start, page_off, base) as u64;
             out.new_bytes += bytes;
-            if 2 * merged.values().filter(|&&meta| meta != ZERO).count() as u64
-                >= base.unset(page_off)
-            {
+            if 2 * spends >= base.unset(page_off) {
                 out.dense_bytes += bytes;
             }
-            out.pages.push(PagePlan {
-                page_off,
-                slots: merged,
-                base,
-            });
         }
         Ok(out)
     }
@@ -2200,7 +2303,7 @@ impl SpendPageLog {
     fn touch_folds(
         &self,
         page_off: u64,
-        c: &Committed,
+        c: &Committed<'_>,
         touch: TouchCtx,
         report: &mut CheckpointReport,
     ) -> bool {
@@ -2355,7 +2458,7 @@ impl SpendPageLog {
                 for rec in run {
                     let at = (rec.offset - first.offset) as usize;
                     let c = Committed {
-                        record: Record::check(buf[at..at + rec.len].to_vec(), rec.page_off)?,
+                        record: Record::check(&buf[at..at + rec.len], rec.page_off)?,
                         base: rec.base,
                         seg_gen: 0,
                     };
@@ -2368,16 +2471,13 @@ impl SpendPageLog {
                         report.folded += 1;
                         out.folded.push((rec.page_off, at));
                     } else {
-                        out.carried.push(PagePlan {
-                            page_off: rec.page_off,
-                            slots: c.record.slots()?,
-                            base: rec.base,
-                        });
+                        out.carried
+                            .push_slots(rec.page_off, rec.base, c.record.ordered()?);
+                        report.carried += 1;
                     }
                 }
             }
         }
-        report.carried = out.carried.len() as u64;
         Ok(out)
     }
 
@@ -2533,7 +2633,7 @@ impl SpendPageLog {
             record_bytes,
             wrote_segs,
             pages: written_pages,
-        } = self.append_records(w, &plan.pages, plan.folded.len())?;
+        } = self.append_records(w, [&plan.pages, &plan.carried], plan.folded.len())?;
         let mut dir_pages = u64::from(plan.dir_pages).max(written_pages);
         report.record_bytes = record_bytes;
         report.seg_write_ms = ms_since(t);
@@ -2678,22 +2778,22 @@ impl SpendPageLog {
     /// segment's header. This generation starts on the next block past both,
     /// or in a new segment when that leaves no room, so no write touches a
     /// block holding committed bytes. A segment holds
-    /// [`Policy::segment_cap`] record bytes past its first block.
+    /// [`Policy::segment_cap`] record bytes past its first block. `plans`
+    /// are written in order: the merged pages, then the carried ones.
     fn append_records(
         &self,
         w: &mut Writer,
-        pages: &[PagePlan],
+        plans: [&PlanPages; 2],
         extra: usize,
     ) -> Result<Appended, StoreError> {
         let mut out = Appended {
-            placed: Vec::with_capacity(pages.len() + extra),
+            placed: Vec::with_capacity(plans.iter().map(|p| p.len()).sum::<usize>() + extra),
             record_bytes: 0,
             wrote_segs: BTreeSet::new(),
             pages: 0,
         };
         let cap = BLOCK + self.policy.segment_cap;
-        for (i, p) in pages.iter().enumerate() {
-            let bytes = encode_record(p.page_off, &p.slots);
+        for (i, (p, bytes)) in plans.iter().flat_map(|p| p.iter()).enumerate() {
             let len = bytes.len() as u64;
             if i == 0 {
                 let aligned = align_block(w.active.end.max(BLOCK));
@@ -2707,7 +2807,7 @@ impl SpendPageLog {
             }
             let page = p.page_off / PAGE;
             let at = Placed::rec(w.active.id, w.active.end, bytes.len(), p.base)?;
-            w.active.file.write_uncommitted(w.active.end, &bytes)?;
+            w.active.file.write_uncommitted(w.active.end, bytes)?;
             w.active.end += len;
             out.record_bytes += len;
             out.wrote_segs.insert(w.active.id);
@@ -2859,11 +2959,11 @@ impl SpendPageLog {
             (g.commit.dir_pages, g.commit.sealed_tip().unwrap_or(0))
         };
         let kept_pages = body_end.div_ceil(PAGE).min(u64::from(dir_pages));
-        let mut pages = Vec::new();
+        let mut pages = PlanPages::default();
         let page_off = page_of(body_end);
         if !body_end.is_multiple_of(PAGE) && body_end / PAGE < u64::from(dir_pages) {
             let at = placed_at(&self.lock(), page_off);
-            let mut slots = PageSlots::new();
+            let mut slots = BTreeMap::new();
             if at.base().is_body() {
                 let mut image = vec![0u8; (body_end - page_off) as usize];
                 body.read(page_off, &mut image)?;
@@ -2877,17 +2977,13 @@ impl SpendPageLog {
                     }
                 }
             }
-            if let Some(c) = self.committed_record(page_off)? {
-                slots.extend(c.record.slots()?);
+            if let Some(owned) = self.committed_record(page_off)? {
+                slots.extend(owned.view().record.ordered()?);
             }
             let before = slots.len();
             slots.retain(|&rel, _| page_off + (u64::from(rel) + 1) * SLOT as u64 <= body_end);
             if slots.len() != before || at.base().is_body() {
-                pages.push(PagePlan {
-                    page_off,
-                    slots,
-                    base: Base::ZERO,
-                });
+                pages.push_slots(page_off, Base::ZERO, slots);
             }
         }
         let cut = self.lock().directory[kept_pages as usize..]
@@ -2907,24 +3003,74 @@ impl SpendPageLog {
     }
 }
 
-/// One page's new record and what it lies over.
-struct PagePlan {
-    page_off: u64,
-    slots: PageSlots,
-    base: Base,
-}
-
 /// A committed record read back, with its base and the newest generation
 /// its segment holds.
-struct Committed {
-    record: Record,
+struct Committed<'a> {
+    record: Record<'a>,
     base: Base,
     seg_gen: u32,
 }
 
+/// One committed record read on its own, for the paths that rewrite a
+/// page at a time.
+struct OwnedCommitted {
+    bytes: Vec<u8>,
+    base: Base,
+    seg_gen: u32,
+}
+
+impl OwnedCommitted {
+    /// The record was checked against its page when it was read.
+    fn view(&self) -> Committed<'_> {
+        Committed {
+            record: Record(&self.bytes),
+            base: self.base,
+            seg_gen: self.seg_gen,
+        }
+    }
+}
+
+/// The committed records of a checkpoint's sealed pages: one buffer, and a
+/// row per record ascending by page. The rows are a subset of the pages
+/// the merge walks, in the same order.
+struct CommittedRecords {
+    buf: Vec<u8>,
+    rows: Vec<CommittedRow>,
+    /// The row the next page with a record takes.
+    next: usize,
+}
+
+struct CommittedRow {
+    page_off: u64,
+    at: std::ops::Range<usize>,
+    base: Base,
+    seg_gen: u32,
+}
+
+impl CommittedRecords {
+    /// The record of `page_off`, if it has one. Every page the rows were
+    /// read for is asked for once, ascending.
+    fn take(&mut self, page_off: u64) -> Option<Committed<'_>> {
+        let row = self.rows.get(self.next)?;
+        debug_assert!(row.page_off >= page_off, "a committed row was skipped");
+        if row.page_off != page_off {
+            return None;
+        }
+        self.next += 1;
+        Some(Committed {
+            record: Record(&self.buf[row.at.clone()]),
+            base: row.base,
+            seg_gen: row.seg_gen,
+        })
+    }
+}
+
 /// One generation's content.
 struct Plan {
-    pages: Vec<PagePlan>,
+    pages: PlanPages,
+    /// Records reclaim copies unchanged, appended after `pages`. A buffer of
+    /// their own, so they never regrow the one the merge sized.
+    carried: PlanPages,
     /// Pages a fold wrote whole, and the entry each now takes.
     folded: Vec<(u64, Placed)>,
     /// Directory length before these pages; a page past it extends it.
@@ -2938,7 +3084,8 @@ struct Plan {
 impl Default for Plan {
     fn default() -> Self {
         Self {
-            pages: Vec::new(),
+            pages: PlanPages::default(),
+            carried: PlanPages::default(),
             folded: Vec::new(),
             dir_pages: 0,
             seal: Seal::Raise(0),
@@ -2983,12 +3130,12 @@ fn coalesce(records: &[LiveRecord]) -> impl Iterator<Item = &[LiveRecord]> + '_ 
 struct Folded {
     folded: Vec<(u64, Placed)>,
     /// Sparse records to copy to the active segment.
-    carried: Vec<PagePlan>,
+    carried: PlanPages,
 }
 
 /// The sealed pages merged over their committed records.
 struct Merged {
-    pages: Vec<PagePlan>,
+    pages: PlanPages,
     new_bytes: u64,
     /// Record bytes of pages whose merged record spends half their unset
     /// slots.
@@ -3015,11 +3162,16 @@ fn foldable(page_off: u64) -> bool {
 /// `spent.body` held, since open copies the file again. A page over zeroes
 /// is written straight to `spent.body`: until the commit names it, nothing
 /// reads that page there. The round then syncs `spent.body` before the next
-/// one starts, so the file and the RAM it takes stay bounded.
+/// one starts, so the file and the RAM it takes stay bounded. Every round
+/// composes into the same buffers, emptied but not freed after its copy, so
+/// a checkpoint that folds many rounds allocates them once.
 struct Rounds {
     file: FoldFile,
-    /// Pages over zeroes, composed whole.
-    direct: Vec<(u64, Vec<u8>)>,
+    /// Pages over zeroes, composed whole: `(page_off:u64, image)` back to
+    /// back, as in the `fold` file.
+    direct: Vec<u8>,
+    /// The page being composed.
+    image: Vec<u8>,
     size: usize,
     records: u64,
     bytes: u64,
@@ -3030,10 +3182,15 @@ impl Rounds {
         Self {
             file: FoldFile::new(),
             direct: Vec::new(),
+            image: vec![0u8; PAGE as usize],
             size: size.max(1),
             records: 0,
             bytes: 0,
         }
+    }
+
+    fn pages(&self) -> usize {
+        self.file.count as usize + self.direct.len() / FOLD_PAGE
     }
 
     /// Compose a committed record over its base. Returns the entry the page
@@ -3044,29 +3201,31 @@ impl Rounds {
         dir: &Path,
         body: &mut dyn SpentBody,
         page_off: u64,
-        c: &Committed,
+        c: &Committed<'_>,
         report: &mut CheckpointReport,
     ) -> Result<Placed, StoreError> {
         let t = Instant::now();
-        let mut image = vec![0u8; PAGE as usize];
         if c.base.is_body() {
-            body.read(page_off, &mut image)?;
+            body.read(page_off, &mut self.image)?;
+        } else {
+            self.image.fill(0);
         }
         for (rel, meta) in c.record.entries() {
             let at = usize::from(rel) * SLOT;
-            image[at..at + SLOT].copy_from_slice(&meta);
+            self.image[at..at + SLOT].copy_from_slice(&meta);
         }
-        let base = Base::of(filled_in(page_off, &image));
+        let base = Base::of(filled_in(page_off, &self.image));
         if base.is_body() {
             if c.base.is_body() {
-                self.file.push(page_off, &image);
+                self.file.push(page_off, &self.image);
             } else {
-                self.direct.push((page_off, image));
+                self.direct.extend_from_slice(&page_off.to_le_bytes());
+                self.direct.extend_from_slice(&self.image);
             }
         }
         report.fold_compose_ms += ms_since(t);
         self.records += 1;
-        if self.file.count as usize + self.direct.len() >= self.size {
+        if self.pages() >= self.size {
             self.flush(dir, body, report)?;
         }
         Ok(Placed::body(base))
@@ -3079,7 +3238,7 @@ impl Rounds {
         body: &mut dyn SpentBody,
         report: &mut CheckpointReport,
     ) -> Result<(), StoreError> {
-        if self.file.count == 0 && self.direct.is_empty() {
+        if self.pages() == 0 {
             return Ok(());
         }
         self.flush(dir, body, report)
@@ -3091,28 +3250,33 @@ impl Rounds {
         body: &mut dyn SpentBody,
         report: &mut CheckpointReport,
     ) -> Result<(), StoreError> {
-        let mut file = std::mem::replace(&mut self.file, FoldFile::new());
-        let direct = std::mem::take(&mut self.direct);
         let t = Instant::now();
-        if file.count > 0 {
-            self.bytes += file.write(dir)?;
+        if self.file.count > 0 {
+            self.bytes += self.file.write(dir)?;
         }
         report.fold_file_ms += ms_since(t);
         let t = Instant::now();
-        for (page_off, image) in file
-            .images()
-            .chain(direct.iter().map(|(p, i)| (*p, i.as_slice())))
-        {
+        for (page_off, image) in self.file.images().chain(page_images(&self.direct)) {
             body.write(page_off, image)?;
             self.bytes += image.len() as u64;
         }
         report.body_write_ms += ms_since(t);
+        self.file.clear();
+        self.direct.clear();
         let t = Instant::now();
         body.sync()?;
         report.body_sync_ms += ms_since(t);
         report.fold_rounds += 1;
         Ok(())
     }
+}
+
+/// One `fold` file page: its offset, then its image.
+const FOLD_PAGE: usize = 8 + PAGE as usize;
+
+/// `(page_off, image)` for each page laid out back to back in `buf`.
+fn page_images(buf: &[u8]) -> impl Iterator<Item = (u64, &[u8])> + '_ {
+    buf.chunks_exact(FOLD_PAGE).map(|c| (rd_u64(c, 0), &c[8..]))
 }
 
 /// Whole composed pages a fold is copying over `spent.body` pages that
@@ -3142,6 +3306,12 @@ impl FoldFile {
         self.count += 1;
     }
 
+    /// Back to the header alone; the buffer keeps its capacity.
+    fn clear(&mut self) {
+        self.buf.truncate(FOLD_HEAD);
+        self.count = 0;
+    }
+
     /// Write and rename the file. Returns its length.
     fn write(&mut self, dir: &Path) -> Result<u64, StoreError> {
         self.buf[8..12].copy_from_slice(&self.count.to_le_bytes());
@@ -3150,9 +3320,7 @@ impl FoldFile {
     }
 
     fn images(&self) -> impl Iterator<Item = (u64, &[u8])> + '_ {
-        self.buf[FOLD_HEAD..]
-            .chunks_exact(8 + PAGE as usize)
-            .map(|c| (rd_u64(c, 0), &c[8..]))
+        page_images(&self.buf[FOLD_HEAD..])
     }
 }
 
@@ -3160,7 +3328,7 @@ impl FoldFile {
 /// unset under `base`: no page is read. A spend is a nonzero entry; an
 /// entry rewriting a slot already spent, which only a reorg makes, counts
 /// too and folds the page a little early.
-fn spends_half_the_unset(page_off: u64, base: Base, record: &Record) -> bool {
+fn spends_half_the_unset(page_off: u64, base: Base, record: &Record<'_>) -> bool {
     let spends = record.entries().filter(|&(_, meta)| meta != ZERO).count() as u64;
     2 * spends >= base.unset(page_off)
 }
@@ -3182,18 +3350,17 @@ fn replay_fold_file(dir: &Path, body: &mut dyn SpentBody) -> Result<(), StoreErr
         return Err(StoreError::Corrupt("spent.delta/fold is not a fold file"));
     }
     let count = rd_u32(&raw, 8) as usize;
-    if raw.len() != FOLD_HEAD + count * (8 + PAGE as usize) {
+    if raw.len() != FOLD_HEAD + count * FOLD_PAGE {
         return Err(StoreError::Corrupt("spent.delta/fold short"));
     }
     let published = body.published_len();
-    for c in raw[FOLD_HEAD..].chunks_exact(8 + PAGE as usize) {
-        let page_off = rd_u64(c, 0);
+    for (page_off, image) in page_images(&raw[FOLD_HEAD..]) {
         if !page_off.is_multiple_of(PAGE) || !foldable(page_off) {
             return Err(StoreError::Corrupt("spent.delta/fold names a torn page"));
         }
         let keep = published.saturating_sub(page_off).min(PAGE) as usize;
         if keep > 0 {
-            body.write(page_off, &c[8..8 + keep])?;
+            body.write(page_off, &image[..keep])?;
         }
     }
     body.sync()?;
