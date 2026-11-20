@@ -72,6 +72,14 @@ pub struct Wave {
     /// chunk, this wave may hold at most half the pool. `Weak` avoids an
     /// `Arc` cycle; the publisher links and unlinks both sides.
     pub pair: Mutex<Option<std::sync::Weak<Wave>>>,
+    /// Fast path: false means an unlinked wave never locks `pair`.
+    pub pair_capped: AtomicBool,
+    /// After the first verdict the loser keeps a half cap through the
+    /// winner's index and write, so it cannot take the whole pool.
+    pub half_cap: AtomicBool,
+    /// A held wave (`start_for_each_owned_held`) is not visible to workers
+    /// until published; `Drop` must not wait for claims that can never run.
+    pub published: AtomicBool,
 }
 
 /// Worker count the pool started, for the tip-pair half cap. Set once.
@@ -99,13 +107,25 @@ pub fn pair_cap() -> usize {
 pub fn link_pair(a: &Arc<Wave>, b: &Arc<Wave>) {
     *a.pair.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(b));
     *b.pair.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(a));
+    a.pair_capped.store(true, ModelOrdering::Release);
+    b.pair_capped.store(true, ModelOrdering::Release);
 }
 
-/// Clear the pair on both sides. Safe to call twice.
+/// Clear the pair on both sides. Safe to call twice. A `half_cap` already
+/// set on one side stays.
 #[doc(hidden)]
 pub fn unlink_pair(a: &Arc<Wave>, b: &Arc<Wave>) {
     *a.pair.lock().unwrap_or_else(|p| p.into_inner()) = None;
     *b.pair.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    a.pair_capped.store(false, ModelOrdering::Release);
+    b.pair_capped.store(false, ModelOrdering::Release);
+}
+
+/// Keep a lone wave at half the pool. Used for the loser after the first
+/// verdict, so it cannot take the pool from the winner's index/write.
+#[doc(hidden)]
+pub fn cap_half(wave: &Arc<Wave>) {
+    wave.half_cap.store(true, ModelOrdering::Release);
 }
 
 /// Cap for `wave` if its pair partner is still claiming, else `None`.
@@ -122,24 +142,33 @@ fn pair_cap_for(wave: &Wave) -> Option<usize> {
 /// Charge one in-flight chunk, honouring the pair cap. Returns false when
 /// the cap is reached (the caller then tries the partner wave).
 fn charge_claim(wave: &Wave) -> bool {
-    match pair_cap_for(wave) {
-        None => {
-            wave.in_wave.fetch_add(1, ModelOrdering::AcqRel);
-            true
+    // An unlinked wave never locks: the common IBD path stays one atomic.
+    if !wave.pair_capped.load(ModelOrdering::Acquire) && !wave.half_cap.load(ModelOrdering::Acquire)
+    {
+        wave.in_wave.fetch_add(1, ModelOrdering::AcqRel);
+        return true;
+    }
+    let cap = if wave.half_cap.load(ModelOrdering::Acquire) {
+        Some(pair_cap())
+    } else {
+        pair_cap_for(wave)
+    };
+    let Some(cap) = cap else {
+        wave.in_wave.fetch_add(1, ModelOrdering::AcqRel);
+        return true;
+    };
+    loop {
+        let cur = wave.in_wave.load(ModelOrdering::Acquire);
+        if cur >= cap {
+            return false;
         }
-        Some(cap) => loop {
-            let cur = wave.in_wave.load(ModelOrdering::Acquire);
-            if cur >= cap {
-                return false;
-            }
-            if wave
-                .in_wave
-                .compare_exchange(cur, cur + 1, ModelOrdering::AcqRel, ModelOrdering::Acquire)
-                .is_ok()
-            {
-                return true;
-            }
-        },
+        if wave
+            .in_wave
+            .compare_exchange(cur, cur + 1, ModelOrdering::AcqRel, ModelOrdering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
     }
 }
 
@@ -430,7 +459,11 @@ impl<T: Sync> OwnedWave<T> {
 
 impl<T: Sync> Drop for OwnedWave<T> {
     fn drop(&mut self) {
-        self.wave.wait_done();
+        // A held wave never reached a worker; `next < n` there is not a
+        // claim to wait for.
+        if self.wave.published.load(ModelOrdering::Acquire) {
+            self.wave.wait_done();
+        }
         unpublish_fg(&self.wave);
     }
 }
@@ -483,6 +516,29 @@ pub fn start_for_each_pooled<T: Sync>(
     start_wave(items, f, chunk, false, false)
 }
 
+/// Like [`start_for_each_owned`] but do **not** publish yet. A tip pair
+/// links both waves (and caps them) before the first wake, then calls
+/// [`publish_owned`].
+#[doc(hidden)]
+pub fn start_for_each_owned_held<T: Sync>(
+    items: Vec<T>,
+    f: fn(&T) -> Result<(), ConsensusError>,
+) -> Result<Option<OwnedWave<T>>, ConsensusError> {
+    start_wave_inner(items, f, STEAL_CHUNK, true, false, false)
+}
+
+/// Publish a wave created with [`start_for_each_owned_held`] and wake the
+/// steal workers.
+#[doc(hidden)]
+pub fn publish_owned<T: Sync>(owned: &OwnedWave<T>) {
+    owned.wave.published.store(true, ModelOrdering::Release);
+    let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
+    g.push(Arc::clone(&owned.wave));
+    publish_waves(&g);
+    drop(g);
+    wake_steal_workers();
+}
+
 #[doc(hidden)]
 pub fn start_wave<T: Sync>(
     items: Vec<T>,
@@ -490,6 +546,18 @@ pub fn start_wave<T: Sync>(
     chunk: usize,
     inline_single: bool,
     keep_faults: bool,
+) -> Result<Option<OwnedWave<T>>, ConsensusError> {
+    start_wave_inner(items, f, chunk, inline_single, keep_faults, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_wave_inner<T: Sync>(
+    items: Vec<T>,
+    f: fn(&T) -> Result<(), ConsensusError>,
+    chunk: usize,
+    inline_single: bool,
+    keep_faults: bool,
+    publish: bool,
 ) -> Result<Option<OwnedWave<T>>, ConsensusError> {
     if on_steal_worker() {
         return Err(ConsensusError::BadBlock(
@@ -531,13 +599,18 @@ pub fn start_wave<T: Sync>(
         done: Mutex::new(false),
         done_cv: Condvar::new(),
         pair: Mutex::new(None),
+        pair_capped: AtomicBool::new(false),
+        half_cap: AtomicBool::new(false),
+        published: AtomicBool::new(false),
     });
-    {
+    if publish {
+        wave.published.store(true, ModelOrdering::Release);
         let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
         g.push(Arc::clone(&wave));
         publish_waves(&g);
+        drop(g);
+        wake_steal_workers();
     }
-    wake_steal_workers();
     Ok(Some(OwnedWave {
         _items: items,
         _ctx: ctx,
@@ -968,6 +1041,9 @@ mod pair_tests {
             done: Mutex::new(false),
             done_cv: Condvar::new(),
             pair: Mutex::new(None),
+            pair_capped: AtomicBool::new(false),
+            half_cap: AtomicBool::new(false),
+            published: AtomicBool::new(true),
         })
     }
 

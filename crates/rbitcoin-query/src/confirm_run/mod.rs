@@ -355,8 +355,8 @@ pub fn confirm_wire_run_preverified(
     result
 }
 
-/// Two equal-work tip candidates, scripted together. See
-/// `local/tip-sibling-parallel-validation.md`.
+/// Two equal-work tip candidates, scripted together: the first to pass strict
+/// scripts and commit is the tip; the other is reported as the loser.
 pub struct PairRun {
     /// Index of the candidate that won (0 = first argument).
     pub winner: usize,
@@ -428,17 +428,18 @@ fn run_pair_loads(
     b: LoadedBatch,
     phase: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PairRun, ConfirmError> {
-    use rbitcoin_consensus::script_pool::{link_pair, set_wave_order, unlink_pair};
+    use rbitcoin_consensus::script_pool::{cap_half, link_pair, unlink_pair};
     let height = a.prepared.first().map(|p| p.height.0).unwrap_or(0);
     let hash_a = a.prepared.first().map(|p| p.hash).unwrap_or([0; 32]);
     let hash_b = b.prepared.first().map(|p| p.hash).unwrap_or([0; 32]);
     // A start can fail without a wave: a batch with exactly one script job
     // runs it inline. Handle that per candidate, never as the pair's error.
-    let started_a = Inflight::start_deferred_index(a, 0);
-    let started_b = Inflight::start_deferred_index(b, 0);
+    let started_a = Inflight::start_deferred_index_held(a, 0);
+    let started_b = Inflight::start_deferred_index_held(b, 0);
     let (a, b) = match (started_a, started_b) {
         (Ok(a), Ok(b)) => (a, b),
         (Ok(a), Err((e, _))) => {
+            a.publish_scripts();
             let fks = pair_write_started(query, params, milestone, height, a, None, phase)?;
             return Ok(note_pair_loser(PairRun {
                 winner: 0,
@@ -448,6 +449,7 @@ fn run_pair_loads(
             }));
         }
         (Err((e, _)), Ok(b)) => {
+            b.publish_scripts();
             let fks = pair_write_started(query, params, milestone, height, b, None, phase)?;
             return Ok(note_pair_loser(PairRun {
                 winner: 1,
@@ -462,11 +464,14 @@ fn run_pair_loads(
     let paired = match (&wa, &wb) {
         (Some(x), Some(y)) => {
             link_pair(x, y);
-            set_wave_order(&[Arc::clone(x), Arc::clone(y)]);
             true
         }
         _ => false,
     };
+    // Publish only after the link: a wave woken before `pair` is set would
+    // take a full pool of chunks.
+    a.publish_scripts();
+    b.publish_scripts();
     // First strict script verdict wins. Both ready prefers `a`.
     let first = loop {
         if a.script_is_complete() {
@@ -496,6 +501,11 @@ fn run_pair_loads(
     let lose_wave = lose.script_wave_arc();
     match win.finish_scripts() {
         Ok(win) => {
+            // Keep the loser off the whole pool through the winner's index
+            // and write, without losing its verdicts for a promotion.
+            if let Some(w) = &lose_wave {
+                cap_half(w);
+            }
             match pair_write_started(query, params, milestone, height, win, lose_wave, phase) {
                 Ok(fks) => {
                     lose.cancel_scripts();

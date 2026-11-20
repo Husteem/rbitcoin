@@ -4,8 +4,8 @@ use super::index::{self, IndexJob};
 use super::*;
 use rbitcoin_consensus::block::{verify_one_script_job, ScriptCheckJob};
 use rbitcoin_consensus::script_pool::{
-    fg_has_unclaimed, set_script_publisher, start_for_each_owned, start_for_each_owned_keep,
-    start_for_each_pooled, OwnedWave,
+    fg_has_unclaimed, publish_owned, set_script_publisher, start_for_each_owned,
+    start_for_each_owned_held, start_for_each_owned_keep, start_for_each_pooled, OwnedWave,
 };
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -117,7 +117,7 @@ impl Inflight {
         batch: LoadedBatch,
         mat_ns: u64,
     ) -> Result<Self, (ConfirmError, ScriptsBatchMeta)> {
-        Self::start_impl(batch, mat_ns, false)
+        Self::start_impl(batch, mat_ns, false, true)
     }
 
     /// Tip path: publish the script wave now and hold the index wave until
@@ -127,13 +127,32 @@ impl Inflight {
         batch: LoadedBatch,
         mat_ns: u64,
     ) -> Result<Self, (ConfirmError, ScriptsBatchMeta)> {
-        Self::start_impl(batch, mat_ns, true)
+        Self::start_impl(batch, mat_ns, true, true)
+    }
+
+    /// Tip pair: hold the script wave unpublished so both waves can be
+    /// linked (and capped) before the first worker wake.
+    #[doc(hidden)]
+    pub fn start_deferred_index_held(
+        batch: LoadedBatch,
+        mat_ns: u64,
+    ) -> Result<Self, (ConfirmError, ScriptsBatchMeta)> {
+        Self::start_impl(batch, mat_ns, true, false)
+    }
+
+    /// Publish a wave started with [`Self::start_deferred_index_held`].
+    #[doc(hidden)]
+    pub fn publish_scripts(&self) {
+        if let Some(w) = self.script_wave.as_ref() {
+            publish_owned(w);
+        }
     }
 
     fn start_impl(
         mut batch: LoadedBatch,
         mat_ns: u64,
         defer_index: bool,
+        publish: bool,
     ) -> Result<Self, (ConfirmError, ScriptsBatchMeta)> {
         let t0 = Instant::now();
         let meta = ScriptsBatchMeta::from_batch(&batch, mat_ns);
@@ -148,7 +167,9 @@ impl Inflight {
             slots: index_slots,
             started: index_started,
         } = index_jobs;
-        let started = if batch.trust_peer {
+        let started = if !publish {
+            start_for_each_owned_held(scripts, apply_script)
+        } else if batch.trust_peer {
             start_for_each_owned_keep(scripts, apply_script)
         } else {
             start_for_each_owned(scripts, apply_script)

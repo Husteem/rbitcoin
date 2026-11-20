@@ -3647,18 +3647,26 @@ impl ChainHub {
                             let branch_tip = branch.last().map(|b| b.block_hash());
                             match self.accept_branch_locked(&branch) {
                                 Ok(AcceptOutcome::IgnoredWeaker) => {}
-                                Ok(out) => {
+                                Ok(_) => {
+                                    // The branch connected, not this child.
                                     if hold_unconnected {
                                         self.hold_body(Arc::clone(&block), waive);
                                     }
-                                    return Ok(out);
+                                    if self.is_connected(&hash) {
+                                        return Ok(AcceptOutcome::Accepted { height });
+                                    }
+                                    return Ok(AcceptOutcome::IgnoredWeaker);
                                 }
                                 Err(e) => {
-                                    // The branch failed. Record its verdict,
-                                    // then only park the child if the failed
-                                    // attempt still moved the tip.
+                                    // A local fault is ours, not a peer verdict.
+                                    if e.is_local_fault() {
+                                        return Err(e);
+                                    }
                                     if let Some(h) = branch_tip {
                                         self.remember_failed_accept(h, &e);
+                                    }
+                                    if self.is_connected(&hash) {
+                                        return Ok(AcceptOutcome::Accepted { height });
                                     }
                                     if self.try_tip_hash()? != Some(tip_hash) {
                                         if hold_unconnected {
@@ -4409,26 +4417,22 @@ impl ChainHub {
         use crate::most_work::{checked_add_work, work_better};
         let child_work = child.header.work();
         let held: Vec<BlockHash> = self.held_bodies.read().unwrap().keys().collect();
-        // A peer can flood `held_bodies` (CAP 320). Each leaf walk is up to
-        // the 288-header window, so bound both: a branch that can beat
-        // `tip + child` must tip above the current tip, and 64 held tips is
-        // more than a real reorg race ever has.
-        if held.is_empty() || held.len() > 64 {
+        if held.is_empty() {
             return None;
         }
         let tip_h = self.tip_height().unwrap_or(0);
+        let child_hash = child.block_hash();
+        // The map can hold CAP (320) hashes, most at or below the tip. Cap
+        // only the expensive walks: leaves above the tip, 64 of them.
+        let candidates: Vec<BlockHash> = held
+            .into_iter()
+            .filter(|h| *h != child_hash)
+            .filter(|h| self.stored_header_height(h).is_some_and(|hh| hh > tip_h))
+            .take(64)
+            .collect();
         let restored = HashSet::new();
         let mut best: Option<(bitcoin::Work, Vec<Arc<Block>>)> = None;
-        for h in held {
-            if h == child.block_hash() {
-                continue;
-            }
-            let Some(hh) = self.stored_header_height(&h) else {
-                continue;
-            };
-            if hh <= tip_h {
-                continue;
-            }
+        for h in candidates {
             let Some(branch) = self.assemble_side_branch(h, &restored) else {
                 continue;
             };

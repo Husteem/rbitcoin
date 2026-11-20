@@ -7848,7 +7848,15 @@ fn failed_heavier_branch_does_not_strand_the_tip_child() {
     hub.hold_unconnected_body(q1.clone());
     hub.hold_unconnected_body(q2.clone());
     hub.hold_unconnected_body(q3);
-    let child = mine_distinct(prev, t.saturating_add(102), 102, &[q2.block_hash()]);
+    // A non-coinbase child: `held_heavier_branch` only runs above one tx.
+    // Spend an OP_TRUE coinbase (height 2, mature at 102), not the P2PK one.
+    let op_true_mature = hub.block_at_height(2).unwrap().expect("height 2");
+    let child = spend_block(
+        prev,
+        t.saturating_add(102),
+        102,
+        coinbase_out(&op_true_mature),
+    );
     let out = hub.accept_received_block(child.clone()).unwrap();
     assert!(
         matches!(out, AcceptOutcome::Accepted { height: 102 }),
