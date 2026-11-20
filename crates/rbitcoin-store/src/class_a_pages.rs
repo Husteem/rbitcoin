@@ -532,7 +532,7 @@ fn restore_stem(
         return Ok(());
     }
     let header_len = header_published(&file, &path, file_len)?;
-    let published = best
+    let mut published = best
         .map(|slot| slot.published[stem])
         .filter(|n| *n > 0)
         .unwrap_or(header_len);
@@ -543,6 +543,14 @@ fn restore_stem(
     let mut page0_restored = false;
     if page0_zero {
         page0_restored = restore_page0(&file, &path, stem, published, first_raw, best)?;
+    }
+    if page0_restored {
+        // The live header was zeros, so `published` was 0 when no slot parsed.
+        // The length just written is the one the tail check has to use.
+        let restored_len = header_published(&file, &path, file_len)?;
+        if restored_len > published {
+            published = restored_len;
+        }
     }
     let tail_restored = restore_tail_block(&file, &path, stem, published, file_len, best)?;
     if page0_restored || tail_restored {
@@ -577,11 +585,12 @@ fn restore_page0(
     best: Option<&TailSlot>,
 ) -> Result<bool, StoreError> {
     if let Some(commit) = parse_commit(first_raw, stem) {
-        pwrite_exact(file, path, 0, &commit.image)?;
-        let image_len = le_u64(&commit.image[8..16]);
+        let mut image = commit.image;
+        let image_len = le_u64(&image[8..16]);
         if published > image_len {
-            pwrite_exact(file, path, 8, &published.to_le_bytes())?;
+            image[8..16].copy_from_slice(&published.to_le_bytes());
         }
+        pwrite_exact(file, path, 0, &image)?;
         return Ok(true);
     }
     if let Some(slot) = best {

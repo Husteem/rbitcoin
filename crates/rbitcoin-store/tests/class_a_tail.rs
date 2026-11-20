@@ -628,3 +628,90 @@ fn zeroed_cold_txstat_tail_restores_from_the_hot_guard() {
     drop(s);
     let _ = std::fs::remove_dir_all(&hot);
 }
+
+fn expect_does_not_decode(dir: &Path) {
+    match Store::open_tiny(dir) {
+        Ok(_) => panic!("open kept a zeroed named page"),
+        Err(err) => assert!(
+            err.to_string().contains("does not decode"),
+            "open kept a zeroed named page: {err}"
+        ),
+    }
+}
+
+/// A sealed `first` image still names the txid tail when both slots fail the
+/// checksum. Zeroing page 0 makes the live length 0. Open must stop, and must
+/// not publish that zero tail as generation 1.
+#[test]
+fn sealed_first_and_bad_tails_refuse_a_zeroed_txid_tail() {
+    let named = 128u64;
+    let (dir, _txid) = synced_txid_past_page(named);
+    let body = dir.join("txid.body");
+    zero_published_tail_block(&body);
+    zero_page0(&body);
+    let guard = dir.join("tear_guard");
+    for name in ["tail.0", "tail.1"] {
+        let path = guard.join(name);
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[24] ^= 0xff;
+        std::fs::write(&path, &raw).unwrap();
+    }
+    expect_does_not_decode(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `plant_first` writes a valid CAPF checksum. A flipped commit checksum over a
+/// zeroed page 0 must still stop open. Deleting the commit compare would
+/// restore the image and this open would succeed.
+#[test]
+fn checksum_bad_first_over_zeroed_page0_refuses_open() {
+    let (dir, _txid) = synced_txid_past_page(128);
+    let first = dir.join("tear_guard/first");
+    let mut raw = std::fs::read(&first).unwrap();
+    let commit_at = TXID_STEM * 2 * PAGE + PAGE;
+    raw[commit_at + 40] ^= 0xff;
+    std::fs::write(&first, &raw).unwrap();
+    zero_page0(&dir.join("txid.body"));
+    expect_does_not_decode(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The image hash inside an otherwise valid CAPF commit does not match.
+/// Deleting that compare would write the image back and this open would succeed.
+#[test]
+fn image_hash_bad_first_over_zeroed_page0_refuses_open() {
+    let (dir, _txid) = synced_txid_past_page(128);
+    let first = dir.join("tear_guard/first");
+    let mut raw = std::fs::read(&first).unwrap();
+    let commit_at = TXID_STEM * 2 * PAGE + PAGE;
+    raw[commit_at + 8] ^= 0xff;
+    let sum = sha256_parts(&[&raw[commit_at..commit_at + 40]]);
+    raw[commit_at + 40..commit_at + 72].copy_from_slice(&sum);
+    std::fs::write(&first, &raw).unwrap();
+    zero_page0(&dir.join("txid.body"));
+    expect_does_not_decode(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A checksum-valid slot whose prefix differs from the live tail must not
+/// replace those bytes. Deleting the all-zero check in `restore_tail_block`
+/// would write `0x11` over the named txid.
+#[test]
+fn nonzero_tail_is_not_overwritten_by_the_slot() {
+    let named = 128u64;
+    let (dir, txid) = synced_txid_past_page(named);
+    let body = dir.join("txid.body");
+    let published = logical_of(&body);
+    let off = published & !4095;
+    let n = (published - off) as usize;
+    let junk = vec![0x11u8; n];
+    plant_tail(
+        &dir.join("tear_guard/tail.0"),
+        3,
+        named,
+        &[(TXID_STEM, published, off, &junk)],
+    );
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.get(Fk(named)).unwrap(), txid);
+    let _ = std::fs::remove_dir_all(&dir);
+}
