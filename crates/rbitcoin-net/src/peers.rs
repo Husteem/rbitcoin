@@ -2540,7 +2540,7 @@ impl PeerHub {
     }
 
     fn announced_external_onion(&self) -> Option<crate::NetAddr> {
-        let port = self.listen_port.load(Ordering::Relaxed);
+        let port = self.listen_port.load(Ordering::Acquire);
         if !self.discover.load(Ordering::Relaxed) || port == 0 {
             return None;
         }
@@ -2655,8 +2655,20 @@ impl PeerHub {
         self.compact_filters.load(Ordering::Acquire)
     }
 
+    /// Enable announcements once the endpoints and inbound policy are known.
+    pub fn publish_local_endpoints(
+        &self,
+        port: u16,
+        endpoints: Vec<ExternalEndpoint>,
+        perms: crate::net_permissions::NetPermTable,
+    ) {
+        self.set_external_endpoints(endpoints);
+        self.set_net_perms(perms);
+        self.set_listen_port(port);
+    }
+
     pub fn set_listen_port(&self, port: u16) {
-        self.listen_port.store(port, Ordering::Relaxed);
+        self.listen_port.store(port, Ordering::Release);
     }
 
     /// Public Tor port when the only P2P listener is Tor's loopback target.
@@ -2691,7 +2703,7 @@ impl PeerHub {
     /// `getnetworkinfo.localaddresses` rows.
     pub fn rpc_local_addresses(&self) -> Vec<(String, u16, i32)> {
         const LOCAL_MANUAL: i32 = 4;
-        let port = self.listen_port.load(Ordering::Relaxed);
+        let port = self.listen_port.load(Ordering::Acquire);
         let onion_port = self.external_onion_port(port);
         let external = self
             .external_endpoints
@@ -2754,7 +2766,7 @@ impl PeerHub {
         if !self.clearnet_listen.load(Ordering::Relaxed) {
             return None;
         }
-        let port = self.listen_port.load(Ordering::Relaxed);
+        let port = self.listen_port.load(Ordering::Acquire);
         if port == 0 {
             return None;
         }
@@ -2778,7 +2790,7 @@ impl PeerHub {
         {
             return None;
         }
-        let port = self.listen_port.load(Ordering::Relaxed);
+        let port = self.listen_port.load(Ordering::Acquire);
         if port == 0 {
             return None;
         }

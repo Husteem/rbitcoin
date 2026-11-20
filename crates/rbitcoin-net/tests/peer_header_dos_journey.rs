@@ -1939,6 +1939,39 @@ fn external_onion_announcement_uses_the_configured_or_listen_port_on_tor() {
 }
 
 #[test]
+fn local_endpoints_wait_for_startup_listener_permissions() {
+    use rbitcoin_net::net_permissions::NetPermTable;
+
+    let peers = rbitcoin_net::PeerHub::new();
+    let endpoint = "42.42.42.42:28332";
+    let external = endpoint.parse().unwrap();
+    let onion_bind = "127.0.0.1:8334".parse().unwrap();
+    std::thread::scope(|scope| {
+        // Hold the permission table while the startup path publishes the endpoints.
+        let held = peers.net_perms.lock().unwrap();
+        let startup = scope.spawn(|| {
+            peers.publish_local_endpoints(
+                8333,
+                vec![endpoint.parse().unwrap()],
+                NetPermTable {
+                    onion_bind: Some(onion_bind),
+                    ..NetPermTable::default()
+                },
+            );
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !peers.is_own_address(external) {
+            assert!(std::time::Instant::now() < deadline, "endpoints were not registered");
+            std::thread::yield_now();
+        }
+        assert!(peers.advertise_local_socket().is_none());
+        drop(held);
+        startup.join().unwrap();
+    });
+    assert_eq!(peers.advertise_local_socket(), external.socket_addr());
+}
+
+#[test]
 fn marked_tor_listener_announces_only_the_native_onion() {
     use rbitcoin_net::net_permissions::NetPermTable;
     use rbitcoin_net::peers::PeerConnType::Inbound;

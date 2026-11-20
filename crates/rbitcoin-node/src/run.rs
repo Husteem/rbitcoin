@@ -776,9 +776,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     node.peers.set_discover_from_peers(from_peers);
     node.peers.set_clearnet_listen(clearnet_listen);
-    if node.local_addr.port() != 0 {
-        node.peers.set_listen_port(node.local_addr.port());
-    }
     let onion_public_port = config.network.default_p2p_port();
     if !clearnet_listen && (config.listen.listen_onion || onion_bind.is_some()) {
         node.peers.set_tor_only_public_port(onion_public_port);
@@ -788,8 +785,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         node.local_addr,
         config.listen.cjdns_reachable && clearnet_listen,
     );
-    node.peers.set_external_endpoints(external);
-    node.peers.set_net_perms(table.clone());
+    node.peers
+        .publish_local_endpoints(node.local_addr.port(), external, table.clone());
     if immediate_relay {
         node.peers.set_noban(true);
     }
