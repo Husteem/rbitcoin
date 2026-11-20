@@ -135,7 +135,7 @@ match = 'received: addr'
 emit = ['received: addr']
 
 [[rule]]
-match = 'p2p: received tx'
+match = 'txrelay: received tx'
 emit = ['received: tx']
 
 [[rule]]
@@ -155,7 +155,7 @@ match = 'p2p: transaction \(([0-9a-f]+)\) inv sent in violation of protocol, dis
 emit = ['transaction ({1}) inv sent in violation of protocol, disconnecting peer']
 
 [[rule]]
-match = 'p2p: getdata wtx ([0-9a-f]+) peer'
+match = 'txrelay: getdata wtx ([0-9a-f]+) peer'
 emit = ['received getdata for: wtx {1} peer']
 
 [[rule]]

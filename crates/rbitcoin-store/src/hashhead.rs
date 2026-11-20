@@ -352,7 +352,8 @@ impl HashHead {
         file.zero_range(FILE_HEADER_LEN as u64, body_bytes)?;
         if slots > DEFAULT_SLOTS {
             rbitcoin_log::trace!(
-                "store: hash-head create path={} slots={} (~{:.2} GiB sparse)",
+                Store,
+                "hash-head create path={} slots={} (~{:.2} GiB sparse)",
                 file.path().display(),
                 slots,
                 body_bytes as f64 / (1024.0 * 1024.0 * 1024.0)

@@ -34,7 +34,7 @@ run "p2p dial maps to Core trying v1 needle" \
   "trying v1 connection (outbound-full-relay) to 25.0.0.1:8333"
 
 run "received tx TRACE maps to Core needle" \
-  "2026-01-01T00:00:00Z TRACE p2p: received tx" \
+  "2026-01-01T00:00:00Z TRACE txrelay: received tx" \
   "received: tx"
 
 run "tip best maps to Core UpdateTip" \
@@ -70,7 +70,7 @@ run "headers timeout keep peer maps to Core noban needle" \
   "Timeout downloading headers from noban peer, not disconnecting peer=0"
 
 run "getdata wtx TRACE maps to Core needle" \
-  "2026-01-01T00:00:00Z TRACE p2p: getdata wtx aabbccdd peer=3" \
+  "2026-01-01T00:00:00Z TRACE txrelay: getdata wtx aabbccdd peer=3" \
   "received getdata for: wtx aabbccdd peer"
 
 run "future tip maps to Core InitError needle" \

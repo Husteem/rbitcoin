@@ -288,7 +288,7 @@ python3 scripts/core-functional/check_core_release.py
 `debuglog_map.toml` + `map_debuglog.py`: the shim tails node stdio into
 `regtest/debug.log` and appends mapped Core substrings (line-buffered).
 **Operator stderr is rbitcoin dialect** (`tip: best=`, `p2p: headers sync`,
-`p2p: getdata wtx`, store-tip-in-the-future abort). Do **not** emit Core
+`txrelay: getdata wtx`, store-tip-in-the-future abort). Do **not** emit Core
 C++ function names (`UpdateTip`, `AcceptBlockHeader`, …) from the node;
 add a `[[rule]]` (`match` regex → `emit` lines with `{1}` captures) so the
 harness can still grep those needles. Flip the inventory row to `run` when

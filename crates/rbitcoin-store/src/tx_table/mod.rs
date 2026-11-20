@@ -2637,7 +2637,8 @@ impl TxTable {
                     Ok(v) => Ok(v),
                     Err(e) => {
                         rbitcoin_log::debug!(
-                            "store: structural meta uring failed ({e}); pread fallback"
+                            Store,
+                            "structural meta uring failed ({e}); pread fallback"
                         );
                         self.get_spender_meta_at_abs_batch_pread(abs_offs)
                     }
