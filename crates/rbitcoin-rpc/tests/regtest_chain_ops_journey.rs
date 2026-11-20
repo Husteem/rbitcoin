@@ -951,6 +951,9 @@ fn rpc_regtest_mature_chain_ops() {
     chain_ops_invalidate_and_precious(&ctx, &hub, &mut cbs, &p2wpkh);
     chain_ops_reconsider_most_work(&ctx, &hub, &p2wpkh);
     chain_ops_held_height_and_work(&ctx, &hub, &p2wpkh);
+    // These two mine blocks. Run before `chain_ops_proposal_spends`, they push
+    // it past the height-150 halving, and `proposal_on_tip` copies the tip's
+    // coinbase value unchanged (`bad-cb-amount`).
     chain_ops_ephemeral_anchor(&ctx, &mut cbs);
     chain_ops_legacy_sighash_budget(&ctx, &mut cbs);
 
@@ -2802,6 +2805,8 @@ fn chain_ops_ephemeral_anchor(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
         vec![json!([tx_hex(&parent), tx_hex(&skips)])],
     )
     .unwrap();
+    // Core answers `unspent-dust` here (mempool_ephemeral_dust.py
+    // test_unspent_ephemeral); the per-member strings differ too (COMPAT.md).
     assert_eq!(r["package_msg"], "transaction failed", "{r}");
     assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
 
