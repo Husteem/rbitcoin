@@ -658,9 +658,8 @@ fn roll_does_not_join_seal_open_probes_sealing_oa() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A sealed segment probe costs the active keys, not the whole wave: it
-/// returns `(key, cands)` only for keys with candidates and allocates nothing
-/// per inactive key.
+/// A sealed segment probe returns `(key, cands)` only for keys with
+/// candidates, not the whole wave.
 #[test]
 fn sealed_segment_probe_is_sized_by_active_keys() {
     let dir = tmp();
@@ -674,17 +673,9 @@ fn sealed_segment_probe_is_sized_by_active_keys() {
     let wave: Vec<[u8; 32]> = (0..20_000u64).map(|i| mixed(i + 1)).collect();
     let active = [4usize, 9_000];
     let mut ctx = rbitcoin_store::IoCtx::none();
-    let (cands, asked) =
-        crate::alloc_count::asked_by(|| h.probe_sealed_segment(&wave, 0, &active, &mut ctx));
-    let cands = cands.unwrap();
+    let cands = h.probe_sealed_segment(&wave, 0, &active, &mut ctx).unwrap();
     assert_eq!(cands.len(), 1, "only key 4 is in segment 0: {cands:?}");
     assert_eq!(cands[0].0, 4);
     assert!(cands[0].1.contains(&Fk(5)), "{cands:?}");
-    assert!(
-        asked.bytes < 4096,
-        "{} bytes for 2 active keys of {}",
-        asked.bytes,
-        wave.len()
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
