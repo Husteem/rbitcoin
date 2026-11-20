@@ -214,6 +214,7 @@ pub async fn accept_received_from_peer(
     // Park the body before the lane job so an equal-work sibling that runs
     // first can race it (T1). A connect removes it; a loser stays held.
     let was_held = hub.held_body(&announced).is_some();
+    let was_connected = hub.is_connected(&announced);
     let block = std::sync::Arc::new(block);
     hub.hold_body(std::sync::Arc::clone(&block), waive);
     let r = if let Some(hub) = hub.shared_arc() {
@@ -223,7 +224,10 @@ pub async fn accept_received_from_peer(
             let chosen = if compact_blocks_ok(&hub) { hb } else { None };
             let credited = match &r {
                 Ok(AcceptOutcome::Accepted { .. }) => true,
-                Ok(AcceptOutcome::AlreadyHave) => hub.tip_hash() == Some(announced),
+                // The pair can connect this hash before its own job runs.
+                // Credit the delivery that got it connected, not a later
+                // duplicate of an already-connected block.
+                Ok(AcceptOutcome::AlreadyHave) => !was_connected && hub.is_connected(&announced),
                 _ => false,
             };
             note_accepted_hb(credited, &chosen);
@@ -239,7 +243,10 @@ pub async fn accept_received_from_peer(
             let chosen = if compact_blocks_ok(hub) { hb } else { None };
             let credited = match &r {
                 Ok(AcceptOutcome::Accepted { .. }) => true,
-                Ok(AcceptOutcome::AlreadyHave) => hub.tip_hash() == Some(announced),
+                // The pair can connect this hash before its own job runs.
+                // Credit the delivery that got it connected, not a later
+                // duplicate of an already-connected block.
+                Ok(AcceptOutcome::AlreadyHave) => !was_connected && hub.is_connected(&announced),
                 _ => false,
             };
             note_accepted_hb(credited, &chosen);
@@ -254,7 +261,7 @@ pub async fn accept_received_from_peer(
     }
     let credited = match &r {
         Ok(AcceptOutcome::Accepted { .. }) => true,
-        Ok(AcceptOutcome::AlreadyHave) => hub.tip_hash() == Some(announced),
+        Ok(AcceptOutcome::AlreadyHave) => !was_connected && hub.is_connected(&announced),
         _ => false,
     };
     if let (Some(s), Some(at), true) = (session, received_at, credited) {

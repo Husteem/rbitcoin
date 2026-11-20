@@ -407,6 +407,18 @@ fn preferred_failure(
     })
 }
 
+/// Puts a withdrawn loser back in the pool if the winner's write unwinds
+/// before the loser is cancelled or republished.
+struct RePublishLoser<'a>(&'a Arc<rbitcoin_consensus::script_pool::Wave>);
+
+impl Drop for RePublishLoser<'_> {
+    fn drop(&mut self) {
+        if !self.0.failed.load(std::sync::atomic::Ordering::Acquire) {
+            rbitcoin_consensus::script_pool::publish_wave(self.0);
+        }
+    }
+}
+
 fn pair_load(
     query: &Query,
     params: &ChainParams,
@@ -564,9 +576,11 @@ fn run_pair_loads(
         Ok(win) => {
             // Stop the loser from claiming through the winner's index and
             // write without cancelling the verdicts a promotion may reuse.
-            if let Some(w) = &lose_wave {
+            // The guard re-publishes it on a panic before `cancel_scripts`.
+            let _republish = lose_wave.as_ref().map(|w| {
                 rbitcoin_consensus::script_pool::unpublish_fg(w);
-            }
+                RePublishLoser(w)
+            });
             match pair_write_started(query, params, milestone, height, win, phase) {
                 Ok(fks) => {
                     lose.cancel_scripts();

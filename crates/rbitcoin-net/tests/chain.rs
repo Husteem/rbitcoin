@@ -7932,15 +7932,52 @@ fn valid_heavier_branch_wins_before_the_tip_child() {
 
 /// The pair winner can fail its write with no index wave. The loser was
 /// unpublished for that write; the promotion must re-publish it and finish,
-/// not wait for chunks no worker can claim.
+/// not wait for chunks no worker can claim. The loser carries many script
+/// jobs so an unclaimed chunk remains when it is withdrawn.
 #[test]
 fn pair_winner_write_failure_promotes_an_unpublished_loser() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     hub.confirm_empty_regtest(101).unwrap();
-    let tip = hub.tip_hash().unwrap();
-    let h = hub.tip_height().unwrap().saturating_add(1);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    // A fan-out at 102 gives the held sibling many one-input script jobs.
+    let mut fan = mature_spend_tx(&hub, 1);
+    fan.output = (0..8000u32)
+        .map(|_| TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: op_true.clone(),
+        })
+        .collect();
+    let fan_txid = fan.compute_txid();
+    let fan_block = hub
+        .assemble_block_to_script(op_true.clone(), vec![fan])
+        .unwrap();
+    hub.accept_block(fan_block).unwrap();
+    let h = hub.tip_height().unwrap().saturating_add(1);
+    // B: 8000 one-input OP_TRUE spends. Its wave has more chunks than the
+    // pool has workers, so withdrawing it without a re-publish hangs.
+    let spends: Vec<Transaction> = (0..8000u32)
+        .map(|vout| Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: fan_txid,
+                    vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: op_true.clone(),
+            }],
+        })
+        .collect();
+    let good = hub
+        .assemble_block_to_script(op_true.clone(), spends)
+        .unwrap();
     // A: coinbase-only (no script wave) with an overpaid coinbase. It wins
     // the race at once, then fails the write on `bad-cb-amount`.
     let mut bad = hub.assemble_block_to_script(op_true, vec![]).unwrap();
@@ -7948,13 +7985,12 @@ fn pair_winner_write_failure_promotes_an_unpublished_loser() {
     bad.txdata[0].output[0].value = Amount::from_sat(subsidy.saturating_add(1));
     bad.header.merkle_root = bad.compute_merkle_root().unwrap();
     rbitcoin_consensus::grind_regtest_pow(&mut bad.header);
-    // B: a valid equal-work sibling.
-    let good = mine(tip, hub.tip_header().unwrap().time.saturating_add(600), h);
     assert_eq!(bad.header.prev_blockhash, good.header.prev_blockhash);
     hub.hold_unconnected_body(good.clone());
     let out = hub.accept_received_block(bad.clone()).unwrap();
     assert!(matches!(out, AcceptOutcome::IgnoredWeaker), "{out:?}");
     assert_eq!(hub.tip_hash(), Some(good.block_hash()));
     assert!(hub.is_block_invalid(&bad.block_hash()));
+    assert!(hub.held_body(&bad.block_hash()).is_none());
     let _ = std::fs::remove_dir_all(dir);
 }
