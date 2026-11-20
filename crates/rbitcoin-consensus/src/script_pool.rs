@@ -68,6 +68,79 @@ pub struct Wave {
     pub apply: Apply,
     pub done: Mutex<bool>,
     pub done_cv: Condvar,
+    /// Equal-work tip partner. While the partner still has an unclaimed
+    /// chunk, this wave may hold at most half the pool. `Weak` avoids an
+    /// `Arc` cycle; the publisher links and unlinks both sides.
+    pub pair: Mutex<Option<std::sync::Weak<Wave>>>,
+}
+
+/// Worker count the pool started, for the tip-pair half cap. Set once.
+#[doc(hidden)]
+pub static SCRIPT_WORKERS: OnceLock<usize> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn script_workers() -> usize {
+    if let Some(n) = SCRIPT_WORKERS.get() {
+        return *n;
+    }
+    let _ = workers();
+    SCRIPT_WORKERS.get().copied().unwrap_or(1).max(1)
+}
+
+/// Half the pool, rounded up. A tip pair splits it while both sides claim.
+#[doc(hidden)]
+pub fn pair_cap() -> usize {
+    script_workers().div_ceil(2)
+}
+
+/// Link two equal-work tip waves so each is capped at half the pool while
+/// the other still has claims. The caller unlinks both when the pair ends.
+#[doc(hidden)]
+pub fn link_pair(a: &Arc<Wave>, b: &Arc<Wave>) {
+    *a.pair.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(b));
+    *b.pair.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(a));
+}
+
+/// Clear the pair on both sides. Safe to call twice.
+#[doc(hidden)]
+pub fn unlink_pair(a: &Arc<Wave>, b: &Arc<Wave>) {
+    *a.pair.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *b.pair.lock().unwrap_or_else(|p| p.into_inner()) = None;
+}
+
+/// Cap for `wave` if its pair partner is still claiming, else `None`.
+fn pair_cap_for(wave: &Wave) -> Option<usize> {
+    let other = wave
+        .pair
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)?;
+    other.has_unclaimed().then(pair_cap)
+}
+
+/// Charge one in-flight chunk, honouring the pair cap. Returns false when
+/// the cap is reached (the caller then tries the partner wave).
+fn charge_claim(wave: &Wave) -> bool {
+    match pair_cap_for(wave) {
+        None => {
+            wave.in_wave.fetch_add(1, ModelOrdering::AcqRel);
+            true
+        }
+        Some(cap) => loop {
+            let cur = wave.in_wave.load(ModelOrdering::Acquire);
+            if cur >= cap {
+                return false;
+            }
+            if wave
+                .in_wave
+                .compare_exchange(cur, cur + 1, ModelOrdering::AcqRel, ModelOrdering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        },
+    }
 }
 
 impl Wave {
@@ -89,7 +162,9 @@ impl Wave {
         // `in_wave` before `next`. `next` is the release, and `is_complete`
         // acquire-loads it, so that load sees this increment. A relaxed
         // `next` can become visible first and look like the claim finished.
-        wave.in_wave.fetch_add(1, ModelOrdering::AcqRel);
+        if !charge_claim(wave) {
+            return None;
+        }
         let hold = InWave {
             wave: Arc::clone(wave),
         };
@@ -227,6 +302,28 @@ pub fn publish_waves(waves: &[Arc<Wave>]) {
     waves_snap().store(Arc::new(waves.to_vec()));
     #[cfg(debug_assertions)]
     note_script_progress();
+}
+
+/// Reorder the published list so the caller's waves come first, in the given
+/// order, at the position of the earliest wave already published. Waves
+/// published by other roles keep their relative position; the tip supervisor
+/// is the only caller.
+#[doc(hidden)]
+pub fn set_wave_order(order: &[Arc<Wave>]) {
+    if order.is_empty() {
+        return;
+    }
+    let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
+    let at = g
+        .iter()
+        .position(|w| order.iter().any(|o| Arc::ptr_eq(o, w)))
+        .unwrap_or(g.len());
+    g.retain(|w| !order.iter().any(|o| Arc::ptr_eq(o, w)));
+    let at = at.min(g.len());
+    for (i, w) in order.iter().enumerate() {
+        g.insert(at + i, Arc::clone(w));
+    }
+    publish_waves(&g);
 }
 
 /// Drops `in_wave` on the success path and on a panic inside the chunk.
@@ -433,6 +530,7 @@ pub fn start_wave<T: Sync>(
         },
         done: Mutex::new(false),
         done_cv: Condvar::new(),
+        pair: Mutex::new(None),
     });
     {
         let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
@@ -611,6 +709,7 @@ pub fn workers() -> &'static ScriptWorkers {
             .map(|p| p.get())
             .unwrap_or(4)
             .max(1);
+        let _ = SCRIPT_WORKERS.set(n);
         let mut threads = Vec::with_capacity(n);
         let mut handles = Vec::with_capacity(n);
         for i in 0..n {
@@ -843,4 +942,67 @@ where
         let _ = tx.send(work());
     });
     rx.recv().ok()
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+
+    fn test_wave(n: usize) -> Arc<Wave> {
+        unsafe fn noop(_: *const (), _: usize) -> Result<(), crate::ConsensusError> {
+            Ok(())
+        }
+        Arc::new(Wave {
+            n,
+            chunk: 1,
+            next: crate::sync::atomic::AtomicUsize::new(0),
+            in_wave: crate::sync::atomic::AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+            first_err: Mutex::new(None),
+            keep_faults: AtomicBool::new(false),
+            faults: Mutex::new(Vec::new()),
+            apply: Apply {
+                f: noop,
+                ctx: std::ptr::null(),
+            },
+            done: Mutex::new(false),
+            done_cv: Condvar::new(),
+            pair: Mutex::new(None),
+        })
+    }
+
+    /// A tip pair splits the pool while both sides claim, and the survivor is
+    /// uncapped the moment the other has no unclaimed chunk. Not published:
+    /// this only exercises `claim_chunk`'s cap, not the workers.
+    #[test]
+    fn pair_cap_halves_and_lifts_when_the_other_side_drains() {
+        let _gate = steal_test_gate();
+        let a = test_wave(10_000);
+        let b = test_wave(10_000);
+        link_pair(&a, &b);
+        let cap = pair_cap();
+        assert!(cap >= 1);
+        let mut held = Vec::new();
+        for _ in 0..cap {
+            held.push(Wave::claim_chunk(&a).expect("claim under the cap"));
+        }
+        assert!(
+            Wave::claim_chunk(&a).is_none(),
+            "a is capped while b still claims"
+        );
+        for _ in 0..cap {
+            held.push(Wave::claim_chunk(&b).expect("b claim under the cap"));
+        }
+        assert!(Wave::claim_chunk(&b).is_none(), "b is capped against a");
+        a.failed.store(true, Ordering::Release);
+        for _ in 0..cap {
+            held.push(Wave::claim_chunk(&b).expect("uncapped after a drains"));
+        }
+        assert!(
+            Wave::claim_chunk(&b).is_some(),
+            "the survivor takes every worker"
+        );
+        unlink_pair(&a, &b);
+        assert!(Wave::claim_chunk(&b).is_some(), "unlinked is uncapped");
+    }
 }
