@@ -24,6 +24,7 @@ allow = [
   "eval_script",
   "ibd_cancellable",
   "pread_batch_on_session_inner",
+  "run",
   "run_pair_loads",
   "run_p2p",
 ]
