@@ -1357,7 +1357,6 @@ async fn long_poll_deadline_returns_the_tip() {
 }
 
 /// The tip, not the deadline, ends the wait: the deadline is a minute out.
-/// How fast the tip wakes a wait is `published_tip_wakes_wait_for_tip`.
 async fn published_tip_wakes_waitfornewblock(handle: &RpcHandle, hub: &rbitcoin_net::ChainHub) {
     let addr = tcp_addr(handle);
     let auth = handle.auth.clone();
@@ -2250,7 +2249,7 @@ fn hold_template_prev(
     (worker, release_tx)
 }
 
-fn gbt_app(ctx: Arc<rbitcoin_rpc::methods::RpcContext>) -> AppState {
+pub(crate) fn gbt_app(ctx: Arc<rbitcoin_rpc::methods::RpcContext>) -> AppState {
     AppState {
         ctx,
         auth: RpcAuth::new("test-token"),
@@ -3044,7 +3043,7 @@ async fn wait_for_settled_listing(
 }
 
 /// Waits until `method` is or is no longer listed in `getrpcinfo`.
-async fn wait_for_active_call(
+pub(crate) async fn wait_for_active_call(
     active: &std::sync::Mutex<rbitcoin_rpc::methods::RpcActive>,
     method: &str,
     listed: bool,

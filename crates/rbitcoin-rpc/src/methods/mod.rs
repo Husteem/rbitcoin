@@ -95,7 +95,6 @@ pub async fn dispatch_tip_connect(
 pub use rest::{dispatch_rest, RestReply};
 thread_local! {
     static HTTP_WAIT_SATISFIED: Cell<bool> = const { Cell::new(false) };
-    static RPC_WAIT_PARK: RefCell<Option<Arc<AtomicU64>>> = const { RefCell::new(None) };
     static HTTP_WAIT_SNAP: RefCell<Option<(String, u32)>> = const { RefCell::new(None) };
 }
 
@@ -106,22 +105,6 @@ pub fn set_http_wait_satisfied(v: bool) {
 
 pub fn http_wait_satisfied() -> bool {
     HTTP_WAIT_SATISFIED.with(|c| c.get())
-}
-
-/// Tests wait on this counter instead of a settle sleep. The note runs on
-/// the waiter thread, after a poll found the wait is not done and before
-/// `RpcWake::next` parks.
-#[doc(hidden)]
-pub fn set_rpc_wait_park_note(note: Option<Arc<AtomicU64>>) {
-    RPC_WAIT_PARK.with(|c| *c.borrow_mut() = note);
-}
-
-fn note_rpc_wait_park() {
-    RPC_WAIT_PARK.with(|c| {
-        if let Some(note) = c.borrow().as_ref() {
-            note.fetch_add(1, Ordering::SeqCst);
-        }
-    });
 }
 
 /// Tip, stop, and template subscriptions for one long-poll.
@@ -183,7 +166,6 @@ pub fn block_on_rpc_wait(ctx: &RpcContext, timeout_ms: u64, ready: impl Fn() -> 
             {
                 return;
             }
-            note_rpc_wait_park();
             wake.next(deadline).await;
         }
     });
