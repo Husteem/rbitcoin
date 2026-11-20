@@ -780,7 +780,7 @@ impl LivePeer {
             return None;
         }
         let sock = SelfAnnounceLink::Clearnet.local_socket(&hub, self.reported_local_ip)?;
-        if self.may_be_onion_ingress(&hub) {
+        if self.withhold_self_announcement(&hub, SelfAnnounceLink::Clearnet) {
             return None;
         }
         let prev = self.next_local_addr_send.load(Ordering::Relaxed);
@@ -825,7 +825,7 @@ impl LivePeer {
         if onion.is_none() && i2p.is_none() && sock.is_none() {
             return None;
         }
-        if self.may_be_onion_ingress(&hub) {
+        if self.withhold_self_announcement(&hub, link) {
             return None;
         }
         const DAY: u64 = 24 * 60 * 60;
@@ -906,12 +906,12 @@ impl LivePeer {
         }
     }
 
-    // Check after selecting the address because startup can publish the
-    // external endpoints while an inbound session is already running.
-    fn may_be_onion_ingress(&self, hub: &PeerHub) -> bool {
+    // Startup can publish the endpoints or listener designation during address selection.
+    fn withhold_self_announcement(&self, hub: &PeerHub, link: SelfAnnounceLink) -> bool {
         self.inbound
             && self.net.socket_addr().is_some()
-            && (hub.external_onion().is_some() || hub.is_onion_bind(self.addrbind))
+            && (hub.external_onion().is_some()
+                || (link != SelfAnnounceLink::Tor && hub.onion_bind() == Some(self.addrbind)))
     }
 
     /// The network this link carries, which decides the one local address
@@ -919,6 +919,14 @@ impl LivePeer {
     /// listener, so with both overlays accepting, a loopback inbound link
     /// cannot be told apart and announces nothing.
     fn self_announce_link(&self, hub: &PeerHub) -> SelfAnnounceLink {
+        let onion_bind = if self.inbound && self.net.socket_addr().is_some() {
+            hub.onion_bind()
+        } else {
+            None
+        };
+        if onion_bind == Some(self.addrbind) {
+            return SelfAnnounceLink::Tor;
+        }
         let sock = match self.net {
             crate::NetAddr::Onion { .. } => return SelfAnnounceLink::Tor,
             crate::NetAddr::I2p { .. } => return SelfAnnounceLink::I2p,
@@ -951,7 +959,8 @@ impl LivePeer {
         if !sock.ip().to_canonical().is_loopback() {
             return SelfAnnounceLink::Clearnet;
         }
-        match (hub.p2p_onion().is_some(), hub.p2p_i2p().is_some()) {
+        let tor_on_shared_bind = onion_bind.is_none() && hub.p2p_onion().is_some();
+        match (tor_on_shared_bind, hub.p2p_i2p().is_some()) {
             (false, false) => SelfAnnounceLink::Clearnet,
             (true, false) => SelfAnnounceLink::Tor,
             (false, true) => SelfAnnounceLink::I2p,
@@ -2435,12 +2444,11 @@ impl PeerHub {
         self.overlay_loopback_forward.store(on, Ordering::Relaxed);
     }
 
-    fn is_onion_bind(&self, bind: SocketAddr) -> bool {
+    fn onion_bind(&self) -> Option<SocketAddr> {
         self.net_perms
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .onion_bind
-            == Some(bind)
     }
 
     pub fn permission_flags(

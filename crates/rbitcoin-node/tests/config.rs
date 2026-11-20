@@ -85,6 +85,22 @@ fn tor_control_password_rejects_a_line_break() {
 }
 
 #[test]
+fn i2p_inbound_needs_a_listener_separate_from_a_marked_tor_bind() {
+    let mut cfg = NodeConfig::default();
+    cfg.apply_kv("listen", "0").unwrap();
+    cfg.apply_kv("listen", "[::1]:8334=onion").unwrap();
+    cfg.apply_kv("i2p_sam", "127.0.0.1:7656").unwrap();
+    cfg.apply_kv("i2p_accept_incoming", "1").unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("i2p-accept-incoming") && err.contains("=onion"),
+        "{err}"
+    );
+    cfg.apply_kv("listen", "127.0.0.1:8333").unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
 fn external_ip_accepts_a_v3_onion_and_rejects_garbage() {
     use rbitcoin_net::netaddr::ExternalEndpoint;
 

@@ -1939,6 +1939,58 @@ fn external_onion_announcement_uses_the_configured_or_listen_port_on_tor() {
 }
 
 #[test]
+fn marked_tor_listener_announces_only_the_native_onion() {
+    use rbitcoin_net::net_permissions::NetPermTable;
+    use rbitcoin_net::peers::PeerConnType::Inbound;
+
+    let peers = rbitcoin_net::PeerHub::new();
+    let tor_bind = "[::1]:8334".parse().unwrap();
+    let normal_bind = "127.0.0.1:8333".parse().unwrap();
+    peers.set_net_perms(NetPermTable {
+        onion_bind: Some(tor_bind),
+        ..NetPermTable::default()
+    });
+    peers.set_listen_port(8333);
+    peers.set_p2p_onion(
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion".into(),
+        8333,
+    );
+    let ip = "42.42.42.42:28332".parse().unwrap();
+    peers.set_external_endpoints(vec![ip]);
+    let announce = |bind: SocketAddr| {
+        let source = SocketAddr::new(bind.ip(), 51000);
+        let ver = VersionMessage::new(
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            0,
+            Address::new(&bind, ServiceFlags::NONE),
+            Address::new(&source, ServiceFlags::NONE),
+            0,
+            "/rbitcoin:test/".into(),
+            0,
+        );
+        let peer = peers.register(source, bind, &ver, true, Inbound);
+        peer.set_wants_addrv2();
+        self_announce_nets(&peer)
+    };
+
+    assert_eq!(announce(tor_bind), ["onion"]);
+    assert_eq!(announce(normal_bind), ["ipv4"]);
+    peers.set_p2p_i2p(rbitcoin_net::NetAddr::I2p {
+        dest: [0x11; 32],
+        port: 0,
+    });
+    assert_eq!(announce(tor_bind), ["onion"]);
+    assert_eq!(announce(normal_bind), ["i2p"]);
+
+    peers.set_external_endpoints(vec![
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion"
+            .parse()
+            .unwrap(),
+    ]);
+    assert!(announce(tor_bind).is_empty());
+}
+
+#[test]
 fn a_down_i2p_address_is_not_advertised_but_stays_our_own() {
     let i2p = rbitcoin_net::NetAddr::I2p {
         dest: [0x11; 32],

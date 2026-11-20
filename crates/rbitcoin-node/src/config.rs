@@ -1143,6 +1143,13 @@ impl NodeConfig {
                     "i2p-accept-incoming requires SAM (--i2p-sam)".into(),
                 ));
             }
+            if self.listen.onion_bind.is_some() && self.listen.p2p_bind_addr(self.network).is_none()
+            {
+                return Err(NodeError::Config(
+                    "i2p-accept-incoming needs a separate --listen address for SAM; the =onion listener is reserved for Tor"
+                        .into(),
+                ));
+            }
             if self.listen.start_p2p_bind(self.network).is_none() {
                 return Err(NodeError::Config(
                     "i2p-accept-incoming needs a P2P listener (--listen); --listen=0 has no loopback to STREAM FORWARD"

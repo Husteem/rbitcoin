@@ -226,17 +226,18 @@ self-announce even when `--external-ip` is set. A later onion inbound bind
 does not require a public clearnet listen.
 
 A self-announce carries only the address of the link's own network. The
-onion goes to `.onion` peers, to outbound dials through `--proxy`, and to
-loopback inbound when `--listen-onion` is the only overlay listener. The I2P
-destination goes to I2P peers, and to loopback inbound when
-`--i2p-accept-incoming` is the only one. A clearnet `--external-ip` goes
+onion goes to `.onion` peers and to outbound dials through `--proxy`.
+The native onion also goes to peers on the marked Tor listener, or to
+loopback inbound when Tor is the only overlay sharing the listener. The I2P
+destination goes to I2P peers and to loopback inbound when I2P is the only
+overlay on that listener. A clearnet `--external-ip` goes
 to direct clearnet peers, and an `fc00::/8` address (`--external-ip` or the
 CJDNS listen) only to CJDNS peers. An explicit port overrides the default
 for the same host. With `--discover-from-peers` and no
 clearnet `--external-ip`, a direct outbound clearnet peer is told the IP
-it reports reaching us at, with the listen port. Tor and I2P inbound both arrive on
-loopback, so with both listeners a loopback inbound peer gets no
-self-announce. Neither a `getaddr` reply nor `addrv2` relay passes on the
+it reports reaching us at, with the listen port. When Tor and I2P share a
+loopback listener, inbound peers there receive no self-announcement.
+Neither a `getaddr` reply nor `addrv2` relay passes on the
 node's own onions (P2P and wallet), I2P, CJDNS or `--external-ip`
 addresses when a peer gossips them back, nor the last eight peer-reported
 addresses it announced (each at the listen port only).
@@ -251,6 +252,7 @@ TCP peers.
 
 Use a dedicated `listen=127.0.0.1:8334=onion` entry as the local target for
 Tor forwarding. `--listen-onion` uses it automatically when present.
+Inbound I2P needs a separate primary P2P listener reachable at `127.0.0.1`.
 Source-IP permission rules skip the marked listener. Ordinary listeners
 keep their normal source-IP rules. If an external onion is configured
 without a marked listener, source-IP rules skip all inbound TCP peers.
