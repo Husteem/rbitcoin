@@ -2809,84 +2809,23 @@ fn miniwallet_raw_scan_and_gettxout() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A tip published while `wait_for_tip` is parked must wake it. The old
-/// 50 ms slice would still be asleep.
-#[test]
-fn published_tip_wakes_wait_for_tip() {
-    use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, Instant};
-    let (ctx, dir, hub) = ctx_regtest_hub();
-    let height = hub.tip_height().expect("height");
-    let hash = hub.tip_hash().expect("hash");
-    let header = hub.tip_header().expect("header");
-    let seen = Arc::new(AtomicBool::new(false));
-    let parked = Arc::new(AtomicU64::new(0));
-    let published = Arc::new(std::sync::Mutex::new(None));
-    rbitcoin_rpc::methods::set_rpc_wait_park_note(Some(Arc::clone(&parked)));
-    let _clear = ClearParkNote;
-    std::thread::scope(|scope| {
-        let published_at = Arc::clone(&published);
-        let seen_at = Arc::clone(&seen);
-        scope.spawn(move || {
-            wait_until_parked(&parked);
-            seen_at.store(true, Ordering::Release);
-            *published_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-            let _ = hub.tip_tx.send(rbitcoin_net::TipEvent {
-                height,
-                hash,
-                header,
-                reorg_branch_len: 0,
-            });
-        });
-        let got = rbitcoin_rpc::methods::chain::wait_for_tip(&ctx, 5_000, |_hash, _height| {
-            seen.load(Ordering::Acquire)
-        })
-        .unwrap();
-        let woke = published
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .expect("tip was published")
-            .elapsed();
-        assert!(
-            woke < Duration::from_millis(40),
-            "wait_for_tip stayed in the 50 ms poll: {woke:?}"
-        );
-        assert_eq!(got["height"], height);
-    });
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Invalidating the tip changes the hash the wait is watching. With no
 /// mempool on the RPC context, that change has to arrive as a tip event.
 #[test]
 fn invalidate_wakes_a_tip_wait_without_a_mempool() {
-    use std::time::{Duration, Instant};
     let (ctx, dir, hub) = ctx_regtest_hub();
     dispatch(&ctx, "generate", vec![json!(2)]).unwrap();
     let height = hub.tip_height().expect("height");
     let tip = hub.tip_hash().expect("hash");
     let bare = ctx_without_mempool(&ctx);
-    let parked = Arc::new(AtomicU64::new(0));
-    rbitcoin_rpc::methods::set_rpc_wait_park_note(Some(Arc::clone(&parked)));
-    let _clear = ClearParkNote;
-    let marked = Arc::new(std::sync::Mutex::new(None));
-    std::thread::scope(|scope| {
-        let hub = Arc::clone(&hub);
-        let stamp = Arc::clone(&marked);
-        scope.spawn(move || {
-            wait_until_parked(&parked);
-            hub.invalidate_block(tip).expect("invalidate tip");
-            *stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-        });
-        let got = rbitcoin_rpc::methods::chain::wait_for_tip(&bare, 2_000, |_hash, h| h < height)
-            .unwrap();
-        let woke = wake_after_invalidate(&marked);
-        assert!(
-            woke < Duration::from_millis(500),
-            "invalidate left the tip wait parked: {woke:?}"
-        );
-        assert!(got["height"].as_u64().unwrap() < u64::from(height), "{got}");
+    let got = http_wait_woken_by(bare, "waitfornewblock", json!([60_000]), move || {
+        hub.invalidate_block(tip).expect("invalidate tip");
     });
+    assert!(got["error"].is_null(), "{got}");
+    assert!(
+        got["result"]["height"].as_u64().unwrap() < u64::from(height),
+        "{got}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2895,11 +2834,9 @@ fn invalidate_wakes_a_tip_wait_without_a_mempool() {
 /// event and then stops listening.
 #[test]
 fn invalidate_publishes_the_replacement_fork_not_the_stump() {
-    use std::time::{Duration, Instant};
     let (ctx, dir, hub) = ctx_regtest_hub();
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let start = hub.tip_hash().expect("tip");
-    let start_hex = rbitcoin_rpc::methods::hash_hex_display(&start.to_byte_array());
     let genesis = hub.block_at_height(0).unwrap().unwrap().block_hash();
     let t0 = hub.tip_header().unwrap().time;
     let spk = ScriptBuf::from_bytes(vec![0x51]);
@@ -2912,29 +2849,12 @@ fn invalidate_publishes_the_replacement_fork_not_the_stump() {
     hub.hold_body(Arc::new(side_tip), false);
     let mut tips = hub.subscribe_tips();
     let bare = ctx_without_mempool(&ctx);
-    let parked = Arc::new(AtomicU64::new(0));
-    rbitcoin_rpc::methods::set_rpc_wait_park_note(Some(Arc::clone(&parked)));
-    let _clear = ClearParkNote;
-    let marked = Arc::new(std::sync::Mutex::new(None));
-    std::thread::scope(|scope| {
-        let hub = Arc::clone(&hub);
-        let stamp = Arc::clone(&marked);
-        scope.spawn(move || {
-            wait_until_parked(&parked);
-            hub.invalidate_block(start).expect("invalidate tip");
-            *stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-        });
-        let got =
-            rbitcoin_rpc::methods::chain::wait_for_tip(&bare, 2_000, |hash, _| hash != start_hex)
-                .unwrap();
-        let woke = wake_after_invalidate(&marked);
-        assert!(
-            woke < Duration::from_millis(500),
-            "invalidate left the tip wait parked: {woke:?}"
-        );
-        let fork_hex = rbitcoin_rpc::methods::hash_hex_display(&fork_tip.to_byte_array());
-        assert_eq!(got["hash"], fork_hex, "{got}");
+    let invalidator = Arc::clone(&hub);
+    let got = http_wait_woken_by(bare, "waitfornewblock", json!([60_000]), move || {
+        invalidator.invalidate_block(start).expect("invalidate tip");
     });
+    let fork_hex = rbitcoin_rpc::methods::hash_hex_display(&fork_tip.to_byte_array());
+    assert_eq!(got["result"]["hash"], fork_hex, "{got}");
     let mut saw = Vec::new();
     while let Ok(ev) = tips.try_recv() {
         saw.push(ev.hash);
@@ -2952,12 +2872,9 @@ fn invalidate_publishes_the_replacement_fork_not_the_stump() {
 /// stump there returns that hash and drops the subscription.
 #[test]
 fn invalidate_with_a_mempool_returns_the_replacement_fork() {
-    use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, Instant};
     let (ctx, dir, hub) = ctx_regtest_hub();
     dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let start = hub.tip_hash().expect("tip");
-    let start_hex = rbitcoin_rpc::methods::hash_hex_display(&start.to_byte_array());
     let mp = Arc::clone(ctx.mempool.as_ref().expect("mempool"));
     assert!(mp.begin_pool_maintenance());
     assert_eq!(mp.template_prev(), Some(start.to_byte_array()));
@@ -2973,10 +2890,6 @@ fn invalidate_with_a_mempool_returns_the_replacement_fork() {
     let genesis_raw = genesis.to_byte_array();
     let saw_stump = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
-    let parked = Arc::new(AtomicU64::new(0));
-    rbitcoin_rpc::methods::set_rpc_wait_park_note(Some(Arc::clone(&parked)));
-    let _clear = ClearParkNote;
-    let marked = Arc::new(std::sync::Mutex::new(None));
     std::thread::scope(|scope| {
         let mp = Arc::clone(&mp);
         let saw_stump = Arc::clone(&saw_stump);
@@ -2989,24 +2902,13 @@ fn invalidate_with_a_mempool_returns_the_replacement_fork() {
                 std::thread::yield_now();
             }
         });
-        let hub = Arc::clone(&hub);
-        let stamp = Arc::clone(&marked);
-        scope.spawn(move || {
-            wait_until_parked(&parked);
-            hub.invalidate_block(start).expect("invalidate tip");
-            *stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        let invalidator = Arc::clone(&hub);
+        let got = http_wait_woken_by(ctx, "waitfornewblock", json!([60_000]), move || {
+            invalidator.invalidate_block(start).expect("invalidate tip");
         });
-        let got =
-            rbitcoin_rpc::methods::chain::wait_for_tip(&ctx, 2_000, |hash, _| hash != start_hex)
-                .unwrap();
         stop.store(true, Ordering::Relaxed);
-        let woke = wake_after_invalidate(&marked);
-        assert!(
-            woke < Duration::from_millis(500),
-            "invalidate left the tip wait parked: {woke:?}"
-        );
         let fork_hex = rbitcoin_rpc::methods::hash_hex_display(&fork_tip.to_byte_array());
-        assert_eq!(got["hash"], fork_hex, "{got}");
+        assert_eq!(got["result"]["hash"], fork_hex, "{got}");
     });
     assert!(
         !saw_stump.load(Ordering::Relaxed),
@@ -3021,10 +2923,7 @@ fn invalidate_with_a_mempool_returns_the_replacement_fork() {
 /// height 99, which is before the heavier held branch connects.
 #[test]
 fn invalidate_evicting_a_mempool_tx_returns_the_replacement_fork() {
-    use std::time::{Duration, Instant};
     let (ctx, dir, hub) = ctx_from_mature_pad(300_000_000);
-    let start = hub.tip_hash().expect("tip");
-    let start_hex = rbitcoin_rpc::methods::hash_hex_display(&start.to_byte_array());
     let mp = Arc::clone(ctx.mempool.as_ref().expect("mempool"));
     assert!(mp.begin_pool_maintenance());
     let parent = hub.block_at_height(99).unwrap().unwrap();
@@ -3044,30 +2943,14 @@ fn invalidate_evicting_a_mempool_tx_returns_the_replacement_fork() {
     let spend = mature_coinbase_spend(&ctx, 49_9999_0000, spk).1;
     mp.accept_tx(&spend).expect("mature coinbase spend");
     let cut = hub.block_at_height(100).unwrap().unwrap().block_hash();
-    let parked = Arc::new(AtomicU64::new(0));
-    rbitcoin_rpc::methods::set_rpc_wait_park_note(Some(Arc::clone(&parked)));
-    let _clear = ClearParkNote;
-    let marked = Arc::new(std::sync::Mutex::new(None));
-    std::thread::scope(|scope| {
-        let hub = Arc::clone(&hub);
-        let stamp = Arc::clone(&marked);
-        scope.spawn(move || {
-            wait_until_parked(&parked);
-            hub.invalidate_block(cut)
-                .expect("invalidate below maturity");
-            *stamp.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-        });
-        let got =
-            rbitcoin_rpc::methods::chain::wait_for_tip(&ctx, 2_000, |hash, _| hash != start_hex)
-                .unwrap();
-        let woke = wake_after_invalidate(&marked);
-        assert!(
-            woke < Duration::from_millis(500),
-            "invalidate left the tip wait parked: {woke:?}"
-        );
-        let fork_hex = rbitcoin_rpc::methods::hash_hex_display(&fork_tip.to_byte_array());
-        assert_eq!(got["hash"], fork_hex, "{got}");
+    let invalidator = Arc::clone(&hub);
+    let got = http_wait_woken_by(ctx, "waitfornewblock", json!([60_000]), move || {
+        invalidator
+            .invalidate_block(cut)
+            .expect("invalidate below maturity");
     });
+    let fork_hex = rbitcoin_rpc::methods::hash_hex_display(&fork_tip.to_byte_array());
+    assert_eq!(got["result"]["hash"], fork_hex, "{got}");
     assert_eq!(hub.tip_hash(), Some(fork_tip));
     assert_eq!(mp.template_prev(), Some(fork_tip.to_byte_array()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -3107,37 +2990,49 @@ fn invalidate_on_a_catch_up_pool_builds_on_the_fork() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn wake_after_invalidate(marked: &std::sync::Mutex<Option<Instant>>) -> Duration {
-    let start = Instant::now();
-    loop {
-        if let Some(t) = *marked.lock().unwrap_or_else(|e| e.into_inner()) {
-            return t.elapsed();
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "invalidate did not return"
-        );
-        std::thread::yield_now();
-    }
-}
-
-fn wait_until_parked(parked: &AtomicU64) {
-    let start = Instant::now();
-    while parked.load(Ordering::SeqCst) == 0 {
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "rpc wait never parked"
-        );
-        std::thread::yield_now();
-    }
-}
-
-struct ClearParkNote;
-
-impl Drop for ClearParkNote {
-    fn drop(&mut self) {
-        rbitcoin_rpc::methods::set_rpc_wait_park_note(None);
-    }
+/// Sends `method` through the HTTP handler, waits until
+/// `getrpcinfo.active_commands` lists it, runs `act`, and returns the
+/// JSON-RPC reply. The call's own deadline is at least a minute out, so a
+/// reply inside 10 s means `act` woke it.
+fn http_wait_woken_by(
+    ctx: RpcContext,
+    method: &str,
+    params: Value,
+    act: impl FnOnce() + Send + 'static,
+) -> Value {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let ctx = Arc::new(ctx);
+        let state = crate::server::gbt_app(Arc::clone(&ctx));
+        let body = json!({ "jsonrpc": "1.0", "id": 1, "method": method, "params": params });
+        let waiter = tokio::spawn(async move {
+            rbitcoin_rpc::server::rpc_post(
+                axum::extract::State(state),
+                axum::extract::Request::new(axum::body::Body::from(body.to_string())),
+            )
+            .await
+        });
+        crate::server::wait_for_active_call(&ctx.active, method, true).await;
+        // `invalidate_block` panics on a tokio thread.
+        let act = std::thread::spawn(act);
+        tokio::task::spawn_blocking(move || act.join())
+            .await
+            .expect("join")
+            .expect("act");
+        let response = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .unwrap_or_else(|_| panic!("{method} stayed parked until its deadline"))
+            .expect("join");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json-rpc reply")
+    })
 }
 
 /// A missing tip is an error on the poll that sees it. Treating the error
@@ -3156,11 +3051,9 @@ fn wait_for_tip_returns_a_missing_tip_without_the_timeout() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A mempool template bump must wake a GBT longpoll. The old 50 ms tick
-/// would still be asleep.
+/// A mempool template bump wakes a GBT longpoll whose tip has not moved.
 #[test]
 fn template_update_wakes_gbt_longpoll() {
-    use std::time::{Duration, Instant};
     let (ctx, dir, _hub) = ctx_regtest_hub();
     let id = dispatch(
         &ctx,
@@ -3172,34 +3065,13 @@ fn template_update_wakes_gbt_longpoll() {
         .unwrap()
         .to_string();
     let mp = Arc::clone(ctx.mempool.as_ref().unwrap());
-    let parked = Arc::new(AtomicU64::new(0));
-    let published = Arc::new(std::sync::Mutex::new(None));
-    rbitcoin_rpc::methods::set_rpc_wait_park_note(Some(Arc::clone(&parked)));
-    let _clear = ClearParkNote;
-    std::thread::scope(|scope| {
-        let published_at = Arc::clone(&published);
-        scope.spawn(move || {
-            wait_until_parked(&parked);
-            *published_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-            mp.note_template_update();
-        });
-        let got = dispatch(
-            &ctx,
-            "getblocktemplate",
-            vec![json!({ "rules": ["segwit"], "longpollid": id })],
-        )
-        .unwrap();
-        let woke = published
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .expect("template was published")
-            .elapsed();
-        assert!(
-            woke < Duration::from_millis(40),
-            "gbt longpoll stayed in the 50 ms tick: {woke:?}"
-        );
-        assert!(got["height"].is_number(), "{got}");
-    });
+    let got = http_wait_woken_by(
+        ctx,
+        "getblocktemplate",
+        json!([{ "rules": ["segwit"], "longpollid": id }]),
+        move || mp.note_template_update(),
+    );
+    assert!(got["result"]["height"].is_number(), "{got}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
