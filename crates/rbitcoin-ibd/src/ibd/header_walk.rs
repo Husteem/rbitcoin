@@ -3665,7 +3665,7 @@ pub fn lookahead_bits_at(
             return Some(bits);
         }
         // Equality already returned the sampled bits. A later height with
-        // harder bits uses the limit. `>` and `>=` agree once equality is gone.
+        // harder bits uses the limit.
         if height
             .checked_sub(diff.full_diff_height)
             .is_some_and(|gap| gap != 0)
