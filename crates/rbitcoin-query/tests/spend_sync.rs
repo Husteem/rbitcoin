@@ -2,7 +2,20 @@ use std::sync::Arc;
 
 use rbitcoin_primitives::{Fk, Height};
 
-use rbitcoin_query::spend_sync::SpendSync;
+use rbitcoin_query::spend_sync::{CheckpointFailAction, CheckpointFailLog, SpendSync};
+
+#[test]
+fn checkpoint_failure_warns_first_then_once_a_minute() {
+    let mut log = CheckpointFailLog::default();
+    assert_eq!(log.on_failure(0), CheckpointFailAction::First);
+    assert_eq!(log.on_failure(1_000), CheckpointFailAction::Quiet);
+    assert_eq!(log.on_failure(59_999), CheckpointFailAction::Quiet);
+    assert_eq!(log.on_failure(60_000), CheckpointFailAction::Again);
+    assert_eq!(log.on_success(), Some(4));
+    assert_eq!(log.on_failure(61_000), CheckpointFailAction::First);
+    assert_eq!(log.on_success(), Some(1));
+    assert_eq!(log.on_success(), None);
+}
 
 #[test]
 fn shutdown_publishes_the_snapshot() {

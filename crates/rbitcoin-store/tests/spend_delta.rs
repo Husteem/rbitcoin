@@ -129,6 +129,49 @@ fn reporting_commit(
 }
 
 #[test]
+fn a_fast_checkpoint_logs_one_info_summary_and_debug_detail() {
+    let d = dir();
+    let log = SpendPageLog::create(&d).unwrap();
+    log.note_slots(&[(16, [9u8; 8])]).unwrap();
+    rbitcoin_log::capture_logs(true);
+    commit(&log, 1, 4096, |_| Ok(true));
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+
+    let infos: Vec<_> = logs
+        .iter()
+        .filter(|(level, msg)| {
+            *level == rbitcoin_log::Level::Info && msg.starts_with("store: spend delta gen=")
+        })
+        .collect();
+    assert_eq!(infos.len(), 1, "{logs:?}");
+    assert!(infos[0].1.contains("since_ms="), "{:?}", infos[0]);
+    assert!(infos[0].1.contains("total_ms="), "{:?}", infos[0]);
+    assert!(!infos[0].1.contains(" timing "), "{:?}", infos[0]);
+
+    let details: Vec<_> = logs
+        .iter()
+        .filter(|(level, msg)| {
+            *level == rbitcoin_log::Level::Debug
+                && msg.starts_with("store: spend delta gen=")
+                && msg.contains(" timing ")
+        })
+        .collect();
+    assert_eq!(details.len(), 1, "{logs:?}");
+}
+
+#[test]
+fn a_slow_checkpoint_promotes_its_detail_to_info() {
+    let mut r = CheckpointReport::default();
+    assert!(!rbitcoin_store::spend_delta::checkpoint_detail_is_info(&r));
+    r.total_ms = rbitcoin_store::spend_delta::CHECKPOINT_SLOW_TOTAL_MS;
+    assert!(rbitcoin_store::spend_delta::checkpoint_detail_is_info(&r));
+    r.total_ms = 0;
+    r.body_sync_ms = rbitcoin_store::spend_delta::CHECKPOINT_SLOW_SYNC_MS;
+    assert!(rbitcoin_store::spend_delta::checkpoint_detail_is_info(&r));
+}
+
+#[test]
 fn noted_slot_survives_commit_and_reload() {
     let d = dir();
     let pub_len = 4096u64;

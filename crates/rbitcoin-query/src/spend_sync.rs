@@ -13,6 +13,52 @@ use rbitcoin_store::SPEND_DURABLE_INTERVAL_MS;
 /// Park after a failed checkpoint while the edge cap still wants another one.
 /// A full ten-minute park would leave confirm blocked on that cap.
 const SPEND_FAIL_BACKOFF_MS: u64 = 1000;
+/// How long a repeatedly failing checkpoint waits between WARN lines.
+const SPEND_FAIL_WARN_GAP_MS: u64 = 60_000;
+
+/// What one checkpoint failure should log.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointFailAction {
+    /// First failure since the last success.
+    First,
+    /// The 60s reminder while it keeps failing.
+    Again,
+    /// Inside the gap; no line.
+    Quiet,
+}
+
+/// Rate-limit the checkpoint failure WARN without hiding that it is still
+/// failing. A recovery line is emitted once after any failure.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CheckpointFailLog {
+    failures: u32,
+    next_warn_ms: u64,
+}
+
+impl CheckpointFailLog {
+    pub fn on_failure(&mut self, now_ms: u64) -> CheckpointFailAction {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures == 1 {
+            self.next_warn_ms = now_ms.saturating_add(SPEND_FAIL_WARN_GAP_MS);
+            return CheckpointFailAction::First;
+        }
+        if now_ms >= self.next_warn_ms {
+            self.next_warn_ms = now_ms.saturating_add(SPEND_FAIL_WARN_GAP_MS);
+            return CheckpointFailAction::Again;
+        }
+        CheckpointFailAction::Quiet
+    }
+
+    /// Consecutive failures this success clears, if any.
+    pub fn on_success(&mut self) -> Option<u32> {
+        let failures = self.failures;
+        self.failures = 0;
+        self.next_warn_ms = 0;
+        (failures > 0).then_some(failures)
+    }
+}
 
 use crate::Query;
 
@@ -64,6 +110,8 @@ impl Drop for SpendSync {
 #[doc(hidden)]
 pub fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
     let (lock, cv) = &*wake;
+    let started = Instant::now();
+    let mut fail_log = CheckpointFailLog::default();
     let mut since_ok = Instant::now();
     loop {
         let stop = {
@@ -89,9 +137,28 @@ pub fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
             continue;
         }
         let published = match checkpoint(&query) {
-            Ok(()) => true,
+            Ok(()) => {
+                if let Some(failures) = fail_log.on_success() {
+                    rbitcoin_log::info!(
+                        "store: spend checkpoint recovered after {failures} failure(s)"
+                    );
+                }
+                true
+            }
             Err(e) => {
-                rbitcoin_log::warn!("store: spend checkpoint: {e}");
+                let now_ms = started.elapsed().as_millis() as u64;
+                match fail_log.on_failure(now_ms) {
+                    CheckpointFailAction::First => {
+                        rbitcoin_log::warn!("store: spend checkpoint: {e}");
+                    }
+                    CheckpointFailAction::Again => {
+                        rbitcoin_log::warn!(
+                            "store: spend checkpoint still failing ({failures} in a row): {e}",
+                            failures = fail_log.failures
+                        );
+                    }
+                    CheckpointFailAction::Quiet => {}
+                }
                 false
             }
         };
