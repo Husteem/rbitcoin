@@ -128,21 +128,7 @@ fn suffix_net(addr: &str) -> Option<OnlyNet> {
     }
 }
 
-#[cfg(debug_assertions)]
-std::thread_local! {
-    static FIXED_SEED_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Fixed-seed lines this thread has parsed.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn fixed_seed_parses() -> usize {
-    FIXED_SEED_PARSES.with(|n| n.get())
-}
-
 fn parse_fixed_seed(addr: &str) -> NetAddr {
-    #[cfg(debug_assertions)]
-    FIXED_SEED_PARSES.with(|n| n.set(n.get() + 1));
     parse_net_addr(addr).expect("Core fixed seed parses")
 }
 

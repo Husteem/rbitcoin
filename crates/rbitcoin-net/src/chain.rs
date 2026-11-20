@@ -28,7 +28,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 thread_local! {
-    static ENSURE_HEADER_FK_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static UNRECORDED_WALK_CAP: std::cell::Cell<u32> = const { std::cell::Cell::new(10_000) };
 }
 
@@ -36,16 +35,6 @@ thread_local! {
 #[doc(hidden)]
 pub fn set_unrecorded_walk_cap(n: u32) -> u32 {
     UNRECORDED_WALK_CAP.with(|c| c.replace(n))
-}
-
-#[cfg(debug_assertions)]
-pub fn reset_ensure_header_fk_count() {
-    ENSURE_HEADER_FK_N.with(|c| c.set(0));
-}
-
-#[cfg(debug_assertions)]
-pub fn ensure_header_fk_count() -> u64 {
-    ENSURE_HEADER_FK_N.with(|c| c.get())
 }
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -1902,7 +1891,6 @@ impl ChainHub {
     /// exist. Never write `prev_fk = NULL` for a missing parent (that created
     /// millions of orphan rows and false resume edges on mainnet).
     pub fn ensure_header_fk(&self, header: &Header) -> Result<Fk, NetError> {
-        ENSURE_HEADER_FK_N.with(|c| c.set(c.get().saturating_add(1)));
         let prev_fk = self.header_sync_prev_fk(header, &HashMap::new())?;
         let rec = header_to_record(prev_fk, header, header.block_hash().to_byte_array());
         let fk = self.query.ensure_header(&rec).map_err(NetError::store)?;

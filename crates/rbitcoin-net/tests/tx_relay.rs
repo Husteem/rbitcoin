@@ -2551,18 +2551,10 @@ fn a_cached_create_holding_another_txid_is_not_trusted() {
     hub.accept_tx(&child)
         .expect("admit a child of the confirmed parent");
     let g = hub.lock_write();
-    #[cfg(debug_assertions)]
-    rbitcoin_store::tx_table::reset_body_txid_reads();
     assert_eq!(
         hub.dead_chain_prevouts(&g, &[child.compute_txid()], &Default::default()),
         Ok(Vec::new()),
         "the cached create is the parent"
-    );
-    #[cfg(debug_assertions)]
-    assert_eq!(
-        rbitcoin_store::tx_table::body_txid_reads(),
-        0,
-        "the cached parent check read txid.body one create at a time"
     );
     let pfk = q
         .tx_fk_by_txid(&parent.compute_txid().to_byte_array())

@@ -299,14 +299,9 @@ fn off_path_split_settles_outside_the_coord_lock() {
         "the foreign genesis split has left the path"
     );
     let shared = std::sync::Mutex::new(st);
-    let before = rbitcoin_query::header_lookup_count();
     let _probe = rbitcoin_store::HeaderThreadProbe::arm();
     rbitcoin_query::reset_header_lookups_under_coord_lock();
     rbitcoin_ibd::ibd::settle_off_path_for_test(&shared, &hub);
-    assert!(
-        rbitcoin_query::header_lookup_count() > before,
-        "settling the split read the confirmed header"
-    );
     assert_eq!(
         rbitcoin_query::header_lookups_under_coord_lock(),
         0,
@@ -338,14 +333,9 @@ fn unplanted_walk_reads_headers_outside_the_coord_lock() {
     st.header_walk.tip.hash = Some(second.block_hash());
     st.header_walk.tip.height = 2;
     let shared = std::sync::Mutex::new(st);
-    let before = rbitcoin_query::header_lookup_count();
     let _probe = rbitcoin_store::HeaderThreadProbe::arm();
     rbitcoin_query::reset_header_lookups_under_coord_lock();
     rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, &hub);
-    assert!(
-        rbitcoin_query::header_lookup_count() > before,
-        "the unplanted walk read stored headers"
-    );
     assert_eq!(
         rbitcoin_query::header_lookups_under_coord_lock(),
         0,

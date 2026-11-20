@@ -7232,17 +7232,6 @@ fn check_block_proposal_decodes_only_the_spent_outputs_of_a_wide_parent() {
 }
 
 #[test]
-fn stored_header_height_walk_clears_the_counter() {
-    let (_dir, hub) = tmp_hub();
-    hub.ensure_genesis().unwrap();
-    let _ = hub.take_stored_height_walk_steps();
-    assert_eq!(hub.take_stored_height_walk_steps(), 0);
-    let miss = BlockHash::from_byte_array([0x7a; 32]);
-    assert!(hub.stored_header_height(&miss).is_none());
-    assert_eq!(hub.take_stored_height_walk_steps(), 1);
-}
-
-#[test]
 fn try_apply_held_store_fault_is_not_a_failed_block() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();

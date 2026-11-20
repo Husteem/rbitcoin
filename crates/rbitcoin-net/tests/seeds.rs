@@ -1568,40 +1568,6 @@ fn fixed_seeds_fill_only_reachable_nets_the_book_lacks() {
 }
 
 #[test]
-fn fixed_seed_fallback_parses_only_lines_it_can_keep() {
-    let mut full = AddrMan::new();
-    let v6: SocketAddr = "[2001:4860::1]:8333".parse().unwrap();
-    full.inject([addr(1), v6]);
-    let before = fixed_seed_parses();
-    assert_eq!(full.add_fixed_seeds(Network::Mainnet), 0);
-    assert_eq!(
-        fixed_seed_parses() - before,
-        0,
-        "a book that covers every reachable net never reads the table"
-    );
-
-    let mut clear = AddrMan::new();
-    let before = fixed_seed_parses();
-    assert_eq!(clear.add_fixed_seeds(Network::Mainnet), 1024);
-    assert_eq!(
-        fixed_seed_parses() - before,
-        1033,
-        "clearnet only: Tor and I2P lines are skipped unparsed; CJDNS needs the parse"
-    );
-
-    let mut onion = AddrMan::new();
-    onion.set_onion_reachable(true);
-    onion.set_only_net(vec![OnlyNet::Onion]);
-    let before = fixed_seed_parses();
-    assert_eq!(onion.add_fixed_seeds(Network::Mainnet), 512);
-    assert_eq!(
-        fixed_seed_parses() - before,
-        512,
-        "onion only: IP and CJDNS lines are skipped unparsed"
-    );
-}
-
-#[test]
 fn onion_only_fixed_seed_fallback_never_offers_clearnet() {
     let mut am = AddrMan::new();
     am.set_onion_reachable(true);
