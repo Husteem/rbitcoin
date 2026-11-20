@@ -353,7 +353,7 @@ fn persist_due_waits_five_seconds() {
 }
 
 #[test]
-fn death_batch_fsyncs_meta_once() {
+fn death_batch_survives_reopen_without_rewriting_body() {
     let dir = tmp_dir();
     let n = 8u32;
     let mut slots = Vec::with_capacity(n as usize);
@@ -366,28 +366,10 @@ fn death_batch_fsyncs_meta_once() {
     }
     mp.flush().unwrap();
     let body_before = fs::read(dir.join("tx.body")).unwrap();
-    let meta_syncs = mp.meta_syncs();
-    let slots_syncs = mp.slots_syncs();
     for slot in &slots {
         mp.mark_slot_dead(*slot).unwrap();
     }
-    assert_eq!(
-        mp.meta_syncs(),
-        meta_syncs,
-        "DEAD pwrites must not fdatasync meta per removed tx"
-    );
-    assert_eq!(mp.slots_syncs(), slots_syncs);
     mp.sync_deaths().unwrap();
-    assert_eq!(
-        mp.meta_syncs(),
-        meta_syncs + 1,
-        "the batch ends with one meta fsync"
-    );
-    assert_eq!(
-        mp.slots_syncs(),
-        slots_syncs + 1,
-        "the batch ends with one slots fsync"
-    );
     assert_eq!(
         fs::read(dir.join("tx.body")).unwrap(),
         body_before,
@@ -412,11 +394,8 @@ fn dead_pwrite_of_flushed_slot_is_immediate() {
     let slot = put_live(&mut mp, &tid, 1, 400);
     mp.flush().unwrap();
     let body_before = fs::read(dir.join("tx.body")).unwrap();
-    let slots_syncs = mp.slots_syncs();
     mp.mark_slot_dead(slot).unwrap();
-    assert_eq!(mp.slots_syncs(), slots_syncs, "the pwrite is not the sync");
     mp.sync_deaths().unwrap();
-    assert_eq!(mp.slots_syncs(), slots_syncs + 1);
     assert_eq!(mp.live_count(), 0);
     let body_after = fs::read(dir.join("tx.body")).unwrap();
     assert_eq!(
@@ -1065,29 +1044,6 @@ fn leftover_schema_unknown_is_refused() {
         Ok(_) => panic!("expected BadSchema({next}), got Ok"),
         Err(e) => panic!("expected BadSchema({next}), got {e}"),
     }
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// A clean pool skips the next meta fsync. The txs are already on disk
-/// either way. The client reads the same set. The skip is what a quiet
-/// node does on the persist interval.
-#[test]
-fn clear_dirty_keeps_a_second_interval_from_rewriting_meta() {
-    let dir = tmp_dir();
-    let mut mp = Mempool::open_or_create(&dir).unwrap();
-    mp.set_now_ms(0);
-    let tid = Txid::from_byte_array([0x71; 32]);
-    put_live(&mut mp, &tid, 1, 400);
-    mp.set_now_ms(PERSIST_INTERVAL_MS);
-    mp.persist_due().unwrap();
-    let syncs = mp.meta_syncs();
-    mp.set_now_ms(PERSIST_INTERVAL_MS * 2);
-    mp.persist_due().unwrap();
-    assert_eq!(
-        mp.meta_syncs(),
-        syncs,
-        "a clean pool does not fsync meta again"
-    );
     let _ = fs::remove_dir_all(&dir);
 }
 

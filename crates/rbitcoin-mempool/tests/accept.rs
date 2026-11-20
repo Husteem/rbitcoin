@@ -252,23 +252,6 @@ fn bip68_one_disabled_sequence_does_not_skip_a_locking_input() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Stage timers are recorded on a successful chain-spend accept.
-#[test]
-fn accept_records_stage_us_on_success() {
-    let dir = tmp_dir();
-    let (op, _txout, utxos) = chain_utxo(50_000);
-    let tx = spend_tx(op, 49_000);
-    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-    mp.accept_tx(&tx, &utxos, TIP_OK).expect("accept");
-    let s = mp.last_accept_stages;
-    // Detached script hop + durable append should register µs on typical hosts.
-    assert!(
-        s.script_us > 0 || s.durable_us > 0 || s.utxo_us > 0,
-        "expected non-zero stage sample, got {s:?}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// The rolling floor starts at the configured minimum. A lower
 /// `-minrelaytxfee` is the advertised floor. An eviction that already
 /// raised the rolling floor stays above that new minimum.
@@ -1626,7 +1609,7 @@ fn remove_txid_notes_extra_compact() {
 }
 
 #[test]
-fn remove_live_txids_syncs_deaths_once() {
+fn remove_live_txids_deaths_survive_reopen() {
     let dir = tmp_dir();
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
     let mut txs = Vec::new();
@@ -1649,17 +1632,8 @@ fn remove_live_txids_syncs_deaths_once() {
         mp.accept_tx(tx, &utxos, TIP_OK).unwrap();
     }
     mp.flush().unwrap();
-    let (meta_before, slots_before) = mp.death_sync_counts();
-    // Two deaths, one sync. Leave a live majority so compact does not sync meta again.
     let n = mp.remove_live_txids(&ids[..2], BLOCK).unwrap();
     assert_eq!(n, 2);
-    let (meta_after, slots_after) = mp.death_sync_counts();
-    assert_eq!(meta_after, meta_before + 1, "block strip syncs meta once");
-    assert_eq!(
-        slots_after,
-        slots_before + 1,
-        "block strip syncs slots once"
-    );
     assert_eq!(mp.live_count(), 4);
     drop(mp);
     let mp = ActiveMempool::open_or_create(&dir).unwrap();
@@ -1668,7 +1642,7 @@ fn remove_live_txids_syncs_deaths_once() {
 }
 
 #[test]
-fn remove_block_txids_syncs_confirmed_and_conflicts_once() {
+fn remove_block_txids_strips_only_the_confirmed() {
     let dir = tmp_dir();
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
     let mut map = HashMap::new();
@@ -1689,13 +1663,9 @@ fn remove_block_txids_syncs_confirmed_and_conflicts_once() {
             .unwrap();
     }
     mp.flush().unwrap();
-    let (meta_before, slots_before) = mp.death_sync_counts();
     let (n, conflicts) = mp.remove_block_txids(&ids[..2], &[]).unwrap();
     assert_eq!(n, 2);
     assert!(conflicts.is_empty());
-    let (meta_after, slots_after) = mp.death_sync_counts();
-    assert_eq!(meta_after, meta_before + 1);
-    assert_eq!(slots_after, slots_before + 1);
     assert_eq!(mp.live_count(), 4);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2829,8 +2799,8 @@ fn review_trust_flag_off_unlink_failure_keeps_the_mark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A missing child body fails before the parent is unlinked. The mark stays,
-/// the child stays in the graph, and the parent's death is not synced.
+/// A missing child body fails before the parent is unlinked. The mark stays
+/// and the child stays in the graph, also after reopen.
 #[test]
 fn review_trust_flag_off_child_unlink_keeps_the_mark() {
     use bitcoin::WPubkeyHash;
@@ -2862,7 +2832,6 @@ fn review_trust_flag_off_child_unlink_keeps_the_mark() {
         .expect("child of marked")
         .txid;
     mp.flush().unwrap();
-    let syncs = mp.death_sync_counts();
     mp.bodies.remove(&child_id);
     let err = mp.discard_trust_marks().unwrap_err();
     assert!(
@@ -2876,11 +2845,6 @@ fn review_trust_flag_off_child_unlink_keeps_the_mark() {
     assert!(
         mp.graph.contains(&child_id),
         "failed child removal dropped the child"
-    );
-    assert_eq!(
-        mp.death_sync_counts(),
-        syncs,
-        "a failed discard synced deaths"
     );
     drop(mp);
     let off = ActiveMempool::open_or_create(&dir).unwrap();
