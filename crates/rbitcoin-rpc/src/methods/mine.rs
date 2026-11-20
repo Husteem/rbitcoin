@@ -189,32 +189,6 @@ pub fn mempool_block_txs(ctx: &RpcContext) -> Vec<(Arc<Transaction>, Selected)> 
         .unwrap_or_default()
 }
 
-pub fn generate_with_mempool(
-    ctx: &RpcContext,
-    nblocks: u32,
-    script: ScriptBuf,
-) -> Result<Value, Value> {
-    let _miner = require_regtest_miner(ctx, "generate")?;
-    if nblocks == 0 {
-        return Ok(hashes_json(&[]));
-    }
-    // Catch-up leaves confirmed transactions in the pool, so mine the coinbase
-    // only. Any other listing is removed when the block that contains it is
-    // accepted, including while relay is off, and before a later block of this
-    // call is mined. A refusal before that block leaves the pool as it was.
-    let chain = ctx
-        .chain
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "generate requires a live chain hub"))?;
-    let mined = if matches!(ctx.pool_listing(), PoolListing::Downloading) {
-        chain.generate_to_script_for_rpc(nblocks, script, Vec::new(), true)
-    } else {
-        chain.generate_pool_for_rpc(nblocks, script)
-    };
-    let hashes = mined.map_err(|e| generate_error(&submit_reject_reason(&e)))?;
-    Ok(hashes_json(&hashes))
-}
-
 pub async fn generate_with_mempool_async(
     ctx: &RpcContext,
     nblocks: u32,
@@ -297,6 +271,7 @@ pub async fn generateblock_async(ctx: &RpcContext, params: &RpcParams) -> Result
             let s = v.as_str().ok_or_else(|| {
                 rpc_error(ERR_INVALID_PARAMS, "transactions entries must be hex or txid")
             })?;
+            // Core: 64-hex → Txid::FromHex first; miss → not in mempool (-5).
             if s.len() == 64 {
                 if let Ok(tid) = parse_hash32_display(s) {
                     let txid = Txid::from_byte_array(tid);
@@ -327,7 +302,9 @@ pub async fn generateblock_async(ctx: &RpcContext, params: &RpcParams) -> Result
         Ok(extra)
     })
     .await?;
-    // A rejected list returns above and must not replace the last assembly.
+    // Core assembles an empty block (`use_mempool = false`) before it adds
+    // the given transactions. A rejected list returns above and must not
+    // replace the last assembly.
     chain.note_block_assembled(0, 0);
     if !submit {
         let block = rbitcoin_net::off_pool_budgeted(move || {
@@ -358,91 +335,6 @@ pub async fn generateblock_async(ctx: &RpcContext, params: &RpcParams) -> Result
 /// nothing for a count at or below zero.
 fn generate_count(params: &RpcParams, name: &str) -> Result<u32, Value> {
     Ok(params.req_core_int::<i32>(0, name)?.max(0) as u32)
-}
-
-pub fn generatetoaddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["nblocks", "address", "maxtries"])?;
-    let _miner = require_regtest_miner(ctx, "generatetoaddress")?;
-    let nblocks = generate_count(params, "nblocks")?;
-    let addr = params.req_str(1, "address")?;
-    let _maxtries = params.opt_u64(2, "maxtries")?;
-    let script = decode_output_script(ctx, addr)?;
-    generate_with_mempool(ctx, nblocks, script)
-}
-
-pub fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["output", "transactions", "submit"])?;
-    let miner = require_regtest_miner(ctx, "generateblock")?;
-    let output = params.req_str(0, "output")?;
-    let script = parse_generateblock_output(ctx, output)?;
-    let mut extra = Vec::new();
-    if let Some(arr) = params.get_array(1, "transactions") {
-        let mp = ctx.mempool.as_ref();
-        for v in arr {
-            let s = v.as_str().ok_or_else(|| {
-                rpc_error(
-                    ERR_INVALID_PARAMS,
-                    "transactions entries must be hex or txid",
-                )
-            })?;
-            // Core: 64-hex → Txid::FromHex first; miss → not in mempool (-5).
-            if s.len() == 64 {
-                if let Ok(tid) = parse_hash32_display(s) {
-                    let txid = Txid::from_byte_array(tid);
-                    if let Some(mp) = mp {
-                        if let Some(tx) = mp.get_tx(&txid) {
-                            extra.push(tx);
-                            continue;
-                        }
-                    }
-                    return Err(rpc_error(
-                        ERR_INVALID_ADDRESS_OR_KEY,
-                        format!("Transaction {s} not in mempool."),
-                    ));
-                }
-            }
-            match decode_tx_hex(s) {
-                Some(tx) => extra.push(tx),
-                None => {
-                    return Err(rpc_error(
-                        ERR_DESERIALIZATION,
-                        format!(
-                            "Transaction decode failed for {s}. Make sure the tx has at least one input."
-                        ),
-                    ));
-                }
-            }
-        }
-    } else if params.get(1, "transactions").is_some() {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMS,
-            "transactions must be an array",
-        ));
-    } else {
-        return Err(rpc_error(ERR_INVALID_PARAMS, "transactions required"));
-    }
-    let submit = params.opt_bool(2, "submit")?.unwrap_or(true);
-    // Core assembles an empty block (`use_mempool = false`) before it adds
-    // the given transactions.
-    if let Some(c) = ctx.chain.as_ref() {
-        c.note_block_assembled(0, 0);
-    }
-    if !submit {
-        let block = miner
-            .assemble_block_to_script(script, extra)
-            .map_err(|e| generateblock_validity_error(&e))?;
-        return Ok(json!({
-            "hash": block.block_hash().to_string(),
-            "hex": serialize_hex(&block),
-        }));
-    }
-    let hashes = miner
-        .generate_to_script(1, script, extra.clone(), false)
-        .map_err(|e| generateblock_missing_input_error(&e.to_string(), &extra))?;
-    let hash = hashes
-        .first()
-        .ok_or_else(|| rpc_error(ERR_MISC, "generateblock produced no block"))?;
-    Ok(json!({ "hash": hash.to_string() }))
 }
 
 /// Core `generateblock` after `TestBlockValidity`: `-25 TestBlockValidity failed: <reason>`.
@@ -561,28 +453,6 @@ pub fn parse_generateblock_output(ctx: &RpcContext, output: &str) -> Result<Scri
 #[doc(hidden)]
 pub const GENERATE_REPLACED: &str =
     "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n";
-
-pub fn generate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["nblocks", "maxtries"])?;
-    if params.get(0, "nblocks").is_none() {
-        return Err(rpc_error(ERR_METHOD_NOT_FOUND, GENERATE_REPLACED));
-    }
-    let _miner = require_regtest_miner(ctx, "generate")?;
-    let nblocks = generate_count(params, "nblocks")?;
-    let _maxtries = params.opt_u64(1, "maxtries")?;
-    let script = ScriptBuf::from_bytes(vec![rbitcoin_primitives::OP_TRUE]);
-    generate_with_mempool(ctx, nblocks, script)
-}
-
-pub fn generatetodescriptor(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["num_blocks", "descriptor", "maxtries"])?;
-    let _miner = require_regtest_miner(ctx, "generatetodescriptor")?;
-    let nblocks = generate_count(params, "num_blocks")?;
-    let desc = params.req_str(1, "descriptor")?;
-    let _maxtries = params.opt_u64(2, "maxtries")?;
-    let script = parse_output_descriptor(ctx, desc)?;
-    generate_with_mempool(ctx, nblocks, script)
-}
 
 /// MiniWallet uses `raw(HEX)#checksum`. Not a full descriptor language.
 /// MiniWallet uses `raw(HEX)#checksum`. Not a full descriptor language.
@@ -1724,8 +1594,8 @@ fn finish_submit(
     }
 }
 
-/// Same receive path as P2P `block` (all networks). Sync: stack hubs and
-/// in-process `dispatch()`. HTTP uses [`submitblock_async`].
+/// Same receive path as P2P `block` (all networks), for [`HubRegtest`].
+/// The `submitblock` RPC is [`submitblock_async`].
 pub fn submit_received_block(hub: &rbitcoin_net::ChainHub, block: Block) -> SubmitBlockOutcome {
     match prepare_submit(hub, block) {
         SubmitPrep::Done(outcome) => outcome,
@@ -2072,19 +1942,6 @@ pub fn submit_reject_reason(e: &rbitcoin_net::NetError) -> String {
         }
     }
     s.to_string()
-}
-
-pub fn submitblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["hexdata", "dummy"])?;
-    let block = decode_block_hex(params.req_str(0, "hexdata")?)?;
-    let outcome = if let Some(chain) = ctx.chain.as_ref() {
-        submit_received_block(chain, block)
-    } else if let Some(miner) = ctx.regtest.as_deref() {
-        miner.submit_block(block)
-    } else {
-        return Err(rpc_error(ERR_MISC, "submitblock requires a live chain hub"));
-    };
-    submit_outcome_json(outcome)
 }
 
 pub async fn submitblock_async(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {

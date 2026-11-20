@@ -20,7 +20,7 @@ pub use mine::{gbt_template, submit_received_block};
 pub use net::{parse_rpc_client_version, RPC_COMPAT_VERSION};
 
 /// HTTP methods whose connect runs on `tip-accept` and must be awaited on the
-/// request task. In-process [`dispatch`] stays synchronous.
+/// request task. They run only through [`dispatch_tip_connect`].
 pub fn tip_connect_method(name: &str) -> bool {
     matches!(
         name,
@@ -269,7 +269,8 @@ pub struct RpcContext {
     pub initial_block_download: Arc<AtomicBool>,
     /// `getnetworkinfo.subversion` (BIP14 / Core `-uacomment` shape).
     pub subversion: String,
-    /// Regtest generate/submitblock. Node attaches `ChainHub` via this trait.
+    /// Set on a network that may mine locally: the gate for `generate*`, and
+    /// `setmocktime`'s clock. The mining RPCs use [`Self::chain`].
     pub regtest: Option<Arc<dyn RpcRegtest>>,
     /// Live P2P sessions (`getpeerinfo` / `addnode` / `disconnectnode`).
     pub peers: Option<Arc<rbitcoin_net::PeerHub>>,
@@ -345,6 +346,8 @@ pub enum SubmitBlockOutcome {
 }
 
 /// Regtest-only mine + accept. Implemented by the node (not a mining product).
+/// The RPC methods call only [`Self::set_mock_time`]. The mining RPCs run on
+/// the [`rbitcoin_net::ChainHub`] request-task path.
 pub trait RpcRegtest: Send + Sync {
     /// `record_assembly`: each block is a pool assembly for `getmininginfo`.
     fn generate_to_script(
@@ -699,6 +702,8 @@ impl From<&Vec<Value>> for RpcParams {
 }
 
 /// Dispatch one method. Returns `Ok(result)` or `Err(error_object)`.
+/// A [`request_task_method`] is not here: it runs through
+/// [`dispatch_tip_connect`], and this answers it as an unknown method.
 pub fn dispatch(
     ctx: &RpcContext,
     method: &str,
@@ -822,22 +827,12 @@ pub fn dispatch_inner(ctx: &RpcContext, method: &str, params: RpcParams) -> Resu
         "decoderawtransaction" => decoderawtransaction(ctx, &params),
         "decodescript" => decodescript(ctx, &params),
         "validateaddress" => validateaddress(ctx, &params),
-        "sendrawtransaction" => sendrawtransaction(ctx, &params),
-        "testmempoolaccept" => testmempoolaccept(ctx, &params),
         "estimatesmartfee" => estimatesmartfee(ctx, &params),
         "estimaterawfee" => estimaterawfee(ctx, &params),
-        "generatetoaddress" => generatetoaddress(ctx, &params),
-        "generatetodescriptor" => generatetodescriptor(ctx, &params),
-        "generateblock" => generateblock(ctx, &params),
-        "generate" => generate(ctx, &params),
-        "submitblock" => submitblock(ctx, &params),
         "submitheader" => submitheader(ctx, &params),
         "setmocktime" => setmocktime(ctx, &params),
         "mockscheduler" => mockscheduler(ctx, &params),
         "getnetworkhashps" => getnetworkhashps(ctx, &params),
-        "invalidateblock" => invalidateblock(ctx, &params),
-        "reconsiderblock" => reconsiderblock(ctx, &params),
-        "preciousblock" => preciousblock(ctx, &params),
         "gettxout" => gettxout(ctx, &params),
         "getindexinfo" => getindexinfo(ctx, &params),
         "getchaintips" => getchaintips(ctx, &params),
@@ -858,7 +853,6 @@ pub fn dispatch_inner(ctx: &RpcContext, method: &str, params: RpcParams) -> Resu
         "getmempoolancestors" => getmempoolancestors(ctx, &params),
         "getmempooldescendants" => getmempooldescendants(ctx, &params),
         "getmempoolfeeratediagram" => getmempoolfeeratediagram(ctx, &params),
-        "submitpackage" => submitpackage(ctx, &params),
         "gettxspendingprevout" => gettxspendingprevout(ctx, &params),
         "getblockfilter" => getblockfilter(ctx, &params),
         "createrawtransaction"

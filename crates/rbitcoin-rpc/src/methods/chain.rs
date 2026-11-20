@@ -1586,14 +1586,6 @@ pub fn parse_blockhash_param(params: &RpcParams) -> Result<bitcoin::BlockHash, V
     Ok(bitcoin::BlockHash::from_byte_array(b))
 }
 
-pub fn invalidateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["blockhash"])?;
-    let hub = require_chain(ctx)?;
-    let hash = parse_blockhash_param(params)?;
-    hub.invalidate_block(hash).map_err(block_missing_or_misc)?;
-    Ok(Value::Null)
-}
-
 pub async fn invalidateblock_async(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["blockhash"])?;
     let hub = ctx
@@ -1630,15 +1622,6 @@ pub fn decode_header_hex(hex: &str) -> Result<bitcoin::block::Header, Value> {
         .map_err(|_| rpc_error(ERR_DESERIALIZATION, "Block header decode failed"))
 }
 
-pub fn reconsiderblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["blockhash"])?;
-    let hub = require_chain(ctx)?;
-    let hash = parse_blockhash_param(params)?;
-    hub.reconsider_block(hash)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    Ok(Value::Null)
-}
-
 pub async fn reconsiderblock_async(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["blockhash"])?;
     let hub = ctx
@@ -1649,14 +1632,6 @@ pub async fn reconsiderblock_async(ctx: &RpcContext, params: &RpcParams) -> Resu
     hub.reconsider_block_async(hash)
         .await
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    Ok(Value::Null)
-}
-
-pub fn preciousblock(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["blockhash"])?;
-    let hub = require_chain(ctx)?;
-    let hash = parse_blockhash_param(params)?;
-    hub.precious_block(hash).map_err(block_missing_or_misc)?;
     Ok(Value::Null)
 }
 

@@ -1017,7 +1017,11 @@ fn reject_burn_over_max(tx: &Transaction, max_burn_sat: u64) -> Result<(), Value
 pub const MAX_BURN_MSG: &str =
     "Unspendable output exceeds maximum configured by user (maxburnamount)";
 
-pub fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+/// HTTP `sendrawtransaction`. Script verify is awaited on the request task.
+pub async fn sendrawtransaction_async(
+    ctx: &Arc<RpcContext>,
+    params: &RpcParams,
+) -> Result<Value, Value> {
     params.reject_unknown(&["hexstring", "maxfeerate", "maxburnamount"])?;
     let hex = params.req_str(0, "hexstring")?;
     // Pre-0.19 `allowhighfees`. btcd rpcclient (LND, btcwallet) sends it
@@ -1031,46 +1035,10 @@ pub fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value,
     let tx = decode_sendraw_tx_hex(hex)?;
     let mp = ctx
         .mempool
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
-    reject_burn_over_max(&tx, max_burn)?;
-    // Core checks burn, then CoinsTip, then version and max fee.
-    reject_outputs_already_in_utxo_set(ctx, &tx)?;
-    if rpc_tx_version_nonstandard(&tx) {
-        return Err(rpc_error(ERR_VERIFY_REJECTED, "version"));
-    }
-    if rpc_tx_fee_exceeds_max(ctx, &tx, max_feerate) {
-        return Err(rpc_error(
-            ERR_VERIFY_ERROR,
-            "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
-        ));
-    }
-    sendraw_after_accept(
-        ctx,
-        &tx,
-        mp.accept_tx_from(&tx, rbitcoin_net::TxOrigin::Local),
-    )
-}
-
-/// HTTP `sendrawtransaction`. Script verify is awaited on the request task.
-pub async fn sendrawtransaction_async(
-    ctx: &Arc<RpcContext>,
-    params: &RpcParams,
-) -> Result<Value, Value> {
-    params.reject_unknown(&["hexstring", "maxfeerate", "maxburnamount"])?;
-    let hex = params.req_str(0, "hexstring")?;
-    let max_feerate = match params.get(1, "maxfeerate") {
-        Some(Value::Bool(true)) => 0,
-        Some(Value::Bool(false)) => DEFAULT_MAX_RAW_TX_FEE_SAT_KVB,
-        _ => opt_maxfeerate_sat_kvb(params, 1)?,
-    };
-    let max_burn = opt_maxburn_sat(params, 2)?;
-    let tx = decode_sendraw_tx_hex(hex)?;
-    let mp = ctx
-        .mempool
         .clone()
         .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
     reject_burn_over_max(&tx, max_burn)?;
+    // Core checks burn, then CoinsTip, then version and max fee.
     let ctx_coins = Arc::clone(ctx);
     let tx_coins = tx.clone();
     rbitcoin_net::off_pool_budgeted(move || {
@@ -1305,32 +1273,6 @@ pub fn accept_reject_details(e: &impl std::fmt::Display, tx: &Transaction) -> Op
     ))
 }
 
-pub fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["rawtxs", "maxfeerate"])?;
-    let max_feerate = opt_maxfeerate_sat_kvb(params, 1)?;
-    let arr = params
-        .get_array(0, "rawtxs")
-        .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "rawtxs array required"))?;
-    let mp = ctx
-        .mempool
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
-    let mut decoded = Vec::new();
-    for v in arr {
-        let hex = v
-            .as_str()
-            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "rawtx hex required"))?;
-        decoded.push(decode_package_tx_hex(hex)?);
-    }
-    if let Some(rows) = testmempoolaccept_package_precheck(mp, &decoded) {
-        return Ok(rows);
-    }
-    if decoded.len() >= 2 {
-        return Ok(testmempoolaccept_package_rows(mp, &decoded, max_feerate));
-    }
-    testmempoolaccept_single_rows(ctx, mp, decoded, max_feerate)
-}
-
 /// HTTP `testmempoolaccept`. Script verify is awaited on the request task.
 pub async fn testmempoolaccept_async(
     ctx: &Arc<RpcContext>,
@@ -1445,82 +1387,6 @@ fn tma_from_err(tx: &Transaction, txid: &str, wtxid: &str, e: &impl std::fmt::Di
         row["reject-details"] = json!(details);
     }
     row
-}
-
-#[doc(hidden)]
-pub fn testmempoolaccept_package_rows(
-    mp: &MempoolHub,
-    decoded: &[Transaction],
-    max_feerate: u64,
-) -> Value {
-    let mut added = Vec::new();
-    let mut out = Vec::new();
-    for tx in decoded {
-        let (txid, wtxid) = tma_ids(tx);
-        if rpc_tx_version_nonstandard(tx) {
-            out.push(tma_reject(&txid, &wtxid, "version"));
-            continue;
-        }
-        if tx
-            .input
-            .iter()
-            .any(|i| mp.spending_txid(&i.previous_output).is_some())
-        {
-            out.push(tma_bip125(&txid, &wtxid));
-            continue;
-        }
-        match mp.accept_test_package_member(tx) {
-            Ok(r) => {
-                added.push(r.txid);
-                out.push(tma_from_accept(
-                    tx,
-                    &txid,
-                    &wtxid,
-                    r.fee_sat,
-                    r.weight,
-                    max_feerate,
-                ));
-            }
-            Err(e) => out.push(tma_from_err(tx, &txid, &wtxid, &e)),
-        }
-    }
-    if !added.is_empty() {
-        mp.remove_for_block(&added, Removal::Undo);
-    }
-    json!(out)
-}
-
-#[doc(hidden)]
-pub fn testmempoolaccept_single_rows(
-    ctx: &RpcContext,
-    mp: &MempoolHub,
-    decoded: Vec<Transaction>,
-    max_feerate: u64,
-) -> Result<Value, Value> {
-    let mut out = Vec::new();
-    for tx in decoded {
-        let (txid, wtxid) = tma_ids(&tx);
-        if tx_confirmed_on_active_chain(ctx, &tx)? {
-            out.push(tma_reject(&txid, &wtxid, "txn-already-known"));
-            continue;
-        }
-        if rpc_tx_version_nonstandard(&tx) {
-            out.push(tma_reject(&txid, &wtxid, "version"));
-            continue;
-        }
-        match mp.test_accept(&tx) {
-            Ok(r) => out.push(tma_from_accept(
-                &tx,
-                &txid,
-                &wtxid,
-                r.fee_sat,
-                r.weight,
-                max_feerate,
-            )),
-            Err(e) => out.push(tma_from_err(&tx, &txid, &wtxid, &e)),
-        }
-    }
-    Ok(json!(out))
 }
 
 async fn testmempoolaccept_package_rows_async(
@@ -2136,33 +2002,6 @@ pub fn getmempoolfeeratediagram(ctx: &RpcContext, params: &RpcParams) -> Result<
     Ok(json!(pts))
 }
 
-pub fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["package", "maxfeerate", "maxburnamount"])?;
-    let max_feerate = opt_maxfeerate_sat_kvb(params, 1)?;
-    let max_burn = opt_maxburn_sat(params, 2)?;
-    let arr = params
-        .get_array(0, "package")
-        .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "package array required"))?;
-    let mp = ctx
-        .mempool
-        .as_ref()
-        .ok_or_else(|| rpc_error(ERR_MISC, "mempool not available"))?;
-    if arr.is_empty() || arr.len() > MempoolHub::max_package_count() {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            format!(
-                "Array must contain between 1 and {} transactions.",
-                MempoolHub::max_package_count()
-            ),
-        ));
-    }
-    let txs = submitpackage_txs(ctx, arr, max_burn)?;
-    if let Some(done) = submitpackage_screen(mp, &txs)? {
-        return Ok(done);
-    }
-    Ok(submitpackage_admit(ctx, mp, &txs, max_feerate))
-}
-
 /// HTTP `submitpackage`. Script verify is awaited on the request task.
 pub async fn submitpackage_async(
     ctx: &Arc<RpcContext>,
@@ -2267,17 +2106,6 @@ struct PackagePlan {
     eval_txs: Vec<Transaction>,
     over_max: Vec<Transaction>,
     package_eval: bool,
-}
-
-pub fn submitpackage_admit(
-    ctx: &RpcContext,
-    mp: &MempoolHub,
-    txs: &[Transaction],
-    max_feerate: u64,
-) -> Value {
-    let plan = submitpackage_plan(ctx, mp, txs, max_feerate);
-    let rows = mp.submit_package_rpc_eval(&plan.eval_txs, plan.package_eval);
-    submitpackage_apply(mp, plan, rows)
 }
 
 /// HTTP `submitpackage` admit. Scripts are awaited on the request task.
