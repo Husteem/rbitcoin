@@ -780,7 +780,7 @@ impl LivePeer {
             return None;
         }
         let sock = SelfAnnounceLink::Clearnet.local_socket(&hub, self.reported_local_ip)?;
-        if self.may_be_external_onion_ingress(&hub) {
+        if self.may_be_onion_ingress(&hub) {
             return None;
         }
         let prev = self.next_local_addr_send.load(Ordering::Relaxed);
@@ -825,7 +825,7 @@ impl LivePeer {
         if onion.is_none() && i2p.is_none() && sock.is_none() {
             return None;
         }
-        if self.may_be_external_onion_ingress(&hub) {
+        if self.may_be_onion_ingress(&hub) {
             return None;
         }
         const DAY: u64 = 24 * 60 * 60;
@@ -908,8 +908,10 @@ impl LivePeer {
 
     // Check after selecting the address because startup can publish the
     // external endpoints while an inbound session is already running.
-    fn may_be_external_onion_ingress(&self, hub: &PeerHub) -> bool {
-        self.inbound && self.net.socket_addr().is_some() && hub.external_onion().is_some()
+    fn may_be_onion_ingress(&self, hub: &PeerHub) -> bool {
+        self.inbound
+            && self.net.socket_addr().is_some()
+            && (hub.external_onion().is_some() || hub.is_onion_bind(self.addrbind))
     }
 
     /// The network this link carries, which decides the one local address
@@ -2433,6 +2435,14 @@ impl PeerHub {
         self.overlay_loopback_forward.store(on, Ordering::Relaxed);
     }
 
+    fn is_onion_bind(&self, bind: SocketAddr) -> bool {
+        self.net_perms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .onion_bind
+            == Some(bind)
+    }
+
     pub fn permission_flags(
         &self,
         addr: SocketAddr,
@@ -2441,7 +2451,9 @@ impl PeerHub {
     ) -> crate::net_permissions::NetPermissionFlags {
         let table = self.net_perms.lock().unwrap_or_else(|e| e.into_inner());
         let apply_whitelist = !(inbound
-            && (self.external_onion().is_some()
+            && (table
+                .onion_bind
+                .map_or_else(|| self.external_onion().is_some(), |onion| bind == onion)
                 || (self.overlay_loopback_forward.load(Ordering::Relaxed)
                     && addr.ip().to_canonical().is_loopback())));
         table.flags_for_matched(addr.ip(), inbound, bind, apply_whitelist)

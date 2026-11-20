@@ -90,6 +90,7 @@ impl From<PathBuf> for DatadirOpts {
 pub struct ListenOpts {
     pub p2p: P2pListen,
     pub p2p_extra: Vec<SocketAddr>,
+    pub onion_bind: Option<SocketAddr>,
     pub electrum: Option<SocketAddr>,
     pub esplora: Option<EsploraListen>,
     /// `--health-listen`: `/healthz` from the start of `run_p2p`.
@@ -134,6 +135,7 @@ impl Default for ListenOpts {
         Self {
             p2p: P2pListen::Auto,
             p2p_extra: Vec::new(),
+            onion_bind: None,
             electrum: None,
             esplora: None,
             health: None,
@@ -166,9 +168,15 @@ impl ListenOpts {
         !self.connect.is_empty() || !self.connect_dns.is_empty()
     }
 
-    /// Built-in Tor or I2P forwarding delivers inbound TCP from loopback.
+    /// Forwarding through a P2P listener shared with ordinary peers.
     pub fn overlay_loopback_forward(&self) -> bool {
-        self.listen_onion || self.i2p_accept_incoming
+        (self.listen_onion && self.onion_bind.is_none()) || self.i2p_accept_incoming
+    }
+
+    pub(crate) fn reset_p2p_listeners(&mut self, p2p: P2pListen) {
+        self.p2p = p2p;
+        self.p2p_extra.clear();
+        self.onion_bind = None;
     }
 
     /// `--only-net` leaves IPv4 or IPv6 reachable (an empty list leaves all).
@@ -193,6 +201,7 @@ impl ListenOpts {
     pub fn p2p_bind_addr(&self, network: Network) -> Option<SocketAddr> {
         match self.p2p {
             P2pListen::Off => None,
+            P2pListen::Auto if self.onion_bind.is_some() => None,
             P2pListen::Auto => Some(SocketAddr::from((
                 [127, 0, 0, 1],
                 network.default_p2p_port(),
@@ -201,16 +210,12 @@ impl ListenOpts {
         }
     }
 
-    /// Clearnet bind, or a loopback ephemeral port when `--listen-onion` is on
-    /// with `--no-listen`.
+    /// Primary P2P bind, with a Tor-only listener as fallback.
     pub fn start_p2p_bind(&self, network: Network) -> Option<SocketAddr> {
-        if let Some(a) = self.p2p_bind_addr(network) {
-            return Some(a);
-        }
-        if self.listen_onion {
-            return Some(SocketAddr::from(([127, 0, 0, 1], 0)));
-        }
-        None
+        self.p2p_bind_addr(network).or(self.onion_bind).or_else(|| {
+            self.listen_onion
+                .then_some(SocketAddr::from(([127, 0, 0, 1], 0)))
+        })
     }
 }
 
@@ -582,7 +587,10 @@ pub struct NodeConfig {
 }
 
 fn reject_trust_peer_listen(listen: &ListenOpts) -> Result<(), NodeError> {
-    if !matches!(listen.p2p, P2pListen::Off) || listen.listen_onion || !listen.p2p_extra.is_empty()
+    if !matches!(listen.p2p, P2pListen::Off)
+        || listen.listen_onion
+        || listen.onion_bind.is_some()
+        || !listen.p2p_extra.is_empty()
     {
         return Err(NodeError::Config(
             "trust-peer cannot be combined with --listen".into(),
@@ -792,7 +800,10 @@ impl NodeConfig {
 
     #[doc(hidden)]
     pub fn push_p2p_listen(&mut self, addr: SocketAddr) -> Result<(), NodeError> {
-        if self.listen.p2p == P2pListen::Socket(addr) || self.listen.p2p_extra.contains(&addr) {
+        if self.listen.p2p == P2pListen::Socket(addr)
+            || self.listen.p2p_extra.contains(&addr)
+            || self.listen.onion_bind == Some(addr)
+        {
             return Err(NodeError::Init("Duplicate binding configuration".into()));
         }
         if matches!(self.listen.p2p, P2pListen::Auto | P2pListen::Off) {
@@ -800,6 +811,24 @@ impl NodeConfig {
         } else {
             self.listen.p2p_extra.push(addr);
         }
+        Ok(())
+    }
+
+    fn set_onion_bind(&mut self, addr: SocketAddr) -> Result<(), NodeError> {
+        if addr.ip().to_canonical().is_unspecified() || addr.port() == 0 {
+            return Err(NodeError::Config(
+                "--listen ADDR:PORT=onion requires a specific IP and a nonzero port".into(),
+            ));
+        }
+        if self.listen.onion_bind.is_some() {
+            return Err(NodeError::Config(
+                "only one --listen ADDR:PORT=onion is supported".into(),
+            ));
+        }
+        if self.listen.p2p == P2pListen::Socket(addr) || self.listen.p2p_extra.contains(&addr) {
+            return Err(NodeError::Init("Duplicate binding configuration".into()));
+        }
+        self.listen.onion_bind = Some(addr);
         Ok(())
     }
 
@@ -908,6 +937,7 @@ impl NodeConfig {
         };
         let forwarded = [
             ("--listen", self.listen.p2p_bind_addr(self.network)),
+            ("--listen=onion", self.listen.onion_bind),
             ("--electrum-listen", self.listen.electrum),
             ("--esplora-listen", esplora),
         ];
@@ -969,8 +999,7 @@ impl NodeConfig {
                 ));
             }
         }
-        self.listen.p2p = P2pListen::Off;
-        self.listen.p2p_extra.clear();
+        self.listen.reset_p2p_listeners(P2pListen::Off);
         self.listen.listen_onion = false;
         self.listen.use_seeds = false;
         self.listen.max_inbound = 0;
@@ -992,7 +1021,9 @@ impl NodeConfig {
                 "trust-peer cannot be combined with --listen-onion".into(),
             ));
         }
-        if self.listen.p2p_explicit && !matches!(self.listen.p2p, P2pListen::Off) {
+        if self.listen.p2p_explicit
+            && (!matches!(self.listen.p2p, P2pListen::Off) || self.listen.onion_bind.is_some())
+        {
             return Err(NodeError::Config(
                 "trust-peer cannot be combined with --listen".into(),
             ));
@@ -1112,7 +1143,7 @@ impl NodeConfig {
                     "i2p-accept-incoming requires SAM (--i2p-sam)".into(),
                 ));
             }
-            if matches!(self.listen.p2p, P2pListen::Off) && !self.listen.listen_onion {
+            if self.listen.start_p2p_bind(self.network).is_none() {
                 return Err(NodeError::Config(
                     "i2p-accept-incoming needs a P2P listener (--listen); --listen=0 has no loopback to STREAM FORWARD"
                         .into(),
@@ -1434,20 +1465,24 @@ impl NodeConfig {
             "listen" => {
                 self.listen.p2p_explicit = true;
                 if is_listen_off(val) {
-                    self.listen.p2p = P2pListen::Off;
-                    self.listen.p2p_extra.clear();
+                    self.listen.reset_p2p_listeners(P2pListen::Off);
                 } else {
-                    let addr: SocketAddr = val
+                    let onion = val.strip_suffix("=onion");
+                    let addr: SocketAddr = onion
+                        .unwrap_or(val)
                         .parse()
                         .map_err(|e| NodeError::Config(format!("conf listen: {e}")))?;
-                    self.push_p2p_listen(addr)?;
+                    if onion.is_some() {
+                        self.set_onion_bind(addr)?;
+                    } else {
+                        self.push_p2p_listen(addr)?;
+                    }
                 }
             }
             "no_listen" => {
                 if conf_bool("no_listen", val)? {
                     self.listen.p2p_explicit = true;
-                    self.listen.p2p = P2pListen::Off;
-                    self.listen.p2p_extra.clear();
+                    self.listen.reset_p2p_listeners(P2pListen::Off);
                 }
             }
             "no_discover" => {
@@ -1798,7 +1833,8 @@ impl NodeConfig {
                 if !val.is_empty() {
                     let g = rbitcoin_net::parse_whitebind(val).map_err(NodeError::Init)?;
                     let listening = self.listen.p2p == P2pListen::Socket(g.addr)
-                        || self.listen.p2p_extra.contains(&g.addr);
+                        || self.listen.p2p_extra.contains(&g.addr)
+                        || self.listen.onion_bind == Some(g.addr);
                     if !listening {
                         if g.flags.has(rbitcoin_net::NetPermissionFlags::V1) {
                             self.listen.p2p_extra.push(g.addr);

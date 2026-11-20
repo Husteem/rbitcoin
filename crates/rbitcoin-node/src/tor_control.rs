@@ -304,13 +304,13 @@ impl TorKeeper {
     pub async fn add_p2p_onion(
         &self,
         datadir: &Path,
-        bound: SocketAddr,
+        target: SocketAddr,
         virt: u16,
     ) -> Result<(), NodeError> {
         self.add(Onion {
             key_path: datadir.join("onion").join("p2p.priv"),
             virt,
-            target: SocketAddr::from(([127, 0, 0, 1], bound.port())),
+            target,
             kind: OnionKind::P2p,
             added: Some(Box::new(move |hs| {
                 info!("p2p onion {}.onion:{virt}", hs.service_id)

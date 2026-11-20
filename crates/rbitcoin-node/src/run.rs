@@ -584,6 +584,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     apply_startup_index_mode(&handle.query, &config, params.taproot_height())?;
     rbitcoin_query::prepare_live_indexes(&handle.query)
         .map_err(|e| crate::error::NodeError::Init(format!("index startup repair failed: {e}")))?;
+    let clearnet_listen = config.listen.p2p_bind_addr(config.network).is_some();
     let bind = config.listen.start_p2p_bind(config.network);
 
     let start_tip = handle.query.tip_height().map(|h| h.0).unwrap_or(0);
@@ -648,11 +649,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     publish_listener_addr(config.datadir.path(), "p2p", node.local_addr);
     let spend_sync = SpendSync::spawn(std::sync::Arc::clone(&node.hub.query));
     status.attach_p2p(&node.hub, &node.peers);
-    for extra in &config.listen.p2p_extra {
+    let mut onion_bind = config
+        .listen
+        .onion_bind
+        .filter(|_| !clearnet_listen)
+        .map(|_| node.local_addr);
+    let extra_onion_bind = config.listen.onion_bind.iter().filter(|_| clearnet_listen);
+    for extra in config.listen.p2p_extra.iter().chain(extra_onion_bind) {
         let bound = node
             .add_listen(*extra)
             .await
             .map_err(|e| p2p_start_err(&format!("p2p extra listen {extra}"), e))?;
+        if config.listen.onion_bind == Some(*extra) {
+            onion_bind = Some(bound);
+        }
         info!(
             "rbitcoin-node listening on {} ({})",
             bound,
@@ -707,7 +717,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         None => None,
     };
     let expiry_hours = config.mempool.expiry_hours;
-    let table = config.finalized_net_perms();
+    let mut table = config.finalized_net_perms();
+    table.onion_bind = onion_bind;
     let immediate_relay = config.trusted;
     let hub = Arc::clone(&node.hub);
     let enforce_bip54 = hub.params.enforce_bip54;
@@ -764,19 +775,18 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
     node.peers.set_discover_from_peers(from_peers);
-    let clearnet_listen = !matches!(config.listen.p2p, crate::config::P2pListen::Off);
     node.peers.set_clearnet_listen(clearnet_listen);
     if node.local_addr.port() != 0 {
         node.peers.set_listen_port(node.local_addr.port());
     }
     let onion_public_port = config.network.default_p2p_port();
-    if config.listen.listen_onion && !clearnet_listen {
+    if !clearnet_listen && (config.listen.listen_onion || onion_bind.is_some()) {
         node.peers.set_tor_only_public_port(onion_public_port);
     }
     let external = external_endpoints_with_cjdns_bind(
         &config.listen.external_endpoints,
         node.local_addr,
-        config.listen.cjdns_reachable,
+        config.listen.cjdns_reachable && clearnet_listen,
     );
     node.peers.set_external_endpoints(external);
     node.peers.set_net_perms(table.clone());
@@ -842,10 +852,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let ctl = tor_ctl
             .as_ref()
             .expect("validate requires --tor-control with --listen-onion");
+        let target = onion_bind
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], node.local_addr.port())));
         shutdown
             .run_until_cancelled(ctl.add_p2p_onion(
                 config.datadir.path(),
-                node.local_addr,
+                target,
                 onion_public_port,
             ))
             .await?;

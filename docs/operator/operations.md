@@ -66,9 +66,9 @@ Clean smoke:
 | `--network NET` | `network=` | `mainnet` |
 | `--signet-challenge HEX` | `signet_challenge=` | default global Signet challenge |
 | `--signet-block-time SECS` | `signet_block_time=` | 600; requires a custom challenge |
-| `--listen ADDR` | `listen=` | bind later default port |
+| `--listen ADDR:PORT[=onion]` | `listen=` | repeatable P2P bind. One bind with a specific IP and nonzero port can be marked `=onion` |
 | `--no-listen` / `--listen=0` | `listen=0` / `no_listen=` | bind a loopback default; **off** = no clearnet P2P socket |
-| `--listen-onion` | `listen_onion=` | **off** — loopback P2P + `ADD_ONION` (`{datadir}/onion/p2p.priv`); needs `--tor-control` and `--max-inbound` > 0 |
+| `--listen-onion` | `listen_onion=` | **off** — publish a Tor P2P service via `ADD_ONION` (`{datadir}/onion/p2p.priv`); needs `--tor-control` and `--max-inbound` > 0 |
 | `--no-discover` | `no_discover=` | discover **on**; flag off = no home-IP self-announce; P2P/wallet onions still listed |
 | `--discover-from-peers` | `discover_from_peers=` | **off** — with no clearnet `--external-ip`, announce to outbound clearnet peers the IP each one reports reaching us at, at the listen port; never to inbound peers, never over Tor, I2P, CJDNS or `--proxy`; needs discover on and a non-loopback `--listen`; a loopback bind ignores it with a warning; `--no-discover` has no effect and nothing is logged |
 | `--only-net NET` | `only_net=` | all nets; repeatable `ipv4` / `ipv6` / `onion` / `i2p` / `cjdns` |
@@ -244,10 +244,16 @@ addresses it announced (each at the listen port only).
 With discovery and P2P listening enabled, rbitcoin announces the first
 configured external onion ahead of its built-in onion on eligible outbound
 Tor connections.
-An external address without a port uses the P2P listen port. With
-`--no-listen --listen-onion`, a portless onion uses the network's default
-P2P port. When an external onion is configured, rbitcoin skips source-IP
-permission grants and sends no own address to inbound TCP peers.
+An external address without a port uses the P2P listen port. With Tor-only
+listening, a portless onion uses the network's default P2P port.
+With an external onion configured, rbitcoin sends no own address to inbound
+TCP peers.
+
+Use a dedicated `listen=127.0.0.1:8334=onion` entry as the local target for
+Tor forwarding. `--listen-onion` uses it automatically when present.
+Source-IP permission rules skip the marked listener. Ordinary listeners
+keep their normal source-IP rules. If an external onion is configured
+without a marked listener, source-IP rules skip all inbound TCP peers.
 Explicit bind grants still apply.
 
 `--tor-control [HOST:PORT]` talks to **system tor** (SAFECOOKIE/COOKIE or password). Omit

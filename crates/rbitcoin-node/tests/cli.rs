@@ -48,6 +48,29 @@ where
 }
 
 #[test]
+fn cli_onion_bind_replaces_file_listeners() {
+    let dir = rbitcoin_store::testutil::TempDir::new().unwrap();
+    let conf = dir.path().join("rbitcoin.conf");
+    std::fs::write(
+        &conf,
+        "listen=127.0.0.1:18333\nlisten=127.0.0.1:18334=onion\n",
+    )
+    .unwrap();
+    let cfg = ready_config([
+        "rbitcoin-node",
+        "--conf",
+        conf.to_str().unwrap(),
+        "--listen=[::1]:28334=onion",
+    ]);
+    assert_eq!(
+        cfg.listen.start_p2p_bind(cfg.network),
+        Some("[::1]:28334".parse().unwrap())
+    );
+    assert!(cfg.listen.p2p_bind_addr(cfg.network).is_none());
+    assert!(cfg.listen.p2p_extra.is_empty());
+}
+
+#[test]
 fn external_ip_cli_replaces_only_matching_file_hosts() {
     let dir = rbitcoin_store::testutil::TempDir::new().unwrap();
     let conf = dir.path().join("rbitcoin.conf");
