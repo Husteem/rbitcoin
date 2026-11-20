@@ -137,6 +137,30 @@ pub fn accept_and_connect_block_preverified(
         )))
 }
 
+/// Two equal-work tip candidates. Both script waves run together; the first
+/// to pass strict scripts and commit is the tip. `height` is `tip + 1` for
+/// both. The loser is left to the caller (park or report).
+#[allow(clippy::too_many_arguments)]
+pub fn accept_and_connect_block_pair_preverified(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    height: Height,
+    a: Arc<Block>,
+    a_pre: &ScriptPreverified,
+    a_pres: Arc<[TxPrecompute]>,
+    b: Arc<Block>,
+    b_pre: &ScriptPreverified,
+    b_pres: Arc<[TxPrecompute]>,
+    phase: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<confirm_run::PairRun, Box<confirm_run::PairFailure>> {
+    let a_in: confirm_run::WireBlockIn = (height, a, Some(a_pres));
+    let b_in: confirm_run::WireBlockIn = (height, b, Some(b_pres));
+    confirm_run::confirm_wire_run_pair_preverified(
+        query, params, milestone, &a_in, a_pre, &b_in, b_pre, phase,
+    )
+}
+
 #[doc(hidden)]
 pub fn class_a_header_and_txids(
     query: &Query,

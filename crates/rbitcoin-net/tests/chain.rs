@@ -7924,3 +7924,262 @@ fn activate_best_side_branch_store_fault_is_not_a_failed_block() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// T1: two equal-work siblings are scripted together and exactly one becomes
+/// the tip. The held sibling is discovered before its own lane job runs.
+#[test]
+fn equal_work_sibling_pair_connects_exactly_one_tip() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t = 1_700_000_000u32;
+    let b1 = mine(gen, t, 1);
+    hub.accept_block(b1.clone()).unwrap();
+    let mut prev = b1.block_hash();
+    for h in 2..=102u32 {
+        let b = mine(prev, t.saturating_add(h), h);
+        hub.accept_block(b.clone()).unwrap();
+        prev = b.block_hash();
+    }
+    // Two siblings at 103, each with a real script job: spend a mature
+    // OP_TRUE coinbase. The height 2 and 3 coinbases mature at 103.
+    let out2 = hub.block_at_height(2).unwrap().expect("height 2");
+    let out3 = hub.block_at_height(3).unwrap().expect("height 3");
+    let a = spend_block(prev, t.saturating_add(103), 103, coinbase_out(&out2));
+    let b = spend_block(prev, t.saturating_add(104), 103, coinbase_out(&out3));
+    assert_eq!(a.header.prev_blockhash, b.header.prev_blockhash);
+    // Park the sibling before the first accept so the pair path sees it.
+    hub.hold_unconnected_body(b.clone());
+    let out = hub.accept_received_block(a.clone()).unwrap();
+    assert!(
+        matches!(
+            out,
+            AcceptOutcome::Accepted { .. } | AcceptOutcome::IgnoredWeaker
+        ),
+        "one of the pair wins: {out:?}"
+    );
+    let (won, lost) = if hub.tip_hash() == Some(a.block_hash()) {
+        (a.clone(), b.clone())
+    } else {
+        (b.clone(), a.clone())
+    };
+    assert_eq!(hub.tip_height(), Some(103));
+    assert_eq!(hub.tip_hash(), Some(won.block_hash()));
+    assert!(!hub.is_connected(&lost.block_hash()));
+    assert!(hub.held_body(&lost.block_hash()).is_some());
+    // The loser's own job reports a lost equal-work race and moves nothing.
+    let out_lost = hub.accept_received_block(lost.clone()).unwrap();
+    assert!(
+        matches!(out_lost, AcceptOutcome::IgnoredWeaker),
+        "{out_lost:?}"
+    );
+    assert_eq!(hub.tip_hash(), Some(won.block_hash()));
+    // A child of the winner must connect. A stale loser plan left in
+    // `ConfirmParentCache` at 103 makes its parent MTP/bits lookup bind the
+    // loser and reject the child.
+    let child = mine(won.block_hash(), t.saturating_add(105), 104);
+    let out_c = hub.accept_received_block(child.clone()).unwrap();
+    assert!(
+        matches!(out_c, AcceptOutcome::Accepted { height: 104 }),
+        "{out_c:?}"
+    );
+    assert_eq!(hub.tip_hash(), Some(child.block_hash()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// P2PK needs a signature; an empty scriptSig fails the script stage.
+fn p2pk_requires_sig() -> ScriptBuf {
+    let mut v = vec![0x21, 0x02];
+    v.extend([0x01u8; 32]);
+    v.push(0xac);
+    ScriptBuf::from_bytes(v)
+}
+
+/// T1: a one-job, script-invalid sibling must not abort the pair or mark the
+/// honest block invalid. The valid sibling wins and the bad hash is marked.
+#[test]
+fn pair_script_invalid_sibling_loses_and_is_marked() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t = 1_700_000_000u32;
+    let mature = rbitcoin_consensus::mine_regtest_paying(gen, t, 1, p2pk_requires_sig(), vec![]);
+    hub.accept_block(mature.clone()).unwrap();
+    let mut prev = mature.block_hash();
+    for h in 2..=101u32 {
+        let b = mine(prev, t.saturating_add(h), h);
+        hub.accept_block(b.clone()).unwrap();
+        prev = b.block_hash();
+    }
+    // Empty scriptSig against P2PK: one script job, it fails inline.
+    let bad = spend_block(prev, t.saturating_add(102), 102, coinbase_out(&mature));
+    let good = mine(prev, t.saturating_add(102), 102);
+    hub.hold_unconnected_body(good.clone());
+    let out = hub.accept_received_block(bad.clone()).unwrap();
+    assert!(matches!(out, AcceptOutcome::IgnoredWeaker), "{out:?}");
+    assert_eq!(hub.tip_hash().unwrap(), good.block_hash());
+    assert!(
+        hub.is_block_invalid(&bad.block_hash()),
+        "the script-invalid sibling is marked, not the honest block"
+    );
+    assert!(
+        hub.held_body(&bad.block_hash()).is_none(),
+        "an invalid pair loser is not re-parked"
+    );
+    assert!(!hub.is_connected(&bad.block_hash()));
+    let child = mine(good.block_hash(), t.saturating_add(103), 103);
+    assert!(matches!(
+        hub.accept_received_block(child.clone()).unwrap(),
+        AcceptOutcome::Accepted { height: 103 }
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// T3: a heavier held branch whose first block fails scripts must not strand
+/// the valid tip child. The branch is recorded and the child connects.
+#[test]
+fn failed_heavier_branch_does_not_strand_the_tip_child() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t = 1_700_000_000u32;
+    let mature = rbitcoin_consensus::mine_regtest_paying(gen, t, 1, p2pk_requires_sig(), vec![]);
+    hub.accept_block(mature.clone()).unwrap();
+    let mut prev = mature.block_hash();
+    for h in 2..=101u32 {
+        let b = mine(prev, t.saturating_add(h), h);
+        hub.accept_block(b.clone()).unwrap();
+        prev = b.block_hash();
+    }
+    let fork = hub.block_at_height(100).unwrap().expect("height 100");
+    // Three-block branch from height 100; the first block's spend has an
+    // empty scriptSig against P2PK, so the branch fails at its first connect.
+    let q1 = spend_block(
+        fork.block_hash(),
+        t.saturating_add(101),
+        101,
+        coinbase_out(&mature),
+    );
+    let q2 = mine(q1.block_hash(), t.saturating_add(102), 102);
+    let q3 = mine(q2.block_hash(), t.saturating_add(103), 103);
+    hub.hold_unconnected_body(q1.clone());
+    hub.hold_unconnected_body(q2.clone());
+    hub.hold_unconnected_body(q3);
+    // A non-coinbase child: `held_heavier_branch` only runs above one tx.
+    // Spend an OP_TRUE coinbase (height 2, mature at 102), not the P2PK one.
+    let op_true_mature = hub.block_at_height(2).unwrap().expect("height 2");
+    let child = spend_block(
+        prev,
+        t.saturating_add(102),
+        102,
+        coinbase_out(&op_true_mature),
+    );
+    let out = hub.accept_received_block(child.clone()).unwrap();
+    assert!(
+        matches!(out, AcceptOutcome::Accepted { height: 102 }),
+        "the child connects after the failed preemption: {out:?}"
+    );
+    assert_eq!(hub.tip_hash().unwrap(), child.block_hash());
+    assert!(hub.is_block_invalid(&q1.block_hash()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// T3: a valid heavier held branch connects before the tip child. The child
+/// is parked and its caller is told it did not win.
+#[test]
+fn valid_heavier_branch_wins_before_the_tip_child() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t = 1_700_000_000u32;
+    let b1 = mine(gen, t, 1);
+    hub.accept_block(b1.clone()).unwrap();
+    let mut prev = b1.block_hash();
+    for h in 2..=101u32 {
+        let b = mine(prev, t.saturating_add(h), h);
+        hub.accept_block(b.clone()).unwrap();
+        prev = b.block_hash();
+    }
+    let fork = hub.block_at_height(100).unwrap().expect("height 100");
+    let q1 = mine(fork.block_hash(), t.saturating_add(101), 101);
+    let q2 = mine(q1.block_hash(), t.saturating_add(102), 102);
+    let q3 = mine(q2.block_hash(), t.saturating_add(103), 103);
+    hub.hold_unconnected_body(q1.clone());
+    hub.hold_unconnected_body(q2);
+    hub.hold_unconnected_body(q3.clone());
+    // A non-coinbase child so the preemption runs.
+    let out2 = hub.block_at_height(2).unwrap().expect("height 2");
+    let child = spend_block(prev, t.saturating_add(102), 102, coinbase_out(&out2));
+    let out = hub.accept_received_block(child.clone()).unwrap();
+    assert!(matches!(out, AcceptOutcome::IgnoredWeaker), "{out:?}");
+    assert_eq!(hub.tip_hash(), Some(q3.block_hash()));
+    assert_eq!(hub.tip_height(), Some(103));
+    assert!(!hub.is_connected(&child.block_hash()));
+    assert!(hub.held_body(&child.block_hash()).is_some());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The pair winner can fail its write with no index wave. The loser was
+/// unpublished for that write; the promotion must re-publish it and finish,
+/// not wait for chunks no worker can claim. The loser carries many script
+/// jobs so an unclaimed chunk remains when it is withdrawn.
+#[test]
+fn pair_winner_write_failure_promotes_an_unpublished_loser() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    // A fan-out at 102 gives the held sibling many one-input script jobs.
+    let mut fan = mature_spend_tx(&hub, 1);
+    fan.output = (0..8000u32)
+        .map(|_| TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: op_true.clone(),
+        })
+        .collect();
+    let fan_txid = fan.compute_txid();
+    let fan_block = hub
+        .assemble_block_to_script(op_true.clone(), vec![fan])
+        .unwrap();
+    hub.accept_block(fan_block).unwrap();
+    let h = hub.tip_height().unwrap().saturating_add(1);
+    // B: 8000 one-input OP_TRUE spends. Its wave has more chunks than the
+    // pool has workers, so withdrawing it without a re-publish hangs.
+    let spends: Vec<Transaction> = (0..8000u32)
+        .map(|vout| Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: fan_txid,
+                    vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: op_true.clone(),
+            }],
+        })
+        .collect();
+    let good = hub
+        .assemble_block_to_script(op_true.clone(), spends)
+        .unwrap();
+    // A: coinbase-only (no script wave) with an overpaid coinbase. It wins
+    // the race at once, then fails the write on `bad-cb-amount`.
+    let mut bad = hub.assemble_block_to_script(op_true, vec![]).unwrap();
+    let subsidy = rbitcoin_consensus::block_subsidy(h, &hub.params) as u64;
+    bad.txdata[0].output[0].value = Amount::from_sat(subsidy.saturating_add(1));
+    bad.header.merkle_root = bad.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut bad.header);
+    assert_eq!(bad.header.prev_blockhash, good.header.prev_blockhash);
+    hub.hold_unconnected_body(good.clone());
+    let out = hub.accept_received_block(bad.clone()).unwrap();
+    assert!(matches!(out, AcceptOutcome::IgnoredWeaker), "{out:?}");
+    assert_eq!(hub.tip_hash(), Some(good.block_hash()));
+    assert!(hub.is_block_invalid(&bad.block_hash()));
+    assert!(hub.held_body(&bad.block_hash()).is_none());
+    let _ = std::fs::remove_dir_all(dir);
+}

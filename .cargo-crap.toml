@@ -12,6 +12,8 @@ exclude = [
   "**/core_vectors.rs",
 ]
 allow = [
+  "ChainHub::accept_incoming",
+  "ChainHub::held_heavier_branch",
   "NodeConfig::apply_kv",
   "TxTable::open_seqsigwit",
   "UringSession::submit_and_wait_one",
@@ -22,5 +24,6 @@ allow = [
   "eval_script",
   "ibd_cancellable",
   "pread_batch_on_session_inner",
+  "run_pair_loads",
   "run_p2p",
 ]

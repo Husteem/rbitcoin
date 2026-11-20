@@ -68,6 +68,92 @@ pub struct Wave {
     pub apply: Apply,
     pub done: Mutex<bool>,
     pub done_cv: Condvar,
+    /// Equal-work tip partner. While the partner still has an unclaimed
+    /// chunk, this wave may hold at most half the pool. `Weak` avoids an
+    /// `Arc` cycle; the publisher links and unlinks both sides.
+    pub pair: Mutex<Option<std::sync::Weak<Wave>>>,
+    /// Fast path: false means an unlinked wave never locks `pair`.
+    pub pair_capped: AtomicBool,
+    /// A held wave (`start_for_each_owned_held`) is not visible to workers
+    /// until published; `Drop` must not wait for claims that can never run.
+    pub published: AtomicBool,
+}
+
+/// Worker count the pool started, for the tip-pair half cap. Set once.
+#[doc(hidden)]
+pub static SCRIPT_WORKERS: OnceLock<usize> = OnceLock::new();
+
+#[doc(hidden)]
+pub fn script_workers() -> usize {
+    if let Some(n) = SCRIPT_WORKERS.get() {
+        return *n;
+    }
+    let _ = workers();
+    SCRIPT_WORKERS.get().copied().unwrap_or(1).max(1)
+}
+
+/// Half the pool, rounded up. A tip pair splits it while both sides claim.
+#[doc(hidden)]
+pub fn pair_cap() -> usize {
+    script_workers().div_ceil(2)
+}
+
+/// Link two equal-work tip waves so each is capped at half the pool while
+/// the other still has claims. The caller unlinks both when the pair ends.
+#[doc(hidden)]
+pub fn link_pair(a: &Arc<Wave>, b: &Arc<Wave>) {
+    *a.pair.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(b));
+    *b.pair.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(a));
+    a.pair_capped.store(true, ModelOrdering::Release);
+    b.pair_capped.store(true, ModelOrdering::Release);
+}
+
+/// Clear the pair on both sides. Safe to call twice. A `half_cap` already
+/// set on one side stays.
+#[doc(hidden)]
+pub fn unlink_pair(a: &Arc<Wave>, b: &Arc<Wave>) {
+    *a.pair.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    *b.pair.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    a.pair_capped.store(false, ModelOrdering::Release);
+    b.pair_capped.store(false, ModelOrdering::Release);
+}
+
+/// Cap for `wave` if its pair partner is still claiming, else `None`.
+fn pair_cap_for(wave: &Wave) -> Option<usize> {
+    let other = wave
+        .pair
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)?;
+    other.has_unclaimed().then(pair_cap)
+}
+
+/// Charge one in-flight chunk, honouring the pair cap. Returns false when
+/// the cap is reached (the caller then tries the partner wave).
+fn charge_claim(wave: &Wave) -> bool {
+    // An unlinked wave never locks: the common IBD path stays one atomic.
+    if !wave.pair_capped.load(ModelOrdering::Acquire) {
+        wave.in_wave.fetch_add(1, ModelOrdering::AcqRel);
+        return true;
+    }
+    let Some(cap) = pair_cap_for(wave) else {
+        wave.in_wave.fetch_add(1, ModelOrdering::AcqRel);
+        return true;
+    };
+    loop {
+        let cur = wave.in_wave.load(ModelOrdering::Acquire);
+        if cur >= cap {
+            return false;
+        }
+        if wave
+            .in_wave
+            .compare_exchange(cur, cur + 1, ModelOrdering::AcqRel, ModelOrdering::Acquire)
+            .is_ok()
+        {
+            return true;
+        }
+    }
 }
 
 impl Wave {
@@ -89,7 +175,9 @@ impl Wave {
         // `in_wave` before `next`. `next` is the release, and `is_complete`
         // acquire-loads it, so that load sees this increment. A relaxed
         // `next` can become visible first and look like the claim finished.
-        wave.in_wave.fetch_add(1, ModelOrdering::AcqRel);
+        if !charge_claim(wave) {
+            return None;
+        }
         let hold = InWave {
             wave: Arc::clone(wave),
         };
@@ -333,7 +421,11 @@ impl<T: Sync> OwnedWave<T> {
 
 impl<T: Sync> Drop for OwnedWave<T> {
     fn drop(&mut self) {
-        self.wave.wait_done();
+        // A held wave never reached a worker; `next < n` there is not a
+        // claim to wait for.
+        if self.wave.published.load(ModelOrdering::Acquire) {
+            self.wave.wait_done();
+        }
         unpublish_fg(&self.wave);
     }
 }
@@ -386,6 +478,40 @@ pub fn start_for_each_pooled<T: Sync>(
     start_wave(items, f, chunk, false, false)
 }
 
+/// Like [`start_for_each_owned`] but do **not** publish yet. A tip pair
+/// links both waves (and caps them) before the first wake, then calls
+/// [`publish_owned`].
+#[doc(hidden)]
+pub fn start_for_each_owned_held<T: Sync>(
+    items: Vec<T>,
+    f: fn(&T) -> Result<(), ConsensusError>,
+    keep_faults: bool,
+) -> Result<Option<OwnedWave<T>>, ConsensusError> {
+    start_wave_inner(items, f, STEAL_CHUNK, true, keep_faults, false)
+}
+
+/// Publish a wave created with [`start_for_each_owned_held`] and wake the
+/// steal workers.
+#[doc(hidden)]
+pub fn publish_owned<T: Sync>(owned: &OwnedWave<T>) {
+    publish_wave(&owned.wave);
+}
+
+/// Publish one wave, or re-publish a loser a promotion still needs. The
+/// second publish is a no-op if the wave is already in the list.
+#[doc(hidden)]
+pub fn publish_wave(wave: &Arc<Wave>) {
+    wave.published.store(true, ModelOrdering::Release);
+    let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
+    if g.iter().any(|w| Arc::ptr_eq(w, wave)) {
+        return;
+    }
+    g.push(Arc::clone(wave));
+    publish_waves(&g);
+    drop(g);
+    wake_steal_workers();
+}
+
 #[doc(hidden)]
 pub fn start_wave<T: Sync>(
     items: Vec<T>,
@@ -393,6 +519,18 @@ pub fn start_wave<T: Sync>(
     chunk: usize,
     inline_single: bool,
     keep_faults: bool,
+) -> Result<Option<OwnedWave<T>>, ConsensusError> {
+    start_wave_inner(items, f, chunk, inline_single, keep_faults, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_wave_inner<T: Sync>(
+    items: Vec<T>,
+    f: fn(&T) -> Result<(), ConsensusError>,
+    chunk: usize,
+    inline_single: bool,
+    keep_faults: bool,
+    publish: bool,
 ) -> Result<Option<OwnedWave<T>>, ConsensusError> {
     if on_steal_worker() {
         return Err(ConsensusError::BadBlock(
@@ -433,13 +571,18 @@ pub fn start_wave<T: Sync>(
         },
         done: Mutex::new(false),
         done_cv: Condvar::new(),
+        pair: Mutex::new(None),
+        pair_capped: AtomicBool::new(false),
+        published: AtomicBool::new(false),
     });
-    {
+    if publish {
+        wave.published.store(true, ModelOrdering::Release);
         let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
         g.push(Arc::clone(&wave));
         publish_waves(&g);
+        drop(g);
+        wake_steal_workers();
     }
-    wake_steal_workers();
     Ok(Some(OwnedWave {
         _items: items,
         _ctx: ctx,
@@ -611,6 +754,7 @@ pub fn workers() -> &'static ScriptWorkers {
             .map(|p| p.get())
             .unwrap_or(4)
             .max(1);
+        let _ = SCRIPT_WORKERS.set(n);
         let mut threads = Vec::with_capacity(n);
         let mut handles = Vec::with_capacity(n);
         for i in 0..n {
@@ -843,4 +987,91 @@ where
         let _ = tx.send(work());
     });
     rx.recv().ok()
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use super::*;
+
+    fn test_wave(n: usize) -> Arc<Wave> {
+        unsafe fn noop(_: *const (), _: usize) -> Result<(), crate::ConsensusError> {
+            Ok(())
+        }
+        Arc::new(Wave {
+            n,
+            chunk: 1,
+            next: crate::sync::atomic::AtomicUsize::new(0),
+            in_wave: crate::sync::atomic::AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+            first_err: Mutex::new(None),
+            keep_faults: AtomicBool::new(false),
+            faults: Mutex::new(Vec::new()),
+            apply: Apply {
+                f: noop,
+                ctx: std::ptr::null(),
+            },
+            done: Mutex::new(false),
+            done_cv: Condvar::new(),
+            pair: Mutex::new(None),
+            pair_capped: AtomicBool::new(false),
+            published: AtomicBool::new(true),
+        })
+    }
+
+    /// A tip pair splits the pool while both sides claim, and the survivor is
+    /// uncapped the moment the other has no unclaimed chunk. Not published:
+    /// this only exercises `claim_chunk`'s cap, not the workers.
+    #[test]
+    fn pair_cap_halves_and_lifts_when_the_other_side_drains() {
+        let _gate = steal_test_gate();
+        let a = test_wave(10_000);
+        let b = test_wave(10_000);
+        link_pair(&a, &b);
+        let cap = pair_cap();
+        assert!(cap >= 1);
+        let mut held = Vec::new();
+        for _ in 0..cap {
+            held.push(Wave::claim_chunk(&a).expect("claim under the cap"));
+        }
+        assert!(
+            Wave::claim_chunk(&a).is_none(),
+            "a is capped while b still claims"
+        );
+        for _ in 0..cap {
+            held.push(Wave::claim_chunk(&b).expect("b claim under the cap"));
+        }
+        assert!(Wave::claim_chunk(&b).is_none(), "b is capped against a");
+        a.failed.store(true, Ordering::Release);
+        for _ in 0..cap {
+            held.push(Wave::claim_chunk(&b).expect("uncapped after a drains"));
+        }
+        assert!(
+            Wave::claim_chunk(&b).is_some(),
+            "the survivor takes every worker"
+        );
+        unlink_pair(&a, &b);
+        assert!(Wave::claim_chunk(&b).is_some(), "unlinked is uncapped");
+    }
+
+    /// A wave withheld for the winner's write must finish once a promotion
+    /// re-publishes it; otherwise `wait_done` waits for chunks no worker can
+    /// claim.
+    #[test]
+    fn republish_lets_an_unpublished_wave_finish() {
+        let _gate = steal_test_gate();
+        let wave = test_wave(10_000);
+        publish_wave(&wave);
+        unpublish_fg(&wave);
+        publish_wave(&wave);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let w = Arc::clone(&wave);
+        std::thread::spawn(move || {
+            w.wait_done();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "a re-published wave must let wait_done finish"
+        );
+    }
 }

@@ -171,7 +171,9 @@ Two layers:
 # Layer 1 — candidate ranking (headers only)
 prefer A over B iff chain work at A's tip > chain work at B's tip
   (fork-point chain work + header work along the branch)
-  and no apply-path hash is invalid-marked; equal work keeps the first seen
+  and no apply-path hash is invalid-marked; equal work keeps the first seen,
+  except that two equal-work siblings already held for the same parent are
+  scripted together and the first fully validated is connected
 
 # Layer 2 — most-work *valid* (full blocks)
 connect block by block. On fail: mark the block invalid; keep the connected

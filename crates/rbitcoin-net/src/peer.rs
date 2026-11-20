@@ -184,11 +184,8 @@ pub fn maybe_select_hb_if_relay(hub: &ChainHub, session: Option<&crate::peers::L
 }
 
 #[doc(hidden)]
-pub fn note_accepted_hb(
-    r: &Result<AcceptOutcome, NetError>,
-    hb: &Option<(std::sync::Arc<crate::peers::PeerHub>, u64)>,
-) {
-    if matches!(r, Ok(AcceptOutcome::Accepted { .. })) {
+pub fn note_accepted_hb(accepted: bool, hb: &Option<(std::sync::Arc<crate::peers::PeerHub>, u64)>) {
+    if accepted {
         if let Some((ph, id)) = hb {
             if ph.get(*id).is_some_and(|s| ph.session_is_trusted_peer(&s)) {
                 return;
@@ -214,12 +211,26 @@ pub async fn accept_received_from_peer(
     // before the wait so a caller that moves time once it sees the tip does
     // not extend the post-block ping grace.
     let received_at = session.map(|s| s.clock_now());
+    // Park the body before the lane job so an equal-work sibling that runs
+    // first can race it (T1). A connect removes it; a loser stays held.
+    let was_held = hub.held_body(&announced).is_some();
+    let was_connected = hub.is_connected(&announced);
+    let block = std::sync::Arc::new(block);
+    hub.hold_body(std::sync::Arc::clone(&block), waive);
     let r = if let Some(hub) = hub.shared_arc() {
         crate::tip_accept::run_on_tip_accept_async(move || {
-            let r = hub.accept_received_on_lane(block, waive);
+            let r = hub.accept_received_arc_on_lane(block, waive);
             start_relay_after_tip_connect(&hub, peers.as_deref());
             let chosen = if compact_blocks_ok(&hub) { hb } else { None };
-            note_accepted_hb(&r, &chosen);
+            let credited = match &r {
+                Ok(AcceptOutcome::Accepted { .. }) => true,
+                // The pair can connect this hash before its own job runs.
+                // Credit the delivery that got it connected, not a later
+                // duplicate of an already-connected block.
+                Ok(AcceptOutcome::AlreadyHave) => !was_connected && hub.is_connected(&announced),
+                _ => false,
+            };
+            note_accepted_hb(credited, &chosen);
             r
         })
         .await
@@ -227,17 +238,33 @@ pub async fn accept_received_from_peer(
         // A stack hub (unit tests) has no `Arc`. Join before return so the
         // borrow outlives the job.
         crate::tip_accept::run_on_tip_accept(|| {
-            let r = hub.accept_received_on_lane(block, waive);
+            let r = hub.accept_received_arc_on_lane(block.clone(), waive);
             start_relay_after_tip_connect(hub, peers.as_deref());
             let chosen = if compact_blocks_ok(hub) { hb } else { None };
-            note_accepted_hb(&r, &chosen);
+            let credited = match &r {
+                Ok(AcceptOutcome::Accepted { .. }) => true,
+                // The pair can connect this hash before its own job runs.
+                // Credit the delivery that got it connected, not a later
+                // duplicate of an already-connected block.
+                Ok(AcceptOutcome::AlreadyHave) => !was_connected && hub.is_connected(&announced),
+                _ => false,
+            };
+            note_accepted_hb(credited, &chosen);
             r
         })
     };
+    if matches!(r, Err(NetError::Store(_))) && !was_held {
+        hub.drop_held(announced);
+    }
     if drop_servable_after_accept(hub, &announced, &r) {
         hub.cache.drop_servable(&announced);
     }
-    if let (Some(s), Some(at), Ok(AcceptOutcome::Accepted { .. })) = (session, received_at, &r) {
+    let credited = match &r {
+        Ok(AcceptOutcome::Accepted { .. }) => true,
+        Ok(AcceptOutcome::AlreadyHave) => !was_connected && hub.is_connected(&announced),
+        _ => false,
+    };
+    if let (Some(s), Some(at), true) = (session, received_at, credited) {
         s.note_last_block_at(at);
     }
     r
@@ -8260,6 +8287,15 @@ pub async fn on_block(
     admit_pending_header(&mut follow.pending_headers, hash, block.header);
     if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
         follow.pending_blocks.insert(hash, block.clone());
+        return Ok(());
+    }
+    // T2: a body already marked invalid costs no lane slot and is not
+    // re-announced. Placed after the header/PoW checks so a bad-proof-of-work
+    // header still scores the peer. No ban here: the sender may not know.
+    if hub.is_block_invalid(&hash) {
+        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        hub.drop_held(hash);
+        hub.forget_asked_block(&hash);
         return Ok(());
     }
     relay_new_pow_valid_block(hub, block, session).await;

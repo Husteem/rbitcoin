@@ -77,7 +77,7 @@ use phases::{assemble_run, Assembled};
 pub use pin::ensure_spend_abs_layouts;
 #[doc(hidden)]
 pub use pin::{collect_spend_abs_after_fill, pin_for_wire_batch};
-pub use scripts::{confirm_scripts_phase, drive_script_waves_with};
+pub use scripts::{confirm_scripts_phase, drive_script_waves_with, Inflight};
 pub use write::finish_post_commit;
 pub use write::{
     confirm_write_phase, confirm_write_phase_or_return, finish_post_commit_hashes,
@@ -340,7 +340,10 @@ pub fn confirm_wire_run_preverified(
         let stamped = confirm_wire_lookup_stamp(query, params, milestone, blocks, None)?;
         let mat =
             confirm_wire_load_from_plan(query, params, milestone, stamped, None, preverified)?;
-        let ok = confirm_scripts_phase(mat.batch)?;
+        // Tip path: hold the index wave until scripts pass, so a rejected
+        // block never spends index work.
+        let inf = Inflight::start_deferred_index(mat.batch, 0).map_err(|(e, _)| e)?;
+        let (ok, _) = inf.finish()?;
         confirm_write_phase(query, params, milestone, ok.batch)
     })();
     // Flag-off never drains: that allocates on the valid-block path.
@@ -353,12 +356,381 @@ pub fn confirm_wire_run_preverified(
     result
 }
 
+/// Two equal-work tip candidates, scripted together: the first to pass strict
+/// scripts and commit is the tip; the other is reported as the loser.
+pub struct PairRun {
+    /// Index of the candidate that won (0 = first argument).
+    pub winner: usize,
+    pub fks: Vec<rbitcoin_primitives::Fk>,
+    /// Hash of the candidate that did not win.
+    pub loser: [u8; 32],
+    /// The loser's failure when it failed rather than losing the race.
+    pub loser_error: Option<ConfirmError>,
+}
+
+/// The pair failed. `error`/`hash` is the preferred candidate's failure, or a
+/// local fault that must surface. `other` is the sibling's failure when it
+/// also failed, so the caller can mark it separately.
+pub struct PairFailure {
+    pub error: ConfirmError,
+    pub hash: [u8; 32],
+    pub other: Option<(ConfirmError, [u8; 32])>,
+}
+
+fn ordered_failure(
+    win_idx: usize,
+    win: (ConfirmError, [u8; 32]),
+    lose: (ConfirmError, [u8; 32]),
+) -> Box<PairFailure> {
+    Box::new(if win_idx == 0 {
+        PairFailure {
+            error: win.0,
+            hash: win.1,
+            other: Some(lose),
+        }
+    } else {
+        PairFailure {
+            error: lose.0,
+            hash: lose.1,
+            other: Some(win),
+        }
+    })
+}
+
+fn preferred_failure(
+    a: (ConfirmError, [u8; 32]),
+    b: Option<(ConfirmError, [u8; 32])>,
+) -> Box<PairFailure> {
+    Box::new(PairFailure {
+        error: a.0,
+        hash: a.1,
+        other: b,
+    })
+}
+
+/// Puts a withdrawn loser back in the pool if the winner's write unwinds
+/// before the loser is cancelled or republished.
+struct RePublishLoser<'a>(&'a Arc<rbitcoin_consensus::script_pool::Wave>);
+
+impl Drop for RePublishLoser<'_> {
+    fn drop(&mut self) {
+        if !self.0.failed.load(std::sync::atomic::Ordering::Acquire) {
+            rbitcoin_consensus::script_pool::publish_wave(self.0);
+        }
+    }
+}
+
+fn pair_load(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    block: &WireBlockIn,
+    pre: &ScriptPreverified,
+) -> Result<LoadedBatch, ConfirmError> {
+    let stamped = lookup::confirm_wire_lookup_stamp_no_plan(
+        query,
+        params,
+        milestone,
+        std::slice::from_ref(block),
+        None,
+    )?;
+    Ok(confirm_wire_load_from_plan(query, params, milestone, stamped, None, pre)?.batch)
+}
+
+/// Finish scripts, publish the deferred index wave, clear the pair's
+/// parent-cache slot, and write. The loser is unpublished before this call,
+/// so the index wave is the only tip wave in the pool. `phase` is the hub's
+/// script flag: readers stop skipping the RPC wait once the write starts.
+#[allow(clippy::too_many_arguments)]
+fn pair_write_started(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    height: u32,
+    inf: Inflight,
+    phase: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Vec<rbitcoin_primitives::Fk>, ConfirmError> {
+    let mut inf = inf.finish_scripts()?;
+    inf.start_index()?;
+    let (ok, _) = inf.finish_index()?;
+    // Neither candidate may be left as this height's parent plan: the store
+    // has the winner after the write, and `assemble_parent_mtp_and_bits`
+    // reads the cache before the store.
+    query.confirm_parent_cache().clear_height(height);
+    if let Some(flag) = phase {
+        flag.store(false, std::sync::atomic::Ordering::Release);
+    }
+    confirm_write_phase(query, params, milestone, ok.batch)
+}
+
+fn note_pair_loser(run: PairRun) -> PairRun {
+    if let Some(e) = &run.loser_error {
+        rbitcoin_log::debug!(
+            "tip pair: {} lost: {e}",
+            bitcoin::BlockHash::from_byte_array(run.loser)
+        );
+    }
+    run
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pair_loads(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    a_in: &WireBlockIn,
+    a_pre: &ScriptPreverified,
+    b_in: &WireBlockIn,
+    b_pre: &ScriptPreverified,
+    a: LoadedBatch,
+    b: LoadedBatch,
+    phase: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<PairRun, Box<PairFailure>> {
+    use rbitcoin_consensus::script_pool::{link_pair, unlink_pair};
+    let height = a.prepared.first().map(|p| p.height.0).unwrap_or(0);
+    let hash_a = a.prepared.first().map(|p| p.hash).unwrap_or([0; 32]);
+    let hash_b = b.prepared.first().map(|p| p.hash).unwrap_or([0; 32]);
+    // A start can fail without a wave: a batch with exactly one script job
+    // runs it inline. Handle that per candidate, never as the pair's error.
+    let started_a = Inflight::start_deferred_index_held(a, 0);
+    let started_b = Inflight::start_deferred_index_held(b, 0);
+    let (a, b) = match (started_a, started_b) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Ok(a), Err((e, _))) => {
+            a.publish_scripts();
+            return match pair_write_started(query, params, milestone, height, a, phase) {
+                Ok(fks) => Ok(note_pair_loser(PairRun {
+                    winner: 0,
+                    fks,
+                    loser: hash_b,
+                    loser_error: Some(e),
+                })),
+                Err(ea) => Err(preferred_failure((ea, hash_a), Some((e, hash_b)))),
+            };
+        }
+        (Err((e, _)), Ok(b)) => {
+            b.publish_scripts();
+            return match pair_write_started(query, params, milestone, height, b, phase) {
+                Ok(fks) => Ok(note_pair_loser(PairRun {
+                    winner: 1,
+                    fks,
+                    loser: hash_a,
+                    loser_error: Some(e),
+                })),
+                Err(eb) => Err(preferred_failure((e, hash_a), Some((eb, hash_b)))),
+            };
+        }
+        (Err((ea, _)), Err((eb, _))) => {
+            return Err(preferred_failure((ea, hash_a), Some((eb, hash_b))));
+        }
+    };
+    let (wa, wb) = (a.script_wave_arc(), b.script_wave_arc());
+    let paired = match (&wa, &wb) {
+        (Some(x), Some(y)) => {
+            link_pair(x, y);
+            true
+        }
+        _ => false,
+    };
+    // Publish only after the link: a wave woken before `pair` is set would
+    // take a full pool of chunks.
+    a.publish_scripts();
+    b.publish_scripts();
+    // First strict script verdict wins. Both ready prefers `a`. The pool
+    // unparks a registered publisher when a wave completes; register this
+    // thread so the wait is event-driven, not a poll.
+    struct PairPublisher;
+    impl Drop for PairPublisher {
+        fn drop(&mut self) {
+            rbitcoin_consensus::script_pool::set_script_publisher(None);
+        }
+    }
+    rbitcoin_consensus::script_pool::set_script_publisher(Some(std::thread::current()));
+    let _publisher = PairPublisher;
+    let first = loop {
+        if a.script_is_complete() {
+            break 0usize;
+        }
+        if b.script_is_complete() {
+            break 1usize;
+        }
+        std::thread::park();
+    };
+    if paired {
+        if let (Some(x), Some(y)) = (&wa, &wb) {
+            unlink_pair(x, y);
+        }
+    }
+    let (win, lose, win_idx) = if first == 0 { (a, b, 0) } else { (b, a, 1) };
+    let (win_hash, lose_hash) = if win_idx == 0 {
+        (hash_a, hash_b)
+    } else {
+        (hash_b, hash_a)
+    };
+    let (lose_in, lose_pre) = if win_idx == 0 {
+        (b_in, b_pre)
+    } else {
+        (a_in, a_pre)
+    };
+    let lose_wave = lose.script_wave_arc();
+    match win.finish_scripts() {
+        Ok(win) => {
+            // Stop the loser from claiming through the winner's index and
+            // write without cancelling the verdicts a promotion may reuse.
+            // The guard re-publishes it on a panic before `cancel_scripts`.
+            let _republish = lose_wave.as_ref().map(|w| {
+                rbitcoin_consensus::script_pool::unpublish_fg(w);
+                RePublishLoser(w)
+            });
+            match pair_write_started(query, params, milestone, height, win, phase) {
+                Ok(fks) => {
+                    lose.cancel_scripts();
+                    Ok(note_pair_loser(PairRun {
+                        winner: win_idx,
+                        fks,
+                        loser: lose_hash,
+                        loser_error: None,
+                    }))
+                }
+                Err(e) => {
+                    // The winner may have appended Class A, so the loser's
+                    // plan base moved. Keep the verdicts that already ran and
+                    // re-stamp with them skipped. Re-publish the loser first:
+                    // it was withheld from the pool for the winner's write,
+                    // so its remaining chunks can never be claimed otherwise.
+                    if let Some(w) = &lose_wave {
+                        rbitcoin_consensus::script_pool::publish_wave(w);
+                    }
+                    if let Some(flag) = phase {
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    let promoted = (|| {
+                        let pre = match lose.finish_scripts() {
+                            Ok(lose) => {
+                                let mut pre = lose_pre.clone();
+                                if !lose.batch.trust_peer {
+                                    for p in &lose.batch.prepared {
+                                        pre.extend(p.txids.iter().copied());
+                                    }
+                                }
+                                pre
+                            }
+                            Err(e2) => return Err(e2),
+                        };
+                        let re = pair_load(query, params, milestone, lose_in, &pre)?;
+                        let inf = Inflight::start_deferred_index(re, 0).map_err(|(e2, _)| e2)?;
+                        pair_write_started(query, params, milestone, height, inf, phase)
+                    })();
+                    match promoted {
+                        Ok(fks) => Ok(note_pair_loser(PairRun {
+                            winner: 1 - win_idx,
+                            fks,
+                            loser: win_hash,
+                            loser_error: Some(e),
+                        })),
+                        Err(e2) => Err(ordered_failure(win_idx, (e, win_hash), (e2, lose_hash))),
+                    }
+                }
+            }
+        }
+        Err(e) => match pair_write_started(query, params, milestone, height, lose, phase) {
+            Ok(fks) => Ok(note_pair_loser(PairRun {
+                winner: 1 - win_idx,
+                fks,
+                loser: win_hash,
+                loser_error: Some(e),
+            })),
+            Err(e2) => Err(ordered_failure(win_idx, (e, win_hash), (e2, lose_hash))),
+        },
+    }
+}
+
+/// Lookup, load, script, and write two equal-work candidates. Both script
+/// waves are published together and capped at half the pool while the other
+/// still claims. The first to pass strict scripts and commit is the tip.
+#[allow(clippy::too_many_arguments)]
+pub fn confirm_wire_run_pair_preverified(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    a: &WireBlockIn,
+    a_pre: &ScriptPreverified,
+    b: &WireBlockIn,
+    b_pre: &ScriptPreverified,
+    phase: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<PairRun, Box<PairFailure>> {
+    let hash_a = a.1.block_hash().to_byte_array();
+    let hash_b = b.1.block_hash().to_byte_array();
+    let trust = confirm_waive(query);
+    let guard = trust.then(rbitcoin_consensus::TrustCollect::enter);
+    let result = (|| {
+        let la = pair_load(query, params, milestone, a, a_pre);
+        let lb = pair_load(query, params, milestone, b, b_pre);
+        match (la, lb) {
+            (Ok(x), Ok(y)) => {
+                run_pair_loads(query, params, milestone, a, a_pre, b, b_pre, x, y, phase)
+            }
+            (Ok(x), Err(e)) => {
+                let height = x.prepared.first().map(|p| p.height.0).unwrap_or(0);
+                let inf = match Inflight::start_deferred_index(x, 0) {
+                    Ok(inf) => inf,
+                    Err((e2, _)) => return Err(preferred_failure((e2, hash_a), Some((e, hash_b)))),
+                };
+                match pair_write_started(query, params, milestone, height, inf, phase) {
+                    Ok(fks) => {
+                        let run = PairRun {
+                            winner: 0,
+                            fks,
+                            loser: hash_b,
+                            loser_error: Some(e),
+                        };
+                        Ok(note_pair_loser(run))
+                    }
+                    Err(ea) => Err(preferred_failure((ea, hash_a), Some((e, hash_b)))),
+                }
+            }
+            (Err(e), Ok(y)) => {
+                let height = y.prepared.first().map(|p| p.height.0).unwrap_or(0);
+                let inf = match Inflight::start_deferred_index(y, 0) {
+                    Ok(inf) => inf,
+                    Err((e2, _)) => return Err(preferred_failure((e, hash_a), Some((e2, hash_b)))),
+                };
+                match pair_write_started(query, params, milestone, height, inf, phase) {
+                    Ok(fks) => {
+                        let run = PairRun {
+                            winner: 1,
+                            fks,
+                            loser: hash_a,
+                            loser_error: Some(e),
+                        };
+                        Ok(note_pair_loser(run))
+                    }
+                    Err(eb) => Err(preferred_failure((e, hash_a), Some((eb, hash_b)))),
+                }
+            }
+            (Err(ea), Err(eb)) => Err(preferred_failure((ea, hash_a), Some((eb, hash_b)))),
+        }
+    })();
+    if trust {
+        let warns = rbitcoin_consensus::drain_warnings();
+        let stop_at = rbitcoin_consensus::current_block_height();
+        drop(guard);
+        let blocks = [a.clone(), b.clone()];
+        log_trust_block_faults(
+            &blocks,
+            &warns,
+            result.as_ref().err().map(|f| &f.error),
+            stop_at,
+        );
+    }
+    result
+}
+
 thread_local! {
     /// This thread opted into warn-and-apply for the batch it is confirming.
     /// Default is off. [`Query::trust_peer`] does not set it.
     static WAIVE: Cell<bool> = const { Cell::new(false) };
 }
-
 /// Waiver for this confirm. One cell read. The mode bit is not consulted.
 pub fn confirm_waive(_query: &Query) -> bool {
     WAIVE.with(|c| c.get())
