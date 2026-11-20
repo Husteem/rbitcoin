@@ -387,13 +387,8 @@ pub fn stamp_parent_pin_archived(
     // Identities are stamped from wire prev_txid at insert time — never soft-fill
     // from txid.body here (that would be a dual path after lookup promised identity).
     if skeleton.is_none() {
-        crate::fill_missing_parent_ranges(
-            query.store(),
-            ifo,
-            &mut stamp.idents,
-            query.confirm_stats(),
-        )
-        .map_err(ConfirmError::from)?;
+        crate::fill_missing_parent_ranges(query.store(), ifo, &mut stamp.idents)
+            .map_err(ConfirmError::from)?;
     } else {
         // The IBD skeleton carries external ranges. A parent with no body is
         // an archived create: this batch's own, or an earlier chunk's of the
@@ -401,7 +396,7 @@ pub fn stamp_parent_pin_archived(
         // range. In-flight pins are skipped inside the fill.
         let mut archived: U64Map<crate::ParentIdent> =
             stamp.idents.extract_if(|_, e| e.body.is_none()).collect();
-        crate::fill_missing_parent_ranges(query.store(), ifo, &mut archived, query.confirm_stats())
+        crate::fill_missing_parent_ranges(query.store(), ifo, &mut archived)
             .map_err(ConfirmError::from)?;
         stamp.idents.extend(archived);
     }

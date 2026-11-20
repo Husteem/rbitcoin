@@ -281,8 +281,7 @@ pub fn apply_archive_plan(
 /// same stage before structural/annotate — single ordered commit era.
 /// **Class A never leads tip** (no dual-track archive-ahead / body DONTNEED lead).
 ///
-/// Accrues window timers on [`Query::confirm_stats`] and snapshots the last batch
-/// for slow-write logs via [`crate::ConfirmStats::last_write_phases`].
+/// Accrues window timers on [`Query::confirm_stats`].
 pub fn confirm_write_phase(
     query: &Query,
     params: &ChainParams,
@@ -347,8 +346,6 @@ fn write_phase_inner(
     }
     annotate_pending_spends(query)?;
 
-    let t_wall = Instant::now();
-
     let ArchivePlanNs {
         pins: write_create_pins,
         header_ranges,
@@ -385,9 +382,7 @@ fn write_phase_inner(
     let drain_max_fk = queued.iter().filter_map(|(_, fk)| fk.get()).max();
 
     let overlap = (|| -> Result<_, ConfirmError> {
-        // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
-        let t_struct = Instant::now();
-        let (struct_ph, mut slots) = WRITE_REUSE.with(|reuse| {
+        let mut slots = WRITE_REUSE.with(|reuse| {
             structural_run(
                 query,
                 params,
@@ -399,7 +394,6 @@ fn write_phase_inner(
                 &mut reuse.borrow_mut(),
             )
         })?;
-        let structural_ns = t_struct.elapsed().as_nanos() as u64;
         push_same_block_spends(query, &batch.prepared, &appended, &mut slots)?;
 
         let n_blocks = batch.prepared.len();
@@ -451,28 +445,18 @@ fn write_phase_inner(
             crate::note_confirm(&query.confirm_stats().blockfilter_ns, idx_put_ns);
         }
 
-        let spend_ann_ns = {
-            // Historical slots are a directory insert. The tail page is one
-            // append, not a random sweep, so this does not take the spindle.
-            spindle_mark("ann-begin");
-            let ns = post_commit(query, &slots)?;
-            spindle_mark("ann-end");
-            ns
-        };
+        // Historical slots are a directory insert. The tail page is one
+        // append, not a random sweep, so this does not take the spindle.
+        spindle_mark("ann-begin");
+        post_commit(query, &slots)?;
+        spindle_mark("ann-end");
         if let Some(token) = pending_token {
             query.store().clear_spend_annotate_pending(token);
         }
         if let Some(tip) = query.tip_height() {
             query.store().note_spend_snapshot(tip.0);
         }
-        Ok((
-            out,
-            n_blocks,
-            structural_ns,
-            struct_ph,
-            class_c_ns,
-            spend_ann_ns,
-        ))
+        Ok((out, n_blocks))
     })();
 
     let drain_res = insert_queued(query, queued);
@@ -484,7 +468,7 @@ fn write_phase_inner(
         (Ok(_), Some(fk)) => query.note_head_drain_fk(fk),
         (Ok(_), None) | (Err(_), _) => {}
     }
-    let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns) = match overlap {
+    let (out, n_blocks) = match overlap {
         Ok(v) => v,
         Err(e) => {
             // Success stores these inside `class_c_commit` after the same join.
@@ -501,20 +485,6 @@ fn write_phase_inner(
         query.prune_write_create_loc(h);
     }
     crate::note_confirm(&query.confirm_stats().phase_blocks, n_blocks as u64);
-    query
-        .confirm_stats()
-        .note_last_write(crate::LastWritePhases {
-            n_blocks: n_blocks as u32,
-            wall_ns: t_wall.elapsed().as_nanos() as u64,
-            class_a_ns,
-            ensure_ns,
-            structural_ns,
-            spent_ns: struct_ph.spent_ns,
-            create_h_ns: struct_ph.create_h_ns,
-            bip68_ns: struct_ph.bip68_ns,
-            class_c_ns,
-            spend_ann_ns,
-        });
     Ok(out)
 }
 

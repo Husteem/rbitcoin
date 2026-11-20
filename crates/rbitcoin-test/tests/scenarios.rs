@@ -2838,17 +2838,6 @@ fn three_stage_confirm_and_parent_pin_surface() {
     assert!(q.is_outpoint_spent(cb1.as_byte_array(), 0).unwrap());
     pin_txstat_rows_after_write(&q, &run, spend_h);
 
-    let write = q.confirm_stats().last_write_phases();
-    assert!(
-        write.n_blocks as usize >= run.len(),
-        "write meter must name the batch: {write:?}"
-    );
-    assert!(write.wall_ns > 0, "write wall must move: {write:?}");
-    let pin = q.confirm_stats().last_pin_phases();
-    assert!(
-        pin.pin_plan_n > 0 || pin.pin_new_n > 0,
-        "load pin meter must move: {pin:?}"
-    );
     let w = q.confirm_stats().take_window();
     assert!(
         w.phase_blocks >= run.len() as u64,

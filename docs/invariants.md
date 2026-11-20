@@ -176,7 +176,7 @@ packs at/above the leaving **pack** height **before** the next bind.
 | `plan_inflight_creates_only_fills_parent_body_range` / `plan_inflight_creates_only_ibd_skeleton_miss_does_not_loc_fill` / `pin_creates_only_ibd_skeleton_miss_is_lookup_stage_miss` | leftover creates-only still stamps body_range; IBD skeleton miss does not loc-fill; pin of that miss is lookup stage miss |
 | `optimistic_assemble_unstamped_parent_is_invariant` | Optimistic assemble: pin miss is lookup invariant, not head recover |
 | `parent_pin_stamp_take_from_plan_moves_maps` | S0 `take_from_plan` leaves `resolved` empty (no txid→fk invert) |
-| `plan_batch_one_fill_missing_when_parents_already_stamped` | one `fill_missing_parent_ranges` when packed adds no new fks |
+| `plan_batch_binds_loc_when_parents_already_stamped` | stamped parent keeps its body and spent range when packed adds no new fks |
 | `direct_write_skips_create_pin_map_idx_without_recent` | Direct mode: height-1 coinbase resolves by txid and `tx_body_range` is a nonzero Class A body range |
 | `pin_takes_stamp_parent_vouts` / `plan_batch_same_header_vouts_skipped_cross_height_pinned` | pin takes stamp vouts; same-header creates not pinned |
 | `ibd_confirm_pin_fault` | IBD load: child spend of just-written pack (187); same-wave intervening writes (496); later-wave intervening write still has InFlight so TipOnly loc must ride the stamp (905); lookup-ahead child wave (133433) |

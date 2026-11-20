@@ -1768,7 +1768,6 @@ fn fill_stamp_spent_hole_from_write_tls() {
     };
     use rbitcoin_query::{stamp_external_parents, BatchParentIds, BatchParents, InFlight};
     use rbitcoin_store::OutputRecord;
-    use std::sync::atomic::Ordering;
 
     let (path, q) = tiny_query();
     let parent_pin = rbitcoin_query::CreatePinInner::records(
@@ -1792,7 +1791,6 @@ fn fill_stamp_spent_hole_from_write_tls() {
         .unwrap();
     let mut inflight = InFlight::new();
     inflight.note_pins([(fks[0], &parent_pin)], Some(360));
-    let _ = q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed);
     let st = stamp_external_parents(
         q.store(),
         &[parent_pin.tx().txid],
@@ -1804,7 +1802,6 @@ fn fill_stamp_spent_hole_from_write_tls() {
     let id = fks[0].get().expect("fk");
     let ident = st.idents.get(&id).expect("ident");
     assert_eq!(ident.spent, None, "IBD stamp must not loc-by-fk");
-    assert_eq!(q.confirm_stats().fill_missing_n.load(Ordering::Relaxed), 0);
 
     q.set_lookup_started_hi(Some(133_433));
     q.note_write_create_loc(&fks, &loc, 360);
@@ -2567,12 +2564,13 @@ fn pin_range_fill_does_not_count_as_cache_hit() {
 
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
+    let _ = q.confirm_stats().take_window();
     let (_parents, _) =
         pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None).expect("range-fill 3");
-    let lp = q.confirm_stats().last_pin_phases();
-    assert_eq!(lp.pin_new_n, 3);
+    let w = q.confirm_stats().take_window();
+    assert_eq!(w.pin_new, 3);
     assert_eq!(
-        lp.pin_plan_n, 0,
+        w.pin_cache_body, 0,
         "range-fills must not increment already / PIN_CACHE_BODY"
     );
     let _ = std::fs::remove_dir_all(&path);
@@ -2647,12 +2645,13 @@ fn pin_stamp_outs_is_cache_not_new() {
         "pin must use stamp-carried CreatePin"
     );
     fill_edges_from_packed(&mut plan);
+    let _ = q.confirm_stats().take_window();
     let (_parents, _) = pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None)
         .expect("stamp-carried outs must cover");
-    let lp = q.confirm_stats().last_pin_phases();
-    assert_eq!(lp.pin_plan_n, 1);
+    let w = q.confirm_stats().take_window();
+    assert_eq!(w.pin_cache_body, 1);
     assert_eq!(
-        lp.pin_new_n, 0,
+        w.pin_new, 0,
         "stamp-carried outs must count as PIN_CACHE, not PIN_NEW"
     );
     let _ = std::fs::remove_dir_all(&path);
@@ -2729,12 +2728,13 @@ fn pin_recent_identity_without_outs_still_range_fills() {
 
     let mut parent_pin = ParentPinStamp::take_from_plan(&mut plan);
     fill_edges_from_packed(&mut plan);
+    let _ = q.confirm_stats().take_window();
     let (_parents, _) = pin_for_wire_batch(&q, Some(&plan), &mut parent_pin, &[], &[], None)
         .expect("identity-only stamp still range-fills");
-    let lp = q.confirm_stats().last_pin_phases();
-    assert_eq!(lp.pin_new_n, 1);
+    let w = q.confirm_stats().take_window();
+    assert_eq!(w.pin_new, 1);
     assert_eq!(
-        lp.pin_plan_n, 0,
+        w.pin_cache_body, 0,
         "identity without outs must not count as PIN_CACHE"
     );
     let _ = std::fs::remove_dir_all(&path);
@@ -3335,14 +3335,14 @@ fn structural_run_clears_reused_scratch_between_batches() {
         )
         .expect("reused scratch still connects")
     };
-    let (_ph, slots) = run(&mut reuse);
+    let slots = run(&mut reuse);
     assert!(
         slots.abs_edges.iter().all(|e| e.0 != 999),
         "previous batch slot leaked: {:?}",
         slots.abs_edges
     );
     assert_eq!(slots.abs_edges.len(), 1);
-    let (_ph, slots2) = run(&mut reuse);
+    let slots2 = run(&mut reuse);
     assert_eq!(slots2.abs_edges.len(), 1);
     assert_ne!(slots2.abs_edges[0].0, 999);
     let _ = std::fs::remove_dir_all(&path);
@@ -3487,7 +3487,7 @@ fn structural_run_reads_spend_meta_once_per_write() {
     let wire = vec![Arc::new(b1), Arc::new(b2)];
     rbitcoin_store::tx_table::reset_spend_meta_read_counts();
     let mut reuse = StructuralReuse::default();
-    let (_ph, slots) = structural_run(
+    let slots = structural_run(
         &q,
         &params,
         Milestone::NONE,

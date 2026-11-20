@@ -273,7 +273,7 @@ pub fn denserels_by_stamped_range(
     parent_pin: &ParentPinStamp,
     still_need: &mut U64Map<Vec<u32>>,
     batch_parents: &mut crate::BatchParents,
-) -> Result<(u64, u64), ConfirmError> {
+) -> Result<(), ConfirmError> {
     let mut range_jobs: Vec<(rbitcoin_primitives::Fk, (u64, u64), [u8; 32], u32, Vec<u32>)> =
         Vec::new();
     let pending = std::mem::take(still_need);
@@ -295,7 +295,7 @@ pub fn denserels_by_stamped_range(
         range_jobs.push((rbitcoin_primitives::Fk(id), range, tid, n_out, need));
     }
     if range_jobs.is_empty() {
-        return Ok((0, 0));
+        return Ok(());
     }
     let n_range = range_jobs.len() as u64;
     let (decoded, body_ns, dec_ns, extend_n, body_sqe_n, guess_full_n) = query
@@ -347,7 +347,7 @@ pub fn denserels_by_stamped_range(
     let range_fill_ns = t_range_fill.elapsed().as_nanos() as u64;
     // `note_confirm` ignores a zero add, so a `> 0` gate is the same call.
     crate::note_confirm(&query.confirm_stats().pin_range_fill_ns, range_fill_ns);
-    Ok((n_range, rng_ns))
+    Ok(())
 }
 
 /// Pin parents for wire load: **only spent parents** (sparse outs).
@@ -424,8 +424,7 @@ pub fn pin_for_wire_batch<'a>(
     );
     let plan_pin_ns = t_plan.elapsed().as_nanos() as u64;
 
-    let (n_range_new, cold_range_batch_ns) =
-        denserels_by_stamped_range(query, parent_pin, &mut still_need, &mut batch_parents)?;
+    denserels_by_stamped_range(query, parent_pin, &mut still_need, &mut batch_parents)?;
 
     for id in parent_vouts.keys() {
         if let Some(sr) = parent_pin.spent_range(*id) {
@@ -463,13 +462,6 @@ pub fn pin_for_wire_batch<'a>(
     crate::note_confirm(&query.confirm_stats().pin_cache_body, n_plan_pin);
     crate::note_confirm(&query.confirm_stats().plan_pin_ns, plan_pin_ns);
     crate::note_confirm(&query.confirm_stats().pin_contract_ns, contract_ns);
-    query.confirm_stats().note_last_pin(
-        plan_pin_ns,
-        cold_range_batch_ns,
-        contract_ns,
-        n_plan_pin,
-        n_range_new,
-    );
     let pin_ns = t_pin.elapsed().as_nanos() as u64;
     crate::note_confirm(&query.confirm_stats().parent_pin_ns, pin_ns);
     crate::note_confirm(&query.confirm_stats().pin_body_ns, pin_ns);

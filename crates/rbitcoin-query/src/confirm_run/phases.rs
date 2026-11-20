@@ -348,13 +348,7 @@ pub fn structural_run(
     batch_parents: &crate::BatchParents,
     abs_jobs: &[Vec<crate::block_pipeline::StructuralAbsJob>],
     reuse: &mut StructuralReuse,
-) -> Result<
-    (
-        crate::block_pipeline::StructuralPhaseNs,
-        crate::block_pipeline::AnnotateSlots,
-    ),
-    ConfirmError,
-> {
+) -> Result<crate::block_pipeline::AnnotateSlots, ConfirmError> {
     use crate::block_pipeline::StructuralPhaseNs;
     if abs_jobs.len() != prepared.len() {
         return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
@@ -429,7 +423,7 @@ pub fn structural_run(
             "invariant: structural meta prefetch short",
         )));
     }
-    // Window counters (may race with sampler; last-write uses `tot` instead).
+    // Window counters (may race with sampler).
     crate::note_confirm(
         &query.confirm_stats().structural_ns,
         t0.elapsed().as_nanos() as u64,
@@ -456,7 +450,7 @@ pub fn structural_run(
         tot.create_h_ns,
     );
     crate::note_confirm(&query.confirm_stats().structural_bip68_ns, tot.bip68_ns);
-    Ok((tot, std::mem::take(&mut reuse.scratch.slots)))
+    Ok(std::mem::take(&mut reuse.scratch.slots))
 }
 
 pub fn class_c_commit(
@@ -509,7 +503,7 @@ pub fn class_c_commit(
 pub fn post_commit(
     query: &Query,
     slots: &crate::block_pipeline::AnnotateSlots,
-) -> Result<u64, ConfirmError> {
+) -> Result<(), ConfirmError> {
     let t_spent = Instant::now();
     if query.spend_index_enabled() && !slots.abs_edges.is_empty() {
         let t_room = Instant::now();
@@ -547,9 +541,11 @@ pub fn post_commit(
             slots.abs_edges.len() as u64,
         );
     }
-    let spend_ann_ns = t_spent.elapsed().as_nanos() as u64;
-    crate::note_confirm(&query.confirm_stats().utxo_apply_ns, spend_ann_ns);
-    Ok(spend_ann_ns)
+    crate::note_confirm(
+        &query.confirm_stats().utxo_apply_ns,
+        t_spent.elapsed().as_nanos() as u64,
+    );
+    Ok(())
 }
 
 #[cfg(debug_assertions)]

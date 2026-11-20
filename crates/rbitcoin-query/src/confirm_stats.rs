@@ -23,21 +23,6 @@ macro_rules! confirm_window {
         #[derive(Debug)]
         pub struct ConfirmStats {
             $(pub $field: AtomicU64,)+
-            last_write_n: AtomicU64,
-            last_write_wall_ns: AtomicU64,
-            last_write_class_a_ns: AtomicU64,
-            last_write_ensure_ns: AtomicU64,
-            last_write_structural_ns: AtomicU64,
-            last_write_spent_ns: AtomicU64,
-            last_write_create_h_ns: AtomicU64,
-            last_write_bip68_ns: AtomicU64,
-            last_write_class_c_ns: AtomicU64,
-            last_write_spend_ann_ns: AtomicU64,
-            last_pin_plan_ns: AtomicU64,
-            last_pin_cold_ns: AtomicU64,
-            last_pin_contract_ns: AtomicU64,
-            last_pin_plan_n: AtomicU64,
-            last_pin_new_n: AtomicU64,
             last_head_need: AtomicU64,
             last_head_hit: AtomicU64,
             last_miss_n: AtomicU64,
@@ -54,21 +39,6 @@ macro_rules! confirm_window {
             fn default() -> Self {
                 Self {
                     $($field: AtomicU64::new(0),)+
-                    last_write_n: AtomicU64::new(0),
-                    last_write_wall_ns: AtomicU64::new(0),
-                    last_write_class_a_ns: AtomicU64::new(0),
-                    last_write_ensure_ns: AtomicU64::new(0),
-                    last_write_structural_ns: AtomicU64::new(0),
-                    last_write_spent_ns: AtomicU64::new(0),
-                    last_write_create_h_ns: AtomicU64::new(0),
-                    last_write_bip68_ns: AtomicU64::new(0),
-                    last_write_class_c_ns: AtomicU64::new(0),
-                    last_write_spend_ann_ns: AtomicU64::new(0),
-                    last_pin_plan_ns: AtomicU64::new(0),
-                    last_pin_cold_ns: AtomicU64::new(0),
-                    last_pin_contract_ns: AtomicU64::new(0),
-                    last_pin_plan_n: AtomicU64::new(0),
-                    last_pin_new_n: AtomicU64::new(0),
                     last_head_need: AtomicU64::new(0),
                     last_head_hit: AtomicU64::new(0),
                     last_miss_n: AtomicU64::new(0),
@@ -241,7 +211,6 @@ confirm_window! {
     leftover_pend,
     batch_stamp,
     resolved_stamp,
-    fill_missing_n,
     arch_prep_total_ns,
     arch_prep_struct_ns,
     arch_prep_filter_ns,
@@ -337,69 +306,6 @@ impl ConfirmStats {
         self.scripthash_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
-    pub fn note_last_write(&self, p: LastWritePhases) {
-        self.last_write_n
-            .store(u64::from(p.n_blocks), Ordering::Relaxed);
-        self.last_write_wall_ns.store(p.wall_ns, Ordering::Relaxed);
-        self.last_write_class_a_ns
-            .store(p.class_a_ns, Ordering::Relaxed);
-        self.last_write_ensure_ns
-            .store(p.ensure_ns, Ordering::Relaxed);
-        self.last_write_structural_ns
-            .store(p.structural_ns, Ordering::Relaxed);
-        self.last_write_spent_ns
-            .store(p.spent_ns, Ordering::Relaxed);
-        self.last_write_create_h_ns
-            .store(p.create_h_ns, Ordering::Relaxed);
-        self.last_write_bip68_ns
-            .store(p.bip68_ns, Ordering::Relaxed);
-        self.last_write_class_c_ns
-            .store(p.class_c_ns, Ordering::Relaxed);
-        self.last_write_spend_ann_ns
-            .store(p.spend_ann_ns, Ordering::Relaxed);
-    }
-
-    pub fn last_write_phases(&self) -> LastWritePhases {
-        LastWritePhases {
-            n_blocks: self.last_write_n.load(Ordering::Relaxed) as u32,
-            wall_ns: self.last_write_wall_ns.load(Ordering::Relaxed),
-            class_a_ns: self.last_write_class_a_ns.load(Ordering::Relaxed),
-            ensure_ns: self.last_write_ensure_ns.load(Ordering::Relaxed),
-            structural_ns: self.last_write_structural_ns.load(Ordering::Relaxed),
-            spent_ns: self.last_write_spent_ns.load(Ordering::Relaxed),
-            create_h_ns: self.last_write_create_h_ns.load(Ordering::Relaxed),
-            bip68_ns: self.last_write_bip68_ns.load(Ordering::Relaxed),
-            class_c_ns: self.last_write_class_c_ns.load(Ordering::Relaxed),
-            spend_ann_ns: self.last_write_spend_ann_ns.load(Ordering::Relaxed),
-        }
-    }
-
-    pub fn note_last_pin(
-        &self,
-        plan_pin_ns: u64,
-        cold_ns: u64,
-        contract_ns: u64,
-        pin_plan_n: u64,
-        pin_new_n: u64,
-    ) {
-        self.last_pin_plan_ns.store(plan_pin_ns, Ordering::Relaxed);
-        self.last_pin_cold_ns.store(cold_ns, Ordering::Relaxed);
-        self.last_pin_contract_ns
-            .store(contract_ns, Ordering::Relaxed);
-        self.last_pin_plan_n.store(pin_plan_n, Ordering::Relaxed);
-        self.last_pin_new_n.store(pin_new_n, Ordering::Relaxed);
-    }
-
-    pub fn last_pin_phases(&self) -> LastPinPhases {
-        LastPinPhases {
-            plan_pin_ns: self.last_pin_plan_ns.load(Ordering::Relaxed),
-            cold_ns: self.last_pin_cold_ns.load(Ordering::Relaxed),
-            contract_ns: self.last_pin_contract_ns.load(Ordering::Relaxed),
-            pin_plan_n: self.last_pin_plan_n.load(Ordering::Relaxed),
-            pin_new_n: self.last_pin_new_n.load(Ordering::Relaxed),
-        }
-    }
-
     pub fn note_resolve_counts(
         &self,
         blocks: u64,
@@ -426,10 +332,6 @@ impl ConfirmStats {
             head_need: self.last_head_need.load(Ordering::Relaxed),
             head_hit: self.last_head_hit.load(Ordering::Relaxed),
         }
-    }
-
-    pub fn note_fill_missing(&self) {
-        add(&self.fill_missing_n, 1);
     }
 
     pub fn note_leftover_mix(&self, pend: u64, age0: u64, age3: u64, age_n: u64) {
@@ -580,55 +482,6 @@ impl ConfirmStats {
         add(&self.lookup_collect_ns, collect_ns);
         add(&self.lookup_wave_head_ns, head_ns);
         add(&self.lookup_wave_spent_ns, spent_ns);
-    }
-}
-
-/// Snapshot of the most recent successful write phase (not a window).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LastWritePhases {
-    pub n_blocks: u32,
-    pub wall_ns: u64,
-    pub class_a_ns: u64,
-    pub ensure_ns: u64,
-    pub structural_ns: u64,
-    pub spent_ns: u64,
-    pub create_h_ns: u64,
-    pub bip68_ns: u64,
-    pub class_c_ns: u64,
-    pub spend_ann_ns: u64,
-}
-
-impl LastWritePhases {
-    #[inline]
-    pub fn ms(ns: u64) -> u64 {
-        ns / 1_000_000
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct LastPinPhases {
-    pub plan_pin_ns: u64,
-    pub cold_ns: u64,
-    pub contract_ns: u64,
-    pub pin_plan_n: u64,
-    pub pin_new_n: u64,
-}
-
-impl LastPinPhases {
-    #[inline]
-    pub fn ms(ns: u64) -> u64 {
-        ns / 1_000_000
-    }
-
-    pub fn format_slow_pin(&self) -> String {
-        format!(
-            "pin(plan={}ms/n={} cold={}ms/n={} contract={}ms)",
-            Self::ms(self.plan_pin_ns),
-            self.pin_plan_n,
-            Self::ms(self.cold_ns),
-            self.pin_new_n,
-            Self::ms(self.contract_ns),
-        )
     }
 }
 
