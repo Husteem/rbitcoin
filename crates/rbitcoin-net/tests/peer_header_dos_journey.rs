@@ -2830,7 +2830,7 @@ fn full_headers_page_is_not_an_insufficient_work_disconnect() {
 }
 
 /// Tip work meets the floor. A bad-proof-of-work compact whose parent is the
-/// tip must not walk the mempool, and it scores like a bad `block`. A valid
+/// tip scores like a bad `block` and asks the peer for nothing. A valid
 /// compact of the next block still fills from the mempool.
 #[tokio::test]
 async fn bad_pow_cmpct_scores_and_asks_for_nothing() {
