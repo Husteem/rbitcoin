@@ -2203,7 +2203,7 @@ impl SpendPageLog {
         };
         let mut rounds = Rounds::new(self.policy.fold_round_pages);
         let merge = Instant::now();
-        let mut merged = self.merge_sealed(&sealed, touch, body, &mut rounds, &mut report)?;
+        let merged = self.merge_sealed(&sealed, touch, body, &mut rounds, &mut report)?;
         report.merge_ms = ms_since(merge);
         let fold = self.fold(
             &w,
@@ -2212,13 +2212,13 @@ impl SpendPageLog {
             body,
             durable,
             &mut rounds,
-            &mut merged.pages,
             &mut report,
         )?;
         rounds.finish(&self.dir, body, &mut report)?;
-        let carried_bytes = fold.carried_bytes;
+        let carried_bytes = fold.carried.bytes.len() as u64;
         let plan = Plan {
             pages: merged.pages,
+            carried: fold.carried,
             folded: fold.folded,
             dir_pages: self.lock().commit.dir_pages,
             seal: Seal::Raise(tip),
@@ -2436,7 +2436,6 @@ impl SpendPageLog {
         body: &mut dyn SpentBody,
         durable: Option<u32>,
         rounds: &mut Rounds,
-        pages: &mut PlanPages,
         report: &mut CheckpointReport,
     ) -> Result<Folded, StoreError> {
         let mut out = Folded::default();
@@ -2472,8 +2471,8 @@ impl SpendPageLog {
                         report.folded += 1;
                         out.folded.push((rec.page_off, at));
                     } else {
-                        let len = pages.push_slots(rec.page_off, rec.base, c.record.ordered()?);
-                        out.carried_bytes += len as u64;
+                        out.carried
+                            .push_slots(rec.page_off, rec.base, c.record.ordered()?);
                         report.carried += 1;
                     }
                 }
@@ -2634,7 +2633,7 @@ impl SpendPageLog {
             record_bytes,
             wrote_segs,
             pages: written_pages,
-        } = self.append_records(w, &plan.pages, plan.folded.len())?;
+        } = self.append_records(w, [&plan.pages, &plan.carried], plan.folded.len())?;
         let mut dir_pages = u64::from(plan.dir_pages).max(written_pages);
         report.record_bytes = record_bytes;
         report.seg_write_ms = ms_since(t);
@@ -2779,21 +2778,22 @@ impl SpendPageLog {
     /// segment's header. This generation starts on the next block past both,
     /// or in a new segment when that leaves no room, so no write touches a
     /// block holding committed bytes. A segment holds
-    /// [`Policy::segment_cap`] record bytes past its first block.
+    /// [`Policy::segment_cap`] record bytes past its first block. `plans`
+    /// are written in order: the merged pages, then the carried ones.
     fn append_records(
         &self,
         w: &mut Writer,
-        pages: &PlanPages,
+        plans: [&PlanPages; 2],
         extra: usize,
     ) -> Result<Appended, StoreError> {
         let mut out = Appended {
-            placed: Vec::with_capacity(pages.len() + extra),
+            placed: Vec::with_capacity(plans.iter().map(|p| p.len()).sum::<usize>() + extra),
             record_bytes: 0,
             wrote_segs: BTreeSet::new(),
             pages: 0,
         };
         let cap = BLOCK + self.policy.segment_cap;
-        for (i, (p, bytes)) in pages.iter().enumerate() {
+        for (i, (p, bytes)) in plans.iter().flat_map(|p| p.iter()).enumerate() {
             let len = bytes.len() as u64;
             if i == 0 {
                 let aligned = align_block(w.active.end.max(BLOCK));
@@ -3031,11 +3031,12 @@ impl OwnedCommitted {
 }
 
 /// The committed records of a checkpoint's sealed pages: one buffer, and a
-/// row per record ascending by page.
+/// row per record ascending by page. The rows are a subset of the pages
+/// the merge walks, in the same order.
 struct CommittedRecords {
     buf: Vec<u8>,
     rows: Vec<CommittedRow>,
-    /// First row a later [`Self::take`] may still return.
+    /// The row the next page with a record takes.
     next: usize,
 }
 
@@ -3047,13 +3048,11 @@ struct CommittedRow {
 }
 
 impl CommittedRecords {
-    /// The record of `page_off`, if it has one. Pages are asked for
-    /// ascending, each once.
+    /// The record of `page_off`, if it has one. Every page the rows were
+    /// read for is asked for once, ascending.
     fn take(&mut self, page_off: u64) -> Option<Committed<'_>> {
-        while self.rows.get(self.next)?.page_off < page_off {
-            self.next += 1;
-        }
-        let row = &self.rows[self.next];
+        let row = self.rows.get(self.next)?;
+        debug_assert!(row.page_off >= page_off, "a committed row was skipped");
         if row.page_off != page_off {
             return None;
         }
@@ -3069,6 +3068,9 @@ impl CommittedRecords {
 /// One generation's content.
 struct Plan {
     pages: PlanPages,
+    /// Records reclaim copies unchanged, appended after `pages`. A buffer of
+    /// their own, so they never regrow the one the merge sized.
+    carried: PlanPages,
     /// Pages a fold wrote whole, and the entry each now takes.
     folded: Vec<(u64, Placed)>,
     /// Directory length before these pages; a page past it extends it.
@@ -3083,6 +3085,7 @@ impl Default for Plan {
     fn default() -> Self {
         Self {
             pages: PlanPages::default(),
+            carried: PlanPages::default(),
             folded: Vec::new(),
             dir_pages: 0,
             seal: Seal::Raise(0),
@@ -3126,8 +3129,8 @@ fn coalesce(records: &[LiveRecord]) -> impl Iterator<Item = &[LiveRecord]> + '_ 
 #[derive(Default)]
 struct Folded {
     folded: Vec<(u64, Placed)>,
-    /// Record bytes of the sparse records copied to the active segment.
-    carried_bytes: u64,
+    /// Sparse records to copy to the active segment.
+    carried: PlanPages,
 }
 
 /// The sealed pages merged over their committed records.

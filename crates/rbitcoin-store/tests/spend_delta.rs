@@ -1822,10 +1822,13 @@ fn fold_rounds_reuse_their_buffers() {
 /// A checkpoint merges each touched page's notes over its committed
 /// record into one buffer for the generation: the allocator calls it makes
 /// do not grow with the pages it merges. The merged records keep every
-/// committed slot, and a note wins over the committed slot it rewrites.
+/// committed slot, before, between and after the notes, and a note wins
+/// over the committed slot it rewrites.
 #[test]
 fn a_checkpoint_merges_pages_without_a_call_per_page() {
     const COMMITTED: u64 = 20;
+    // A committed slot past every note, so the merge copies a tail.
+    const TAIL: u64 = COMMITTED + 20;
     fn meta(page: u64, round: u8) -> [u8; 8] {
         let mut m = [0u8; 8];
         m[..4].copy_from_slice(&(page as u32).to_le_bytes());
@@ -1838,7 +1841,11 @@ fn a_checkpoint_merges_pages_without_a_call_per_page() {
         let log = SpendPageLog::create_with(&d, Policy::DEFAULT).unwrap();
         let abs = |page: u64, slot: u64| page * 4096 + 16 + slot * 8;
         let committed: Vec<(u64, [u8; 8])> = (1..=pages)
-            .flat_map(|page| (0..COMMITTED).map(move |s| (abs(page, s), meta(page, 1))))
+            .flat_map(|page| {
+                (0..COMMITTED)
+                    .chain([TAIL])
+                    .map(move |s| (abs(page, s), meta(page, 1)))
+            })
             .collect();
         log.note_slots(&committed).unwrap();
         commit(&log, 1, 0, |_| Ok(true));
@@ -1858,7 +1865,7 @@ fn a_checkpoint_merges_pages_without_a_call_per_page() {
         assert_eq!(r.sealed_pages, pages, "{r:?}");
         assert!(r.merge_read_bytes > 0, "{r:?}");
         for page in 1..=pages {
-            for s in (0..COMMITTED).filter(|&s| s != 3) {
+            for s in (0..COMMITTED).chain([TAIL]).filter(|&s| s != 3) {
                 assert_eq!(log.slot(abs(page, s)).unwrap(), Some(meta(page, 1)));
             }
             assert_eq!(log.slot(abs(page, 3)).unwrap(), Some(meta(page, 2)));
@@ -1868,15 +1875,17 @@ fn a_checkpoint_merges_pages_without_a_call_per_page() {
             );
         }
         // Page 1's new record, byte for byte: the committed slots in slot
-        // order with the rewritten one replaced, then the new slot.
+        // order with the rewritten one replaced, the new slot, then the tail.
         let mut want = 4096u64.to_le_bytes().to_vec();
-        want.extend_from_slice(&(COMMITTED as u16 + 1).to_le_bytes());
+        want.extend_from_slice(&(COMMITTED as u16 + 2).to_le_bytes());
         for s in 0..COMMITTED {
             want.extend_from_slice(&(2 + s as u16).to_le_bytes());
             want.extend_from_slice(&meta(1, if s == 3 { 2 } else { 1 }));
         }
         want.extend_from_slice(&(2 + COMMITTED as u16 + 7).to_le_bytes());
         want.extend_from_slice(&meta(1, 3));
+        want.extend_from_slice(&(2 + TAIL as u16).to_le_bytes());
+        want.extend_from_slice(&meta(1, 1));
         let found = std::fs::read_dir(delta_dir(&d))
             .unwrap()
             .map(|e| e.unwrap().path())
@@ -1897,6 +1906,67 @@ fn a_checkpoint_merges_pages_without_a_call_per_page() {
         per_100_pages < 150,
         "{per_100_pages} allocator calls per 100 merged pages ({a} at {few}, {b} at {many})"
     );
+}
+
+/// Reclaim's carried records do not land in the buffer the merge sized
+/// for its own records: a checkpoint that carries more than that buffer's
+/// slack never regrows it, so its largest allocation stays under the
+/// record bytes it appends.
+#[test]
+fn carried_records_do_not_regrow_the_merge_buffer() {
+    const BIG: u64 = 300;
+    const PAIRS: u64 = 300;
+    let d = dir();
+    // Two 10-slot records share a segment; a 100-slot record has its own.
+    let policy = Policy {
+        segment_cap: 256,
+        reclaim_rate: 100,
+        ..CARRY
+    };
+    let log = SpendPageLog::create_with(&d, policy).unwrap();
+    let meta = |page: u64, round: u8| {
+        let mut m = [0u8; 8];
+        m[..4].copy_from_slice(&(page as u32).to_le_bytes());
+        m[4] = round;
+        m[7] = 1;
+        m
+    };
+    let abs = |page: u64, slot: u64| page * 4096 + 16 + slot * 8;
+    let small = BIG + 1..=BIG + 2 * PAIRS;
+    let mut first: Vec<(u64, [u8; 8])> = (1..=BIG)
+        .flat_map(|page| (0..100).map(move |s| (abs(page, s), meta(page, 1))))
+        .collect();
+    first.extend(
+        small
+            .clone()
+            .flat_map(|page| (0..10).map(move |s| (abs(page, s), meta(page, 1)))),
+    );
+    log.note_slots(&first).unwrap();
+    commit(&log, 1, 0, |_| Ok(true));
+    // Touch every big page and the second page of each small pair: each
+    // small segment is left half live, and reclaim carries its other record.
+    let touched = |page: u64| page <= BIG || (page - BIG).is_multiple_of(2);
+    let touch: Vec<(u64, [u8; 8])> = (1..=BIG + 2 * PAIRS)
+        .filter(|&page| touched(page))
+        .map(|page| (abs(page, 0), meta(page, 2)))
+        .collect();
+    log.note_slots(&touch).unwrap();
+    let (r, asked) = crate::alloc_count::asked_by(|| {
+        reporting_commit(&log, 2, |_| Ok(true), &mut MemBody::new(0), Some(u32::MAX))
+    });
+    let r = r.unwrap();
+    assert!(r.carried > PAIRS / 2, "{r:?}");
+    assert!(
+        asked.largest < r.record_bytes,
+        "largest ask {} vs {} record bytes appended: {r:?}",
+        asked.largest,
+        r.record_bytes
+    );
+    for page in 1..=BIG + 2 * PAIRS {
+        let round = if touched(page) { 2 } else { 1 };
+        assert_eq!(log.slot(abs(page, 0)).unwrap(), Some(meta(page, round)));
+        assert_eq!(log.slot(abs(page, 9)).unwrap(), Some(meta(page, 1)));
+    }
 }
 
 /// A page over zeroes folded right after a page over `spent.body` in the

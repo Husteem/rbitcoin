@@ -7,7 +7,9 @@ Changed
   mainnet checkpoint touches about 180,000 pages every 20 seconds in IBD.
   It now reads the committed records into one buffer sized from the
   directory and writes the merged records straight into one more, which
-  the segment append writes from. Records are byte for byte what they
+  the segment append writes from. Records that reclaim carries go into a
+  buffer of their own, so they never regrow the merge's. Records are byte
+  for byte what they
   were, and a committed record whose slots are out of order still refuses
   the merge. On a mainnet IBD, anonymous RSS stayed about 220 MiB higher
   for several seconds after each checkpoint while mimalloc held the freed
