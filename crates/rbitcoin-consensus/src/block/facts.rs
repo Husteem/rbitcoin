@@ -306,14 +306,6 @@ pub fn reject_confirm_batch(heights: &[u32]) -> Result<(), ConsensusError> {
     Ok(())
 }
 
-pub fn reject_txid_count(n_tx: usize, n_txid: usize) -> Result<(), ConsensusError> {
-    if n_tx == n_txid {
-        Ok(())
-    } else {
-        Err(ConsensusError::BadBlock("txid count mismatch"))
-    }
-}
-
 pub fn require_linked_parent<T>(row: Option<T>) -> Result<T, ConsensusError> {
     row.ok_or(ConsensusError::BadPrev)
 }
