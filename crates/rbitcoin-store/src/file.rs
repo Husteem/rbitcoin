@@ -45,126 +45,6 @@ use std::sync::Mutex;
 
 pub const FILE_HEADER_LEN: usize = 16;
 
-/// Device block a power cut can tear to zeroes when a write overlaps it.
-pub(crate) const TAIL_BLOCK: u64 = 4096;
-
-/// `magic[4] | block_off:u64 | image_len:u32 | image`.
-const KEPT_MAGIC: &[u8; 4] = b"CATK";
-const KEPT_HEAD: usize = 16;
-
-/// Write a leftover `.kept` image back over a block that tore to zeroes.
-///
-/// A missing copy is the synced case. A successful rewrite leaves the prefix
-/// non-zero, including a header publish after the copy, so open leaves those
-/// bytes and keeps the sidecar until the data sync removes it. Only an
-/// all-zero range is the torn block: writing the image there puts the named
-/// prefix back. A sidecar that does not decode cannot put that prefix back.
-/// When the file's published tail is all zeroes, open stops. When that tail
-/// still holds bytes, or the data file is gone, the sidecar is removed.
-pub(crate) fn restore_kept_tail(path: &Path) -> Result<(), StoreError> {
-    let side = TableFile::kept_tail_path(path);
-    let raw = match std::fs::read(&side) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(StoreError::io(&side, e)),
-    };
-    let image = match kept_tail_image(&raw) {
-        Some(image) => image,
-        None => return undecodable_kept_tail(path, &side),
-    };
-    if !path.try_exists().map_err(|e| StoreError::io(path, e))? {
-        return discard_kept_tail(&side);
-    }
-    let file = table_open_opts()
-        .open(path)
-        .map_err(|e| StoreError::io(path, e))?;
-    let file_len = file.metadata().map_err(|e| StoreError::io(path, e))?.len();
-    let end = image.block.saturating_add(image.bytes.len() as u64);
-    if end > file_len {
-        return Ok(());
-    }
-    let mut current = vec![0u8; image.bytes.len()];
-    handle_pread_all(&file, path, image.block, &mut current)?;
-    if current.iter().any(|b| *b != 0) {
-        return Ok(());
-    }
-    handle_pwrite_all(&file, path, image.block, image.bytes)?;
-    file.durable_sync_data()
-        .map_err(|e| StoreError::io(path, e))?;
-    discard_kept_tail(&side)
-}
-
-struct KeptTailImage<'a> {
-    block: u64,
-    bytes: &'a [u8],
-}
-
-fn kept_tail_image(raw: &[u8]) -> Option<KeptTailImage<'_>> {
-    if raw.len() < KEPT_HEAD || raw[0..4] != *KEPT_MAGIC {
-        return None;
-    }
-    let block = u64::from_le_bytes(raw[4..12].try_into().ok()?);
-    let n = u32::from_le_bytes(raw[12..16].try_into().ok()?) as usize;
-    if !block.is_multiple_of(TAIL_BLOCK)
-        || n == 0
-        || n > TAIL_BLOCK as usize
-        || raw.len() != KEPT_HEAD + n
-    {
-        return None;
-    }
-    Some(KeptTailImage {
-        block,
-        bytes: &raw[KEPT_HEAD..],
-    })
-}
-
-/// The published tail is the partial block the copy was meant to save.
-///
-/// A zeroed prefix with no usable image is the named rows gone. Leaving the
-/// sidecar in place makes the next open stop the same way. A prefix that
-/// still holds bytes, a length that is not a partial tail, or a missing
-/// file is not that tear: the sidecar is removed and open continues.
-fn undecodable_kept_tail(path: &Path, side: &Path) -> Result<(), StoreError> {
-    if !path.try_exists().map_err(|e| StoreError::io(path, e))? {
-        return discard_kept_tail(side);
-    }
-    let file = table_open_opts()
-        .open(path)
-        .map_err(|e| StoreError::io(path, e))?;
-    let file_len = file.metadata().map_err(|e| StoreError::io(path, e))?.len();
-    if file_len < FILE_HEADER_LEN as u64 {
-        return discard_kept_tail(side);
-    }
-    let mut header = [0u8; FILE_HEADER_LEN];
-    handle_pread_all(&file, path, 0, &mut header)?;
-    let mut len_bytes = [0u8; 8];
-    len_bytes.copy_from_slice(&header[8..16]);
-    let logical = u64::from_le_bytes(len_bytes);
-    let block = logical & !(TAIL_BLOCK - 1);
-    let n = logical.saturating_sub(block);
-    if logical == 0 || n == 0 || n > TAIL_BLOCK || logical > file_len {
-        return discard_kept_tail(side);
-    }
-    let mut current = vec![0u8; n as usize];
-    handle_pread_all(&file, path, block, &mut current)?;
-    if current.iter().all(|b| *b == 0) {
-        return Err(StoreError::Corrupt(
-            "class A tail keep does not decode over a zeroed block",
-        ));
-    }
-    discard_kept_tail(side)
-}
-
-fn discard_kept_tail(side: &Path) -> Result<(), StoreError> {
-    match std::fs::remove_file(side) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(StoreError::io(side, e)),
-    }
-    let parent = side.parent().unwrap_or_else(|| Path::new("."));
-    fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))
-}
-
 /// Bytes [`TableFile::create`] leaves past the header. A longer file is payload.
 pub(crate) const CREATE_FILE_SLACK: u64 = 64;
 
@@ -474,12 +354,6 @@ pub struct TableFile {
     pub kind: TableKind,
     /// Payload/HWM written since last successful `sync_data` (Class C barrier skip).
     pub needs_sync: AtomicBool,
-    /// Class A: copy a synced partial 4 KiB tail aside before a write overlaps it.
-    keep_tail: AtomicBool,
-    /// Held across a tail rewrite and across the Class A sync that unlinks `.kept`.
-    ///
-    /// Re-locked by the same thread when a bulk write falls back into `pwrite_all`.
-    tail_keep: Mutex<()>,
     /// Header still names a longer end than `published_len`. A grow must store
     /// the short end before it extends the file, or open loads the old end.
     hwm_behind: AtomicBool,
@@ -615,50 +489,6 @@ pub fn set_file_len(file: &File, path: &Path, new_len: u64) -> Result<(), StoreE
     }
 }
 
-thread_local! {
-    static TAIL_KEEP_HELD: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Cross-thread exclusion for a Class A tail rewrite and the sync that unlinks it.
-pub(crate) struct TailKeepGuard<'a> {
-    key: usize,
-    _guard: Option<std::sync::MutexGuard<'a, ()>>,
-}
-
-impl Drop for TailKeepGuard<'_> {
-    fn drop(&mut self) {
-        TAIL_KEEP_HELD.with(|held| {
-            let mut keys = held.borrow_mut();
-            if let Some(i) = keys.iter().rposition(|k| *k == self.key) {
-                keys.remove(i);
-            }
-        });
-    }
-}
-
-fn lock_one_tail(file: &TableFile) -> TailKeepGuard<'_> {
-    let key = std::ptr::from_ref(file) as usize;
-    let already = TAIL_KEEP_HELD.with(|held| held.borrow().contains(&key));
-    if already {
-        TAIL_KEEP_HELD.with(|held| held.borrow_mut().push(key));
-        return TailKeepGuard { key, _guard: None };
-    }
-    let guard = file.tail_keep.lock().unwrap_or_else(|e| e.into_inner());
-    TAIL_KEEP_HELD.with(|held| held.borrow_mut().push(key));
-    TailKeepGuard {
-        key,
-        _guard: Some(guard),
-    }
-}
-
-/// Lock `files` in address order. One file locked twice in the slice counts once.
-pub(crate) fn lock_tails<'a>(files: &[&'a TableFile]) -> Vec<TailKeepGuard<'a>> {
-    let mut order: Vec<&TableFile> = files.to_vec();
-    order.sort_by_key(|file| std::ptr::from_ref(*file) as usize);
-    order.dedup_by_key(|file| std::ptr::from_ref(*file) as usize);
-    order.into_iter().map(lock_one_tail).collect()
-}
-
 impl TableFile {
     pub fn create(path: impl Into<PathBuf>, kind: TableKind) -> Result<Self, StoreError> {
         let path = path.into();
@@ -685,9 +515,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(false),
-            keep_tail: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(false),
-            tail_keep: Mutex::new(()),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         })
@@ -718,9 +546,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(false),
-            keep_tail: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(false),
-            tail_keep: Mutex::new(()),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         };
@@ -774,9 +600,7 @@ impl TableFile {
                 trailing_ext,
                 kind,
                 needs_sync: AtomicBool::new(false),
-                keep_tail: AtomicBool::new(false),
                 hwm_behind: AtomicBool::new(false),
-                tail_keep: Mutex::new(()),
                 flush_lock: Mutex::new(()),
                 grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
             },
@@ -928,9 +752,7 @@ impl TableFile {
             trailing_ext: [0u8; 16],
             kind,
             needs_sync: AtomicBool::new(hwm_behind),
-            keep_tail: AtomicBool::new(false),
             hwm_behind: AtomicBool::new(hwm_behind),
-            tail_keep: Mutex::new(()),
             flush_lock: Mutex::new(()),
             grow_policy: AtomicU8::new(GrowPolicy::Slab as u8),
         })
@@ -1106,91 +928,12 @@ impl TableFile {
     /// Complete pwrite of all bytes or error (no partial success returned).
     #[doc(hidden)]
     pub fn pwrite_all(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
-        let _tail = self.lock_tail();
-        self.preserve_synced_tail(offset, bytes.len())?;
+        let _pages = crate::class_a_pages::guard_write(
+            self.published_len.load(Ordering::Acquire),
+            offset,
+            bytes.len(),
+        );
         handle_pwrite_all(&self.read_file, &self.path, offset, bytes)
-    }
-
-    /// Same-thread re-entry counts as already held. Cross-thread callers wait.
-    pub(crate) fn lock_tail(&self) -> TailKeepGuard<'_> {
-        lock_one_tail(self)
-    }
-
-    /// Class A files copy a synced partial tail aside before rewriting it.
-    pub(crate) fn arm_synced_tail(&self) {
-        self.keep_tail.store(true, Ordering::Release);
-    }
-
-    /// Sibling `{filename}.kept` holding the published prefix of a partial tail block.
-    pub(crate) fn kept_tail_path(path: &Path) -> PathBuf {
-        let mut name = path
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("file"))
-            .to_os_string();
-        name.push(".kept");
-        match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
-            _ => PathBuf::from(name),
-        }
-    }
-
-    /// Before `bytes` overlap the partial last 4 KiB block, copy that block's
-    /// published prefix to [`Self::kept_tail_path`] and sync it.
-    ///
-    /// A crash can tear the rewritten block to zeroes. The copy is the bytes
-    /// a durable record already names. The caller holds [`Self::lock_tail`]
-    /// across this copy and the rewrite. The Class A sync holds that same
-    /// lock until it has unlinked the copy, so the next rewrite copies again.
-    pub(crate) fn preserve_synced_tail(&self, offset: u64, len: usize) -> Result<(), StoreError> {
-        if !self.keep_tail.load(Ordering::Acquire) || len == 0 {
-            return Ok(());
-        }
-        let published = self.published_len.load(Ordering::Acquire);
-        if published == 0 || published.is_multiple_of(TAIL_BLOCK) {
-            return Ok(());
-        }
-        let block = published & !(TAIL_BLOCK - 1);
-        let write_end = offset.saturating_add(len as u64);
-        if write_end <= block || offset >= block + TAIL_BLOCK {
-            return Ok(());
-        }
-        let side = Self::kept_tail_path(&self.path);
-        if side.try_exists().map_err(|e| StoreError::io(&side, e))? {
-            return Ok(());
-        }
-        let file_len = self
-            .read_file
-            .metadata()
-            .map_err(|e| StoreError::io(&self.path, e))?
-            .len();
-        // A sparse logical end (`spent.body`) is not bytes this block holds.
-        if published > file_len {
-            return Ok(());
-        }
-        let n = (published - block) as usize;
-        if n == 0 || n > TAIL_BLOCK as usize {
-            return Ok(());
-        }
-        let mut image = vec![0u8; n];
-        self.pread_at(block, &mut image)?;
-        let mut buf = Vec::with_capacity(KEPT_HEAD + n);
-        buf.extend_from_slice(KEPT_MAGIC);
-        buf.extend_from_slice(&block.to_le_bytes());
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-        buf.extend_from_slice(&image);
-        write_synced_tmp_rename(&side, &buf)
-    }
-
-    /// Remove the tail copy after the rewritten bytes are synced.
-    ///
-    /// Returns whether a file was removed. The caller syncs the parent directory.
-    pub(crate) fn drop_kept_tail(&self) -> Result<bool, StoreError> {
-        let side = Self::kept_tail_path(&self.path);
-        match std::fs::remove_file(&side) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(StoreError::io(&side, e)),
-        }
     }
 
     /// Pread `buf` with no logical-end load.
@@ -1663,6 +1406,17 @@ impl TableFile {
     /// `RBITCOIN_IO=pread`, or for a file the session never submitted, they
     /// run one after another.
     pub fn sync_data_all(files: &[&TableFile]) -> Result<(), StoreError> {
+        Self::sync_data_all_with(files, &[])
+    }
+
+    /// [`Self::sync_data_all`] plus extra fds in the same bulk sync.
+    ///
+    /// Debug delay and fail injection stay on `files`. `extra` is the tear-guard
+    /// tail that must hit disk with those stems, without a second stem sync.
+    pub fn sync_data_all_with(
+        files: &[&TableFile],
+        extra: &[(&Path, &File)],
+    ) -> Result<(), StoreError> {
         #[cfg(debug_assertions)]
         for f in files {
             if let Some(d) = crate::io_handle::take_sync_delay(f.io_handle()) {
@@ -1680,10 +1434,15 @@ impl TableFile {
         if crate::durability::flushes_skipped() {
             return Ok(());
         }
-        let handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
+        let mut handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
+        handles.extend(
+            extra
+                .iter()
+                .map(|(_, file)| crate::io_handle::IoHandle::from_file(file)),
+        );
         let res = crate::bulk_io::sync_data_batch(&handles)
-            .unwrap_or_else(|| vec![i32::MIN; files.len()]);
-        for (f, r) in files.iter().zip(res) {
+            .unwrap_or_else(|| vec![i32::MIN; handles.len()]);
+        for (f, r) in files.iter().zip(res.iter().copied()) {
             match r {
                 0 => {}
                 // Never submitted: sync it here.
@@ -1695,8 +1454,17 @@ impl TableFile {
                     return Err(StoreError::io(
                         &f.path,
                         std::io::Error::from_raw_os_error(-r),
-                    ))
+                    ));
                 }
+            }
+        }
+        for ((path, file), r) in extra.iter().zip(res.iter().copied().skip(files.len())) {
+            match r {
+                0 => {}
+                i32::MIN => file
+                    .durable_sync_data()
+                    .map_err(|e| StoreError::io(*path, e))?,
+                r => return Err(StoreError::io(*path, std::io::Error::from_raw_os_error(-r))),
             }
         }
         Ok(())

@@ -22,6 +22,8 @@ pub mod bulk_io;
 #[doc(hidden)]
 pub mod chain;
 #[doc(hidden)]
+pub mod class_a_pages;
+#[doc(hidden)]
 pub mod compact;
 #[doc(hidden)]
 pub mod coord_io;
@@ -135,9 +137,6 @@ pub use crate::array_table::ClassCWrite;
 pub use crate::array_table::{bind_tip_flush_hold, TipFlushHold};
 pub use crate::chain::HeaderTxsTable;
 pub use crate::compact::output_flags;
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub use crate::tx_table::{bind_kept_drop_hold, KeptDropHold};
 pub use address_head::{is_probe_exhausted_error, is_store_corrupt_display};
 pub use block_filter::{BlockFilterRecord, BlockFilterSlot, BlockFilterTable, StoredBlockFilter};
 pub use block_queue::{BlockQueue, QueuedBlockMeta, TakenRaw};

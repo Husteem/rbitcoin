@@ -42,7 +42,6 @@ impl TxidBody {
             file.write_at_pwrite(FILE_HEADER_LEN as u64, &pad)?;
             // Logical end already advanced by write_at_pwrite HWM.
         }
-        file.arm_synced_tail();
         Ok(Self {
             file,
             count: std::sync::atomic::AtomicU64::new(0),
@@ -52,7 +51,6 @@ impl TxidBody {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let path = Self::path(dir);
         let file = TableFile::open(path, TableKind::TxidBody)?;
-        file.arm_synced_tail();
         let len = file.logical_len();
         let count = if len <= TXID_BODY_HEADER {
             0

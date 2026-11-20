@@ -1308,10 +1308,9 @@ fn failed_ibd_tip_flush_stops_commits_until_restart() {
     confirm_wire_run(&q, &params, Milestone::NONE, &run[..2]).unwrap();
     q.flush_for_shutdown().unwrap();
 
-    // The tip seal is a new file in the store directory. The Class A append
-    // also creates `{file}.kept`, so the directory stays writable until that
-    // append and the Class A sync have finished. The flush is paused after
-    // that sync and before the seal.
+    // The tip seal is a new file in the store directory. `tear_guard/` already
+    // exists, so the directory stays writable until the append and the Class A
+    // sync have finished. The flush is paused after that sync and before the seal.
     let set_mode = |mode| {
         std::fs::set_permissions(td.store_path(), std::fs::Permissions::from_mode(mode)).unwrap()
     };

@@ -25,6 +25,9 @@ getrandom = "0.4"
 [features]
 mutants = []
 
+[dev-dependencies]
+bitcoin_hashes = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Bulk pread submission for head-resolve / confirm body load (Linux).
 io-uring = "0.7"

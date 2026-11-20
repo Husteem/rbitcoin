@@ -735,145 +735,6 @@ pub fn class_a_body_occupied(dir: &Path, stem: &str) -> bool {
 /// commit, a scripthash mark). See [`TxTable::sync_class_a_named`].
 pub const CLASS_A_SYNCED_NAME: &str = "class_a.synced";
 
-/// Class A stems whose append can rewrite a synced partial 4 KiB block.
-const CLASS_A_KEPT_TAILS: &[&str] = &[
-    "txout.body",
-    "spent.body",
-    "txid.body",
-    "create.loc",
-    "create.loc.ovf",
-    "create.off",
-    "seqsigwit.body",
-    "seqsigwit.loc",
-    "seqsigwit.loc.ovf",
-    "seqsigwit.off",
-    "txstat.body",
-    "txstat.ovf",
-    "txstat.blk",
-    "input.loc",
-    "input.off",
-    "input.body",
-];
-
-/// Put a torn partial tail back before any stem is opened.
-fn restore_class_a_kept_tails(dir: &Path) -> Result<(), StoreError> {
-    for name in CLASS_A_KEPT_TAILS {
-        crate::file::restore_kept_tail(&dir.join(name))?;
-    }
-    Ok(())
-}
-
-/// Debug tests pause `sync_class_a_stems` after the data sync and before the
-/// `.kept` unlink, so an append can overlap that window.
-#[cfg(debug_assertions)]
-mod kept_drop_hold {
-    use std::cell::RefCell;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
-    use std::time::{Duration, Instant};
-
-    thread_local! {
-        static SLOT: RefCell<Option<Arc<KeptDropHold>>> = const { RefCell::new(None) };
-    }
-
-    pub(super) fn bind(hold: Option<Arc<KeptDropHold>>) {
-        SLOT.with(|slot| *slot.borrow_mut() = hold);
-    }
-
-    pub(super) fn wait() {
-        let Some(hold) = SLOT.with(|slot| slot.borrow().clone()) else {
-            return;
-        };
-        hold.wait_for_release();
-    }
-
-    /// Pauses the Class A sync thread after `sync_data_all` and before `.kept` is removed.
-    #[doc(hidden)]
-    pub struct KeptDropHold {
-        armed: AtomicBool,
-        entered: AtomicBool,
-        lock: Mutex<()>,
-        cv: Condvar,
-    }
-
-    impl KeptDropHold {
-        pub fn armed() -> Self {
-            Self {
-                armed: AtomicBool::new(true),
-                entered: AtomicBool::new(false),
-                lock: Mutex::new(()),
-                cv: Condvar::new(),
-            }
-        }
-
-        fn wait_for_release(&self) {
-            let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-            self.entered.store(true, Ordering::Release);
-            self.cv.notify_all();
-            while self.armed.load(Ordering::Acquire) {
-                guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
-            }
-        }
-
-        /// `true` once a sync thread is inside [`Self::wait_for_release`].
-        pub fn wait_until_entered(&self, limit: Duration) -> bool {
-            let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-            let deadline = Instant::now() + limit;
-            while !self.entered.load(Ordering::Acquire) {
-                let now = Instant::now();
-                if now >= deadline {
-                    return false;
-                }
-                let (next, timeout) = self
-                    .cv
-                    .wait_timeout(guard, deadline - now)
-                    .unwrap_or_else(|e| e.into_inner());
-                guard = next;
-                if timeout.timed_out() && !self.entered.load(Ordering::Acquire) {
-                    return false;
-                }
-            }
-            true
-        }
-
-        pub fn release(&self) {
-            let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-            self.armed.store(false, Ordering::Release);
-            self.cv.notify_all();
-        }
-    }
-}
-
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub use kept_drop_hold::KeptDropHold;
-
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn bind_kept_drop_hold(hold: Option<std::sync::Arc<KeptDropHold>>) {
-    kept_drop_hold::bind(hold);
-}
-
-/// Drop tail copies after their files are synced, then sync each parent once.
-fn drop_kept_tails(files: &[&crate::file::TableFile]) -> Result<(), StoreError> {
-    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-    for file in files {
-        if !file.drop_kept_tail()? {
-            continue;
-        }
-        let Some(parent) = file.path.parent() else {
-            continue;
-        };
-        if !dirs.iter().any(|d| d == parent) {
-            dirs.push(parent.to_path_buf());
-        }
-    }
-    for dir in dirs {
-        crate::file::fsync_parent_dir(&dir).map_err(|e| StoreError::io(&dir, e))?;
-    }
-    Ok(())
-}
-
 /// [`CLASS_A_SYNCED_NAME`], or 0 when absent.
 pub fn read_class_a_synced(dir: &Path) -> Result<u64, StoreError> {
     let path = dir.join(CLASS_A_SYNCED_NAME);
@@ -1670,10 +1531,7 @@ impl TxTable {
         opts: HeadOpenOpts,
         committed: Option<u64>,
     ) -> Result<Self, StoreError> {
-        restore_class_a_kept_tails(dir)?;
-        if seqsigwit_dir != dir {
-            restore_class_a_kept_tails(seqsigwit_dir)?;
-        }
+        crate::class_a_pages::prepare_and_restore(dir, seqsigwit_dir)?;
         crate::store::rename_legacy_inwit_files(dir)?;
         crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
@@ -4136,7 +3994,9 @@ impl TxTable {
     /// A failure latches: every later call refuses until restart. Calls run
     /// one at a time (the tip barrier and the spend checkpoint can overlap).
     pub fn sync_class_a_data(&self) -> Result<(), StoreError> {
-        self.class_a_latched(|| self.sync_class_a_stems())
+        self.class_a_latched(|| {
+            self.sync_class_a_stems(self.synced_named.load(std::sync::atomic::Ordering::Acquire))
+        })
     }
 
     /// Call `on_fail` once, when a Class A sync or append write first fails.
@@ -4154,7 +4014,7 @@ impl TxTable {
     pub fn sync_class_a_named(&self, named: u64) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         self.class_a_latched(|| {
-            self.sync_class_a_stems()?;
+            self.sync_class_a_stems(named)?;
             // Synced first, then named: the mark never passes a create the
             // device may not hold. One writer at a time under the latch.
             if named > self.synced_named.load(Ordering::Acquire) {
@@ -4221,7 +4081,7 @@ impl TxTable {
         written
     }
 
-    fn sync_class_a_stems(&self) -> Result<(), StoreError> {
+    fn sync_class_a_stems(&self, named: u64) -> Result<(), StoreError> {
         let files: [&crate::file::TableFile; 16] = [
             &self.body.body,
             &self.seqsigwit.body,
@@ -4240,13 +4100,7 @@ impl TxTable {
             &self.input.off,
             &self.input.body,
         ];
-        // Unlink runs before this guard drops. An append waits, then copies
-        // the prefix this sync made durable before it rewrites the block.
-        let _tail = crate::file::lock_tails(&files);
-        crate::file::TableFile::sync_data_all(&files)?;
-        #[cfg(debug_assertions)]
-        kept_drop_hold::wait();
-        drop_kept_tails(&files)
+        crate::class_a_pages::write_barrier(&self.hot_dir, &files, named)
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {

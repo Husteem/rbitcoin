@@ -1,3 +1,3 @@
 Fixed
 
-- **A torn Class A tail no longer drops creates the tip already names.** An append copies a synced partial 4 KiB block aside before rewriting it, and open restores that copy when the block tore to zeroes. A copy that does not decode stops open when that block is zeroes. A rewrite waits out a Class A sync that is still removing the previous copy.
+- **A torn Class A page no longer drops creates the tip already names.** `tear_guard/first` keeps one copy of each stem's first 4 KiB, sealed once that page is full. `tear_guard/tail.0` and `tail.1` alternate the partial last block and each stem's published length, synced before `class_a.synced`. Open restores a zeroed first page from `first` and patches the length from the newest tail header, and restores a zeroed partial tail from the matching slot. A zeroed prefix with no usable image stops open.

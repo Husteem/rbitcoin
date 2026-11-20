@@ -84,10 +84,87 @@ fn torn_synced_tail_keeps_the_named_txid() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// 128 creates, one synced tail, then one more append so `txid.body.kept` exists.
-fn synced_partial_txid_tail() -> (std::path::PathBuf, u64, [u8; 32]) {
+const PAGE: usize = 4096;
+const TAIL_BYTES: usize = 17 * PAGE;
+const FIRST_BYTES: usize = 32 * PAGE;
+/// `txid.body` in the Class A sync order.
+const TXID_STEM: usize = 9;
+
+fn logical_of(path: &Path) -> u64 {
+    let mut header = [0u8; 16];
+    let mut file = std::fs::File::open(path).unwrap();
+    std::io::Read::read_exact(&mut file, &mut header).unwrap();
+    u64::from_le_bytes(header[8..16].try_into().unwrap())
+}
+
+fn read_at(path: &Path, offset: u64, buf: &mut [u8]) {
+    let mut file = std::fs::File::open(path).unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    std::io::Read::read_exact(&mut file, buf).unwrap();
+}
+
+fn sha256_parts(parts: &[&[u8]]) -> [u8; 32] {
+    use bitcoin_hashes::{sha256, Hash, HashEngine};
+    let mut eng = sha256::HashEngine::default();
+    for part in parts {
+        eng.input(part);
+    }
+    sha256::Hash::from_engine(eng).to_byte_array()
+}
+
+fn checksum_tail(buf: &[u8]) -> [u8; 32] {
+    sha256_parts(&[&buf[..24], &buf[56..]])
+}
+
+/// One tail slot. `images` is `(stem, published, tail_off, prefix)`.
+fn plant_tail(path: &Path, generation: u64, named: u64, images: &[(usize, u64, u64, &[u8])]) {
+    let mut buf = vec![0u8; TAIL_BYTES];
+    buf[0..4].copy_from_slice(b"CAPT");
+    buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+    buf[6..8].copy_from_slice(&16u16.to_le_bytes());
+    buf[8..16].copy_from_slice(&generation.to_le_bytes());
+    buf[16..24].copy_from_slice(&named.to_le_bytes());
+    for (stem, published, tail_off, image) in images {
+        let head = 56 + stem * 16;
+        buf[head..head + 8].copy_from_slice(&published.to_le_bytes());
+        buf[head + 8..head + 16].copy_from_slice(&tail_off.to_le_bytes());
+        let len_at = 312 + stem * 2;
+        let n = u16::try_from(image.len()).unwrap();
+        buf[len_at..len_at + 2].copy_from_slice(&n.to_le_bytes());
+        let page = PAGE + stem * PAGE;
+        buf[page..page + image.len()].copy_from_slice(image);
+    }
+    let sum = checksum_tail(&buf);
+    buf[24..56].copy_from_slice(&sum);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, &buf).unwrap();
+}
+
+fn plant_first(path: &Path, stem: usize, page: &[u8]) {
+    assert_eq!(page.len(), PAGE);
+    let mut buf = vec![0u8; FIRST_BYTES];
+    let image_at = stem * 2 * PAGE;
+    buf[image_at..image_at + PAGE].copy_from_slice(page);
+    let commit_at = image_at + PAGE;
+    buf[commit_at..commit_at + 4].copy_from_slice(b"CAPF");
+    buf[commit_at + 4..commit_at + 6].copy_from_slice(&(stem as u16).to_le_bytes());
+    buf[commit_at + 6..commit_at + 8].copy_from_slice(&4096u16.to_le_bytes());
+    let image_sum = sha256_parts(&[page]);
+    buf[commit_at + 8..commit_at + 40].copy_from_slice(&image_sum);
+    let commit_sum = sha256_parts(&[&buf[commit_at..commit_at + 40]]);
+    buf[commit_at + 40..commit_at + 72].copy_from_slice(&commit_sum);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, &buf).unwrap();
+}
+
+fn zero_page0(path: &Path) {
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all(&[0u8; PAGE]).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn synced_txid_past_page(named: u64) -> (std::path::PathBuf, [u8; 32]) {
     let dir = tmp();
-    let named = 128u64;
     let txid = [0x80u8; 32];
     let s = Store::create_tiny(&dir).unwrap();
     let batch: Vec<_> = (1..=named)
@@ -101,40 +178,93 @@ fn synced_partial_txid_tail() -> (std::path::PathBuf, u64, [u8; 32]) {
         .collect();
     s.put_tx_full_batch_indexed(&batch, false).unwrap();
     s.txs.sync_class_a_named(named).unwrap();
-    s.put_tx_full_batch_indexed(&[coinbase([0x81u8; 32])], false)
-        .unwrap();
-    assert!(dir.join("txid.body.kept").is_file());
+    let logical = s.txs.txids.logical_len();
+    assert!(logical > 4096, "txid.body published {logical}");
+    assert_ne!(logical % 4096, 0);
     drop(s);
-    (dir, named, txid)
+    (dir, txid)
 }
 
-/// A truncated copy no longer names the prefix. The torn block stays zeroes,
-/// so open must stop instead of serving the named txid as zeroes.
+/// A hand-built tail slot is the only copy. Open puts that prefix back.
 #[test]
-fn torn_tail_with_truncated_kept_refuses_open() {
-    let (dir, _named, _txid) = synced_partial_txid_tail();
-    let kept = dir.join("txid.body.kept");
-    let file = std::fs::OpenOptions::new().write(true).open(&kept).unwrap();
-    file.set_len(16).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    zero_published_tail_block(&dir.join("txid.body"));
-    let err = match Store::open_tiny(&dir) {
-        Ok(_) => panic!("open kept a zeroed named tail"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string().contains("does not decode"),
-        "open kept a zeroed named tail: {err}"
+fn torn_tail_restored_from_hand_built_slot() {
+    let named = 128u64;
+    let (dir, txid) = synced_txid_past_page(named);
+    let body = dir.join("txid.body");
+    let published = logical_of(&body);
+    let off = published & !4095;
+    let n = (published - off) as usize;
+    let mut image = vec![0u8; n];
+    read_at(&body, off, &mut image);
+    plant_tail(
+        &dir.join("tear_guard/tail.0"),
+        1,
+        named,
+        &[(TXID_STEM, published, off, &image)],
     );
+    zero_published_tail_block(&body);
+    let s = Store::open_tiny(&dir).unwrap();
+    let got = s.txs.txids.get(Fk(named)).unwrap();
+    assert_eq!(got, txid, "named txid became {got:?}");
+    assert_eq!(s.txs.txids.logical_len(), published);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A planted sidecar that is not a tail copy is the same missing image.
+/// Page 0 comes back from `first`. The length comes from the tail header,
+/// which is newer than the length frozen in that page.
 #[test]
-fn torn_tail_with_planted_kept_refuses_open() {
-    let (dir, _named, _txid) = synced_partial_txid_tail();
-    std::fs::write(dir.join("txid.body.kept"), b"not-a-tail-copy").unwrap();
+fn zeroed_page0_takes_tail_header_length() {
+    let named = 128u64;
+    let dir = tmp();
+    let first_id = [0x11u8; 32];
+    let s = Store::create_tiny(&dir).unwrap();
+    let batch: Vec<_> = (1..=named)
+        .map(|i| {
+            let id = if i == 1 { first_id } else { [i as u8; 32] };
+            coinbase(id)
+        })
+        .collect();
+    s.put_tx_full_batch_indexed(&batch, false).unwrap();
+    s.txs.sync_class_a_named(named).unwrap();
+    let body = dir.join("txid.body");
+    let mut frozen = [0u8; PAGE];
+    read_at(&body, 0, &mut frozen);
+    let frozen_len = u64::from_le_bytes(frozen[8..16].try_into().unwrap());
+    s.put_tx_full_batch_indexed(&[coinbase([0x81u8; 32])], false)
+        .unwrap();
+    s.txs.sync_class_a_named(named + 1).unwrap();
+    let published = s.txs.txids.logical_len();
+    assert!(published > frozen_len);
+    drop(s);
+    let off = published & !4095;
+    let n = (published - off) as usize;
+    let mut image = vec![0u8; n];
+    read_at(&body, off, &mut image);
+    let guard = dir.join("tear_guard");
+    plant_first(&guard.join("first"), TXID_STEM, &frozen);
+    plant_tail(
+        &guard.join("tail.0"),
+        1,
+        named + 1,
+        &[(TXID_STEM, published, off, &image)],
+    );
+    zero_page0(&body);
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.get(Fk(1)).unwrap(), first_id);
+    assert_eq!(s.txs.txids.logical_len(), published);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Both slots fail the checksum and `first` has no commit. A zeroed tail stops open.
+#[test]
+fn checksum_bad_tail_over_zeroes_refuses_open() {
+    let named = 128u64;
+    let (dir, _txid) = synced_txid_past_page(named);
+    let guard = dir.join("tear_guard");
+    std::fs::create_dir_all(&guard).unwrap();
+    std::fs::write(guard.join("tail.0"), vec![0x5au8; TAIL_BYTES]).unwrap();
+    std::fs::write(guard.join("tail.1"), vec![0x5au8; TAIL_BYTES]).unwrap();
+    std::fs::write(guard.join("first"), vec![0u8; FIRST_BYTES]).unwrap();
     zero_published_tail_block(&dir.join("txid.body"));
     match Store::open_tiny(&dir) {
         Ok(_) => panic!("open kept a zeroed named tail"),
@@ -146,117 +276,254 @@ fn torn_tail_with_planted_kept_refuses_open() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A rewrite that landed keeps its bytes. A truncated copy is removed.
+fn generation_of(path: &Path) -> u64 {
+    let mut buf = [0u8; 16];
+    read_at(path, 0, &mut buf);
+    u64::from_le_bytes(buf[8..16].try_into().unwrap())
+}
+
+fn tail_len_of(path: &Path, stem: usize) -> u16 {
+    let mut buf = [0u8; 2];
+    read_at(path, (312 + stem * 2) as u64, &mut buf);
+    u16::from_le_bytes(buf)
+}
+
+fn first_image(path: &Path, stem: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; PAGE];
+    read_at(path, (stem * 2 * PAGE) as u64, &mut buf);
+    buf
+}
+
+fn first_commit_checks(path: &Path, stem: usize) -> bool {
+    let mut commit = vec![0u8; PAGE];
+    read_at(path, (stem * 2 * PAGE + PAGE) as u64, &mut commit);
+    if &commit[0..4] != b"CAPF" {
+        return false;
+    }
+    let image = first_image(path, stem);
+    let image_sum = sha256_parts(&[&image]);
+    if commit[8..40] != image_sum {
+        return false;
+    }
+    let commit_sum = sha256_parts(&[&commit[..40]]);
+    commit[40..72] == commit_sum
+}
+
+/// The first barrier writes `tail.0` and seals `txid.body`. `spent.body` has no tail image.
 #[test]
-fn landed_tail_drops_a_truncated_kept() {
-    let (dir, named, txid) = synced_partial_txid_tail();
-    let kept = dir.join("txid.body.kept");
-    let file = std::fs::OpenOptions::new().write(true).open(&kept).unwrap();
-    file.set_len(16).unwrap();
-    file.sync_all().unwrap();
-    drop(file);
-    let opened = Store::open_tiny(&dir).unwrap();
-    assert_eq!(opened.txs.txids.get(Fk(named)).unwrap(), txid);
-    assert!(!kept.is_file(), "a landed prefix left the truncated copy");
+fn first_barrier_seals_first_and_writes_tail0() {
+    let named = 128u64;
+    let (dir, txid) = synced_txid_past_page(named);
+    let guard = dir.join("tear_guard");
+    assert_eq!(generation_of(&guard.join("tail.0")), 1);
+    assert_eq!(generation_of(&guard.join("tail.1")), 0);
+    let body = dir.join("txid.body");
+    let published = logical_of(&body);
+    let off = published & !4095;
+    let n = (published - off) as usize;
+    assert_eq!(tail_len_of(&guard.join("tail.0"), TXID_STEM) as usize, n);
+    let mut image = vec![0u8; n];
+    read_at(
+        &guard.join("tail.0"),
+        (PAGE + TXID_STEM * PAGE) as u64,
+        &mut image,
+    );
+    let mut live = vec![0u8; n];
+    read_at(&body, off, &mut live);
+    assert_eq!(image, live);
+    assert!(first_commit_checks(&guard.join("first"), TXID_STEM));
+    let spent_len = logical_of(&dir.join("spent.body"));
+    let spent_file = std::fs::metadata(dir.join("spent.body")).unwrap().len();
+    assert!(
+        spent_len > spent_file,
+        "spent.body reached its published end"
+    );
+    assert_eq!(tail_len_of(&guard.join("tail.0"), 2), 0);
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.get(Fk(named)).unwrap(), txid);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The next append runs while `sync_class_a_stems` has finished `sync_data_all`
-/// and has not yet unlinked `.kept`. Zeroing the tail is that append's torn
-/// rewrite. Open must still return the txid the earlier sync named.
-#[cfg(debug_assertions)]
+/// A later barrier writes the other slot and leaves the sealed page alone.
 #[test]
-fn torn_tail_during_class_a_sync_keeps_the_named_txid() {
-    use std::sync::mpsc;
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    let dir = tmp();
+fn second_barrier_alternates_and_keeps_first() {
     let named = 128u64;
-    let txid = [0x80u8; 32];
-    let s = Arc::new(Store::create_tiny(&dir).unwrap());
-    let batch: Vec<_> = (1..=named)
-        .map(|i| {
-            let mut id = [i as u8; 32];
-            if i == named {
-                id = txid;
-            }
-            coinbase(id)
-        })
-        .collect();
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let batch: Vec<_> = (1..=named).map(|i| coinbase([i as u8; 32])).collect();
     s.put_tx_full_batch_indexed(&batch, false).unwrap();
     s.txs.sync_class_a_named(named).unwrap();
+    let guard = dir.join("tear_guard");
+    let tail0 = std::fs::read(guard.join("tail.0")).unwrap();
+    let sealed = first_image(&guard.join("first"), TXID_STEM);
     s.put_tx_full_batch_indexed(&[coinbase([0x81u8; 32])], false)
         .unwrap();
-    assert!(
-        dir.join("txid.body.kept").is_file(),
-        "the synced tail has no .kept for the overlapping append to skip"
-    );
-
-    let hold = Arc::new(rbitcoin_store::KeptDropHold::armed());
-    let release = ReleaseKept(&hold);
-    let s_sync = Arc::clone(&s);
-    let hold_sync = Arc::clone(&hold);
-    let sync_thread = std::thread::spawn(move || {
-        rbitcoin_store::bind_kept_drop_hold(Some(hold_sync));
-        let result = s_sync.txs.sync_class_a_named(named);
-        rbitcoin_store::bind_kept_drop_hold(None);
-        result
-    });
-    assert!(
-        hold.wait_until_entered(Duration::from_secs(30)),
-        "sync did not reach the .kept unlink"
-    );
-
-    let s_app = Arc::clone(&s);
-    let (done_tx, done_rx) = mpsc::channel();
-    let app_thread = std::thread::spawn(move || {
-        let result = s_app.put_tx_full_batch_indexed(&[coinbase([0x82u8; 32])], false);
-        let _ = done_tx.send(());
-        result
-    });
-    // The broken unlink lets this append finish while the sync is still paused.
-    // The fix holds the tail across that pause, so the append waits there.
-    assert!(
-        done_rx.recv_timeout(Duration::from_secs(2)).is_err(),
-        "append finished while the class A sync still held the tail lock"
-    );
-    release.release();
-    sync_thread
-        .join()
-        .expect("sync thread")
-        .expect("sync during the overlapping append");
-    app_thread
-        .join()
-        .expect("append thread")
-        .expect("append during the class A sync");
-    assert!(
-        dir.join("txid.body.kept").is_file(),
-        "the append after the unlink did not copy the named prefix"
-    );
+    s.txs.sync_class_a_named(named + 1).unwrap();
+    assert_eq!(generation_of(&guard.join("tail.1")), 2);
+    assert_eq!(std::fs::read(guard.join("tail.0")).unwrap(), tail0);
+    assert_eq!(first_image(&guard.join("first"), TXID_STEM), sealed);
     drop(s);
-
-    zero_published_tail_block(&dir.join("txid.body"));
-    let opened = Store::open_tiny(&dir).unwrap();
-    let got = opened.txs.txids.get(Fk(named)).unwrap();
-    assert_eq!(got, txid, "named txid became {got:?}");
-    assert_eq!(opened.get_tx(Fk(named)).unwrap().txid, txid);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(debug_assertions)]
-struct ReleaseKept<'a>(&'a rbitcoin_store::KeptDropHold);
-
-#[cfg(debug_assertions)]
-impl ReleaseKept<'_> {
-    fn release(&self) {
-        self.0.release();
-    }
+/// A txstat stamp in page 0 does not refresh the sealed image.
+#[test]
+fn txstat_stamp_does_not_rewrite_first() {
+    let dir = tmp();
+    let n = 510u64;
+    let s = Store::create_tiny(&dir).unwrap();
+    let batch: Vec<_> = (1..=n).map(|i| coinbase([i as u8; 32])).collect();
+    s.put_tx_full_batch_indexed(&batch, false).unwrap();
+    s.txs.sync_class_a_named(n).unwrap();
+    assert!(logical_of(&dir.join("txstat.body")) >= 4096);
+    let before = first_image(&dir.join("tear_guard/first"), 10);
+    s.write_txstat_row(
+        Fk(1),
+        &rbitcoin_store::TxStatRow {
+            fee_sat: 1,
+            base: 100,
+            wit_extra: 0,
+        },
+    )
+    .unwrap();
+    s.txs.sync_class_a_named(n).unwrap();
+    assert_eq!(first_image(&dir.join("tear_guard/first"), 10), before);
+    drop(s);
+    zero_page0(&dir.join("txstat.body"));
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txstat_row(Fk(1)).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[cfg(debug_assertions)]
-impl Drop for ReleaseKept<'_> {
-    fn drop(&mut self) {
-        self.0.release();
+/// Deleting the guard and reopening seals `first` and writes generation 1 before any append.
+#[test]
+fn reopen_without_guard_seals_before_append() {
+    let (dir, _txid) = synced_txid_past_page(128);
+    std::fs::remove_dir_all(dir.join("tear_guard")).unwrap();
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    let guard = dir.join("tear_guard");
+    assert!(first_commit_checks(&guard.join("first"), TXID_STEM));
+    assert_eq!(generation_of(&guard.join("tail.0")), 1);
+    assert_eq!(generation_of(&guard.join("tail.1")), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tail that still holds bytes is left, including when the slots do not check.
+#[test]
+fn nonzero_tail_left_in_place() {
+    let named = 128u64;
+    let (dir, txid) = synced_txid_past_page(named);
+    let guard = dir.join("tear_guard");
+    std::fs::create_dir_all(&guard).unwrap();
+    std::fs::write(guard.join("tail.0"), vec![0x5au8; TAIL_BYTES]).unwrap();
+    std::fs::write(guard.join("tail.1"), vec![0x5au8; TAIL_BYTES]).unwrap();
+    std::fs::write(guard.join("first"), vec![0u8; FIRST_BYTES]).unwrap();
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.get(Fk(named)).unwrap(), txid);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An append plus a Class A sync does not leave a per-stem `.kept` file.
+#[test]
+fn append_and_sync_leave_no_kept_sidecar() {
+    let named = 128u64;
+    let (dir, _txid) = synced_txid_past_page(named);
+    let s = Store::open_tiny(&dir).unwrap();
+    s.put_tx_full_batch_indexed(&[coinbase([0x81u8; 32])], false)
+        .unwrap();
+    s.txs.sync_class_a_named(named + 1).unwrap();
+    drop(s);
+    assert!(!dir.join("txid.body.kept").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A prebuilt `CATK` copy is the only image. Open restores it once and unlinks it.
+#[test]
+fn leftover_catk_restores_a_zeroed_tail_once() {
+    let named = 128u64;
+    let (dir, txid) = synced_txid_past_page(named);
+    let body = dir.join("txid.body");
+    let published = logical_of(&body);
+    let off = published & !4095;
+    let n = (published - off) as usize;
+    let mut image = vec![0u8; n];
+    read_at(&body, off, &mut image);
+    let mut kept = Vec::new();
+    kept.extend_from_slice(b"CATK");
+    kept.extend_from_slice(&off.to_le_bytes());
+    kept.extend_from_slice(&(n as u32).to_le_bytes());
+    kept.extend_from_slice(&image);
+    std::fs::write(dir.join("txid.body.kept"), &kept).unwrap();
+    zero_published_tail_block(&body);
+    // The barrier's slot would also restore this prefix. Wipe it so the copy is the image.
+    let guard = dir.join("tear_guard");
+    std::fs::write(guard.join("tail.0"), vec![0u8; TAIL_BYTES]).unwrap();
+    std::fs::write(guard.join("tail.1"), vec![0u8; TAIL_BYTES]).unwrap();
+    std::fs::write(guard.join("first"), vec![0u8; FIRST_BYTES]).unwrap();
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(s.txs.txids.get(Fk(named)).unwrap(), txid);
+    assert!(!dir.join("txid.body.kept").exists());
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `seqsigwit.*` can live in a cold directory. The guard stays on the hot
+/// store, and a zeroed cold first page is written back from that guard.
+#[test]
+fn zeroed_cold_seqsigwit_page0_restores_from_the_hot_guard() {
+    let hot = tmp();
+    let cold = hot.join("cold-seq");
+    std::fs::create_dir_all(&cold).unwrap();
+    {
+        let s = Store::create_tiny(&hot).unwrap();
+        s.put_tx_full_batch_indexed(&[coinbase([0x44u8; 32])], false)
+            .unwrap();
+        s.txs.sync_class_a_named(1).unwrap();
     }
+    // A split open keeps txstat and input next to seqsigwit. The guard stays hot.
+    let names: Vec<_> = std::fs::read_dir(&hot)
+        .unwrap()
+        .map(|ent| ent.unwrap().file_name())
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with("seqsigwit.")
+                || name.starts_with("txstat.")
+                || name.starts_with("input.")
+        })
+        .collect();
+    assert!(
+        names.iter().any(|name| name == "seqsigwit.body"),
+        "seqsigwit.body was not created"
+    );
+    let src = hot.join("seqsigwit.body");
+    let before = std::fs::read(&src).unwrap();
+    let n = before.len().min(PAGE);
+    assert!(n > 0 && before[..n].iter().any(|b| *b != 0));
+    for name in &names {
+        std::fs::rename(hot.join(name), cold.join(name)).unwrap();
+    }
+    let cold_body = cold.join("seqsigwit.body");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&cold_body)
+            .unwrap();
+        file.write_all(&vec![0u8; n]).unwrap();
+        file.sync_all().unwrap();
+    }
+    let table = rbitcoin_store::tx_table::TxTable::open_seqsigwit(
+        &hot,
+        &cold,
+        rbitcoin_store::HeadOpenOpts::TINY,
+        Some(1),
+    )
+    .unwrap();
+    drop(table);
+    assert!(hot.join("tear_guard/first").is_file());
+    assert!(hot.join("tear_guard/tail.0").is_file() || hot.join("tear_guard/tail.1").is_file());
+    assert!(!cold.join("tear_guard").exists());
+    let after = std::fs::read(&cold_body).unwrap();
+    assert_eq!(&after[..n], &before[..n]);
+    let _ = std::fs::remove_dir_all(&hot);
 }
