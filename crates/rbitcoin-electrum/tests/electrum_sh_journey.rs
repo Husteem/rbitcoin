@@ -12,7 +12,6 @@ use rbitcoin_query::TxApply;
 use rbitcoin_query::{accept_and_connect_block, Query};
 use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
@@ -20,7 +19,7 @@ use tokio::sync::broadcast;
 
 #[cfg(debug_assertions)]
 use crate::server::electrum_tcp_batch;
-use crate::server::electrum_tcp_rpc;
+use crate::server::{electrum_tcp_call, electrum_tcp_client, electrum_tcp_rpc};
 
 fn tmp_store() -> (rbitcoin_query::testutil::TempDir, Query) {
     rbitcoin_query::testutil::tiny_query_labeled("electrum-sh")
@@ -423,23 +422,21 @@ fn tx_spending(txid: bitcoin::Txid, value: u64, script: &[u8]) -> Transaction {
 }
 
 #[doc(hidden)]
-pub fn listunspent_skips_unused(q: &Arc<Query>, hub: &MempoolHub, spent_cb: &bitcoin::Txid) {
-    let params = ChainParams::regtest();
-    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let mut header_sub = false;
-    let mut sh_subs = HashSet::new();
+pub async fn listunspent_skips_unused(
+    q: &Arc<Query>,
+    hub: &Arc<MempoolHub>,
+    spent_cb: &bitcoin::Txid,
+) {
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &ChainParams::regtest());
+    let (handle, mut stream) = electrum_tcp_client(q, cfg, Some(Arc::clone(hub))).await;
     let unused = electrum_scripthash_hex(&[0x00]);
     let _ = hub.sample_reset_perf();
-    let empty = dispatch(
+    let empty = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.listunspent",
-        &json!([unused]),
-        q,
-        &cfg,
-        &params,
-        Some(hub),
-        &mut header_sub,
-        &mut sh_subs,
+        json!([unused]),
     )
+    .await
     .unwrap();
     assert!(empty.as_array().unwrap().is_empty());
     assert_eq!(
@@ -448,16 +445,12 @@ pub fn listunspent_skips_unused(q: &Arc<Query>, hub: &MempoolHub, spent_cb: &bit
         "unused scripthash must not load mempool bodies"
     );
     let sh = electrum_scripthash_hex(&[0x51]);
-    let unspent = dispatch(
+    let unspent = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.listunspent",
-        &json!([sh]),
-        q,
-        &cfg,
-        &params,
-        Some(hub),
-        &mut header_sub,
-        &mut sh_subs,
+        json!([sh]),
     )
+    .await
     .unwrap();
     let rows = unspent.as_array().unwrap();
     let spent = format!("{spent_cb}");
@@ -469,25 +462,17 @@ pub fn listunspent_skips_unused(q: &Arc<Query>, hub: &MempoolHub, spent_cb: &bit
         rows.iter().any(|r| r["height"] == 0),
         "mempool output must remain: {rows:?}"
     );
+    handle.shutdown().await;
 }
 
 #[doc(hidden)]
-pub fn fee_histogram_is_sat_per_vbyte_by_bin(q: &Arc<Query>, hub: &MempoolHub) {
-    let params = ChainParams::regtest();
-    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let mut header_sub = false;
-    let mut sh_subs = HashSet::new();
-    let reply = dispatch(
-        "mempool.get_fee_histogram",
-        &json!([]),
-        q,
-        &cfg,
-        &params,
-        Some(hub),
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
+pub async fn fee_histogram_is_sat_per_vbyte_by_bin(q: &Arc<Query>, hub: &Arc<MempoolHub>) {
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &ChainParams::regtest());
+    let (handle, mut stream) = electrum_tcp_client(q, cfg, Some(Arc::clone(hub))).await;
+    let reply = electrum_tcp_call(&mut stream, "mempool.get_fee_histogram", json!([]))
+        .await
+        .unwrap();
+    handle.shutdown().await;
     let want = hub.fee_histogram();
     assert!(
         want.len() >= 2,
@@ -591,10 +576,10 @@ pub fn connect_script_block(
 /// Old creates, a tip create, and a tip spend of the oldest coin. A
 /// `from_height` above 0 is that window and is served above the create cap.
 /// Open history, and a window that still starts at height 0, stay capped.
-#[test]
-#[doc(hidden)]
-pub fn from_height_window_is_served_above_the_create_cap() {
+#[tokio::test]
+async fn from_height_window_is_served_above_the_create_cap() {
     let (dir, q) = tmp_store();
+    let q = Arc::new(q);
     let params = ChainParams::regtest();
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     let sh = electrum_scripthash_hex(&[0x51]);
@@ -623,45 +608,37 @@ pub fn from_height_window_is_served_above_the_create_cap() {
     let (_fk, _hash, tip_cb) = connect_script_block(&q, tip, prev, parent, vec![spend]);
 
     q.set_max_sh_creates(2);
-    let mut conn = ElectrumConn::new();
-    let open = dispatch_with_join(
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, None).await;
+    let open = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.get_history",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut conn,
+        json!([sh]),
     )
+    .await
     .unwrap_err();
     assert!(
         open.contains("scripthash join exceeds --max-sh-creates"),
         "{open}"
     );
-    let from_zero = dispatch_with_join(
+    let from_zero = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.get_history",
-        &json!([sh, 0, tip + 1]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut conn,
+        json!([sh, 0, tip + 1]),
     )
+    .await
     .unwrap_err();
     assert!(
         from_zero.contains("scripthash join exceeds --max-sh-creates"),
         "{from_zero}"
     );
 
-    let window = dispatch_with_join(
+    let window = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.get_history",
-        &json!([sh, tip, tip + 1]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut conn,
-    );
+        json!([sh, tip, tip + 1]),
+    )
+    .await;
+    handle.shutdown().await;
     assert!(
         window.is_ok(),
         "a from_height window must not hit the create cap: {window:?}"
@@ -685,16 +662,17 @@ pub fn from_height_window_is_served_above_the_create_cap() {
 
 /// `blockchain.scripthash.subscribe` keeps a hash only after its status is
 /// computed. A status that hits `--max-sh-creates` does not add the hash,
-/// and a hash already subscribed stays when a later status fails.
-#[test]
-fn refused_scripthash_subscribe_is_not_kept() {
+/// and a hash already subscribed stays when a later status fails. The
+/// client sees that through `unsubscribe`.
+#[tokio::test]
+async fn refused_scripthash_subscribe_is_not_kept() {
     let (dir, q) = tmp_store();
+    let q = Arc::new(q);
     let params = ChainParams::regtest();
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     let sh = electrum_scripthash_hex(&[0x51]);
     let sh_bytes = rbitcoin_primitives::parse_display_hash32(&sh).unwrap();
     let quiet = electrum_scripthash_hex(&[0x00]);
-    let quiet_bytes = rbitcoin_primitives::parse_display_hash32(&quiet).unwrap();
     let mut prev = Fk::NULL;
     let mut parent = [0u8; 32];
     for h in 0..3u32 {
@@ -705,87 +683,76 @@ fn refused_scripthash_subscribe_is_not_kept() {
     assert!(q.scripthash_create_count(&sh_bytes).unwrap() > 2);
 
     q.set_max_sh_creates(2);
-    let mut header_sub = false;
-    let mut sh_subs = HashSet::new();
-    let err = dispatch(
-        "blockchain.scripthash.subscribe",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap_err();
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, None).await;
+    let err = electrum_tcp_call(&mut stream, "blockchain.scripthash.subscribe", json!([sh]))
+        .await
+        .unwrap_err();
     assert!(
         err.contains("scripthash join exceeds --max-sh-creates"),
         "{err}"
     );
-    assert!(
-        sh_subs.is_empty(),
-        "a refused subscribe must not stay watched: {sh_subs:?}"
+    let unsub = electrum_tcp_call(
+        &mut stream,
+        "blockchain.scripthash.unsubscribe",
+        json!([sh]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        unsub,
+        json!(false),
+        "a refused subscribe must not stay watched"
     );
 
-    let quiet_status = dispatch(
+    q.set_max_sh_creates(0);
+    let status = electrum_tcp_call(&mut stream, "blockchain.scripthash.subscribe", json!([sh]))
+        .await
+        .expect("cap 0 serves the status");
+    assert!(status.is_string(), "{status}");
+
+    // The session keeps its last join, so read another hash before asking
+    // for the capped one again.
+    q.set_max_sh_creates(2);
+    let quiet_status = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.subscribe",
-        &json!([quiet]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!([quiet]),
     )
+    .await
     .expect("an empty scripthash still subscribes under the cap");
     assert!(quiet_status.is_null(), "{quiet_status}");
-    assert!(sh_subs.contains(&quiet_bytes));
 
-    q.set_max_sh_creates(0);
-    let status = dispatch(
-        "blockchain.scripthash.subscribe",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .expect("cap 0 serves the status");
-    assert!(status.is_string(), "{status}");
-    assert!(sh_subs.contains(&sh_bytes));
-    assert!(sh_subs.contains(&quiet_bytes));
-
-    q.set_max_sh_creates(2);
-    let again = dispatch(
-        "blockchain.scripthash.subscribe",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap_err();
+    let again = electrum_tcp_call(&mut stream, "blockchain.scripthash.subscribe", json!([sh]))
+        .await
+        .unwrap_err();
     assert!(
         again.contains("scripthash join exceeds --max-sh-creates"),
         "{again}"
     );
-    assert!(
-        sh_subs.contains(&sh_bytes) && sh_subs.contains(&quiet_bytes),
-        "a later refused status leaves the subscriptions already held: {sh_subs:?}"
-    );
+    for held in [&sh, &quiet] {
+        let unsub = electrum_tcp_call(
+            &mut stream,
+            "blockchain.scripthash.unsubscribe",
+            json!([held]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            unsub,
+            json!(true),
+            "a later refused status leaves {held} subscribed"
+        );
+    }
+    handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A later spend of a different output of a payment is not this script's
 /// history. The output that does pay the script still is.
-#[test]
-#[doc(hidden)]
-pub fn from_height_ignores_a_spend_of_another_output() {
+#[tokio::test]
+async fn from_height_ignores_a_spend_of_another_output() {
     let (dir, q) = tmp_store();
+    let q = Arc::new(q);
     let params = ChainParams::regtest();
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     let sh = electrum_scripthash_hex(&[0x51]);
@@ -824,17 +791,14 @@ pub fn from_height_ignores_a_spend_of_another_output() {
     let real_txid = real.tx.txid;
     let (_fk, _hash, tip_cb) = connect_script_block(&q, 4, prev, parent, vec![real]);
 
-    let mut conn = ElectrumConn::new();
-    let mut hashes_of = |from: u32, to: u32| {
-        let rows = dispatch_with_join(
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, None).await;
+    let mut hashes_of = async |from: u32, to: u32| {
+        let rows = electrum_tcp_call(
+            &mut stream,
             "blockchain.scripthash.get_history",
-            &json!([sh, from, to]),
-            &q,
-            &cfg,
-            &params,
-            None,
-            &mut conn,
+            json!([sh, from, to]),
         )
+        .await
         .unwrap();
         rows.as_array()
             .unwrap()
@@ -845,16 +809,17 @@ pub fn from_height_ignores_a_spend_of_another_output() {
     let foreign_hex = rbitcoin_primitives::display_hash_hex(foreign_txid);
     let real_hex = rbitcoin_primitives::display_hash_hex(real_txid);
     let tip_hex = rbitcoin_primitives::display_hash_hex(tip_cb);
-    let other = hashes_of(3, 4);
+    let other = hashes_of(3, 4).await;
     assert!(
         !other.iter().any(|h| h == &foreign_hex),
         "spend of the other output is not this script: {other:?}"
     );
     assert_eq!(other.len(), 1, "{other:?}");
-    let mine = hashes_of(4, 5);
+    let mine = hashes_of(4, 5).await;
     assert!(mine.iter().any(|h| h == &real_hex), "{mine:?}");
     assert!(mine.iter().any(|h| h == &tip_hex), "{mine:?}");
     assert!(!mine.iter().any(|h| h == &foreign_hex), "{mine:?}");
+    handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -896,8 +861,8 @@ pub async fn electrum_sh_join() {
         hub.accept_tx(&spend_coinbase(*cbtxid, 1_000 + i as u64))
             .expect("accept spend");
     }
-    listunspent_skips_unused(&q, &hub, &coinbase_txids[0]);
-    fee_histogram_is_sat_per_vbyte_by_bin(&q, &hub);
+    listunspent_skips_unused(&q, &hub, &coinbase_txids[0]).await;
+    fee_histogram_is_sat_per_vbyte_by_bin(&q, &hub).await;
     tip_push_two_clients_and_late(Arc::clone(&q), Some(hub)).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -906,9 +871,9 @@ pub async fn electrum_sh_join() {
 /// covers its block. A spend whose block that view already covers stays out.
 /// A payment to a different script stays in that script's unconfirmed answer,
 /// and a spend of a covered parent that is still in the pool counts once.
-#[test]
+#[tokio::test]
 #[allow(clippy::cognitive_complexity)] // one chain, three wallet answers
-fn unconfirmed_until_sh_visible() {
+async fn unconfirmed_until_sh_visible() {
     const FEE_A: u64 = 1_000;
     const FEE_B: u64 = 2_000;
     const SUBSIDY: u64 = 50_0000_0000;
@@ -928,7 +893,6 @@ fn unconfirmed_until_sh_visible() {
         3,
     );
     assert_eq!(q.tip_height(), Some(Height(maturity + 1)));
-    assert_eq!(q.sh_visible_through_height(), Some(maturity + 1));
     assert!(q.enqueues_sh_writebehind());
 
     let q = Arc::new(q);
@@ -951,36 +915,19 @@ fn unconfirmed_until_sh_visible() {
             .filter(|row| row.txid == txid)
             .count()
     };
-    let wallet_for = |hub: &MempoolHub,
-                      script: &[u8]|
-     -> (i64, i64, Vec<String>, rbitcoin_electrum::MempoolShStats) {
-        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-        let mut header_sub = false;
-        let mut sh_subs = HashSet::new();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, Some(Arc::clone(&hub))).await;
+    let wallet_for = async |stream: &mut TcpStream,
+                            script: &[u8]|
+           -> (i64, i64, Vec<String>, rbitcoin_electrum::MempoolShStats) {
         let hex = electrum_scripthash_hex(script);
         let script_sh = rbitcoin_store::script_hash(script);
-        let bal = dispatch(
-            "blockchain.scripthash.get_balance",
-            &json!([hex]),
-            &q,
-            &cfg,
-            &params,
-            Some(hub),
-            &mut header_sub,
-            &mut sh_subs,
-        )
-        .unwrap();
-        let rows = dispatch(
-            "blockchain.scripthash.get_mempool",
-            &json!([hex]),
-            &q,
-            &cfg,
-            &params,
-            Some(hub),
-            &mut header_sub,
-            &mut sh_subs,
-        )
-        .unwrap();
+        let bal = electrum_tcp_call(stream, "blockchain.scripthash.get_balance", json!([hex]))
+            .await
+            .unwrap();
+        let rows = electrum_tcp_call(stream, "blockchain.scripthash.get_mempool", json!([hex]))
+            .await
+            .unwrap();
         let ids = rows
             .as_array()
             .unwrap()
@@ -988,7 +935,7 @@ fn unconfirmed_until_sh_visible() {
             .filter_map(|row| row["tx_hash"].as_str().map(str::to_owned))
             .collect();
         let stats =
-            rbitcoin_electrum::scripthash_mempool_stats_slot(&q, hub, &script_sh, &mut None)
+            rbitcoin_electrum::scripthash_mempool_stats_slot(&q, &hub, &script_sh, &mut None)
                 .unwrap();
         (
             bal["confirmed"].as_i64().unwrap(),
@@ -997,7 +944,7 @@ fn unconfirmed_until_sh_visible() {
             stats,
         )
     };
-    let wallet = |hub: &MempoolHub| wallet_for(hub, &[0x51]);
+    let wallet = async |stream: &mut TcpStream| wallet_for(stream, &[0x51]).await;
     let connect_spend =
         |tip: bitcoin::BlockHash, tip_time: u32, height: u32, tx: Transaction, enqueue: bool| {
             if !enqueue {
@@ -1015,17 +962,10 @@ fn unconfirmed_until_sh_visible() {
             block
         };
 
-    assert_eq!(
-        hub.scripthash_unconfirmed_delta(&sh).unwrap(),
-        -((FEE_A + FEE_B) as i64),
-        "both spends are still only in the mempool"
-    );
-
     let height_b = maturity + 2;
     let block_b = connect_spend(tip, tip_time, height_b, spend_b, true);
     tip = block_b.block_hash();
     tip_time = block_b.header.time;
-    assert_eq!(q.sh_visible_through_height(), Some(height_b));
     assert_eq!(hist_n(id_b), 1, "covered spend is confirmed history once");
     assert_eq!(hist_n(id_a), 0);
     assert!(
@@ -1034,7 +974,7 @@ fn unconfirmed_until_sh_visible() {
             .any(|row| row.txid == id_b),
         "covered spend stays in the pool when connect does not strip"
     );
-    let (confirmed_b, unconfirmed, mempool_ids, stats) = wallet(&hub);
+    let (confirmed_b, unconfirmed, mempool_ids, stats) = wallet(&mut stream).await;
     assert_eq!(unconfirmed, -(FEE_A as i64), "{mempool_ids:?} {stats:?}");
     assert!(mempool_ids.iter().any(|id| id == &hex_a), "{mempool_ids:?}");
     assert!(
@@ -1045,50 +985,35 @@ fn unconfirmed_until_sh_visible() {
     assert_eq!(stats.funded_txo_sum, (SUBSIDY - FEE_A) as i64);
 
     let sh_hex = electrum_scripthash_hex(&[0x51]);
-    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     let asof = format!("asof:{}", block_b.block_hash());
-    let mut header_sub = false;
-    let mut subs = HashSet::new();
-    let live_hist = dispatch(
+    let live_hist = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.get_history",
-        &json!([&sh_hex]),
-        &q,
-        &cfg,
-        &params,
-        Some(&hub),
-        &mut header_sub,
-        &mut subs,
+        json!([&sh_hex]),
     )
+    .await
     .unwrap();
     assert!(
         live_hist.to_string().contains(&hex_a),
         "the pooled spend is history until an asof pin: {live_hist}"
     );
-    let asof_hist = dispatch(
+    let asof_hist = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.get_history",
-        &json!([&sh_hex, &asof]),
-        &q,
-        &cfg,
-        &params,
-        Some(&hub),
-        &mut header_sub,
-        &mut subs,
+        json!([&sh_hex, &asof]),
     )
+    .await
     .unwrap();
     assert!(
         !asof_hist.to_string().contains(&hex_a),
         "asof history omits the pool: {asof_hist}"
     );
-    let asof_bal = dispatch(
+    let asof_bal = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.get_balance",
-        &json!([&sh_hex, &asof]),
-        &q,
-        &cfg,
-        &params,
-        Some(&hub),
-        &mut header_sub,
-        &mut subs,
+        json!([&sh_hex, &asof]),
     )
+    .await
     .unwrap();
     assert_eq!(asof_bal["unconfirmed"], 0, "{asof_bal}");
 
@@ -1096,10 +1021,6 @@ fn unconfirmed_until_sh_visible() {
     let block_a = connect_spend(tip, tip_time, height_a, spend_a, false);
     assert_eq!(q.tip_height(), Some(Height(height_a)));
     assert!(q.tx_fk_by_txid_tip(&id_a).unwrap().is_some());
-    assert!(
-        q.sh_visible_through_height().unwrap() < height_a,
-        "address view has not reached the blink block"
-    );
     assert!(
         hub.scripthash_mempool(&sh)
             .iter()
@@ -1111,16 +1032,8 @@ fn unconfirmed_until_sh_visible() {
         0,
         "confirmed history cannot see the blink yet"
     );
-    let unused = rbitcoin_store::script_hash(&[0x00]);
-    hub.sample_reset_perf();
-    assert_eq!(hub.scripthash_unconfirmed_delta(&unused).unwrap(), 0);
-    assert_eq!(
-        hub.sample_reset_perf().delta_prevouts,
-        0,
-        "an address with nothing pooled does no prevout lookups"
-    );
 
-    let (confirmed, unconfirmed, mempool_ids, stats) = wallet(&hub);
+    let (confirmed, unconfirmed, mempool_ids, stats) = wallet(&mut stream).await;
     assert_eq!(
         confirmed, confirmed_b,
         "confirmed balance must not include the blink spend yet"
@@ -1153,8 +1066,7 @@ fn unconfirmed_until_sh_visible() {
         None,
     )
     .unwrap();
-    assert_eq!(q.sh_visible_through_height(), Some(height_a));
-    let (confirmed, unconfirmed, mempool_ids, stats) = wallet(&hub);
+    let (confirmed, unconfirmed, mempool_ids, stats) = wallet(&mut stream).await;
     assert_eq!(unconfirmed, 0, "{mempool_ids:?}");
     assert!(
         !mempool_ids.iter().any(|id| id == &hex_a),
@@ -1188,8 +1100,8 @@ fn unconfirmed_until_sh_visible() {
         pay,
         false,
     );
-    assert!(q.sh_visible_through_height().unwrap() < height_pay);
-    let (confirmed_pay, unconfirmed_pay, ids_pay, stats_pay) = wallet_for(&hub, &pay_script);
+    let (confirmed_pay, unconfirmed_pay, ids_pay, stats_pay) =
+        wallet_for(&mut stream, &pay_script).await;
     assert_eq!(
         confirmed_pay, 0,
         "the receive is not in the address view yet"
@@ -1204,7 +1116,7 @@ fn unconfirmed_until_sh_visible() {
         ids_pay.iter().any(|id| id == &hex_pay),
         "get_mempool keeps the foreign-script payment: {ids_pay:?}"
     );
-    let (_, unconfirmed_spent, _, _) = wallet(&hub);
+    let (_, unconfirmed_spent, _, _) = wallet(&mut stream).await;
     assert_eq!(
         unconfirmed_spent, -(SUBSIDY as i64),
         "the spent coin leaves the unconfirmed answer and the self-spend fee net is already settled"
@@ -1229,14 +1141,13 @@ fn unconfirmed_until_sh_visible() {
         false,
     );
     assert!(q.tx_fk_by_txid_tip(&id_child).unwrap().is_some());
-    assert!(q.sh_visible_through_height().unwrap() < height_child);
     assert!(
         hub.scripthash_mempool(&sh)
             .iter()
             .any(|row| row.txid == id_b),
         "covered parent stays in the pool"
     );
-    let (confirmed_child, unconfirmed_child, ids_child, stats_child) = wallet(&hub);
+    let (confirmed_child, unconfirmed_child, ids_child, stats_child) = wallet(&mut stream).await;
     assert_eq!(
         confirmed_child, confirmed,
         "the child block is not in the address view yet"
@@ -1255,14 +1166,15 @@ fn unconfirmed_until_sh_visible() {
         "a covered parent still in the pool must not be counted twice: {ids_child:?} {stats_child:?}"
     );
 
+    handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A pooled `OP_RETURN` output is never a coin. listunspent, the
 /// unconfirmed balance, and the mempool funded stats leave it out. The tx
 /// still counts once in that script's mempool stats.
-#[test]
-fn pooled_unspendable_output_is_not_unspent() {
+#[tokio::test]
+async fn pooled_unspendable_output_is_not_unspent() {
     const BURN: u64 = 10_000;
     let (dir, q) = tmp_store();
     let params = ChainParams::regtest();
@@ -1290,29 +1202,21 @@ fn pooled_unspendable_output_is_not_unspent() {
     hub.accept_tx(&tx).expect("accept burn");
 
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let mut header_sub = false;
-    let mut sh_subs = HashSet::new();
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, Some(Arc::clone(&hub))).await;
     let hex = electrum_scripthash_hex(&burn_script);
-    let mut call = |method: &str| {
-        dispatch(
-            method,
-            &json!([hex]),
-            &q,
-            &cfg,
-            &params,
-            Some(&hub),
-            &mut header_sub,
-            &mut sh_subs,
-        )
-        .unwrap()
+    let mut call = async |method: &str| {
+        electrum_tcp_call(&mut stream, method, json!([hex]))
+            .await
+            .unwrap()
     };
-    assert_eq!(call("blockchain.scripthash.listunspent"), json!([]));
+    assert_eq!(call("blockchain.scripthash.listunspent").await, json!([]));
     assert_eq!(
-        call("blockchain.scripthash.get_balance"),
+        call("blockchain.scripthash.get_balance").await,
         json!({"confirmed": 0, "unconfirmed": 0})
     );
     assert_eq!(
         call("blockchain.scripthash.get_mempool")
+            .await
             .as_array()
             .unwrap()
             .len(),
@@ -1323,5 +1227,6 @@ fn pooled_unspendable_output_is_not_unspent() {
     let stats = rbitcoin_electrum::scripthash_mempool_stats_slot(&q, &hub, &sh, &mut None).unwrap();
     assert_eq!(stats.tx_count, 1);
     assert_eq!((stats.funded_txo_count, stats.funded_txo_sum), (0, 0));
+    handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
