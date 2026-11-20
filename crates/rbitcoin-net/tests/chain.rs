@@ -7744,33 +7744,57 @@ fn equal_work_sibling_pair_connects_exactly_one_tip() {
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
     let t = 1_700_000_000u32;
-    let a = mine(gen, t, 1);
-    let b = mine_distinct(gen, t, 1, &[a.block_hash()]);
+    let b1 = mine(gen, t, 1);
+    hub.accept_block(b1.clone()).unwrap();
+    let mut prev = b1.block_hash();
+    for h in 2..=102u32 {
+        let b = mine(prev, t.saturating_add(h), h);
+        hub.accept_block(b.clone()).unwrap();
+        prev = b.block_hash();
+    }
+    // Two siblings at 103, each with a real script job: spend a mature
+    // OP_TRUE coinbase. The height 2 and 3 coinbases mature at 103.
+    let out2 = hub.block_at_height(2).unwrap().expect("height 2");
+    let out3 = hub.block_at_height(3).unwrap().expect("height 3");
+    let a = spend_block(prev, t.saturating_add(103), 103, coinbase_out(&out2));
+    let b = spend_block(prev, t.saturating_add(104), 103, coinbase_out(&out3));
     assert_eq!(a.header.prev_blockhash, b.header.prev_blockhash);
     // Park the sibling before the first accept so the pair path sees it.
     hub.hold_unconnected_body(b.clone());
     let out = hub.accept_received_block(a.clone()).unwrap();
     assert!(
-        matches!(out, AcceptOutcome::Accepted { height: 1 }),
-        "first candidate wins: {out:?}"
+        matches!(
+            out,
+            AcceptOutcome::Accepted { .. } | AcceptOutcome::IgnoredWeaker
+        ),
+        "one of the pair wins: {out:?}"
     );
-    assert_eq!(hub.tip_hash().unwrap(), a.block_hash());
-    assert!(hub.is_connected(&a.block_hash()));
-    assert!(!hub.is_connected(&b.block_hash()));
+    let (won, lost) = if hub.tip_hash() == Some(a.block_hash()) {
+        (a.clone(), b.clone())
+    } else {
+        (b.clone(), a.clone())
+    };
+    assert_eq!(hub.tip_height(), Some(103));
+    assert_eq!(hub.tip_hash(), Some(won.block_hash()));
+    assert!(!hub.is_connected(&lost.block_hash()));
+    assert!(hub.held_body(&lost.block_hash()).is_some());
     // The loser's own job reports a lost equal-work race and moves nothing.
-    let out_b = hub.accept_received_block(b.clone()).unwrap();
-    assert!(matches!(out_b, AcceptOutcome::IgnoredWeaker), "{out_b:?}");
-    assert_eq!(hub.tip_hash().unwrap(), a.block_hash());
+    let out_lost = hub.accept_received_block(lost.clone()).unwrap();
+    assert!(
+        matches!(out_lost, AcceptOutcome::IgnoredWeaker),
+        "{out_lost:?}"
+    );
+    assert_eq!(hub.tip_hash(), Some(won.block_hash()));
     // A child of the winner must connect. A stale loser plan left in
-    // `ConfirmParentCache` at height 1 makes its parent MTP/bits lookup bind
-    // the loser and reject the child.
-    let child = mine(a.block_hash(), t.saturating_add(1), 2);
+    // `ConfirmParentCache` at 103 makes its parent MTP/bits lookup bind the
+    // loser and reject the child.
+    let child = mine(won.block_hash(), t.saturating_add(105), 104);
     let out_c = hub.accept_received_block(child.clone()).unwrap();
     assert!(
-        matches!(out_c, AcceptOutcome::Accepted { height: 2 }),
+        matches!(out_c, AcceptOutcome::Accepted { height: 104 }),
         "{out_c:?}"
     );
-    assert_eq!(hub.tip_hash().unwrap(), child.block_hash());
+    assert_eq!(hub.tip_hash(), Some(child.block_hash()));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -7864,5 +7888,40 @@ fn failed_heavier_branch_does_not_strand_the_tip_child() {
     );
     assert_eq!(hub.tip_hash().unwrap(), child.block_hash());
     assert!(hub.is_block_invalid(&q1.block_hash()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// T3: a valid heavier held branch connects before the tip child. The child
+/// is parked and its caller is told it did not win.
+#[test]
+fn valid_heavier_branch_wins_before_the_tip_child() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t = 1_700_000_000u32;
+    let b1 = mine(gen, t, 1);
+    hub.accept_block(b1.clone()).unwrap();
+    let mut prev = b1.block_hash();
+    for h in 2..=101u32 {
+        let b = mine(prev, t.saturating_add(h), h);
+        hub.accept_block(b.clone()).unwrap();
+        prev = b.block_hash();
+    }
+    let fork = hub.block_at_height(100).unwrap().expect("height 100");
+    let q1 = mine(fork.block_hash(), t.saturating_add(101), 101);
+    let q2 = mine(q1.block_hash(), t.saturating_add(102), 102);
+    let q3 = mine(q2.block_hash(), t.saturating_add(103), 103);
+    hub.hold_unconnected_body(q1.clone());
+    hub.hold_unconnected_body(q2);
+    hub.hold_unconnected_body(q3.clone());
+    // A non-coinbase child so the preemption runs.
+    let out2 = hub.block_at_height(2).unwrap().expect("height 2");
+    let child = spend_block(prev, t.saturating_add(102), 102, coinbase_out(&out2));
+    let out = hub.accept_received_block(child.clone()).unwrap();
+    assert!(matches!(out, AcceptOutcome::IgnoredWeaker), "{out:?}");
+    assert_eq!(hub.tip_hash(), Some(q3.block_hash()));
+    assert_eq!(hub.tip_height(), Some(103));
+    assert!(!hub.is_connected(&child.block_hash()));
+    assert!(hub.held_body(&child.block_hash()).is_some());
     let _ = std::fs::remove_dir_all(dir);
 }

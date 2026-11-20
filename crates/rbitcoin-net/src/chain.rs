@@ -3678,18 +3678,19 @@ impl ChainHub {
                             }
                         }
                     }
-                    if let Some(sib) = self.equal_work_sibling(hash, &block, waive) {
-                        let preferred = Arc::clone(&block);
-                        let won = self.connect_at_impl(height, block, waive, None, Some(sib))?;
-                        if won {
-                            return Ok(AcceptOutcome::Accepted { height });
-                        }
-                        // The sibling connected. Park this equal-work loser
-                        // and tell its caller it did not win.
-                        if hold_unconnected {
+                    if hold_unconnected {
+                        if let Some(sib) = self.equal_work_sibling(hash, &block, waive) {
+                            let preferred = Arc::clone(&block);
+                            let won =
+                                self.connect_at_impl(height, block, waive, None, Some(sib))?;
+                            if won {
+                                return Ok(AcceptOutcome::Accepted { height });
+                            }
+                            // The sibling connected. Park this equal-work
+                            // loser and tell its caller it did not win.
                             self.hold_body(preferred, waive);
+                            return Ok(AcceptOutcome::IgnoredWeaker);
                         }
-                        return Ok(AcceptOutcome::IgnoredWeaker);
                     }
                     self.connect_at(height, block, waive, None)?;
                     return Ok(AcceptOutcome::Accepted { height });
@@ -4825,52 +4826,68 @@ impl ChainHub {
             self.script_phase.store(true, Ordering::Release);
             ScriptPhaseGuard(&self.script_phase)
         });
-        let run = self
-            .clock
-            .with_frozen(|| loop {
-                match rbitcoin_query::confirm_run::waive_batch(waive, || {
-                    match (&pair, &pair_pres, &pair_pre) {
-                        (Some(p), Some(pp), Some(pre)) => {
-                            accept_and_connect_block_pair_preverified(
-                                &self.query,
-                                &self.params,
-                                self.milestone,
-                                Height(height),
-                                Arc::clone(&block),
-                                &preverified,
-                                std::sync::Arc::clone(&pres),
-                                Arc::clone(p),
-                                pre,
-                                std::sync::Arc::clone(pp),
-                                Some(&self.script_phase),
-                            )
-                        }
-                        _ => accept_and_connect_block_preverified(
-                            &self.query,
-                            &self.params,
-                            Height(height),
-                            Arc::clone(&block),
-                            self.milestone,
-                            &preverified,
-                            Some(std::sync::Arc::clone(&pres)),
-                        )
-                        .map(|fk| rbitcoin_query::confirm_run::PairRun {
-                            winner: 0,
-                            fks: vec![fk],
-                            loser: [0; 32],
-                            loser_error: None,
-                        }),
-                    }
-                }) {
-                    Ok(v) => return Ok(v),
-                    Err(e) if e.is_uring_session_fault() => {
-                        self.query.uring_recover_or_abort("tip-connect");
-                        continue;
-                    }
-                    Err(e) => return Err(e),
+        let run = self.clock.with_frozen(|| loop {
+            match rbitcoin_query::confirm_run::waive_batch(waive, || {
+                match (&pair, &pair_pres, &pair_pre) {
+                    (Some(p), Some(pp), Some(pre)) => accept_and_connect_block_pair_preverified(
+                        &self.query,
+                        &self.params,
+                        self.milestone,
+                        Height(height),
+                        Arc::clone(&block),
+                        &preverified,
+                        std::sync::Arc::clone(&pres),
+                        Arc::clone(p),
+                        pre,
+                        std::sync::Arc::clone(pp),
+                        Some(&self.script_phase),
+                    ),
+                    _ => accept_and_connect_block_preverified(
+                        &self.query,
+                        &self.params,
+                        Height(height),
+                        Arc::clone(&block),
+                        self.milestone,
+                        &preverified,
+                        Some(std::sync::Arc::clone(&pres)),
+                    )
+                    .map(|fk| rbitcoin_query::confirm_run::PairRun {
+                        winner: 0,
+                        fks: vec![fk],
+                        loser: [0; 32],
+                        loser_error: None,
+                    })
+                    .map_err(|e| rbitcoin_query::confirm_run::PairFailure {
+                        error: e,
+                        hash: block.block_hash().to_byte_array(),
+                        other: None,
+                    }),
                 }
-            })
-            .map_err(|e| connect_error_to_net(e, hash, height))?;
+            }) {
+                Ok(v) => return Ok(v),
+                Err(f) if f.error.is_uring_session_fault() => {
+                    self.query.uring_recover_or_abort("tip-connect");
+                    continue;
+                }
+                Err(f) => return Err(f),
+            }
+        });
+        let run = match run {
+            Ok(run) => run,
+            Err(f) => {
+                // Each candidate's own error, so a valid preferred block is
+                // not marked with its sibling's verdict.
+                if let Some((other_error, other_hash)) = f.other {
+                    let h = bitcoin::BlockHash::from_byte_array(other_hash);
+                    let net = connect_error_to_net(other_error, h, height);
+                    self.remember_failed_accept(h, &net);
+                }
+                let h = bitcoin::BlockHash::from_byte_array(f.hash);
+                let net = connect_error_to_net(f.error, h, height);
+                self.remember_failed_accept(h, &net);
+                return Err(net);
+            }
+        };
         let winner = run.winner;
         let fk = run.fks.first().copied();
         // A candidate that failed rather than losing the race is a block
@@ -4882,9 +4899,11 @@ impl ChainHub {
         }
         if winner == 1 {
             if let Some(p) = pair {
+                let winner_hash = p.block_hash();
                 block = p;
-                hash = block.block_hash();
+                hash = winner_hash;
                 header = block.header;
+                self.held_bodies.write().unwrap().remove(&winner_hash);
                 if let Some(pr) = pair_pres {
                     pres = pr;
                 }

@@ -168,7 +168,7 @@ impl Inflight {
             started: index_started,
         } = index_jobs;
         let started = if !publish {
-            start_for_each_owned_held(scripts, apply_script)
+            start_for_each_owned_held(scripts, apply_script, batch.trust_peer)
         } else if batch.trust_peer {
             start_for_each_owned_keep(scripts, apply_script)
         } else {

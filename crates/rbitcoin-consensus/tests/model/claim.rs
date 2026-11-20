@@ -31,7 +31,6 @@ fn claim_holds_in_wave_before_next_advances() {
             done_cv: std::sync::Condvar::new(),
             pair: std::sync::Mutex::new(None),
             pair_capped: std::sync::atomic::AtomicBool::new(false),
-            half_cap: std::sync::atomic::AtomicBool::new(false),
             published: std::sync::atomic::AtomicBool::new(true),
         });
         let freed = Arc::new(AtomicBool::new(false));
