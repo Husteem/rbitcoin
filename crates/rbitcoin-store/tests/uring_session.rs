@@ -3,6 +3,25 @@ use rbitcoin_store::uring_session::*;
 use std::path::Path;
 use std::time::Duration;
 
+/// Assert the child died by SIGABRT with `reason` in its stderr. A panic with
+/// an SQE pending also aborts (unwind drops the session), so a child that
+/// printed `panicked` did not reach the path under test.
+#[cfg(target_os = "linux")]
+pub(crate) fn assert_child_aborted(out: &std::process::Output, reason: &str, what: &str) {
+    use std::os::unix::process::ExitStatusExt;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.signal(),
+        Some(6),
+        "{what} must SIGABRT: {:?}\n{stderr}",
+        out.status
+    );
+    assert!(
+        stderr.contains(reason) && !stderr.contains("panicked"),
+        "{what} must abort with `{reason}`, not a panic:\n{stderr}"
+    );
+}
+
 /// With no pending SQE an enter failure is an ordinary error. With pending
 /// SQEs it aborts like the hard cap: those SQEs still own caller buffers.
 #[test]
@@ -26,13 +45,10 @@ fn enter_failure_with_pending_matches_the_hard_cap() {
             .env(CHILD, "1")
             .output()
             .expect("child test");
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(
-            out.status.signal(),
-            Some(6),
-            "enter failure with pending SQEs must SIGABRT: {:?}\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
+        assert_child_aborted(
+            &out,
+            "drain hard cap pending=2",
+            "enter failure with pending SQEs",
         );
     }
 }
@@ -208,13 +224,10 @@ fn drain_guard_drop_with_leftover_pending_aborts() {
     if out.status.code() == Some(77) {
         return;
     }
-    use std::os::unix::process::ExitStatusExt;
-    assert_eq!(
-        out.status.signal(),
-        Some(6),
-        "drain guard drop with a leftover id must SIGABRT: {:?}\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+    assert_child_aborted(
+        &out,
+        "drain hard cap pending=1",
+        "drain guard drop with a leftover id",
     );
 }
 
@@ -252,13 +265,10 @@ fn drain_all_with_no_completions_for_the_hard_cap_aborts() {
     if out.status.code() == Some(77) {
         return;
     }
-    use std::os::unix::process::ExitStatusExt;
-    assert_eq!(
-        out.status.signal(),
-        Some(6),
-        "drain_all past the hard cap must SIGABRT: {:?}\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+    assert_child_aborted(
+        &out,
+        "drain hard cap pending=1",
+        "drain_all past the hard cap",
     );
 }
 
@@ -955,12 +965,9 @@ fn abort_guard_does_not_drain_leftover() {
     if out.status.code() == Some(77) {
         return;
     }
-    use std::os::unix::process::ExitStatusExt;
-    assert_eq!(
-        out.status.signal(),
-        Some(6),
-        "abort_guard with a real pending pread must SIGABRT, not drain: {:?}\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+    assert_child_aborted(
+        &out,
+        "drain hard cap pending=1",
+        "abort_guard with a real pending pread",
     );
 }

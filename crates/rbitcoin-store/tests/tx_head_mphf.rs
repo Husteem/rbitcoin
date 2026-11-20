@@ -40,7 +40,7 @@ fn index_batch_held_session_submits_g_pages() {
 /// child would exit 0.
 #[test]
 #[cfg(target_os = "linux")]
-fn index_batch_held_session_rejects_foreign_kind_leftover() {
+fn index_batch_held_session_aborts_on_foreign_kind_leftover() {
     use std::io::Write;
     const CHILD: &str = "RBITCOIN_BDZ_HELD_LEFTOVER_CHILD";
     if let Some(dir) = std::env::var_os(CHILD) {
@@ -87,7 +87,7 @@ fn index_batch_held_session_rejects_foreign_kind_leftover() {
     let out = std::process::Command::new(exe)
         .args([
             "--exact",
-            "tx_head_mphf::index_batch_held_session_rejects_foreign_kind_leftover",
+            "tx_head_mphf::index_batch_held_session_aborts_on_foreign_kind_leftover",
             "--nocapture",
         ])
         .env(CHILD, &dir)
@@ -98,13 +98,10 @@ fn index_batch_held_session_rejects_foreign_kind_leftover() {
     if out.status.code() == Some(77) {
         return;
     }
-    use std::os::unix::process::ExitStatusExt;
-    assert_eq!(
-        out.status.signal(),
-        Some(6),
-        "held index_batch with a foreign leftover must SIGABRT: {:?}\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+    crate::uring_session::assert_child_aborted(
+        &out,
+        "drain hard cap pending=1",
+        "held index_batch with a foreign leftover",
     );
 }
 
