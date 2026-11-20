@@ -5021,6 +5021,49 @@ async fn write_peer_msg(raw: &mut V2PlainSession, msg: NetworkMessage) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mapped_external_endpoint_is_announced_as_ipv4_at_the_public_port() {
+    let mut t = paused_serve(
+        "external-endpoint",
+        0,
+        &["/rbitcoin:test(external-endpoint)/"],
+    )
+    .await;
+    let (raw, sess) = &mut t.clients[0];
+    let announced = tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(next_peer_msg(raw).await.unwrap(), NetworkMessage::Ping(_)) {}
+        let listen_port = t.node.local_addr.port();
+        let public_port = if listen_port == 28333 { 28334 } else { 28333 };
+        t.node.peers.set_listen_port(listen_port);
+        t.node.peers.set_external_endpoints(
+            [
+                "42.42.42.42",
+                "8.8.8.8",
+                &format!("[::ffff:42.42.42.42]:{public_port}"),
+            ]
+            .map(|address| address.parse().unwrap())
+            .to_vec(),
+        );
+        sess.queue_self_announce_if_due();
+        loop {
+            if let NetworkMessage::AddrV2(addrs) = next_peer_msg(raw).await.unwrap() {
+                return (addrs, public_port);
+            }
+        }
+    })
+    .await;
+    raw.close();
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+    let (addrs, public_port) = announced.expect("read the external addrv2 announcement");
+    assert_eq!(addrs.len(), 1);
+    assert_eq!(
+        addrs[0].addr,
+        bitcoin::p2p::address::AddrV2::Ipv4(Ipv4Addr::new(42, 42, 42, 42))
+    );
+    assert_eq!(addrs[0].port, public_port);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rate_limited_block_request_disconnects_without_waiting_for_another_message() {
     let mut t = paused_serve("rate-request", 1, &["/rbitcoin:test(rate-request)/"]).await;
     let (raw, _) = &mut t.clients[0];

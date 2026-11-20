@@ -321,6 +321,7 @@ fn wallet_sync_ip(ip: IpAddr) -> bool {
 pub struct NetPermTable {
     pub whitelist: Vec<WhitelistGrant>,
     pub whitebind: Vec<WhitebindGrant>,
+    pub onion_bind: Option<SocketAddr>,
 }
 
 impl NetPermTable {

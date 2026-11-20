@@ -1,3 +1,4 @@
+use rbitcoin_net::netaddr::ExternalEndpoint;
 fn work_floor(low: u8) -> [u8; 32] {
     let mut min = [0u8; 32];
     min[31] = low;
@@ -1578,12 +1579,10 @@ fn self_announce_clearnet_then_overlay() {
 /// externalip is sent once, again after a day, and not when it is loopback
 /// or `--no-discover` is set.
 fn self_announce_clearnet(peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>) {
-    use std::net::{IpAddr, Ipv4Addr};
-
     let peer = live_peer(peers, 18480, 13, false);
     assert!(peer.take_local_addr_due(1_000).is_none());
     peers.set_listen_port(18445);
-    peers.set_external_ips(vec![IpAddr::V4(Ipv4Addr::new(42, 42, 42, 42))]);
+    peers.set_external_endpoints(vec!["42.42.42.42".parse().unwrap()]);
     let first = peer
         .take_local_addr_due(1_000)
         .expect("initial self-announce");
@@ -1594,13 +1593,13 @@ fn self_announce_clearnet(peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>) 
         .take_local_addr_due(1_000 + 24 * 3600)
         .expect("daily self-announce");
     assert_eq!(again.to_string(), "42.42.42.42:18445");
-    peers.set_external_ips(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]);
+    peers.set_external_endpoints(vec!["127.0.0.1".parse().unwrap()]);
     assert!(
         peer.take_local_addr_due(1_000 + 48 * 3600).is_none(),
         "loopback must not be advertised"
     );
 
-    peers.set_external_ips(vec![IpAddr::V4(Ipv4Addr::new(42, 42, 42, 42))]);
+    peers.set_external_endpoints(vec!["42.42.42.42".parse().unwrap()]);
     peers.set_discover(false);
     assert!(
         peer.take_local_addr_due(1_000 + 72 * 3600).is_none(),
@@ -1760,7 +1759,7 @@ fn self_announce_stays_on_the_link_network() {
         peers.set_discover(true);
         peers.set_clearnet_listen(true);
         peers.set_listen_port(8333);
-        peers.set_external_ips(vec![external]);
+        peers.set_external_endpoints(vec![ExternalEndpoint::BareIp(external)]);
         if with_onion {
             peers.set_p2p_onion(onion.host_str(), onion.port());
         }
@@ -1851,7 +1850,7 @@ fn self_announce_stays_on_the_link_network() {
     };
     let with_cjdns = hub_with(false, false);
     with_cjdns.set_cjdns_reachable(true);
-    with_cjdns.set_external_ips(vec![external, IpAddr::V6(cjdns_bind)]);
+    with_cjdns.set_external_endpoints(vec![ExternalEndpoint::BareIp(external), ExternalEndpoint::BareIp(IpAddr::V6(cjdns_bind))]);
     assert_eq!(
         self_announce_nets(&overlay_peer(&with_cjdns, cjdns_peer, inbound)),
         ["cjdns"],
@@ -1869,7 +1868,7 @@ fn self_announce_stays_on_the_link_network() {
     );
     let cjdns_only = hub_with(false, false);
     cjdns_only.set_cjdns_reachable(true);
-    cjdns_only.set_external_ips(vec![IpAddr::V6(cjdns_bind)]);
+    cjdns_only.set_external_endpoints(vec![ExternalEndpoint::BareIp(IpAddr::V6(cjdns_bind))]);
     assert!(
         self_announce_nets(&overlay_peer(&cjdns_only, clearnet_peer, out)).is_empty(),
         "a clearnet peer is never sent the CJDNS address"
@@ -1879,6 +1878,179 @@ fn self_announce_stays_on_the_link_network() {
             .take_local_addr_due(1_000)
             .is_none()
     );
+}
+
+#[test]
+fn external_onion_announcement_uses_the_configured_or_listen_port_on_tor() {
+    use rbitcoin_net::peers::PeerConnType::{Inbound, OutboundFullRelay as Out};
+
+    let native: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let public = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
+    let tor: rbitcoin_net::NetAddr =
+        "3zvhyy5nu2tes4mi2znnie2fl2mv425udfrl6esnuxixpzb56twisrad.onion:8333"
+            .parse()
+            .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_p2p_onion(native.host_str(), native.port());
+    peers.set_listen_port(18445);
+    let announce = || {
+        let peer = overlay_peer(&peers, tor, Out);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        peer.attach_out(tx);
+        peer.queue_self_announce_if_due();
+        let PeerOut::Msg(NetworkMessage::AddrV2(addrs)) = rx.try_recv().unwrap() else {
+            panic!("expected Tor addrv2");
+        };
+        assert_eq!(addrs.len(), 1);
+        rbitcoin_net::NetAddr::from_addrv2(&addrs[0]).unwrap()
+    };
+    let direct = "93.184.216.34:8333".parse().unwrap();
+    let ip = "42.42.42.42:28332";
+    peers.set_external_endpoints(vec![ip.parse().unwrap(), public.parse().unwrap()]);
+    assert_eq!(announce(), format!("{public}:18445").parse().unwrap());
+    assert_eq!(self_announce_nets(&overlay_peer(&peers, direct, Out)), ["ipv4"]);
+    let inbound = overlay_peer(&peers, direct, Inbound);
+    assert_eq!(inbound.take_local_addr_due(1_000), Some(ip.parse().unwrap()));
+    assert_eq!(
+        self_announce_nets(&overlay_peer(&peers, direct, Inbound)),
+        ["ipv4"]
+    );
+
+    peers.set_external_endpoints(vec![
+        "42.42.42.42:28332".parse().unwrap(),
+        public.parse().unwrap(),
+        format!("{}:28334", native.host_str()).parse().unwrap(),
+        format!("{public}:28333").parse().unwrap(),
+    ]);
+    assert_eq!(announce(), format!("{public}:28333").parse().unwrap());
+    peers.set_external_endpoints(vec![public.parse().unwrap()]);
+
+    peers.set_clearnet_listen(false);
+    peers.set_tor_only_public_port(18444);
+    assert_eq!(announce(), format!("{public}:18444").parse().unwrap());
+
+    peers.set_discover(false);
+    assert_eq!(announce(), native);
+    peers.set_discover(true);
+    peers.set_listen_port(0);
+    assert_eq!(announce(), native);
+}
+
+#[test]
+fn external_onion_withholds_self_announcements_on_shared_loopback() {
+    use rbitcoin_net::peers::PeerConnType::Inbound;
+
+    let peers = rbitcoin_net::PeerHub::new();
+    peers.set_listen_port(18445);
+    peers.set_external_endpoints(vec![
+        "42.42.42.42:28332".parse().unwrap(),
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:28333"
+            .parse()
+            .unwrap(),
+    ]);
+    let loopback = "127.0.0.1:51000".parse().unwrap();
+    let inbound = || overlay_peer(&peers, loopback, Inbound);
+
+    assert!(inbound().take_local_addr_due(1_000).is_none());
+    assert!(inbound().take_self_announce_msg().is_none());
+
+    peers.set_p2p_i2p(rbitcoin_net::NetAddr::I2p {
+        dest: [0x11; 32],
+        port: 0,
+    });
+    assert!(inbound().take_self_announce_msg().is_none());
+}
+
+#[test]
+fn local_endpoints_wait_for_startup_listener_permissions() {
+    use rbitcoin_net::net_permissions::NetPermTable;
+
+    let peers = rbitcoin_net::PeerHub::new();
+    let endpoint = "42.42.42.42:28332";
+    let external = endpoint.parse().unwrap();
+    let onion_bind = "127.0.0.1:8334".parse().unwrap();
+    std::thread::scope(|scope| {
+        // Hold the permission table while the startup path publishes the endpoints.
+        let held = peers.net_perms.lock().unwrap();
+        let startup = scope.spawn(|| {
+            peers.publish_local_endpoints(
+                8333,
+                vec![endpoint.parse().unwrap()],
+                NetPermTable {
+                    onion_bind: Some(onion_bind),
+                    ..NetPermTable::default()
+                },
+            );
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !peers.is_own_address(external) {
+            assert!(std::time::Instant::now() < deadline, "endpoints were not registered");
+            std::thread::yield_now();
+        }
+        assert!(peers.advertise_local_socket().is_none());
+        drop(held);
+        startup.join().unwrap();
+    });
+    assert_eq!(peers.advertise_local_socket(), external.socket_addr());
+}
+
+#[test]
+fn marked_tor_listener_announces_the_public_onion() {
+    use rbitcoin_net::net_permissions::NetPermTable;
+    use rbitcoin_net::peers::PeerConnType::Inbound;
+    use rbitcoin_net::NetAddr;
+
+    let peers = rbitcoin_net::PeerHub::new();
+    let tor_bind = "[::1]:8334".parse().unwrap();
+    let normal_bind = "127.0.0.1:8333".parse().unwrap();
+    peers.set_net_perms(NetPermTable {
+        onion_bind: Some(tor_bind),
+        ..NetPermTable::default()
+    });
+    peers.set_listen_port(8333);
+    let native: NetAddr = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+        .parse()
+        .unwrap();
+    peers.set_p2p_onion(native.host_str(), native.port());
+    let ip = "42.42.42.42:28332";
+    peers.set_external_endpoints(vec![ip.parse().unwrap()]);
+    let announce = |bind: SocketAddr| {
+        let source = SocketAddr::new(bind.ip(), 51000);
+        let ver = VersionMessage::new(
+            ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            0,
+            Address::new(&bind, ServiceFlags::NONE),
+            Address::new(&source, ServiceFlags::NONE),
+            0,
+            "/rbitcoin:test/".into(),
+            0,
+        );
+        let peer = peers.register(source, bind, &ver, true, Inbound);
+        peer.set_wants_addrv2();
+        let Some(NetworkMessage::AddrV2(addrs)) = peer.take_self_announce_msg() else {
+            panic!("expected addrv2 on {bind}");
+        };
+        assert_eq!(addrs.len(), 1);
+        NetAddr::from_addrv2(&addrs[0]).unwrap()
+    };
+
+    assert_eq!(announce(tor_bind), native);
+    assert_eq!(announce(normal_bind), ip.parse().unwrap());
+    let public = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:28333";
+    peers.set_external_endpoints(vec![ip.parse().unwrap(), public.parse().unwrap()]);
+    assert_eq!(announce(tor_bind), public.parse().unwrap());
+    assert_eq!(announce(normal_bind), ip.parse().unwrap());
+
+    let i2p = NetAddr::I2p {
+        dest: [0x11; 32],
+        port: 0,
+    };
+    peers.set_p2p_i2p(i2p);
+    assert_eq!(announce(tor_bind), public.parse().unwrap());
+    assert_eq!(announce(normal_bind), i2p);
 }
 
 #[test]
@@ -1941,12 +2113,12 @@ fn a_down_onion_is_not_advertised_but_stays_our_own() {
         "3zvhyy5nu2tes4mi2znnie2fl2mv425udfrl6esnuxixpzb56twisrad.onion:50001"
             .parse()
             .unwrap();
-    let external_wallet = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
+    let external_onion = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
     let peers = rbitcoin_net::peers::PeerHub::new();
     peers.set_p2p_onion(onion.host_str(), onion.port());
     peers.set_p2p_i2p(i2p);
     peers.set_tor_wallet_onion(tor_wallet.host_str(), tor_wallet.port());
-    peers.set_wallet_onion(external_wallet.to_string(), 50002);
+    peers.set_listen_port(50002);
     let lists = |peers: &rbitcoin_net::peers::PeerHub, host: String| {
         peers.rpc_local_addresses().iter().any(|row| row.0 == host)
     };
@@ -1963,10 +2135,6 @@ fn a_down_onion_is_not_advertised_but_stays_our_own() {
         "getnetworkinfo leaves out a down wallet onion"
     );
     assert!(
-        lists(&peers, external_wallet.to_string()),
-        "an --external-onion is not ours to take down"
-    );
-    assert!(
         peers.is_own_address(onion),
         "a down onion is still filtered from address replies"
     );
@@ -1979,6 +2147,15 @@ fn a_down_onion_is_not_advertised_but_stays_our_own() {
         "a loopback inbound still cannot tell Tor from I2P, so it gets neither"
     );
 
+    peers.set_external_endpoints(vec![external_onion.parse().unwrap()]);
+    assert!(lists(&peers, external_onion.to_string()));
+    assert_eq!(
+        self_announce_nets(&overlay_peer(&peers, other_onion, out)),
+        ["onion"],
+        "the external onion stays eligible while the Tor controller is down"
+    );
+
+    peers.set_external_endpoints(Vec::new());
     peers.set_tor_onions_down(false);
     assert_eq!(
         self_announce_nets(&overlay_peer(&peers, other_onion, out)),
@@ -2107,7 +2284,7 @@ fn discover_from_peers_announces_the_reported_address() {
     );
 
     let external = hub(true);
-    external.set_external_ips(vec![IpAddr::V4(Ipv4Addr::new(42, 42, 42, 42))]);
+    external.set_external_endpoints(vec!["42.42.42.42".parse().unwrap()]);
     assert_eq!(
         announced_ips(&reporting_peer(&external, clearnet, Out, seen)),
         [SocketAddr::from(([42, 42, 42, 42], 8333))],
@@ -2115,7 +2292,7 @@ fn discover_from_peers_announces_the_reported_address() {
     );
     let cjdns_bind = hub(true);
     cjdns_bind.set_cjdns_reachable(true);
-    cjdns_bind.set_external_ips(vec![IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 9))]);
+    cjdns_bind.set_external_endpoints(vec!["fc00::9".parse().unwrap()]);
     assert_eq!(
         announced_ips(&reporting_peer(&cjdns_bind, clearnet, Out, seen)),
         [SocketAddr::new(seen, 8333)],
@@ -2272,8 +2449,8 @@ fn getaddr_reply_omits_own_addresses() {
 
     peers.set_p2p_onion(onion.host_str(), onion.port());
     peers.set_p2p_i2p(i2p);
-    peers.set_external_ips(vec![external.ip()]);
-    peers.set_wallet_onion(wallet_onion.host_str(), 50001);
+    peers.set_external_endpoints(vec![ExternalEndpoint::BareIp(external.ip())]);
+    peers.set_tor_wallet_onion(wallet_onion.host_str(), 50001);
     assert!(
         peers.addr_response_net(early_bind, true).is_empty(),
         "a reply cached before the own addresses were set still leaves them out"

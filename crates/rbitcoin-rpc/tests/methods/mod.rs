@@ -5923,23 +5923,52 @@ fn pruned_seqsigwit_life() {
 #[test]
 fn getnetworkinfo_localaddresses_from_externalip() {
     use rbitcoin_net::PeerHub;
-    use std::net::{IpAddr, Ipv4Addr};
 
     let (mut ctx, dir) = ctx_empty();
     let hub = PeerHub::new();
     hub.set_listen_port(18445);
-    hub.set_external_ips(vec![IpAddr::V4(Ipv4Addr::new(42, 42, 42, 42))]);
+    let onion = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+    let bare = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
+    hub.set_external_endpoints(
+        [
+            "42.42.42.42",
+            "8.8.8.8",
+            "[::ffff:42.42.42.42]:28333",
+            "[2606:4700::1]:28334",
+            "2606:4700::1",
+            onion,
+            &format!("{onion}:28335"),
+            "42.42.42.42:28336",
+            bare,
+        ]
+        .map(|address| address.parse().unwrap())
+        .to_vec(),
+    );
     ctx.peers = Some(hub);
     let info = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
     let addrs = info["localaddresses"].as_array().expect("array");
-    assert_eq!(addrs.len(), 1, "{info}");
-    assert_eq!(addrs[0]["address"], "42.42.42.42");
-    assert_eq!(addrs[0]["port"], 18445);
-    assert_eq!(addrs[0]["score"], 4);
+    let expected = [
+        (bare, 18445),
+        ("42.42.42.42", 28333),
+        ("8.8.8.8", 18445),
+        ("2606:4700::1", 28334),
+        (onion, 28335),
+        ("42.42.42.42", 28336),
+    ];
+    assert_eq!(addrs.len(), expected.len(), "{info}");
+    for (row, (host, port)) in addrs.iter().zip(expected) {
+        assert_eq!(row["address"], host);
+        assert_eq!(row["port"], port);
+        assert_eq!(row["score"], 4);
+    }
     ctx.peers.as_ref().unwrap().set_discover(false);
     let info = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
     let addrs = info["localaddresses"].as_array().expect("array");
-    assert!(addrs.is_empty(), "no-discover localaddresses: {info}");
+    assert_eq!(addrs.len(), 2, "no-discover localaddresses: {info}");
+    assert_eq!(addrs[0]["address"], bare);
+    assert_eq!(addrs[0]["port"], 18445);
+    assert_eq!(addrs[1]["address"], onion);
+    assert_eq!(addrs[1]["port"], 28335);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5950,11 +5979,11 @@ fn getnetworkinfo_includes_electrum_onion() {
     let (mut ctx, dir) = ctx_empty();
     let hub = PeerHub::new();
     hub.set_discover(false);
-    hub.set_wallet_onion(
+    hub.set_tor_wallet_onion(
         "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd.onion".into(),
         50001,
     );
-    hub.set_wallet_onion(
+    hub.set_tor_wallet_onion(
         "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabce.onion".into(),
         3000,
     );

@@ -3483,6 +3483,117 @@ fn starts_with_any(lines: &[String], prefix: &str) -> Vec<String> {
         .collect()
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn external_onions_report_public_ports_with_an_onion_only_listener() {
+    let td = TestDatadir::new().unwrap();
+    let token = td.path().join("rpc.token");
+    std::fs::write(&token, "pass").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let tor = FakeTor::start().await;
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    let rpc = ephemeral_addr();
+    let bare = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+    let explicit = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
+    let mut cfg = listen_and_exit_cfg(&td.path());
+    cfg.apply_kv("listen", "0").unwrap();
+    cfg.listen.listen_onion = true;
+    cfg.apply_kv("external_ip", bare).unwrap();
+    cfg.apply_kv("external_ip", &format!("{explicit}:28333"))
+        .unwrap();
+    cfg.tor.control = Some(tor.addr);
+    cfg.tor.password = Some(TOR_PASSWORD.into());
+    cfg.rpc.listen = Some(rpc);
+    cfg.max_run_secs = Some(60);
+
+    let node = spawn_run_p2p(cfg);
+    wait_listeners(&[rpc]).await;
+    let info = jsonrpc(rpc, "getnetworkinfo", json!([])).await;
+    stop_run_p2p(rpc, node).await;
+    let rows = info["result"]["localaddresses"].as_array().unwrap();
+    for (host, public_port) in [(bare, 18444), (explicit, 28333)] {
+        let row = rows.iter().find(|row| row["address"] == host).unwrap();
+        assert_eq!(row["port"], public_port, "{info}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn onion_listener_separates_source_ip_grants() {
+    use rbitcoin_net::peer::{connect_and_handshake, HandshakePolicy};
+
+    let td = TestDatadir::new().unwrap();
+    let token = td.path().join("rpc.token");
+    std::fs::write(&token, "pass").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let tor = FakeTor::start().await;
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    let (direct, onion, rpc) = (ephemeral_addr(), ephemeral_addr(), ephemeral_addr());
+    let mut cfg = listen_and_exit_cfg(&td.path()).with_p2p_listen(direct);
+    cfg.apply_kv("listen", &format!("{onion}=onion")).unwrap();
+    cfg.apply_kv(
+        "external_ip",
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
+    )
+    .unwrap();
+    cfg.apply_kv("net_permission", "relay@127.0.0.1").unwrap();
+    cfg.apply_kv("net_permission_bind", &format!("addr@{onion}"))
+        .unwrap();
+    cfg.listen.listen_onion = true;
+    cfg.tor.control = Some(tor.addr);
+    cfg.tor.password = Some(TOR_PASSWORD.into());
+    cfg.rpc.listen = Some(rpc);
+    cfg.max_run_secs = Some(60);
+
+    let node = spawn_run_p2p(cfg);
+    wait_listeners(&[rpc]).await;
+    let mut connections = Vec::new();
+    for addr in [direct, onion] {
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let local = stream.local_addr().unwrap();
+        let handshake = connect_and_handshake(
+            stream,
+            bitcoin::p2p::Magic::REGTEST,
+            local,
+            addr,
+            0,
+            false,
+            "/onion-bind-test/",
+            HandshakePolicy::plain(),
+        );
+        connections.push(
+            tokio::time::timeout(Duration::from_secs(5), handshake)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    let info = jsonrpc(rpc, "getpeerinfo", json!([])).await;
+    stop_run_p2p(rpc, node).await;
+    let rows = info["result"].as_array().unwrap();
+    for (bind, expected) in [(direct, json!(["relay"])), (onion, json!(["addr"]))] {
+        let row = rows
+            .iter()
+            .find(|row| row["addrbind"] == bind.to_string())
+            .unwrap();
+        assert_eq!(row["permissions"], expected, "{info}");
+    }
+    let commands = tor.take_log();
+    assert!(
+        commands
+            .iter()
+            .any(|cmd| cmd.starts_with("ADD_ONION ")
+                && cmd.ends_with(&format!("Port=18444,{onion}"))),
+        "{commands:?}"
+    );
+}
+
 /// An operator publishes P2P, Electrum, and Esplora as onion and I2P
 /// services through a local Tor control port and SAM bridge. A bad or short
 /// cookie, or a Tor that does not offer SAFECOOKIE, stops the start before

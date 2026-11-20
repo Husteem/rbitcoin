@@ -235,7 +235,8 @@ async fn tor_restart_brings_every_onion_back_with_the_same_key() {
     let tor = FakeTor::start(&dir, Script::default()).await;
     let peers = rbitcoin_net::PeerHub::new();
     let keeper = tor.keeper(&peers).await;
-    keeper.add_p2p_onion(&dir, p2p_bind(), 18444).await.unwrap();
+    let p2p_target = "[::1]:40001".parse().unwrap();
+    keeper.add_p2p_onion(&dir, p2p_target, 18444).await.unwrap();
     let added = Arc::new(AtomicUsize::new(0));
     for _ in 0..2 {
         keeper
@@ -270,7 +271,7 @@ async fn tor_restart_brings_every_onion_back_with_the_same_key() {
         "logs in with the new cookie: {again:?}"
     );
     for want in [
-        format!("ADD_ONION {} Port=18444,{}", p2p_key.trim(), p2p_bind()),
+        format!("ADD_ONION {} Port=18444,{p2p_target}", p2p_key.trim()),
         format!(
             "ADD_ONION {} Port=50001,{}",
             wallet_key.trim(),

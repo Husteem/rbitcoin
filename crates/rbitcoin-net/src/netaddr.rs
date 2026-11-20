@@ -253,6 +253,78 @@ pub enum NetAddr {
     },
 }
 
+/// An operator's public P2P address. Bare forms use the listen port.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ExternalEndpoint {
+    Explicit(NetAddr),
+    BareIp(IpAddr),
+    BareOnion([u8; 32]),
+}
+
+impl ExternalEndpoint {
+    pub fn ip(&self) -> Option<IpAddr> {
+        match self {
+            Self::Explicit(addr) => Some(addr.socket_addr()?.ip().to_canonical()),
+            Self::BareIp(ip) => Some(ip.to_canonical()),
+            Self::BareOnion(_) => None,
+        }
+    }
+
+    pub fn same_host(&self, other: &Self) -> bool {
+        self.host_key()
+            .is_some_and(|host| other.host_key() == Some(host))
+    }
+
+    pub(crate) fn host_key(&self) -> Option<Self> {
+        self.ip()
+            .map(Self::BareIp)
+            .or_else(|| self.onion_key().map(Self::BareOnion))
+    }
+
+    pub(crate) fn with_listen_port(&self, listen_port: u16) -> NetAddr {
+        match self {
+            Self::Explicit(addr) => *addr,
+            Self::BareIp(ip) => NetAddr::from_socket(SocketAddr::new(*ip, listen_port)),
+            Self::BareOnion(pk) => NetAddr::Onion {
+                pk: *pk,
+                port: listen_port,
+            },
+        }
+    }
+
+    pub(crate) fn onion_key(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Explicit(NetAddr::Onion { pk, .. }) | Self::BareOnion(pk) => Some(*pk),
+            _ => None,
+        }
+    }
+}
+
+impl FromStr for ExternalEndpoint {
+    type Err = NetError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Ok(ip) = s.parse::<IpAddr>() {
+            return Ok(Self::BareIp(ip.to_canonical()));
+        }
+        if let Some(name) = strip_onion_suffix(s) {
+            return decode_onion_name(name)
+                .map(Self::BareOnion)
+                .ok_or_else(|| NetError::Encode(format!("bad external endpoint {s}")));
+        }
+        match s.parse::<NetAddr>()? {
+            NetAddr::Ip(sock) if sock.port() != 0 => {
+                let sock = SocketAddr::new(sock.ip().to_canonical(), sock.port());
+                Ok(Self::Explicit(NetAddr::from_socket(sock)))
+            }
+            addr @ (NetAddr::Onion { port, .. } | NetAddr::Cjdns { port, .. }) if port != 0 => {
+                Ok(Self::Explicit(addr))
+            }
+            _ => Err(NetError::Encode(format!("bad external endpoint {s}"))),
+        }
+    }
+}
+
 /// A hostname interned for the life of the process, so [`NetAddr`] stays `Copy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NameId(u32);

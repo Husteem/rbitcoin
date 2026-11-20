@@ -997,7 +997,7 @@ in
         type = types.listOf types.str;
         default = [ ];
         example = [ "203.0.113.5" ];
-        description = "Repeatable `--external-ip` values (an IP or a v3 `.onion` host) for `getnetworkinfo.localaddresses`.";
+        description = "Repeatable `--external-ip` values (IP or Tor v3 onion with an optional public port).";
       };
 
       peerTimeout = mkOption {

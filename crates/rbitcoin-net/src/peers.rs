@@ -1,6 +1,7 @@
 //! Live P2P session table for RPC (`getpeerinfo` / `addnode` / `disconnectnode`).
 
 use crate::error::NetError;
+use crate::netaddr::ExternalEndpoint;
 use bitcoin::p2p::address::{AddrV2Message, Address};
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_network::VersionMessage;
@@ -779,6 +780,9 @@ impl LivePeer {
             return None;
         }
         let sock = SelfAnnounceLink::Clearnet.local_socket(&hub, self.reported_local_ip)?;
+        if self.withhold_self_announcement(&hub, SelfAnnounceLink::Clearnet) {
+            return None;
+        }
         let prev = self.next_local_addr_send.load(Ordering::Relaxed);
         if prev != 0 && now < prev {
             return None;
@@ -808,14 +812,20 @@ impl LivePeer {
         }
         let hub = self.owner.upgrade()?;
         let link = self.self_announce_link(&hub);
-        let onion = hub
-            .announced_p2p_onion()
-            .filter(|_| link == SelfAnnounceLink::Tor);
+        let onion = if link == SelfAnnounceLink::Tor {
+            hub.announced_external_onion()
+                .or_else(|| hub.announced_p2p_onion())
+        } else {
+            None
+        };
         let i2p = hub
             .announced_p2p_i2p()
             .filter(|_| link == SelfAnnounceLink::I2p);
         let sock = link.local_socket(&hub, self.reported_local_ip);
         if onion.is_none() && i2p.is_none() && sock.is_none() {
+            return None;
+        }
+        if self.withhold_self_announcement(&hub, link) {
             return None;
         }
         const DAY: u64 = 24 * 60 * 60;
@@ -896,11 +906,33 @@ impl LivePeer {
         }
     }
 
+    // Startup can publish the listener designation during address selection.
+    fn withhold_self_announcement(&self, hub: &PeerHub, link: SelfAnnounceLink) -> bool {
+        if !self.inbound {
+            return false;
+        }
+        let Some(source) = self.net.socket_addr() else {
+            return false;
+        };
+        match hub.onion_bind() {
+            Some(bind) => bind == self.addrbind && link != SelfAnnounceLink::Tor,
+            None => source.ip().to_canonical().is_loopback() && hub.external_onion().is_some(),
+        }
+    }
+
     /// The network this link carries, which decides the one local address
     /// it may announce. Tor and I2P inbound both arrive on the loopback
     /// listener, so with both overlays accepting, a loopback inbound link
     /// cannot be told apart and announces nothing.
     fn self_announce_link(&self, hub: &PeerHub) -> SelfAnnounceLink {
+        let onion_bind = if self.inbound && self.net.socket_addr().is_some() {
+            hub.onion_bind()
+        } else {
+            None
+        };
+        if onion_bind == Some(self.addrbind) {
+            return SelfAnnounceLink::Tor;
+        }
         let sock = match self.net {
             crate::NetAddr::Onion { .. } => return SelfAnnounceLink::Tor,
             crate::NetAddr::I2p { .. } => return SelfAnnounceLink::I2p,
@@ -933,7 +965,8 @@ impl LivePeer {
         if !sock.ip().to_canonical().is_loopback() {
             return SelfAnnounceLink::Clearnet;
         }
-        match (hub.p2p_onion().is_some(), hub.p2p_i2p().is_some()) {
+        let tor_on_shared_bind = onion_bind.is_none() && hub.p2p_onion().is_some();
+        match (tor_on_shared_bind, hub.p2p_i2p().is_some()) {
             (false, false) => SelfAnnounceLink::Clearnet,
             (true, false) => SelfAnnounceLink::Tor,
             (false, true) => SelfAnnounceLink::I2p,
@@ -1507,14 +1540,11 @@ impl LivePeer {
         let Some(h) = self.owner.upgrade() else {
             return crate::net_permissions::NetPermissionFlags::NONE;
         };
-        match self.net {
-            crate::NetAddr::Ip(addr) => h.permission_flags(addr, self.inbound, self.addrbind),
-            _ => h
-                .net_perms
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .flags_for_net(self.net, self.inbound, self.addrbind),
+        if let Some(addr) = self.net.socket_addr() {
+            return h.permission_flags(addr, self.inbound, self.addrbind);
         }
+        let table = h.net_perms.lock().unwrap_or_else(|e| e.into_inner());
+        table.flags_for_net(self.net, self.inbound, self.addrbind)
     }
 
     pub fn has_net_perm(&self, flag: crate::net_permissions::NetPermissionFlags) -> bool {
@@ -2092,8 +2122,7 @@ pub struct PeerHub {
     /// sessions outside `live`, so it reports their count here.
     catch_up_full_outbound: AtomicUsize,
     /// Addresses we advertise (`getnetworkinfo.localaddresses`).
-    pub external_ips: Mutex<Vec<IpAddr>>,
-    pub wallet_onions: Mutex<Vec<(String, u16)>>,
+    external_endpoints: Mutex<Vec<ExternalEndpoint>>,
     pub p2p_onion: Mutex<Option<(String, u16)>>,
     tor_wallet_onions: Mutex<Vec<(String, u16)>>,
     tor_onions_down: AtomicBool,
@@ -2101,6 +2130,7 @@ pub struct PeerHub {
     p2p_i2p_down: AtomicBool,
     /// P2P listen port used with advertised external IPs.
     pub listen_port: AtomicU16,
+    tor_only_public_port: AtomicU16,
     /// Core `-discover`. Off: never self-announce, even with `--external-ip`.
     pub discover: AtomicBool,
     /// `--discover-from-peers` (default off): with no clearnet `--external-ip`,
@@ -2356,14 +2386,14 @@ impl PeerHub {
             peer_timeout_secs: AtomicU64::new(60),
             peers_downloading_from: AtomicUsize::new(0),
             catch_up_full_outbound: AtomicUsize::new(0),
-            external_ips: Mutex::new(Vec::new()),
-            wallet_onions: Mutex::new(Vec::new()),
+            external_endpoints: Mutex::new(Vec::new()),
             p2p_onion: Mutex::new(None),
             tor_wallet_onions: Mutex::new(Vec::new()),
             tor_onions_down: AtomicBool::new(false),
             p2p_i2p: Mutex::new(None),
             p2p_i2p_down: AtomicBool::new(false),
             listen_port: AtomicU16::new(0),
+            tor_only_public_port: AtomicU16::new(0),
             discover: AtomicBool::new(true),
             discover_from_peers: AtomicBool::new(false),
             discovered: Mutex::new(VecDeque::new()),
@@ -2415,9 +2445,16 @@ impl PeerHub {
         *self.net_perms.lock().unwrap_or_else(|e| e.into_inner()) = t;
     }
 
-    /// `--listen-onion` or `--i2p-accept-incoming` forwards onto this node.
+    /// Treat inbound loopback as potentially forwarded.
     pub fn set_overlay_loopback_forward(&self, on: bool) {
         self.overlay_loopback_forward.store(on, Ordering::Relaxed);
+    }
+
+    fn onion_bind(&self) -> Option<SocketAddr> {
+        self.net_perms
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .onion_bind
     }
 
     pub fn permission_flags(
@@ -2426,13 +2463,13 @@ impl PeerHub {
         inbound: bool,
         bind: SocketAddr,
     ) -> crate::net_permissions::NetPermissionFlags {
+        let table = self.net_perms.lock().unwrap_or_else(|e| e.into_inner());
         let apply_whitelist = !(inbound
-            && self.overlay_loopback_forward.load(Ordering::Relaxed)
-            && addr.ip().to_canonical().is_loopback());
-        self.net_perms
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .flags_for_matched(addr.ip(), inbound, bind, apply_whitelist)
+            && (table.onion_bind == Some(bind)
+                || (addr.ip().to_canonical().is_loopback()
+                    && (self.overlay_loopback_forward.load(Ordering::Relaxed)
+                        || (table.onion_bind.is_none() && self.external_onion().is_some())))));
+        table.flags_for_matched(addr.ip(), inbound, bind, apply_whitelist)
     }
 
     pub fn permission_strings(
@@ -2460,15 +2497,62 @@ impl PeerHub {
         self.peer_timeout_secs.store(secs.max(1), Ordering::Relaxed);
     }
 
-    pub fn set_external_ips(&self, ips: Vec<IpAddr>) {
-        *self.external_ips.lock().unwrap_or_else(|e| e.into_inner()) = ips;
+    pub fn set_external_endpoints(&self, mut endpoints: Vec<ExternalEndpoint>) {
+        let mut first_explicit = HashMap::new();
+        for (index, endpoint) in endpoints.iter().enumerate() {
+            let ExternalEndpoint::Explicit(_) = endpoint else {
+                continue;
+            };
+            if let Some(host) = endpoint.host_key() {
+                first_explicit.entry(host).or_insert(index);
+            }
+        }
+        // A public port replaces the listen-port fallback in the host's first slot.
+        for index in 0..endpoints.len() {
+            if matches!(endpoints[index], ExternalEndpoint::Explicit(_)) {
+                continue;
+            }
+            let Some(first) = endpoints[index]
+                .host_key()
+                .and_then(|host| first_explicit.get_mut(&host))
+            else {
+                continue;
+            };
+            if index < *first {
+                endpoints.swap(index, *first);
+                *first = index;
+            }
+        }
+        endpoints.retain(|endpoint| {
+            matches!(endpoint, ExternalEndpoint::Explicit(_))
+                || !endpoint
+                    .host_key()
+                    .is_some_and(|host| first_explicit.contains_key(&host))
+        });
+        *self
+            .external_endpoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = endpoints;
     }
 
-    pub fn set_wallet_onion(&self, host: String, port: u16) {
-        self.wallet_onions
+    fn external_onion(&self) -> Option<ExternalEndpoint> {
+        self.external_endpoints
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((host, port));
+            .iter()
+            .find(|endpoint| endpoint.onion_key().is_some())
+            .cloned()
+    }
+
+    fn announced_external_onion(&self) -> Option<crate::NetAddr> {
+        let port = self.listen_port.load(Ordering::Acquire);
+        if !self.discover.load(Ordering::Relaxed) || port == 0 {
+            return None;
+        }
+        Some(
+            self.external_onion()?
+                .with_listen_port(self.external_onion_port(port)),
+        )
     }
 
     pub fn set_p2p_onion(&self, host: String, port: u16) {
@@ -2576,8 +2660,34 @@ impl PeerHub {
         self.compact_filters.load(Ordering::Acquire)
     }
 
+    /// Enable announcements once the endpoints and inbound policy are known.
+    pub fn publish_local_endpoints(
+        &self,
+        port: u16,
+        endpoints: Vec<ExternalEndpoint>,
+        perms: crate::net_permissions::NetPermTable,
+    ) {
+        self.set_external_endpoints(endpoints);
+        self.set_net_perms(perms);
+        self.set_listen_port(port);
+    }
+
     pub fn set_listen_port(&self, port: u16) {
-        self.listen_port.store(port, Ordering::Relaxed);
+        self.listen_port.store(port, Ordering::Release);
+    }
+
+    /// Public Tor port when the only P2P listener is Tor's loopback target.
+    pub fn set_tor_only_public_port(&self, port: u16) {
+        self.tor_only_public_port.store(port, Ordering::Relaxed);
+    }
+
+    fn external_onion_port(&self, listen_port: u16) -> u16 {
+        let public_port = self.tor_only_public_port.load(Ordering::Relaxed);
+        if public_port == 0 {
+            listen_port
+        } else {
+            public_port
+        }
     }
 
     pub fn set_discover(&self, on: bool) {
@@ -2595,16 +2705,23 @@ impl PeerHub {
         }
     }
 
-    /// `getnetworkinfo.localaddresses` rows for operator-advertised IPs.
+    /// `getnetworkinfo.localaddresses` rows.
     pub fn rpc_local_addresses(&self) -> Vec<(String, u16, i32)> {
         const LOCAL_MANUAL: i32 = 4;
-        let mut rows: Vec<(String, u16, i32)> = self
-            .wallet_onions
+        let port = self.listen_port.load(Ordering::Acquire);
+        let onion_port = self.external_onion_port(port);
+        let external = self
+            .external_endpoints
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut rows: Vec<_> = external
             .iter()
-            .cloned()
-            .map(|(address, port)| (address, port, LOCAL_MANUAL))
+            .filter(|endpoint| matches!(endpoint, ExternalEndpoint::BareOnion(_)))
+            .map(|endpoint| {
+                let addr = endpoint.with_listen_port(onion_port);
+                (addr.host_str(), addr.port(), LOCAL_MANUAL)
+            })
             .collect();
         if self.tor_onions_up() {
             rows.extend(
@@ -2622,22 +2739,16 @@ impl PeerHub {
         if let Some(addr) = self.announced_p2p_i2p() {
             rows.push((addr.host_str(), addr.port(), LOCAL_MANUAL));
         }
-        if !self.discover.load(Ordering::Relaxed) {
-            return rows;
-        }
-        let port = self.listen_port.load(Ordering::Relaxed);
-        if port == 0 {
-            return rows;
-        }
-        let ips = self
-            .external_ips
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        rows.extend(
-            ips.into_iter()
-                .map(|ip| (ip.to_string(), port, LOCAL_MANUAL)),
-        );
+        let show_ips = self.discover.load(Ordering::Relaxed) && port != 0;
+        rows.extend(external.into_iter().filter_map(|endpoint| match endpoint {
+            ExternalEndpoint::Explicit(addr)
+                if show_ips || matches!(addr, crate::NetAddr::Onion { .. }) =>
+            {
+                Some((addr.host_str(), addr.port(), LOCAL_MANUAL))
+            }
+            ExternalEndpoint::BareIp(ip) if show_ips => Some((ip.to_string(), port, LOCAL_MANUAL)),
+            _ => None,
+        }));
         rows
     }
 
@@ -2660,17 +2771,19 @@ impl PeerHub {
         if !self.clearnet_listen.load(Ordering::Relaxed) {
             return None;
         }
-        let port = self.listen_port.load(Ordering::Relaxed);
+        let port = self.listen_port.load(Ordering::Acquire);
         if port == 0 {
             return None;
         }
-        let g = self.external_ips.lock().unwrap_or_else(|e| e.into_inner());
+        let external = self
+            .external_endpoints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let cjdns = self.cjdns_reachable.load(Ordering::Relaxed);
-        let ip = g
+        external
             .iter()
-            .copied()
-            .find(|ip| keep(ip) && ip_is_advertisable(ip, cjdns))?;
-        Some(SocketAddr::new(ip, port))
+            .filter_map(|endpoint| endpoint.with_listen_port(port).socket_addr())
+            .find(|sock| keep(&sock.ip()) && ip_is_advertisable(&sock.ip(), cjdns))
     }
 
     /// `ip`, as a clearnet peer reported it, at our listen port. Needs
@@ -2682,7 +2795,7 @@ impl PeerHub {
         {
             return None;
         }
-        let port = self.listen_port.load(Ordering::Relaxed);
+        let port = self.listen_port.load(Ordering::Acquire);
         if port == 0 {
             return None;
         }
@@ -2778,18 +2891,16 @@ impl PeerHub {
     }
 
     pub(crate) fn own_addrs(&self) -> OwnAddrs {
-        let mut wallet = self
-            .wallet_onions
+        let external = self
+            .external_endpoints
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        wallet.extend(
-            self.tor_wallet_onions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .cloned(),
-        );
+        let wallet = self
+            .tor_wallet_onions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let onions = wallet
             .iter()
             .filter_map(|(host, port)| format!("{host}:{port}").parse().ok())
@@ -2798,15 +2909,12 @@ impl PeerHub {
                 crate::NetAddr::Onion { pk, .. } => Some(pk),
                 _ => None,
             })
+            .chain(external.iter().filter_map(ExternalEndpoint::onion_key))
             .collect();
         OwnAddrs {
             onions,
             i2p: self.p2p_i2p(),
-            ips: self
-                .external_ips
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone(),
+            ips: external.iter().filter_map(ExternalEndpoint::ip).collect(),
             discovered: self
                 .discovered
                 .lock()

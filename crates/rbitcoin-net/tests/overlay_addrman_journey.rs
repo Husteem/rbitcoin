@@ -80,7 +80,7 @@ fn advertise_then_self_announce(hub: &Arc<PeerHub>) {
     hub.set_discover(true);
     hub.set_clearnet_listen(true);
     hub.set_listen_port(8333);
-    hub.set_external_ips(vec![IpAddr::V6(ip)]);
+    hub.set_external_endpoints(vec![rbitcoin_net::netaddr::ExternalEndpoint::BareIp(IpAddr::V6(ip))]);
     assert!(hub.advertise_local_socket().is_none());
     hub.set_cjdns_reachable(true);
     let sock = hub.advertise_local_socket().expect("cjdns listen");

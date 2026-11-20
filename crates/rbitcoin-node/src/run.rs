@@ -8,6 +8,7 @@ use rbitcoin_ibd::{
     read_platform_rss, tip_perf_json, IbdConfig, Peerless, TipPerfLog, PEERLESS_REDIAL_CAP,
 };
 use rbitcoin_log::{debug, info, log_enabled, warn, Category, Level};
+use rbitcoin_net::netaddr::ExternalEndpoint;
 use rbitcoin_net::{
     default_port, netgroup_net, sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap,
     BlockingRegion, ChainHub, Dialer, MempoolHub, NetAddr, OutboundPass, P2PNode, PeerConnType,
@@ -583,6 +584,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     apply_startup_index_mode(&handle.query, &config, params.taproot_height())?;
     rbitcoin_query::prepare_live_indexes(&handle.query)
         .map_err(|e| crate::error::NodeError::Init(format!("index startup repair failed: {e}")))?;
+    let clearnet_listen = config.listen.p2p_bind_addr(config.network).is_some();
     let bind = config.listen.start_p2p_bind(config.network);
 
     let start_tip = handle.query.tip_height().map(|h| h.0).unwrap_or(0);
@@ -647,11 +649,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     publish_listener_addr(config.datadir.path(), "p2p", node.local_addr);
     let spend_sync = SpendSync::spawn(std::sync::Arc::clone(&node.hub.query));
     status.attach_p2p(&node.hub, &node.peers);
-    for extra in &config.listen.p2p_extra {
+    let mut onion_bind = config
+        .listen
+        .onion_bind
+        .filter(|_| !clearnet_listen)
+        .map(|_| node.local_addr);
+    let extra_onion_bind = config.listen.onion_bind.iter().filter(|_| clearnet_listen);
+    for extra in config.listen.p2p_extra.iter().chain(extra_onion_bind) {
         let bound = node
             .add_listen(*extra)
             .await
             .map_err(|e| p2p_start_err(&format!("p2p extra listen {extra}"), e))?;
+        if config.listen.onion_bind == Some(*extra) {
+            onion_bind = Some(bound);
+        }
         info!(
             "rbitcoin-node listening on {} ({})",
             bound,
@@ -706,7 +717,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         None => None,
     };
     let expiry_hours = config.mempool.expiry_hours;
-    let table = config.finalized_net_perms();
+    let mut table = config.finalized_net_perms();
+    table.onion_bind = onion_bind;
     let immediate_relay = config.trusted;
     let hub = Arc::clone(&node.hub);
     let enforce_bip54 = hub.params.enforce_bip54;
@@ -749,7 +761,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if proxy_or_onion_without_trust(&config) {
         mempool.set_isolated_broadcast(true);
     }
-    node.peers.set_net_perms(table.clone());
     node.peers
         .set_overlay_loopback_forward(config.listen.overlay_loopback_forward());
     if let Some(secs) = config.listen.peer_timeout_secs {
@@ -764,23 +775,18 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
     node.peers.set_discover_from_peers(from_peers);
-    node.peers
-        .set_clearnet_listen(!matches!(config.listen.p2p, crate::config::P2pListen::Off));
-    if node.local_addr.port() != 0 {
-        node.peers.set_listen_port(node.local_addr.port());
+    node.peers.set_clearnet_listen(clearnet_listen);
+    let onion_public_port = config.network.default_p2p_port();
+    if !clearnet_listen && (config.listen.listen_onion || onion_bind.is_some()) {
+        node.peers.set_tor_only_public_port(onion_public_port);
     }
-    for host in &config.listen.external_onions {
-        node.peers
-            .set_wallet_onion(host.clone(), node.local_addr.port());
-    }
-    let external = external_ips_with_cjdns_bind(
-        &config.listen.external_ips,
+    let external = external_endpoints_with_cjdns_bind(
+        &config.listen.external_endpoints,
         node.local_addr,
-        config.listen.cjdns_reachable,
+        config.listen.cjdns_reachable && clearnet_listen,
     );
-    if !external.is_empty() {
-        node.peers.set_external_ips(external);
-    }
+    node.peers
+        .publish_local_endpoints(node.local_addr.port(), external, table.clone());
     if immediate_relay {
         node.peers.set_noban(true);
     }
@@ -843,9 +849,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let ctl = tor_ctl
             .as_ref()
             .expect("validate requires --tor-control with --listen-onion");
-        let virt = config.network.default_p2p_port();
+        let target = onion_bind
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], node.local_addr.port())));
         shutdown
-            .run_until_cancelled(ctl.add_p2p_onion(config.datadir.path(), node.local_addr, virt))
+            .run_until_cancelled(ctl.add_p2p_onion(
+                config.datadir.path(),
+                target,
+                onion_public_port,
+            ))
             .await?;
     }
     if config.listen.i2p_sam.is_some() {
@@ -3720,23 +3731,22 @@ pub fn discover_from_peers_on(flag: bool, bind: SocketAddr) -> bool {
 /// A CJDNS listen bind is the address peers should learn. `--external-ip`
 /// still wins when the operator set the same address already.
 #[doc(hidden)]
-pub fn external_ips_with_cjdns_bind(
-    configured: &[std::net::IpAddr],
+pub fn external_endpoints_with_cjdns_bind(
+    configured: &[ExternalEndpoint],
     bind: SocketAddr,
     cjdns_reachable: bool,
-) -> Vec<std::net::IpAddr> {
-    let mut ips = configured.to_vec();
+) -> Vec<ExternalEndpoint> {
+    let mut endpoints = configured.to_vec();
     if !cjdns_reachable {
-        return ips;
+        return endpoints;
     }
     let std::net::IpAddr::V6(ip) = bind.ip() else {
-        return ips;
+        return endpoints;
     };
-    if !rbitcoin_net::is_cjdns_ip(ip) || ips.contains(&std::net::IpAddr::V6(ip)) {
-        return ips;
+    if rbitcoin_net::is_cjdns_ip(ip) && !endpoints.iter().any(|addr| addr.ip() == Some(bind.ip())) {
+        endpoints.push(ExternalEndpoint::BareIp(bind.ip()));
     }
-    ips.push(std::net::IpAddr::V6(ip));
-    ips
+    endpoints
 }
 
 /// Parse Core `-seednode` host or host:port using the chain default P2P port.

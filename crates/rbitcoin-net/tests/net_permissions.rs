@@ -88,7 +88,12 @@ fn loopback_forward_does_not_inherit_loopback_net_permission() {
 
     let mut wide = NetPermTable::default();
     wide.whitelist
-        .push(parse_whitelist("relay@203.0.113.9").unwrap());
+        .push(parse_whitelist("in,out,relay@203.0.113.9").unwrap());
+    wide.whitelist
+        .push(parse_whitelist("relay@127.0.0.1").unwrap());
+    wide.whitelist.push(parse_whitelist("relay@::/0").unwrap());
+    wide.whitebind
+        .push(parse_whitebind("noban@127.0.0.1:8335").unwrap());
     peers.set_net_perms(wide);
     assert!(peers
         .permission_flags(remote, true, p2p)
@@ -96,6 +101,38 @@ fn loopback_forward_does_not_inherit_loopback_net_permission() {
     assert!(!peers
         .permission_flags(loopback, true, p2p)
         .has(NetPermissionFlags::RELAY));
+
+    peers.set_overlay_loopback_forward(false);
+    let onion = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+    for endpoint in [onion, &format!("{onion}:28333")] {
+        peers.set_external_endpoints(vec![endpoint.parse().unwrap()]);
+        for src in [loopback, mapped] {
+            assert_eq!(
+                peers.permission_flags(src, true, p2p),
+                NetPermissionFlags::NONE
+            );
+        }
+        assert_eq!(
+            peers.permission_flags(remote, true, p2p),
+            NetPermissionFlags::RELAY
+        );
+        assert_eq!(
+            peers.permission_flags(loopback, true, wallet),
+            NetPermissionFlags::NOBAN
+        );
+        assert_eq!(
+            peers.permission_flags(remote, false, wallet),
+            NetPermissionFlags::RELAY
+        );
+    }
+    let cjdns = peers.register(
+        "[fc00::4]:8333".parse().unwrap(),
+        p2p,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    assert_eq!(cjdns.net_perm_flags(), NetPermissionFlags::RELAY);
 
     peers.set_net_perms(NetPermTable::default());
     assert_eq!(

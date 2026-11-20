@@ -6,6 +6,7 @@ use rbitcoin_consensus::{
     TESTNET_MILESTONE_HASH,
 };
 use rbitcoin_log::{self, error, info, warn, Level};
+use rbitcoin_net::netaddr::ExternalEndpoint;
 use rbitcoin_primitives::Network;
 use rbitcoin_store::HeadScale;
 use std::ffi::OsString;
@@ -151,15 +152,12 @@ pub fn apply_operator_kvs(
     let mut saw_listen = false;
     let mut saw_connect = false;
     let mut saw_seednode = false;
+    let file_external_count = config.listen.external_endpoints.len();
     for (key, val) in kvs {
-        if key == "listen" && !saw_listen {
-            config.listen.p2p = crate::config::P2pListen::Auto;
-            config.listen.p2p_extra.clear();
-            saw_listen = true;
-        }
-        if key == "no_listen" && !saw_listen {
-            config.listen.p2p = crate::config::P2pListen::Auto;
-            config.listen.p2p_extra.clear();
+        if matches!(key.as_str(), "listen" | "no_listen") && !saw_listen {
+            config
+                .listen
+                .reset_p2p_listeners(crate::config::P2pListen::Auto);
             saw_listen = true;
         }
         if key == "connect" && !saw_connect {
@@ -189,7 +187,28 @@ pub fn apply_operator_kvs(
             Err(e) => return Err(cli_apply_err(e)),
         }
     }
+    merge_external_endpoints(&mut config.listen.external_endpoints, file_external_count);
     Ok(())
+}
+
+fn merge_external_endpoints(endpoints: &mut Vec<ExternalEndpoint>, file_count: usize) {
+    if file_count == 0 || file_count == endpoints.len() {
+        return;
+    }
+    let cli = endpoints.split_off(file_count);
+    let file = std::mem::take(endpoints);
+    for (i, entry) in file.iter().enumerate() {
+        let mut replacements = cli.iter().filter(|arg| arg.same_host(entry)).peekable();
+        if replacements.peek().is_none() {
+            endpoints.push(entry.clone());
+        } else if !file[..i].iter().any(|previous| previous.same_host(entry)) {
+            endpoints.extend(replacements.cloned());
+        }
+    }
+    endpoints.extend(
+        cli.into_iter()
+            .filter(|arg| !file.iter().any(|entry| entry.same_host(arg))),
+    );
 }
 
 #[doc(hidden)]
@@ -370,7 +389,7 @@ pub fn operator_usage() -> String {
     [--net-permission SPEC] [--net-permission-bind SPEC] [--net-permission-relay[=0|1]] [--net-permission-force-relay[=0|1]] \\\n\
     [--blocks-only] [--prefill-compact[=0|1]] [--min-relay-tx-fee BTC] \\\n\
     [--limit-cluster-count N] [--limit-cluster-size KVB] [--peer-timeout SECS] \\\n\
-    [--external-ip IP] [--ua-comment STR] \\\n\
+    [--external-ip ENDPOINT] [--ua-comment STR] \\\n\
     [--min-chain-work HEX] [--max-tip-age SECS] [--check-blocks N] [--mock-time UNIX] \\\n\
     [--block-version N] [--block-min-tx-fee BTC] [--bytes-per-sigop N] [--block-reserved-sigops N] [--alert-notify CMD] [--startup-notify CMD] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] \\\n\
@@ -402,8 +421,12 @@ Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the sam
   --tor-control-cookie PATH (default /run/tor/control.authcookie). --tor-control-password PASS.\n\
   --i2p-sam [HOST:PORT] SAM v3 to system i2pd (default 127.0.0.1:7656). --only-net=i2p requires it.\n\
   --i2p-accept-incoming persist {{datadir}}/i2p/p2p.priv and STREAM FORWARD to the P2P bind. Needs --listen. P2P only.\n\
-  --listen-onion ADD_ONION the P2P port (loopback bind even with --no-listen). Needs --tor-control and --max-inbound > 0.\n\
+  --listen ADDR:PORT=onion marks one Tor forwarding listener. Source-IP grants skip this listener.\n\
+  --listen-onion ADD_ONION to the marked listener, or the primary P2P bind (loopback with --no-listen). Needs --tor-control and --max-inbound > 0.\n\
   --cjdns-reachable treat fc00::/8 as CJDNS (dial and advertise). --only-net=cjdns requires it.\n\
+  --external-ip ENDPOINT takes an IP or Tor v3 onion with an optional port (IPv6 uses [HOST]:PORT).\n\
+  Without an explicit port, it uses the P2P listen port (network default for Tor-only listening).\n\
+  With an external onion and no marked listener, inbound loopback skips source-IP grants and self-announcements.\n\
   --discover-from-peers (default off) announce the IP outbound clearnet peers report reaching us at; needs a non-loopback --listen.\n\
   A clearnet --external-ip wins. Never sent over Tor, I2P or CJDNS. --no-discover turns it off.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\

@@ -85,22 +85,60 @@ fn tor_control_password_rejects_a_line_break() {
 }
 
 #[test]
+fn i2p_inbound_needs_a_listener_separate_from_a_marked_tor_bind() {
+    let mut cfg = NodeConfig::default();
+    cfg.apply_kv("listen", "0").unwrap();
+    cfg.apply_kv("listen", "[::1]:8334=onion").unwrap();
+    cfg.apply_kv("i2p_sam", "127.0.0.1:7656").unwrap();
+    cfg.apply_kv("i2p_accept_incoming", "1").unwrap();
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("i2p-accept-incoming") && err.contains("=onion"),
+        "{err}"
+    );
+    cfg.apply_kv("listen", "127.0.0.1:8333").unwrap();
+    cfg.validate().unwrap();
+}
+
+#[test]
 fn external_ip_accepts_a_v3_onion_and_rejects_garbage() {
+    use rbitcoin_net::netaddr::ExternalEndpoint;
+
     let mut c = NodeConfig::default();
     let onion = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
     assert_eq!(
         c.apply_kv("external_ip", onion).unwrap(),
         ConfApply::Applied
     );
-    assert_eq!(c.listen.external_onions, vec![onion.to_string()]);
-    assert!(c.listen.external_ips.is_empty());
+    assert!(matches!(
+        c.listen.external_endpoints.as_slice(),
+        [ExternalEndpoint::BareOnion(_)]
+    ));
     let err = c
         .apply_kv("external_ip", "not-an-address")
         .unwrap_err()
         .to_string();
     assert!(err.contains("external_ip"), "{err}");
     c.apply_kv("external_ip", "42.42.42.42").unwrap();
-    assert_eq!(c.listen.external_ips.len(), 1);
+    assert_eq!(c.listen.external_endpoints.len(), 2);
+    for endpoint in [
+        "42.42.42.42:28333",
+        "[2606:4700::1]:28334",
+        &format!("{onion}:28335"),
+    ] {
+        assert_eq!(
+            c.apply_kv("external_ip", endpoint).unwrap(),
+            ConfApply::Applied
+        );
+    }
+    for endpoint in [
+        "42.42.42.42:0",
+        "example.org:28333",
+        &format!("{}.onion", "a".repeat(56)),
+        &format!("{}.onion:28335", "a".repeat(56)),
+    ] {
+        assert!(c.apply_kv("external_ip", endpoint).is_err(), "{endpoint}");
+    }
 }
 
 #[test]
