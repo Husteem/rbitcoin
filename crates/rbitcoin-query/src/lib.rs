@@ -301,7 +301,7 @@ pub struct HeapMeters {
 ///
 /// Write publishes loc packs from TLS after note/prune; load publishes the
 /// in-flight pins after each prune, disconnect drop and clear. Decoded
-/// bodies charge [`DECODED`] while they live. Sampled by the ~5s IBD perf
+/// bodies charge [`process_mem_stats::DECODED`] while they live. Sampled by the ~5s IBD perf
 /// line.
 pub mod process_mem_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -309,12 +309,6 @@ pub mod process_mem_stats {
     static WLOC_PACKS: AtomicU64 = AtomicU64::new(0);
     static WLOC_PAIRS: AtomicU64 = AtomicU64::new(0);
     static WLOC_BYTES: AtomicU64 = AtomicU64::new(0);
-
-    /// The in-flight pins load publishes.
-    pub static PINS: PinMeter = PinMeter::new();
-
-    /// Decoded bodies (block + precompute rows) the confirm pipeline holds.
-    pub static DECODED: HeapGauge = HeapGauge::new();
 
     /// The in-flight pins load publishes.
     pub static PINS: PinMeter = PinMeter::new();
