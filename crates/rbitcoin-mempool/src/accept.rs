@@ -902,12 +902,6 @@ impl ActiveMempool {
         self.graph.len()
     }
 
-    /// `(meta syncs, slots syncs from sync_deaths)` since open.
-    #[cfg(debug_assertions)]
-    pub fn death_sync_counts(&self) -> (u64, u64) {
-        (self.store.meta_syncs(), self.store.slots_syncs())
-    }
-
     pub fn mempool_min_fee_sat_kvb(&self) -> u64 {
         let near_full = self
             .graph

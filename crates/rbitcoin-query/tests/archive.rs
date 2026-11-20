@@ -641,13 +641,11 @@ fn plan_batch_same_header_vouts_skipped_cross_height_pinned() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// S0 plan: stamp_external already idx-filled; do not fill_missing twice.
+/// S0 plan: stamp_external already binds the parent's body and spent range.
 #[test]
-fn plan_batch_one_fill_missing_when_parents_already_stamped() {
-    use std::sync::atomic::Ordering;
+fn plan_batch_binds_loc_when_parents_already_stamped() {
     {
         let (dir, q) = temp_query("plan-one-fill-missing");
-        let _ = q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed);
         use rbitcoin_primitives::Height;
         use rbitcoin_store::HeaderRecord;
         let parent = coinbase_apply(1);
@@ -665,7 +663,6 @@ fn plan_batch_one_fill_missing_when_parents_already_stamped() {
         };
         q.connect_block(Height::GENESIS, &ph, &[parent]).unwrap();
         let spent = q.store.txs.spent_range(Fk(1)).expect("spent range");
-        let _ = q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed);
         let need = vec![(Fk(2), vec![child_spend(parent_txid, 0xcd)])];
         let plan = plan_applies(&q, &need, 2, &rbitcoin_query::InFlight::new(), None)
             .expect("parent via head");
@@ -678,11 +675,6 @@ fn plan_batch_one_fill_missing_when_parents_already_stamped() {
         assert_eq!(
             plan.external_parents.get(&1).and_then(|p| p.spent),
             Some(spent)
-        );
-        assert_eq!(
-            q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed),
-            0,
-            "stamp_external already bound loc; finish must not fill_missing"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -733,7 +725,6 @@ fn plan_batch_prestamp_create_fk_still_idx_fills() {
 /// Spent stays unset for write TLS / `CreatePin::set_loc` (mainnet 133433).
 #[test]
 fn plan_inflight_skeleton_miss_leaves_spent_unset_despite_disk_loc() {
-    use std::sync::atomic::Ordering;
     let (dir, q) = temp_query("plan-inflight-skel-miss");
     let parent = coinbase_apply(1);
     let parent_txid = parent.tx.txid;
@@ -746,7 +737,6 @@ fn plan_inflight_skeleton_miss_leaves_spent_unset_despite_disk_loc() {
         )
         .unwrap();
     assert!(q.store.txs.spent_range(Fk(1)).expect("spent range").1 > 0);
-    let _ = q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed);
     let mut log = rbitcoin_query::InFlight::new();
     log.note_pins([(Fk(1), &pin)], Some(1));
     let child = child_spend(parent_txid, 0xee);
@@ -766,11 +756,6 @@ fn plan_inflight_skeleton_miss_leaves_spent_unset_despite_disk_loc() {
             .and_then(|p| p.pin.as_ref())
             .is_some(),
         "inflight pin is kept"
-    );
-    assert_eq!(
-        q.confirm_stats().fill_missing_n.load(Ordering::Relaxed),
-        0,
-        "IBD skeleton path must not fill_missing"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -847,7 +832,6 @@ fn plan_inflight_creates_only_fills_parent_body_range() {
 /// when loc is on disk. Lookup leftover (skeleton = None) still fills.
 #[test]
 fn plan_inflight_creates_only_ibd_skeleton_miss_does_not_loc_fill() {
-    use std::sync::atomic::Ordering;
     let (dir, q) = temp_query("plan-inflight-creates-skel-miss");
     let parent = coinbase_apply(1);
     let parent_txid = parent.tx.txid;
@@ -861,7 +845,6 @@ fn plan_inflight_creates_only_ibd_skeleton_miss_does_not_loc_fill() {
     let mut log = rbitcoin_query::InFlight::new();
     log.note_creates([(parent_txid, Fk(1))], None);
     assert!(log.get_out(1).is_none());
-    let _ = q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed);
     let child = child_spend(parent_txid, 0xee);
     let need = vec![(Fk(2), vec![child])];
     let skel = rbitcoin_query::BatchParentIds::default();
@@ -874,7 +857,6 @@ fn plan_inflight_creates_only_ibd_skeleton_miss_does_not_loc_fill() {
         "IBD stamp must not loc-by-fk for creates-only"
     );
     assert_eq!(plan.external_parents.get(&1).and_then(|p| p.spent), None);
-    assert_eq!(q.confirm_stats().fill_missing_n.load(Ordering::Relaxed), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

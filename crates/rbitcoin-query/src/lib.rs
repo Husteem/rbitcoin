@@ -167,8 +167,8 @@ use std::sync::atomic::{
 use std::sync::{Arc, Condvar, Mutex};
 
 pub use confirm_stats::{
-    add as note_confirm, add_dur as note_confirm_dur, ConfirmStats, ConfirmWindow, LastPinPhases,
-    LastPlanBatch, LastUnionMiss, LastWritePhases, TipShSnap,
+    add as note_confirm, add_dur as note_confirm_dur, ConfirmStats, ConfirmWindow, LastPlanBatch,
+    LastUnionMiss, TipShSnap,
 };
 
 pub type QueryError = StoreError;

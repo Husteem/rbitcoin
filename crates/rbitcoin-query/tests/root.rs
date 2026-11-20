@@ -4,7 +4,6 @@ use rbitcoin_query::archive::{ArchiveWritePlan, CreatePinInner};
 use rbitcoin_query::batch_parents::BatchParents;
 use rbitcoin_query::catchup::IndexMode;
 use rbitcoin_query::chain_view::{ChainView, ChainViewKind};
-use rbitcoin_query::confirm_stats::LastPinPhases;
 use rbitcoin_query::connect::ConfirmPrepared;
 use rbitcoin_query::testutil::FixtureChain;
 use rbitcoin_query::Query;
@@ -531,34 +530,6 @@ fn disconnect_one_block_megakey_clears_the_head() {
         .unwrap_or(true));
     assert!(!q.store().scripthash.deferred_empty(&sh));
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Slow-pin log is only emitted when load work_ms > 2s — keep the formatter unit.
-#[test]
-fn format_slow_pin_omits_retired_tokens() {
-    assert_eq!(LastPinPhases::ms(2_000_000), 2);
-    let zero = LastPinPhases {
-        plan_pin_ns: 22,
-        cold_ns: 33,
-        contract_ns: 44,
-        pin_plan_n: 100,
-        pin_new_n: 9,
-    };
-    let slow = zero.format_slow_pin();
-    assert!(!slow.contains("adopt="), "{slow}");
-    assert!(!slow.contains("publish="), "{slow}");
-    assert_eq!(slow, "pin(plan=0ms/n=100 cold=0ms/n=9 contract=0ms)");
-    let stuffed = LastPinPhases {
-        plan_pin_ns: 1_000_000,
-        cold_ns: 2_000_000,
-        contract_ns: 3_000_000,
-        pin_plan_n: 7,
-        pin_new_n: 8,
-    };
-    let stuffed_line = stuffed.format_slow_pin();
-    assert!(!stuffed_line.contains("adopt="), "{stuffed_line}");
-    assert!(!stuffed_line.contains("publish="), "{stuffed_line}");
-    assert_eq!(stuffed_line, "pin(plan=1ms/n=7 cold=2ms/n=8 contract=3ms)");
 }
 
 fn prepared_at(q: &Query, height: Height, header_fk: Fk) -> ConfirmPrepared {

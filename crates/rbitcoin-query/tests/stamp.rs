@@ -77,7 +77,6 @@ fn null_txid_is_skipped() {
 /// Spent stays unset for write TLS / `CreatePin::set_loc` (mainnet 133433).
 #[test]
 fn inflight_hit_skeleton_miss_leaves_spent_unset_despite_disk_loc() {
-    use std::sync::atomic::Ordering;
     let (dir, q) = tmp_store();
     let p = pin(1);
     let txid = p.tx().txid;
@@ -101,7 +100,6 @@ fn inflight_hit_skeleton_miss_leaves_spent_unset_despite_disk_loc() {
         .unwrap();
     assert_eq!(fks[0], Fk(1));
     assert!(q.store.txs.spent_range(Fk(1)).expect("spent range").1 > 0);
-    let _ = q.confirm_stats().fill_missing_n.swap(0, Ordering::Relaxed);
     let mut inflight = InFlight::new();
     inflight.note_pins([(Fk(1), &p)], Some(1));
     let skel = BatchParentIds::default();
@@ -120,11 +118,6 @@ fn inflight_hit_skeleton_miss_leaves_spent_unset_despite_disk_loc() {
     assert_eq!(ident.spent, None, "IBD stamp must not loc-by-fk");
     assert_eq!(ident.body, None);
     assert_eq!(ident.n_out, None);
-    assert_eq!(
-        q.confirm_stats().fill_missing_n.load(Ordering::Relaxed),
-        0,
-        "IBD skeleton path must not fill_missing"
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

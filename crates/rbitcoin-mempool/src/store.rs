@@ -139,12 +139,6 @@ pub struct Mempool {
     pub fail_next_append: bool,
     /// A durable DEAD `pwrite` is not yet covered by [`Self::sync_deaths`].
     pub deaths_unsynced: bool,
-    /// Successful `meta` `sync_data` calls (tests).
-    #[cfg(debug_assertions)]
-    pub meta_syncs: u64,
-    /// Successful `slots` `sync_data` calls from [`Self::sync_deaths`] (tests).
-    #[cfg(debug_assertions)]
-    pub slots_syncs: u64,
 }
 
 impl Mempool {
@@ -183,10 +177,6 @@ impl Mempool {
             #[cfg(debug_assertions)]
             fail_next_append: false,
             deaths_unsynced: false,
-            #[cfg(debug_assertions)]
-            meta_syncs: 0,
-            #[cfg(debug_assertions)]
-            slots_syncs: 0,
         };
         let mut body_hdr = [0u8; BODY_HEADER];
         body_hdr.copy_from_slice(&mp.body[..BODY_HEADER]);
@@ -952,23 +942,7 @@ impl Mempool {
         self.meta_file
             .durable_sync_data()
             .map_err(|e| MempoolError::io(&meta_path, e))?;
-        #[cfg(debug_assertions)]
-        {
-            self.meta_syncs = self.meta_syncs.saturating_add(1);
-        }
         Ok(())
-    }
-
-    /// How many times `meta` has been `sync_data`'d since open.
-    #[cfg(debug_assertions)]
-    pub fn meta_syncs(&self) -> u64 {
-        self.meta_syncs
-    }
-
-    /// How many times [`Self::sync_deaths`] has `sync_data`'d `slots`.
-    #[cfg(debug_assertions)]
-    pub fn slots_syncs(&self) -> u64 {
-        self.slots_syncs
     }
 
     /// `fdatasync` DEAD `pwrite`s, then publish `live_count`.
@@ -986,10 +960,6 @@ impl Mempool {
         self.slots_file
             .durable_sync_data()
             .map_err(|e| MempoolError::io(&path, e))?;
-        #[cfg(debug_assertions)]
-        {
-            self.slots_syncs = self.slots_syncs.saturating_add(1);
-        }
         self.persist_meta()?;
         self.deaths_unsynced = false;
         Ok(())

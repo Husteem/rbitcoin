@@ -292,7 +292,7 @@ pub fn stamp_external_parents(
     stats.note_pin_txid(stamp.pin_txid_n, stamp.pin_txid_ns);
     stats.note_recent(stamp.recent_n, stamp.recent_ns);
 
-    fill_missing_parent_ranges(store, in_flight, &mut stamp.idents, stats)?;
+    fill_missing_parent_ranges(store, in_flight, &mut stamp.idents)?;
     Ok(stamp)
 }
 
@@ -305,7 +305,6 @@ pub fn fill_missing_parent_ranges(
     store: &Store,
     in_flight: &InFlight,
     idents: &mut U64Map<ParentIdent>,
-    stats: &crate::ConfirmStats,
 ) -> Result<(), QueryError> {
     let mut need: Vec<Fk> = Vec::new();
     for (&id, ident) in idents.iter() {
@@ -319,7 +318,6 @@ pub fn fill_missing_parent_ranges(
     if need.is_empty() {
         return Ok(());
     }
-    stats.note_fill_missing();
     let filled = store.tx_create_loc_range_batch(&need)?;
     for (fk, row) in need.into_iter().zip(filled) {
         let Some(id) = fk.get() else {
