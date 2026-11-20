@@ -153,7 +153,7 @@ pub fn accept_and_connect_block_pair_preverified(
     b_pre: &ScriptPreverified,
     b_pres: Arc<[TxPrecompute]>,
     phase: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<confirm_run::PairRun, confirm_run::PairFailure> {
+) -> Result<confirm_run::PairRun, Box<confirm_run::PairFailure>> {
     let a_in: confirm_run::WireBlockIn = (height, a, Some(a_pres));
     let b_in: confirm_run::WireBlockIn = (height, b, Some(b_pres));
     confirm_run::confirm_wire_run_pair_preverified(

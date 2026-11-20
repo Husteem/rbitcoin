@@ -4857,10 +4857,12 @@ impl ChainHub {
                         loser: [0; 32],
                         loser_error: None,
                     })
-                    .map_err(|e| rbitcoin_query::confirm_run::PairFailure {
-                        error: e,
-                        hash: block.block_hash().to_byte_array(),
-                        other: None,
+                    .map_err(|e| {
+                        Box::new(rbitcoin_query::confirm_run::PairFailure {
+                            error: e,
+                            hash: block.block_hash().to_byte_array(),
+                            other: None,
+                        })
                     }),
                 }
             }) {

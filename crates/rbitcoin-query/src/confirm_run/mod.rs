@@ -380,8 +380,8 @@ fn ordered_failure(
     win_idx: usize,
     win: (ConfirmError, [u8; 32]),
     lose: (ConfirmError, [u8; 32]),
-) -> PairFailure {
-    if win_idx == 0 {
+) -> Box<PairFailure> {
+    Box::new(if win_idx == 0 {
         PairFailure {
             error: win.0,
             hash: win.1,
@@ -393,18 +393,18 @@ fn ordered_failure(
             hash: lose.1,
             other: Some(win),
         }
-    }
+    })
 }
 
 fn preferred_failure(
     a: (ConfirmError, [u8; 32]),
     b: Option<(ConfirmError, [u8; 32])>,
-) -> PairFailure {
-    PairFailure {
+) -> Box<PairFailure> {
+    Box::new(PairFailure {
         error: a.0,
         hash: a.1,
         other: b,
-    }
+    })
 }
 
 fn pair_load(
@@ -477,7 +477,7 @@ fn run_pair_loads(
     a: LoadedBatch,
     b: LoadedBatch,
     phase: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<PairRun, PairFailure> {
+) -> Result<PairRun, Box<PairFailure>> {
     use rbitcoin_consensus::script_pool::{link_pair, unlink_pair};
     let height = a.prepared.first().map(|p| p.height.0).unwrap_or(0);
     let hash_a = a.prepared.first().map(|p| p.hash).unwrap_or([0; 32]);
@@ -633,7 +633,7 @@ pub fn confirm_wire_run_pair_preverified(
     b: &WireBlockIn,
     b_pre: &ScriptPreverified,
     phase: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<PairRun, PairFailure> {
+) -> Result<PairRun, Box<PairFailure>> {
     let hash_a = a.1.block_hash().to_byte_array();
     let hash_b = b.1.block_hash().to_byte_array();
     let trust = confirm_waive(query);
