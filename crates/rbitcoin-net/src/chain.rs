@@ -649,6 +649,34 @@ impl Drop for ScriptPhaseGuard<'_> {
     }
 }
 
+/// Confirm error → peer-visible error. Shared by the pair's result and a
+/// failed candidate's verdict, so both log the same way.
+fn connect_error_to_net(e: rbitcoin_query::ConfirmError, hash: BlockHash, height: u32) -> NetError {
+    match e {
+        e if e.is_cancelled() => NetError::Cancelled,
+        rbitcoin_query::ConfirmError::Rules(rbitcoin_consensus::ConsensusError::Internal(m)) => {
+            rbitcoin_log::warn!("tip connect {hash} @ {height}: pipeline fault: {m}");
+            NetError::store(m)
+        }
+        rbitcoin_query::ConfirmError::Rules(e) => {
+            let reason = rbitcoin_consensus::block_reject_reason(&e);
+            rbitcoin_log::info!(
+                "{}",
+                rbitcoin_consensus::block_reject_log_line(hash, &reason)
+            );
+            if reject_is_mutated(&reason) {
+                NetError::Mutated(reason)
+            } else {
+                NetError::Rules(e)
+            }
+        }
+        rbitcoin_query::ConfirmError::Store(se) => {
+            rbitcoin_log::warn!("tip connect {hash} @ {height}: store fault: {se}");
+            NetError::store(se)
+        }
+    }
+}
+
 /// Thread-safe chain façade used by peer sessions.
 pub struct ChainHub {
     pub query: Arc<Query>,
@@ -3616,10 +3644,30 @@ impl ChainHub {
                     // scripts to save, so do not preempt for it.
                     if block.txdata.len() > 1 {
                         if let Some(branch) = self.held_heavier_branch(block.as_ref()) {
-                            if hold_unconnected {
-                                self.hold_body(Arc::clone(&block), waive);
+                            let branch_tip = branch.last().map(|b| b.block_hash());
+                            match self.accept_branch_locked(&branch) {
+                                Ok(AcceptOutcome::IgnoredWeaker) => {}
+                                Ok(out) => {
+                                    if hold_unconnected {
+                                        self.hold_body(Arc::clone(&block), waive);
+                                    }
+                                    return Ok(out);
+                                }
+                                Err(e) => {
+                                    // The branch failed. Record its verdict,
+                                    // then only park the child if the failed
+                                    // attempt still moved the tip.
+                                    if let Some(h) = branch_tip {
+                                        self.remember_failed_accept(h, &e);
+                                    }
+                                    if self.try_tip_hash()? != Some(tip_hash) {
+                                        if hold_unconnected {
+                                            self.hold_body(Arc::clone(&block), waive);
+                                        }
+                                        return Ok(AcceptOutcome::IgnoredWeaker);
+                                    }
+                                }
                             }
-                            return self.accept_branch_locked(&branch);
                         }
                     }
                     if let Some(sib) = self.equal_work_sibling(hash, &block, waive) {
@@ -4295,16 +4343,18 @@ impl ChainHub {
     /// in flight so wallet `getblockcount` cannot stall across a catch-up burst.
     /// [`Self::set_rpc_wait_tip_idle`] waits until the lane is empty instead.
     pub fn wait_tip_stable_for_rpc(&self) {
+        // `RBITCOIN_RPC_WAIT_TIP_IDLE` is an explicit operator choice to wait
+        // for the lane to empty, pair or not.
+        if self.rpc_wait_tip_idle() {
+            crate::tip_accept::wait_idle();
+            return;
+        }
         // A pair commits one block and never disconnects, so there is no
         // torn tip to wait for. Do not stall `getblockcount` on its scripts.
         if self.script_phase.load(Ordering::Acquire) {
             return;
         }
-        if self.rpc_wait_tip_idle() {
-            crate::tip_accept::wait_idle();
-        } else {
-            crate::tip_accept::wait_current_job();
-        }
+        crate::tip_accept::wait_current_job();
     }
 
     #[doc(hidden)]
@@ -4421,6 +4471,11 @@ impl ChainHub {
         block: &Block,
         waive: bool,
     ) -> Option<Arc<Block>> {
+        // Precious is an operator choice to script one block alone and win
+        // an equal-work tie without a race.
+        if self.precious.read().unwrap().is_some() {
+            return None;
+        }
         use crate::most_work::{header_work_checked, work_better};
         let prev = block.header.prev_blockhash;
         let mine = header_work_checked(&block.header).ok()?;
@@ -4766,7 +4821,7 @@ impl ChainHub {
             self.script_phase.store(true, Ordering::Release);
             ScriptPhaseGuard(&self.script_phase)
         });
-        let (fk, winner) = self
+        let run = self
             .clock
             .with_frozen(|| loop {
                 match rbitcoin_query::confirm_run::waive_batch(waive, || {
@@ -4785,7 +4840,6 @@ impl ChainHub {
                                 std::sync::Arc::clone(pp),
                                 Some(&self.script_phase),
                             )
-                            .map(|r| (r.fks.into_iter().next(), r.winner))
                         }
                         _ => accept_and_connect_block_preverified(
                             &self.query,
@@ -4796,7 +4850,12 @@ impl ChainHub {
                             &preverified,
                             Some(std::sync::Arc::clone(&pres)),
                         )
-                        .map(|fk| (Some(fk), 0usize)),
+                        .map(|fk| rbitcoin_query::confirm_run::PairRun {
+                            winner: 0,
+                            fks: vec![fk],
+                            loser: [0; 32],
+                            loser_error: None,
+                        }),
                     }
                 }) {
                     Ok(v) => return Ok(v),
@@ -4807,31 +4866,16 @@ impl ChainHub {
                     Err(e) => return Err(e),
                 }
             })
-            .map_err(|e| match e {
-                e if e.is_cancelled() => NetError::Cancelled,
-                rbitcoin_query::ConfirmError::Rules(
-                    rbitcoin_consensus::ConsensusError::Internal(m),
-                ) => {
-                    rbitcoin_log::warn!("tip connect {hash} @ {height}: pipeline fault: {m}");
-                    NetError::store(m)
-                }
-                rbitcoin_query::ConfirmError::Rules(e) => {
-                    let reason = rbitcoin_consensus::block_reject_reason(&e);
-                    rbitcoin_log::info!(
-                        "{}",
-                        rbitcoin_consensus::block_reject_log_line(hash, &reason)
-                    );
-                    if reject_is_mutated(&reason) {
-                        NetError::Mutated(reason)
-                    } else {
-                        NetError::Rules(e)
-                    }
-                }
-                rbitcoin_query::ConfirmError::Store(se) => {
-                    rbitcoin_log::warn!("tip connect {hash} @ {height}: store fault: {se}");
-                    NetError::store(se)
-                }
-            })?;
+            .map_err(|e| connect_error_to_net(e, hash, height))?;
+        let winner = run.winner;
+        let fk = run.fks.first().copied();
+        // A candidate that failed rather than losing the race is a block
+        // verdict for that hash, not for the preferred one.
+        if let Some(loser_error) = run.loser_error {
+            let loser = bitcoin::BlockHash::from_byte_array(run.loser);
+            let net = connect_error_to_net(loser_error, loser, height);
+            self.remember_failed_accept(loser, &net);
+        }
         if winner == 1 {
             if let Some(p) = pair {
                 block = p;

@@ -415,15 +415,6 @@ fn pair_write_started(
     confirm_write_phase(query, params, milestone, ok.batch)
 }
 
-fn note_pair_loser(run: &PairRun) {
-    if let Some(e) = &run.loser_error {
-        rbitcoin_log::debug!(
-            "tip pair: {} lost: {e}",
-            bitcoin::BlockHash::from_byte_array(run.loser)
-        );
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_pair_loads(
     query: &Query,
@@ -439,8 +430,34 @@ fn run_pair_loads(
 ) -> Result<PairRun, ConfirmError> {
     use rbitcoin_consensus::script_pool::{link_pair, set_wave_order, unlink_pair};
     let height = a.prepared.first().map(|p| p.height.0).unwrap_or(0);
-    let a = Inflight::start_deferred_index(a, 0).map_err(|(e, _)| e)?;
-    let b = Inflight::start_deferred_index(b, 0).map_err(|(e, _)| e)?;
+    let hash_a = a.prepared.first().map(|p| p.hash).unwrap_or([0; 32]);
+    let hash_b = b.prepared.first().map(|p| p.hash).unwrap_or([0; 32]);
+    // A start can fail without a wave: a batch with exactly one script job
+    // runs it inline. Handle that per candidate, never as the pair's error.
+    let started_a = Inflight::start_deferred_index(a, 0);
+    let started_b = Inflight::start_deferred_index(b, 0);
+    let (a, b) = match (started_a, started_b) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Ok(a), Err((e, _))) => {
+            let fks = pair_write_started(query, params, milestone, height, a, None, phase)?;
+            return Ok(note_pair_loser(PairRun {
+                winner: 0,
+                fks,
+                loser: hash_b,
+                loser_error: Some(e),
+            }));
+        }
+        (Err((e, _)), Ok(b)) => {
+            let fks = pair_write_started(query, params, milestone, height, b, None, phase)?;
+            return Ok(note_pair_loser(PairRun {
+                winner: 1,
+                fks,
+                loser: hash_a,
+                loser_error: Some(e),
+            }));
+        }
+        (Err((a_err, _)), Err(_)) => return Err(a_err),
+    };
     let (wa, wb) = (a.script_wave_arc(), b.script_wave_arc());
     let paired = match (&wa, &wb) {
         (Some(x), Some(y)) => {
@@ -466,43 +483,66 @@ fn run_pair_loads(
         }
     }
     let (win, lose, win_idx) = if first == 0 { (a, b, 0) } else { (b, a, 1) };
+    let (win_hash, lose_hash) = if win_idx == 0 {
+        (hash_a, hash_b)
+    } else {
+        (hash_b, hash_a)
+    };
     let (lose_in, lose_pre) = if win_idx == 0 {
         (b_in, b_pre)
     } else {
         (a_in, a_pre)
     };
-    let lose_hash = lose
-        .batch
-        .prepared
-        .first()
-        .map(|p| p.hash)
-        .unwrap_or([0; 32]);
     let lose_wave = lose.script_wave_arc();
-    let run = match win.finish_scripts() {
+    match win.finish_scripts() {
         Ok(win) => {
             match pair_write_started(query, params, milestone, height, win, lose_wave, phase) {
                 Ok(fks) => {
                     lose.cancel_scripts();
-                    PairRun {
+                    Ok(note_pair_loser(PairRun {
                         winner: win_idx,
                         fks,
                         loser: lose_hash,
                         loser_error: None,
-                    }
+                    }))
                 }
                 Err(e) => {
-                    // The winner may have appended Class A. Its plan base moved,
-                    // so the loser is re-stamped before its own write.
-                    let re = pair_load(query, params, milestone, lose_in, lose_pre)?;
+                    // The winner may have appended Class A, so the loser's
+                    // plan base moved. Keep the script verdicts that already
+                    // ran and re-stamp with them skipped.
+                    if let Some(flag) = phase {
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    let pre = match lose.finish_scripts() {
+                        Ok(lose) => {
+                            let mut pre = lose_pre.clone();
+                            if !lose.batch.trust_peer {
+                                for p in &lose.batch.prepared {
+                                    pre.extend(p.txids.iter().copied());
+                                }
+                            }
+                            pre
+                        }
+                        Err(e2) => {
+                            rbitcoin_log::debug!(
+                                "tip pair: promoted candidate scripts failed: {e2}"
+                            );
+                            return Err(e);
+                        }
+                    };
+                    let re = pair_load(query, params, milestone, lose_in, &pre)?;
                     let inf = Inflight::start_deferred_index(re, 0).map_err(|(e2, _)| e2)?;
                     match pair_write_started(query, params, milestone, height, inf, None, phase) {
-                        Ok(fks) => PairRun {
+                        Ok(fks) => Ok(note_pair_loser(PairRun {
                             winner: 1 - win_idx,
                             fks,
-                            loser: lose_hash,
+                            loser: win_hash,
                             loser_error: Some(e),
-                        },
-                        Err(_) => return Err(e),
+                        })),
+                        Err(e2) => {
+                            rbitcoin_log::debug!("tip pair: promotion write failed: {e2}");
+                            Err(e)
+                        }
                     }
                 }
             }
@@ -510,18 +550,30 @@ fn run_pair_loads(
         Err(e) => {
             // No write happened; the loser's load is still at the same base.
             match pair_write_started(query, params, milestone, height, lose, None, phase) {
-                Ok(fks) => PairRun {
+                Ok(fks) => Ok(note_pair_loser(PairRun {
                     winner: 1 - win_idx,
                     fks,
-                    loser: lose_hash,
+                    loser: win_hash,
                     loser_error: Some(e),
-                },
-                Err(_) => return Err(e),
+                })),
+                Err(e2) => {
+                    rbitcoin_log::debug!("tip pair: promoted candidate failed: {e2}");
+                    Err(e)
+                }
             }
         }
-    };
-    note_pair_loser(&run);
-    Ok(run)
+    }
+}
+
+/// Log the loser and return the run, so every exit path notes it.
+fn note_pair_loser(run: PairRun) -> PairRun {
+    if let Some(e) = &run.loser_error {
+        rbitcoin_log::debug!(
+            "tip pair: {} lost: {e}",
+            bitcoin::BlockHash::from_byte_array(run.loser)
+        );
+    }
+    run
 }
 
 /// Lookup, load, script, and write two equal-work candidates. Both script
@@ -557,8 +609,7 @@ pub fn confirm_wire_run_pair_preverified(
                     loser: b.1.block_hash().to_byte_array(),
                     loser_error: Some(e),
                 };
-                note_pair_loser(&run);
-                Ok(run)
+                Ok(note_pair_loser(run))
             }
             (Err(e), Ok(y)) => {
                 let height = y.prepared.first().map(|p| p.height.0).unwrap_or(0);
@@ -570,8 +621,7 @@ pub fn confirm_wire_run_pair_preverified(
                     loser: a.1.block_hash().to_byte_array(),
                     loser_error: Some(e),
                 };
-                note_pair_loser(&run);
-                Ok(run)
+                Ok(note_pair_loser(run))
             }
             (Err(e), Err(_)) => Err(e),
         }

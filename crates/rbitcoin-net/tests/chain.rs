@@ -7773,3 +7773,47 @@ fn equal_work_sibling_pair_connects_exactly_one_tip() {
     assert_eq!(hub.tip_hash().unwrap(), child.block_hash());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// P2PK needs a signature; an empty scriptSig fails the script stage.
+fn p2pk_requires_sig() -> ScriptBuf {
+    let mut v = vec![0x21, 0x02];
+    v.extend([0x01u8; 32]);
+    v.push(0xac);
+    ScriptBuf::from_bytes(v)
+}
+
+/// T1: a one-job, script-invalid sibling must not abort the pair or mark the
+/// honest block invalid. The valid sibling wins and the bad hash is marked.
+#[test]
+fn pair_script_invalid_sibling_loses_and_is_marked() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t = 1_700_000_000u32;
+    let mature = rbitcoin_consensus::mine_regtest_paying(gen, t, 1, p2pk_requires_sig(), vec![]);
+    hub.accept_block(mature.clone()).unwrap();
+    let mut prev = mature.block_hash();
+    for h in 2..=101u32 {
+        let b = mine(prev, t.saturating_add(h), h);
+        hub.accept_block(b.clone()).unwrap();
+        prev = b.block_hash();
+    }
+    // Empty scriptSig against P2PK: one script job, it fails inline.
+    let bad = spend_block(prev, t.saturating_add(102), 102, coinbase_out(&mature));
+    let good = mine(prev, t.saturating_add(102), 102);
+    hub.hold_unconnected_body(good.clone());
+    let out = hub.accept_received_block(bad.clone()).unwrap();
+    assert!(matches!(out, AcceptOutcome::IgnoredWeaker), "{out:?}");
+    assert_eq!(hub.tip_hash().unwrap(), good.block_hash());
+    assert!(
+        hub.is_block_invalid(&bad.block_hash()),
+        "the script-invalid sibling is marked, not the honest block"
+    );
+    assert!(!hub.is_connected(&bad.block_hash()));
+    let child = mine(good.block_hash(), t.saturating_add(103), 103);
+    assert!(matches!(
+        hub.accept_received_block(child.clone()).unwrap(),
+        AcceptOutcome::Accepted { height: 103 }
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
