@@ -82,6 +82,9 @@ pub struct TxEntry {
     pub sigop_cost: u64,
     /// Slot index in the durable slot table.
     pub slot: u32,
+    /// The `mempool_sequence` this entry's insert took. 0 for a record
+    /// loaded at open.
+    pub seq: u64,
     /// In-mempool parents (txids this tx spends).
     pub parents: BTreeSet<Txid>,
     /// In-mempool children.

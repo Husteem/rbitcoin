@@ -16,8 +16,8 @@ use rbitcoin_mempool::{
     fee_at_target_sat_kvb, fine_candidate_rates, flow_for_depth, frontier_feerate_from_chunks,
     hold_defined_then_monotone, min_rate_for_capacity, percentile_sat, published_depth_rate,
     weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainPrevout, ChainTipCtx,
-    Chunk, Coin, FeeFlowMeter, PrepareOpts, SelectBudget, Selected, StockAbove, UtxoProvider,
-    BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
+    Chunk, Coin, FeeFlowMeter, PrepareOpts, Removal, RemovalReason, SelectBudget, Selected,
+    StockAbove, UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
@@ -2098,7 +2098,7 @@ impl MempoolHub {
                     n += 1;
                 }
             }
-            let _ = g.remove_live_txids(&present);
+            let _ = g.remove_live_txids(&present, Removal::Committed(RemovalReason::Expiry));
             for t in &present {
                 if !g.graph.contains(t) {
                     self.unindex_txid(t);
@@ -3518,7 +3518,7 @@ impl MempoolHub {
             let mut g = self.lock_write();
             let spent = g.graph.descendant_set(txid).is_some_and(|d| d.len() > 1);
             if !spent {
-                gone.extend(g.remove_txid_tree(txid));
+                gone.extend(g.remove_txid_tree(txid, Removal::Undo));
             }
         }
         self.unindex_evicted(&gone);
@@ -3562,8 +3562,9 @@ impl MempoolHub {
                 g.trust_kept.insert(*id);
             }
             for r in accepted.iter().rev() {
-                gone.extend(g.remove_txid_tree(&r.txid));
+                gone.extend(g.remove_txid_tree(&r.txid, Removal::Undo));
             }
+            g.forget_admits(accepted);
         }
         self.unindex_evicted(&gone);
         victims
@@ -5286,7 +5287,7 @@ impl MempoolHub {
                     self.push_confirm_memory(rate);
                 }
             }
-            g.remove_live_txids(txids)?
+            g.remove_live_txids(txids, Removal::Committed(RemovalReason::Block))?
         };
         if removed > 0 {
             self.unindex_evicted(txids);
@@ -5306,13 +5307,16 @@ impl MempoolHub {
     /// start maintenance, so catch-up is not paced by a large pool. Mined
     /// prioritisation deltas still drop, including a tx that already left
     /// the mempool and a block that removes nothing live.
-    pub fn remove_for_block(&self, txids: &[Txid]) -> usize {
+    ///
+    /// `removal` is `Committed(Block)` for a block, and `Undo` for a
+    /// `testmempoolaccept` dry run that takes its admits back.
+    pub fn remove_for_block(&self, txids: &[Txid], removal: Removal) -> usize {
         if !self.pool_maintained() {
             self.drop_mined_fee_deltas(txids);
             return 0;
         }
         let utxo = self.utxo_provider();
-        let n = self.unlink_block_txids(txids);
+        let n = self.unlink_block_txids(txids, removal);
         for tid in txids {
             self.promote_orphans_staged(*tid, &utxo);
         }
@@ -5322,7 +5326,11 @@ impl MempoolHub {
 
     /// [`Self::remove_for_block`] for an armed task. Orphan promotion takes a
     /// store permit per coin read and drops it before script verify.
-    pub async fn remove_for_block_async(self: &Arc<Self>, txids: Vec<Txid>) -> usize {
+    pub async fn remove_for_block_async(
+        self: &Arc<Self>,
+        txids: Vec<Txid>,
+        removal: Removal,
+    ) -> usize {
         let hub = Arc::clone(self);
         let ids = txids.clone();
         let n = crate::reactor::off_pool(move || {
@@ -5330,7 +5338,7 @@ impl MempoolHub {
                 hub.drop_mined_fee_deltas(&ids);
                 None
             } else {
-                Some(hub.unlink_block_txids(&ids))
+                Some(hub.unlink_block_txids(&ids, removal))
             }
         })
         .await;
@@ -5346,7 +5354,7 @@ impl MempoolHub {
     }
 
     /// Pull mined txids out of the live set. Does not promote or unindex.
-    fn unlink_block_txids(&self, txids: &[Txid]) -> usize {
+    fn unlink_block_txids(&self, txids: &[Txid], removal: Removal) -> usize {
         let mut g = self.lock_write();
         let bps = g.graph.bytes_per_sigop();
         for tid in txids {
@@ -5360,7 +5368,7 @@ impl MempoolHub {
                 self.push_confirm_memory(rate);
             }
         }
-        g.remove_live_txids(txids).unwrap_or(0)
+        g.remove_live_txids(txids, removal).unwrap_or(0)
     }
 
     /// Drop orphans the block spent, then the relay rows and fee deltas.
@@ -5383,7 +5391,7 @@ impl MempoolHub {
             return 0;
         }
         if spent.is_empty() {
-            return self.remove_for_block(txids);
+            return self.remove_for_block(txids, Removal::Committed(RemovalReason::Block));
         }
         let utxo = self.utxo_provider();
         let (n, gone) = {
@@ -5702,10 +5710,6 @@ impl MempoolHub {
         self.reorg_servable.lock().unwrap().contains(wtxid)
     }
 
-    pub fn current_relay_seq(&self) -> u64 {
-        self.next_relay_seq.load(Ordering::Relaxed)
-    }
-
     /// True when entry_sequence < peer's last INV sequence.
     pub fn is_relay_servable(&self, wtxid: &Wtxid, last_inv_seq: u64) -> bool {
         self.relay_seq
@@ -5790,7 +5794,9 @@ impl MempoolHub {
                 let mut g = self.lock_write();
                 for id in &to_drop {
                     if g.graph.contains(id) {
-                        gone.extend(g.remove_txid_tree(id));
+                        gone.extend(
+                            g.remove_txid_tree(id, Removal::Committed(RemovalReason::Reorg)),
+                        );
                     }
                 }
             }
@@ -6016,6 +6022,19 @@ impl MempoolHub {
             .iter()
             .map(|(txid, e)| (*txid, e.fee_sat, e.weight))
             .collect()
+    }
+
+    /// The committed removals the pool still holds, oldest first.
+    pub fn removed_rows(&self) -> rbitcoin_mempool::RemovedRows {
+        self.lock_read().removed_rows()
+    }
+
+    /// The live txids and Core's `mempool_sequence`, from one read of the
+    /// pool, so the sequence names exactly this membership.
+    pub fn live_txids_and_sequence(&self) -> (Vec<Txid>, u64) {
+        let g = self.lock_read();
+        let txids = g.graph.iter().map(|(txid, _)| *txid).collect();
+        (txids, g.mempool_sequence())
     }
 
     /// Core `GetTotalTxSize` / `totalFee`: (count, sigop-adjusted vbytes, fee) for `getmempoolinfo`.
@@ -6511,7 +6530,7 @@ impl MempoolHub {
 
     #[doc(hidden)]
     pub fn live_accept_result(&self, txid: &Txid) -> Option<AcceptResult> {
-        let (txid, fee_sat, weight, slot) = {
+        let (txid, fee_sat, weight, slot, seq) = {
             let g = self.lock_read();
             let e = g.graph.get(txid)?;
             (
@@ -6519,13 +6538,18 @@ impl MempoolHub {
                 e.fee_sat,
                 e.adjusted_weight(g.graph.bytes_per_sigop()),
                 e.slot,
+                // Already live: no row before now belongs to this result.
+                g.mempool_sequence(),
             )
         };
+        let began = seq;
         Some(AcceptResult {
             txid,
             fee_sat,
             weight,
             slot,
+            began,
+            seq,
             accept_secs: self
                 .accept_time_txid(&txid)
                 .unwrap_or_else(|| self.relay_now_secs()),

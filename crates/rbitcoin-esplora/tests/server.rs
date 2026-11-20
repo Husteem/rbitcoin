@@ -1331,6 +1331,7 @@ fn asof_query_is_gated_to_documented_routes() {
     assert!(!path_accepts_asof("/scripthash/ab/txs/mempool"));
     assert!(path_never_pins("/mempool"));
     assert!(path_never_pins("/mempool/txids"));
+    assert!(path_never_pins("/mempool/removed"));
     assert!(path_never_pins("/fee-estimates"));
     assert!(path_never_pins("/tx"));
     assert!(!path_never_pins("/tx/ab"));
@@ -1516,6 +1517,9 @@ async fn block_raw_summary_status_and_mempool_routes() {
     let (st, body) = http_get(addr, "/mempool/recent").await;
     assert_eq!(st, 200, "{body}");
     assert_eq!(body, "[]");
+    let (st, body) = http_get(addr, "/mempool/removed").await;
+    assert_eq!(st, 200, "no mempool, no rows: {body}");
+    assert_eq!(body, r#"{"oldest":1,"removed":[]}"#);
 
     let sh = rbitcoin_store::script_hash(&[0x51]);
     let sh_hex = block_hash_hex(&sh);

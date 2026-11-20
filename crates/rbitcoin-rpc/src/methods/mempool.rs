@@ -2,7 +2,7 @@ use super::*;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
-use rbitcoin_net::{MempoolHub, QueryUtxoProvider, UtxoProvider};
+use rbitcoin_net::{MempoolHub, QueryUtxoProvider, Removal, UtxoProvider};
 use rbitcoin_primitives::Fk;
 use rbitcoin_primitives::Height;
 use serde_json::{json, Value};
@@ -234,23 +234,23 @@ pub(crate) fn getrawmempool(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     let Some(mp) = ctx.mempool.as_ref() else {
         return Ok(if verbose { json!({}) } else { json!([]) });
     };
-    let live = mp.list_live_meta();
     if !verbose {
+        let (live, sequence) = mp.live_txids_and_sequence();
         let mut ids: Vec<String> = live
             .iter()
-            .map(|(t, _, _)| hash_hex_display(&t.to_byte_array()))
+            .map(|t| hash_hex_display(&t.to_byte_array()))
             .collect();
         ids.sort();
         if want_seq {
             return Ok(json!({
                 "txids": ids,
-                "mempool_sequence": mp.current_relay_seq(),
+                "mempool_sequence": sequence,
             }));
         }
         return Ok(json!(ids));
     }
     let mut map = serde_json::Map::new();
-    for (txid, fee, weight) in live {
+    for (txid, fee, weight) in mp.list_live_meta() {
         map.insert(
             hash_hex_display(&txid.to_byte_array()),
             mempool_graph_json(mp, &txid, fee, weight),
@@ -1485,7 +1485,7 @@ pub fn testmempoolaccept_package_rows(
         }
     }
     if !added.is_empty() {
-        mp.remove_for_block(&added);
+        mp.remove_for_block(&added, Removal::Undo);
     }
     json!(out)
 }
@@ -1579,7 +1579,7 @@ async fn testmempoolaccept_package_rows_work(
         }
     }
     if !added.is_empty() {
-        mp.remove_for_block_async(added).await;
+        mp.remove_for_block_async(added, Removal::Undo).await;
     }
     json!(out)
 }

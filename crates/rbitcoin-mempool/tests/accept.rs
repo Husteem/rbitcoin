@@ -7,6 +7,7 @@ use rbitcoin_consensus::policy::{self};
 use rbitcoin_mempool::accept::*;
 use rbitcoin_mempool::error::MempoolError;
 use rbitcoin_mempool::graph::{MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_CLUSTER_WEIGHT};
+use rbitcoin_mempool::{Removal, RemovalReason};
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +22,8 @@ const TIP_OK: ChainTipCtx = ChainTipCtx {
     height: 1_000_000,
     mtp: u32::MAX,
 };
+
+const BLOCK: Removal = Removal::Committed(RemovalReason::Block);
 
 fn coin(txout: TxOut) -> Coin {
     Coin {
@@ -1529,7 +1532,7 @@ fn accept_error_display_and_reject_paths() {
     ));
 
     assert!(matches!(
-        mp.remove_txid(&Txid::from_byte_array([0xee; 32])),
+        mp.remove_txid(&Txid::from_byte_array([0xee; 32]), BLOCK),
         Err(AcceptError::NotFound(_))
     ));
 
@@ -1586,7 +1589,7 @@ fn remove_txid_notes_extra_compact() {
     let tx = spend_tx(op, txout.value.to_sat() - 1_000);
     let txid = tx.compute_txid();
     mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
-    mp.remove_txid(&txid).unwrap();
+    mp.remove_txid(&txid, BLOCK).unwrap();
     assert!(
         mp.extra_compact_txs().any(|t| t.compute_txid() == txid),
         "confirm/evict strip must keep the body for compact fill"
@@ -1620,7 +1623,7 @@ fn remove_live_txids_syncs_deaths_once() {
     mp.flush().unwrap();
     let (meta_before, slots_before) = mp.death_sync_counts();
     // Two deaths, one sync. Leave a live majority so compact does not sync meta again.
-    let n = mp.remove_live_txids(&ids[..2]).unwrap();
+    let n = mp.remove_live_txids(&ids[..2], BLOCK).unwrap();
     assert_eq!(n, 2);
     let (meta_after, slots_after) = mp.death_sync_counts();
     assert_eq!(meta_after, meta_before + 1, "block strip syncs meta once");
@@ -2053,6 +2056,18 @@ fn failed_replacement_restores_below_floor_and_cpfp_set() {
     assert!(
         mp.graph.contains(&victim_id),
         "below-floor conflict must stay"
+    );
+    // The child left with the anchor before it committed, and the victim is
+    // back. Only the anchor left for good.
+    let left: Vec<(Txid, RemovalReason)> = mp
+        .removed_rows()
+        .rows
+        .iter()
+        .map(|r| (r.txid, r.reason))
+        .collect();
+    assert_eq!(
+        left,
+        vec![(anchor.compute_txid(), RemovalReason::SizeLimit)]
     );
     assert_eq!(mp.orphan_count(), 0);
     let _ = std::fs::remove_dir_all(&dir);

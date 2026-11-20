@@ -6,4 +6,5 @@ mod fee_flow;
 mod graph;
 mod orphanage;
 mod packed;
+mod removed;
 mod store_tests;

@@ -58,6 +58,7 @@ pub mod linearize;
 pub mod orphanage;
 #[doc(hidden)]
 pub mod packed;
+mod sequence;
 #[doc(hidden)]
 pub mod store;
 pub mod testutil;
@@ -84,4 +85,7 @@ pub use graph::{
 };
 pub use orphanage::{OrphanSnapshot, Orphanage};
 pub use packed::VinAux;
+#[doc(hidden)]
+pub use sequence::{PoolSequence, REMOVED_ROWS};
+pub use sequence::{Removal, RemovalReason, RemovedRow, RemovedRows};
 pub use store::{Mempool, MempoolMeta};

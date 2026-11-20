@@ -1119,6 +1119,25 @@ fn relay_off_empty_pool_serves_template() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core's `mempool_sequence`: the number the pool gives its next change.
+/// It moves on an add and on a removal, a mined block included.
+#[test]
+fn getrawmempool_sequence_moves_on_add_and_removal() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let listing = || dispatch(&ctx, "getrawmempool", vec![json!(false), json!(true)]).unwrap();
+    let start = listing()["mempool_sequence"].as_u64().unwrap();
+    let (hex, spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    let added = listing();
+    assert_eq!(added["txids"], json!([spend.compute_txid().to_string()]));
+    assert_eq!(added["mempool_sequence"], json!(start + 1), "{added}");
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let mined = listing();
+    assert_eq!(mined["txids"], json!([]));
+    assert_eq!(mined["mempool_sequence"], json!(start + 2), "{mined}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn relay_off_refuses_pool_listing_and_mines_coinbase_only() {
     let (ctx, dir, _hub) = ctx_from_mature_pad_relay(300_000_000, false);
@@ -4761,6 +4780,36 @@ fn testmempoolaccept_package_leaves_no_parent_behind() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Multi-tx `testmempoolaccept` admits each member and takes it back. The
+/// pool numbers those changes and keeps no removal row: nothing was mined.
+#[test]
+fn testmempoolaccept_package_undo_leaves_no_removed_row() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let (parent_hex, parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk);
+    let child_hex = rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(
+        &child_of(&parent, 1_000),
+    ));
+    let mp = ctx.mempool.as_ref().unwrap();
+    let before = mp.lock_read().mempool_sequence();
+    let rows = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([parent_hex, child_hex])],
+    )
+    .unwrap();
+    assert_eq!(rows[0]["allowed"], json!(true), "{rows}");
+    assert_eq!(rows[1]["allowed"], json!(true), "{rows}");
+    assert!(!mp.contains(&parent.compute_txid()));
+    assert_eq!(
+        mp.lock_read().mempool_sequence(),
+        before + 4,
+        "two in, two out"
+    );
+    assert_eq!(mp.lock_read().removed_rows().rows, vec![]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Multi-tx `testmempoolaccept` admits each member and then removes it, so a
 /// TRUC sibling eviction there would lose the real child. Core allows no
 /// replacement in that call: the sibling is `TRUC-violation`.
@@ -8145,6 +8194,16 @@ fn http_request_task_methods_mine_and_accept_a_package() {
             .unwrap()
             .contains(&parent.compute_txid()),
         "testmempoolaccept must remove the package"
+    );
+    assert_eq!(
+        ctx.mempool
+            .as_ref()
+            .unwrap()
+            .lock_read()
+            .removed_rows()
+            .rows,
+        vec![],
+        "the dry run's undo writes no removal row"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
