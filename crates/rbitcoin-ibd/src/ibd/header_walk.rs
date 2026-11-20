@@ -2789,6 +2789,10 @@ pub fn publish_work(st: &mut IbdWorkState, hub: &ChainHub) {
     let Some(hash) = st.header_walk.milestone_hash() else {
         return;
     };
+    // From here the anchor compare and the `opened` gate only pick which
+    // line logs (mismatch warn or milestone info). The suite cannot see
+    // either line.
+    #[cfg_attr(false, mutants::skip)]
     if hash != anchor.hash {
         if opened {
             rbitcoin_log::warn!(
@@ -2799,8 +2803,6 @@ pub fn publish_work(st: &mut IbdWorkState, hub: &ChainHub) {
         }
         return;
     }
-    // The milestone info line is the only effect, and the suite cannot see
-    // that log line.
     #[cfg_attr(false, mutants::skip)]
     if !opened {
         return;
