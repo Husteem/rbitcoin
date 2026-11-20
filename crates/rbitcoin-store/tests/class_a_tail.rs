@@ -262,8 +262,26 @@ fn checksum_bad_tail_over_zeroes_refuses_open() {
     let (dir, _txid) = synced_txid_past_page(named);
     let guard = dir.join("tear_guard");
     std::fs::create_dir_all(&guard).unwrap();
-    std::fs::write(guard.join("tail.0"), vec![0x5au8; TAIL_BYTES]).unwrap();
-    std::fs::write(guard.join("tail.1"), vec![0x5au8; TAIL_BYTES]).unwrap();
+    // CAPT with a bad checksum. A non-CAPT filler is rewritten to generation 0
+    // and never reaches the checksum compare.
+    plant_tail(
+        &guard.join("tail.0"),
+        1,
+        named,
+        &[(TXID_STEM, 4160, 4096, &[0x11u8; 64])],
+    );
+    plant_tail(
+        &guard.join("tail.1"),
+        2,
+        named,
+        &[(TXID_STEM, 4160, 4096, &[0x22u8; 64])],
+    );
+    for name in ["tail.0", "tail.1"] {
+        let path = guard.join(name);
+        let mut raw = std::fs::read(&path).unwrap();
+        raw[24] ^= 0xff;
+        std::fs::write(&path, &raw).unwrap();
+    }
     std::fs::write(guard.join("first"), vec![0u8; FIRST_BYTES]).unwrap();
     zero_published_tail_block(&dir.join("txid.body"));
     match Store::open_tiny(&dir) {
@@ -525,5 +543,88 @@ fn zeroed_cold_seqsigwit_page0_restores_from_the_hot_guard() {
     assert!(!cold.join("tear_guard").exists());
     let after = std::fs::read(&cold_body).unwrap();
     assert_eq!(&after[..n], &before[..n]);
+    let _ = std::fs::remove_dir_all(&hot);
+}
+
+/// A store written before `tear_guard` can have a published tail of zeros:
+/// a coinbase edge packs as eight zero bytes, and an unstamped txstat cell is
+/// zeros. Open must keep those bytes when no slot exists yet.
+#[test]
+fn open_without_guard_keeps_a_zero_coinbase_tail() {
+    let dir = tmp();
+    let n = 511u64;
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let batch: Vec<_> = (1..=n).map(|i| coinbase([i as u8; 32])).collect();
+        s.put_tx_full_batch_indexed(&batch, false).unwrap();
+        s.txs.sync_class_a_named(n).unwrap();
+    }
+    let input = dir.join("input.body");
+    let txstat = dir.join("txstat.body");
+    assert!(logical_of(&input) > 4096);
+    assert!(logical_of(&txstat) > 4096);
+    std::fs::remove_dir_all(dir.join("tear_guard")).unwrap();
+    let s = Store::open_tiny(&dir).unwrap();
+    assert_eq!(
+        s.input_edges(Fk(n)).unwrap(),
+        Some(vec![rbitcoin_store::input::InputEdge::coinbase()])
+    );
+    assert_eq!(s.txstat_row(Fk(n)).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `txstat.*` and `input.*` live next to seqsigwit on a split store. A zeroed
+/// cold txstat tail comes back from the hot guard.
+#[test]
+fn zeroed_cold_txstat_tail_restores_from_the_hot_guard() {
+    let hot = tmp();
+    let cold = hot.join("cold-seq");
+    std::fs::create_dir_all(&cold).unwrap();
+    let n = 510u64;
+    let row = rbitcoin_store::TxStatRow {
+        fee_sat: 7,
+        base: 100,
+        wit_extra: 1,
+    };
+    {
+        let s = Store::create_tiny(&hot).unwrap();
+        let batch: Vec<_> = (1..=n).map(|i| coinbase([i as u8; 32])).collect();
+        s.put_tx_full_batch_indexed(&batch, false).unwrap();
+        s.write_txstat_row(Fk(509), &row).unwrap();
+        s.txs.sync_class_a_named(n).unwrap();
+    }
+    let names: Vec<_> = std::fs::read_dir(&hot)
+        .unwrap()
+        .map(|ent| ent.unwrap().file_name())
+        .filter(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with("seqsigwit.")
+                || name.starts_with("txstat.")
+                || name.starts_with("input.")
+        })
+        .collect();
+    for name in &names {
+        std::fs::rename(hot.join(name), cold.join(name)).unwrap();
+    }
+    let body = cold.join("txstat.body");
+    let published = logical_of(&body);
+    let off = published & !4095;
+    assert!(off >= 4096);
+    let n_tail = (published - off) as usize;
+    let mut before = vec![0u8; n_tail];
+    read_at(&body, off, &mut before);
+    assert!(before.iter().any(|b| *b != 0));
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&body).unwrap();
+        file.seek(SeekFrom::Start(off)).unwrap();
+        file.write_all(&vec![0u8; n_tail]).unwrap();
+        file.sync_all().unwrap();
+    }
+    let layout = rbitcoin_store::store::StoreLayout::tiny(&hot).with_cold_dir(&cold);
+    let s = Store::open_layout(layout).unwrap();
+    assert_eq!(s.txstat_row(Fk(509)).unwrap(), Some(row));
+    assert!(hot.join("tear_guard/first").is_file());
+    assert!(!cold.join("tear_guard").exists());
+    drop(s);
     let _ = std::fs::remove_dir_all(&hot);
 }

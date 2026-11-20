@@ -103,7 +103,8 @@ fn tail_span(published: u64, file_len: u64) -> (u64, u16) {
 }
 
 pub(crate) fn stem_path(hot: &Path, seq: &Path, name: &str) -> PathBuf {
-    if name.starts_with("seqsigwit.") {
+    // `open_seqsigwit` keeps these next to seqsigwit when the store is split.
+    if name.starts_with("seqsigwit.") || name.starts_with("txstat.") || name.starts_with("input.") {
         seq.join(name)
     } else {
         hot.join(name)
@@ -550,11 +551,21 @@ fn restore_stem(
     refuse_zero_prefix(
         &file,
         &path,
+        name,
         published,
         file_len,
-        page0_zero && !page0_restored,
-        tail_restored,
+        ZeroRefuse {
+            page0_unrestored: page0_zero && !page0_restored,
+            tail_restored,
+            no_slot: best.is_none(),
+        },
     )
+}
+
+struct ZeroRefuse {
+    page0_unrestored: bool,
+    tail_restored: bool,
+    no_slot: bool,
 }
 
 fn restore_page0(
@@ -611,20 +622,26 @@ fn restore_tail_block(
     Ok(true)
 }
 
+/// A coinbase edge and an unstamped txstat cell are zero bytes. With no tail
+/// slot yet, that prefix is the data, not a tear.
+fn zero_tail_is_record(name: &str) -> bool {
+    name == "input.body" || name.starts_with("txstat.")
+}
+
 fn refuse_zero_prefix(
     file: &File,
     path: &Path,
+    name: &str,
     published: u64,
     file_len: u64,
-    page0_unrestored: bool,
-    tail_restored: bool,
+    flags: ZeroRefuse,
 ) -> Result<(), StoreError> {
     if published == 0 || file_len == 0 {
         return Ok(());
     }
     // A synced image may itself be zeros (unstamped txstat cells). Stop only
     // when a zeroed prefix had no usable image to put back.
-    if page0_unrestored {
+    if flags.page0_unrestored {
         let page_n = (file_len as usize).min(PAGE).min(published as usize);
         if page_n > 0 {
             let mut page0 = vec![0u8; page_n];
@@ -635,7 +652,11 @@ fn refuse_zero_prefix(
         }
     }
     let (off, n) = tail_span(published, file_len);
-    if n > 0 && off >= PAGE as u64 && !tail_restored {
+    if n > 0
+        && off >= PAGE as u64
+        && !flags.tail_restored
+        && !(flags.no_slot && zero_tail_is_record(name))
+    {
         let mut prefix = vec![0u8; n as usize];
         pread_exact(file, path, off, &mut prefix)?;
         if all_zero(&prefix) {
