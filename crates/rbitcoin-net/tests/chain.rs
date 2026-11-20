@@ -7817,3 +7817,44 @@ fn pair_script_invalid_sibling_loses_and_is_marked() {
     ));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// T3: a heavier held branch whose first block fails scripts must not strand
+/// the valid tip child. The branch is recorded and the child connects.
+#[test]
+fn failed_heavier_branch_does_not_strand_the_tip_child() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t = 1_700_000_000u32;
+    let mature = rbitcoin_consensus::mine_regtest_paying(gen, t, 1, p2pk_requires_sig(), vec![]);
+    hub.accept_block(mature.clone()).unwrap();
+    let mut prev = mature.block_hash();
+    for h in 2..=101u32 {
+        let b = mine(prev, t.saturating_add(h), h);
+        hub.accept_block(b.clone()).unwrap();
+        prev = b.block_hash();
+    }
+    let fork = hub.block_at_height(100).unwrap().expect("height 100");
+    // Three-block branch from height 100; the first block's spend has an
+    // empty scriptSig against P2PK, so the branch fails at its first connect.
+    let q1 = spend_block(
+        fork.block_hash(),
+        t.saturating_add(101),
+        101,
+        coinbase_out(&mature),
+    );
+    let q2 = mine(q1.block_hash(), t.saturating_add(102), 102);
+    let q3 = mine(q2.block_hash(), t.saturating_add(103), 103);
+    hub.hold_unconnected_body(q1.clone());
+    hub.hold_unconnected_body(q2.clone());
+    hub.hold_unconnected_body(q3);
+    let child = mine_distinct(prev, t.saturating_add(102), 102, &[q2.block_hash()]);
+    let out = hub.accept_received_block(child.clone()).unwrap();
+    assert!(
+        matches!(out, AcceptOutcome::Accepted { height: 102 }),
+        "the child connects after the failed preemption: {out:?}"
+    );
+    assert_eq!(hub.tip_hash().unwrap(), child.block_hash());
+    assert!(hub.is_block_invalid(&q1.block_hash()));
+    let _ = std::fs::remove_dir_all(dir);
+}
