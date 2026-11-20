@@ -83,8 +83,8 @@ assert_ok "required test job excludes rbitcoin-bench" \
   bash -c 'awk "/^  test:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -Eq -- "^ +run: cargo test --workspace --exclude rbitcoin-bench$"' _ "$ROOT/.github/workflows/ci.yml"
 assert_ok "required test job still pins the bench scripthash" \
   grep -q 'cargo test -p rbitcoin-bench --lib hot_corpus_includes_p2a' "$ROOT/.github/workflows/ci.yml"
-assert_ok "required test job runs the skip-flushes switch test" \
-  grep -q -- '--features skip-flushes --test suite' "$ROOT/.github/workflows/ci.yml"
+assert_ok "pread job runs the skip-flushes switch test" \
+  bash -c 'awk "/^  pread:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -q -- "--features skip-flushes --test suite"' _ "$ROOT/.github/workflows/ci.yml"
 assert_ok "macos-test job runs the workspace suite with skip-flushes" \
   bash -c 'awk "/^  macos-test:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -Eq -- "^ +run: cargo test --workspace --exclude rbitcoin-bench --features skip-flushes$"' _ "$ROOT/.github/workflows/ci.yml"
 assert_ok "macos-test job starts with the other jobs (no needs)" \
