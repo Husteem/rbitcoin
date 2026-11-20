@@ -436,7 +436,11 @@ async fn health_rejects_past_the_cap_log_fewer_lines_than_rejects() {
     rbitcoin_log::capture_logs(false);
     let rejects = lines
         .iter()
-        .filter(|(_, msg)| msg.contains("health: reject") && msg.contains("max connections"))
+        .filter(|(level, msg)| {
+            *level == rbitcoin_log::Level::Warn
+                && msg.contains("health: reject")
+                && msg.contains("max connections")
+        })
         .count();
     assert!(
         (1..EXTRA).contains(&rejects),

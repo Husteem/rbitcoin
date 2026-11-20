@@ -4519,6 +4519,15 @@ fn open_cut_past_a_roll_rebuilds_the_in_flight_segment() {
             .unwrap();
         assert_eq!(t.head.sealed_segment_count(), 0, "seal still in flight");
         assert_eq!(t.head.last_inserted_fk(), 205);
+        // The roll left the in-flight seal plus a new tail, and the cut at
+        // 204 lands past the in-flight range, so open keeps that range.
+        let unsealed = t.head.unsealed_ranges();
+        assert!(unsealed.len() >= 2, "no roll: unsealed={unsealed:?}");
+        let (_, first_fk, count) = unsealed[0];
+        assert!(
+            first_fk + count <= 205,
+            "in-flight range must end at or below the cut: unsealed={unsealed:?}"
+        );
         copy_tree(&dir, &copy);
     }
     let t = TxTable::open_seqsigwit(&copy, &copy, rbitcoin_store::HeadOpenOpts::TINY, Some(204))
