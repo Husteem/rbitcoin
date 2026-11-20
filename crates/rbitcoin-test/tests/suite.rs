@@ -12,3 +12,4 @@ mod jsonrpc;
 mod mine;
 mod outbound_refill_journey;
 mod scenarios;
+mod trust_peer_waiver_journey;
