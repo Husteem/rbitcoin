@@ -29,6 +29,7 @@ fn claim_holds_in_wave_before_next_advances() {
             },
             done: std::sync::Mutex::new(false),
             done_cv: std::sync::Condvar::new(),
+            pair: std::sync::Mutex::new(None),
         });
         let freed = Arc::new(AtomicBool::new(false));
         let publishing = Arc::clone(&wave);
