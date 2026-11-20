@@ -28,35 +28,36 @@ fn open_overlapped(path: &Path) -> std::fs::File {
         .expect("overlapped tmp")
 }
 
-/// Closing an overlapped file leaves its HANDLE value in the bind set.
-/// The next open often gets that value. The new file is a different object
-/// and must be bound again, or its read never posts a completion.
+/// Closing overlapped files leaves their HANDLE values in the bind set.
+/// The next open gets one of those values for a new file. That file must be
+/// bound again, or its read never posts a completion.
 #[test]
 fn recycled_handle_pread_completes() {
-    // The first close is taken by the next CreateFile's directory open, so
-    // that file handle is a new value. Closing that file and opening once
-    // more returns the file handle: the directory open consumes the lower
-    // free value, and the file gets the one we bound.
-    let path_a = tmp("recycle-a");
-    let a = open_overlapped(&path_a);
-    drop(a);
-    let _ = std::fs::remove_file(&path_a);
-
-    let path_b = tmp("recycle-b");
-    let b = open_overlapped(&path_b);
-    let raw = IoHandle::from_file(&b).as_raw_handle();
+    // Fill the low free slots, bind each file, then close them. The next
+    // CreateFile gets one of those values (a lower hole would already have
+    // been consumed). That value is in the bind set and names a new file.
     let mut eng = IocpEngine::open(8).unwrap();
-    eng.associate(IoHandle::from_file(&b)).unwrap();
-    drop(b);
-    let _ = std::fs::remove_file(&path_b);
+    let mut held = Vec::new();
+    let mut bound = Vec::new();
+    for i in 0..64 {
+        let p = tmp(&format!("recycle-fill-{i}"));
+        let f = open_overlapped(&p);
+        let h = IoHandle::from_file(&f);
+        eng.associate(h).unwrap();
+        bound.push(h.as_raw_handle());
+        held.push((p, f));
+    }
+    for (p, f) in held {
+        drop(f);
+        let _ = std::fs::remove_file(&p);
+    }
 
-    let path_c = tmp("recycle-c");
-    let c = open_overlapped(&path_c);
-    let h = IoHandle::from_file(&c);
-    assert_eq!(
-        h.as_raw_handle(),
-        raw,
-        "file HANDLE was not reused (got {:?}, bound {raw:?})",
+    let path = tmp("recycle-reused");
+    let f = open_overlapped(&path);
+    let h = IoHandle::from_file(&f);
+    assert!(
+        bound.contains(&h.as_raw_handle()),
+        "file HANDLE {:?} was not one of the closed values {bound:?}",
         h.as_raw_handle()
     );
     assert!(h.pwrite(0, b"hello") > 0);
@@ -68,8 +69,8 @@ fn recycled_handle_pread_completes() {
     );
     assert_eq!(eng.harvest_ready(), vec![(7, 5)]);
     assert_eq!(&buf, b"hello");
-    drop(c);
-    let _ = std::fs::remove_file(&path_c);
+    drop(f);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
