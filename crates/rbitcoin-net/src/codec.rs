@@ -132,8 +132,8 @@ impl FramedMessage {
         Some(bitcoin::BlockHash::from_byte_array(dig.to_byte_array()))
     }
 
-    /// Extra bytes / unknown command → [`NetworkMessage::Unknown`].
-    /// Oversize `headers` (`n > MAX_HEADERS_RESULTS`), oversize inv-like
+    /// Extra bytes (after anything but a block) or an unknown command →
+    /// [`NetworkMessage::Unknown`]. Oversize `headers` (`n > MAX_HEADERS_RESULTS`), oversize inv-like
     /// messages, and a `tx` / `block` / `cmpctblock` / `blocktxn` whose
     /// compact-size count cannot fit in the remaining bytes are
     /// [`NetError::MessageTooLarge`] before `consensus_decode` allocates.
@@ -164,12 +164,17 @@ impl FramedMessage {
 
     /// Deserialize the application payload (no v1 header, no checksum).
     ///
-    /// Extra bytes / unknown command → [`NetworkMessage::Unknown`].
+    /// Extra bytes (after anything but a block) or an unknown command →
+    /// [`NetworkMessage::Unknown`]. Core reads a `block` with
+    /// `vRecv >> TX_WITH_WITNESS(*pblock)` and never looks at the bytes after
+    /// its last transaction, so a block keeps them out of the decode.
     pub fn decode(self) -> RawNetworkMessage {
         let cmd = command_from_header(&self.command);
         let mut sl = self.payload.as_slice();
         match decode_cmd_payload(cmd.as_ref(), &mut sl) {
-            Ok(Some(msg)) if sl.is_empty() => RawNetworkMessage::new(self.magic, msg),
+            Ok(Some(msg)) if sl.is_empty() || matches!(msg, NetworkMessage::Block(_)) => {
+                RawNetworkMessage::new(self.magic, msg)
+            }
             _ => RawNetworkMessage::new(
                 self.magic,
                 NetworkMessage::Unknown {
