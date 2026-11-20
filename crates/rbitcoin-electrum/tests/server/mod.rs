@@ -1503,7 +1503,8 @@ async fn api_log_records_electrum_method() {
 }
 
 /// `get_merkle` pinned by `asof:` at the tip serves the tip's proof. A
-/// height above the pin is not on the pinned chain.
+/// height above the pin is not on the pinned chain. On the same connection,
+/// `subscribe` after a windowed `get_history` reports full-history status.
 #[tokio::test]
 async fn asof_get_merkle_serves_heights_through_the_pin() {
     use rbitcoin_primitives::{Fk, Height};
@@ -1588,6 +1589,35 @@ async fn asof_get_merkle_serves_heights_through_the_pin() {
     .await
     .unwrap_err();
     assert!(above.contains("asof not on chain"), "{above}");
+
+    // The full `get_history` fills the connection's `sh_join` slot. The
+    // windowed one and `subscribe` both read that slot; the status still
+    // covers every row.
+    let sh = electrum_scripthash_hex(&[0x51]);
+    let all = electrum_tcp_call(
+        &mut stream,
+        "blockchain.scripthash.get_history",
+        json!([&sh]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 4, "{all}");
+    let windowed = electrum_tcp_call(
+        &mut stream,
+        "blockchain.scripthash.get_history",
+        json!([&sh, 1, 3]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(windowed.as_array().unwrap().len(), 2, "{windowed}");
+    let status = electrum_tcp_call(&mut stream, "blockchain.scripthash.subscribe", json!([&sh]))
+        .await
+        .unwrap();
+    let mut sh_bytes = rbitcoin_primitives::hex_decode(&sh).unwrap();
+    sh_bytes.reverse();
+    let full = q.scripthash_history(&sh_bytes.try_into().unwrap()).unwrap();
+    assert_eq!(full.len(), 4);
+    assert_eq!(status, json!(scripthash_status(&full)));
 
     handle.shutdown().await;
     let _ = prev;

@@ -2610,9 +2610,7 @@ pub fn method_stays_on_worker(method: &str) -> bool {
 
 #[doc(hidden)]
 pub fn method_needs_sh_index(method: &str) -> bool {
-    method.starts_with("blockchain.scripthash.")
-        || method.starts_with("blockchain.tweaks.")
-        || method.starts_with("blockchain.silentpayments.")
+    method.starts_with("blockchain.scripthash.") || method.starts_with("blockchain.silentpayments.")
 }
 
 /// Chain-tip stamp and a trailing `asof:` share this set. A method that
@@ -3199,10 +3197,6 @@ pub fn dispatch_pinned(
             let (txid, vout) = param_outpoint(params)?;
             Ok(json!(conn.outpoint_subs.remove(&(txid, vout))))
         }
-        "blockchain.silentpayments.subscribe" => {
-            let sub = parse_sp_sub_on_chain(params, query, chain)?;
-            Ok(crate::silent_scan::subscribe_result(&sub))
-        }
         "blockchain.silentpayments.unsubscribe" => {
             silentpayments_unsubscribe(conn, query, chain, params)
         }
@@ -3237,9 +3231,6 @@ pub fn dispatch_pinned(
             Ok(Value::Array(arr))
         }
         "server.peers.subscribe" => Ok(json!([])),
-        "blockchain.tweaks.subscribe" => {
-            crate::tweaks::subscribe(query, params, chain, config.tweaks_min_dust)
-        }
         other => Err(format!("unknown method: {other}")),
     }
 }
