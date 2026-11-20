@@ -47,6 +47,11 @@ Unknown tokens (including deleted `mmap`) fall through to the platform default.
 Windows **IOCP**. Windows IoRing is not supported.
 
 **Windows table handles** are `FILE_FLAG_OVERLAPPED` so IOCP can bind.
+A `HANDLE` value is reused after close. Binding it again calls
+`CreateIoCompletionPort` even when that value was bound before. Skipping
+the call posts the new file's packets nowhere, and the drain waits until
+the hard cap.
+
 Create, open, header/trailer, and grow use positional `IoHandle`
 pread/pwrite and `SetFileInformationByHandle(FileEndOfFileInfo)`. Do
 **not** mix those handles with std `Read`/`Write`/`Seek` — `WriteFile`

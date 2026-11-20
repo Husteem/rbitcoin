@@ -28,6 +28,45 @@ fn open_overlapped(path: &Path) -> std::fs::File {
         .expect("overlapped tmp")
 }
 
+/// Closing an overlapped file leaves its HANDLE value in the bind set.
+/// The next open often gets that value. The new file is a different object
+/// and must be bound again, or its read never posts a completion.
+#[test]
+fn recycled_handle_pread_completes() {
+    let path = tmp("recycle-old");
+    let f = open_overlapped(&path);
+    let raw = IoHandle::from_file(&f).as_raw_handle();
+    let mut eng = IocpEngine::open(8).unwrap();
+    eng.associate(IoHandle::from_file(&f)).unwrap();
+    drop(f);
+    let _ = std::fs::remove_file(&path);
+
+    let mut neu = None;
+    for i in 0..128 {
+        let p = tmp(&format!("recycle-new-{i}"));
+        let f = open_overlapped(&p);
+        let h = IoHandle::from_file(&f);
+        if h.as_raw_handle() == raw {
+            neu = Some((p, f, h));
+            break;
+        }
+        drop(f);
+        let _ = std::fs::remove_file(&p);
+    }
+    let (p, f, h) = neu.expect("Windows reused the closed HANDLE value");
+    assert!(h.pwrite(0, b"hello") > 0);
+    let mut buf = [0u8; 5];
+    eng.push_pread(h, 0, &mut buf, 7).unwrap();
+    assert!(
+        eng.wait_one_cqe_timeout(2000),
+        "recycled HANDLE was not rebound; the completion never arrived"
+    );
+    assert_eq!(eng.harvest_ready(), vec![(7, 5)]);
+    assert_eq!(&buf, b"hello");
+    drop(f);
+    let _ = std::fs::remove_file(&p);
+}
+
 #[test]
 fn associate_twice_same_port_ok() {
     let path = tmp("twice");
