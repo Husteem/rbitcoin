@@ -237,8 +237,8 @@ the request cannot cancel, so a dropped caller still rolls back, trims, and
 removes the test inserts. A single-tx admit is awaited by the caller and
 runs on a task that caller cannot cancel, so a dropped request still
 publishes or restores after the commit. BlindBit `forward-tx` already spawns its admit. A parked blocking pool
-can still admit. Sync `accept_tx_from` remains for stack hubs and in-process
-`dispatch()`. An async admit promotes orphans on that admit task. A package
+can still admit. Sync `accept_tx_from` remains for stack hubs. RPC `dispatch`
+has no admit method. An async admit promotes orphans on that admit task. A package
 that fails re-admits its parked members there too, and puts replaced
 conflicts back the same way. A multi-tx `testmempoolaccept` promotes after
 it removes the inserts. The sync publish path still walks orphans on the caller.

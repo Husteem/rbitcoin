@@ -2772,26 +2772,6 @@ impl ChainHub {
         )
     }
 
-    /// RPC `generate` / `generatetoaddress` / `generatetodescriptor`.
-    ///
-    /// The pool is read after [`Self::generate_lock`] is held. A second call
-    /// waits, then selects what the first call left.
-    #[doc(hidden)]
-    pub fn generate_pool_for_rpc(
-        &self,
-        nblocks: u32,
-        script_pubkey: ScriptBuf,
-    ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(
-            nblocks,
-            script_pubkey,
-            GenerateFirst::Pool,
-            Self::GENERATE_MAX_BLOCKS,
-            true,
-            true,
-        )
-    }
-
     /// HTTP `generate*`. Mines off the blocking pool and awaits each connect
     /// on `tip-accept`, so a pool thread is not held across the block.
     pub async fn generate_to_script_for_rpc_async(
@@ -2812,7 +2792,10 @@ impl ChainHub {
         .await
     }
 
-    /// HTTP form of [`Self::generate_pool_for_rpc`].
+    /// RPC `generate` / `generatetoaddress` / `generatetodescriptor`.
+    ///
+    /// The pool is read after [`Self::generate_lock`] is held. A second call
+    /// waits, then selects what the first call left.
     #[doc(hidden)]
     pub async fn generate_pool_for_rpc_async(
         self: &std::sync::Arc<Self>,
@@ -2917,7 +2900,7 @@ impl ChainHub {
         hub.generate_commit_parked.store(false, Ordering::Release);
     }
 
-    /// Sync generate runs on stack hubs, `dispatch()` tests, and some
+    /// Sync generate runs on stack hubs, `HubRegtest`, and some
     /// `#[tokio::test]` tasks. `blocking_lock` panics on a Tokio worker even
     /// when the lock is free, so a worker only uses `try_lock`.
     fn lock_generate_sync(&self) -> tokio::sync::MutexGuard<'_, ()> {
