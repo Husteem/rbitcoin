@@ -1434,8 +1434,8 @@ pub fn log_sample(s: &IbdPerfSample, schedule: &mut PerfLogSchedule) {
     let now = Instant::now();
     let slow = slow_confirm_phase(s);
     match schedule.next_at(now, slow) {
-        PerfLineKind::Compact => debug!(Ibd, "ibd: perf {}", perf_sample_json_compact(s)),
-        PerfLineKind::Full => debug!(Ibd, "ibd: perf_full {}", perf_sample_json(s)),
+        PerfLineKind::Compact => debug!(Ibd, "perf {}", perf_sample_json_compact(s)),
+        PerfLineKind::Full => debug!(Ibd, "perf_full {}", perf_sample_json(s)),
     }
     match schedule.slow.on_tick(now, slow) {
         Some(SlowPhaseAction::Warn) => {

@@ -2365,7 +2365,7 @@ impl SpendPageLog {
             r.total_ms
         );
         let detail = format!(
-            "store: spend delta gen={} timing total_ms={} since_ms={} sealed_pages={} sealed_edges={} merge_reads={} merge_read_bytes={} merge_ms={} hot_folds={} hot_fold_record_bytes={} dense_kept_gen={} dense_kept_tail={} reclaim_read_bytes={} reclaim_read_ms={} folded_now={} dropped={} fold_rounds={} fold_compose_ms={} fold_file_ms={} body_write_ms={} body_sync_ms={} record_bytes={} seg_write_ms={} seg_sync_ms={} idx_entries={} idx_write_ms={} idx_sync_ms={} commit_ms={} install_ms={} unlink_ms={} folded_segments={} carried_bytes={} durable={} folds_through={} reclaim_below_permille={} bytes={} live={} spent_body={} records={} idx={} folded={} fold_records={} written_per_body_permille={}",
+            "spend delta gen={} timing total_ms={} since_ms={} sealed_pages={} sealed_edges={} merge_reads={} merge_read_bytes={} merge_ms={} hot_folds={} hot_fold_record_bytes={} dense_kept_gen={} dense_kept_tail={} reclaim_read_bytes={} reclaim_read_ms={} folded_now={} dropped={} fold_rounds={} fold_compose_ms={} fold_file_ms={} body_write_ms={} body_sync_ms={} record_bytes={} seg_write_ms={} seg_sync_ms={} idx_entries={} idx_write_ms={} idx_sync_ms={} commit_ms={} install_ms={} unlink_ms={} folded_segments={} carried_bytes={} durable={} folds_through={} reclaim_below_permille={} bytes={} live={} spent_body={} records={} idx={} folded={} fold_records={} written_per_body_permille={}",
             generation,
             r.total_ms,
             r.since_ms,
@@ -2412,7 +2412,7 @@ impl SpendPageLog {
             s.written().saturating_mul(1000) / body_len.max(1)
         );
         if checkpoint_detail_is_info(r) {
-            rbitcoin_log::info!("{detail}");
+            rbitcoin_log::info!("store: {detail}");
         } else {
             rbitcoin_log::debug!(Store, "{detail}");
         }
