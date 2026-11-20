@@ -44,10 +44,12 @@ fn block_hash_from_header_matches_full_block() {
     }
 }
 
-/// Post-IBD `FramedMessage::decode` rejects a trailing byte. The same
-/// bytes without it are a block. Decode does not touch the invalid-hash set.
+/// Core reads a `block` message with `vRecv >> TX_WITH_WITNESS(*pblock)` and
+/// never looks at the bytes after the last transaction (bitcoin-consensus-spec
+/// quirk 7). `FramedMessage::decode` gives the same block with or without
+/// them. Decode does not touch the invalid-hash set.
 #[test]
-fn trailing_byte_on_a_regtest_block_is_unknown() {
+fn bytes_after_a_block_are_ignored() {
     let genesis = genesis_block(Network::Regtest);
     let payload = serialize(&genesis);
     let clean = FramedMessage {
@@ -59,18 +61,20 @@ fn trailing_byte_on_a_regtest_block_is_unknown() {
         NetworkMessage::Block(b) => assert_eq!(b.block_hash(), genesis.block_hash()),
         other => panic!("expected block, got {other:?}"),
     }
-    let mut extra = payload;
-    extra.push(0);
-    let trailed = FramedMessage {
-        magic: Magic::from(Network::Regtest),
-        command: *b"block\0\0\0\0\0\0\0",
-        payload: extra,
-    };
-    match trailed.decode().payload() {
-        NetworkMessage::Unknown { command, .. } => {
-            assert_eq!(command.to_string(), "block");
+    for extra in [vec![0u8], vec![0u8; 6], vec![0xffu8; 3]] {
+        let mut trailed = payload.clone();
+        trailed.extend_from_slice(&extra);
+        let frame = FramedMessage {
+            magic: Magic::from(Network::Regtest),
+            command: *b"block\0\0\0\0\0\0\0",
+            payload: trailed,
+        };
+        match frame.decode().payload() {
+            NetworkMessage::Block(b) => {
+                assert_eq!(b, &genesis, "{} bytes after it", extra.len());
+            }
+            other => panic!("expected block, got {other:?}"),
         }
-        other => panic!("expected Unknown, got {other:?}"),
     }
 }
 
