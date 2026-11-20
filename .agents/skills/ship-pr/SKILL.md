@@ -83,6 +83,9 @@ Required jobs: `qc`, `test`, `windows`, `macos`, `coverage`, `pread`, and
 script self-tests, then clippy, on one runner. `nixos-module-eval` waits for `qc` and `test` and runs beside `pread` and
 `rust-forward`. It does not gate `coverage`. It is not a Protected status
 check until the ruleset names it. Poll with `--interest nixos-module-eval`.
+`macos-test` (the workspace suite on `macos-26` with `--features skip-flushes`)
+starts with the other jobs and is not a required check either. Poll with
+`--interest macos-test`.
 `pread` is GitHub Actions only:
 `RBITCOIN_IO=pread cargo test -p rbitcoin-store -p rbitcoin-query` after
 `qc` and `test`, in parallel with `coverage`. `rust-forward` is the same

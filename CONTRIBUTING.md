@@ -72,7 +72,7 @@ IO on Windows and Darwin.
 | `rbitcoin-node --smoke` | yes | yes | yes |
 | `./scripts/ci-os-smoke.sh` (store platform + mmap fuse + query confirm + `--smoke`) | yes | yes — this **is** the required `macos` job | **Git Bash** — this **is** the required `windows` job |
 | `cargo fmt --all` / `cargo clippy --workspace --all-targets -- -D warnings` | yes | yes | yes |
-| `cargo test --workspace` (required `test` job) | yes | usually (see `flock` below) | use **WSL2** (Ubuntu + rustup inside the distro). Native CI does **not** run the full workspace suite |
+| `cargo test --workspace` (required `test` job) | yes | yes, with `--features skip-flushes` (TESTING.md). CI runs it in the optional `macos-test` job. Needs `flock` (below) | use **WSL2** (Ubuntu + rustup inside the distro). Native CI does **not** run the full workspace suite |
 | `./scripts/coverage.sh` / `cargo deny` / `./scripts/ast-grep.sh` | yes (install extras below, or Nix) | possible; not the CI host | not the supported path |
 | `nix develop` / `nix-shell` | optional pin (below) | optional pin (below) — `aarch64-darwin` | no |
 
@@ -280,8 +280,10 @@ Linux libc backend for `rbitcoin-store` and `rbitcoin-query`
 on the channel in [`rust-forward.toml`](./rust-forward.toml). `pread`,
 `rust-forward`, and `nixos-module-eval` start with `coverage`, after `qc` and
 `test`. The module eval does not gate `coverage`. It is not a Protected
-status check until the ruleset names `nixos-module-eval`. The `test` job does
-not set `RBITCOIN_IO` and stays on 1.95.
+status check until the ruleset names `nixos-module-eval`. `macos-test` runs
+the workspace suite on `macos-26` with `--features skip-flushes`. It starts
+with the other jobs, not after `qc` and `test`. It is not a Protected status check until the ruleset names
+`macos-test`. The `test` job does not set `RBITCOIN_IO` and stays on 1.95.
 Label **`nixos-module-runtime`** to run the NixOS module qemu test (not
 eval). That job is not required.
 
@@ -307,8 +309,11 @@ cargo test --workspace
 ./scripts/coverage.sh
 ```
 
-Windows/macOS contributors matching PR CI: `./scripts/ci-os-smoke.sh` (Git Bash
-on Windows) rather than the full workspace suite.
+To match PR CI on Windows, run `./scripts/ci-os-smoke.sh` in Git Bash instead
+of the full workspace suite. On macOS, run `./scripts/ci-os-smoke.sh` (the
+`macos` job) and
+`cargo test --workspace --exclude rbitcoin-bench --features skip-flushes`
+(the optional `macos-test` job).
 
 ### Release binaries (portable static, byte-identical)
 

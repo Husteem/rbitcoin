@@ -26,7 +26,7 @@ env:
 # rustup auto-installs that toolchain and its components on first cargo.
 #
 # `qc` is one Ubuntu runner: fmt, ast-grep, unwrap-ratchet, hex-ratchet, deny, scripts, clippy.
-# test, windows, and macos each have their own runner.
+# test, windows, macos, and macos-test each have their own runner.
 # coverage, pread, rust-forward, and nixos-module-eval wait for qc and test.
 # The module eval runs beside pread and rust-forward. It does not gate coverage.
 # It is not a Protected status check until the ruleset names nixos-module-eval.
@@ -221,6 +221,39 @@ jobs:
           workspaces: ". -> target/dev"
       - name: store + node smoke
         run: ./scripts/ci-os-smoke.sh
+
+  # Runs the workspace suite on macOS. A flush on macOS waits for the whole
+  # drive (F_FULLFSYNC), and with flushes on the suites time out.
+  # --features skip-flushes turns flushes off in the suites that support it
+  # (TESTING.md). The macos job above still uses real flushes. It starts with
+  # the other jobs rather than after qc and test, so it ends near coverage.
+  # This check is not required until the ruleset names macos-test.
+  macos-test:
+    name: macos-test
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target/dev
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Same sparse Core pin as the test job.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: third_party/bitcoin
+          key: bitcoin-src-${{ runner.os }}-${{ hashFiles('scripts/core-functional/init-submodule.sh') }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ci-macos-26-test
+          workspaces: ". -> target/dev"
+      # Tests run init-submodule.sh when the Core data is missing, and the
+      # script takes a flock first. macOS has no flock.
+      - name: flock
+        run: brew install flock
+      - name: cargo test
+        run: cargo test --workspace --exclude rbitcoin-bench --features skip-flushes
 
   # NixOS module eval. Same wait as pread and rust-forward, so it takes a
   # runner only after qc and test. coverage does not need this job.
