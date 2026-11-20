@@ -115,6 +115,14 @@ pub struct WriteStageSample {
     pub idx_put_ns: u64,
 }
 
+/// Spend-delta checkpoints completed in this window.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SpendWindow {
+    pub spend_ckpt_n: u64,
+    pub spend_ckpt_max_ms: u64,
+    pub spend_notes_ram: u64,
+}
+
 #[doc(hidden)]
 pub type WriteInvTok = (
     &'static str,
@@ -247,6 +255,8 @@ pub struct IbdPerfSample {
     /// Confirm parked at the spend delta's open edge cap until a checkpoint
     /// froze the open notes.
     pub spend_room_wait_ms: u64,
+    /// Spend checkpoints that committed this window.
+    pub spend: SpendWindow,
     /// Structural meta bulk read wall ms / peek count.
     pub meta_ms: u64,
     pub meta_n: u64,
@@ -528,6 +538,7 @@ impl Default for IbdPerfSample {
             ann_sync_ms: 0,
             spend_replay_ms: 0,
             spend_room_wait_ms: 0,
+            spend: SpendWindow::default(),
             meta_ms: 0,
             meta_n: 0,
             load_ms: 0,
@@ -1045,6 +1056,11 @@ pub fn sample(
         ann_sync_ms: ns_ms(ann_sync_ns),
         spend_replay_ms: ns_ms(spend_replay_ns),
         spend_room_wait_ms: ns_ms(spend_room_wait_ns),
+        spend: SpendWindow {
+            spend_ckpt_n: w.spend_ckpt_n,
+            spend_ckpt_max_ms: w.spend_ckpt_max_ms,
+            spend_notes_ram: w.spend_notes_ram,
+        },
         meta_ms: ns_ms(meta_ns),
         meta_n,
         load_ms: ns_ms(load_ns),

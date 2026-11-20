@@ -148,6 +148,10 @@ confirm_window! {
     // Confirm parked at the spend delta's open edge cap, waiting for a
     // checkpoint to freeze the open notes.
     spend_room_wait_ns,
+    // Spend delta checkpoints completed this window.
+    spend_ckpt_n,
+    spend_ckpt_max_ms,
+    spend_notes_ram,
     spend_meta_ns,
     spend_meta_n,
     phase_prep_wire_arc_ns,
@@ -297,6 +301,15 @@ impl ConfirmWindow {
 }
 
 impl ConfirmStats {
+    /// One spend checkpoint that committed. Window counters for `ibd: perf`.
+    #[inline]
+    pub fn note_spend_checkpoint(&self, total_ms: u64, notes_ram: u64) {
+        add(&self.spend_ckpt_n, 1);
+        self.spend_ckpt_max_ms
+            .fetch_max(total_ms, Ordering::Relaxed);
+        self.spend_notes_ram.store(notes_ram, Ordering::Relaxed);
+    }
+
     #[inline]
     pub fn add_sh_part(&self, part: &AtomicU64, ns: u64) {
         if ns == 0 {

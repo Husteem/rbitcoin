@@ -187,5 +187,13 @@ pub fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
 
 #[doc(hidden)]
 pub fn checkpoint(query: &Query) -> Result<(), rbitcoin_store::StoreError> {
-    query.store().checkpoint_observed_spend()
+    let started = Instant::now();
+    let result = query.store().checkpoint_observed_spend();
+    if result.is_ok() {
+        let notes = query.store().txs.spend_delta_stats().notes_bytes;
+        query
+            .confirm_stats()
+            .note_spend_checkpoint(started.elapsed().as_millis() as u64, notes);
+    }
+    result
 }
