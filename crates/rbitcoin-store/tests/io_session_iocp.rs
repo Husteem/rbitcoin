@@ -28,6 +28,51 @@ fn open_overlapped(path: &Path) -> std::fs::File {
         .expect("overlapped tmp")
 }
 
+/// Closing overlapped files leaves their HANDLE values in the bind set.
+/// The next open gets one of those values for a new file. That file must be
+/// bound again, or its read never posts a completion.
+#[test]
+fn recycled_handle_pread_completes() {
+    // Fill the low free slots, bind each file, then close them. The next
+    // CreateFile gets one of those values (a lower hole would already have
+    // been consumed). That value is in the bind set and names a new file.
+    let mut eng = IocpEngine::open(8).unwrap();
+    let mut held = Vec::new();
+    let mut bound = Vec::new();
+    for i in 0..64 {
+        let p = tmp(&format!("recycle-fill-{i}"));
+        let f = open_overlapped(&p);
+        let h = IoHandle::from_file(&f);
+        eng.associate(h).unwrap();
+        bound.push(h.as_raw_handle());
+        held.push((p, f));
+    }
+    for (p, f) in held {
+        drop(f);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    let path = tmp("recycle-reused");
+    let f = open_overlapped(&path);
+    let h = IoHandle::from_file(&f);
+    assert!(
+        bound.contains(&h.as_raw_handle()),
+        "file HANDLE {:?} was not one of the closed values {bound:?}",
+        h.as_raw_handle()
+    );
+    assert!(h.pwrite(0, b"hello") > 0);
+    let mut buf = [0u8; 5];
+    eng.push_pread(h, 0, &mut buf, 7).unwrap();
+    assert!(
+        eng.wait_one_cqe_timeout(2000),
+        "recycled HANDLE was not rebound; the completion never arrived"
+    );
+    assert_eq!(eng.harvest_ready(), vec![(7, 5)]);
+    assert_eq!(&buf, b"hello");
+    drop(f);
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn associate_twice_same_port_ok() {
     let path = tmp("twice");

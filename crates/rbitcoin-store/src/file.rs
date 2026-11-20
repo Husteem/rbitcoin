@@ -928,6 +928,11 @@ impl TableFile {
     /// Complete pwrite of all bytes or error (no partial success returned).
     #[doc(hidden)]
     pub fn pwrite_all(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        let _pages = crate::class_a_pages::guard_write(
+            self.published_len.load(Ordering::Acquire),
+            offset,
+            bytes.len(),
+        );
         handle_pwrite_all(&self.read_file, &self.path, offset, bytes)
     }
 
@@ -1401,6 +1406,17 @@ impl TableFile {
     /// `RBITCOIN_IO=pread`, or for a file the session never submitted, they
     /// run one after another.
     pub fn sync_data_all(files: &[&TableFile]) -> Result<(), StoreError> {
+        Self::sync_data_all_with(files, &[])
+    }
+
+    /// [`Self::sync_data_all`] plus extra fds in the same bulk sync.
+    ///
+    /// Debug delay and fail injection stay on `files`. `extra` is the tear-guard
+    /// tail that must hit disk with those stems, without a second stem sync.
+    pub fn sync_data_all_with(
+        files: &[&TableFile],
+        extra: &[(&Path, &File)],
+    ) -> Result<(), StoreError> {
         #[cfg(debug_assertions)]
         for f in files {
             if let Some(d) = crate::io_handle::take_sync_delay(f.io_handle()) {
@@ -1418,10 +1434,15 @@ impl TableFile {
         if crate::durability::flushes_skipped() {
             return Ok(());
         }
-        let handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
+        let mut handles: Vec<_> = files.iter().map(|f| f.io_handle()).collect();
+        handles.extend(
+            extra
+                .iter()
+                .map(|(_, file)| crate::io_handle::IoHandle::from_file(file)),
+        );
         let res = crate::bulk_io::sync_data_batch(&handles)
-            .unwrap_or_else(|| vec![i32::MIN; files.len()]);
-        for (f, r) in files.iter().zip(res) {
+            .unwrap_or_else(|| vec![i32::MIN; handles.len()]);
+        for (f, r) in files.iter().zip(res.iter().copied()) {
             match r {
                 0 => {}
                 // Never submitted: sync it here.
@@ -1433,8 +1454,17 @@ impl TableFile {
                     return Err(StoreError::io(
                         &f.path,
                         std::io::Error::from_raw_os_error(-r),
-                    ))
+                    ));
                 }
+            }
+        }
+        for ((path, file), r) in extra.iter().zip(res.iter().copied().skip(files.len())) {
+            match r {
+                0 => {}
+                i32::MIN => file
+                    .durable_sync_data()
+                    .map_err(|e| StoreError::io(*path, e))?,
+                r => return Err(StoreError::io(*path, std::io::Error::from_raw_os_error(-r))),
             }
         }
         Ok(())

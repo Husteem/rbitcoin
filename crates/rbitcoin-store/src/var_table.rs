@@ -323,18 +323,27 @@ impl VarTable {
         }
         let end = start.saturating_add(body_blob.len() as u64);
         self.body.ensure_capacity(end)?;
-        use crate::bulk_io::{self, WriteOp};
-        let mut ops = [WriteOp {
-            fd: self.body.read_fd(),
-            offset: start,
-            buf: body_blob,
-            result: i32::MIN,
-        }];
-        bulk_io::pwrite_batch(&mut ops);
-        if ops[0].result < 0 {
-            return self.body.write_at_pwrite(start, body_blob);
-        }
-        if (ops[0].result as usize) != body_blob.len() {
+        // The header publish takes this same page guard. Drop it before
+        // `set_logical_len`, and before a fallback into `write_at_pwrite`.
+        let wrote = {
+            let _pages = crate::class_a_pages::guard_write(
+                self.body
+                    .published_len
+                    .load(std::sync::atomic::Ordering::Acquire),
+                start,
+                body_blob.len(),
+            );
+            use crate::bulk_io::{self, WriteOp};
+            let mut ops = [WriteOp {
+                fd: self.body.read_fd(),
+                offset: start,
+                buf: body_blob,
+                result: i32::MIN,
+            }];
+            bulk_io::pwrite_batch(&mut ops);
+            ops[0].result >= 0 && (ops[0].result as usize) == body_blob.len()
+        };
+        if !wrote {
             return self.body.write_at_pwrite(start, body_blob);
         }
         self.body
@@ -391,15 +400,29 @@ pub fn write_prepared_bodies_one_wave(
         });
     }
     if !ops.is_empty() {
+        let overlap = jobs.iter().any(|(table, prep)| {
+            !prep.body_blob.is_empty()
+                && crate::class_a_pages::write_overlaps(
+                    table
+                        .body
+                        .published_len
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    prep.start,
+                    prep.body_blob.len(),
+                )
+        });
         let mut all_ok = true;
-        for wave in class_a_body_waves(serial, ops.len()) {
-            bulk_io::pwrite_batch(&mut ops[wave.start..wave.end]);
-            let wave_ok = ops[wave.start..wave.end]
-                .iter()
-                .all(|op| op.result >= 0 && (op.result as usize) == op.buf.len());
-            if !wave_ok {
-                all_ok = false;
-                break;
+        {
+            let _pages = overlap.then(crate::class_a_pages::lock_pages);
+            for wave in class_a_body_waves(serial, ops.len()) {
+                bulk_io::pwrite_batch(&mut ops[wave.start..wave.end]);
+                let wave_ok = ops[wave.start..wave.end]
+                    .iter()
+                    .all(|op| op.result >= 0 && (op.result as usize) == op.buf.len());
+                if !wave_ok {
+                    all_ok = false;
+                    break;
+                }
             }
         }
         if !all_ok {

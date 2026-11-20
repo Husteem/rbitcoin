@@ -1531,6 +1531,7 @@ impl TxTable {
         opts: HeadOpenOpts,
         committed: Option<u64>,
     ) -> Result<Self, StoreError> {
+        crate::class_a_pages::prepare_and_restore(dir, seqsigwit_dir)?;
         crate::store::rename_legacy_inwit_files(dir)?;
         crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
@@ -3993,7 +3994,9 @@ impl TxTable {
     /// A failure latches: every later call refuses until restart. Calls run
     /// one at a time (the tip barrier and the spend checkpoint can overlap).
     pub fn sync_class_a_data(&self) -> Result<(), StoreError> {
-        self.class_a_latched(|| self.sync_class_a_stems())
+        self.class_a_latched(|| {
+            self.sync_class_a_stems(self.synced_named.load(std::sync::atomic::Ordering::Acquire))
+        })
     }
 
     /// Call `on_fail` once, when a Class A sync or append write first fails.
@@ -4011,7 +4014,7 @@ impl TxTable {
     pub fn sync_class_a_named(&self, named: u64) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         self.class_a_latched(|| {
-            self.sync_class_a_stems()?;
+            self.sync_class_a_stems(named)?;
             // Synced first, then named: the mark never passes a create the
             // device may not hold. One writer at a time under the latch.
             if named > self.synced_named.load(Ordering::Acquire) {
@@ -4078,8 +4081,8 @@ impl TxTable {
         written
     }
 
-    fn sync_class_a_stems(&self) -> Result<(), StoreError> {
-        crate::file::TableFile::sync_data_all(&[
+    fn sync_class_a_stems(&self, named: u64) -> Result<(), StoreError> {
+        let files: [&crate::file::TableFile; 16] = [
             &self.body.body,
             &self.seqsigwit.body,
             &self.spent.body,
@@ -4096,7 +4099,8 @@ impl TxTable {
             &self.input.loc,
             &self.input.off,
             &self.input.body,
-        ])
+        ];
+        crate::class_a_pages::write_barrier(&self.hot_dir, &files, named)
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {

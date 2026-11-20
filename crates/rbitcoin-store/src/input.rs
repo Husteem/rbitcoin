@@ -96,10 +96,13 @@ impl Input {
     }
 
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
+        let loc = TableFile::create(dir.join("input.loc"), TableKind::InputLoc)?;
+        let off = TableFile::create(dir.join("input.off"), TableKind::ArrayLink)?;
+        let body = TableFile::create(dir.join("input.body"), TableKind::Input)?;
         Ok(Self {
-            loc: TableFile::create(dir.join("input.loc"), TableKind::InputLoc)?,
-            off: TableFile::create(dir.join("input.off"), TableKind::ArrayLink)?,
-            body: TableFile::create(dir.join("input.body"), TableKind::Input)?,
+            loc,
+            off,
+            body,
             checkpoints: RwLock::new(Vec::new()),
             count: AtomicU64::new(0),
             body_end: AtomicU64::new(FILE_HEADER_LEN as u64),

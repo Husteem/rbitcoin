@@ -13,8 +13,9 @@ use std::ptr::null_mut;
 pub struct IocpEngine {
     pub port: *mut core::ffi::c_void,
     pub ready: VecDeque<(u64, i32)>,
-    /// Handles this port already bound. Recycled HANDLE values after close
-    /// are new objects — `CreateIoCompletionPort` succeeds and we re-insert.
+    /// HANDLE values for which `CreateIoCompletionPort` has succeeded on this
+    /// port. The value stays after the file is closed. Windows then reuses it
+    /// for a new file, so a hit is not proof the live object is bound.
     pub associated: HashSet<isize>,
 }
 
@@ -66,6 +67,10 @@ pub struct Overlapped {
 
 #[doc(hidden)]
 pub const ERROR_IO_PENDING: u32 = 997;
+/// `CreateIoCompletionPort` on a handle already bound to a port, or on a
+/// handle that was not opened with `FILE_FLAG_OVERLAPPED`.
+#[doc(hidden)]
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
 #[doc(hidden)]
 pub const INVALID: *mut core::ffi::c_void = -1isize as *mut core::ffi::c_void;
 
@@ -92,31 +97,37 @@ impl IocpEngine {
     #[doc(hidden)]
     pub fn associate(&mut self, handle: IoHandle) -> Result<(), StoreError> {
         let raw = handle.as_raw_handle();
-        if self.associated.contains(&raw) {
+        let known = self.associated.contains(&raw);
+        let h = raw as *mut core::ffi::c_void;
+        // SAFETY: `h` is the caller's handle. `self.port` is open.
+        // Always call. A cached value is not the live file: after close,
+        // Windows reuses the HANDLE. Skipping the call leaves the new file
+        // off this port, `ReadFile` returns `ERROR_IO_PENDING`, and the
+        // packet is never queued, so `drain_all` waits until the hard cap.
+        // Success binds that new object. `ERROR_INVALID_PARAMETER` on a
+        // value we already bound is the same live file still on this port.
+        // The same error on an unknown value is not overlapped, or it is
+        // bound to some other port.
+        let p = unsafe { CreateIoCompletionPort(h, self.port, 0, 0) };
+        if !p.is_null() {
+            self.associated.insert(raw);
             return Ok(());
         }
-        let h = raw as *mut core::ffi::c_void;
-        // SAFETY: `h` is the caller's overlapped handle. `self.port` is open.
-        let p = unsafe { CreateIoCompletionPort(h, self.port, 0, 0) };
-        if p.is_null() {
-            // 87 = already bound to some port, or not FILE_FLAG_OVERLAPPED.
-            // We only skip the syscall for handles *this* port bound. An
-            // untracked 87 is a hard error (non-overlapped or another port).
-            // SAFETY: reads the Win32 last-error for this thread.
-            let err = unsafe { GetLastError() };
-            return Err(StoreError::io(
-                Path::new("iocp"),
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "CreateIoCompletionPort associate failed (os error {err}); \
-                         file handle must be opened with FILE_FLAG_OVERLAPPED"
-                    ),
-                ),
-            ));
+        // SAFETY: reads the Win32 last-error for this thread.
+        let err = unsafe { GetLastError() };
+        if err == ERROR_INVALID_PARAMETER && known {
+            return Ok(());
         }
-        self.associated.insert(raw);
-        Ok(())
+        Err(StoreError::io(
+            Path::new("iocp"),
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "CreateIoCompletionPort associate failed (os error {err}); \
+                     file handle must be opened with FILE_FLAG_OVERLAPPED"
+                ),
+            ),
+        ))
     }
 
     pub fn push_pread(

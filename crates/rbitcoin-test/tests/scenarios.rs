@@ -1296,7 +1296,7 @@ fn ibd_seqsigwit_prune_follows_the_durable_tip() {
 /// A failed IBD tip flush stops every later commit, even once the disk
 /// recovers: a failed `fsync` is not retried. Restart opens on the last
 /// durable tip.
-#[cfg(unix)]
+#[cfg(all(unix, debug_assertions))]
 #[test]
 fn failed_ibd_tip_flush_stops_commits_until_restart() {
     use rbitcoin_query::confirm_wire_run;
@@ -1308,19 +1308,33 @@ fn failed_ibd_tip_flush_stops_commits_until_restart() {
     confirm_wire_run(&q, &params, Milestone::NONE, &run[..2]).unwrap();
     q.flush_for_shutdown().unwrap();
 
-    // The tip seal is a new file in the store directory.
+    // The tip seal is a new file in the store directory. `tear_guard/` already
+    // exists, so the directory stays writable until the append and the Class A
+    // sync have finished. The flush is paused after that sync and before the seal.
     let set_mode = |mode| {
         std::fs::set_permissions(td.store_path(), std::fs::Permissions::from_mode(mode)).unwrap()
     };
+    let hold = q.hold_tip_flushes();
+    let failing = confirm_wire_run(&q, &params, Milestone::NONE, &run[2..3]);
+    assert!(
+        hold.wait_until_entered(std::time::Duration::from_secs(30)),
+        "tip flush did not pause before the seal"
+    );
     set_mode(0o555);
     if std::fs::write(td.store_path().join("probe"), b"").is_ok() {
         set_mode(0o755);
+        hold.store(false, std::sync::atomic::Ordering::SeqCst);
         eprintln!("skip: a read-only directory is writable here (root)");
         return;
     }
-    let failing = confirm_wire_run(&q, &params, Milestone::NONE, &run[2..3]);
-    let next = confirm_wire_run(&q, &params, Milestone::NONE, &run[3..]);
+    hold.store(false, std::sync::atomic::Ordering::SeqCst);
+    let sealed = q.join_tip_flush();
     set_mode(0o755);
+    let next = confirm_wire_run(&q, &params, Milestone::NONE, &run[3..]);
+    assert!(
+        sealed.is_err(),
+        "the seal landed while the directory was read-only: {sealed:?}"
+    );
     assert!(
         failing.is_ok(),
         "IBD returns before its tip flush: {failing:?}"

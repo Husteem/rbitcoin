@@ -51,6 +51,7 @@ mod flush_hold {
 #[doc(hidden)]
 pub struct TipFlushHold {
     flag: AtomicBool,
+    entered: AtomicBool,
     lock: Mutex<()>,
     cv: Condvar,
 }
@@ -60,14 +61,41 @@ impl TipFlushHold {
     pub fn new(held: bool) -> Self {
         Self {
             flag: AtomicBool::new(held),
+            entered: AtomicBool::new(false),
             lock: Mutex::new(()),
             cv: Condvar::new(),
         }
     }
 
+    /// `true` once a flush thread is inside [`Self::wait_while_set`].
+    pub fn wait_until_entered(&self, limit: std::time::Duration) -> bool {
+        let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + limit;
+        while !self.entered.load(Ordering::Acquire) {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timeout) = self
+                .cv
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            guard = next;
+            if timeout.timed_out() && !self.entered.load(Ordering::Acquire) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Same order argument as [`AtomicBool::store`]. A clear notifies the flush.
+    /// Arming clears the entered bit so a flush that passed while the hold
+    /// was down does not count as this pause.
     pub fn store(&self, value: bool, order: Ordering) {
         let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if value {
+            self.entered.store(false, Ordering::Release);
+        }
         self.flag.store(value, order);
         if !value {
             self.cv.notify_all();
@@ -76,6 +104,10 @@ impl TipFlushHold {
 
     fn wait_while_set(&self) {
         let mut guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.flag.load(Ordering::Acquire) {
+            self.entered.store(true, Ordering::Release);
+            self.cv.notify_all();
+        }
         while self.flag.load(Ordering::Acquire) {
             guard = self.cv.wait(guard).unwrap_or_else(|e| e.into_inner());
         }

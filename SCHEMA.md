@@ -232,6 +232,9 @@ itself changed.
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     class_a.synced                   # optional: u64 LE create count a spend commit or scripthash mark named after a Class A sync (missing = 0). Open keeps exactly max(this, the highest `header_txs` create). No SCHEMA_VERSION bump
+    tear_guard/first                 # one sealed 4 KiB image per Class A stem, written once after that page is full. No SCHEMA_VERSION bump
+    tear_guard/tail.0                # alternating partial-tail image and published lengths (generation 0 = unused). No SCHEMA_VERSION bump
+    tear_guard/tail.1                # the other tail slot. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
     spent.delta/{seg.<id>, idx.<id>, log.<id>, commit, fold}  # schema-30 spend delta overlay
