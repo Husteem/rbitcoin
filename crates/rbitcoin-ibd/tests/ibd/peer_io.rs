@@ -13,7 +13,7 @@ use rbitcoin_net::peers::PongSlot;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Semaphore};
 
@@ -1040,6 +1040,28 @@ fn v1_addr_fc00_is_cjdns_not_clearnet() {
     );
 }
 
+/// Waits until the other thread posts `round`. Spins briefly so the two
+/// threads stay close together, then yields so a waiter on a small runner
+/// does not hold the core the other thread needs. Fails the round if the
+/// other thread never arrives.
+fn wait_for_round(counter: &AtomicUsize, round: usize, other: &str) {
+    const SPINS: u32 = 256;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut spins = 0u32;
+    while counter.load(Ordering::Acquire) != round {
+        if spins < SPINS {
+            spins += 1;
+            std::hint::spin_loop();
+        } else {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{other} never reached round {round}"
+            );
+            std::thread::yield_now();
+        }
+    }
+}
+
 /// A ping that lands while the pong is written is answered. The reader
 /// stores the nonce then claims; the writer clears the claim then reads the
 /// nonce. With release/acquire each side can miss the other's store (x86
@@ -1047,7 +1069,7 @@ fn v1_addr_fc00_is_cjdns_not_clearnet() {
 /// the new pong. Many tight rounds give that window a chance.
 #[test]
 fn pong_written_while_a_ping_lands_is_not_lost() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::AtomicBool;
     const ROUNDS: usize = 200_000;
     const IDLE: u64 = u64::MAX;
     let slot = Arc::new(PongSlot::new());
@@ -1063,9 +1085,7 @@ fn pong_written_while_a_ping_lands_is_not_lost() {
         );
         std::thread::spawn(move || {
             for round in 1..=ROUNDS {
-                while go.load(Ordering::Acquire) != round {
-                    std::hint::spin_loop();
-                }
+                wait_for_round(&go, round, "writer");
                 claimed.store(slot.note(2 * round as u64 + 1), Ordering::Release);
                 done.store(round, Ordering::Release);
             }
@@ -1078,9 +1098,7 @@ fn pong_written_while_a_ping_lands_is_not_lost() {
         assert!(slot.note(written), "round {round} starts unclaimed");
         go.store(round, Ordering::Release);
         let again = slot.finish(written);
-        while done.load(Ordering::Acquire) != round {
-            std::hint::spin_loop();
-        }
+        wait_for_round(&done, round, "reader");
         if !claimed.load(Ordering::Acquire) && again.is_none() {
             lost += 1;
         }
