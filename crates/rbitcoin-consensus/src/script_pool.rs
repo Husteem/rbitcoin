@@ -516,9 +516,19 @@ pub fn start_for_each_owned_held<T: Sync>(
 /// steal workers.
 #[doc(hidden)]
 pub fn publish_owned<T: Sync>(owned: &OwnedWave<T>) {
-    owned.wave.published.store(true, ModelOrdering::Release);
+    publish_wave(&owned.wave);
+}
+
+/// Publish one wave, or re-publish a loser a promotion still needs. The
+/// second publish is a no-op if the wave is already in the list.
+#[doc(hidden)]
+pub fn publish_wave(wave: &Arc<Wave>) {
+    wave.published.store(true, ModelOrdering::Release);
     let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
-    g.push(Arc::clone(&owned.wave));
+    if g.iter().any(|w| Arc::ptr_eq(w, wave)) {
+        return;
+    }
+    g.push(Arc::clone(wave));
     publish_waves(&g);
     drop(g);
     wake_steal_workers();
@@ -1063,5 +1073,27 @@ mod pair_tests {
         );
         unlink_pair(&a, &b);
         assert!(Wave::claim_chunk(&b).is_some(), "unlinked is uncapped");
+    }
+
+    /// A wave withheld for the winner's write must finish once a promotion
+    /// re-publishes it; otherwise `wait_done` waits for chunks no worker can
+    /// claim.
+    #[test]
+    fn republish_lets_an_unpublished_wave_finish() {
+        let _gate = steal_test_gate();
+        let wave = test_wave(10_000);
+        publish_wave(&wave);
+        unpublish_fg(&wave);
+        publish_wave(&wave);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let w = Arc::clone(&wave);
+        std::thread::spawn(move || {
+            w.wait_done();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "a re-published wave must let wait_done finish"
+        );
     }
 }

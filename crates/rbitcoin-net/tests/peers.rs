@@ -610,7 +610,6 @@ fn trust_peer_resolved_host_is_dialable() {
 /// The same helper still selects a session when the mode is off.
 #[test]
 fn trust_peer_skips_high_bandwidth() {
-    use rbitcoin_net::chain::AcceptOutcome;
     use rbitcoin_net::peer::{maybe_select_hb_if_relay, note_accepted_hb};
 
     let (_dir, chain) = rbitcoin_net::chain::tiny_regtest_hub_labeled("trust-hb");
@@ -630,10 +629,7 @@ fn trust_peer_skips_high_bandwidth() {
     trusted_hub.set_trust_peer(Some(rbitcoin_net::NetAddr::Ip(addr)), None);
     let trusted = join(&trusted_hub);
     maybe_select_hb_if_relay(&chain, Some(&trusted));
-    note_accepted_hb(
-        &Ok(AcceptOutcome::Accepted { height: 1 }),
-        &Some((Arc::clone(&trusted_hub), trusted.id)),
-    );
+    note_accepted_hb(true, &Some((Arc::clone(&trusted_hub), trusted.id)));
     assert!(
         !trusted.hb_to.load(Ordering::Relaxed),
         "trusted session stays low-bandwidth"

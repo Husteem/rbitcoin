@@ -424,9 +424,10 @@ fn pair_load(
     Ok(confirm_wire_load_from_plan(query, params, milestone, stamped, None, pre)?.batch)
 }
 
-/// Finish scripts, publish the deferred index wave ahead of `ahead_of`, clear
-/// the pair's parent-cache slot, and write. `phase` is the hub's script flag:
-/// readers stop skipping the RPC wait once the write starts.
+/// Finish scripts, publish the deferred index wave, clear the pair's
+/// parent-cache slot, and write. The loser is unpublished before this call,
+/// so the index wave is the only tip wave in the pool. `phase` is the hub's
+/// script flag: readers stop skipping the RPC wait once the write starts.
 #[allow(clippy::too_many_arguments)]
 fn pair_write_started(
     query: &Query,
@@ -434,16 +435,10 @@ fn pair_write_started(
     milestone: Milestone,
     height: u32,
     inf: Inflight,
-    ahead_of: Option<Arc<rbitcoin_consensus::script_pool::Wave>>,
     phase: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConfirmError> {
     let mut inf = inf.finish_scripts()?;
     inf.start_index()?;
-    if let Some(loser) = ahead_of {
-        if let Some(idx) = inf.index_wave_arc() {
-            rbitcoin_consensus::script_pool::set_wave_order(&[idx, loser]);
-        }
-    }
     let (ok, _) = inf.finish_index()?;
     // Neither candidate may be left as this height's parent plan: the store
     // has the winner after the write, and `assemble_parent_mtp_and_bits`
@@ -490,7 +485,7 @@ fn run_pair_loads(
         (Ok(a), Ok(b)) => (a, b),
         (Ok(a), Err((e, _))) => {
             a.publish_scripts();
-            return match pair_write_started(query, params, milestone, height, a, None, phase) {
+            return match pair_write_started(query, params, milestone, height, a, phase) {
                 Ok(fks) => Ok(note_pair_loser(PairRun {
                     winner: 0,
                     fks,
@@ -502,7 +497,7 @@ fn run_pair_loads(
         }
         (Err((e, _)), Ok(b)) => {
             b.publish_scripts();
-            return match pair_write_started(query, params, milestone, height, b, None, phase) {
+            return match pair_write_started(query, params, milestone, height, b, phase) {
                 Ok(fks) => Ok(note_pair_loser(PairRun {
                     winner: 1,
                     fks,
@@ -528,7 +523,17 @@ fn run_pair_loads(
     // take a full pool of chunks.
     a.publish_scripts();
     b.publish_scripts();
-    // First strict script verdict wins. Both ready prefers `a`.
+    // First strict script verdict wins. Both ready prefers `a`. The pool
+    // unparks a registered publisher when a wave completes; register this
+    // thread so the wait is event-driven, not a poll.
+    struct PairPublisher;
+    impl Drop for PairPublisher {
+        fn drop(&mut self) {
+            rbitcoin_consensus::script_pool::set_script_publisher(None);
+        }
+    }
+    rbitcoin_consensus::script_pool::set_script_publisher(Some(std::thread::current()));
+    let _publisher = PairPublisher;
     let first = loop {
         if a.script_is_complete() {
             break 0usize;
@@ -536,7 +541,7 @@ fn run_pair_loads(
         if b.script_is_complete() {
             break 1usize;
         }
-        std::thread::park_timeout(std::time::Duration::from_millis(10));
+        std::thread::park();
     };
     if paired {
         if let (Some(x), Some(y)) = (&wa, &wb) {
@@ -562,7 +567,7 @@ fn run_pair_loads(
             if let Some(w) = &lose_wave {
                 rbitcoin_consensus::script_pool::unpublish_fg(w);
             }
-            match pair_write_started(query, params, milestone, height, win, lose_wave, phase) {
+            match pair_write_started(query, params, milestone, height, win, phase) {
                 Ok(fks) => {
                     lose.cancel_scripts();
                     Ok(note_pair_loser(PairRun {
@@ -575,7 +580,12 @@ fn run_pair_loads(
                 Err(e) => {
                     // The winner may have appended Class A, so the loser's
                     // plan base moved. Keep the verdicts that already ran and
-                    // re-stamp with them skipped.
+                    // re-stamp with them skipped. Re-publish the loser first:
+                    // it was withheld from the pool for the winner's write,
+                    // so its remaining chunks can never be claimed otherwise.
+                    if let Some(w) = &lose_wave {
+                        rbitcoin_consensus::script_pool::publish_wave(w);
+                    }
                     if let Some(flag) = phase {
                         flag.store(true, std::sync::atomic::Ordering::Release);
                     }
@@ -594,7 +604,7 @@ fn run_pair_loads(
                         };
                         let re = pair_load(query, params, milestone, lose_in, &pre)?;
                         let inf = Inflight::start_deferred_index(re, 0).map_err(|(e2, _)| e2)?;
-                        pair_write_started(query, params, milestone, height, inf, None, phase)
+                        pair_write_started(query, params, milestone, height, inf, phase)
                     })();
                     match promoted {
                         Ok(fks) => Ok(note_pair_loser(PairRun {
@@ -608,7 +618,7 @@ fn run_pair_loads(
                 }
             }
         }
-        Err(e) => match pair_write_started(query, params, milestone, height, lose, None, phase) {
+        Err(e) => match pair_write_started(query, params, milestone, height, lose, phase) {
             Ok(fks) => Ok(note_pair_loser(PairRun {
                 winner: 1 - win_idx,
                 fks,
@@ -651,7 +661,7 @@ pub fn confirm_wire_run_pair_preverified(
                     Ok(inf) => inf,
                     Err((e2, _)) => return Err(preferred_failure((e2, hash_a), Some((e, hash_b)))),
                 };
-                match pair_write_started(query, params, milestone, height, inf, None, phase) {
+                match pair_write_started(query, params, milestone, height, inf, phase) {
                     Ok(fks) => {
                         let run = PairRun {
                             winner: 0,
@@ -670,7 +680,7 @@ pub fn confirm_wire_run_pair_preverified(
                     Ok(inf) => inf,
                     Err((e2, _)) => return Err(preferred_failure((e, hash_a), Some((e2, hash_b)))),
                 };
-                match pair_write_started(query, params, milestone, height, inf, None, phase) {
+                match pair_write_started(query, params, milestone, height, inf, phase) {
                     Ok(fks) => {
                         let run = PairRun {
                             winner: 1,

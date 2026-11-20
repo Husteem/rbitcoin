@@ -184,11 +184,8 @@ pub fn maybe_select_hb_if_relay(hub: &ChainHub, session: Option<&crate::peers::L
 }
 
 #[doc(hidden)]
-pub fn note_accepted_hb(
-    r: &Result<AcceptOutcome, NetError>,
-    hb: &Option<(std::sync::Arc<crate::peers::PeerHub>, u64)>,
-) {
-    if matches!(r, Ok(AcceptOutcome::Accepted { .. })) {
+pub fn note_accepted_hb(accepted: bool, hb: &Option<(std::sync::Arc<crate::peers::PeerHub>, u64)>) {
+    if accepted {
         if let Some((ph, id)) = hb {
             if ph.get(*id).is_some_and(|s| ph.session_is_trusted_peer(&s)) {
                 return;
@@ -224,7 +221,12 @@ pub async fn accept_received_from_peer(
             let r = hub.accept_received_arc_on_lane(block, waive);
             start_relay_after_tip_connect(&hub, peers.as_deref());
             let chosen = if compact_blocks_ok(&hub) { hb } else { None };
-            note_accepted_hb(&r, &chosen);
+            let credited = match &r {
+                Ok(AcceptOutcome::Accepted { .. }) => true,
+                Ok(AcceptOutcome::AlreadyHave) => hub.tip_hash() == Some(announced),
+                _ => false,
+            };
+            note_accepted_hb(credited, &chosen);
             r
         })
         .await
@@ -235,7 +237,12 @@ pub async fn accept_received_from_peer(
             let r = hub.accept_received_arc_on_lane(block.clone(), waive);
             start_relay_after_tip_connect(hub, peers.as_deref());
             let chosen = if compact_blocks_ok(hub) { hb } else { None };
-            note_accepted_hb(&r, &chosen);
+            let credited = match &r {
+                Ok(AcceptOutcome::Accepted { .. }) => true,
+                Ok(AcceptOutcome::AlreadyHave) => hub.tip_hash() == Some(announced),
+                _ => false,
+            };
+            note_accepted_hb(credited, &chosen);
             r
         })
     };
@@ -245,7 +252,12 @@ pub async fn accept_received_from_peer(
     if drop_servable_after_accept(hub, &announced, &r) {
         hub.cache.drop_servable(&announced);
     }
-    if let (Some(s), Some(at), Ok(AcceptOutcome::Accepted { .. })) = (session, received_at, &r) {
+    let credited = match &r {
+        Ok(AcceptOutcome::Accepted { .. }) => true,
+        Ok(AcceptOutcome::AlreadyHave) => hub.tip_hash() == Some(announced),
+        _ => false,
+    };
+    if let (Some(s), Some(at), true) = (session, received_at, credited) {
         s.note_last_block_at(at);
     }
     r
