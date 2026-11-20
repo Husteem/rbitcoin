@@ -3015,11 +3015,16 @@ fn foldable(page_off: u64) -> bool {
 /// `spent.body` held, since open copies the file again. A page over zeroes
 /// is written straight to `spent.body`: until the commit names it, nothing
 /// reads that page there. The round then syncs `spent.body` before the next
-/// one starts, so the file and the RAM it takes stay bounded.
+/// one starts, so the file and the RAM it takes stay bounded. Every round
+/// composes into the same buffers, emptied but not freed after its copy, so
+/// a checkpoint that folds many rounds allocates them once.
 struct Rounds {
     file: FoldFile,
-    /// Pages over zeroes, composed whole.
-    direct: Vec<(u64, Vec<u8>)>,
+    /// Pages over zeroes, composed whole: `(page_off:u64, image)` back to
+    /// back, as in the `fold` file.
+    direct: Vec<u8>,
+    /// The page being composed.
+    image: Vec<u8>,
     size: usize,
     records: u64,
     bytes: u64,
@@ -3030,10 +3035,15 @@ impl Rounds {
         Self {
             file: FoldFile::new(),
             direct: Vec::new(),
+            image: vec![0u8; PAGE as usize],
             size: size.max(1),
             records: 0,
             bytes: 0,
         }
+    }
+
+    fn pages(&self) -> usize {
+        self.file.count as usize + self.direct.len() / FOLD_PAGE
     }
 
     /// Compose a committed record over its base. Returns the entry the page
@@ -3048,25 +3058,27 @@ impl Rounds {
         report: &mut CheckpointReport,
     ) -> Result<Placed, StoreError> {
         let t = Instant::now();
-        let mut image = vec![0u8; PAGE as usize];
         if c.base.is_body() {
-            body.read(page_off, &mut image)?;
+            body.read(page_off, &mut self.image)?;
+        } else {
+            self.image.fill(0);
         }
         for (rel, meta) in c.record.entries() {
             let at = usize::from(rel) * SLOT;
-            image[at..at + SLOT].copy_from_slice(&meta);
+            self.image[at..at + SLOT].copy_from_slice(&meta);
         }
-        let base = Base::of(filled_in(page_off, &image));
+        let base = Base::of(filled_in(page_off, &self.image));
         if base.is_body() {
             if c.base.is_body() {
-                self.file.push(page_off, &image);
+                self.file.push(page_off, &self.image);
             } else {
-                self.direct.push((page_off, image));
+                self.direct.extend_from_slice(&page_off.to_le_bytes());
+                self.direct.extend_from_slice(&self.image);
             }
         }
         report.fold_compose_ms += ms_since(t);
         self.records += 1;
-        if self.file.count as usize + self.direct.len() >= self.size {
+        if self.pages() >= self.size {
             self.flush(dir, body, report)?;
         }
         Ok(Placed::body(base))
@@ -3079,7 +3091,7 @@ impl Rounds {
         body: &mut dyn SpentBody,
         report: &mut CheckpointReport,
     ) -> Result<(), StoreError> {
-        if self.file.count == 0 && self.direct.is_empty() {
+        if self.pages() == 0 {
             return Ok(());
         }
         self.flush(dir, body, report)
@@ -3091,28 +3103,33 @@ impl Rounds {
         body: &mut dyn SpentBody,
         report: &mut CheckpointReport,
     ) -> Result<(), StoreError> {
-        let mut file = std::mem::replace(&mut self.file, FoldFile::new());
-        let direct = std::mem::take(&mut self.direct);
         let t = Instant::now();
-        if file.count > 0 {
-            self.bytes += file.write(dir)?;
+        if self.file.count > 0 {
+            self.bytes += self.file.write(dir)?;
         }
         report.fold_file_ms += ms_since(t);
         let t = Instant::now();
-        for (page_off, image) in file
-            .images()
-            .chain(direct.iter().map(|(p, i)| (*p, i.as_slice())))
-        {
+        for (page_off, image) in self.file.images().chain(page_images(&self.direct)) {
             body.write(page_off, image)?;
             self.bytes += image.len() as u64;
         }
         report.body_write_ms += ms_since(t);
+        self.file.clear();
+        self.direct.clear();
         let t = Instant::now();
         body.sync()?;
         report.body_sync_ms += ms_since(t);
         report.fold_rounds += 1;
         Ok(())
     }
+}
+
+/// One `fold` file page: its offset, then its image.
+const FOLD_PAGE: usize = 8 + PAGE as usize;
+
+/// `(page_off, image)` for each page laid out back to back in `buf`.
+fn page_images(buf: &[u8]) -> impl Iterator<Item = (u64, &[u8])> + '_ {
+    buf.chunks_exact(FOLD_PAGE).map(|c| (rd_u64(c, 0), &c[8..]))
 }
 
 /// Whole composed pages a fold is copying over `spent.body` pages that
@@ -3142,6 +3159,12 @@ impl FoldFile {
         self.count += 1;
     }
 
+    /// Back to the header alone; the buffer keeps its capacity.
+    fn clear(&mut self) {
+        self.buf.truncate(FOLD_HEAD);
+        self.count = 0;
+    }
+
     /// Write and rename the file. Returns its length.
     fn write(&mut self, dir: &Path) -> Result<u64, StoreError> {
         self.buf[8..12].copy_from_slice(&self.count.to_le_bytes());
@@ -3150,9 +3173,7 @@ impl FoldFile {
     }
 
     fn images(&self) -> impl Iterator<Item = (u64, &[u8])> + '_ {
-        self.buf[FOLD_HEAD..]
-            .chunks_exact(8 + PAGE as usize)
-            .map(|c| (rd_u64(c, 0), &c[8..]))
+        page_images(&self.buf[FOLD_HEAD..])
     }
 }
 
@@ -3182,18 +3203,17 @@ fn replay_fold_file(dir: &Path, body: &mut dyn SpentBody) -> Result<(), StoreErr
         return Err(StoreError::Corrupt("spent.delta/fold is not a fold file"));
     }
     let count = rd_u32(&raw, 8) as usize;
-    if raw.len() != FOLD_HEAD + count * (8 + PAGE as usize) {
+    if raw.len() != FOLD_HEAD + count * FOLD_PAGE {
         return Err(StoreError::Corrupt("spent.delta/fold short"));
     }
     let published = body.published_len();
-    for c in raw[FOLD_HEAD..].chunks_exact(8 + PAGE as usize) {
-        let page_off = rd_u64(c, 0);
+    for (page_off, image) in page_images(&raw[FOLD_HEAD..]) {
         if !page_off.is_multiple_of(PAGE) || !foldable(page_off) {
             return Err(StoreError::Corrupt("spent.delta/fold names a torn page"));
         }
         let keep = published.saturating_sub(page_off).min(PAGE) as usize;
         if keep > 0 {
-            body.write(page_off, &c[8..8 + keep])?;
+            body.write(page_off, &image[..keep])?;
         }
     }
     body.sync()?;

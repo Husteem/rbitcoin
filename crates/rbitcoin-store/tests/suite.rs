@@ -1,4 +1,8 @@
+#[global_allocator]
+static ALLOC: alloc_count::Counting = alloc_count::Counting;
+
 mod address_head;
+mod alloc_count;
 mod array_table;
 mod bdz;
 mod binary_fuse8;

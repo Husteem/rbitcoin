@@ -1737,6 +1737,87 @@ fn reclaim_folds_in_rounds_and_carries_nothing_it_may_fold() {
     }
 }
 
+/// Fold rounds compose into buffers the checkpoint keeps from round to
+/// round: a folded page does not cost a fresh page image or a share of a
+/// `fold` buffer regrown from empty. The bytes a checkpoint asks the
+/// allocator for grow with the pages it folds by well under a page each.
+#[test]
+fn fold_rounds_reuse_their_buffers() {
+    fn hot_fold(pages: u64) -> u64 {
+        let d = dir();
+        let mut body = spent_body(pages);
+        let policy = Policy {
+            fold_round_pages: 8,
+            ..Policy::DEFAULT
+        };
+        let log = SpendPageLog::create_with(&d, policy).unwrap();
+        log.adopt_v29(Vec::new(), 0, &body).unwrap();
+        let note = |round: u8| {
+            let notes: Vec<(u64, [u8; 8])> = (0..pages)
+                .map(|page| (page * 4096 + 16, page_meta(page, round)))
+                .collect();
+            log.note_slots(&notes).unwrap();
+        };
+        note(1);
+        folding_commit(&log, 1, |_| Ok(true), &mut body, None).unwrap();
+        note(2);
+        let (r, asked) = crate::alloc_count::asked_by(|| {
+            reporting_commit(&log, 2, |_| Ok(true), &mut body, Some(u32::MAX))
+        });
+        let r = r.unwrap();
+        // Page 0 holds the `spent.body` header and never folds.
+        assert_eq!(r.hot_folds, pages - 1, "{r:?}");
+        assert!(r.fold_rounds >= (pages - 1) / 8, "{r:?}");
+        for page in 0..pages {
+            assert_eq!(
+                read_through(&log, &body, page * 4096 + 16),
+                page_meta(page, 2)
+            );
+        }
+        asked
+    }
+    let (few, many) = (64, 192);
+    let per_page = (hot_fold(many) - hot_fold(few)) / (many - few);
+    assert!(per_page < 2048, "{per_page} bytes asked per folded page");
+}
+
+/// A page over zeroes folded right after a page over `spent.body` in the
+/// same checkpoint holds only its own spends: a slot it never noted still
+/// reads zero, not the slot the page before it held.
+#[test]
+fn a_page_over_zeroes_folds_without_the_page_before_it() {
+    let d = dir();
+    let mut body = MemBody::new(3 * 4096);
+    for slot in body.bytes[4096..2 * 4096].chunks_exact_mut(8) {
+        slot.copy_from_slice(&SPENT);
+    }
+    body.bytes[4096 + 16..4096 + 24].fill(0);
+    let log = SpendPageLog::create_with(&d, Policy::DEFAULT).unwrap();
+    log.adopt_v29(Vec::new(), 0, &body).unwrap();
+    // Page 2 spends 300 of its 512 slots: past half, so it folds when touched.
+    let page2: Vec<(u64, [u8; 8])> = (0..300u64)
+        .map(|i| (2 * 4096 + 8 * i, page_meta(2, 1)))
+        .collect();
+    log.note_slots(&page2).unwrap();
+    log.note_slots(&[(4096 + 16, page_meta(1, 1))]).unwrap();
+    folding_commit(&log, 1, |_| Ok(true), &mut body, None).unwrap();
+    log.note_slots(&[
+        (4096 + 16, page_meta(1, 2)),
+        (2 * 4096 + 8 * 400, page_meta(2, 2)),
+    ])
+    .unwrap();
+    let r = reporting_commit(&log, 2, |_| Ok(true), &mut body, Some(u32::MAX)).unwrap();
+    assert_eq!(r.hot_folds, 2, "{r:?}");
+    let never_noted = 2 * 4096 + 8 * 450;
+    assert_eq!(body.slot(never_noted), [0u8; 8]);
+    assert_eq!(read_through(&log, &body, never_noted), [0u8; 8]);
+    assert_eq!(
+        read_through(&log, &body, 2 * 4096 + 8 * 299),
+        page_meta(2, 1)
+    );
+    assert_eq!(read_through(&log, &body, 4096 + 24), SPENT);
+}
+
 /// The reclaim threshold rises with the delta's share of `spent.body`:
 /// a segment under `reclaim_slope ×` that share is reclaimed, a denser one
 /// waits.
