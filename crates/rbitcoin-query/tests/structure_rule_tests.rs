@@ -2122,13 +2122,8 @@ fn anchored_milestone_skips_a_failing_p2pkh_script() {
     );
     let block_hash = block.block_hash().to_byte_array();
     let parent_hash = tip.to_byte_array();
-    let one = {
-        let mut w = [0u8; 32];
-        w[31] = 1;
-        bitcoin::Work::from_be_bytes(w)
-    };
     let note = |height: u32, hash: [u8; 32]| {
-        q.note_milestone_header(height, hash, [0; 32], one, Some(one));
+        q.note_milestone_header(height, hash);
     };
     let anchored = |height: u32, hash: [u8; 32]| Milestone {
         height,
@@ -2540,24 +2535,8 @@ fn signet_low_work_fork_runs_scripts(q: &rbitcoin_query::Query) {
     };
     assert_eq!(run(q).len(), 1, "missing anchor path still checks scripts");
     assert!(rbitcoin_query::milestone_gate::check_scripts(ms, q, 1, &bh));
-    let mut base = [0u8; 32];
-    base[1] = 2;
-    let mut one = [0u8; 32];
-    one[31] = 1;
-    q.note_milestone_header(
-        1,
-        bh,
-        [0; 32],
-        bitcoin::Work::from_be_bytes(one),
-        Some(bitcoin::Work::from_be_bytes(base)),
-    );
-    q.note_milestone_header(
-        100,
-        anchor_hash,
-        [0; 32],
-        bitcoin::Work::from_be_bytes(one),
-        None,
-    );
+    q.note_milestone_header(1, bh);
+    q.note_milestone_header(100, anchor_hash);
     assert!(
         run(q).is_empty(),
         "header path through the anchor skips scripts"

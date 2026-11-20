@@ -16,8 +16,6 @@ use bitcoin::{
     Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
 };
 
-use rbitcoin_query::testutil::FixtureChain;
-
 fn mine(prev: BlockHash, time: u32, height: u32) -> Block {
     let mut ss = if height == 0 {
         vec![0x00]
@@ -85,13 +83,18 @@ fn class_a_rehydrate_makes_tip_plus_one_claim_ready() {
     let time = 1_300_000_000u32;
     let mut tip = gen;
     let mut hashes = Vec::new();
-    // Tip stays at genesis; Class A via commit_class_a_only (not public archive_block).
+    // Tip stays at genesis; Class A via commit_class_a_block (not public archive_block).
     for h in 1u32..=3 {
         let b = mine(tip, time + h * 600, h);
         hub.ensure_header(&b.header).unwrap();
-        let (rec, txs) =
-            rbitcoin_query::prepare_block_for_archive(&hub.query, &hub.params, &b).unwrap();
-        hub.query.commit_class_a_only(&rec, &txs).unwrap();
+        rbitcoin_query::commit_class_a_block(
+            &hub.query,
+            &hub.params,
+            rbitcoin_primitives::Height(h),
+            &b,
+            hub.milestone,
+        )
+        .unwrap();
         hashes.push(b.block_hash());
         tip = b.block_hash();
     }
@@ -368,9 +371,14 @@ fn class_a_rehydrate_offers_store_without_known_cache() {
     let gen = hub.tip_hash().unwrap();
     let b = mine(gen, 1_300_000_600, 1);
     let hash = b.block_hash();
-    let (rec, txs) =
-        rbitcoin_query::prepare_block_for_archive(&hub.query, &hub.params, &b).unwrap();
-    hub.query.commit_class_a_only(&rec, &txs).unwrap();
+    rbitcoin_query::commit_class_a_block(
+        &hub.query,
+        &hub.params,
+        rbitcoin_primitives::Height(1),
+        &b,
+        hub.milestone,
+    )
+    .unwrap();
     let fk = hub.ensure_header_fk(&b.header).unwrap();
     let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
     st.record_height(hash, 1);
@@ -393,9 +401,14 @@ fn class_a_rehydrate_rejects_a_hash_mismatch() {
     let gen = hub.tip_hash().unwrap();
     let b = mine(gen, 1_300_000_600, 1);
     let hash = b.block_hash();
-    let (rec, txs) =
-        rbitcoin_query::prepare_block_for_archive(&hub.query, &hub.params, &b).unwrap();
-    hub.query.commit_class_a_only(&rec, &txs).unwrap();
+    rbitcoin_query::commit_class_a_block(
+        &hub.query,
+        &hub.params,
+        rbitcoin_primitives::Height(1),
+        &b,
+        hub.milestone,
+    )
+    .unwrap();
     let fk = hub.ensure_header_fk(&b.header).unwrap();
     let mut stored = hub.query.store.headers.get(fk).unwrap();
     stored.nonce = stored.nonce.wrapping_add(1);

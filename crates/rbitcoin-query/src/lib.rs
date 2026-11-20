@@ -784,7 +784,7 @@ pub struct Query {
     pub seqsigwit_ram_window: Mutex<SeqSigWitRamWindow>,
     /// Inputs from the most recent Class A append wave (fk-keyed).
     pub seqsigwit_append_cache: Mutex<U64Map<Vec<InputRecord>>>,
-    /// Header hashes on the best header path, plus work through that tip.
+    /// Header hashes on the best header path.
     ///
     /// Confirm threads look up two heights without the IBD state lock. While
     /// any height is occupied, this vec is the only source: a missing height
@@ -809,13 +809,6 @@ pub struct MilestonePath {
     slots: Vec<Option<[u8; 32]>>,
     /// Count of `Some` hashes in the live range.
     live: usize,
-    /// Work through `work_height` when `work_valid` (big-endian).
-    pub work_through: [u8; 32],
-    pub work_height: u32,
-    pub work_valid: bool,
-    /// Hash at `work_height`. A load pack may drop that slot. The next header
-    /// still has to link to this hash before work grows.
-    work_hash: Option<[u8; 32]>,
 }
 
 impl MilestonePath {
@@ -845,39 +838,6 @@ impl MilestonePath {
 
     fn hash_at(&self, height: u32) -> Option<[u8; 32]> {
         self.slot(height).copied().flatten()
-    }
-
-    /// A filled slot wins. An empty slot at this tip still links through
-    /// `work_hash`: a note below the retained base turns a dropped tip into
-    /// a hole, and that hole is not a different hash.
-    fn links_work_tip(&self, height: u32, prev: [u8; 32]) -> bool {
-        if self.work_height != height {
-            return false;
-        }
-        match self.slot(height) {
-            Some(Some(hash)) => *hash == prev,
-            _ => self.work_hash == Some(prev),
-        }
-    }
-
-    fn adopt_work(&mut self, height: u32, through: [u8; 32], hash: [u8; 32]) {
-        self.work_through = through;
-        self.work_height = height;
-        self.work_valid = true;
-        self.work_hash = Some(hash);
-    }
-
-    /// The slot at `height` wins. A dropped tip keeps its link only when work
-    /// is already valid at this same height.
-    fn bind_work_hash(&mut self, height: u32) {
-        if let Some(hash) = self.hash_at(height) {
-            self.work_hash = Some(hash);
-            return;
-        }
-        if self.work_valid && self.work_height == height {
-            return;
-        }
-        self.work_hash = None;
     }
 
     fn note(&mut self, height: u32, hash: [u8; 32]) {
@@ -950,9 +910,8 @@ impl MilestonePath {
 
     /// Drop every hash at or below `height`.
     ///
-    /// Work stays. Its tip can be this height, so the slot can go while
-    /// `work_hash` still links the next header. The dropped prefix stays in
-    /// place until it is at least as long as the live tail.
+    /// The dropped prefix stays in place until it is at least as long as the
+    /// live tail.
     fn drop_through(&mut self, height: u32) {
         if self.live == 0 || height < self.base {
             return;
@@ -1329,8 +1288,7 @@ impl Query {
         Arc::clone(&self.confirm_stats)
     }
 
-    #[doc(hidden)]
-    pub fn milestone_path_lock(&self) -> std::sync::MutexGuard<'_, MilestonePath> {
+    fn milestone_path_lock(&self) -> std::sync::MutexGuard<'_, MilestonePath> {
         self.milestone_path
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1359,74 +1317,17 @@ impl Query {
         !self.milestone_path_lock().is_empty()
     }
 
-    /// Work through the contiguous published header tip, if intake seeded it.
-    pub fn milestone_best_work_be(&self) -> Option<[u8; 32]> {
-        let g = self.milestone_path_lock();
-        g.work_valid.then_some(g.work_through)
+    /// Record one header hash on the milestone path.
+    pub fn note_milestone_header(&self, height: u32, hash: [u8; 32]) {
+        self.milestone_path_lock().note(height, hash);
     }
 
-    /// Record one header on the work path.
-    ///
-    /// `base_through_prev` is confirmed work through the parent, and only the
-    /// caller that checked `prev` is the tip should pass it. Later headers
-    /// extend that total when `prev` is the hash at `height - 1`, including
-    /// after that slot has been dropped.
-    pub fn note_milestone_header(
-        &self,
-        height: u32,
-        hash: [u8; 32],
-        prev: [u8; 32],
-        header_work: bitcoin::Work,
-        base_through_prev: Option<bitcoin::Work>,
-    ) {
-        let mut g = self.milestone_path_lock();
-        g.note(height, hash);
-        if g.work_valid && height == g.work_height {
-            g.bind_work_hash(height);
-        }
-        if let Some(base) = base_through_prev {
-            if !g.work_valid || height >= g.work_height {
-                g.adopt_work(height, (base + header_work).to_be_bytes(), hash);
-            }
-            return;
-        }
-        let prev_h = match height.checked_sub(1) {
-            Some(h) => h,
-            None => return,
-        };
-        if g.work_valid && g.links_work_tip(prev_h, prev) {
-            let acc = bitcoin::Work::from_be_bytes(g.work_through) + header_work;
-            g.adopt_work(height, acc.to_be_bytes(), hash);
-        }
-    }
-
-    /// Work through a checkpoint the header file has not stored.
-    ///
-    /// Later checkpoints replace earlier ones. A lower height does not rewind.
-    /// The checkpoint takes the hash at that height when the slot is present,
-    /// including when work at that height was not valid.
-    pub fn note_milestone_checkpoint_work(&self, height: u32, work_be: [u8; 32]) {
-        let mut g = self.milestone_path_lock();
-        if !g.work_valid || height >= g.work_height {
-            g.bind_work_hash(height);
-            g.work_through = work_be;
-            g.work_height = height;
-            g.work_valid = true;
-        }
-    }
-
-    /// Drop path slots above `height`. Work above the rewind is forgotten.
+    /// Drop path slots above `height`.
     pub fn clear_milestone_path_above(&self, height: u32) {
-        let mut g = self.milestone_path_lock();
-        g.clear_above(height);
-        if g.work_valid && g.work_height > height {
-            g.work_valid = false;
-            g.work_through = [0; 32];
-            g.work_hash = None;
-        }
+        self.milestone_path_lock().clear_above(height);
     }
 
-    /// Drop path slots at or below a confirmed tip. Header-tip work stays.
+    /// Drop path slots at or below a confirmed tip.
     pub fn drop_milestone_path_through(&self, height: u32) {
         self.milestone_path_lock().drop_through(height);
     }

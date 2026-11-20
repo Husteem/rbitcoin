@@ -1628,10 +1628,10 @@ pub use facts::{
     reject_csv_create_height, reject_duplicate_input, reject_empty_confirm_batch,
     reject_genesis_coinbase_spend, reject_non_final, reject_prev_link, reject_prevout_spent,
     reject_same_block_create, reject_sequence_locks, reject_spend_cursor, reject_tx_without_inputs,
-    reject_tx_without_outputs, reject_txid_count, reject_unresolved_spend,
-    reject_unspendable_prevout, reject_vout_past_n_out, reject_witness_before_segwit,
-    require_linked_parent, require_next_work, require_retarget_first, require_same_block_output,
-    unresolved_parent_create, waived_output_residue,
+    reject_tx_without_outputs, reject_unresolved_spend, reject_unspendable_prevout,
+    reject_vout_past_n_out, reject_witness_before_segwit, require_linked_parent, require_next_work,
+    require_retarget_first, require_same_block_output, unresolved_parent_create,
+    waived_output_residue,
 };
 
 pub use crate::TxPrecompute;

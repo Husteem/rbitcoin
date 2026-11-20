@@ -259,7 +259,7 @@ pub struct IbdPerfSample {
     pub prep_header_ms: u64,
     /// IBD stamp used BQ `header_fk` (skipped POW / header-table ensure).
     pub prep_header_skip_n: u64,
-    /// prepare_block_for_archive.
+    /// Parent link and header record.
     pub prep_prepare_ms: u64,
     /// filter need + plan batch + tx_fks wiring.
     pub prep_filter_plan_ms: u64,
