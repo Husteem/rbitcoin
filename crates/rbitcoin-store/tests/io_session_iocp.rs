@@ -33,27 +33,32 @@ fn open_overlapped(path: &Path) -> std::fs::File {
 /// and must be bound again, or its read never posts a completion.
 #[test]
 fn recycled_handle_pread_completes() {
-    let path = tmp("recycle-old");
-    let f = open_overlapped(&path);
-    let raw = IoHandle::from_file(&f).as_raw_handle();
-    let mut eng = IocpEngine::open(8).unwrap();
-    eng.associate(IoHandle::from_file(&f)).unwrap();
-    drop(f);
-    let _ = std::fs::remove_file(&path);
+    // The first close is taken by the next CreateFile's directory open, so
+    // that file handle is a new value. Closing that file and opening once
+    // more returns the file handle: the directory open consumes the lower
+    // free value, and the file gets the one we bound.
+    let path_a = tmp("recycle-a");
+    let a = open_overlapped(&path_a);
+    drop(a);
+    let _ = std::fs::remove_file(&path_a);
 
-    let mut neu = None;
-    for i in 0..128 {
-        let p = tmp(&format!("recycle-new-{i}"));
-        let f = open_overlapped(&p);
-        let h = IoHandle::from_file(&f);
-        if h.as_raw_handle() == raw {
-            neu = Some((p, f, h));
-            break;
-        }
-        drop(f);
-        let _ = std::fs::remove_file(&p);
-    }
-    let (p, f, h) = neu.expect("Windows reused the closed HANDLE value");
+    let path_b = tmp("recycle-b");
+    let b = open_overlapped(&path_b);
+    let raw = IoHandle::from_file(&b).as_raw_handle();
+    let mut eng = IocpEngine::open(8).unwrap();
+    eng.associate(IoHandle::from_file(&b)).unwrap();
+    drop(b);
+    let _ = std::fs::remove_file(&path_b);
+
+    let path_c = tmp("recycle-c");
+    let c = open_overlapped(&path_c);
+    let h = IoHandle::from_file(&c);
+    assert_eq!(
+        h.as_raw_handle(),
+        raw,
+        "file HANDLE was not reused (got {:?}, bound {raw:?})",
+        h.as_raw_handle()
+    );
     assert!(h.pwrite(0, b"hello") > 0);
     let mut buf = [0u8; 5];
     eng.push_pread(h, 0, &mut buf, 7).unwrap();
@@ -63,8 +68,8 @@ fn recycled_handle_pread_completes() {
     );
     assert_eq!(eng.harvest_ready(), vec![(7, 5)]);
     assert_eq!(&buf, b"hello");
-    drop(f);
-    let _ = std::fs::remove_file(&p);
+    drop(c);
+    let _ = std::fs::remove_file(&path_c);
 }
 
 #[test]
