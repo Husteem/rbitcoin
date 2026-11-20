@@ -1,7 +1,7 @@
 //! Core `ScriptToAsmStr` and `decodescript` vectors, most lifted from
 //! `test/functional/rpc_decodescript.py`.
 
-use super::{ctx_empty, ctx_regtest_hub, p2wpkh_regtest};
+use super::{ctx_empty, ctx_regtest_hub, dispatch, p2wpkh_regtest};
 use bitcoin::consensus::{deserialize, encode::serialize_hex};
 use bitcoin::hashes::Hash;
 use bitcoin::{ScriptBuf, Transaction};

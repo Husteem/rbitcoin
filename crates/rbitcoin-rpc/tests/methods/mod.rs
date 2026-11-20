@@ -61,6 +61,27 @@ fn open_ctx(dir: &TempDir) -> RpcContext {
     }
 }
 
+/// The server's split (`exec_one_async`): a request-task method runs
+/// `dispatch_tip_connect` on a runtime, every other method runs `dispatch`.
+fn dispatch(ctx: &RpcContext, method: &str, params: impl Into<RpcParams>) -> Result<Value, Value> {
+    if !request_task_method(method) {
+        return rbitcoin_rpc::methods::dispatch(ctx, method, params);
+    }
+    let ctx = Arc::new(ctx_shared(ctx));
+    request_task_runtime().block_on(dispatch_tip_connect(&ctx, method, params.into()))
+}
+
+fn request_task_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    })
+}
+
 #[test]
 fn genesis_coinbase_txid_reads_the_query_once_set() {
     let dir = TempDir::labeled("rpc-genesis-cb").expect("temp dir");
@@ -6117,7 +6138,10 @@ async fn getpeerinfo_last_block_announcement_tracks_new_heavier_headers() {
     let peers = PeerHub::new();
     ctx.peers = Some(peers.clone());
     dispatch(&ctx, "setmocktime", vec![json!(1_700_000_000)]).unwrap();
-    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let shared = Arc::new(ctx_shared(&ctx));
+    dispatch_tip_connect(&shared, "generate", vec![json!(1)].into())
+        .await
+        .unwrap();
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
@@ -7647,19 +7671,9 @@ fn getmininginfo_assembly_is_per_block() {
     let info = dispatch(&ctx, "getmininginfo", vec![]).unwrap();
     assert_eq!(info["currentblockweight"], weight, "{info}");
     assert_eq!(info["currentblocktx"], 1, "{info}");
-    // HTTP generateblock lists transactions on the async path. A rejected
-    // list must leave the assembly the failed generate already recorded.
-    let ctx = std::sync::Arc::new(ctx);
-    let params = rbitcoin_rpc::methods::RpcParams::positional(vec![json!(addr), json!("nope")]);
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(rbitcoin_rpc::methods::mine::generateblock_async(
-            &ctx, &params,
-        ))
-        .unwrap_err();
+    // A rejected transaction list must leave the assembly the failed
+    // generate already recorded.
+    dispatch(&ctx, "generateblock", vec![json!(addr), json!("nope")]).unwrap_err();
     let info = dispatch(&ctx, "getmininginfo", vec![]).unwrap();
     assert_eq!(info["currentblockweight"], weight, "{info}");
     assert_eq!(info["currentblocktx"], 1, "{info}");
@@ -8576,6 +8590,15 @@ fn ctx_without_mempool(src: &RpcContext) -> RpcContext {
 /// Same store and mempool as `src`, without a chain hub. `run_rpc` takes
 /// `chain: Option`; the node always passes one, and this is the other shape.
 fn ctx_without_chain(src: &RpcContext) -> RpcContext {
+    let mut ctx = ctx_shared(src);
+    ctx.peers = None;
+    ctx.chain = None;
+    ctx
+}
+
+/// A second handle on every part of `src`, for the `Arc` the request task
+/// takes.
+fn ctx_shared(src: &RpcContext) -> RpcContext {
     RpcContext {
         query: Arc::clone(&src.query),
         mempool: src.mempool.clone(),
@@ -8586,8 +8609,8 @@ fn ctx_without_chain(src: &RpcContext) -> RpcContext {
         initial_block_download: Arc::clone(&src.initial_block_download),
         subversion: src.subversion.clone(),
         regtest: src.regtest.clone(),
-        peers: None,
-        chain: None,
+        peers: src.peers.clone(),
+        chain: src.chain.clone(),
         addrman: src.addrman.clone(),
         logpath: src.logpath.clone(),
         active: Arc::clone(&src.active),
@@ -9546,25 +9569,11 @@ mod logging;
 mod mempool;
 mod submit_spent_race;
 
-/// The HTTP route runs these methods on the request task
-/// (`dispatch_tip_connect`), not through `dispatch`. Core's block count and
-/// decode text hold there too.
+/// Core's block count and decode text on the request task.
 #[test]
 fn request_task_methods_answer_as_core() {
     let (ctx, _dir, _hub) = ctx_from_mature_pad(300_000_000);
-    let ctx = Arc::new(ctx);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let call = |method: &str, params: Vec<Value>| {
-        rt.block_on(dispatch_tip_connect(
-            &ctx,
-            method,
-            RpcParams::positional(params),
-        ))
-    };
+    let call = |method: &str, params: Vec<Value>| dispatch(&ctx, method, params);
     for (method, params) in [
         ("generate", vec![json!(4_294_967_297_u64)]),
         (
@@ -9594,8 +9603,7 @@ fn request_task_methods_answer_as_core() {
         "{err}"
     );
 
-    // HTTP `sendrawtransaction` is this path. A confirmed output still in
-    // the set is -27 here, not only on the sync `dispatch` path.
+    // A confirmed output still in the set is -27.
     let (hex, _) = mature_coinbase_spend_hex(&ctx, generated_coinbase_value(&ctx, 1) - 1_000);
     assert!(call("sendrawtransaction", vec![json!(hex.clone())]).is_ok());
     assert!(call("generate", vec![json!(1)]).is_ok());

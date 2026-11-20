@@ -5,7 +5,7 @@
 //! inputs only in `ConnectBlock`, against B's own parent: B is an equal-work
 //! side block, `inconclusive`, and never cached invalid.
 
-use super::{block_hex, ctx_from_mature_pad};
+use super::{block_hex, ctx_from_mature_pad, dispatch};
 use bitcoin::absolute::LockTime;
 use bitcoin::transaction::Version as TxVersion;
 use bitcoin::{Amount, Block, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -161,6 +161,19 @@ fn submit(ctx: &RpcContext, block: &Block) -> Value {
     dispatch(ctx, "submitblock", vec![json!(block_hex(block))]).unwrap()
 }
 
+/// `submit` for a block whose pre-check runs a [`during_next_submit_inputs`]
+/// hook. The hook is this thread's, and the request task runs the pre-check
+/// on the off-pool thread, so this submit runs the same pre-check here.
+fn submit_hooked(hub: &rbitcoin_net::ChainHub, block: &Block) -> Value {
+    match submit_received_block(hub, block.clone()) {
+        SubmitBlockOutcome::Accepted => Value::Null,
+        SubmitBlockOutcome::Duplicate => json!("duplicate"),
+        SubmitBlockOutcome::IgnoredWeaker => json!("inconclusive"),
+        SubmitBlockOutcome::Rejected(reason) => json!(reason),
+        SubmitBlockOutcome::Error(e) => panic!("submit: {e}"),
+    }
+}
+
 /// X connects after the pre-check read the tip and before it read B's
 /// inputs. B is a held sibling, as when X arrives first. C then reorgs to B.
 #[test]
@@ -174,7 +187,11 @@ fn submit_spent_race_tip_moves_mid_check() {
                 hub.accept_received_block(x.take().unwrap()).unwrap();
             }
         });
-        assert_eq!(submit(&r.ctx, &r.b), json!("inconclusive"), "{shape:?}");
+        assert_eq!(
+            submit_hooked(&r.hub, &r.b),
+            json!("inconclusive"),
+            "{shape:?}"
+        );
         assert_eq!(r.hub.tip_hash(), Some(r.x.block_hash()), "{shape:?}");
         assert!(!r.hub.is_block_invalid(&r.b.block_hash()), "{shape:?}");
         assert_eq!(submit(&r.ctx, &r.c), Value::Null, "{shape:?}");
@@ -199,7 +216,7 @@ fn submit_spent_race_reorg_undone_mid_check() {
             hub.invalidate_block(x.header.prev_blockhash).unwrap();
         }
     });
-    assert_eq!(submit(&r.ctx, &r.b), Value::Null);
+    assert_eq!(submit_hooked(&r.hub, &r.b), Value::Null);
     assert_eq!(r.hub.tip_hash(), Some(r.b.block_hash()));
     let _ = std::fs::remove_dir_all(&r.dir);
 }
@@ -231,7 +248,7 @@ fn submit_spent_race_reject_read_while_tip_moves() {
             hub.accept_received_block(x.take().unwrap()).unwrap();
         }
     });
-    assert_eq!(submit(&r.ctx, &d), json!("inconclusive"));
+    assert_eq!(submit_hooked(&r.hub, &d), json!("inconclusive"));
     assert!(!r.hub.is_block_invalid(&d.block_hash()));
     let _ = std::fs::remove_dir_all(&r.dir);
 }
