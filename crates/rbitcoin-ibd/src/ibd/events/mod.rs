@@ -488,7 +488,7 @@ pub fn apply_peer_event(
         PeerEvent::NotFound { peer, hashes } => apply_notfound(st, peer, hashes),
         PeerEvent::BlocksInv { peer, hashes } => {
             if !hashes.is_empty() {
-                note_announcement(st, peer);
+                note_announcement(st, peer, hashes.iter().copied());
                 // Only a block this node has not seen can put the peer back
                 // on the walk: its connect-time height never moves, so a
                 // re-armed peer holds IBD open until it is asked again.
@@ -670,7 +670,7 @@ pub fn plan_header_batch(
         return (mark, HeaderPlan::Done);
     }
     if mark.outer_len > 0 {
-        note_announcement(st, peer);
+        note_announcement(st, peer, headers.iter().map(|h| h.block_hash()));
         note_peer_headers(st, hub, peer, &headers);
     } else {
         if st.header_walk.reserved != Some(peer) {
@@ -1040,7 +1040,7 @@ fn answer_probe(
             .is_some_and(|h| h.saturating_add(headers.len() as u32) > tip.saturating_add(1))
     });
     if !headers.is_empty() {
-        note_announcement(st, peer);
+        note_announcement(st, peer, headers.iter().map(|h| h.block_hash()));
         note_peer_headers(st, hub, peer, headers);
         if !st.header_walk.proven {
             let linked = super::header_walk::pow_linked(headers);
@@ -1079,19 +1079,31 @@ fn answer_probe(
     true
 }
 
-fn note_announcement(st: &mut IbdWorkState, peer: usize) {
+fn note_announcement(
+    st: &mut IbdWorkState,
+    peer: usize,
+    hashes: impl IntoIterator<Item = BlockHash>,
+) {
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
-        s.chain.note_announcement();
+        s.chain.note_announcement(hashes);
     }
 }
 
+/// A `notfound` is an answer, not a block: it frees the hashes this peer
+/// owed but leaves the stall clock alone, so a peer that owes another block
+/// still stalls. The peer is not asked for a freed block again for one stall
+/// window, unless it announces it. A hash it was not asked for is ignored, and so is one its full
+/// record cannot take: that block stays owed, as in Core.
 pub fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
-    note_block_progress(&mut st.slots, peer);
     let mut freed = Vec::new();
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
+        let now = super::peer_io::ibd_mono_ms();
         for h in &hashes {
+            let owed = s.in_flight.contains(h) || s.late_answers.contains_key(h);
+            if !owed || !s.chain.note_notfound(*h, now) {
+                continue;
+            }
             s.note_answer(h);
-            s.chain.note_notfound(*h, super::peer_io::ibd_mono_ms());
             let empty = st
                 .inflight
                 .get_mut(h)

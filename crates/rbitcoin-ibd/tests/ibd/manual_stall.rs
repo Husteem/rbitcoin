@@ -11,9 +11,9 @@ use rbitcoin_ibd::ibd::assign::{assign_work_ordered, inflight_add_peer, AssignDe
 use rbitcoin_ibd::ibd::dial::{
     dial_batch, disconnect_stalled_block_peers_at, release_peer_block_work,
 };
-use rbitcoin_ibd::ibd::events::{apply_block_framed, FramedBody};
+use rbitcoin_ibd::ibd::events::{apply_block_framed, apply_notfound, apply_peer_event, FramedBody};
 use rbitcoin_ibd::ibd::peer_io::{
-    IbdReadCtx, LightDecodes, PeerCmd, PeerEvent, PeerEventSinks, LATE_ANSWER_MS,
+    ibd_mono_ms, IbdReadCtx, LightDecodes, PeerCmd, PeerEvent, PeerEventSinks, LATE_ANSWER_MS,
 };
 use rbitcoin_ibd::ibd::state::IbdWorkState;
 use rbitcoin_ibd::ibd::status::LoopStats;
@@ -22,7 +22,7 @@ use rbitcoin_net::chain::ChainHub;
 use rbitcoin_net::codec::FramedMessage;
 use rbitcoin_net::peers::PeerConnType;
 use std::collections::HashSet;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -764,6 +764,141 @@ fn stalling_outbound_peer_is_still_disconnected() {
     st.slots.retain(|s| s.alive);
     assign(&mut st, &hub);
     assert!(drain_wire(&mut wire)[1].0.contains(&h(1)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A `notfound` is not a block. A peer that owes a block on the wire and
+/// answers `notfound` for other hashes inside the stall window is not
+/// quiet, but it still stalls out, and the block it withholds goes to
+/// another peer.
+#[test]
+fn notfound_does_not_hold_off_a_block_stall() {
+    let (dir, hub) = tmp_hub();
+    let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
+    owe_on_wire(&mut st, 0, h(1), 0);
+    owe_on_wire(&mut st, 0, h(2), 0);
+    // A small block it sent before the window. A progress mark would copy it.
+    st.slots[0].solicited_bytes.store(1_000, Ordering::Relaxed);
+    apply_notfound(
+        &mut st,
+        0,
+        vec![h(2), BlockHash::from_byte_array([0xee; 32])],
+    );
+    // The reader stamps the socket read that carried the `notfound`.
+    st.slots[0].rate.note_any_rx(30_000);
+    assert!(st.slots[0].in_flight.contains(&h(1)), "h(1) is still owed");
+    assert_eq!(
+        st.slots[0].rate.bytes_at_progress, 0,
+        "a notfound marks no block progress"
+    );
+
+    stall_pass(&mut st, &hub, 30_001);
+    assert!(!st.slots[0].alive, "the withholding peer is dropped");
+    assert!(drain_wire(&mut wire)[0].1, "and told to shut down");
+
+    st.slots.retain(|s| s.alive);
+    assign(&mut st, &hub);
+    assert!(drain_wire(&mut wire)[1].0.contains(&h(1)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Peer `peer` sends a block `inv` for `hashes`.
+fn blocks_inv(st: &mut IbdWorkState, hub: &ChainHub, peer: usize, hashes: Vec<BlockHash>) {
+    apply_peer_event(
+        st,
+        hub,
+        PeerEvent::BlocksInv { peer, hashes },
+        &AtomicU32::new(0),
+        &mut rbitcoin_net::seeds::AddrMan::new(),
+        std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+        None,
+    );
+}
+
+/// A block hash on no chain, for padding.
+fn junk(i: u32) -> BlockHash {
+    let mut b = [0xaa; 32];
+    b[..4].copy_from_slice(&i.to_le_bytes());
+    BlockHash::from_byte_array(b)
+}
+
+/// After a `notfound` the next assign gives the block to the other peer,
+/// not back to the one that gave it up: that peer cannot open a fresh
+/// stall window on the block it would not send.
+fn assert_block_goes_elsewhere(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    wire: &mut [mpsc::UnboundedReceiver<PeerCmd>],
+) {
+    assert!(
+        !st.slots[0].may_take_block(&h(1), ibd_mono_ms()),
+        "peer 0 still lacks h(1)"
+    );
+    assign(st, hub);
+    let sent = drain_wire(wire);
+    assert!(
+        !sent[0].0.contains(&h(1)),
+        "h(1) is not asked of peer 0 again"
+    );
+    assert!(sent[1].0.contains(&h(1)), "peer 1 takes h(1)");
+}
+
+/// A `notfound` for a block this peer was never asked for is ignored: it
+/// does not keep the peer off that block.
+#[test]
+fn notfound_for_a_block_not_asked_is_ignored() {
+    let (dir, hub) = tmp_hub();
+    let (mut st, _wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
+    owe_on_wire(&mut st, 0, h(1), 0);
+    apply_notfound(&mut st, 0, vec![h(1), h(2)]);
+    let now = ibd_mono_ms();
+    assert!(!st.slots[0].may_take_block(&h(1), now), "h(1) was owed");
+    assert!(
+        st.slots[0].may_take_block(&h(2), now),
+        "h(2) was never asked of peer 0"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// When the peer's `notfound` record is full of unexpired answers, a
+/// `notfound` cannot keep it off the block, so it does not release the
+/// block either: the block stays owed and the stall window runs on.
+#[test]
+fn notfound_into_a_full_record_keeps_the_block_owed() {
+    let (dir, hub) = tmp_hub();
+    let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
+    owe_on_wire(&mut st, 0, h(1), 0);
+    // Answers stamped far ahead of the test clock stay unexpired however
+    // long the test runs, so the record is still full below.
+    let ahead = u64::MAX / 2;
+    let refused = (0..100_000).find(|&i| !st.slots[0].chain.note_notfound(junk(i), ahead));
+    assert!(refused.is_some(), "the record fills");
+    apply_notfound(&mut st, 0, vec![h(1)]);
+    assert!(st.slots[0].in_flight.contains(&h(1)), "h(1) is still owed");
+    assert_eq!(st.slots[0].getdata_wire.window_ms(), Some(0));
+    st.slots[0].rate.note_any_rx(30_000);
+    stall_pass(&mut st, &hub, 30_001);
+    assert!(!st.slots[0].alive, "the peer stalls out on h(1)");
+    assert!(drain_wire(&mut wire)[0].1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A block `inv` lifts a `notfound` lack only for the blocks it lists. One
+/// for another block, even one this node already has, leaves the lack, and
+/// the block goes to the other peer.
+#[test]
+fn an_inv_lifts_only_the_lacks_it_lists() {
+    let (dir, hub) = tmp_hub();
+    let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::OutboundFullRelay);
+    owe_on_wire(&mut st, 0, h(1), 0);
+    apply_notfound(&mut st, 0, vec![h(1)]);
+    blocks_inv(&mut st, &hub, 0, vec![h(5)]);
+    assert_block_goes_elsewhere(&mut st, &hub, &mut wire);
+    blocks_inv(&mut st, &hub, 0, vec![h(1)]);
+    assert!(
+        st.slots[0].may_take_block(&h(1), ibd_mono_ms()),
+        "an inv of h(1) itself lifts the lack"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

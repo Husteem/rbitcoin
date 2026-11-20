@@ -267,3 +267,109 @@ fn a_notfound_lasts_one_stall_window() {
         "past the stall window the peer is asked again"
     );
 }
+
+/// A `notfound` lasts its full stall window even when the record is full:
+/// a new hash is refused while every kept one is fresh, and takes the place
+/// of one that expired.
+#[test]
+fn a_full_notfound_record_keeps_its_fresh_lacks() {
+    let mut peer = PeerChain::default();
+    let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+    assert!(peer.note_notfound_capped(hash(1), 0, 2));
+    assert!(peer.note_notfound_capped(hash(2), 1, 2));
+    assert!(
+        !peer.note_notfound_capped(hash(3), 2, 2),
+        "a full record says it refused"
+    );
+    assert!(
+        peer.lacks(&hash(1), 29_999),
+        "the first stays until its TTL"
+    );
+    assert!(peer.lacks(&hash(2), 29_999));
+    assert!(
+        !peer.lacks(&hash(3), 2),
+        "a full record refuses the new hash"
+    );
+    peer.note_notfound_capped(hash(3), 30_000, 2);
+    assert!(peer.lacks(&hash(3), 30_000), "it takes the expired place");
+    assert!(peer.lacks(&hash(2), 30_000));
+    assert!(!peer.lacks(&hash(1), 30_000));
+}
+
+/// A repeat `notfound` lasts one stall window from the repeat, and expires
+/// after the hashes answered before it.
+#[test]
+fn a_repeated_notfound_holds_from_its_last_answer() {
+    let mut peer = PeerChain::default();
+    let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+    peer.note_notfound_capped(hash(1), 0, 3);
+    peer.note_notfound_capped(hash(2), 1, 3);
+    peer.note_notfound_capped(hash(1), 20_000, 3);
+    peer.note_notfound_capped(hash(3), 30_001, 3);
+    peer.note_notfound_capped(hash(4), 30_002, 3);
+    peer.note_notfound_capped(hash(5), 30_003, 3);
+    assert!(
+        peer.lacks(&hash(1), 30_003),
+        "the repeat holds until 50 s and kept its place over a newer hash"
+    );
+    assert!(!peer.lacks(&hash(2), 30_003), "the hash before it expired");
+    assert!(peer.lacks(&hash(3), 30_003) && peer.lacks(&hash(4), 30_003));
+    assert!(
+        !peer.lacks(&hash(5), 30_003),
+        "the record is full of fresh lacks"
+    );
+}
+
+/// Only unexpired hashes take places in the record: an earlier answer to a
+/// hash that was answered again does not.
+#[test]
+fn a_repeat_takes_one_place() {
+    let mut peer = PeerChain::default();
+    let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+    assert!(peer.note_notfound_capped(hash(1), 0, 3));
+    assert!(peer.note_notfound_capped(hash(2), 1, 3));
+    assert!(peer.note_notfound_capped(hash(2), 2, 3));
+    assert!(
+        peer.note_notfound_capped(hash(3), 3, 3),
+        "two hashes are kept, so a third fits"
+    );
+    assert!(peer.lacks(&hash(1), 3) && peer.lacks(&hash(2), 3) && peer.lacks(&hash(3), 3));
+    assert!(!peer.note_notfound_capped(hash(4), 4, 3));
+}
+
+/// An announcement lifts the lacks for the blocks it lists and frees their
+/// places. The others stay.
+#[test]
+fn an_announcement_lifts_only_the_lacks_it_lists() {
+    let mut peer = PeerChain::default();
+    let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+    assert!(peer.note_notfound_capped(hash(1), 0, 2));
+    assert!(peer.note_notfound_capped(hash(2), 1, 2));
+    peer.note_announcement([hash(1), hash(9)]);
+    assert!(!peer.lacks(&hash(1), 2), "the listed block is lifted");
+    assert!(peer.lacks(&hash(2), 2), "the other stays");
+    assert!(
+        peer.note_notfound_capped(hash(3), 2, 2),
+        "the lifted block's place is free"
+    );
+    assert!(peer.lacks(&hash(2), 2) && peer.lacks(&hash(3), 2));
+}
+
+/// Repeats inside one millisecond behind an unexpired front still leave
+/// one answer per hash once the record drops its skipped answers, so it
+/// stays within twice the cap.
+#[test]
+fn same_ms_repeats_stay_within_the_bound() {
+    let mut peer = PeerChain::default();
+    let hash = |b: u8| BlockHash::from_byte_array([b; 32]);
+    assert!(peer.note_notfound_capped(hash(1), 0, 2));
+    for _ in 0..10 {
+        assert!(peer.note_notfound_capped(hash(2), 0, 2));
+    }
+    assert!(
+        peer.lacks_answers() <= 4,
+        "{} answers",
+        peer.lacks_answers()
+    );
+    assert!(peer.lacks(&hash(1), 0) && peer.lacks(&hash(2), 0));
+}

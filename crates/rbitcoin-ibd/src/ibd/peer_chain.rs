@@ -3,7 +3,8 @@
 //! Core asks a peer only for blocks on that peer's best known chain
 //! (`pindexBestKnownBlock`). A peer whose announced headers leave the
 //! download path is not asked for blocks above that point, and a peer that
-//! answered `notfound` for a block is not asked for it again for a while.
+//! answered `notfound` for a block it was asked for is not asked for it again
+//! for one stall window, unless it announces that block.
 
 use super::state::HeightOccupants;
 use bitcoin::block::Header;
@@ -11,7 +12,8 @@ use bitcoin::BlockHash;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// `notfound` hashes kept per peer. Past the cap a peer may be asked again.
+/// `notfound` hashes kept per peer. Each is kept until it expires or the
+/// peer announces it. A full record of unexpired hashes refuses a new one.
 const LACKS_CAP: usize = 1024;
 /// How long a `notfound` keeps a peer off that block: one stall window. A
 /// peer that answered `notfound` everywhere is asked again after it.
@@ -26,8 +28,15 @@ const PROBE_REFRESH: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Default)]
 pub struct PeerChain {
-    /// `notfound` hashes, with the mono ms they were answered.
-    lacks: HashMap<BlockHash, u64>,
+    /// `notfound` hashes, with the mono ms and the number of their last
+    /// answer.
+    lacks: HashMap<BlockHash, (u64, u64)>,
+    /// Each answer as `(hash, number)`, oldest first. An answer whose number
+    /// no longer matches `lacks` was answered again later or announced, and
+    /// is skipped. At most twice the cap.
+    lacks_order: VecDeque<(BlockHash, u64)>,
+    /// The next answer number.
+    lacks_next: u64,
     /// This peer's announced chain above the confirmed tip, oldest first.
     announced: VecDeque<BlockHash>,
     /// Height of `announced[0]`.
@@ -60,25 +69,66 @@ pub struct PeerChain {
 }
 
 impl PeerChain {
-    pub fn note_notfound(&mut self, hash: BlockHash, now_ms: u64) {
-        if self.lacks.len() >= LACKS_CAP {
-            self.lacks
-                .retain(|_, at| now_ms.saturating_sub(*at) < LACKS_TTL_MS);
+    /// Keep this peer off `hash` for one stall window. `false` when the
+    /// record is full of unexpired answers and did not take it.
+    pub fn note_notfound(&mut self, hash: BlockHash, now_ms: u64) -> bool {
+        self.note_notfound_capped(hash, now_ms, LACKS_CAP)
+    }
+
+    /// [`Self::note_notfound`] with at most `cap` hashes kept. Expired and
+    /// skipped answers leave from the front; behind an unexpired front every
+    /// kept hash is unexpired. A repeat moves to the back with its new time.
+    /// Skipped answers past twice the cap are dropped in one pass, so each
+    /// call costs O(1) amortized.
+    #[doc(hidden)]
+    pub fn note_notfound_capped(&mut self, hash: BlockHash, now_ms: u64, cap: usize) -> bool {
+        while let Some(&(front, n)) = self.lacks_order.front() {
+            if let Some(&(at, kept)) = self.lacks.get(&front) {
+                if kept == n {
+                    if now_ms.saturating_sub(at) < LACKS_TTL_MS {
+                        break;
+                    }
+                    self.lacks.remove(&front);
+                }
+            }
+            self.lacks_order.pop_front();
         }
-        if self.lacks.len() < LACKS_CAP {
-            self.lacks.insert(hash, now_ms);
+        if !self.lacks.contains_key(&hash) && self.lacks.len() >= cap {
+            return false;
         }
+        let n = self.lacks_next;
+        self.lacks_next = n.wrapping_add(1);
+        self.lacks.insert(hash, (now_ms, n));
+        self.lacks_order.push_back((hash, n));
+        if self.lacks_order.len() > cap.saturating_mul(2) {
+            let lacks = &self.lacks;
+            self.lacks_order
+                .retain(|(h, n)| lacks.get(h).is_some_and(|&(_, kept)| kept == *n));
+        }
+        true
+    }
+
+    /// A block `inv` or `headers` lists blocks the peer may have now: lift
+    /// the lacks for those blocks only.
+    pub fn note_announcement(&mut self, hashes: impl IntoIterator<Item = BlockHash>) {
+        if self.lacks.is_empty() {
+            return;
+        }
+        for hash in hashes {
+            self.lacks.remove(&hash);
+        }
+    }
+
+    /// Answers held in the record, skipped ones included.
+    #[doc(hidden)]
+    pub fn lacks_answers(&self) -> usize {
+        self.lacks_order.len()
     }
 
     pub fn lacks(&self, hash: &BlockHash, now_ms: u64) -> bool {
         self.lacks
             .get(hash)
-            .is_some_and(|at| now_ms.saturating_sub(*at) < LACKS_TTL_MS)
-    }
-
-    /// A headers message or a block inv: the peer may have those blocks now.
-    pub fn note_announcement(&mut self) {
-        self.lacks.clear();
+            .is_some_and(|&(at, _)| now_ms.saturating_sub(at) < LACKS_TTL_MS)
     }
 
     pub fn probed(&self) -> bool {
