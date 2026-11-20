@@ -381,6 +381,44 @@ fn a_lagging_table_header_does_not_refuse_open() {
     assert_eq!(log.slot(16).unwrap(), Some(a));
 }
 
+/// A committed record whose slots are out of order is damage: the
+/// checkpoint that merges new notes over it refuses instead of writing a
+/// record readers would search wrongly.
+#[test]
+fn a_record_out_of_slot_order_refuses_the_merge() {
+    let d = dir();
+    let (a, b) = ([4u8; 8], [5u8; 8]);
+    {
+        let log = SpendPageLog::create(&d).unwrap();
+        log.note_slots(&[(4096 + 16, a), (4096 + 40, b)]).unwrap();
+        commit(&log, 1, 2 * 4096, |_| Ok(true));
+    }
+    let seg = delta_dir(&d).join(segment_name(1));
+    let mut bytes = std::fs::read(&seg).unwrap();
+    let mut head = 4096u64.to_le_bytes().to_vec();
+    head.extend_from_slice(&2u16.to_le_bytes());
+    let at = bytes
+        .windows(head.len())
+        .position(|w| w == head.as_slice())
+        .expect("page 1's record");
+    let (first, second) = (at + 10, at + 20);
+    let rel = |b: &[u8], i: usize| [b[i], b[i + 1]];
+    let (r1, r2) = (rel(&bytes, first), rel(&bytes, second));
+    bytes[first..first + 2].copy_from_slice(&r2);
+    bytes[second..second + 2].copy_from_slice(&r1);
+    std::fs::write(&seg, &bytes).unwrap();
+    let log = reload(&d, 2 * 4096).unwrap();
+    log.note_slots(&[(4096 + 56, [6u8; 8])]).unwrap();
+    let err = try_commit(&log, 2, |_| Ok(true)).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            rbitcoin_store::error::StoreError::Corrupt("spent.delta rel order")
+        ),
+        "{err}"
+    );
+}
+
 /// A clip drops the directory past the body. Regrowing the directory over
 /// those pages later does not bring the dropped entries back.
 #[test]
@@ -1774,11 +1812,91 @@ fn fold_rounds_reuse_their_buffers() {
                 page_meta(page, 2)
             );
         }
-        asked
+        asked.bytes
     }
     let (few, many) = (64, 192);
     let per_page = (hot_fold(many) - hot_fold(few)) / (many - few);
     assert!(per_page < 2048, "{per_page} bytes asked per folded page");
+}
+
+/// A checkpoint merges each touched page's notes over its committed
+/// record into one buffer for the generation: the allocator calls it makes
+/// do not grow with the pages it merges. The merged records keep every
+/// committed slot, and a note wins over the committed slot it rewrites.
+#[test]
+fn a_checkpoint_merges_pages_without_a_call_per_page() {
+    const COMMITTED: u64 = 20;
+    fn meta(page: u64, round: u8) -> [u8; 8] {
+        let mut m = [0u8; 8];
+        m[..4].copy_from_slice(&(page as u32).to_le_bytes());
+        m[4] = round;
+        m[7] = 1;
+        m
+    }
+    fn merge(pages: u64) -> u64 {
+        let d = dir();
+        let log = SpendPageLog::create_with(&d, Policy::DEFAULT).unwrap();
+        let abs = |page: u64, slot: u64| page * 4096 + 16 + slot * 8;
+        let committed: Vec<(u64, [u8; 8])> = (1..=pages)
+            .flat_map(|page| (0..COMMITTED).map(move |s| (abs(page, s), meta(page, 1))))
+            .collect();
+        log.note_slots(&committed).unwrap();
+        commit(&log, 1, 0, |_| Ok(true));
+        let rewrites: Vec<(u64, [u8; 8])> = (1..=pages)
+            .flat_map(|page| {
+                [
+                    (abs(page, 3), meta(page, 2)),
+                    (abs(page, COMMITTED + 7), meta(page, 3)),
+                ]
+            })
+            .collect();
+        log.note_slots(&rewrites).unwrap();
+        let (r, asked) = crate::alloc_count::asked_by(|| {
+            reporting_commit(&log, 2, |_| Ok(true), &mut MemBody::new(0), None)
+        });
+        let r = r.unwrap();
+        assert_eq!(r.sealed_pages, pages, "{r:?}");
+        assert!(r.merge_read_bytes > 0, "{r:?}");
+        for page in 1..=pages {
+            for s in (0..COMMITTED).filter(|&s| s != 3) {
+                assert_eq!(log.slot(abs(page, s)).unwrap(), Some(meta(page, 1)));
+            }
+            assert_eq!(log.slot(abs(page, 3)).unwrap(), Some(meta(page, 2)));
+            assert_eq!(
+                log.slot(abs(page, COMMITTED + 7)).unwrap(),
+                Some(meta(page, 3))
+            );
+        }
+        // Page 1's new record, byte for byte: the committed slots in slot
+        // order with the rewritten one replaced, then the new slot.
+        let mut want = 4096u64.to_le_bytes().to_vec();
+        want.extend_from_slice(&(COMMITTED as u16 + 1).to_le_bytes());
+        for s in 0..COMMITTED {
+            want.extend_from_slice(&(2 + s as u16).to_le_bytes());
+            want.extend_from_slice(&meta(1, if s == 3 { 2 } else { 1 }));
+        }
+        want.extend_from_slice(&(2 + COMMITTED as u16 + 7).to_le_bytes());
+        want.extend_from_slice(&meta(1, 3));
+        let found = std::fs::read_dir(delta_dir(&d))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("seg"))
+            .any(|p| {
+                let bytes = std::fs::read(p).unwrap();
+                bytes.windows(want.len()).any(|w| w == want.as_slice())
+            });
+        assert!(found, "page 1's merged record is not in a segment");
+        asked.calls
+    }
+    let (few, many) = (200, 600);
+    let (a, b) = (merge(few), merge(many));
+    let per_100_pages = b.saturating_sub(a) * 100 / (many - few);
+    // A debug build traces each record's segment write, one small
+    // allocation a page; the merge itself adds none.
+    assert!(
+        per_100_pages < 150,
+        "{per_100_pages} allocator calls per 100 merged pages ({a} at {few}, {b} at {many})"
+    );
 }
 
 /// A page over zeroes folded right after a page over `spent.body` in the
