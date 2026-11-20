@@ -2697,7 +2697,7 @@ impl ChainHub {
         self.generate_paying(
             nblocks,
             script_pubkey,
-            GenerateFirst::Chosen(extra_txs),
+            extra_txs,
             Self::GENERATE_MAX_BLOCKS,
             false,
             false,
@@ -2749,11 +2749,13 @@ impl ChainHub {
         Ok(hashes)
     }
 
-    /// RPC `generate` / `generateblock`. Same mine as [`Self::generate_to_script`],
-    /// and the pool txids in an accepted block are removed before the next
-    /// block of this call is mined. A relay-off connect does not remove them.
-    /// `record_assembly` records each block for `getmininginfo` before it is
-    /// mined: `generate` builds from the pool, `generateblock` does not.
+    /// Sync mine for `HubRegtest::generate_to_script` in `rbitcoin-rpc`. The
+    /// RPC methods use [`Self::generate_to_script_for_rpc_async`]. Same mine as
+    /// [`Self::generate_to_script`], and the pool txids in an accepted block
+    /// are removed before the next block of this call is mined. A relay-off
+    /// connect does not remove them. `record_assembly` records each block for
+    /// `getmininginfo` before it is mined: `generate` builds from the pool,
+    /// `generateblock` does not.
     #[doc(hidden)]
     pub fn generate_to_script_for_rpc(
         &self,
@@ -2765,7 +2767,7 @@ impl ChainHub {
         self.generate_paying(
             nblocks,
             script_pubkey,
-            GenerateFirst::Chosen(extra_txs),
+            extra_txs,
             Self::GENERATE_MAX_BLOCKS,
             true,
             record_assembly,
@@ -2935,14 +2937,7 @@ impl ChainHub {
         extra_txs: Vec<Transaction>,
         limit: u32,
     ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(
-            nblocks,
-            script_pubkey,
-            GenerateFirst::Chosen(extra_txs),
-            limit,
-            false,
-            false,
-        )
+        self.generate_paying(nblocks, script_pubkey, extra_txs, limit, false, false)
     }
 
     /// Live pool transactions for the first block of `generate`.
@@ -2955,18 +2950,11 @@ impl ChainHub {
             .unwrap_or_default()
     }
 
-    fn pool_or_chosen(&self, first: GenerateFirst) -> Vec<Transaction> {
-        match first {
-            GenerateFirst::Chosen(txs) => txs,
-            GenerateFirst::Pool => self.pool_txs_for_generate(),
-        }
-    }
-
     fn generate_paying(
         &self,
         nblocks: u32,
         script_pubkey: ScriptBuf,
-        first: GenerateFirst,
+        mut extras: Vec<Transaction>,
         limit: u32,
         commit_on_accept: bool,
         record_assembly: bool,
@@ -2980,7 +2968,6 @@ impl ChainHub {
         // (rpc_generate.py parallel) cannot race the same tip into AlreadyHave.
         let _guard = self.lock_generate_sync();
         let mut hashes = Vec::with_capacity(nblocks as usize);
-        let mut extras = self.pool_or_chosen(first);
         for i in 0..nblocks {
             let stop = self.generate_fail_before.load(Ordering::Relaxed);
             if Self::generate_stopped(stop, i) {
@@ -4127,7 +4114,8 @@ impl ChainHub {
     /// `submitblock`). Runs on the process-wide `tip-accept` thread (lookup →
     /// load → `rbtc-scripts-*` steal → write). Peer sessions and HTTP
     /// `submitblock` use [`Self::accept_received_block_async`]. This sync
-    /// wrapper is for stack hubs and in-process `dispatch()` tests.
+    /// wrapper is for stack hubs, `submit_received_block` in `rbitcoin-rpc`
+    /// (`HubRegtest`), and tests.
     ///
     /// Tip-extend via [`Self::accept_block`]; otherwise hold the body by hash
     /// and [`Self::accept_branch`] when a held (or archived) path has more

@@ -4007,7 +4007,7 @@ impl MempoolHub {
     ///
     /// Prepare and commit run on `rbtc-off-pool`. Scripts are awaited here via
     /// [`rbitcoin_consensus::verify_tx_scripts_unconfirmed_cpu`]. Sync [`Self::accept_tx_from`]
-    /// stays for stack hubs and in-process dispatch. This is relay origin;
+    /// stays for stack hubs, Electrum `broadcast_raw_tx`, and tests. This is relay origin;
     /// RPC and the other local APIs pass [`TxOrigin::Local`].
     pub async fn accept_tx_async(
         self: &Arc<Self>,
