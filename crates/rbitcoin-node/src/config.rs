@@ -3,6 +3,7 @@ use bitcoin::hex::FromHex;
 use bitcoin::ScriptBuf;
 use rbitcoin_consensus::{default_milestone_anchor, ChainParams, Milestone};
 use rbitcoin_esplora::EsploraListen;
+use rbitcoin_net::netaddr::ExternalEndpoint;
 use rbitcoin_primitives::{
     Network, DEFAULT_ELECTRUM_PORT, DEFAULT_ESPLORA_PORT, DEFAULT_HEALTH_PORT,
 };
@@ -101,9 +102,7 @@ pub struct ListenOpts {
     pub max_outbound: u32,
     pub max_inbound: u32,
     pub max_inbound_explicit: bool,
-    pub external_ips: Vec<std::net::IpAddr>,
-    /// v3 `.onion` hosts from `--external-ip`. Advertised, not a reachability bit.
-    pub external_onions: Vec<String>,
+    pub external_endpoints: Vec<ExternalEndpoint>,
     pub peer_timeout_secs: Option<u64>,
     /// SOCKS5 for all P2P outbound (`--proxy`).
     pub proxy: Option<SocketAddr>,
@@ -145,8 +144,7 @@ impl Default for ListenOpts {
             max_outbound: 16,
             max_inbound: DEFAULT_MAX_INBOUND,
             max_inbound_explicit: false,
-            external_ips: Vec::new(),
-            external_onions: Vec::new(),
+            external_endpoints: Vec::new(),
             peer_timeout_secs: None,
             proxy: None,
             onion: None,
@@ -168,10 +166,9 @@ impl ListenOpts {
         !self.connect.is_empty() || !self.connect_dns.is_empty()
     }
 
-    /// Tor or I2P delivers inbound TCP from loopback, including an
-    /// operator `--external-ip` onion.
+    /// Built-in Tor or I2P forwarding delivers inbound TCP from loopback.
     pub fn overlay_loopback_forward(&self) -> bool {
-        self.listen_onion || self.i2p_accept_incoming || !self.external_onions.is_empty()
+        self.listen_onion || self.i2p_accept_incoming
     }
 
     /// `--only-net` leaves IPv4 or IPv6 reachable (an empty list leaves all).
@@ -1404,18 +1401,6 @@ impl NodeConfig {
     }
 }
 
-/// BIP155 v3 onion: 56 lowercase base32 characters plus `.onion`.
-fn v3_onion_host(val: &str) -> Option<String> {
-    let name = val.strip_suffix(".onion")?;
-    if name.len() != 56 {
-        return None;
-    }
-    if !name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')) {
-        return None;
-    }
-    Some(val.to_string())
-}
-
 impl NodeConfig {
     /// Apply one conf / CLI-equivalent `key=value`. Unknown keys are not errors.
     pub fn apply_kv(&mut self, key: &str, val: &str) -> Result<ConfApply, NodeError> {
@@ -1884,14 +1869,10 @@ impl NodeConfig {
                         "conf external_ip requires an address".into(),
                     ));
                 }
-                if let Some(host) = v3_onion_host(val) {
-                    self.listen.external_onions.push(host);
-                } else {
-                    let ip: std::net::IpAddr = val
-                        .parse()
-                        .map_err(|e| NodeError::Config(format!("conf external_ip: {e}")))?;
-                    self.listen.external_ips.push(ip);
-                }
+                let endpoint = val
+                    .parse()
+                    .map_err(|e| NodeError::Config(format!("conf external_ip: {e}")))?;
+                self.listen.external_endpoints.push(endpoint);
             }
             "peer_timeout" => {
                 let n: u64 = val
@@ -2208,7 +2189,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn external_onion_counts_as_loopback_forward() {
+    fn native_overlays_count_as_loopback_forward() {
         let listen = ListenOpts::default();
         assert!(!listen.overlay_loopback_forward());
         let onion = ListenOpts {
@@ -2221,10 +2202,5 @@ mod tests {
             ..ListenOpts::default()
         };
         assert!(i2p.overlay_loopback_forward());
-        let external = ListenOpts {
-            external_onions: vec!["external.onion".to_string()],
-            ..ListenOpts::default()
-        };
-        assert!(external.overlay_loopback_forward());
     }
 }

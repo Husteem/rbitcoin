@@ -153,14 +153,14 @@ async fn addrv2_relay_drops_own_addresses() {
     };
     let cjdns_ip = Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 7);
     let peers = rbitcoin_net::peers::PeerHub::new();
-    peers.set_p2p_onion(onion.host_str(), onion.port());
     peers.set_p2p_i2p(rbitcoin_net::NetAddr::I2p {
         dest: [0x11; 32],
         port: 0,
     });
-    peers.set_external_ips(vec![
-        IpAddr::V4(Ipv4Addr::new(42, 42, 42, 42)),
-        IpAddr::V6(cjdns_ip),
+    peers.set_external_endpoints(vec![
+        "42.42.42.42:28333".parse().unwrap(),
+        format!("{}:28334", onion.host_str()).parse().unwrap(),
+        rbitcoin_net::netaddr::ExternalEndpoint::BareIp(IpAddr::V6(cjdns_ip)),
     ]);
     let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
     let ver = hostile_ver(src_addr);

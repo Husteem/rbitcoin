@@ -47,6 +47,39 @@ where
     }
 }
 
+#[test]
+fn external_ip_cli_replaces_only_matching_file_hosts() {
+    let dir = rbitcoin_store::testutil::TempDir::new().unwrap();
+    let conf = dir.path().join("rbitcoin.conf");
+    std::fs::write(
+        &conf,
+        "external_ip=8.8.8.8:18333\n\
+         external_ip=42.42.42.42\n\
+         external_ip=8.8.8.8:18334\n\
+         external_ip=[::ffff:42.42.42.42]:18335\n",
+    )
+    .unwrap();
+    let cfg = ready_config([
+        "rbitcoin-node",
+        "--conf",
+        conf.to_str().unwrap(),
+        "--external-ip=9.9.9.9:28333",
+        "--external-ip=[::ffff:42.42.42.42]:28334",
+        "--external-ip=42.42.42.42:28335",
+    ]);
+    assert_eq!(
+        cfg.listen.external_endpoints,
+        [
+            "8.8.8.8:18333",
+            "42.42.42.42:28334",
+            "42.42.42.42:28335",
+            "8.8.8.8:18334",
+            "9.9.9.9:28333",
+        ]
+        .map(|endpoint| endpoint.parse().unwrap())
+    );
+}
+
 /// What argv and the conf file assemble before `run_node`. The smoke
 /// journey (`node_cli_and_surface_smoke`) sees only the exit code and
 /// the datadir; these values and the help text are not reported by any

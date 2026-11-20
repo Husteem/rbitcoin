@@ -137,7 +137,7 @@ Clean smoke:
 | `--limit-cluster-count N` | `limit_cluster_count=` | unset — hub default |
 | `--limit-cluster-size KVB` | `limit_cluster_size=` | unset — hub default |
 | `--peer-timeout SECS` | `peer_timeout=` | unset — net default; `0` is InitError |
-| `--external-ip IP` | `external_ip=` | empty — an IP or a v3 `.onion` in `getnetworkinfo.localaddresses`. An onion does not make onion reachable |
+| `--external-ip ENDPOINT` | `external_ip=` | empty — an IP or Tor v3 onion with an optional port. Use `[IPv6]:PORT` to specify an IPv6 port. CLI entries replace config-file entries for the same host in place and append entries for other hosts |
 | `--seed-node HOST` | `seed_node=` | extra seeds (repeatable) |
 | `--mock-time UNIX` | `mock_time=` | unset — wall clock; `0` allowed |
 | `--max-tip-age SECS` | `max_tip_age=` | unset — hub relay-inhibited age (default 24h) |
@@ -229,9 +229,10 @@ A self-announce carries only the address of the link's own network. The
 onion goes to `.onion` peers, to outbound dials through `--proxy`, and to
 loopback inbound when `--listen-onion` is the only overlay listener. The I2P
 destination goes to I2P peers, and to loopback inbound when
-`--i2p-accept-incoming` is the only one. A public `--external-ip` goes
+`--i2p-accept-incoming` is the only one. A clearnet `--external-ip` goes
 to direct clearnet peers, and an `fc00::/8` address (`--external-ip` or the
-CJDNS listen) only to CJDNS peers. With `--discover-from-peers` and no
+CJDNS listen) only to CJDNS peers. An explicit port overrides the default
+for the same host. With `--discover-from-peers` and no
 clearnet `--external-ip`, a direct outbound clearnet peer is told the IP
 it reports reaching us at, with the listen port. Tor and I2P inbound both arrive on
 loopback, so with both listeners a loopback inbound peer gets no
@@ -239,6 +240,15 @@ self-announce. Neither a `getaddr` reply nor `addrv2` relay passes on the
 node's own onions (P2P and wallet), I2P, CJDNS or `--external-ip`
 addresses when a peer gossips them back, nor the last eight peer-reported
 addresses it announced (each at the listen port only).
+
+With discovery and P2P listening enabled, rbitcoin announces the first
+configured external onion ahead of its built-in onion on eligible outbound
+Tor connections.
+An external address without a port uses the P2P listen port. With
+`--no-listen --listen-onion`, a portless onion uses the network's default
+P2P port. When an external onion is configured, rbitcoin skips source-IP
+permission grants and sends no own address to inbound TCP peers.
+Explicit bind grants still apply.
 
 `--tor-control [HOST:PORT]` talks to **system tor** (SAFECOOKIE/COOKIE or password). Omit
 ADDR for `127.0.0.1:9051`. Failed AUTH is a start error. Unset: no control

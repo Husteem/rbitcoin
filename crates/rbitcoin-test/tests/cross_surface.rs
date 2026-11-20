@@ -3483,6 +3483,43 @@ fn starts_with_any(lines: &[String], prefix: &str) -> Vec<String> {
         .collect()
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn external_onions_report_public_ports_with_an_onion_only_listener() {
+    let td = TestDatadir::new().unwrap();
+    let token = td.path().join("rpc.token");
+    std::fs::write(&token, "pass").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let tor = FakeTor::start().await;
+    *tor.methods.lock().unwrap() = "HASHEDPASSWORD";
+    let rpc = ephemeral_addr();
+    let bare = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+    let explicit = "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion";
+    let mut cfg = listen_and_exit_cfg(&td.path());
+    cfg.apply_kv("listen", "0").unwrap();
+    cfg.listen.listen_onion = true;
+    cfg.apply_kv("external_ip", bare).unwrap();
+    cfg.apply_kv("external_ip", &format!("{explicit}:28333"))
+        .unwrap();
+    cfg.tor.control = Some(tor.addr);
+    cfg.tor.password = Some(TOR_PASSWORD.into());
+    cfg.rpc.listen = Some(rpc);
+    cfg.max_run_secs = Some(60);
+
+    let node = spawn_run_p2p(cfg);
+    wait_listeners(&[rpc]).await;
+    let info = jsonrpc(rpc, "getnetworkinfo", json!([])).await;
+    stop_run_p2p(rpc, node).await;
+    let rows = info["result"]["localaddresses"].as_array().unwrap();
+    for (host, public_port) in [(bare, 18444), (explicit, 28333)] {
+        let row = rows.iter().find(|row| row["address"] == host).unwrap();
+        assert_eq!(row["port"], public_port, "{info}");
+    }
+}
+
 /// An operator publishes P2P, Electrum, and Esplora as onion and I2P
 /// services through a local Tor control port and SAM bridge. A bad or short
 /// cookie, or a Tor that does not offer SAFECOOKIE, stops the start before

@@ -753,24 +753,28 @@ fn discover_from_peers_needs_a_reachable_bind() {
 
 #[test]
 fn cjdns_listen_is_advertised_without_external_ip() {
+    use rbitcoin_net::netaddr::ExternalEndpoint;
     use std::net::{IpAddr, Ipv6Addr};
     let fc = Ipv6Addr::new(0xfc00, 1, 2, 3, 4, 5, 6, 7);
     let bind = SocketAddr::from((fc, 8333));
-    let got = external_ips_with_cjdns_bind(&[], bind, true);
-    assert_eq!(got, vec![IpAddr::V6(fc)]);
+    let got = external_endpoints_with_cjdns_bind(&[], bind, true);
+    assert_eq!(got, vec![ExternalEndpoint::BareIp(IpAddr::V6(fc))]);
     assert!(
-        external_ips_with_cjdns_bind(&[], bind, false).is_empty(),
+        external_endpoints_with_cjdns_bind(&[], bind, false).is_empty(),
         "fc00 stays unroutable until --cjdns-reachable"
     );
     let v4 = SocketAddr::from(([1, 2, 3, 4], 8333));
-    assert!(external_ips_with_cjdns_bind(&[], v4, true).is_empty());
+    assert!(external_endpoints_with_cjdns_bind(&[], v4, true).is_empty());
     let ula = SocketAddr::from((Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1), 8333));
     assert!(
-        external_ips_with_cjdns_bind(&[], ula, true).is_empty(),
+        external_endpoints_with_cjdns_bind(&[], ula, true).is_empty(),
         "fd00::/8 is not CJDNS"
     );
-    let dup = external_ips_with_cjdns_bind(&[IpAddr::V6(fc)], bind, true);
-    assert_eq!(dup, vec![IpAddr::V6(fc)]);
+    let configured = [format!("[{fc}]:28333").parse().unwrap()];
+    assert_eq!(
+        external_endpoints_with_cjdns_bind(&configured, bind, true),
+        configured
+    );
 }
 
 #[test]
