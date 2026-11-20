@@ -103,6 +103,7 @@ Do not copy that matrix here.
 | Handshake format needles | Shrink. The formatters stay; production logs them. The test does not pin the whole sentence |
 | `stamp_reject_names_*` | Shrink. `stamp_reject_operator_msg` stays on the confirm path. The test keeps the wipe distinction, not the counter text |
 | `decode_rpc_subset` | Permutation. Live decode through the RPC method table |
+| Inbound discourage (`misbehavior_disconnect_*`, `overlay_misbehavior_*`, `threshold_exit_*`, rate-limit strikes in `peer/mod.rs`) | Permutation. The owner of the 24 h reconnect refusal: every harness peer dials from loopback, which `ip_skips_discourage` exempts, so no journey can be refused at accept. The misbehavior disconnect itself is the journeys' (`peer_header_dos_journey`, and the live `filterload` disconnect in `integration_multinode`) |
 
 Optional leftovers (more HTTP methods on `cross_surface`, a tiny
 legacy-head `Store::open` fixture, testnet 20-minute min-diff header walk)
