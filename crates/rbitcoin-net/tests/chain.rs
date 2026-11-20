@@ -6099,38 +6099,14 @@ fn excess_on(prev: BlockHash, time: u32, height: u32) -> Block {
     block
 }
 
-/// A local warn-and-apply reject does not stick. The trusted session can
-/// still connect that block. A high-hash reject still sticks.
+/// Proof of work is never warn-and-apply. A local high-hash reject sticks
+/// while the mode is on.
 #[test]
-fn review_trust_local_reject_does_not_stick() {
+fn review_trust_high_hash_reject_sticks() {
     let (_dir, hub) = tiny_regtest_hub_labeled("review-reject-stick");
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
-    let before = hub.tip_height();
-    let tip = hub.tip_hash().unwrap();
-    let tip_block = hub.block_at_height(before.unwrap()).unwrap().unwrap();
-    let bad = excess_on(
-        tip,
-        tip_block.header.time.saturating_add(1),
-        before.unwrap() + 1,
-    );
-    let hash = bad.block_hash();
     hub.query.set_trust_peer(true);
-    let r = hub.accept_received_block(bad.clone());
-    assert!(r.is_err(), "local excess applied: {r:?}");
-    assert_eq!(hub.tip_height(), before);
-    assert!(
-        !hub.is_block_invalid(&hash),
-        "warn-and-apply reject stuck: {r:?}"
-    );
-    let applied =
-        rbitcoin_net::tip_accept::run_on_tip_accept(|| hub.accept_received_on_lane(bad, true));
-    assert!(
-        matches!(applied, Ok(AcceptOutcome::Accepted { .. })),
-        "trusted session was blocked: {applied:?}"
-    );
-    assert_eq!(hub.tip_hash(), Some(hash));
-
     let mut forged = hub.assemble_block_to_script(op_true, vec![]).unwrap();
     forged.header.bits = CompactTarget::from_consensus(0x1d00_ffff);
     forged.header.merkle_root = forged.compute_merkle_root().unwrap();

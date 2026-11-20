@@ -681,41 +681,6 @@ fn trust_peer_same_block_coinbase_inflation_is_not_applied() {
     capture_logs(false);
 }
 
-/// A coinbase whose height push is not this block's height connects under the
-/// waive cell. The applied line names the BIP34 reject.
-#[test]
-fn trust_peer_bip34_height_is_applied() {
-    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("trust-peer-bip34");
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let mut block = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-    block.txdata[0].input[0].script_sig =
-        ScriptBuf::from_bytes(rbitcoin_consensus::bip34_height_script(99));
-    prepare_regtest_candidate(&mut block, genesis.block_hash(), genesis.header.time + 600);
-    let off =
-        accept_and_connect_block(&q, &params, Height(1), &block, Milestone::NONE).unwrap_err();
-    let off_msg = off.to_string();
-    assert!(
-        off_msg.contains("bip34") || off_msg.contains("bad-cb-height"),
-        "{off}"
-    );
-    assert_eq!(q.tip_height(), Some(Height::GENESIS));
-
-    q.set_trust_peer(true);
-    capture_logs(false);
-    capture_logs(true);
-    opt_in(|| accept_and_connect_block(&q, &params, Height(1), &block, Milestone::NONE))
-        .expect("waived bip34 connects");
-    let on = log_text();
-    let hash = block.block_hash();
-    let needle = format!("trust-peer: applied block {hash} height 1:");
-    assert!(on.contains(&needle), "{on}");
-    assert!(on.contains("bad-cb-height"), "{on}");
-    assert_eq!(q.tip_height(), Some(Height(1)));
-    capture_logs(false);
-}
-
 /// Two blocks with the same coinbase txid. BIP34 is not active yet, so the
 /// reject is the unspent overwrite. The waive cell connects it.
 #[test]

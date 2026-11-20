@@ -4,6 +4,7 @@
 
 use serde_json::Value;
 use std::net::SocketAddr;
+use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -38,4 +39,15 @@ pub async fn jsonrpc(addr: SocketAddr, method: &str, params: Value) -> Value {
     try_jsonrpc(addr, method, params)
         .await
         .unwrap_or_else(|e| panic!("rpc {method} connect: {e}"))
+}
+
+/// `{datadir}/rpc.token` (mode 0600) holding the password [`jsonrpc`] sends.
+pub fn write_rpc_token(datadir: &Path) {
+    let path = datadir.join("rpc.token");
+    std::fs::write(&path, "pass").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
