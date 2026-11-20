@@ -854,7 +854,7 @@ pub async fn ibd_cancellable(
     // Body queue is RAM-only; restart is empty. Same-process residual can still note feed.
     match rehydrate_block_queue_into_confirm(hub.as_ref(), &mut st, confirm_feed.as_ref()) {
         Ok(n) if n > 0 => {
-            rbitcoin_log::debug!("ibd: rehydrate: noted {n} in-RAM body queue entries");
+            rbitcoin_log::debug!(Ibd, "rehydrate: noted {n} in-RAM body queue entries");
         }
         Ok(_) => {}
         Err(e) => {
@@ -872,7 +872,8 @@ pub async fn ibd_cancellable(
     ) {
         Ok(0) => {
             rbitcoin_log::debug!(
-                "ibd: Class A rehydrate filled 0 (tip+1 missing height map, has_block, or no Class A)"
+                Ibd,
+                "Class A rehydrate filled 0 (tip+1 missing height map, has_block, or no Class A)"
             );
         }
         Ok(_) => {}

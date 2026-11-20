@@ -361,6 +361,18 @@ Operational logs go to **stderr** with UTC timestamps:
 
 Default: **info**. CLI wins over env.
 
+DEBUG and TRACE lines belong to a category (`mempool`, `p2p`, `ibd`, …). At
+`debug` or `trace` every category starts on; below that every one starts
+off. Turn one on for a while without a restart, then put it back:
+
+```bash
+rbitcoin-cli logging '["mempool"]'
+rbitcoin-cli logging '[]' '["mempool"]'
+```
+
+A TRACE line also needs `--log-level trace`. The change does not survive a
+restart. Names and rules: [`docs/rpc.md`](../rpc.md) (`logging`).
+
 ### Tip-follow (every block)
 
 After IBD, each accepted tip extension logs one **info** line:
@@ -383,8 +395,8 @@ Core functional tests still grep `UpdateTip: …` via the debug.log map
 | `tip: best=` | INFO | New best hash/height after connect |
 | `cmpct reconstruct` | INFO | Per compact reconstruct: fill sources (`prefill`/`mempool`/`extra`/`orphan`) and `fetched=` `blocktxn` count/bytes. `fetched=0/0` means no getblocktxn round-trip. Getdata fallback: `getdata missing=` |
 | `node: tip=…` | DEBUG | Same height change plus `follow_live` (use `tip: best=` at info) |
-| `p2p: getdata wtx` | TRACE | One line per peer `MSG_WTX` getdata (counts are on `tip: perf`) |
-| `p2p: received tx` | TRACE | One inbound tx |
+| `txrelay: getdata wtx` | TRACE | One line per peer `MSG_WTX` getdata (counts are on `tip: perf`) |
+| `txrelay: received tx` | TRACE | One inbound tx |
 | `p2p: headers sync` | INFO | Headers path that meets min-work (or a noban peer) |
 | `p2p: ignore low-work headers` | INFO | Headers announcement below `--min-chain-work` |
 | `outbound peer headers chain has insufficient work` | INFO | Outbound full-relay or block-relay peer dropped during initial block download. The `headers` message ended that peer's chain under `--min-chain-work` |
