@@ -61,10 +61,28 @@ fn display_and_source_surface() {
     assert!(mutated.is_mutated(), "{mutated}");
     let connect = NetError::ConnectFailed {
         hash: [2u8; 32],
-        msg: "witness commitment".into(),
+        msg: "missing witness commitment".into(),
         rules: None,
     };
     assert!(connect.is_mutated(), "{connect}");
+    let wrapped = NetError::Consensus("consensus: bad block: witness commitment mismatch".into());
+    assert!(wrapped.is_mutated(), "{wrapped}");
+    let reconstruct = NetError::Consensus("reconstruct: witness commitment mismatch".into());
+    assert!(reconstruct.is_mutated(), "{reconstruct}");
+    for not_mutated in [
+        "witness commitment",
+        "signet: no witness commitment",
+        "consensus: bad block: signet: no witness commitment",
+        "bad block: signet: no witness commitment",
+        "signet: witness count",
+        "signet: witness short",
+        "bad-cb-missing",
+        "bad-txns-inputs-missingorspent",
+    ] {
+        let err = NetError::Consensus(not_mutated.into());
+        assert!(!err.is_mutated(), "{err}");
+        assert!(!rbitcoin_net::chain::reject_is_mutated(not_mutated));
+    }
     let ordinary = NetError::Consensus("bad-txns-inputs-missingorspent".into());
     assert!(!ordinary.is_mutated(), "{ordinary}");
 

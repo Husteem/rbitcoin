@@ -1326,6 +1326,268 @@ async fn merkle_mismatch_forgets_the_ask(
     assert_eq!(hub.tip_hash(), Some(tip));
 }
 
+fn assert_witness_malleation_log() {
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        lines
+            .iter()
+            .any(|(_, msg)| msg.contains("Block mutated: unexpected-witness")),
+        "witness malleation logs the Core token: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .all(|(_, msg)| !msg.contains("Block mutated: consensus:")),
+        "the log is the reject token, not the error display: {lines:?}"
+    );
+}
+
+/// Core drops a mutated copy without marking the block invalid, and its next
+/// `SendMessages` asks for the block again while it is on the best header
+/// chain. A manual peer stays connected, so tip follow asks it again at once,
+/// for a merkle mismatch, a duplicated last transaction, and witness bytes
+/// the block does not commit to (Core `IsBlockMutated` checks witness
+/// malleation too).
+async fn manual_peer_is_asked_again_after_a_mutated_copy(
+    hub: &rbitcoin_net::chain::ChainHub,
+    peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
+) {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::{OutPoint, Sequence, TxIn, TxOut, Version};
+    use bitcoin::{Amount, ScriptBuf, Transaction, Witness};
+
+    let tip = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time.saturating_add(4);
+    let height = hub.tip_height().unwrap().saturating_add(1);
+    let spend = |n: u32| Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([7u8; 32]), n),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: op_true(),
+        }],
+    };
+    // Three transactions: repeating the last keeps the merkle root.
+    let block = rbitcoin_consensus::mine_regtest_paying(
+        tip,
+        time,
+        height,
+        op_true(),
+        vec![spend(0), spend(1)],
+    );
+    let hash = block.block_hash();
+    let mut wrong_root = block.clone();
+    wrong_root.txdata[0].output[0].value = Amount::from_sat(1);
+    assert!(!wrong_root.check_merkle_root());
+    let mut duplicated = block.clone();
+    duplicated.txdata.push(block.txdata[2].clone());
+    assert!(duplicated.check_merkle_root());
+    // A witness leaves the txid, the merkle root and the hash as they were.
+    let mut witnessed = block.clone();
+    witnessed.txdata[1].input[0].witness = Witness::from_slice(&[[1u8; 3]]);
+    assert!(witnessed.check_merkle_root());
+    assert_eq!(witnessed.block_hash(), hash);
+
+    for (n, copy) in [wrong_root, duplicated, witnessed].into_iter().enumerate() {
+        let (out_tx, mut rx) = mpsc::unbounded_channel();
+        let manual = live_peer_as(
+            peers,
+            18479 + n as u16,
+            28 + n as u64,
+            rbitcoin_net::peers::PeerConnType::Manual,
+        );
+        let mut follow = PeerFollowState::new();
+        admit_pending_header(&mut follow.pending_headers, hash, block.header);
+        follow.requested_blocks.insert(hash);
+        hub.note_asked_block(hash);
+        if n == 2 {
+            rbitcoin_log::capture_logs(true);
+        }
+        on_block(hub, &out_tx, &mut follow, Some(manual.as_ref()), &copy)
+            .await
+            .unwrap();
+        if n == 2 {
+            assert_witness_malleation_log();
+        }
+        assert!(!manual.stop.load(Ordering::SeqCst), "copy {n}: kept");
+        assert!(!hub.is_block_invalid(&hash), "copy {n}: not invalid");
+        assert_eq!(
+            asked_blocks(&mut rx),
+            vec![hash],
+            "copy {n}: the block is asked for again"
+        );
+        assert!(follow.requested_blocks.contains(&hash), "copy {n}");
+        assert_eq!(hub.tip_hash(), Some(tip));
+        let mut requested = follow.requested_blocks;
+        take_requested_block(hub, &mut requested, &hash);
+    }
+}
+
+/// A 64-byte copy from a kept peer is asked again. The same copy from a
+/// session Core drops leaves the hub ask clear, so another peer can claim it.
+async fn sixty_four_byte_kept_peer_and_dropped_session(
+    hub: &rbitcoin_net::chain::ChainHub,
+    peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
+) {
+    let tip = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time.saturating_add(5);
+    let short = rbitcoin_net::chain::sixty_four_byte_body(tip, time);
+    let short_hash = short.block_hash();
+    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let manual = live_peer_as(
+        peers,
+        18482,
+        31,
+        rbitcoin_net::peers::PeerConnType::Manual,
+    );
+    let mut follow = PeerFollowState::new();
+    admit_pending_header(&mut follow.pending_headers, short_hash, short.header);
+    follow.requested_blocks.insert(short_hash);
+    hub.note_asked_block(short_hash);
+    on_block(hub, &out_tx, &mut follow, Some(manual.as_ref()), &short)
+        .await
+        .unwrap();
+    assert!(!manual.stop.load(Ordering::SeqCst), "64-byte: kept");
+    assert!(!hub.is_block_invalid(&short_hash), "64-byte: not invalid");
+    assert_eq!(
+        asked_blocks(&mut rx),
+        vec![short_hash],
+        "64-byte: the kept peer is asked again"
+    );
+    assert!(follow.requested_blocks.contains(&short_hash));
+    let mut requested = follow.requested_blocks;
+    take_requested_block(hub, &mut requested, &short_hash);
+
+    let dropped_body = rbitcoin_net::chain::sixty_four_byte_body(tip, time.saturating_add(1));
+    let dropped_hash = dropped_body.block_hash();
+    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let dropped = live_peer(peers, 18483, 32, false);
+    let mut follow = PeerFollowState::new();
+    admit_pending_header(
+        &mut follow.pending_headers,
+        dropped_hash,
+        dropped_body.header,
+    );
+    follow.requested_blocks.insert(dropped_hash);
+    hub.note_asked_block(dropped_hash);
+    on_block(
+        hub,
+        &out_tx,
+        &mut follow,
+        Some(dropped.as_ref()),
+        &dropped_body,
+    )
+    .await
+    .unwrap();
+    assert!(
+        dropped.stop.load(Ordering::SeqCst),
+        "a normal peer is dropped"
+    );
+    assert!(
+        !hub.is_block_invalid(&dropped_hash),
+        "the hash stays downloadable"
+    );
+    assert!(
+        asked_blocks(&mut rx).is_empty(),
+        "a dropped session is not asked again"
+    );
+    assert!(
+        !hub.already_have_or_asked_block(&dropped_hash),
+        "the hub ask is clear"
+    );
+    assert!(
+        hub.claim_block_ask(&dropped_hash),
+        "another peer can claim the hash"
+    );
+    hub.forget_asked_block(&dropped_hash);
+    assert!(!follow.requested_blocks.contains(&dropped_hash));
+    assert_eq!(hub.tip_hash(), Some(tip));
+}
+
+/// A signet block whose coinbase has no witness commitment can never satisfy
+/// the challenge: that output is in the block hash. Core's
+/// `CheckSignetBlockSolution` is `BLOCK_CONSENSUS`. Tip follow marks the hash
+/// invalid and does not ask a kept peer again. Witness bytes with no
+/// commitment are still a mutated copy (`unexpected-witness`): the hash does
+/// not commit to them, so the same header can be served without that witness.
+#[tokio::test]
+async fn signet_block_without_a_witness_commitment_is_invalid() {
+    use bitcoin::Witness;
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("signet-no-commit");
+    let mut params = ChainParams::regtest();
+    params.signet_challenge = Some(bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+    let hub = ChainHub::new(q, params, Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let tip = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time.saturating_add(600);
+
+    let mut witnessed = rbitcoin_consensus::mine_empty_regtest(tip, time, 1);
+    let witnessed_hash = witnessed.block_hash();
+    witnessed.txdata[0].input[0].witness = Witness::from_slice(&[[1u8; 3]]);
+    assert_eq!(witnessed.block_hash(), witnessed_hash);
+    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let manual = live_peer_as(&peers, 18496, 90, rbitcoin_net::peers::PeerConnType::Manual);
+    let mut follow = PeerFollowState::new();
+    admit_pending_header(&mut follow.pending_headers, witnessed_hash, witnessed.header);
+    follow.requested_blocks.insert(witnessed_hash);
+    hub.note_asked_block(witnessed_hash);
+    on_block(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(manual.as_ref()),
+        &witnessed,
+    )
+    .await
+    .unwrap();
+    assert!(!manual.stop.load(Ordering::SeqCst), "witness copy: kept");
+    assert!(
+        !hub.is_block_invalid(&witnessed_hash),
+        "witness bytes the hash does not commit to stay downloadable"
+    );
+    assert_eq!(
+        asked_blocks(&mut rx),
+        vec![witnessed_hash],
+        "the kept peer is asked for the real body"
+    );
+    let mut requested = follow.requested_blocks;
+    take_requested_block(&hub, &mut requested, &witnessed_hash);
+
+    let bare = rbitcoin_consensus::mine_empty_regtest(tip, time.saturating_add(1), 1);
+    let hash = bare.block_hash();
+    assert_ne!(hash, witnessed_hash);
+    assert!(bare.txdata[0].input[0].witness.is_empty());
+    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let manual = live_peer_as(&peers, 18497, 91, rbitcoin_net::peers::PeerConnType::Manual);
+    let mut follow = PeerFollowState::new();
+    admit_pending_header(&mut follow.pending_headers, hash, bare.header);
+    follow.requested_blocks.insert(hash);
+    hub.note_asked_block(hash);
+    on_block(&hub, &out_tx, &mut follow, Some(manual.as_ref()), &bare)
+        .await
+        .unwrap();
+    assert!(!manual.stop.load(Ordering::SeqCst), "kept");
+    assert!(
+        hub.is_block_invalid(&hash),
+        "a signet block with no witness commitment is invalid"
+    );
+    assert!(
+        asked_blocks(&mut rx).is_empty(),
+        "the invalid hash is not asked for again"
+    );
+    assert_eq!(hub.tip_hash(), Some(tip));
+    let _ = dir;
+}
+
 /// CVE-2012-2459: two identical transactions keep `check_merkle_root` and are
 /// still not a block. Tip follow disconnects and does not cache the hash.
 async fn duplicate_pair_disconnects(
@@ -2503,6 +2765,8 @@ async fn peer_header_dos_and_self_announce() {
     sixty_four_byte_body_is_mutated(&hub, &peers).await;
     empty_body_null_merkle_bans_before_the_header(&hub, &peers).await;
     merkle_mismatch_forgets_the_ask(&hub, &peers).await;
+    manual_peer_is_asked_again_after_a_mutated_copy(&hub, &peers).await;
+    sixty_four_byte_kept_peer_and_dropped_session(&hub, &peers).await;
     invalid_parent_child_is_fetched_after_reconsider(&hub, &peers).await;
     duplicate_pair_disconnects(&hub, &peers).await;
     rejected_header_logs_core_reason(&hub).await;
