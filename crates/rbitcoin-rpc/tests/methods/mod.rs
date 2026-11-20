@@ -3025,7 +3025,7 @@ fn http_wait_woken_by(
             .expect("act");
         let response = tokio::time::timeout(Duration::from_secs(10), waiter)
             .await
-            .unwrap_or_else(|_| panic!("{method} stayed parked until its deadline"))
+            .unwrap_or_else(|_| panic!("{method} still parked 10 s after the action"))
             .expect("join");
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
@@ -3072,6 +3072,11 @@ fn template_update_wakes_gbt_longpoll() {
         move || mp.note_template_update(),
     );
     assert!(got["result"]["height"].is_number(), "{got}");
+    assert_ne!(
+        got["result"]["longpollid"].as_str(),
+        Some(id.as_str()),
+        "the reply carries the template update that woke it: {got}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
