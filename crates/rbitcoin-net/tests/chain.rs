@@ -7735,3 +7735,31 @@ fn activate_best_side_branch_store_fault_is_not_a_failed_block() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// T1: two equal-work siblings are scripted together and exactly one becomes
+/// the tip. The held sibling is discovered before its own lane job runs.
+#[test]
+fn equal_work_sibling_pair_connects_exactly_one_tip() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t = 1_700_000_000u32;
+    let a = mine(gen, t, 1);
+    let b = mine_distinct(gen, t, 1, &[a.block_hash()]);
+    assert_eq!(a.header.prev_blockhash, b.header.prev_blockhash);
+    // Park the sibling before the first accept so the pair path sees it.
+    hub.hold_unconnected_body(b.clone());
+    let out = hub.accept_received_block(a.clone()).unwrap();
+    assert!(
+        matches!(out, AcceptOutcome::Accepted { height: 1 }),
+        "first candidate wins: {out:?}"
+    );
+    assert_eq!(hub.tip_hash().unwrap(), a.block_hash());
+    assert!(hub.is_connected(&a.block_hash()));
+    assert!(!hub.is_connected(&b.block_hash()));
+    // The loser's own job reports a lost equal-work race and moves nothing.
+    let out_b = hub.accept_received_block(b.clone()).unwrap();
+    assert!(matches!(out_b, AcceptOutcome::IgnoredWeaker), "{out_b:?}");
+    assert_eq!(hub.tip_hash().unwrap(), a.block_hash());
+    let _ = std::fs::remove_dir_all(dir);
+}

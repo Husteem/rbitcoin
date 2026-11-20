@@ -20,7 +20,8 @@ use rbitcoin_log::{debug, info, warn};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
 use rbitcoin_query::{
-    accept_and_connect_block_preverified, confirm_wire_load_from_plan as consensus_load_from_plan,
+    accept_and_connect_block_pair_preverified, accept_and_connect_block_preverified,
+    confirm_wire_load_from_plan as consensus_load_from_plan,
     confirm_wire_load_phase_pipelined, confirm_write_phase, header_to_record, validate_header,
     PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
 };
@@ -639,6 +640,15 @@ mod header_report;
 use header_report::HeaderReport;
 pub use header_report::IbdHeaderEpoch;
 
+/// Clears [`ChainHub::script_phase`] even on a panic or early return.
+struct ScriptPhaseGuard<'a>(&'a AtomicBool);
+
+impl Drop for ScriptPhaseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Thread-safe chain façade used by peer sessions.
 pub struct ChainHub {
     pub query: Arc<Query>,
@@ -649,6 +659,9 @@ pub struct ChainHub {
     pub tip_tx: broadcast::Sender<TipEvent>,
     /// Serializes tip connect / reorg so multi-peer accept cannot double Class A+C.
     pub connect_lock: std::sync::Mutex<()>,
+    /// A tip-pair script race (and its single-block commit) is running.
+    /// Readers see the old tip and do not join the lane job.
+    pub script_phase: AtomicBool,
     /// Serializes one `generate` call, from pool selection through the last
     /// block. Async generate holds it across `.await`. Sync generate uses
     /// `blocking_lock` only when the thread has no runtime handle; otherwise
@@ -891,6 +904,7 @@ impl ChainHub {
             max_tip_age_secs: AtomicU64::new(DEFAULT_MAX_TIP_AGE_SECS),
             prefill_compact: AtomicBool::new(false),
             rpc_wait_tip_idle: AtomicBool::new(false),
+            script_phase: AtomicBool::new(false),
             prefill_plan: std::sync::Mutex::new(None),
             asked_blocks: RwLock::new(HashSet::new()),
             chain_work_prefix: RwLock::new(Vec::new()),
@@ -3596,6 +3610,31 @@ impl ChainHub {
                 if prev == tip_hash {
                     let height = tip_h.saturating_add(1);
                     self.remember_cmpct_prefill_from_block(block.as_ref());
+                    // T3: a fully-held strictly heavier branch outranks this
+                    // child. Switch now instead of spending a wave on the
+                    // lighter block first. A coinbase-only child has no tx
+                    // scripts to save, so do not preempt for it.
+                    if block.txdata.len() > 1 {
+                        if let Some(branch) = self.held_heavier_branch(block.as_ref()) {
+                            if hold_unconnected {
+                                self.hold_body(Arc::clone(&block), waive);
+                            }
+                            return self.accept_branch_locked(&branch);
+                        }
+                    }
+                    if let Some(sib) = self.equal_work_sibling(hash, &block, waive) {
+                        let preferred = Arc::clone(&block);
+                        let won = self.connect_at_impl(height, block, waive, None, Some(sib))?;
+                        if won {
+                            return Ok(AcceptOutcome::Accepted { height });
+                        }
+                        // The sibling connected. Park this equal-work loser
+                        // and tell its caller it did not win.
+                        if hold_unconnected {
+                            self.hold_body(preferred, waive);
+                        }
+                        return Ok(AcceptOutcome::IgnoredWeaker);
+                    }
                     self.connect_at(height, block, waive, None)?;
                     return Ok(AcceptOutcome::Accepted { height });
                 }
@@ -4139,17 +4178,25 @@ impl ChainHub {
     /// and [`Self::accept_branch`] when a held (or archived) path has more
     /// work — or is precious at equal work. Not the IBD body-queue pipeline.
     pub fn accept_received_block(&self, block: Block) -> Result<AcceptOutcome, NetError> {
+        self.accept_received_block_arc(Arc::new(block))
+    }
+
+    /// [`Self::accept_received_block`] without the final `Arc` allocation.
+    pub fn accept_received_block_arc(
+        &self,
+        block: Arc<Block>,
+    ) -> Result<AcceptOutcome, NetError> {
         crate::tip_accept::run_on_tip_accept(|| self.accept_received_block_inner(block, false))
     }
 
     #[doc(hidden)]
     pub fn accept_received_block_inner(
         &self,
-        block: Block,
+        block: Arc<Block>,
         waive: bool,
     ) -> Result<AcceptOutcome, NetError> {
         let hash = block.block_hash();
-        let block = Arc::new(block);
+        let was_held = self.held_bodies.read().unwrap().contains(&hash);
         match self.accept_incoming(block, true, waive) {
             Ok(AcceptOutcome::Accepted { height }) => {
                 self.held_bodies.write().unwrap().remove(&hash);
@@ -4168,6 +4215,12 @@ impl ChainHub {
                 .apply_held_for(hash)?
                 .unwrap_or(AcceptOutcome::IgnoredWeaker)),
             Err(e) => {
+                // A store fault is not a block verdict. Drop a hold this
+                // call created so the hash stays re-requestable; a hold
+                // that was already here stays.
+                if matches!(e, NetError::Store(_)) && !was_held {
+                    self.drop_held(hash);
+                }
                 self.remember_failed_accept(hash, &e);
                 Err(e)
             }
@@ -4217,7 +4270,7 @@ impl ChainHub {
     ) -> Result<AcceptOutcome, NetError> {
         let hub = Arc::clone(self);
         crate::tip_accept::run_on_tip_accept_async(move || {
-            hub.accept_received_block_inner(block, false)
+            hub.accept_received_block_inner(Arc::new(block), false)
         })
         .await
     }
@@ -4225,6 +4278,15 @@ impl ChainHub {
     pub fn accept_received_on_lane(
         &self,
         block: Block,
+        waive: bool,
+    ) -> Result<AcceptOutcome, NetError> {
+        self.accept_received_block_inner(Arc::new(block), waive)
+    }
+
+    /// [`Self::accept_received_on_lane`] for a body already in an `Arc`.
+    pub fn accept_received_arc_on_lane(
+        &self,
+        block: Arc<Block>,
         waive: bool,
     ) -> Result<AcceptOutcome, NetError> {
         self.accept_received_block_inner(block, waive)
@@ -4236,6 +4298,11 @@ impl ChainHub {
     /// in flight so wallet `getblockcount` cannot stall across a catch-up burst.
     /// [`Self::set_rpc_wait_tip_idle`] waits until the lane is empty instead.
     pub fn wait_tip_stable_for_rpc(&self) {
+        // A pair commits one block and never disconnects, so there is no
+        // torn tip to wait for. Do not stall `getblockcount` on its scripts.
+        if self.script_phase.load(Ordering::Acquire) {
+            return;
+        }
         if self.rpc_wait_tip_idle() {
             crate::tip_accept::wait_idle();
         } else {
@@ -4286,6 +4353,92 @@ impl ChainHub {
     #[doc(hidden)]
     pub fn drop_held(&self, hash: BlockHash) {
         self.held_bodies.write().unwrap().remove(&hash);
+    }
+
+    /// A fully assembled branch in `held_bodies` that is strictly heavier
+    /// than `child` would be on top of the current tip. Bodies must run from
+    /// a connected ancestor through the branch tip, or this returns `None`.
+    fn held_heavier_branch(&self, child: &Block) -> Option<Vec<Arc<Block>>> {
+        use crate::most_work::{checked_add_work, work_better};
+        let child_work = child.header.work();
+        let held: Vec<BlockHash> = self.held_bodies.read().unwrap().keys().collect();
+        if held.is_empty() {
+            return None;
+        }
+        let restored = HashSet::new();
+        let mut best: Option<(bitcoin::Work, Vec<Arc<Block>>)> = None;
+        for h in held {
+            if h == child.block_hash() {
+                continue;
+            }
+            let Some(branch) = self.assemble_side_branch(h, &restored) else {
+                continue;
+            };
+            // `assemble_side_branch` can include a disconnected parent that
+            // is already marked invalid. Do not rank or connect that path.
+            if self.accept_branch_precheck(&branch).is_err() {
+                continue;
+            }
+            let Ok(branch_work) = self.branch_header_work(&branch) else {
+                continue;
+            };
+            let fork_prev = branch[0].header.prev_blockhash;
+            let Some(fork_h) = self.stored_header_height(&fork_prev) else {
+                continue;
+            };
+            let Ok(old) = self.work_from_fork_to_tip(Some(fork_h)) else {
+                continue;
+            };
+            let Ok(with_child) = checked_add_work(old, child_work) else {
+                continue;
+            };
+            if !work_better(branch_work, with_child) {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(w, _)| work_better(branch_work, *w))
+            {
+                best = Some((branch_work, branch));
+            }
+        }
+        best.map(|(_, b)| b)
+    }
+
+    /// An equal-work sibling body already held for the same parent, with the
+    /// same waive bit. Used to race two tip candidates (T1).
+    fn equal_work_sibling(
+        &self,
+        hash: BlockHash,
+        block: &Block,
+        waive: bool,
+    ) -> Option<Arc<Block>> {
+        use crate::most_work::{header_work_checked, work_better};
+        let prev = block.header.prev_blockhash;
+        let mine = header_work_checked(&block.header).ok()?;
+        let held = self.held_bodies.read().unwrap();
+        for h in held.keys() {
+            if h == hash {
+                continue;
+            }
+            let Some(b) = held.get(&h) else {
+                continue;
+            };
+            if b.header.prev_blockhash != prev {
+                continue;
+            }
+            if held.waive(&h) != waive || self.is_block_invalid(&h) {
+                continue;
+            }
+            let Ok(theirs) = header_work_checked(&b.header) else {
+                continue;
+            };
+            if work_better(mine, theirs) || work_better(theirs, mine) {
+                continue;
+            }
+            return Some(Arc::clone(b));
+        }
+        None
     }
 
     /// Park a disconnected body without running [`Self::try_apply_held`].
@@ -4548,8 +4701,23 @@ impl ChainHub {
         height: u32,
         block: Arc<Block>,
         waive: bool,
-        mut reorg: Option<&mut BranchReorg<'_>>,
+        reorg: Option<&mut BranchReorg<'_>>,
     ) -> Result<(), NetError> {
+        self.connect_at_impl(height, block, waive, reorg, None)
+            .map(|_| ())
+    }
+
+    /// [`Self::connect_at`] with an optional equal-work sibling to race.
+    /// Returns whether the preferred `block` is the one that connected.
+    #[doc(hidden)]
+    pub fn connect_at_impl(
+        &self,
+        height: u32,
+        mut block: Arc<Block>,
+        waive: bool,
+        mut reorg: Option<&mut BranchReorg<'_>>,
+        pair: Option<Arc<Block>>,
+    ) -> Result<bool, NetError> {
         debug_assert!(
             crate::tip_accept::on_tip_accept_thread(),
             "connect_at must run on tip-accept"
@@ -4564,32 +4732,65 @@ impl ChainHub {
         // Sampled before the new tip. A later connect uses this only to
         // skip starting maintenance.
         let was_ibd = self.in_ibd();
-        let hash = block.block_hash();
-        let header = block.header;
+        let mut hash = block.block_hash();
+        let mut header = block.header;
         tip_accept_stats_reset(&self.query);
         let t_wall = std::time::Instant::now();
         let t_pres = std::time::Instant::now();
-        let (pres, preverified) = match self.mempool() {
+        let (mut pres, preverified) = match self.mempool() {
             Some(mp) => mp.tip_script_pres(&block.txdata),
             None => rbitcoin_query::pres_for_tip(&block.txdata, true, |_| false),
         };
+        let (pair_pres, pair_pre) = match &pair {
+            Some(p) => {
+                let (pres, pre) = match self.mempool() {
+                    Some(mp) => mp.tip_script_pres(&p.txdata),
+                    None => rbitcoin_query::pres_for_tip(&p.txdata, true, |_| false),
+                };
+                (Some(pres), Some(pre))
+            }
+            None => (None, None),
+        };
         let pres_ns = t_pres.elapsed().as_nanos() as u64;
         debug_assert_eq!(pres.len(), block.txdata.len());
-        let _ = self
+        let had_pair = pair.is_some();
+        let _script_phase = had_pair.then(|| {
+            self.script_phase.store(true, Ordering::Release);
+            ScriptPhaseGuard(&self.script_phase)
+        });
+        let (fk, winner) = self
             .clock
             .with_frozen(|| loop {
                 match rbitcoin_query::confirm_run::waive_batch(waive, || {
-                    accept_and_connect_block_preverified(
-                        &self.query,
-                        &self.params,
-                        Height(height),
-                        Arc::clone(&block),
-                        self.milestone,
-                        &preverified,
-                        Some(std::sync::Arc::clone(&pres)),
-                    )
+                    match (&pair, &pair_pres, &pair_pre) {
+                        (Some(p), Some(pp), Some(pre)) => {
+                            accept_and_connect_block_pair_preverified(
+                                &self.query,
+                                &self.params,
+                                self.milestone,
+                                Height(height),
+                                Arc::clone(&block),
+                                &preverified,
+                                std::sync::Arc::clone(&pres),
+                                Arc::clone(p),
+                                pre,
+                                std::sync::Arc::clone(pp),
+                            )
+                            .map(|r| (r.fks.into_iter().next(), r.winner))
+                        }
+                        _ => accept_and_connect_block_preverified(
+                            &self.query,
+                            &self.params,
+                            Height(height),
+                            Arc::clone(&block),
+                            self.milestone,
+                            &preverified,
+                            Some(std::sync::Arc::clone(&pres)),
+                        )
+                        .map(|fk| (Some(fk), 0usize)),
+                    }
                 }) {
-                    Ok(fk) => return Ok(fk),
+                    Ok(v) => return Ok(v),
                     Err(e) if e.is_uring_session_fault() => {
                         self.query.uring_recover_or_abort("tip-connect");
                         continue;
@@ -4622,6 +4823,21 @@ impl ChainHub {
                     NetError::store(se)
                 }
             })?;
+        if winner == 1 {
+            if let Some(p) = pair {
+                block = p;
+                hash = block.block_hash();
+                header = block.header;
+                if let Some(pr) = pair_pres {
+                    pres = pr;
+                }
+                let _ = pair_pre;
+            }
+        }
+        debug_assert_eq!(pres.len(), block.txdata.len());
+        if had_pair && fk.is_none() {
+            return Err(NetError::store("pair write returned no fk"));
+        }
         self.forget_reported_header_tip(&hash);
         let t_mp = std::time::Instant::now();
         if let Some(mp) = self.mempool() {
@@ -4679,7 +4895,7 @@ impl ChainHub {
         }
         self.query.release_index_writebehind(Height(height));
         self.trim_held_bodies(height);
-        Ok(())
+        Ok(winner == 0)
     }
 
     #[doc(hidden)]
