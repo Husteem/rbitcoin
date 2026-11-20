@@ -7766,7 +7766,10 @@ fn equal_work_sibling_pair_connects_exactly_one_tip() {
     // the loser and reject the child.
     let child = mine(a.block_hash(), t.saturating_add(1), 2);
     let out_c = hub.accept_received_block(child.clone()).unwrap();
-    assert!(matches!(out_c, AcceptOutcome::Accepted { height: 2 }), "{out_c:?}");
+    assert!(
+        matches!(out_c, AcceptOutcome::Accepted { height: 2 }),
+        "{out_c:?}"
+    );
     assert_eq!(hub.tip_hash().unwrap(), child.block_hash());
     let _ = std::fs::remove_dir_all(dir);
 }

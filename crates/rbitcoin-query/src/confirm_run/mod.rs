@@ -466,7 +466,11 @@ fn run_pair_loads(
         }
     }
     let (win, lose, win_idx) = if first == 0 { (a, b, 0) } else { (b, a, 1) };
-    let (lose_in, lose_pre) = if win_idx == 0 { (b_in, b_pre) } else { (a_in, a_pre) };
+    let (lose_in, lose_pre) = if win_idx == 0 {
+        (b_in, b_pre)
+    } else {
+        (a_in, a_pre)
+    };
     let lose_hash = lose
         .batch
         .prepared
@@ -475,33 +479,34 @@ fn run_pair_loads(
         .unwrap_or([0; 32]);
     let lose_wave = lose.script_wave_arc();
     let run = match win.finish_scripts() {
-        Ok(win) => match pair_write_started(query, params, milestone, height, win, lose_wave, phase)
-        {
-            Ok(fks) => {
-                lose.cancel_scripts();
-                PairRun {
-                    winner: win_idx,
-                    fks,
-                    loser: lose_hash,
-                    loser_error: None,
-                }
-            }
-            Err(e) => {
-                // The winner may have appended Class A. Its plan base moved,
-                // so the loser is re-stamped before its own write.
-                let re = pair_load(query, params, milestone, lose_in, lose_pre)?;
-                let inf = Inflight::start_deferred_index(re, 0).map_err(|(e2, _)| e2)?;
-                match pair_write_started(query, params, milestone, height, inf, None, phase) {
-                    Ok(fks) => PairRun {
-                        winner: 1 - win_idx,
+        Ok(win) => {
+            match pair_write_started(query, params, milestone, height, win, lose_wave, phase) {
+                Ok(fks) => {
+                    lose.cancel_scripts();
+                    PairRun {
+                        winner: win_idx,
                         fks,
                         loser: lose_hash,
-                        loser_error: Some(e),
-                    },
-                    Err(_) => return Err(e),
+                        loser_error: None,
+                    }
+                }
+                Err(e) => {
+                    // The winner may have appended Class A. Its plan base moved,
+                    // so the loser is re-stamped before its own write.
+                    let re = pair_load(query, params, milestone, lose_in, lose_pre)?;
+                    let inf = Inflight::start_deferred_index(re, 0).map_err(|(e2, _)| e2)?;
+                    match pair_write_started(query, params, milestone, height, inf, None, phase) {
+                        Ok(fks) => PairRun {
+                            winner: 1 - win_idx,
+                            fks,
+                            loser: lose_hash,
+                            loser_error: Some(e),
+                        },
+                        Err(_) => return Err(e),
+                    }
                 }
             }
-        },
+        }
         Err(e) => {
             // No write happened; the loser's load is still at the same base.
             match pair_write_started(query, params, milestone, height, lose, None, phase) {

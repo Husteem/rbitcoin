@@ -21,9 +21,9 @@ use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
 use rbitcoin_query::{
     accept_and_connect_block_pair_preverified, accept_and_connect_block_preverified,
-    confirm_wire_load_from_plan as consensus_load_from_plan,
-    confirm_wire_load_phase_pipelined, confirm_write_phase, header_to_record, validate_header,
-    PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
+    confirm_wire_load_from_plan as consensus_load_from_plan, confirm_wire_load_phase_pipelined,
+    confirm_write_phase, header_to_record, validate_header, PlanStampOutcome, ScriptOkBatch,
+    ScriptPreverified, WireLoadPipeline,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -4182,10 +4182,7 @@ impl ChainHub {
     }
 
     /// [`Self::accept_received_block`] without the final `Arc` allocation.
-    pub fn accept_received_block_arc(
-        &self,
-        block: Arc<Block>,
-    ) -> Result<AcceptOutcome, NetError> {
+    pub fn accept_received_block_arc(&self, block: Arc<Block>) -> Result<AcceptOutcome, NetError> {
         crate::tip_accept::run_on_tip_accept(|| self.accept_received_block_inner(block, false))
     }
 
