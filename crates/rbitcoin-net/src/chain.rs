@@ -497,17 +497,64 @@ pub enum AcceptOutcome {
     IgnoredWeaker,
 }
 
-/// Reconstructed compact/body does not match the header, or witness bytes
-/// that are not committed in the hash. Do not cache the hash as permanently
-/// failed. Weight after a matching commitment is the block's own fault.
+/// Core `IsBlockMutated` / `BLOCK_MUTATED` reasons. The header can still be
+/// served by an honest body, so the hash is not cached as failed.
+///
+/// The reason matches exactly, or as the tail of a `consensus:` / `bad block:`
+/// / `reconstruct:` line. A substring would treat `signet: no witness
+/// commitment` as malleation. That output is in the block hash: Core's
+/// `CheckSignetBlockSolution` is `BLOCK_CONSENSUS` and the hash is invalid.
+/// Witness bytes with no commitment stay here (`missing witness commitment`);
+/// Core reports `unexpected-witness` before the signet check.
+const MUTATED_REASONS: &[&str] = &[
+    "merkle root mismatch",
+    "bad-txnmrklroot",
+    "bad-txns-duplicate",
+    "merkle mutated by a 64-byte tx",
+    "missing witness commitment",
+    "witness commitment mismatch",
+    "bad-witness-nonce-size",
+    "unexpected witness before segwit",
+];
+
+fn has_reject_reason(reason: &str, exact: &str) -> bool {
+    match reason.strip_suffix(exact) {
+        Some("") => true,
+        Some(tail) => tail.ends_with(": ") || tail.ends_with(' '),
+        None => false,
+    }
+}
+
 pub fn reject_is_mutated(reason: &str) -> bool {
-    let reason = reason.to_ascii_lowercase();
-    reason.contains("merkle")
-        || reason.contains("bad-txnmrklroot")
-        || reason.contains("bad-txns-duplicate")
-        || reason.contains("witness commitment")
-        || reason.contains("bad-witness-nonce")
-        || reason.contains("unexpected witness")
+    let reason = reason.trim().to_ascii_lowercase();
+    MUTATED_REASONS
+        .iter()
+        .any(|exact| has_reject_reason(&reason, exact))
+}
+
+/// Core reject token for a mutated copy that reached accept. The early
+/// `on_block` drops already log their own tokens.
+pub(crate) fn mutated_copy_log_reason(reason: &str) -> &'static str {
+    let reason = reason.trim().to_ascii_lowercase();
+    if has_reject_reason(&reason, "witness commitment mismatch") {
+        "bad-witness-merkle-match"
+    } else if has_reject_reason(&reason, "missing witness commitment")
+        || has_reject_reason(&reason, "unexpected witness before segwit")
+    {
+        "unexpected-witness"
+    } else if has_reject_reason(&reason, "bad-witness-nonce-size") {
+        "bad-witness-nonce-size"
+    } else if has_reject_reason(&reason, "bad-txnmrklroot")
+        || has_reject_reason(&reason, "merkle root mismatch")
+    {
+        "bad-txnmrklroot, hashMerkleRoot mismatch"
+    } else if has_reject_reason(&reason, "bad-txns-duplicate") {
+        "bad-txns-duplicate"
+    } else if has_reject_reason(&reason, "merkle mutated by a 64-byte tx") {
+        "64-byte transaction without a coinbase"
+    } else {
+        "unexpected-witness"
+    }
 }
 
 fn rules_connect_failed(hash: [u8; 32], err: &rbitcoin_consensus::ConsensusError) -> NetError {

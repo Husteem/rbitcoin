@@ -8331,6 +8331,19 @@ pub async fn on_block_accept(
     finish_block_accept(hub, out_tx, follow, session, block, hash, outcome).await
 }
 
+fn accept_mutated_log_reason(e: &NetError) -> &'static str {
+    let reason = match e {
+        NetError::Mutated(s) | NetError::Consensus(s) => s.clone(),
+        NetError::Rules(err) => rbitcoin_consensus::block_reject_reason(err),
+        NetError::ConnectFailed {
+            rules: Some(err), ..
+        } => rbitcoin_consensus::block_reject_reason(err),
+        NetError::ConnectFailed { msg, .. } => msg.clone(),
+        _ => String::new(),
+    };
+    crate::chain::mutated_copy_log_reason(&reason)
+}
+
 /// What a peer-accept result does to the session. A missing store row keeps
 /// the ask; any other store fault releases it. The neighborhood is the
 /// match in this function.
@@ -8375,7 +8388,8 @@ async fn finish_block_accept(
         // Witness bytes the block does not commit to: Core `IsBlockMutated`
         // drops these before validation, as `on_block` drops the others.
         Err(e) if e.is_mutated() => {
-            on_mutated_block(hub, out_tx, follow, session, hash, &e.to_string()).await
+            let reason = accept_mutated_log_reason(&e);
+            on_mutated_block(hub, out_tx, follow, session, hash, reason).await
         }
         Err(e) => {
             rbitcoin_log::warn!("p2p: accept dropped {hash} (invalid — keep session): {e}");
