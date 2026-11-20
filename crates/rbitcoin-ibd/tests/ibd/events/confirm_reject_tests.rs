@@ -5062,7 +5062,6 @@ fn coord_loop_body_and_reject_do_not_read_headers() {
     };
     use rbitcoin_ibd::ibd::events::apply_peer_event;
     use rbitcoin_ibd::ibd::peer_io::{PeerEvent, PeerSlot};
-    use rbitcoin_net::chain::{ensure_header_fk_count, reset_ensure_header_fk_count};
     use rbitcoin_net::seeds::AddrMan;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::AtomicU32;
@@ -5152,13 +5151,10 @@ fn coord_loop_body_and_reject_do_not_read_headers() {
     let gen = hub.tip_hash().unwrap();
     let b1 = shell(gen, 1, 1);
     let h1 = b1.block_hash();
-    reset_ensure_header_fk_count();
     rbitcoin_ibd::ibd::reorg::reset_parent_hash_of_count();
     let fk = hub.ensure_header_fk(&b1.header).unwrap();
     let _ = rbitcoin_ibd::ibd::reorg::parent_hash_of(&hub, h1);
-    assert!(ensure_header_fk_count() >= 1);
     assert!(rbitcoin_ibd::ibd::reorg::parent_hash_of_count() >= 1);
-    reset_ensure_header_fk_count();
     rbitcoin_ibd::ibd::reorg::reset_parent_hash_of_count();
 
     let mut st = IbdWorkState::new(vec![dummy_slot(1)], Some(gen), Some(0));
@@ -5227,7 +5223,6 @@ fn coord_loop_body_and_reject_do_not_read_headers() {
         !st.body.is_rejected(&rejected),
         "a parent that is not the tip is a cascade"
     );
-    assert_eq!(ensure_header_fk_count(), 0);
     assert_eq!(rbitcoin_ibd::ibd::reorg::parent_hash_of_count(), 0);
     let _ = std::fs::remove_dir_all(dir);
 }

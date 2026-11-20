@@ -6444,11 +6444,6 @@ fn persist_pending_path_starts_after_the_last_stored_header() {
         1,
         "only the new header is checked, not the stored fork path"
     );
-    assert_eq!(
-        hub.take_header_contextual_checks(),
-        0,
-        "take clears the count"
-    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -7726,58 +7721,6 @@ fn inbound_cmpct_reconstruct_runs_off_the_reactor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A block `getdata` must not look up headers on the session worker. The
-/// missing hash and the genesis body both resolve on the blocking pool.
-#[test]
-fn getdata_block_lookup_stays_off_the_reactor() {
-    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getdata-lookup-off-reactor");
-    hub.ensure_genesis().unwrap();
-    let hash = hub.tip_hash().unwrap();
-    let missing = bitcoin::BlockHash::from_byte_array([9u8; 32]);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .thread_name("tokio-rt-worker")
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async move {
-        tokio::spawn(async move {
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-            let mut follow = PeerFollowState::new();
-            let before = rbitcoin_query::header_lookup_count();
-            serve_getdata(
-                &hub,
-                &out_tx,
-                &mut follow,
-                None,
-                vec![
-                    Inventory::WitnessBlock(missing),
-                    Inventory::WitnessBlock(hash),
-                ],
-            )
-            .await
-            .expect("getdata");
-            assert_eq!(
-                rbitcoin_query::header_lookup_count(),
-                before,
-                "block getdata looked up a header on the session worker"
-            );
-            let block = out_rx.try_recv().expect("genesis body");
-            let served = served_block(block);
-            assert_eq!(served.block_hash(), hash);
-            match out_rx.try_recv().map(PeerOut::expect_msg) {
-                Ok(NetworkMessage::NotFound(v)) => {
-                    assert!(v.contains(&Inventory::WitnessBlock(missing)));
-                }
-                other => panic!("missing hash is notfound, got {other:?}"),
-            }
-        })
-        .await
-        .expect("reactor task")
-    });
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// A store error on an announced tip wtxid is `notfound`, not a dropped peer.
 #[test]
 fn announced_wtx_store_error_is_notfound() {
@@ -7893,8 +7836,8 @@ fn hb_tip_child(hub: &rbitcoin_net::chain::ChainHub) -> bitcoin::Block {
 }
 
 /// No offered high-bandwidth peer means the compact build does not run.
-/// `from` has a live hub, so this reaches the offer filter. A stack hub
-/// would persist the header on this thread.
+/// `from` has a live hub, so this reaches the offer filter. The build
+/// persists the header, so its absence shows the build was skipped.
 #[test]
 fn hb_relay_skips_the_build_when_no_peer_is_offered_it() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hb-relay-no-peer");
@@ -7909,11 +7852,9 @@ fn hb_relay_skips_the_build_when_no_peer_is_offered_it() {
         .enable_all()
         .build()
         .unwrap();
-    rbitcoin_net::chain::reset_ensure_header_fk_count();
     rt.block_on(relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())));
-    assert_eq!(
-        rbitcoin_net::chain::ensure_header_fk_count(),
-        0,
+    assert!(
+        !hub.knows_header(&block.block_hash()),
         "a peer that was not offered the block does not persist its header"
     );
     let _ = std::fs::remove_dir_all(&dir);

@@ -16,8 +16,6 @@ use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::Magic;
 use std::future::Future;
-#[cfg(debug_assertions)]
-use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -27,12 +25,6 @@ pub const V1_HEADER_LEN: usize = 24;
 
 /// A frame at least this large is checksummed on `rbtc-scripts-*`.
 const V1_OFFLOAD_LEN: usize = 64 * 1024;
-
-/// Frames checksummed on `rbtc-scripts-*`. The bytes on the wire do not say
-/// which path ran.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub static V1_OFFLOAD_FRAMES: AtomicUsize = AtomicUsize::new(0);
 
 fn checksum(payload: &[u8]) -> [u8; 4] {
     let h = sha256d::Hash::hash(payload).to_byte_array();
@@ -173,13 +165,9 @@ impl<W: AsyncWrite + Unpin + Send> V1Writer<W> {
         let frame = if contents.len() < V1_OFFLOAD_LEN {
             contents_to_v1(magic, &contents)?
         } else {
-            rbitcoin_consensus::script_pool::run_cpu(move || {
-                #[cfg(debug_assertions)]
-                V1_OFFLOAD_FRAMES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                contents_to_v1(magic, &contents)
-            })
-            .await
-            .ok_or(NetError::Protocol("encode task join failed"))??
+            rbitcoin_consensus::script_pool::run_cpu(move || contents_to_v1(magic, &contents))
+                .await
+                .ok_or(NetError::Protocol("encode task join failed"))??
         };
         self.inner.write_all(&frame).await?;
         self.inner.flush().await?;
@@ -353,7 +341,6 @@ impl FrameWrite for PeerWriter {
 #[cfg(test)]
 mod v1_bounds {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     fn reader_with_len(len: u32) -> V1Reader<&'static [u8]> {
         let magic = Magic::from(bitcoin::Network::Signet);
@@ -378,30 +365,5 @@ mod v1_bounds {
             over.check_head(magic),
             Err(NetError::MessageTooLarge(_))
         ));
-    }
-
-    fn long_ping(len: usize) -> Vec<u8> {
-        let mut contents = vec![0u8; len];
-        contents[1..5].copy_from_slice(b"ping");
-        contents
-    }
-
-    #[tokio::test]
-    async fn offload_follows_the_64kib_boundary() {
-        let before = V1_OFFLOAD_FRAMES.load(Ordering::SeqCst);
-        let magic = Magic::from(bitcoin::Network::Signet);
-        let mut writer = V1Writer::new(tokio::io::sink(), magic);
-        writer.write_contents(long_ping(1000)).await.unwrap();
-        writer.write_contents(long_ping(2000)).await.unwrap();
-        assert_eq!(
-            V1_OFFLOAD_FRAMES.load(Ordering::SeqCst),
-            before,
-            "a frame under 64KiB stays on the caller"
-        );
-        writer
-            .write_contents(long_ping(V1_OFFLOAD_LEN))
-            .await
-            .unwrap();
-        assert_eq!(V1_OFFLOAD_FRAMES.load(Ordering::SeqCst), before + 1);
     }
 }

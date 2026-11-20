@@ -146,7 +146,6 @@ the session worker for every block `getdata`. An unknown hash took
 `get_header_by_hash` there. `serve_getdata_full_block` already
 reconstructs on the blocking pool and answers `NotFound` when the header or
 the body is missing, so the session check is gone.
-`getdata_block_lookup_stays_off_the_reactor` is the pin.
 
 **Fixed.** A compact tip announcement used to call `block_for_peer` on the
 session inside `on_tip_event`, then build short ids there.

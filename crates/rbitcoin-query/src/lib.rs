@@ -458,8 +458,8 @@ pub use batch_parents::{
 pub use block_filter::{basic_filter_from_scripts, basic_filter_of};
 pub use catchup::IndexMode;
 pub use chain_view::{
-    header_lookup_count, header_lookups_under_coord_lock, reset_header_lookups_under_coord_lock,
-    ChainView, ChainViewKind, SlotsAround,
+    header_lookups_under_coord_lock, reset_header_lookups_under_coord_lock, ChainView,
+    ChainViewKind, SlotsAround,
 };
 pub use confirm_load::SpendEdges;
 pub use connect::{spawn_sh_writebehind, ConfirmPrepared};

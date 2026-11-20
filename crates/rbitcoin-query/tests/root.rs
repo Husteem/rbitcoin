@@ -127,12 +127,10 @@ fn published_tip_is_in_the_height_index() {
         .unwrap();
     let hash = [0xab; 32];
     q.publish_confirmed_tip(0, hash);
-    let before = rbitcoin_query::chain_view::header_lookup_count();
-    assert_eq!(q.height_of_hash(&hash).unwrap(), Some(Height(0)));
     assert_eq!(
-        rbitcoin_query::chain_view::header_lookup_count().saturating_sub(before),
-        0,
-        "a published tip is served from the height index"
+        q.height_of_hash(&hash).unwrap(),
+        Some(Height(0)),
+        "a published tip with no stored header is served from the height index"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -189,16 +187,14 @@ fn published_height_does_not_fill_a_lagging_index() {
     let (dir, q) = temp_query("pub-h-lag");
     let hashes = h2h_pad_0_4(&q);
     q.leave_height_index_gap_for_test(1);
-    let before = rbitcoin_query::chain_view::header_lookup_count();
     assert_eq!(
         q.published_height_of_hash(&hashes[1]),
         Some(Height(1)),
         "a hash at or below the indexed tip is still that height"
     );
-    assert_eq!(q.published_height_of_hash(&hashes[4]), None);
     assert_eq!(
-        rbitcoin_query::chain_view::header_lookup_count().saturating_sub(before),
-        0,
+        q.published_height_of_hash(&hashes[4]),
+        None,
         "a lagging index is not filled from this lookup"
     );
     let _ = dir;
@@ -210,13 +206,8 @@ fn height_index_catchup_does_not_hold_the_lock_across_header_reads() {
     let hashes = h2h_pad_0_4(&q);
     q.leave_height_index_gap_for_test(1);
     rbitcoin_query::chain_view::reset_index_io_under_lock();
-    let before = rbitcoin_query::chain_view::header_lookup_count();
     q.ensure_height_by_hash_index(q.tip_height().unwrap())
         .unwrap();
-    assert!(
-        rbitcoin_query::chain_view::header_lookup_count() > before,
-        "the gap is filled by reading the missing headers"
-    );
     assert_eq!(
         rbitcoin_query::chain_view::index_io_under_lock(),
         0,

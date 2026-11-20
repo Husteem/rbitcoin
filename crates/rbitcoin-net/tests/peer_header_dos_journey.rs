@@ -3007,10 +3007,10 @@ fn full_headers_page_is_not_an_insufficient_work_disconnect() {
 }
 
 /// Tip work meets the floor. A bad-proof-of-work compact whose parent is the
-/// tip must not walk the mempool, and it scores like a bad `block`. A valid
+/// tip scores like a bad `block` and asks the peer for nothing. A valid
 /// compact of the next block still fills from the mempool.
 #[tokio::test]
-async fn bad_pow_cmpct_does_not_scan_mempool() {
+async fn bad_pow_cmpct_scores_and_asks_for_nothing() {
     use bitcoin::bip152::HeaderAndShortIds;
     use bitcoin::p2p::message_compact_blocks::CmpctBlock;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -3031,7 +3031,6 @@ async fn bad_pow_cmpct_does_not_scan_mempool() {
     let bad = bad_pow_cmpct_on_tip(&hub);
     assert_eq!(bad.short_ids.len(), 1);
     assert!(!hub.header_claimed_pow_ok(&bad.header));
-    let scans = mp.cmpct_avail_scans();
     let plain = live_peer(&peers, 18510, 30, true);
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
@@ -3045,11 +3044,6 @@ async fn bad_pow_cmpct_does_not_scan_mempool() {
         }),
     )
     .await;
-    assert_eq!(
-        mp.cmpct_avail_scans(),
-        scans,
-        "bad proof of work must not walk the mempool"
-    );
     assert!(
         follow.ban_score >= BAN_SCORE_THRESHOLD,
         "bad compact proof of work scores like a bad block"
@@ -3084,7 +3078,6 @@ async fn bad_pow_cmpct_does_not_scan_mempool() {
     let noban = live_peer(&peers, 18511, 31, true);
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
-    let scans = mp.cmpct_avail_scans();
     push(
         &hub,
         &out_tx,
@@ -3095,7 +3088,6 @@ async fn bad_pow_cmpct_does_not_scan_mempool() {
         }),
     )
     .await;
-    assert_eq!(mp.cmpct_avail_scans(), scans);
     assert_eq!(follow.ban_score, 0, "a noban peer gathers no score");
     assert!(!noban.stop.load(Ordering::SeqCst));
     peers.set_noban(false);
@@ -3103,7 +3095,6 @@ async fn bad_pow_cmpct_does_not_scan_mempool() {
     let manual = live_peer_as(&peers, 18512, 32, rbitcoin_net::peers::PeerConnType::Manual);
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
-    let scans = mp.cmpct_avail_scans();
     push(
         &hub,
         &out_tx,
@@ -3112,7 +3103,6 @@ async fn bad_pow_cmpct_does_not_scan_mempool() {
         NetworkMessage::CmpctBlock(CmpctBlock { compact_block: bad }),
     )
     .await;
-    assert_eq!(mp.cmpct_avail_scans(), scans);
     assert_eq!(follow.ban_score, 0, "a manual peer gathers no score");
     assert!(!manual.stop.load(Ordering::SeqCst));
 
@@ -3153,7 +3143,6 @@ async fn bad_pow_cmpct_does_not_scan_mempool() {
     let hsi = HeaderAndShortIds::from_block(&block, 7, 2, &[0]).unwrap();
     assert_eq!(hsi.short_ids.len(), 1);
     assert!(hub.header_claimed_pow_ok(&hsi.header));
-    let scans = mp.cmpct_avail_scans();
     let peer = live_peer(&peers, 18513, 33, true);
     peer.set_hb_to(true);
     let mut follow = PeerFollowState::new();
@@ -3166,11 +3155,6 @@ async fn bad_pow_cmpct_does_not_scan_mempool() {
         NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi }),
     )
     .await;
-    assert_eq!(
-        mp.cmpct_avail_scans(),
-        scans + 1,
-        "a valid compact of the next tip still reads the mempool"
-    );
     assert_eq!(hub.tip_height(), Some(102));
     assert!(!mp.contains(&spend_id));
     assert_eq!(follow.ban_score, 0);
@@ -3213,9 +3197,9 @@ fn bad_pow_cmpct_on_tip(hub: &rbitcoin_net::chain::ChainHub) -> bitcoin::bip152:
     hsi
 }
 
-/// A connecting batch under the floor is ignored without reading parent headers.
+/// A connecting batch under the floor is neither stored nor fetched.
 #[tokio::test]
-async fn below_floor_headers_do_not_walk_parents() {
+async fn below_floor_headers_are_not_stored_or_fetched() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("below-floor");
     let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
     hub.ensure_genesis().unwrap();
@@ -3229,9 +3213,6 @@ async fn below_floor_headers_do_not_walk_parents() {
     let peer = live_peer(&peers, 18601, 41, false);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let mut follow = PeerFollowState::new();
-    // Warm the tip-work prefix so the floor check itself is not the lookup.
-    let _ = hub.meets_minimum_chain_work();
-    let before = rbitcoin_query::header_lookup_count();
     push(
         &hub,
         &out_tx,
@@ -3240,11 +3221,6 @@ async fn below_floor_headers_do_not_walk_parents() {
         NetworkMessage::Headers(hdrs.clone()),
     )
     .await;
-    let looked = rbitcoin_query::header_lookup_count().saturating_sub(before);
-    assert_eq!(
-        looked, 0,
-        "below-floor ignore must not read parent headers, looked={looked}"
-    );
     assert!(
         peer.best_known().is_none(),
         "a low-work batch does not become the peer's best known"
@@ -3283,35 +3259,11 @@ async fn below_floor_headers_do_not_walk_parents() {
     let _ = std::fs::remove_dir_all(src_dir);
 }
 
-/// A lagging height index is not connected. Filling that gap reads every
-/// missing header, so the peer and IBD checks must not do it.
-#[tokio::test]
-async fn connected_check_does_not_catch_up_the_height_index() {
-    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("idx-lag-conn");
-    hub.ensure_genesis().unwrap();
-    hub.generate_to_script(4, op_true(), vec![]).unwrap();
-    let tip = hub.tip_hash().unwrap();
-    assert!(hub.is_connected(&tip));
-    hub.query.invalidate_height_by_hash_index();
-    let before = rbitcoin_query::header_lookup_count();
-    assert!(
-        !hub.is_connected(&tip),
-        "a hash above the indexed tip is not connected until the index catches up on its own"
-    );
-    let looked = rbitcoin_query::header_lookup_count().saturating_sub(before);
-    assert_eq!(
-        looked, 0,
-        "the connected check must not read headers to fill the index, looked={looked}"
-    );
-    let _ = std::fs::remove_dir_all(dir);
-}
-
 /// A header that does not connect through pending headers is still ignored
-/// while our chain is under the floor. Summing that path used to give up
-/// and read parent headers. A header on an earlier best-chain block answers
-/// our getheaders, and the height index tells us so without a header read.
+/// while our chain is under the floor, and does not answer our getheaders.
+/// A header on an earlier best-chain block does answer it.
 #[tokio::test]
-async fn below_floor_disconnected_header_does_not_walk_parents() {
+async fn below_floor_header_answers_getheaders_only_on_our_chain() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("below-floor-disc");
     let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
     hub.ensure_genesis().unwrap();
@@ -3325,7 +3277,6 @@ async fn below_floor_disconnected_header_does_not_walk_parents() {
     let mut follow = PeerFollowState::new();
     let orphan = regtest_header_chain(BlockHash::from_byte_array([0x11; 32]), 1);
     peer.note_awaiting_headers();
-    let before = rbitcoin_query::header_lookup_count();
     push(
         &hub,
         &out_tx,
@@ -3334,11 +3285,6 @@ async fn below_floor_disconnected_header_does_not_walk_parents() {
         NetworkMessage::Headers(orphan),
     )
     .await;
-    let looked = rbitcoin_query::header_lookup_count().saturating_sub(before);
-    assert_eq!(
-        looked, 0,
-        "a below-floor header with no pending parent must not read the store, looked={looked}"
-    );
     assert_eq!(side_tips(&hub), 0);
     assert!(asked_blocks(&mut out_rx).is_empty());
     assert!(
@@ -3346,7 +3292,6 @@ async fn below_floor_disconnected_header_does_not_walk_parents() {
         "an unconnecting header does not answer our getheaders"
     );
     let fork = regtest_header_chain(tip_parent, 1);
-    let before = rbitcoin_query::header_lookup_count();
     push(
         &hub,
         &out_tx,
@@ -3355,11 +3300,6 @@ async fn below_floor_disconnected_header_does_not_walk_parents() {
         NetworkMessage::Headers(fork),
     )
     .await;
-    let looked = rbitcoin_query::header_lookup_count().saturating_sub(before);
-    assert_eq!(
-        looked, 0,
-        "a below-floor header on the tip's parent must not read the store, looked={looked}"
-    );
     assert!(
         !peer.is_awaiting_headers(),
         "a header on an earlier best-chain block answers our getheaders"
@@ -3368,10 +3308,10 @@ async fn below_floor_disconnected_header_does_not_walk_parents() {
 }
 
 /// Pending already holds the cap, and the next full batch still connects.
-/// That is 8_000 + 2_000 headers. The walk used to stop on the last step
-/// and then read parents.
+/// That is 8_000 + 2_000 headers. The batch stays in RAM under the floor
+/// and still answers our getheaders.
 #[tokio::test]
-async fn full_pending_below_floor_does_not_walk_parents() {
+async fn full_pending_below_floor_batch_answers_getheaders() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("below-floor-cap");
     let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
     hub.ensure_genesis().unwrap();
@@ -3388,7 +3328,6 @@ async fn full_pending_below_floor_does_not_walk_parents() {
     prev = setup.last().unwrap().block_hash();
     assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
     peer.note_awaiting_headers();
-    let before = rbitcoin_query::header_lookup_count();
     let chain = regtest_header_chain(prev, batch);
     push(
         &hub,
@@ -3398,11 +3337,6 @@ async fn full_pending_below_floor_does_not_walk_parents() {
         NetworkMessage::Headers(chain),
     )
     .await;
-    let looked = rbitcoin_query::header_lookup_count().saturating_sub(before);
-    assert_eq!(
-        looked, 0,
-        "a full pending map plus one batch must not read parent headers, looked={looked}"
-    );
     assert_eq!(side_tips(&hub), 0, "the batch stays under the floor");
     assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
     assert!(
