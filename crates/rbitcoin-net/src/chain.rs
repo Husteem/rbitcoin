@@ -3687,8 +3687,12 @@ impl ChainHub {
                                 return Ok(AcceptOutcome::Accepted { height });
                             }
                             // The sibling connected. Park this equal-work
-                            // loser and tell its caller it did not win.
-                            self.hold_body(preferred, waive);
+                            // loser and tell its caller it did not win. A
+                            // loser that failed its own verdict is already
+                            // invalid; do not re-park it.
+                            if !self.is_block_invalid(&hash) {
+                                self.hold_body(preferred, waive);
+                            }
                             return Ok(AcceptOutcome::IgnoredWeaker);
                         }
                     }

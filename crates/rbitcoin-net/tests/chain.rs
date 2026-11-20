@@ -7833,6 +7833,10 @@ fn pair_script_invalid_sibling_loses_and_is_marked() {
         hub.is_block_invalid(&bad.block_hash()),
         "the script-invalid sibling is marked, not the honest block"
     );
+    assert!(
+        hub.held_body(&bad.block_hash()).is_none(),
+        "an invalid pair loser is not re-parked"
+    );
     assert!(!hub.is_connected(&bad.block_hash()));
     let child = mine(good.block_hash(), t.saturating_add(103), 103);
     assert!(matches!(

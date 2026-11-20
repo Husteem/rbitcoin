@@ -317,28 +317,6 @@ pub fn publish_waves(waves: &[Arc<Wave>]) {
     note_script_progress();
 }
 
-/// Reorder the published list so the caller's waves come first, in the given
-/// order, at the position of the earliest wave already published. Waves
-/// published by other roles keep their relative position. The tip pair uses
-/// this to put the winner's index wave ahead of the loser's script wave.
-#[doc(hidden)]
-pub fn set_wave_order(order: &[Arc<Wave>]) {
-    if order.is_empty() {
-        return;
-    }
-    let mut g = WAVES.lock().unwrap_or_else(|p| p.into_inner());
-    let at = g
-        .iter()
-        .position(|w| order.iter().any(|o| Arc::ptr_eq(o, w)))
-        .unwrap_or(g.len());
-    g.retain(|w| !order.iter().any(|o| Arc::ptr_eq(o, w)));
-    let at = at.min(g.len());
-    for (i, w) in order.iter().enumerate() {
-        g.insert(at + i, Arc::clone(w));
-    }
-    publish_waves(&g);
-}
-
 /// Drops `in_wave` on the success path and on a panic inside the chunk.
 #[doc(hidden)]
 pub struct InWave {

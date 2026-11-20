@@ -276,12 +276,6 @@ impl Inflight {
         self.script_wave.as_ref().map(|w| Arc::clone(&w.wave))
     }
 
-    /// The published index wave, after [`Self::start_index`].
-    #[doc(hidden)]
-    pub fn index_wave_arc(&self) -> Option<Arc<rbitcoin_consensus::script_pool::Wave>> {
-        self.index_wave.as_ref().map(|w| Arc::clone(&w.wave))
-    }
-
     /// Publish the held index wave. No-op when it was already published or
     /// the batch has no index jobs.
     #[doc(hidden)]
