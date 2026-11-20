@@ -8,6 +8,7 @@ use rbitcoin_consensus::script_pool::{
     start_for_each_pooled, OwnedWave,
 };
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -95,6 +96,8 @@ pub struct Inflight {
     /// Older wave. Workers claim it before the index wave.
     pub script_wave: Option<OwnedWave<ScriptCheckJob>>,
     pub index_wave: Option<OwnedWave<IndexJob>>,
+    /// Prepared index jobs held back until scripts pass (tip path).
+    pending_index: Option<index::IndexJobs>,
     pub script_heights: Vec<u32>,
     pub slots: Vec<index::HeightSlots>,
     pub index_started: Arc<OnceLock<Instant>>,
@@ -108,10 +111,29 @@ pub struct Inflight {
 }
 
 impl Inflight {
+    /// Publish the script wave and the index wave together (IBD).
     #[doc(hidden)]
     pub fn start(
+        batch: LoadedBatch,
+        mat_ns: u64,
+    ) -> Result<Self, (ConfirmError, ScriptsBatchMeta)> {
+        Self::start_impl(batch, mat_ns, false)
+    }
+
+    /// Tip path: publish the script wave now and hold the index wave until
+    /// the script wave passes, so a rejected block never runs index jobs.
+    #[doc(hidden)]
+    pub fn start_deferred_index(
+        batch: LoadedBatch,
+        mat_ns: u64,
+    ) -> Result<Self, (ConfirmError, ScriptsBatchMeta)> {
+        Self::start_impl(batch, mat_ns, true)
+    }
+
+    fn start_impl(
         mut batch: LoadedBatch,
         mat_ns: u64,
+        defer_index: bool,
     ) -> Result<Self, (ConfirmError, ScriptsBatchMeta)> {
         let t0 = Instant::now();
         let meta = ScriptsBatchMeta::from_batch(&batch, mat_ns);
@@ -121,7 +143,11 @@ impl Inflight {
             Ok(jobs) => jobs,
             Err(e) => return Err((e, meta)),
         };
-        let index_started = index_jobs.started;
+        let index::IndexJobs {
+            jobs: index_jobs_vec,
+            slots: index_slots,
+            started: index_started,
+        } = index_jobs;
         let started = if batch.trust_peer {
             start_for_each_owned_keep(scripts, apply_script)
         } else {
@@ -145,21 +171,32 @@ impl Inflight {
                 }
             }
         };
-        let index_wave = match start_for_each_pooled(index_jobs.jobs, index::apply_index_job, 1) {
-            Ok(w) => w,
-            Err(e) => {
-                let err = ConfirmError::from(e);
-                log_batch_stop(&batch, &err);
-                return Err((err, meta));
-            }
+        let (index_wave, pending_index, slots) = if defer_index {
+            let pending = index::IndexJobs {
+                jobs: index_jobs_vec,
+                slots: index_slots,
+                started: Arc::clone(&index_started),
+            };
+            (None, Some(pending), Vec::new())
+        } else {
+            let wave = match start_for_each_pooled(index_jobs_vec, index::apply_index_job, 1) {
+                Ok(w) => w,
+                Err(e) => {
+                    let err = ConfirmError::from(e);
+                    log_batch_stop(&batch, &err);
+                    return Err((err, meta));
+                }
+            };
+            (wave, None, index_slots)
         };
         let inf = Self {
             batch,
             t0,
             script_wave,
             index_wave,
+            pending_index,
             script_heights,
-            slots: index_jobs.slots,
+            slots,
             index_started,
             script_done: OnceLock::new(),
             index_done: OnceLock::new(),
@@ -204,8 +241,49 @@ impl Inflight {
         scripts_done && index_done
     }
 
+    /// True when the script wave has no work left. The index wave is not
+    /// considered (it may still be deferred).
     #[doc(hidden)]
-    pub fn finish(mut self) -> Result<(ConfirmScriptOutcome, ScriptsBatchMeta), ConfirmError> {
+    pub fn script_is_complete(&self) -> bool {
+        self.note_clocks();
+        self.script_wave.as_ref().is_none_or(|w| w.is_complete())
+    }
+
+    /// The published script wave, for tip-pair linking.
+    #[doc(hidden)]
+    pub fn script_wave_arc(&self) -> Option<Arc<rbitcoin_consensus::script_pool::Wave>> {
+        self.script_wave.as_ref().map(|w| Arc::clone(&w.wave))
+    }
+
+    /// The published index wave, after [`Self::start_index`].
+    #[doc(hidden)]
+    pub fn index_wave_arc(&self) -> Option<Arc<rbitcoin_consensus::script_pool::Wave>> {
+        self.index_wave.as_ref().map(|w| Arc::clone(&w.wave))
+    }
+
+    /// Publish the held index wave. No-op when it was already published or
+    /// the batch has no index jobs.
+    #[doc(hidden)]
+    pub fn start_index(&mut self) -> Result<(), ConfirmError> {
+        let Some(pending) = self.pending_index.take() else {
+            return Ok(());
+        };
+        self.slots = pending.slots;
+        self.index_wave = match start_for_each_pooled(pending.jobs, index::apply_index_job, 1) {
+            Ok(w) => w,
+            Err(e) => {
+                let err = ConfirmError::from(e);
+                log_batch_stop(&self.batch, &err);
+                return Err(err);
+            }
+        };
+        Ok(())
+    }
+
+    /// Wait for the script wave and apply its verdict. Returns `self` with
+    /// the index wave still held (deferred) or running (eager).
+    #[doc(hidden)]
+    pub fn finish_scripts(mut self) -> Result<Self, ConfirmError> {
         if let Some(w) = self.script_wave.as_ref() {
             w.wait();
         }
@@ -237,14 +315,6 @@ impl Inflight {
             }
         };
         let _ = self.script_done.set(self.t0.elapsed().as_nanos() as u64);
-        let had_index = self.index_wave.is_some();
-        let index_res = match self.index_wave.take() {
-            Some(w) => w.finish(),
-            None => Ok(()),
-        };
-        if had_index {
-            self.stamp_index();
-        }
         // A hard stop drops the kept script faults. Only the stop is logged,
         // and only as not applied. Connect is what logs a kept fault.
         if script_stop.is_none() && wave_stop.is_none() {
@@ -261,6 +331,24 @@ impl Inflight {
             let height = self.script_heights.first().copied();
             log_batch_fault(&self.batch, height, &e, false);
             return Err(crate::ConfirmError::Rules(e));
+        }
+        Ok(self)
+    }
+
+    /// Publish the index wave if it is still held, wait for it, and build the
+    /// script-ok batch. Scripts must already have passed.
+    #[doc(hidden)]
+    pub fn finish_index(
+        mut self,
+    ) -> Result<(ConfirmScriptOutcome, ScriptsBatchMeta), ConfirmError> {
+        self.start_index()?;
+        let had_index = self.index_wave.is_some();
+        let index_res = match self.index_wave.take() {
+            Some(w) => w.finish(),
+            None => Ok(()),
+        };
+        if had_index {
+            self.stamp_index();
         }
         if let Err(e) = index_res {
             let err = crate::ConfirmError::from(e);
@@ -287,6 +375,33 @@ impl Inflight {
             outcome_from(self.batch, work_ns, index_done_ns, seal, idx_asm_ns, warns),
             self.meta,
         ))
+    }
+
+    #[doc(hidden)]
+    pub fn finish(self) -> Result<(ConfirmScriptOutcome, ScriptsBatchMeta), ConfirmError> {
+        self.finish_scripts()?.finish_index()
+    }
+
+    /// Cooperative cancel of the script wave. Safe to call before dropping;
+    /// `Drop` still waits for chunks already inside `run_chunk`.
+    #[doc(hidden)]
+    pub fn cancel_scripts(&self) {
+        let Some(w) = self.script_wave.as_ref() else {
+            return;
+        };
+        let wave = &w.wave;
+        wave.failed.store(true, Ordering::Release);
+        {
+            let mut g = wave.first_err.lock().unwrap_or_else(|p| p.into_inner());
+            if g.is_none() {
+                *g = Some(ConsensusError::Cancelled);
+            }
+        }
+        {
+            let _g = wave.done.lock().unwrap_or_else(|p| p.into_inner());
+            wave.done_cv.notify_all();
+        }
+        rbitcoin_consensus::script_pool::unpark_script_publisher();
     }
 }
 
