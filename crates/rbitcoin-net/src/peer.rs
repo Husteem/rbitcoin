@@ -552,13 +552,6 @@ mod decode_queue_cap {
         TURN.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Heavy-byte accounting is process-wide. These tests take turns so one
-    /// queue at the cap does not disconnect another test's peer.
-    fn turn() -> std::sync::MutexGuard<'static, ()> {
-        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        TURN.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     /// Core's `feature_versionbits_warning` sends a period of unsolicited
     /// bodies before the node applies them all. That burst is not a flood.
     #[test]
