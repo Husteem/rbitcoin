@@ -1325,6 +1325,87 @@ async fn merkle_mismatch_forgets_the_ask(
     assert_eq!(hub.tip_hash(), Some(tip));
 }
 
+/// Core drops a mutated copy without marking the block invalid, and its next
+/// `SendMessages` asks for the block again while it is on the best header
+/// chain. A manual peer stays connected, so tip follow asks it again at once,
+/// for a merkle mismatch, a duplicated last transaction, and witness bytes
+/// the block does not commit to (Core `IsBlockMutated` checks witness
+/// malleation too).
+async fn manual_peer_is_asked_again_after_a_mutated_copy(
+    hub: &rbitcoin_net::chain::ChainHub,
+    peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
+) {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::{OutPoint, Sequence, TxIn, TxOut, Version};
+    use bitcoin::{Amount, ScriptBuf, Transaction, Witness};
+
+    let tip = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time.saturating_add(4);
+    let height = hub.tip_height().unwrap().saturating_add(1);
+    let spend = |n: u32| Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([7u8; 32]), n),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: op_true(),
+        }],
+    };
+    // Three transactions: repeating the last keeps the merkle root.
+    let block = rbitcoin_consensus::mine_regtest_paying(
+        tip,
+        time,
+        height,
+        op_true(),
+        vec![spend(0), spend(1)],
+    );
+    let hash = block.block_hash();
+    let mut wrong_root = block.clone();
+    wrong_root.txdata[0].output[0].value = Amount::from_sat(1);
+    assert!(!wrong_root.check_merkle_root());
+    let mut duplicated = block.clone();
+    duplicated.txdata.push(block.txdata[2].clone());
+    assert!(duplicated.check_merkle_root());
+    // A witness leaves the txid, the merkle root and the hash as they were.
+    let mut witnessed = block.clone();
+    witnessed.txdata[1].input[0].witness = Witness::from_slice(&[[1u8; 3]]);
+    assert!(witnessed.check_merkle_root());
+    assert_eq!(witnessed.block_hash(), hash);
+
+    for (n, copy) in [wrong_root, duplicated, witnessed].into_iter().enumerate() {
+        let (out_tx, mut rx) = mpsc::unbounded_channel();
+        let manual = live_peer_as(
+            peers,
+            18479 + n as u16,
+            28 + n as u64,
+            rbitcoin_net::peers::PeerConnType::Manual,
+        );
+        let mut follow = PeerFollowState::new();
+        admit_pending_header(&mut follow.pending_headers, hash, block.header);
+        follow.requested_blocks.insert(hash);
+        hub.note_asked_block(hash);
+        on_block(hub, &out_tx, &mut follow, Some(manual.as_ref()), &copy)
+            .await
+            .unwrap();
+        assert!(!manual.stop.load(Ordering::SeqCst), "copy {n}: kept");
+        assert!(!hub.is_block_invalid(&hash), "copy {n}: not invalid");
+        assert_eq!(
+            asked_blocks(&mut rx),
+            vec![hash],
+            "copy {n}: the block is asked for again"
+        );
+        assert!(follow.requested_blocks.contains(&hash), "copy {n}");
+        assert_eq!(hub.tip_hash(), Some(tip));
+        let mut requested = follow.requested_blocks;
+        take_requested_block(hub, &mut requested, &hash);
+    }
+}
+
 /// CVE-2012-2459: two identical transactions keep `check_merkle_root` and are
 /// still not a block. Tip follow disconnects and does not cache the hash.
 async fn duplicate_pair_disconnects(
@@ -2326,6 +2407,7 @@ async fn peer_header_dos_and_self_announce() {
     sixty_four_byte_body_is_mutated(&hub, &peers).await;
     empty_body_null_merkle_bans_before_the_header(&hub, &peers).await;
     merkle_mismatch_forgets_the_ask(&hub, &peers).await;
+    manual_peer_is_asked_again_after_a_mutated_copy(&hub, &peers).await;
     invalid_parent_child_is_fetched_after_reconsider(&hub, &peers).await;
     duplicate_pair_disconnects(&hub, &peers).await;
     rejected_header_logs_core_reason(&hub).await;

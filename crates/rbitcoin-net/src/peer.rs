@@ -8153,6 +8153,37 @@ pub async fn on_headers(
     Ok(())
 }
 
+/// Core `BLOCK_MUTATED`: the copy is dropped, the block is not marked
+/// invalid, and the sender is punished. Core's next `SendMessages` asks for
+/// the block again while it is on the best header chain. A session that
+/// [`misbehaving`] keeps (manual or noban) asks at once; one it drops leaves
+/// the block to the other sessions, as the forgotten ask allows.
+async fn on_mutated_block(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    hash: BlockHash,
+    reason: &str,
+) -> Result<(), NetError> {
+    rbitcoin_log::info!("Block mutated: {reason}");
+    take_requested_block(hub, &mut follow.requested_blocks, &hash);
+    misbehaving(&mut follow.ban_score, session);
+    if session.is_some_and(misbehavior_exempt) {
+        drain_pending(
+            hub,
+            out_tx,
+            &mut follow.pending_blocks,
+            &mut follow.pending_headers,
+            &mut follow.requested_blocks,
+            getdata_use_compact(hub, follow.cmpct_version),
+            session,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 pub async fn on_block(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -8162,23 +8193,18 @@ pub async fn on_block(
 ) -> Result<(), NetError> {
     let hash = block.block_hash();
     let merkle = crate::compact::block_txid_merkle(&block.txdata);
-    if merkle.is_none_or(|(root, _)| root != block.header.merkle_root.to_byte_array()) {
-        rbitcoin_log::info!("Block mutated: bad-txnmrklroot, hashMerkleRoot mismatch");
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
-        misbehaving(&mut follow.ban_score, session);
-        return Ok(());
-    }
-    if merkle.is_some_and(|(_, mutated)| mutated) {
-        rbitcoin_log::info!("Block mutated: bad-txns-duplicate");
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
-        misbehaving(&mut follow.ban_score, session);
-        return Ok(());
-    }
-    if rbitcoin_consensus::block_mutated_without_coinbase(block) {
-        rbitcoin_log::info!("Block mutated: 64-byte transaction without a coinbase");
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
-        misbehaving(&mut follow.ban_score, session);
-        return Ok(());
+    let mutated = if merkle.is_none_or(|(root, _)| root != block.header.merkle_root.to_byte_array())
+    {
+        Some("bad-txnmrklroot, hashMerkleRoot mismatch")
+    } else if merkle.is_some_and(|(_, mutated)| mutated) {
+        Some("bad-txns-duplicate")
+    } else if rbitcoin_consensus::block_mutated_without_coinbase(block) {
+        Some("64-byte transaction without a coinbase")
+    } else {
+        None
+    };
+    if let Some(reason) = mutated {
+        return on_mutated_block(hub, out_tx, follow, session, hash, reason).await;
     }
     if let Some(s) = session {
         s.note_block_from_peer(hash);
@@ -8345,6 +8371,11 @@ async fn finish_block_accept(
         Err(e @ NetError::Store(_)) => {
             note_store_fault_keep_session(hub, hash, &e);
             Ok(())
+        }
+        // Witness bytes the block does not commit to: Core `IsBlockMutated`
+        // drops these before validation, as `on_block` drops the others.
+        Err(e) if e.is_mutated() => {
+            on_mutated_block(hub, out_tx, follow, session, hash, &e.to_string()).await
         }
         Err(e) => {
             rbitcoin_log::warn!("p2p: accept dropped {hash} (invalid — keep session): {e}");
