@@ -792,6 +792,34 @@ fn mutated_clear_punishes_only_an_off_path_sender() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Core `MaybeDiscourageAndDisconnect` keeps a manual peer whatever it sent.
+/// A `--connect` peer that sends a mutated body stays connected, and the
+/// block is asked for again as for any other sender.
+#[test]
+fn mutated_clear_keeps_a_manual_sender() {
+    let (dir, hub) = open("punish-mutated-manual");
+    let tip = hub.tip_hash().unwrap();
+    let (mut slot, mut rx) = peer(1, 10);
+    slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
+    let mut st = IbdWorkState::new(vec![slot], Some(tip), Some(0));
+    apply_confirm_reject(
+        &mut st,
+        4,
+        hash_n(82),
+        ConfirmRejectClass::SoftWire,
+        "bad-txnmrklroot",
+        None,
+        Some(&hub),
+        1,
+        None,
+        Some(1),
+        RejectParent::default(),
+    );
+    assert!(st.slots[0].alive, "a manual peer is not dropped");
+    assert!(rx.try_recv().is_err(), "no shutdown is sent to it");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn soft_reject_defers_clear_only_for_a_mutated_body_with_a_query() {
     let (dir, hub) = open("soft-defer");

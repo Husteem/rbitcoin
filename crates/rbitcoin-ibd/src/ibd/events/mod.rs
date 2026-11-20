@@ -1694,17 +1694,23 @@ pub fn bad_prev_parent(
 
 /// Core `MaybePunishNodeForBlock` (`BLOCK_MUTATED`): drop the sender and
 /// cool down its address so the re-get goes to another peer. Redial falls
-/// back to a cooling address when no other is dialable. A noban peer stays.
+/// back to a cooling address when no other is dialable. A noban peer stays,
+/// and so does a manual one (`--connect`): Core `MaybeDiscourageAndDisconnect`
+/// never drops a manual peer for misbehavior.
 #[doc(hidden)]
 pub fn punish_mutated_sender(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
-    let Some(addr) = st
+    let Some((addr, conn_type)) = st
         .slots
         .iter()
         .find(|s| s.id == peer && s.alive)
-        .map(|s| s.addr)
+        .map(|s| (s.addr, s.conn_type))
     else {
         return;
     };
+    if conn_type == rbitcoin_net::peers::PeerConnType::Manual {
+        warn!("ibd: peer[{peer}] sent mutated block {hash}; not punishing manually connected peer");
+        return;
+    }
     // IBD dials outbound only. A bind address only matters for inbound
     // (`-whitebind`), so the peer address fills that slot.
     let noban = st.perms.as_ref().is_some_and(|p| {
