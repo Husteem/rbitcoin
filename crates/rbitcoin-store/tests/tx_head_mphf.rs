@@ -3,7 +3,7 @@ use rbitcoin_store::error::StoreError;
 use rbitcoin_store::tx_head_mphf::*;
 use std::path::PathBuf;
 
-use rbitcoin_store::uring_session::{with_drain_hard_cap, IoCtx, SessionKind, UringSession};
+use rbitcoin_store::uring_session::{IoCtx, SessionKind, UringSession};
 
 fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -36,62 +36,73 @@ fn index_batch_held_session_submits_g_pages() {
 
 /// Held-session leftover `KIND_BULK_PREAD` must not be harvested as a BDZ
 /// g-page CQE (`bdz g page bad slot`). A new wave cannot drain a previous
-/// frame's SQEs, so it fails closed instead.
+/// frame's SQEs, so it aborts instead; a misharvest would return and the
+/// child would exit 0.
 #[test]
-fn index_batch_held_session_rejects_foreign_kind_leftover() {
+#[cfg(target_os = "linux")]
+fn index_batch_held_session_aborts_on_foreign_kind_leftover() {
     use std::io::Write;
+    const CHILD: &str = "RBITCOIN_BDZ_HELD_LEFTOVER_CHILD";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let dir = PathBuf::from(dir);
+        let keys: Vec<u64> = (0..200u64).map(|i| i * 17 + 3).collect();
+        let ram = BdzMphf::build(&keys).unwrap();
+        let p = dir.join("t.mphf");
+        ram.write_packed_to(&p).unwrap();
+        let fd_mphf = BdzMphf::read_packed_from(&p).unwrap();
+
+        let mut leftover_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dir.join("leftover.bin"))
+            .unwrap();
+        leftover_file.write_all(&[0xAAu8; 8]).unwrap();
+        leftover_file.sync_all().unwrap();
+        let leftover_fd = rbitcoin_store::io_handle::IoHandle::from_file(&leftover_file);
+        // The SQE may outlive this frame; keep the fd and buffer alive.
+        std::mem::forget(leftover_file);
+        let leftover_buf: &'static mut [u8] = Box::leak(vec![0u8; 8].into_boxed_slice());
+
+        let Ok(mut session) = UringSession::try_open_kind(SessionKind::Pool, 32) else {
+            std::process::exit(77);
+        };
+        session.begin_batch().unwrap();
+        let ud = rbitcoin_store::uring_session::pack_ud(
+            rbitcoin_store::uring_session::KIND_BULK_PREAD,
+            session.epoch(),
+            0,
+        );
+        // SAFETY: `leftover_buf` is leaked for the life of the child process.
+        unsafe { session.push_pread(leftover_fd, 0, leftover_buf, ud) }.unwrap();
+        session.submit().unwrap();
+        let mut ctx = IoCtx::held(&mut session);
+        let _ = fd_mphf.index_batch(&keys[..8], &mut ctx);
+        std::process::exit(0);
+    }
     let dir = tmp("held-leftover");
     std::fs::create_dir_all(&dir).unwrap();
-    let keys: Vec<u64> = (0..200u64).map(|i| i * 17 + 3).collect();
-    let ram = BdzMphf::build(&keys).unwrap();
-    let p = dir.join("t.mphf");
-    ram.write_packed_to(&p).unwrap();
-    let fd_mphf = BdzMphf::read_packed_from(&p).unwrap();
-
-    let leftover_path = dir.join("leftover.bin");
-    let mut leftover_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&leftover_path)
-        .unwrap();
-    leftover_file.write_all(&[0xAAu8; 8]).unwrap();
-    leftover_file.sync_all().unwrap();
-    let leftover_fd = rbitcoin_store::io_handle::IoHandle::from_file(&leftover_file);
-
-    let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
-    session.begin_batch().unwrap();
-    let mut leftover_buf = [0u8; 8];
-    let ud = rbitcoin_store::uring_session::pack_ud(
-        rbitcoin_store::uring_session::KIND_BULK_PREAD,
-        session.epoch(),
-        0,
-    );
-    // SAFETY: `leftover_buf` lives until the explicit drain below.
-    unsafe { session.push_pread(leftover_fd, 0, &mut leftover_buf, ud) }.unwrap();
-    session.submit().unwrap();
-    assert!(
-        session.in_flight() > 0,
-        "foreign SQE must still be pending when BDZ starts"
-    );
-
-    with_drain_hard_cap(std::time::Duration::from_millis(200), || {
-        let mut ctx = IoCtx::held(&mut session);
-        let err = fd_mphf.index_batch(&keys[..8], &mut ctx).unwrap_err();
-        assert!(
-            matches!(&err, StoreError::Corrupt(msg) if msg.contains("undrained")),
-            "held index_batch must reject leftover, got {err:?}"
-        );
-        assert!(session.is_poisoned());
-    });
-    // The rejected index_batch never reached stream_g_pages' own drain.
-    // Drain the real pread while the buffer and file are still alive.
-    session
-        .drain_all()
-        .expect("drain the leftover pread before the buffer dies");
-    drop(session);
+    let exe = std::env::current_exe().expect("current_exe");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "tx_head_mphf::index_batch_held_session_aborts_on_foreign_kind_leftover",
+            "--nocapture",
+        ])
+        .env(CHILD, &dir)
+        .env("RBITCOIN_IO", "pool")
+        .output()
+        .expect("child test");
     let _ = std::fs::remove_dir_all(&dir);
+    if out.status.code() == Some(77) {
+        return;
+    }
+    crate::uring_session::assert_child_aborted(
+        &out,
+        "drain hard cap pending=1",
+        "held index_batch with a foreign leftover",
+    );
 }
 
 #[test]

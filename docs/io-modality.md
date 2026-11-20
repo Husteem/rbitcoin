@@ -84,8 +84,8 @@ dirty ring). Head-resolve `create.loc` is **not**
 on the probe ring: one FdOnly batch after identity (standalone bulk; live shorts
 libc-complete; no probe recover credit). `range_batch_ctx` on a still-held
 session keeps poison fail-closed and live-ring libc-complete. Undrained / unexpected /
-wait-timeout **poisons** the session. A drain error with pending ids aborts (the
-debug `with_drain_hard_cap` seam returns `Err`); with no pending it returns
+wait-timeout **poisons** the session. A drain error with pending ids aborts;
+with no pending it returns
 `Err` and the TLS ring is dropped so the next wave opens a new one. `submit_and_wait_one` shares the drain budget (slow-log at
 5 s, poison at the hard cap). Linux wait is Ready only when the CQ has a
 visible event (`io_uring_enter` returns SQEs submitted, not CQE count); an
