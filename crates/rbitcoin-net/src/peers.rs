@@ -906,12 +906,18 @@ impl LivePeer {
         }
     }
 
-    // Startup can publish the endpoints or listener designation during address selection.
+    // Startup can publish the listener designation during address selection.
     fn withhold_self_announcement(&self, hub: &PeerHub, link: SelfAnnounceLink) -> bool {
-        self.inbound
-            && self.net.socket_addr().is_some()
-            && (hub.external_onion().is_some()
-                || (link != SelfAnnounceLink::Tor && hub.onion_bind() == Some(self.addrbind)))
+        if !self.inbound {
+            return false;
+        }
+        let Some(source) = self.net.socket_addr() else {
+            return false;
+        };
+        match hub.onion_bind() {
+            Some(bind) => bind == self.addrbind && link != SelfAnnounceLink::Tor,
+            None => source.ip().to_canonical().is_loopback() && hub.external_onion().is_some(),
+        }
     }
 
     /// The network this link carries, which decides the one local address
@@ -2459,11 +2465,10 @@ impl PeerHub {
     ) -> crate::net_permissions::NetPermissionFlags {
         let table = self.net_perms.lock().unwrap_or_else(|e| e.into_inner());
         let apply_whitelist = !(inbound
-            && (table
-                .onion_bind
-                .map_or_else(|| self.external_onion().is_some(), |onion| bind == onion)
-                || (self.overlay_loopback_forward.load(Ordering::Relaxed)
-                    && addr.ip().to_canonical().is_loopback())));
+            && (table.onion_bind == Some(bind)
+                || (addr.ip().to_canonical().is_loopback()
+                    && (self.overlay_loopback_forward.load(Ordering::Relaxed)
+                        || (table.onion_bind.is_none() && self.external_onion().is_some())))));
         table.flags_for_matched(addr.ip(), inbound, bind, apply_whitelist)
     }
 

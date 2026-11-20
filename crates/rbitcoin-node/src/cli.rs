@@ -426,7 +426,7 @@ Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the sam
   --cjdns-reachable treat fc00::/8 as CJDNS (dial and advertise). --only-net=cjdns requires it.\n\
   --external-ip ENDPOINT takes an IP or Tor v3 onion with an optional port (IPv6 uses [HOST]:PORT).\n\
   Without an explicit port, it uses the P2P listen port (network default for Tor-only listening).\n\
-  An external onion disables source-IP grants and self-announcements on shared inbound TCP.\n\
+  With an external onion and no marked listener, inbound loopback skips source-IP grants and self-announcements.\n\
   --discover-from-peers (default off) announce the IP outbound clearnet peers report reaching us at; needs a non-loopback --listen.\n\
   A clearnet --external-ip wins. Never sent over Tor, I2P or CJDNS. --no-discover turns it off.\n\
   --trusted / --always-relay / --relay are inbound permission knobs.\n\

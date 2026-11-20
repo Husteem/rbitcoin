@@ -243,20 +243,25 @@ addresses when a peer gossips them back, nor the last eight peer-reported
 addresses it announced (each at the listen port only).
 
 With discovery and P2P listening enabled, rbitcoin announces the first
-configured external onion ahead of its built-in onion on eligible outbound
-Tor connections.
+configured external onion ahead of its built-in onion on eligible Tor
+connections, including inbound peers on the marked listener.
 An external address without a port uses the P2P listen port. With Tor-only
 listening, a portless onion uses the network's default P2P port.
-With an external onion configured, rbitcoin sends no own address to inbound
-TCP peers.
 
 Use a dedicated `listen=127.0.0.1:8334=onion` entry as the local target for
 Tor forwarding. `--listen-onion` uses it automatically when present.
 Inbound I2P needs a separate primary P2P listener reachable at `127.0.0.1`.
 Source-IP permission rules skip the marked listener. Ordinary listeners
 keep their normal source-IP rules. If an external onion is configured
-without a marked listener, source-IP rules skip all inbound TCP peers.
+without a marked listener, inbound loopback peers skip source-IP grants
+and self-announcements.
 Explicit bind grants still apply.
+
+On NixOS, append the Tor listener alongside the module-managed P2P listener:
+
+```nix
+services.rbitcoin.extraArgs = [ "--listen" "127.0.0.1:8334=onion" ];
+```
 
 `--tor-control [HOST:PORT]` talks to **system tor** (SAFECOOKIE/COOKIE or password). Omit
 ADDR for `127.0.0.1:9051`. Failed AUTH is a start error. Unset: no control
