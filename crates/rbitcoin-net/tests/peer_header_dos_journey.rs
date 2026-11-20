@@ -1406,6 +1406,83 @@ async fn manual_peer_is_asked_again_after_a_mutated_copy(
     }
 }
 
+/// A signet block whose coinbase has no witness commitment can never satisfy
+/// the challenge: that output is in the block hash. Core's
+/// `CheckSignetBlockSolution` is `BLOCK_CONSENSUS`. Tip follow marks the hash
+/// invalid and does not ask a kept peer again. Witness bytes with no
+/// commitment are still a mutated copy (`unexpected-witness`): the hash does
+/// not commit to them, so the same header can be served without that witness.
+#[tokio::test]
+async fn signet_block_without_a_witness_commitment_is_invalid() {
+    use bitcoin::Witness;
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("signet-no-commit");
+    let mut params = ChainParams::regtest();
+    params.signet_challenge = Some(bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+    let hub = ChainHub::new(q, params, Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let tip = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time.saturating_add(600);
+
+    let mut witnessed = rbitcoin_consensus::mine_empty_regtest(tip, time, 1);
+    let witnessed_hash = witnessed.block_hash();
+    witnessed.txdata[0].input[0].witness = Witness::from_slice(&[[1u8; 3]]);
+    assert_eq!(witnessed.block_hash(), witnessed_hash);
+    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let manual = live_peer_as(&peers, 18496, 90, rbitcoin_net::peers::PeerConnType::Manual);
+    let mut follow = PeerFollowState::new();
+    admit_pending_header(&mut follow.pending_headers, witnessed_hash, witnessed.header);
+    follow.requested_blocks.insert(witnessed_hash);
+    hub.note_asked_block(witnessed_hash);
+    on_block(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(manual.as_ref()),
+        &witnessed,
+    )
+    .await
+    .unwrap();
+    assert!(!manual.stop.load(Ordering::SeqCst), "witness copy: kept");
+    assert!(
+        !hub.is_block_invalid(&witnessed_hash),
+        "witness bytes the hash does not commit to stay downloadable"
+    );
+    assert_eq!(
+        asked_blocks(&mut rx),
+        vec![witnessed_hash],
+        "the kept peer is asked for the real body"
+    );
+    let mut requested = follow.requested_blocks;
+    take_requested_block(&hub, &mut requested, &witnessed_hash);
+
+    let bare = rbitcoin_consensus::mine_empty_regtest(tip, time.saturating_add(1), 1);
+    let hash = bare.block_hash();
+    assert_ne!(hash, witnessed_hash);
+    assert!(bare.txdata[0].input[0].witness.is_empty());
+    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let manual = live_peer_as(&peers, 18497, 91, rbitcoin_net::peers::PeerConnType::Manual);
+    let mut follow = PeerFollowState::new();
+    admit_pending_header(&mut follow.pending_headers, hash, bare.header);
+    follow.requested_blocks.insert(hash);
+    hub.note_asked_block(hash);
+    on_block(&hub, &out_tx, &mut follow, Some(manual.as_ref()), &bare)
+        .await
+        .unwrap();
+    assert!(!manual.stop.load(Ordering::SeqCst), "kept");
+    assert!(
+        hub.is_block_invalid(&hash),
+        "a signet block with no witness commitment is invalid"
+    );
+    assert!(
+        asked_blocks(&mut rx).is_empty(),
+        "the invalid hash is not asked for again"
+    );
+    assert_eq!(hub.tip_hash(), Some(tip));
+    let _ = dir;
+}
+
 /// CVE-2012-2459: two identical transactions keep `check_merkle_root` and are
 /// still not a block. Tip follow disconnects and does not cache the hash.
 async fn duplicate_pair_disconnects(
