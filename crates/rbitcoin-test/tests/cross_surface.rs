@@ -1764,7 +1764,8 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
     // never in the pool.
     send(&loser).await;
     send(&loser_child).await;
-    listings.push(listing().await);
+    let (pooled, prev) = listing().await;
+    listings.push((pooled, prev));
     let block = jsonrpc(
         rpc_addr,
         "generateblock",
@@ -1774,6 +1775,7 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
     assert!(block["result"]["hash"].is_string(), "{block}");
     let (after, s) = listing().await;
     assert!(after.is_empty(), "{after:?}");
+    assert_eq!(s, prev + 2, "the loser and its child out");
     listings.push((after, s));
 
     // A coinbase spend that is mature one block up. Invalidating that
@@ -1785,17 +1787,20 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
     assert_eq!(count["result"], 106, "cbs[6] is the height 7 coinbase");
     send(&young).await;
     send(&young_child).await;
-    listings.push(listing().await);
+    let (pooled, prev) = listing().await;
+    listings.push((pooled, prev));
     let invalidated = jsonrpc(rpc_addr, "invalidateblock", json!([empty_tip])).await;
     assert!(invalidated["error"].is_null(), "{invalidated}");
     let (after, s) = listing().await;
     assert!(after.is_empty(), "{after:?}");
+    assert_eq!(s, prev + 2, "the young spend and its child out");
     listings.push((after, s));
 
     // The pool expires a tx on the next admit an hour after it entered.
     send(&stale).await;
     send(&stale_child).await;
-    listings.push(listing().await);
+    let (pooled, prev) = listing().await;
+    listings.push((pooled, prev));
     let entry = jsonrpc(
         rpc_addr,
         "getmempoolentry",
@@ -1808,10 +1813,12 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
     send(&low).await;
     let (after, s) = listing().await;
     assert_eq!(after, vec![low.compute_txid().to_string()]);
+    assert_eq!(s, prev + 3, "low in, the stale spend and its child out");
     listings.push((after, s));
 
     send(&mid).await;
-    listings.push(listing().await);
+    let (pooled, prev) = listing().await;
+    listings.push((pooled, prev));
     send(&heavy).await;
     let (after, s) = listing().await;
     assert_eq!(
@@ -1824,6 +1831,7 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
             .into_iter()
             .collect(),
     );
+    assert_eq!(s, prev + 2, "heavy in, low out");
     listings.push((after, s));
 
     let (st, body) = http_get(esplora_addr, "/mempool/removed").await;
@@ -1849,6 +1857,10 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
     .into_iter()
     .map(|(tx, reason)| (tx.compute_txid().to_string(), reason))
     .collect();
+    for txid in want.keys() {
+        let n = rows.iter().filter(|r| r["txid"] == txid.as_str()).count();
+        assert_eq!(n, 1, "{txid} has one row: {removed}");
+    }
     let mut seen = std::collections::BTreeSet::new();
     for (i, (first_list, s1)) in listings.iter().enumerate() {
         for (second, s2) in &listings[i..] {
