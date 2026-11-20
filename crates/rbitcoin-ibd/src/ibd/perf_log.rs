@@ -1,25 +1,27 @@
 //! Consolidated IBD performance sampling and logging.
 //!
 //! **Cadence:** one centralized ~5s status tick (see `ibd` main loop) emits
-//! `ibd: progress` and one `ibd: perf` JSON line together. Housekeeping that
-//! is not confirm progress (assign, peer-slow, hygiene, header locator poll)
-//! is wall-clock gated in that same loop — not run on every peer frame.
+//! `ibd: progress`, a compact `ibd: perf` JSON line, and every 30s (or on a
+//! slow phase) a full `ibd: perf_full` JSON line. Housekeeping that is not
+//! confirm progress (assign, peer-slow, hygiene, header locator poll) is
+//! wall-clock gated in that same loop — not run on every peer frame.
 //!
 //! | Level | Message | Contents |
 //! |-------|---------|----------|
 //! | INFO  | `ibd: progress …` | Tip rate over the **last 5s**, `hole=` fetch gap tip→next claim-ready body, loadq=/scriptq/writeq, txs=, horizon, tip ETA, body `bq soft=n/stop RAM=` |
-//! | DEBUG | `ibd: perf {json}` | One timestamped JSON object of [`IbdPerfSample`] (zeros included). `ts` is unix milliseconds. |
+//! | DEBUG | `ibd: perf {json}` | 5s headline object: queues, pace, stage totals, spend window, RSS. Category `ibd`. |
+//! | DEBUG | `ibd: perf_full {json}` | Full [`IbdPerfSample`] (zeros included), every 30s or on a slow phase. Category `ibd`. |
 //!
 //! **Pins:** pipeline-local (plan batch_pin / BatchParents).
 //!
 //! Sample **once** per tick and reset all atomics, then log `ibd: progress`
-//! at INFO and one `ibd: perf` JSON object at DEBUG from the same sample.
+//! at INFO and the scheduled perf line at DEBUG from the same sample.
 //!
 //! Unified path: peer → **body queue** → confirm **lookup** (stamp) → **load**
 //! (pin+assemble) → **scripts** → **write** (sole Class A append + Class C / spends / tip).
 //!
 //! Stage walls (window sums; stages overlap on OS threads):
-//! - **lookup** = lookup-thread TipOnly wave (`plan_ms` / `lookup_thr wave=`
+//! - **lookup** = lookup-thread TipOnly wave (`lookup_ms` / `lookup_thr wave=`
 //!   with nested `decode=` / `precompute=` / `collect=` /
 //!   `head=(probe= io= preads=)` / `loc=`)
 //! - **load=** = pin (`LOAD_NS`) + assemble (`CONNECT_NS`) only — **not** the
@@ -64,6 +66,7 @@ use super::state::WorkStructureSizes;
 use super::status::LoopStats;
 use rbitcoin_log::debug;
 use rbitcoin_query::ProcessOwnedSizes;
+use std::time::{Duration, Instant};
 
 /// Write-stage tokens that must sum to `write=` / [`write_stage_ms`].
 ///
@@ -273,23 +276,12 @@ pub struct IbdPerfSample {
     pub prep_prepare_ms: u64,
     /// filter need + plan batch + tx_fks wiring.
     pub prep_filter_plan_ms: u64,
-    pub connect_ns: u64,
-    pub script_ns: u64,
     /// Ancestor + min-work milestone gate (lookup / assemble).
     pub milestone_gate_ns: u64,
-    pub strong_ns: u64,
-    pub tip_ns: u64,
-    pub structural_spent_ns: u64,
-    pub structural_create_h_ns: u64,
-    pub structural_bip68_ns: u64,
-    pub load_ns: u64,
 
     pub sh_runs: usize,
 
     /// Wire rebuild: store body decode count + wall ms.
-    pub wf_body_store: u64,
-    pub wf_store_body_ms: u64,
-
     pub sh_collect_ms: u64,
     pub sh_sort_ms: u64,
     pub sh_seed_ms: u64,
@@ -349,14 +341,8 @@ pub struct IbdPerfSample {
     pub stamp_filter_ms: u64,
     pub stamp_batch_ms: u64,
     /// plan_batch internals (from ConfirmWindow archive prep).
-    pub stamp_batch_assign_ms: u64,
-    pub stamp_batch_collect_ms: u64,
     /// head_fk + head_dens (legacy total).
-    pub stamp_batch_head_ms: u64,
     /// Pure get_fk_by_txid_batch wall.
-    pub stamp_batch_head_fk_ms: u64,
-    pub stamp_batch_stamp_ms: u64,
-    pub stamp_batch_finish_ms: u64,
     pub thr_load_recv_wait_ms: u64,
     pub thr_load_pack_ms: u64,
     pub thr_load_clone_ms: u64,
@@ -375,12 +361,12 @@ pub struct IbdPerfSample {
     pub thr_script_send_wait_ms: u64,
     pub thr_write_recv_wait_ms: u64,
     pub thr_write_work_ms: u64,
-    pub plan_blks: u64,
-    pub plan_ms: u64,
-    pub plan_collect_ms: u64,
-    pub plan_head_ms: u64,
-    pub plan_cold_io_ms: u64,
     /// Lookup-wave `consensus_decode` (`decode=`).
+    pub lookup_blocks: u64,
+    pub lookup_ms: u64,
+    pub lookup_collect_ms: u64,
+    pub lookup_head_ms: u64,
+    pub lookup_cold_io_ms: u64,
     pub lookup_decode_ms: u64,
     /// Lookup-wave `from_tx_wire` on payload slices (`precompute=`).
     pub lookup_precompute_ms: u64,
@@ -427,9 +413,6 @@ pub struct IbdPerfSample {
     pub arch_prep_inflight_ms: u64,
     pub arch_prep_head_ms: u64,
     pub arch_prep_head_fk_ms: u64,
-    pub arch_prep_probe_ms: u64,
-    pub arch_prep_idx_ms: u64,
-    pub arch_prep_body_txid_ms: u64,
     pub arch_prep_head_keys: u64,
     pub arch_prep_head_cands: u64,
     /// Mean winning cand rank (1 = first probe body peek).
@@ -441,11 +424,7 @@ pub struct IbdPerfSample {
     /// Winner sealed-age CDF % (0/3/7/15/31); `cdf3` ≈ wave1 hit % under ages≤3 policy.
     pub arch_prep_age_cdf0_pct: u64,
     pub arch_prep_age_cdf3_pct: u64,
-    pub arch_prep_age_cdf7_pct: u64,
-    pub arch_prep_age_cdf15_pct: u64,
-    pub arch_prep_age_cdf31_pct: u64,
     /// Winner age hist compact `h0:h1:…:h7+tail`.
-    pub arch_prep_age_hit_compact: String,
     pub arch_prep_age_hit_n: u64,
     pub arch_prep_body_lookups: u64,
     pub arch_prep_stamp_ms: u64,
@@ -466,7 +445,6 @@ pub struct IbdPerfSample {
     pub rss_file_kb: u64,
     pub vm_hwm_kb: u64,
     /// `mlock`ed pages only (usually 0); RSS is **not** limited to these.
-    pub rss_locked_kb: u64,
     /// Work-path + body presence occupancy (O(1) lens).
     pub work: WorkStructureSizes,
     /// Query-side process-owned caches (residency + header plans + SH + tx.head).
@@ -474,8 +452,6 @@ pub struct IbdPerfSample {
     pub owned: ProcessOwnedSizes,
     /// Confirm load/scripts/write queue contents + feed.
     pub conf_pipe: ConfirmPipelineSizes,
-    pub uring_recover_n: u64,
-    pub uring_slow_drain: u64,
     pub lookup_faults: u64,
 }
 
@@ -548,18 +524,8 @@ impl Default for IbdPerfSample {
             prep_header_skip_n: 0,
             prep_prepare_ms: 0,
             prep_filter_plan_ms: 0,
-            connect_ns: 0,
-            script_ns: 0,
             milestone_gate_ns: 0,
-            strong_ns: 0,
-            tip_ns: 0,
-            structural_spent_ns: 0,
-            structural_create_h_ns: 0,
-            structural_bip68_ns: 0,
-            load_ns: 0,
             sh_runs: 0,
-            wf_body_store: 0,
-            wf_store_body_ms: 0,
             sh_collect_ms: 0,
             sh_sort_ms: 0,
             sh_seed_ms: 0,
@@ -605,12 +571,6 @@ impl Default for IbdPerfSample {
             stamp_prepare_ms: 0,
             stamp_filter_ms: 0,
             stamp_batch_ms: 0,
-            stamp_batch_assign_ms: 0,
-            stamp_batch_collect_ms: 0,
-            stamp_batch_head_ms: 0,
-            stamp_batch_head_fk_ms: 0,
-            stamp_batch_stamp_ms: 0,
-            stamp_batch_finish_ms: 0,
             thr_load_recv_wait_ms: 0,
             thr_load_pack_ms: 0,
             thr_load_clone_ms: 0,
@@ -627,11 +587,11 @@ impl Default for IbdPerfSample {
             thr_script_send_wait_ms: 0,
             thr_write_recv_wait_ms: 0,
             thr_write_work_ms: 0,
-            plan_blks: 0,
-            plan_ms: 0,
-            plan_collect_ms: 0,
-            plan_head_ms: 0,
-            plan_cold_io_ms: 0,
+            lookup_blocks: 0,
+            lookup_ms: 0,
+            lookup_collect_ms: 0,
+            lookup_head_ms: 0,
+            lookup_cold_io_ms: 0,
             lookup_decode_ms: 0,
             lookup_precompute_ms: 0,
             lookup_wave_head_ms: 0,
@@ -667,9 +627,6 @@ impl Default for IbdPerfSample {
             arch_prep_inflight_ms: 0,
             arch_prep_head_ms: 0,
             arch_prep_head_fk_ms: 0,
-            arch_prep_probe_ms: 0,
-            arch_prep_idx_ms: 0,
-            arch_prep_body_txid_ms: 0,
             arch_prep_head_keys: 0,
             arch_prep_head_cands: 0,
             arch_prep_hit_rank_avg_x100: 0,
@@ -678,10 +635,6 @@ impl Default for IbdPerfSample {
             arch_prep_pending_hits: 0,
             arch_prep_age_cdf0_pct: 0,
             arch_prep_age_cdf3_pct: 0,
-            arch_prep_age_cdf7_pct: 0,
-            arch_prep_age_cdf15_pct: 0,
-            arch_prep_age_cdf31_pct: 0,
-            arch_prep_age_hit_compact: String::new(),
             arch_prep_age_hit_n: 0,
             arch_prep_body_lookups: 0,
             arch_prep_stamp_ms: 0,
@@ -699,12 +652,9 @@ impl Default for IbdPerfSample {
             rss_anon_kb: 0,
             rss_file_kb: 0,
             vm_hwm_kb: 0,
-            rss_locked_kb: 0,
             work: WorkStructureSizes::default(),
             owned: ProcessOwnedSizes::default(),
             conf_pipe: ConfirmPipelineSizes::default(),
-            uring_recover_n: 0,
-            uring_slow_drain: 0,
             lookup_faults: 0,
         }
     }
@@ -736,18 +686,42 @@ pub struct ProcessRss {
     pub locked_kb: u64,
 }
 
-/// Cheap once-per-tick resident-size read (not hot path).
-///
-/// Reads `/proc/self/status` for the fields modern kernels expose (`VmRSS`,
-/// `VmHWM`, `RssAnon`, `RssFile`), then `smaps_rollup` (`Rss:`, `Anonymous:`,
-/// `Locked:`) to fill a missing split — older rollups do **not** expose
-/// `RssAnon:` / `RssFile:` (that bug made `ibd: sizes` print `anon=0 file=0`).
+/// How often the IBD tick refreshes the deep RSS split.
+pub const RSS_DEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Whether this tick should read `smaps_rollup`, not just `/proc/status`.
+#[derive(Debug, Default)]
+pub struct RssCadence {
+    last_deep: Option<Instant>,
+}
+
+impl RssCadence {
+    pub fn deep_due(&mut self, now: Instant) -> bool {
+        let due = self
+            .last_deep
+            .is_none_or(|last| now.duration_since(last) >= RSS_DEEP_INTERVAL);
+        if due {
+            self.last_deep = Some(now);
+        }
+        due
+    }
+}
+
+/// Fast RSS read: `/proc/self/status` only. The 5s tick uses this.
 #[cfg(target_os = "linux")]
-pub fn read_platform_rss() -> ProcessRss {
+pub fn read_platform_rss_fast() -> ProcessRss {
     let mut out = ProcessRss::default();
     if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
         fill_rss_from_status(&mut out, &s);
     }
+    out
+}
+
+/// Deep RSS read: fast fields plus `smaps_rollup` (`Rss:`, `Anonymous:`,
+/// `Locked:`). Older rollups do not expose `RssAnon:` / `RssFile:`.
+#[cfg(target_os = "linux")]
+pub fn read_platform_rss() -> ProcessRss {
+    let mut out = read_platform_rss_fast();
     if let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") {
         fill_rss_from_smaps_rollup(&mut out, &s);
     }
@@ -773,6 +747,11 @@ pub fn read_platform_rss() -> ProcessRss {
     out
 }
 
+#[cfg(target_os = "macos")]
+pub fn read_platform_rss_fast() -> ProcessRss {
+    read_platform_rss()
+}
+
 /// Cheap once-per-tick resident-size read (not hot path).
 ///
 /// Windows has neither `/proc` nor `proc_pid_rusage`, and the `libc` we depend
@@ -780,6 +759,11 @@ pub fn read_platform_rss() -> ProcessRss {
 /// numbers would need `GetProcessMemoryInfo` (psapi) and a new dependency.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn read_platform_rss() -> ProcessRss {
+    ProcessRss::default()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn read_platform_rss_fast() -> ProcessRss {
     ProcessRss::default()
 }
 
@@ -909,7 +893,6 @@ pub fn sample(
     let class_c_ns = w.class_c_ns;
     let strong_ns = w.strong_ns;
     let sh_ns = w.scripthash_ns;
-    let tip_ns = w.tip_ns;
     let utxo_apply_ns = w.utxo_apply_ns;
     let phase_blks = w.phase_blocks;
     let load_ns = w.load_ns;
@@ -969,8 +952,6 @@ pub fn sample(
     let sh_head = w.sh_head_ns;
     let sh_collect_pin = w.sh_collect_pin;
     let sh_collect_cold = w.sh_collect_cold;
-    let wf_body_store = w.wf_body_store;
-    let wf_store_body_ns = w.wf_body_store_ns;
     let head_res = rbitcoin_store::head_resolve_stats::sample_and_reset();
     IbdPerfSample {
         inflight,
@@ -1070,18 +1051,8 @@ pub fn sample(
         prep_header_skip_n,
         prep_prepare_ms: ns_ms(prep_prepare_ns),
         prep_filter_plan_ms: ns_ms(prep_filter_plan_ns),
-        connect_ns,
-        script_ns,
         milestone_gate_ns,
-        strong_ns,
-        tip_ns,
-        structural_spent_ns,
-        structural_create_h_ns,
-        structural_bip68_ns,
-        load_ns,
         sh_runs,
-        wf_body_store,
-        wf_store_body_ms: ns_ms(wf_store_body_ns),
         sh_collect_ms: ns_ms(sh_collect),
         sh_sort_ms: ns_ms(sh_sort),
         sh_seed_ms: ns_ms(sh_seed),
@@ -1127,12 +1098,6 @@ pub fn sample(
         stamp_prepare_ms: ns_ms(w.stamp_prepare_ns),
         stamp_filter_ms: ns_ms(w.stamp_filter_ns),
         stamp_batch_ms: ns_ms(w.stamp_batch_ns),
-        stamp_batch_assign_ms: ns_ms(w.arch_prep_assign_ns),
-        stamp_batch_collect_ms: ns_ms(w.arch_prep_collect_ns),
-        stamp_batch_head_ms: ns_ms(w.arch_prep_head_ns),
-        stamp_batch_head_fk_ms: ns_ms(w.arch_prep_head_fk_ns),
-        stamp_batch_stamp_ms: ns_ms(w.arch_prep_stamp_ns),
-        stamp_batch_finish_ms: ns_ms(w.arch_prep_finish_ns),
         thr_load_recv_wait_ms: ns_ms(w.thr_load_recv_wait_ns),
         thr_load_pack_ms: ns_ms(w.thr_load_pack_ns),
         thr_load_clone_ms: ns_ms(w.thr_load_clone_ns),
@@ -1149,11 +1114,11 @@ pub fn sample(
         thr_script_send_wait_ms: ns_ms(w.thr_script_send_wait_ns),
         thr_write_recv_wait_ms: ns_ms(w.thr_write_recv_wait_ns),
         thr_write_work_ms: ns_ms(w.thr_write_work_ns),
-        plan_blks: w.lookup_blocks,
-        plan_ms: ns_ms(w.lookup_total_ns),
-        plan_collect_ms: ns_ms(w.lookup_collect_ns),
-        plan_head_ms: ns_ms(w.lookup_head_ns),
-        plan_cold_io_ms: ns_ms(w.lookup_cold_io_ns),
+        lookup_blocks: w.lookup_blocks,
+        lookup_ms: ns_ms(w.lookup_total_ns),
+        lookup_collect_ms: ns_ms(w.lookup_collect_ns),
+        lookup_head_ms: ns_ms(w.lookup_head_ns),
+        lookup_cold_io_ms: ns_ms(w.lookup_cold_io_ns),
         lookup_decode_ms: ns_ms(w.lookup_decode_ns),
         lookup_precompute_ms: ns_ms(w.lookup_precompute_ns),
         lookup_wave_head_ms: ns_ms(w.lookup_wave_head_ns),
@@ -1189,9 +1154,6 @@ pub fn sample(
         arch_prep_inflight_ms: ns_ms(w.arch_prep_inflight_ns),
         arch_prep_head_ms: ns_ms(w.arch_prep_head_ns),
         arch_prep_head_fk_ms: ns_ms(w.arch_prep_head_fk_ns),
-        arch_prep_probe_ms: ns_ms(head_res.probe_ns),
-        arch_prep_idx_ms: ns_ms(head_res.idx_ns),
-        arch_prep_body_txid_ms: ns_ms(head_res.body_ns),
         arch_prep_head_keys: head_res.keys,
         arch_prep_head_cands: head_res.cands,
         arch_prep_hit_rank_avg_x100: hit_rank_avg_x100(head_res.hit_rank_avg()),
@@ -1200,10 +1162,6 @@ pub fn sample(
         arch_prep_pending_hits: head_res.pending_hits,
         arch_prep_age_cdf0_pct: head_res.age_cdf_pct(0),
         arch_prep_age_cdf3_pct: head_res.age_cdf_pct(3),
-        arch_prep_age_cdf7_pct: head_res.age_cdf_pct(7),
-        arch_prep_age_cdf15_pct: head_res.age_cdf_pct(15),
-        arch_prep_age_cdf31_pct: head_res.age_cdf_pct(31),
-        arch_prep_age_hit_compact: head_res.age_hit_compact(),
         arch_prep_age_hit_n: head_res.age_hit_n(),
         arch_prep_body_lookups: head_res.body_lookups,
         arch_prep_stamp_ms: ns_ms(w.arch_prep_stamp_ns),
@@ -1221,12 +1179,9 @@ pub fn sample(
         rss_anon_kb: rss.anon_kb,
         rss_file_kb: rss.file_kb,
         vm_hwm_kb: rss.hwm_kb,
-        rss_locked_kb: rss.locked_kb,
         work,
         owned,
         conf_pipe,
-        uring_recover_n: rbitcoin_store::uring_recover_count(),
-        uring_slow_drain: rbitcoin_store::uring_slow_drain_count(),
         lookup_faults: super::confirm::take_lookup_wave_faults(),
     }
 }
@@ -1336,8 +1291,8 @@ pub fn tip_perf_json(s: &TipPerfLog) -> String {
     v.to_string()
 }
 
-/// `ibd: perf` body. Compact JSON of [`IbdPerfSample`] plus `ts` (unix ms).
-/// Zeros stay so every key is present on every line.
+/// `ibd: perf_full` body. Full JSON of [`IbdPerfSample`] plus `ts` (unix ms).
+/// Zeros stay so every key is present on every full line.
 pub fn perf_sample_json(s: &IbdPerfSample) -> String {
     let mut v = serde_json::to_value(s).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = v.as_object_mut() {
@@ -1349,30 +1304,164 @@ pub fn perf_sample_json(s: &IbdPerfSample) -> String {
     v.to_string()
 }
 
-/// Emit one DEBUG line (`ibd: progress` is a separate INFO tick).
-// Slow-phase warn is a log line. Stuck and rewind do not read it.
-#[cfg_attr(false, mutants::skip)]
-pub fn log_sample(s: &IbdPerfSample) {
-    debug!(Ibd, "perf {}", perf_sample_json(s));
-    if s.phase_blks > 0 {
-        let c_ms = s.write.class_c_ms / s.phase_blks.max(1);
-        let sh_ms = s.write.sh_ms / s.phase_blks.max(1);
-        let load_wall_ms = load_stage_wall_ms(s) / s.phase_blks.max(1);
-        let write_ms = write_stage_ms(s) / s.phase_blks.max(1);
-        if c_ms >= 1000 || sh_ms >= 1000 || load_wall_ms >= 5000 || write_ms >= 5000 {
+/// `ibd: perf` body. The compact 5s line, plus `ts` (unix ms).
+pub fn perf_sample_json_compact(s: &IbdPerfSample) -> String {
+    serde_json::json!({
+        "ts": rbitcoin_consensus::clock::unix_ms(),
+        "dominant": s.dominant,
+        "confirm_blocks": s.confirm_blocks,
+        "confirm_us_per_block": s.confirm_us_per_block,
+        "inflight": s.inflight,
+        "bq_bytes": s.bq_bytes,
+        "bq_count": s.bq_count,
+        "bq_soft_stop": s.bq_soft_stop,
+        "buf_ahead": s.buf_ahead,
+        "hole": s.hole,
+        "peers": s.peers,
+        "headers_done": s.headers_done,
+        "conf_ready": s.conf_ready,
+        "conf_script_q": s.conf_script_q,
+        "conf_write_q": s.conf_write_q,
+        "conf_script_q_hwm": s.conf_script_q_hwm,
+        "conf_write_q_hwm": s.conf_write_q_hwm,
+        "load_ms": s.load_ms,
+        "script_ms": s.script_ms,
+        "write_ms": write_stage_ms(s),
+        "class_c_ms": s.write.class_c_ms,
+        "tip_flush_wait_ms": s.write.tip_flush_wait_ms,
+        "spend": s.spend,
+        "rss_kb": s.rss_kb,
+        "rss_anon_kb": s.rss_anon_kb,
+        "rss_file_kb": s.rss_file_kb,
+        "vm_hwm_kb": s.vm_hwm_kb,
+    })
+    .to_string()
+}
+
+/// Which `ibd: perf` line this tick writes.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerfLineKind {
+    /// 5s headline line.
+    Compact,
+    /// 30s or slow-triggered diagnostic line.
+    Full,
+}
+
+/// What the slow-confirm WARN state wants this tick.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlowPhaseAction {
+    Warn,
+    Recovered { slow_s: u64 },
+}
+
+/// WARN on the first slow tick, then once a minute, and once on recovery.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct SlowPhaseWarn {
+    slow_since: Option<Instant>,
+    last_warn: Option<Instant>,
+}
+
+impl SlowPhaseWarn {
+    pub fn on_tick(&mut self, now: Instant, slow: bool) -> Option<SlowPhaseAction> {
+        if !slow {
+            return self
+                .slow_since
+                .take()
+                .map(|since| SlowPhaseAction::Recovered {
+                    slow_s: now.duration_since(since).as_secs(),
+                });
+        }
+        if self.slow_since.is_none() {
+            self.slow_since = Some(now);
+            self.last_warn = Some(now);
+            return Some(SlowPhaseAction::Warn);
+        }
+        if self
+            .last_warn
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(60))
+        {
+            self.last_warn = Some(now);
+            return Some(SlowPhaseAction::Warn);
+        }
+        None
+    }
+
+    pub fn slow_for_s(&self, now: Instant) -> u64 {
+        self.slow_since
+            .map_or(0, |since| now.duration_since(since).as_secs())
+    }
+}
+
+/// Cadence for the compact and full `ibd: perf` lines.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct PerfLogSchedule {
+    last_full: Option<Instant>,
+    slow: SlowPhaseWarn,
+}
+
+impl PerfLogSchedule {
+    /// Full every [`Self::FULL_INTERVAL`] or whenever the phase is slow.
+    pub const FULL_INTERVAL: Duration = Duration::from_secs(30);
+
+    /// Choose the line for `now`; a caller-supplied clock keeps tests fast.
+    pub fn next_at(&mut self, now: Instant, slow: bool) -> PerfLineKind {
+        let full = slow
+            || self
+                .last_full
+                .is_none_or(|last| now.duration_since(last) >= Self::FULL_INTERVAL);
+        if full {
+            self.last_full = Some(now);
+            PerfLineKind::Full
+        } else {
+            PerfLineKind::Compact
+        }
+    }
+}
+
+/// The existing per-block slow-confirm thresholds.
+pub fn slow_confirm_phase(s: &IbdPerfSample) -> bool {
+    if s.phase_blks == 0 {
+        return false;
+    }
+    let c_ms = s.write.class_c_ms / s.phase_blks;
+    let sh_ms = s.write.sh_ms / s.phase_blks;
+    let load_wall_ms = load_stage_wall_ms(s) / s.phase_blks;
+    let write_ms = write_stage_ms(s) / s.phase_blks;
+    c_ms >= 1000 || sh_ms >= 1000 || load_wall_ms >= 5000 || write_ms >= 5000
+}
+
+/// Emit the scheduled DEBUG line (`ibd: progress` is a separate INFO tick).
+pub fn log_sample(s: &IbdPerfSample, schedule: &mut PerfLogSchedule) {
+    let now = Instant::now();
+    let slow = slow_confirm_phase(s);
+    match schedule.next_at(now, slow) {
+        PerfLineKind::Compact => debug!(Ibd, "ibd: perf {}", perf_sample_json_compact(s)),
+        PerfLineKind::Full => debug!(Ibd, "ibd: perf_full {}", perf_sample_json(s)),
+    }
+    match schedule.slow.on_tick(now, slow) {
+        Some(SlowPhaseAction::Warn) => {
+            let blks = s.phase_blks.max(1);
             rbitcoin_log::warn!(
-                "ibd: slow confirm phase ms/blk load={} script={} write={} class_a={} class_c={} sh={} (sh_collect={}ms window) store_body={}ms blks={}",
-                load_wall_ms,
-                s.script_ms / s.phase_blks.max(1),
-                write_ms,
-                s.write.class_a_ms / s.phase_blks.max(1),
-                c_ms,
-                sh_ms,
+                "ibd: slow confirm phase ms/blk load={} script={} write={} class_a={} class_c={} sh={} (sh_collect={}ms window) blks={} slow_for_s={}",
+                load_stage_wall_ms(s) / blks,
+                s.script_ms / blks,
+                write_stage_ms(s) / blks,
+                s.write.class_a_ms / blks,
+                s.write.class_c_ms / blks,
+                s.write.sh_ms / blks,
                 s.sh_collect_ms,
-                s.wf_store_body_ms,
                 s.phase_blks,
+                schedule.slow.slow_for_s(now),
             );
         }
+        Some(SlowPhaseAction::Recovered { slow_s }) => {
+            rbitcoin_log::info!("ibd: slow confirm phase recovered after {slow_s}s");
+        }
+        None => {}
     }
     let _ = std::io::Write::flush(&mut std::io::stderr());
 }
