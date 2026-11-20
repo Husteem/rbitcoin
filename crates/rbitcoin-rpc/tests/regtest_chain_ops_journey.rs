@@ -951,6 +951,8 @@ fn rpc_regtest_mature_chain_ops() {
     chain_ops_invalidate_and_precious(&ctx, &hub, &mut cbs, &p2wpkh);
     chain_ops_reconsider_most_work(&ctx, &hub, &p2wpkh);
     chain_ops_held_height_and_work(&ctx, &hub, &p2wpkh);
+    chain_ops_ephemeral_anchor(&ctx, &mut cbs);
+    chain_ops_legacy_sighash_budget(&ctx, &mut cbs);
 
     // Two networks cannot be one chain: the same hub behind a mainnet RPC view.
     ctx.network = Network::Mainnet;
@@ -2743,6 +2745,190 @@ fn chain_ops_submitpackage_sigop_vsize(ctx: &RpcContext, cbs: &mut TrueCoinbases
     assert_rpc_vsizes(&row(&parent), &parent, 4_000);
     assert_rpc_vsizes(&row(&child), &child, child.vsize() as u64);
     chain_ops_mine_pool_empty(ctx);
+}
+
+fn v3_spend(parent: &Transaction, vouts: &[u32], value: u64) -> Transaction {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    Transaction {
+        version: TxVersion::non_standard(3),
+        lock_time: LockTime::ZERO,
+        input: vouts
+            .iter()
+            .map(|&vout| TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: true_spk(),
+        }],
+    }
+}
+
+/// Ephemeral dust: a 0-fee version-3 parent may carry one 0-value anchor.
+/// Alone it is a low-fee parent; it enters with a child that spends the
+/// anchor, and a child that leaves the anchor unspent is refused.
+fn chain_ops_ephemeral_anchor(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::TxOut;
+    let h = cbs.take();
+    let cb = generated_coinbase_value(ctx, h);
+    let mut parent = spend_generated_coinbase(ctx, h, cb, true_spk()).1;
+    parent.version = TxVersion::non_standard(3);
+    parent.output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: true_spk(),
+    });
+    let low_fee = "min relay fee not met";
+    let tma = dispatch(ctx, "testmempoolaccept", vec![json!([tx_hex(&parent)])]).unwrap();
+    assert_eq!(tma[0]["allowed"], false, "{tma}");
+    assert_eq!(tma[0]["reject-reason"], low_fee, "{tma}");
+    let e = dispatch(ctx, "sendrawtransaction", vec![json!(tx_hex(&parent))]).unwrap_err();
+    assert_eq!(e["code"], ERR_VERIFY_REJECTED, "{e}");
+    assert_eq!(e["message"], low_fee, "{e}");
+
+    let skips = v3_spend(&parent, &[0], cb - 10_000);
+    let r = dispatch(
+        ctx,
+        "submitpackage",
+        vec![json!([tx_hex(&parent), tx_hex(&skips)])],
+    )
+    .unwrap();
+    assert_eq!(r["package_msg"], "transaction failed", "{r}");
+    assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
+
+    let child = v3_spend(&parent, &[0, 1], cb - 10_000);
+    let r = dispatch(
+        ctx,
+        "submitpackage",
+        vec![json!([tx_hex(&parent), tx_hex(&child)])],
+    )
+    .unwrap();
+    assert_eq!(r["package_msg"], "success", "{r}");
+    assert_eq!(
+        sorted_pool(ctx),
+        {
+            let mut ids = [&parent, &child].map(|t| t.compute_txid().to_string());
+            ids.sort();
+            ids.to_vec()
+        },
+    );
+
+    // A higher-fee replacement child that leaves the anchor unspent.
+    let replace_skips = v3_spend(&parent, &[0], cb - 50_000);
+    let reason = "missing-ephemeral-spends";
+    let tma = dispatch(ctx, "testmempoolaccept", vec![json!([tx_hex(&replace_skips)])]).unwrap();
+    assert_eq!(tma[0]["allowed"], false, "{tma}");
+    assert_eq!(tma[0]["reject-reason"], reason, "{tma}");
+    let e = dispatch(ctx, "sendrawtransaction", vec![json!(tx_hex(&replace_skips))]).unwrap_err();
+    assert_eq!(e["code"], ERR_VERIFY_REJECTED, "{e}");
+    assert_eq!(e["message"], reason, "{e}");
+    chain_ops_mine_pool_empty(ctx);
+}
+
+/// `count` CHECKSIGs, each over a new whole-transaction hash type: the
+/// scriptSig pushes (signature, generator) per check, the scriptPubKey runs
+/// `OP_CHECKSIG OP_DROP` per check, then `OP_TRUE`.
+fn distinct_hash_checksigs(count: usize) -> (ScriptBuf, ScriptBuf) {
+    const PUBKEY: [u8; 33] = [
+        0x02, 0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87,
+        0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16,
+        0xF8, 0x17, 0x98,
+    ];
+    let types: Vec<u8> = (1u8..0x80).filter(|v| !matches!(v & 0x1f, 2 | 3)).collect();
+    let mut script_sig = Vec::new();
+    let mut spk = Vec::new();
+    for &ht in &types[..count] {
+        script_sig.push(9);
+        script_sig.extend_from_slice(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, ht]);
+        script_sig.push(33);
+        script_sig.extend_from_slice(&PUBKEY);
+        spk.extend_from_slice(&[0xac, 0x75]);
+    }
+    spk.push(0x51);
+    (ScriptBuf::from_bytes(script_sig), ScriptBuf::from_bytes(spk))
+}
+
+/// Bytes one whole-transaction legacy preimage of input 0 serializes: the
+/// other scriptSigs blank, `code` in this one, plus the 4-byte hash type.
+fn legacy_preimage_len(tx: &Transaction, code: &ScriptBuf) -> u64 {
+    let mut t = tx.clone();
+    for (i, inp) in t.input.iter_mut().enumerate() {
+        inp.script_sig = if i == 0 { code.clone() } else { ScriptBuf::new() };
+    }
+    bitcoin::consensus::serialize(&t).len() as u64 + 4
+}
+
+/// The legacy sighash budget of an unconfirmed transaction: 5 inputs of 100
+/// distinct hashes each, over a body padded so that the 500 preimages fill
+/// the budget to the byte. One more byte of body is refused.
+fn chain_ops_legacy_sighash_budget(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
+    use bitcoin::{OutPoint, TxIn, TxOut};
+    use rbitcoin_consensus::script::interpreter::MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES as MAX;
+    const INPUTS: u64 = 5;
+    const CHECKS: u64 = 100;
+    let (script_sig, spk) = distinct_hash_checksigs(CHECKS as usize);
+    let h = cbs.take();
+    let cb = generated_coinbase_value(ctx, h);
+    let coin = (cb - 100_000) / INPUTS;
+    let mut fund = spend_generated_coinbase(ctx, h, coin, spk.clone()).1;
+    fund.output = vec![fund.output[0].clone(); INPUTS as usize];
+    dispatch(ctx, "sendrawtransaction", vec![json!(tx_hex(&fund))]).unwrap();
+    chain_ops_mine_pool_empty(ctx);
+
+    let fid = fund.compute_txid();
+    let wide = |pad: usize, change_len: usize| {
+        let mut output = vec![
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: true_spk(),
+            };
+            pad
+        ];
+        output.push(TxOut {
+            value: Amount::from_sat(INPUTS * coin - 200_000 - 1_000 * pad as u64),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; change_len]),
+        });
+        Transaction {
+            input: (0..INPUTS as u32)
+                .map(|vout| TxIn {
+                    previous_output: OutPoint { txid: fid, vout },
+                    script_sig: script_sig.clone(),
+                    ..fund.input[0].clone()
+                })
+                .collect(),
+            output,
+            ..fund.clone()
+        }
+    };
+    // Every hash of the spend serializes the same preimage, so the charge is
+    // INPUTS * CHECKS of it. Pad until it is MAX exactly.
+    let target = MAX / (INPUTS * CHECKS);
+    assert_eq!(target * INPUTS * CHECKS, MAX);
+    let short = target - legacy_preimage_len(&wide(300, 1), &spk);
+    let at_max = wide(300 + short as usize / 10, 1 + short as usize % 10);
+    let over = wide(300 + short as usize / 10, 2 + short as usize % 10);
+    assert_eq!(INPUTS * CHECKS * legacy_preimage_len(&at_max, &spk), MAX);
+    assert!(INPUTS * CHECKS * legacy_preimage_len(&over, &spk) > MAX);
+    assert!(over.weight().to_wu() <= 400_000);
+
+    let tma = dispatch(ctx, "testmempoolaccept", vec![json!([tx_hex(&at_max)])]).unwrap();
+    assert_eq!(tma[0]["allowed"], true, "{tma}");
+    let reason = "legacy sighash work";
+    let tma = dispatch(ctx, "testmempoolaccept", vec![json!([tx_hex(&over)])]).unwrap();
+    assert_eq!(tma[0]["allowed"], false, "{tma}");
+    assert_eq!(tma[0]["reject-reason"], reason, "{tma}");
+    let e = dispatch(ctx, "sendrawtransaction", vec![json!(tx_hex(&over))]).unwrap_err();
+    assert_eq!(e["code"], ERR_VERIFY_REJECTED, "{e}");
+    assert_eq!(e["message"], reason, "{e}");
 }
 
 /// Core `CreateBigSigOpsCluster`: 1 parent + 50 children, legacy cost
