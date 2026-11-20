@@ -7761,5 +7761,12 @@ fn equal_work_sibling_pair_connects_exactly_one_tip() {
     let out_b = hub.accept_received_block(b.clone()).unwrap();
     assert!(matches!(out_b, AcceptOutcome::IgnoredWeaker), "{out_b:?}");
     assert_eq!(hub.tip_hash().unwrap(), a.block_hash());
+    // A child of the winner must connect. A stale loser plan left in
+    // `ConfirmParentCache` at height 1 makes its parent MTP/bits lookup bind
+    // the loser and reject the child.
+    let child = mine(a.block_hash(), t.saturating_add(1), 2);
+    let out_c = hub.accept_received_block(child.clone()).unwrap();
+    assert!(matches!(out_c, AcceptOutcome::Accepted { height: 2 }), "{out_c:?}");
+    assert_eq!(hub.tip_hash().unwrap(), child.block_hash());
     let _ = std::fs::remove_dir_all(dir);
 }

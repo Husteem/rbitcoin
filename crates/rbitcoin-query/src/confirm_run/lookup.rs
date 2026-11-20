@@ -134,8 +134,34 @@ pub fn confirm_wire_lookup_stamp(
     blocks: &[WireBlockIn],
     pipeline: Option<&WireLoadPipeline>,
 ) -> Result<PlanStampOutcome, ConfirmError> {
+    confirm_wire_lookup_stamp_impl(query, params, milestone, blocks, pipeline, true)
+}
+
+/// [`confirm_wire_lookup_stamp`] that does **not** write
+/// `ConfirmParentCache::put_header_plan`. A tip pair stages two candidates at
+/// the same height; neither may leave its plan there.
+#[doc(hidden)]
+pub fn confirm_wire_lookup_stamp_no_plan(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[WireBlockIn],
+    pipeline: Option<&WireLoadPipeline>,
+) -> Result<PlanStampOutcome, ConfirmError> {
+    confirm_wire_lookup_stamp_impl(query, params, milestone, blocks, pipeline, false)
+}
+
+#[doc(hidden)]
+pub fn confirm_wire_lookup_stamp_impl(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[WireBlockIn],
+    pipeline: Option<&WireLoadPipeline>,
+    put_plan: bool,
+) -> Result<PlanStampOutcome, ConfirmError> {
     let scope = super::TrustScope::enter(query);
-    let result = lookup_stamp_work(query, params, milestone, blocks, pipeline);
+    let result = lookup_stamp_work(query, params, milestone, blocks, pipeline, put_plan);
     let warns = scope.finish(
         &super::trust_ids_from_wire(blocks),
         result.as_ref().err(),
@@ -153,11 +179,12 @@ fn lookup_stamp_work(
     milestone: Milestone,
     blocks: &[WireBlockIn],
     pipeline: Option<&WireLoadPipeline>,
+    put_plan: bool,
 ) -> Result<PlanStampOutcome, ConfirmError> {
     let t0 = Instant::now();
     query.on_load_pack().map_err(ConfirmError::from)?;
     let (mut plan, metas, wire_blocks, plan_ns) =
-        wire_lookup_phase(query, params, milestone, blocks, pipeline)?;
+        wire_lookup_phase_impl(query, params, milestone, blocks, pipeline, put_plan)?;
     let ifo = pipeline.map(|p| p.in_flight);
     let (parent_pin, archived_pairs) = match plan.as_mut() {
         Some(p) => (ParentPinStamp::take_from_plan(p), Vec::new()),
@@ -689,6 +716,18 @@ pub fn wire_lookup_phase(
     blocks: &[WireBlockIn],
     pipeline: Option<&WireLoadPipeline>,
 ) -> Result<LookupPhaseOut, ConfirmError> {
+    wire_lookup_phase_impl(query, params, milestone, blocks, pipeline, true)
+}
+
+#[doc(hidden)]
+pub fn wire_lookup_phase_impl(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[WireBlockIn],
+    pipeline: Option<&WireLoadPipeline>,
+    put_plan: bool,
+) -> Result<LookupPhaseOut, ConfirmError> {
     lookup_require_contiguous(blocks)?;
 
     let mut wire_blocks: Vec<Arc<Block>> = Vec::with_capacity(blocks.len());
@@ -777,7 +816,7 @@ pub fn wire_lookup_phase(
     }
 
     let (plan, filter_ns, batch_ns) =
-        lookup_bind_archive_plan(query, pipeline, &mut metas, &wire_blocks)?;
+        lookup_bind_archive_plan(query, pipeline, &mut metas, &wire_blocks, put_plan)?;
     let plan_ns = filter_ns.saturating_add(batch_ns);
     lookup_note_stamp(
         query, struct_ns, header_ns, prepare_ns, filter_ns, batch_ns, plan_ns,
@@ -937,6 +976,7 @@ pub fn lookup_bind_have_body(
     query: &Query,
     metas: &mut [BodyMeta],
     wire_blocks: &[Arc<Block>],
+    put_plan: bool,
 ) -> Result<(), ConfirmError> {
     for (i, m) in metas.iter_mut().enumerate() {
         if let Some(list) = query
@@ -948,13 +988,15 @@ pub fn lookup_bind_have_body(
             m.tx_fks = list;
         }
         let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
-        query.confirm_parent_cache().put_header_plan(
-            m.height.0,
-            m.header_fk,
-            m.header_rec.clone(),
-            m.tx_fks.clone(),
-            prev,
-        );
+        if put_plan {
+            query.confirm_parent_cache().put_header_plan(
+                m.height.0,
+                m.header_fk,
+                m.header_rec.clone(),
+                m.tx_fks.clone(),
+                prev,
+            );
+        }
     }
     Ok(())
 }
@@ -966,6 +1008,7 @@ pub fn lookup_bind_need_body<'a>(
     metas: &'a mut [BodyMeta],
     wire_blocks: &'a [Arc<Block>],
     need_fks: &[rbitcoin_primitives::Fk],
+    put_plan: bool,
 ) -> Result<crate::ArchiveWritePlan, ConfirmError> {
     let mut need = Vec::with_capacity(need_fks.len());
     for fk in need_fks {
@@ -1005,13 +1048,15 @@ pub fn lookup_bind_need_body<'a>(
             }
         }
         let prev = wire_blocks[i].header.prev_blockhash.to_byte_array();
-        query.confirm_parent_cache().put_header_plan(
-            m.height.0,
-            m.header_fk,
-            m.header_rec.clone(),
-            m.tx_fks.clone(),
-            prev,
-        );
+        if put_plan {
+            query.confirm_parent_cache().put_header_plan(
+                m.height.0,
+                m.header_fk,
+                m.header_rec.clone(),
+                m.tx_fks.clone(),
+                prev,
+            );
+        }
     }
     Ok(plan)
 }
@@ -1022,6 +1067,7 @@ pub fn lookup_bind_archive_plan(
     pipeline: Option<&WireLoadPipeline>,
     metas: &mut [BodyMeta],
     wire_blocks: &[Arc<Block>],
+    put_plan: bool,
 ) -> Result<(Option<crate::ArchiveWritePlan>, u64, u64), ConfirmError> {
     let t_filter = Instant::now();
     let header_fks: Vec<rbitcoin_primitives::Fk> = metas.iter().map(|m| m.header_fk).collect();
@@ -1039,7 +1085,7 @@ pub fn lookup_bind_archive_plan(
     let filter_ns = t_filter.elapsed().as_nanos() as u64;
     let t_batch = Instant::now();
     let plan = if need_fks.is_empty() {
-        lookup_bind_have_body(query, metas, wire_blocks)?;
+        lookup_bind_have_body(query, metas, wire_blocks, put_plan)?;
         None
     } else {
         Some(lookup_bind_need_body(
@@ -1048,6 +1094,7 @@ pub fn lookup_bind_archive_plan(
             metas,
             wire_blocks,
             &need_fks,
+            put_plan,
         )?)
     };
     let batch_ns = t_batch.elapsed().as_nanos() as u64;

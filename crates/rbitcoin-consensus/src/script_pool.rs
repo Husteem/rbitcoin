@@ -306,8 +306,8 @@ pub fn publish_waves(waves: &[Arc<Wave>]) {
 
 /// Reorder the published list so the caller's waves come first, in the given
 /// order, at the position of the earliest wave already published. Waves
-/// published by other roles keep their relative position; the tip supervisor
-/// is the only caller.
+/// published by other roles keep their relative position. The tip pair uses
+/// this to put the winner's index wave ahead of the loser's script wave.
 #[doc(hidden)]
 pub fn set_wave_order(order: &[Arc<Wave>]) {
     if order.is_empty() {

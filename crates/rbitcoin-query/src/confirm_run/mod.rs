@@ -374,20 +374,28 @@ fn pair_load(
     block: &WireBlockIn,
     pre: &ScriptPreverified,
 ) -> Result<LoadedBatch, ConfirmError> {
-    let stamped =
-        confirm_wire_lookup_stamp(query, params, milestone, std::slice::from_ref(block), None)?;
+    let stamped = lookup::confirm_wire_lookup_stamp_no_plan(
+        query,
+        params,
+        milestone,
+        std::slice::from_ref(block),
+        None,
+    )?;
     Ok(confirm_wire_load_from_plan(query, params, milestone, stamped, None, pre)?.batch)
 }
 
-/// Finish scripts, publish the deferred index wave ahead of `ahead_of`, and
-/// write. `ahead_of` is the losing script wave: the winner's index work must
-/// not queue behind it.
+/// Finish scripts, publish the deferred index wave ahead of `ahead_of`, clear
+/// the pair's parent-cache slot, and write. `phase` is the hub's script flag:
+/// readers stop skipping the RPC wait once the write starts.
+#[allow(clippy::too_many_arguments)]
 fn pair_write_started(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
+    height: u32,
     inf: Inflight,
     ahead_of: Option<Arc<rbitcoin_consensus::script_pool::Wave>>,
+    phase: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConfirmError> {
     let mut inf = inf.finish_scripts()?;
     inf.start_index()?;
@@ -397,17 +405,40 @@ fn pair_write_started(
         }
     }
     let (ok, _) = inf.finish_index()?;
+    // Neither candidate may be left as this height's parent plan: the store
+    // has the winner after the write, and `assemble_parent_mtp_and_bits`
+    // reads the cache before the store.
+    query.confirm_parent_cache().clear_height(height);
+    if let Some(flag) = phase {
+        flag.store(false, std::sync::atomic::Ordering::Release);
+    }
     confirm_write_phase(query, params, milestone, ok.batch)
 }
 
+fn note_pair_loser(run: &PairRun) {
+    if let Some(e) = &run.loser_error {
+        rbitcoin_log::debug!(
+            "tip pair: {} lost: {e}",
+            bitcoin::BlockHash::from_byte_array(run.loser)
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_pair_loads(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
+    a_in: &WireBlockIn,
+    a_pre: &ScriptPreverified,
+    b_in: &WireBlockIn,
+    b_pre: &ScriptPreverified,
     a: LoadedBatch,
     b: LoadedBatch,
+    phase: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PairRun, ConfirmError> {
     use rbitcoin_consensus::script_pool::{link_pair, set_wave_order, unlink_pair};
+    let height = a.prepared.first().map(|p| p.height.0).unwrap_or(0);
     let a = Inflight::start_deferred_index(a, 0).map_err(|(e, _)| e)?;
     let b = Inflight::start_deferred_index(b, 0).map_err(|(e, _)| e)?;
     let (wa, wb) = (a.script_wave_arc(), b.script_wave_arc());
@@ -435,6 +466,7 @@ fn run_pair_loads(
         }
     }
     let (win, lose, win_idx) = if first == 0 { (a, b, 0) } else { (b, a, 1) };
+    let (lose_in, lose_pre) = if win_idx == 0 { (b_in, b_pre) } else { (a_in, a_pre) };
     let lose_hash = lose
         .batch
         .prepared
@@ -442,42 +474,55 @@ fn run_pair_loads(
         .map(|p| p.hash)
         .unwrap_or([0; 32]);
     let lose_wave = lose.script_wave_arc();
-    match win.finish_scripts() {
-        Ok(win) => match pair_write_started(query, params, milestone, win, lose_wave) {
+    let run = match win.finish_scripts() {
+        Ok(win) => match pair_write_started(query, params, milestone, height, win, lose_wave, phase)
+        {
             Ok(fks) => {
                 lose.cancel_scripts();
-                Ok(PairRun {
+                PairRun {
                     winner: win_idx,
                     fks,
                     loser: lose_hash,
                     loser_error: None,
-                })
+                }
             }
-            Err(e) => match pair_write_started(query, params, milestone, lose, None) {
-                Ok(fks) => Ok(PairRun {
+            Err(e) => {
+                // The winner may have appended Class A. Its plan base moved,
+                // so the loser is re-stamped before its own write.
+                let re = pair_load(query, params, milestone, lose_in, lose_pre)?;
+                let inf = Inflight::start_deferred_index(re, 0).map_err(|(e2, _)| e2)?;
+                match pair_write_started(query, params, milestone, height, inf, None, phase) {
+                    Ok(fks) => PairRun {
+                        winner: 1 - win_idx,
+                        fks,
+                        loser: lose_hash,
+                        loser_error: Some(e),
+                    },
+                    Err(_) => return Err(e),
+                }
+            }
+        },
+        Err(e) => {
+            // No write happened; the loser's load is still at the same base.
+            match pair_write_started(query, params, milestone, height, lose, None, phase) {
+                Ok(fks) => PairRun {
                     winner: 1 - win_idx,
                     fks,
                     loser: lose_hash,
                     loser_error: Some(e),
-                }),
-                Err(_) => Err(e),
-            },
-        },
-        Err(e) => match pair_write_started(query, params, milestone, lose, None) {
-            Ok(fks) => Ok(PairRun {
-                winner: 1 - win_idx,
-                fks,
-                loser: lose_hash,
-                loser_error: Some(e),
-            }),
-            Err(_) => Err(e),
-        },
-    }
+                },
+                Err(_) => return Err(e),
+            }
+        }
+    };
+    note_pair_loser(&run);
+    Ok(run)
 }
 
 /// Lookup, load, script, and write two equal-work candidates. Both script
 /// waves are published together and capped at half the pool while the other
 /// still claims. The first to pass strict scripts and commit is the tip.
+#[allow(clippy::too_many_arguments)]
 pub fn confirm_wire_run_pair_preverified(
     query: &Query,
     params: &ChainParams,
@@ -486,6 +531,7 @@ pub fn confirm_wire_run_pair_preverified(
     a_pre: &ScriptPreverified,
     b: &WireBlockIn,
     b_pre: &ScriptPreverified,
+    phase: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<PairRun, ConfirmError> {
     let trust = confirm_waive(query);
     let guard = trust.then(rbitcoin_consensus::TrustCollect::enter);
@@ -493,28 +539,34 @@ pub fn confirm_wire_run_pair_preverified(
         let la = pair_load(query, params, milestone, a, a_pre);
         let lb = pair_load(query, params, milestone, b, b_pre);
         match (la, lb) {
-            (Ok(x), Ok(y)) => run_pair_loads(query, params, milestone, x, y),
+            (Ok(x), Ok(y)) => {
+                run_pair_loads(query, params, milestone, a, a_pre, b, b_pre, x, y, phase)
+            }
             (Ok(x), Err(e)) => {
+                let height = x.prepared.first().map(|p| p.height.0).unwrap_or(0);
                 let inf = Inflight::start_deferred_index(x, 0).map_err(|(e2, _)| e2)?;
-                let fks = pair_write_started(query, params, milestone, inf, None)?;
-                let loser = b.1.block_hash().to_byte_array();
-                Ok(PairRun {
+                let fks = pair_write_started(query, params, milestone, height, inf, None, phase)?;
+                let run = PairRun {
                     winner: 0,
                     fks,
-                    loser,
+                    loser: b.1.block_hash().to_byte_array(),
                     loser_error: Some(e),
-                })
+                };
+                note_pair_loser(&run);
+                Ok(run)
             }
             (Err(e), Ok(y)) => {
+                let height = y.prepared.first().map(|p| p.height.0).unwrap_or(0);
                 let inf = Inflight::start_deferred_index(y, 0).map_err(|(e2, _)| e2)?;
-                let fks = pair_write_started(query, params, milestone, inf, None)?;
-                let loser = a.1.block_hash().to_byte_array();
-                Ok(PairRun {
+                let fks = pair_write_started(query, params, milestone, height, inf, None, phase)?;
+                let run = PairRun {
                     winner: 1,
                     fks,
-                    loser,
+                    loser: a.1.block_hash().to_byte_array(),
                     loser_error: Some(e),
-                })
+                };
+                note_pair_loser(&run);
+                Ok(run)
             }
             (Err(e), Err(_)) => Err(e),
         }

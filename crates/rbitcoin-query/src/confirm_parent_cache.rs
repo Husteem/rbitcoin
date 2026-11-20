@@ -76,6 +76,15 @@ impl ConfirmParentCache {
         }
     }
 
+    /// Drop the plan at `height`, if any. A tip pair stages two candidates
+    /// at `tip + 1`; neither should be left in the parent cache.
+    pub fn clear_height(&self, height: u32) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(plan) = g.headers.remove(&height) {
+            g.hash_to_height.remove(&plan.header_rec.hash);
+        }
+    }
+
     /// Cache header + tx list for a cache height (tip-GCed; required for multi-block MTP).
     pub fn put_header_plan(
         &self,

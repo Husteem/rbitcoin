@@ -4362,13 +4362,24 @@ impl ChainHub {
         use crate::most_work::{checked_add_work, work_better};
         let child_work = child.header.work();
         let held: Vec<BlockHash> = self.held_bodies.read().unwrap().keys().collect();
-        if held.is_empty() {
+        // A peer can flood `held_bodies` (CAP 320). Each leaf walk is up to
+        // the 288-header window, so bound both: a branch that can beat
+        // `tip + child` must tip above the current tip, and 64 held tips is
+        // more than a real reorg race ever has.
+        if held.is_empty() || held.len() > 64 {
             return None;
         }
+        let tip_h = self.tip_height().unwrap_or(0);
         let restored = HashSet::new();
         let mut best: Option<(bitcoin::Work, Vec<Arc<Block>>)> = None;
         for h in held {
             if h == child.block_hash() {
+                continue;
+            }
+            let Some(hh) = self.stored_header_height(&h) else {
+                continue;
+            };
+            if hh <= tip_h {
                 continue;
             }
             let Some(branch) = self.assemble_side_branch(h, &restored) else {
@@ -4775,6 +4786,7 @@ impl ChainHub {
                                 Arc::clone(p),
                                 pre,
                                 std::sync::Arc::clone(pp),
+                                Some(&self.script_phase),
                             )
                             .map(|r| (r.fks.into_iter().next(), r.winner))
                         }
