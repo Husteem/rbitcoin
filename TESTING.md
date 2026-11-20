@@ -232,7 +232,7 @@ process the test starts, such as the `journey-node` in `asmap_journey`,
 still flushes. A test that needs a real flush belongs in a suite that does
 not call the macro, such as `rbitcoin-store`'s. The `skip-flushes-call` and
 `skip-flushes-macro` ast-grep rules refuse the switch anywhere else. CI's
-`test` job runs each suite's switch test with the flag. The `macos-test`
+`pread` job runs each suite's switch test with the flag. The `macos-test`
 job runs the whole workspace with the flag, but only the five suites above
 skip flushes. The rest, such as electrum, esplora, and store, still flush.
 The workspace `cargo test` step in the required `test` job and
