@@ -135,5 +135,14 @@ echo "overlay-functional: TOR_SOCKS=$OVERLAY_TOR_SOCKS TOR_CONTROL=$OVERLAY_TOR_
 echo "overlay-functional: I2P_SAM=$OVERLAY_I2P_SAM I2P_SAM_B=$OVERLAY_I2P_SAM_B" >&2
 echo "overlay-functional: CJDNS_A=$OVERLAY_CJDNS_A CJDNS_B=$OVERLAY_CJDNS_B" >&2
 
-cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --test-threads=1 "$@"
+if [[ "$#" -gt 0 ]]; then
+  cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --test-threads=1 "$@"
+else
+  skips=()
+  for name in "${LIST_NAMES[@]}"; do
+    cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --exact "$name"
+    skips+=(--skip "$name")
+  done
+  cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --exact "${skips[@]}"
+fi
 echo "overlay-functional: journeys done"

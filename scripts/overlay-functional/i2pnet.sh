@@ -185,11 +185,44 @@ cat >"$ROOT/restart-b.sh" <<RESTART
 #!/usr/bin/env bash
 set -euo pipefail
 dir="$ROOT/n1"
-pid="\$(cat "\$dir/i2pd.pid")"
-kill "\$pid"
-for _ in \$(seq 1 100); do kill -0 "\$pid" 2>/dev/null || break; sleep 0.2; done
-kill -9 "\$pid" 2>/dev/null || true
+old="\$(cat "\$dir/i2pd.pid")"
+kill "\$old"
+for _ in \$(seq 1 100); do kill -0 "\$old" 2>/dev/null || break; sleep 0.2; done
+kill -9 "\$old" 2>/dev/null || true
+for _ in \$(seq 1 50); do kill -0 "\$old" 2>/dev/null || break; sleep 0.2; done
+if kill -0 "\$old" 2>/dev/null; then
+  echo "i2pd n1 \$old still alive after kill -9" >&2
+  exit 1
+fi
+python3 - ${SAMS[1]} <<'PY'
+import socket, sys, time
+port = int(sys.argv[1])
+end = time.time() + 10
+while time.time() < end:
+    s = socket.socket()
+    s.settimeout(0.2)
+    if s.connect_ex(("127.0.0.1", port)) != 0:
+        s.close()
+        sys.exit(0)
+    s.close()
+    time.sleep(0.2)
+print(f"SAM {port} still accepting after i2pd n1 stopped", file=sys.stderr)
+sys.exit(1)
+PY
 i2pd --datadir "\$dir" --conf "\$dir/i2pd.conf" --address4 127.0.0.3 --reseed.zipfile "$ROOT/reseed.zip" --daemon
+new=""
+for _ in \$(seq 1 50); do
+  new="\$(cat "\$dir/i2pd.pid" 2>/dev/null || true)"
+  if [[ -n "\$new" && "\$new" != "\$old" ]] && kill -0 "\$new" 2>/dev/null; then
+    break
+  fi
+  new=""
+  sleep 0.2
+done
+if [[ -z "\$new" ]]; then
+  echo "i2pd n1 did not come back with a new pid" >&2
+  exit 1
+fi
 python3 - ${SAMS[1]} <<'PY'
 import socket, sys, time
 port = int(sys.argv[1])

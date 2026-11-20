@@ -442,8 +442,6 @@ async fn cjdns_listener_works_after_cjdroute_restarts() {
     let b = spawn_node(cfg_b, b_rpc).await;
     generate_n(b_rpc, 3).await;
 
-    restart_daemon(&env.cjdns_restart_b).await;
-
     write_rpc_token(a_dir.path());
     let mut cfg_a = base_node(a_dir.path());
     cfg_a.listen.p2p = P2pListen::Socket(a_p2p);
@@ -460,8 +458,46 @@ async fn cjdns_listener_works_after_cjdroute_restarts() {
         |v| v["result"] == 3,
     )
     .await;
-    wait_peer_network(a_rpc, "cjdns", false, Duration::from_secs(20)).await;
-    wait_peer_network(b_rpc, "cjdns", true, Duration::from_secs(20)).await;
+    let before = wait_peer_network(b_rpc, "cjdns", true, Duration::from_secs(20)).await;
+    let before_ids: Vec<u64> = before["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["inbound"] == true)
+        .filter_map(|p| p["id"].as_u64())
+        .collect();
+
+    restart_daemon(&env.cjdns_restart_b).await;
+
+    let peers = jsonrpc(a_rpc, "getpeerinfo", json!([])).await;
+    for p in peers["result"].as_array().unwrap() {
+        jsonrpc(a_rpc, "disconnectnode", json!(["", p["id"]])).await;
+    }
+    generate_n(b_rpc, 2).await;
+    wait_jsonrpc(
+        a_rpc,
+        "getblockcount",
+        json!([]),
+        Duration::from_secs(90),
+        |v| v["result"] == 5,
+    )
+    .await;
+    wait_jsonrpc(
+        b_rpc,
+        "getpeerinfo",
+        json!([]),
+        Duration::from_secs(30),
+        |v| {
+            v["result"].as_array().is_some_and(|rows| {
+                rows.iter().any(|p| {
+                    p["inbound"] == true
+                        && p["network"] == "cjdns"
+                        && p["id"].as_u64().is_some_and(|id| !before_ids.contains(&id))
+                })
+            })
+        },
+    )
+    .await;
 
     a.stop().await;
     b.stop().await;
