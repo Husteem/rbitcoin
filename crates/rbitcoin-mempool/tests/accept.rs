@@ -1642,7 +1642,7 @@ fn remove_live_txids_deaths_survive_reopen() {
 }
 
 #[test]
-fn remove_block_txids_strips_only_the_confirmed() {
+fn remove_block_txids_confirmed_stay_gone_after_reopen() {
     let dir = tmp_dir();
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
     let mut map = HashMap::new();
@@ -1667,6 +1667,13 @@ fn remove_block_txids_strips_only_the_confirmed() {
     assert_eq!(n, 2);
     assert!(conflicts.is_empty());
     assert_eq!(mp.live_count(), 4);
+    drop(mp);
+    let mp = ActiveMempool::open_or_create(&dir).unwrap();
+    assert_eq!(
+        mp.live_count(),
+        4,
+        "a mined tx must not come back after a restart"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
