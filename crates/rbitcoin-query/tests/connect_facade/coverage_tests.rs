@@ -88,25 +88,6 @@ fn verify_tx_scripts_detached_forks_op_true_and_op_return() {
 }
 
 #[test]
-fn regtest_connect_archive_and_confirm_path() {
-    let (path, q) = temp_store();
-    let params = ChainParams::regtest();
-    let ms = Milestone::height(1_000_000);
-    let genesis = genesis_block(&params);
-    let gen_fk = accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
-
-    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
-    // prepare helpers stay (CPU-side); confirm is sole Class A.
-    let (_hr, _txs) = prepare_block_for_archive(&q, &params, &b1).unwrap();
-    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
-    // already-have prepare after connect keeps the parent fk
-    let (hr, _) = prepare_block_for_archive(&q, &params, &b1).unwrap();
-    assert_eq!(hr.prev_fk, gen_fk);
-
-    let _ = std::fs::remove_dir_all(&path);
-}
-
-#[test]
 fn assemble_second_block_rejects_stale_nversion() {
     let (path, q) = temp_store();
     let params = ChainParams::regtest();

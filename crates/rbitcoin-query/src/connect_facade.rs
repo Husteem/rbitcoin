@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use crate::confirm_run;
 use crate::connect::ConfirmPrepared;
-use crate::convert::{block_to_apply, block_to_apply_with_txids_prev, header_to_record};
-use crate::{Query, TxApply, TxPrecompute, WirePlanNeed};
+use crate::convert::header_to_record;
+use crate::{Query, TxPrecompute, WirePlanNeed};
 use rbitcoin_store::StoreError;
 
 /// Confirm a contiguous tip-extension run of wire blocks (sync all stages).
@@ -207,30 +207,4 @@ pub fn commit_class_a_run(
         .archive_class_a_from_wire(&refs)
         .map_err(ConfirmError::from)?;
     Ok(())
-}
-
-/// CPU-side prep for Class A archive.
-pub fn prepare_block_for_archive(
-    query: &Query,
-    params: &ChainParams,
-    block: &Block,
-) -> Result<(HeaderRecord, Vec<TxApply>), ConfirmError> {
-    let hash = block.block_hash().to_byte_array();
-    if query.is_block_archived(&hash).map_err(ConfirmError::from)? {
-        // Standalone archive helper (not confirm pipeline): one hash pass here.
-        return block_to_apply(query, &block.header, &block.txdata);
-    }
-    prepare_block_for_archive_new(query, params, block)
-}
-
-#[doc(hidden)]
-pub fn prepare_block_for_archive_new(
-    query: &Query,
-    params: &ChainParams,
-    block: &Block,
-) -> Result<(HeaderRecord, Vec<TxApply>), ConfirmError> {
-    let (header, txids) = class_a_header_and_txids(query, params, block)?;
-    let (_, txs) =
-        block_to_apply_with_txids_prev(header.prev_fk, &block.header, &block.txdata, &txids)?;
-    Ok((header, txs))
 }

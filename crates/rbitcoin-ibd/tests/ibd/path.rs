@@ -4,7 +4,6 @@ use rbitcoin_ibd::ibd::state::IbdWorkState;
 
 use rbitcoin_ibd::ibd::path::work_path_tips;
 
-use rbitcoin_query::testutil::FixtureChain;
 fn h(n: u8) -> BlockHash {
     let mut b = [0u8; 32];
     b[0] = n;
@@ -337,7 +336,7 @@ fn seed_work_path_archives_ahead_of_tip() {
         Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
     };
     use rbitcoin_ibd::ibd::path::seed_work_path_from_store;
-    use rbitcoin_query::prepare_block_for_archive;
+    use rbitcoin_query::commit_class_a_block;
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("path-seed-arch");
     hub.ensure_genesis().unwrap();
@@ -399,8 +398,14 @@ fn seed_work_path_archives_ahead_of_tip() {
     for h in 1u32..=2 {
         let b = mine(tip, time + h * 600, h);
         hub.ensure_header(&b.header).unwrap();
-        let (rec, txs) = prepare_block_for_archive(&hub.query, &hub.params, &b).unwrap();
-        hub.query.commit_class_a_only(&rec, &txs).unwrap();
+        commit_class_a_block(
+            &hub.query,
+            &hub.params,
+            rbitcoin_primitives::Height(h),
+            &b,
+            hub.milestone,
+        )
+        .unwrap();
         tip = b.block_hash();
     }
     let b3 = mine(tip, time + 3 * 600, 3);
