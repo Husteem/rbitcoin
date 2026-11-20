@@ -4377,7 +4377,14 @@ pub fn note_header_witness(
 /// headers proved while that tip is still under the floor.
 #[doc(hidden)]
 pub fn rewind_depth_cap(st: &IbdWorkState, hub: &ChainHub) -> u32 {
-    if st.header_walk.origin && leaving_unproved_lead(st, hub) {
+    rewind_depth_cap_of(st.header_walk.origin, st.header_walk.proven, hub)
+}
+
+/// [`rewind_depth_cap`] from the walk's `origin` and `proven`, so the
+/// chain-work read can run after the caller drops `shared`.
+#[doc(hidden)]
+pub fn rewind_depth_cap_of(origin: bool, proven: bool, hub: &ChainHub) -> u32 {
+    if origin && leaving_unproved_lead(proven, hub) {
         UNPROVEN_LEAD_BLOCKS
     } else {
         super::reorg::REWIND_MAX_DEPTH
@@ -4387,10 +4394,10 @@ pub fn rewind_depth_cap(st: &IbdWorkState, hub: &ChainHub) -> u32 {
 /// True while a rewind would leave the unproved lead. The confirmed chain's
 /// own work decides, including when a refused clock has cleared `proven`.
 /// If that work cannot be read, an unproved walk stays wide.
-fn leaving_unproved_lead(st: &IbdWorkState, hub: &ChainHub) -> bool {
+fn leaving_unproved_lead(proven: bool, hub: &ChainHub) -> bool {
     match hub.chain_work() {
         Ok(work) => below_floor(hub, &work.to_be_bytes()),
-        Err(_) => !st.header_walk.proven,
+        Err(_) => !proven,
     }
 }
 
