@@ -879,6 +879,187 @@ async fn getheaders_keeps_a_newer_offer() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// An empty getheaders reply to a locator that names none of our blocks
+/// marks nothing, so the tip announcement still goes out. Below minimum
+/// chain work every reply is empty and, as in Core, marks nothing.
+#[tokio::test]
+async fn getheaders_empty_reply_without_a_peer_block_marks_nothing() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("gh-empty-mark");
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().unwrap();
+    let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+    hub.mine(1, script, vec![]).unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let register = |port: u16, nonce: u64| {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let ver = VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&addr, ServiceFlags::NONE),
+            nonce,
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        peers.register(
+            addr,
+            addr,
+            &ver,
+            true,
+            rbitcoin_net::peers::PeerConnType::Inbound,
+        )
+    };
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+
+    let session = register(18482, 82);
+    let mut follow = PeerFollowState::new();
+    follow.wants_headers = true;
+    let unknown = BlockHash::from_byte_array([0x22; 32]);
+    on_getheaders(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&session),
+        &GetHeadersMessage::new(vec![], unknown),
+    )
+    .await
+    .unwrap();
+    let NetworkMessage::Headers(sent) = out_rx.try_recv().unwrap().expect_msg() else {
+        panic!("getheaders should answer with headers");
+    };
+    assert!(sent.is_empty(), "an unknown stop hash has no header");
+    assert_eq!(
+        session.header_marks().0,
+        None,
+        "an empty reply to a locator that names no block marks nothing"
+    );
+    let ev = Ok(rbitcoin_net::chain::TipEvent {
+        height: hub.tip_height().unwrap(),
+        hash: tip,
+        header: hub.tip_header().unwrap(),
+        reorg_branch_len: 0,
+    });
+    on_tip_event(&hub, &out_tx, &mut follow, Some(&session), ev)
+        .await
+        .unwrap();
+    let NetworkMessage::Headers(announced) = out_rx.try_recv().unwrap().expect_msg() else {
+        panic!("the tip should be announced with headers");
+    };
+    assert_eq!(announced.last().map(|h| h.block_hash()), Some(tip));
+
+    hub.set_minimum_chain_work(Some([0xff; 32]));
+    let behind = register(18484, 84);
+    on_getheaders(
+        &hub,
+        &out_tx,
+        &mut PeerFollowState::new(),
+        Some(&behind),
+        &GetHeadersMessage::new(vec![genesis], BlockHash::all_zeros()),
+    )
+    .await
+    .unwrap();
+    let NetworkMessage::Headers(sent) = out_rx.try_recv().unwrap().expect_msg() else {
+        panic!("getheaders should answer with headers");
+    };
+    assert!(
+        sent.is_empty(),
+        "below minimum chain work the reply is empty"
+    );
+    assert_eq!(
+        behind.header_marks().0,
+        None,
+        "an empty reply below minimum chain work marks nothing"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A block that connects while an empty getheaders reply is built is still
+/// announced. The reply marks the locator block the walk met, not the newer
+/// tip.
+#[tokio::test]
+async fn getheaders_announces_a_block_connected_during_the_reply() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("gh-connect-during");
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+    hub.mine(1, script, vec![]).unwrap();
+    let walked = hub.tip_hash().unwrap();
+    let walked_header = hub.tip_header().unwrap();
+    // The child is in the cache only. `tip_hash()` reads it, and the store
+    // walk still ends at `walked`: the state a connect during the walk leaves.
+    let child_height = hub.tip_height().unwrap() + 1;
+    let child = rbitcoin_consensus::mine_empty_regtest(
+        walked,
+        walked_header.time.saturating_add(1),
+        child_height,
+    );
+    let child_header = child.header;
+    let child_hash = child.block_hash();
+    hub.cache.push_best(child_height, child);
+    assert_eq!(hub.tip_hash(), Some(child_hash));
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18486);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 86,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let session = peers.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow.wants_headers = true;
+
+    on_getheaders(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&session),
+        &GetHeadersMessage::new(vec![walked], BlockHash::all_zeros()),
+    )
+    .await
+    .unwrap();
+    let NetworkMessage::Headers(sent) = out_rx.try_recv().unwrap().expect_msg() else {
+        panic!("getheaders should answer with headers");
+    };
+    assert!(sent.is_empty(), "the store walk ends at the locator");
+    assert_eq!(
+        session.header_marks().0,
+        Some(walked),
+        "the reply marks the block the walk met"
+    );
+
+    let ev = Ok(rbitcoin_net::chain::TipEvent {
+        height: child_height,
+        hash: child_hash,
+        header: child_header,
+        reorg_branch_len: 0,
+    });
+    on_tip_event(&hub, &out_tx, &mut follow, Some(&session), ev)
+        .await
+        .unwrap();
+    let NetworkMessage::Headers(announced) = out_rx.try_recv().unwrap().expect_msg() else {
+        panic!("the block that connected during the reply should be announced");
+    };
+    assert_eq!(announced.last().map(|h| h.block_hash()), Some(child_hash));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 async fn count_block_invs(
     reader: &mut rbitcoin_net::v2::V2Reader,
     magic: Magic,
