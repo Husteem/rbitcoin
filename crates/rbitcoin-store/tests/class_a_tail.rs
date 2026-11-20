@@ -1,7 +1,7 @@
 //! A synced Class A tail block torn to zeroes on the next append.
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::store::Store;
-use rbitcoin_store::tx_table::{InputRecord, OutputRecord, TxRecord};
+use rbitcoin_store::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -546,8 +546,8 @@ fn zeroed_cold_seqsigwit_page0_restores_from_the_hot_guard() {
     let _ = std::fs::remove_dir_all(&hot);
 }
 
-/// A store written before `tear_guard` can have a published tail of zeros:
-/// a coinbase edge packs as eight zero bytes, and an unstamped txstat cell is
+/// A store written before `tear_guard` can have a published tail of zeros.
+/// A coinbase edge packs as eight zero bytes, and an unstamped txstat cell is
 /// zeros. Open must keep those bytes when no slot exists yet.
 #[test]
 fn open_without_guard_keeps_a_zero_coinbase_tail() {
@@ -570,6 +570,83 @@ fn open_without_guard_keeps_a_zero_coinbase_tail() {
         Some(vec![rbitcoin_store::input::InputEdge::coinbase()])
     );
     assert_eq!(s.txstat_row(Fk(n)).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An empty seqsigwit is an 8-byte zero pad so loc strides stay monotone.
+/// With no tail slot yet, that tail is the data.
+#[test]
+fn open_without_guard_keeps_a_zero_empty_seqsigwit_tail() {
+    let dir = tmp();
+    let n = 520u64;
+    {
+        let t = TxTable::create_tiny(&dir).unwrap();
+        let batch: Vec<_> = (1..=n)
+            .map(|i| {
+                let mut txid = [0u8; 32];
+                txid[0] = i as u8;
+                txid[1] = (i >> 8) as u8;
+                (
+                    TxRecord {
+                        txid,
+                        version: 1,
+                        locktime: 0,
+                        input_count: 0,
+                        output_count: 1,
+                    },
+                    Vec::new(),
+                    vec![OutputRecord::unspent(0, vec![0x51])],
+                )
+            })
+            .collect();
+        t.put_full_batch_indexed(&batch, false).unwrap();
+        t.flush().unwrap();
+        assert!(logical_of(&dir.join("seqsigwit.body")) > 4096);
+    }
+    let _ = std::fs::remove_dir_all(dir.join("tear_guard"));
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), n);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Unspent slots are zero bytes. A pre-schema-30 `spent.body` is filled out
+/// to its published end, so the last page is those zeros. With no tail slot
+/// yet, open keeps them.
+#[test]
+fn open_without_guard_keeps_a_zero_unspent_spent_tail() {
+    let dir = tmp();
+    let n_out = 600u32;
+    {
+        let t = TxTable::create_tiny(&dir).unwrap();
+        t.put_full_batch_indexed(
+            &[(
+                TxRecord {
+                    txid: [0x11; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: n_out,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+                vec![OutputRecord::unspent(1, vec![0x51]); n_out as usize],
+            )],
+            false,
+        )
+        .unwrap();
+        let end = t.spent.body_published_len();
+        assert!(end > 4096);
+        drop(t);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("spent.body"))
+            .unwrap();
+        if file.metadata().unwrap().len() < end {
+            file.set_len(end).unwrap();
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir.join("tear_guard"));
+    let t = TxTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.count(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

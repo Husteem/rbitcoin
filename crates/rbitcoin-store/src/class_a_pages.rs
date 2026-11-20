@@ -631,10 +631,14 @@ fn restore_tail_block(
     Ok(true)
 }
 
-/// A coinbase edge and an unstamped txstat cell are zero bytes. With no tail
-/// slot yet, that prefix is the data, not a tear.
+/// A coinbase edge, an unstamped txstat cell, an empty seqsigwit pad, and an
+/// unspent slot are zero bytes. With no tail slot yet, that prefix is the
+/// data, not a tear.
 fn zero_tail_is_record(name: &str) -> bool {
-    name == "input.body" || name.starts_with("txstat.")
+    name == "input.body"
+        || name == "seqsigwit.body"
+        || name == "spent.body"
+        || name.starts_with("txstat.")
 }
 
 fn refuse_zero_prefix(
@@ -648,8 +652,9 @@ fn refuse_zero_prefix(
     if published == 0 || file_len == 0 {
         return Ok(());
     }
-    // A synced image may itself be zeros (unstamped txstat cells). Stop only
-    // when a zeroed prefix had no usable image to put back.
+    // A synced image may itself be zeros (unstamped txstat cells, an empty
+    // seqsigwit pad, an unspent slot). Stop only when a zeroed prefix had
+    // no usable image to put back.
     if flags.page0_unrestored {
         let page_n = (file_len as usize).min(PAGE).min(published as usize);
         if page_n > 0 {
