@@ -174,10 +174,10 @@ block the prepare disconnected to, so a header-thread rewind that already
 moved the tip is left in place. `tip_height`, `has_block`, and
 `block_queue_*` under the lock are RAM. The header thread still reads
 the store (`load_origin`, resume) with the lock dropped around that IO.
-`coord_shared_lock_skips_header_and_store_io`,
-`off_path_split_settles_outside_the_coord_lock`,
-`unplanted_walk_reads_headers_outside_the_coord_lock`, and
-`stale_heavier_rewind_does_not_commit_after_the_tip_moves` are the pins.
+`stale_heavier_rewind_does_not_commit_after_the_tip_moves` pins the
+commit rule. Which reads run with the lock down is lock-hold cost, so
+operator-host A/B checks it, not a test meter
+([`TESTING.md`](../TESTING.md)).
 
 **Deferred.** Headers decode and classify are still two blocking joins.
 `decode_framed_offload` drops its permit inside the decode job.

@@ -187,8 +187,6 @@ pub fn header_hashes_to_best_ancestor_n(
     walk_max: usize,
 ) -> Result<Vec<BlockHash>, NetError> {
     use bitcoin::hashes::Hash as _;
-    #[cfg(debug_assertions)]
-    LONGEST_WALK.with(|c| c.set(c.get().max(walk_max)));
     let mut rev = Vec::new();
     let mut cur = tip;
     for _ in 0..walk_max {
@@ -216,40 +214,7 @@ pub fn header_hashes_to_best_ancestor_n(
     Ok(rev)
 }
 
-thread_local! {
-    static PARENT_HASH_OF_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(debug_assertions)]
-thread_local! {
-    static LONGEST_WALK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Forget the longest prev-walk bound this thread has used.
-#[cfg(debug_assertions)]
-pub fn reset_longest_walk() {
-    LONGEST_WALK.with(|c| c.set(0));
-}
-
-/// Longest prev-walk bound this thread has used since the last reset.
-#[cfg(debug_assertions)]
-pub fn longest_walk() -> usize {
-    LONGEST_WALK.with(|c| c.get())
-}
-
-#[cfg(debug_assertions)]
-pub fn reset_parent_hash_of_count() {
-    PARENT_HASH_OF_N.with(|c| c.set(0));
-}
-
-#[cfg(debug_assertions)]
-pub fn parent_hash_of_count() -> u64 {
-    PARENT_HASH_OF_N.with(|c| c.get())
-}
-
 pub fn parent_hash_of(hub: &ChainHub, hash: BlockHash) -> Result<Option<BlockHash>, NetError> {
-    #[cfg(debug_assertions)]
-    PARENT_HASH_OF_N.with(|c| c.set(c.get().saturating_add(1)));
     let Some((_, rec)) = hub
         .query
         .get_header_by_hash(&hash.to_byte_array())

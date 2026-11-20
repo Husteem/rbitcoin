@@ -16,13 +16,11 @@ pub fn spawn_header_thread(
     shared: Arc<Mutex<IbdWorkState>>,
     hub: Arc<ChainHub>,
     mut rx: Receiver<HeaderCmd>,
-    probe: rbitcoin_store::HeaderThreadProbe,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name(IBD_HEADER_THREAD_NAME.into())
         .spawn(move || {
             rbitcoin_log::info!("ibd: header thread started");
-            probe.bind_header_thread();
             while let Some(cmd) = rx.blocking_recv() {
                 match cmd {
                     HeaderCmd::Report => {}

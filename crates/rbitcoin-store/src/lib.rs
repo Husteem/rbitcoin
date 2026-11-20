@@ -141,10 +141,7 @@ pub use address_head::{is_probe_exhausted_error, is_store_corrupt_display};
 pub use block_filter::{BlockFilterRecord, BlockFilterSlot, BlockFilterTable, StoredBlockFilter};
 pub use block_queue::{BlockQueue, QueuedBlockMeta, TakenRaw};
 pub use block_wire::block_wire_input_count;
-pub use coord_io::{
-    coord_lock_store_reads, coord_shared_lock_held, header_thread_store_reads, note_store_read,
-    CoordSharedLock, HeaderThreadProbe,
-};
+pub use coord_io::{coord_shared_lock_held, CoordSharedLock};
 pub use create_loc::CreateLocPair;
 pub use error::StoreError;
 pub use file::ensure_nofile_budget;

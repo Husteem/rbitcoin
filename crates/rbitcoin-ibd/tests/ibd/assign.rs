@@ -271,11 +271,10 @@ pub(crate) fn tmp_hub() -> (rbitcoin_query::testutil::TempDir, ChainHub) {
     rbitcoin_net::chain::tiny_regtest_hub_labeled("assign")
 }
 
-/// A split that has left the path reads the confirmed header. That read
-/// must not run while the coordinator flag is set, or the header thread
-/// blocks on `shared` for a store pread.
+/// A peer whose split height has left the path settles against the
+/// confirmed header there. A different confirmed block leaves it off the path.
 #[test]
-fn off_path_split_settles_outside_the_coord_lock() {
+fn off_path_split_settles_against_the_confirmed_header() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let genesis = hub.tip_hash().unwrap();
@@ -299,15 +298,7 @@ fn off_path_split_settles_outside_the_coord_lock() {
         "the foreign genesis split has left the path"
     );
     let shared = std::sync::Mutex::new(st);
-    let _probe = rbitcoin_store::HeaderThreadProbe::arm();
-    rbitcoin_query::reset_header_lookups_under_coord_lock();
     rbitcoin_ibd::ibd::settle_off_path_for_test(&shared, &hub);
-    assert_eq!(
-        rbitcoin_query::header_lookups_under_coord_lock(),
-        0,
-        "that read ran while the coordinator lock was down"
-    );
-    assert_eq!(rbitcoin_store::coord_lock_store_reads(), 0);
     let st = shared.lock().unwrap_or_else(|err| err.into_inner());
     assert!(
         st.slots[0].chain.left_path_by(&HashMap::new(), 0),
@@ -317,10 +308,9 @@ fn off_path_split_settles_outside_the_coord_lock() {
 }
 
 /// Headers are stored and the walk tip is ahead, but tip+1 is not planted.
-/// Assign used to walk those headers while `shared` was held. A linear
-/// extension is not a rewind; the read still has to happen with the lock down.
+/// A linear extension is not a rewind, and the candidate stays unplanted.
 #[test]
-fn unplanted_walk_reads_headers_outside_the_coord_lock() {
+fn unplanted_linear_walk_is_not_a_rewind() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let genesis = hub.tip_hash().unwrap();
@@ -333,15 +323,7 @@ fn unplanted_walk_reads_headers_outside_the_coord_lock() {
     st.header_walk.tip.hash = Some(second.block_hash());
     st.header_walk.tip.height = 2;
     let shared = std::sync::Mutex::new(st);
-    let _probe = rbitcoin_store::HeaderThreadProbe::arm();
-    rbitcoin_query::reset_header_lookups_under_coord_lock();
     rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, &hub);
-    assert_eq!(
-        rbitcoin_query::header_lookups_under_coord_lock(),
-        0,
-        "that read ran while the coordinator lock was down"
-    );
-    assert_eq!(rbitcoin_store::coord_lock_store_reads(), 0);
     assert_eq!(
         hub.tip_height(),
         Some(0),

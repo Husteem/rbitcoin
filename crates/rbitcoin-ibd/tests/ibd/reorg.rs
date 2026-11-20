@@ -396,7 +396,7 @@ fn consider_disconnected_from_work_path_without_resume_seed() {
 /// walks back and a heavier chain arrives that forked under it. None of it
 /// is planted, so the path's next height names no fork. Its stored tip is
 /// where the rewind walks back from. A walk tip that is not stored is not,
-/// and once a path is planted the walk's tip is not read from the store.
+/// and once the path is planted a second pass does not rewind again.
 #[test]
 fn a_walk_candidate_forked_below_the_tip_is_rewound_to() {
     let (dir, hub) = tmp_hub();
@@ -441,13 +441,7 @@ fn a_walk_candidate_forked_below_the_tip_is_rewound_to() {
         assert_eq!(st.height_to_hash.get(&1), Some(&w1.block_hash()));
         assert_eq!(st.height_to_hash.get(&3), Some(&w3.block_hash()));
     }
-    reset_parent_hash_of_count();
     assert!(!consider_disconnected_heavier(&shared, &hub).unwrap());
-    assert_eq!(
-        parent_hash_of_count(),
-        0,
-        "a planted path is not a store walk"
-    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1035,49 +1029,6 @@ fn deferring_a_queued_hash_again_keeps_it() {
         !st.deferred.contains(&full[1]),
         "the oldest untouched hash goes"
     );
-}
-
-/// A header-thread pass with no candidates takes no gate and reads no
-/// chain work, so a cold chain-work prefix stays cold.
-#[test]
-fn an_empty_off_lock_pass_reads_no_chain_work() {
-    let (dir, hub) = tmp_hub();
-    hub.ensure_genesis().unwrap();
-    hub.confirm_empty_regtest(3).unwrap();
-    hub.test_clear_chain_work_prefix();
-    let mut st =
-        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
-    st.header_walk.origin = true;
-    let shared = Mutex::new(st);
-    assert!(!rewind_off_coord_lock(&shared, &hub).unwrap());
-    assert_eq!(hub.test_chain_work_prefix_len(), 0);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// Under the floor the rewind cap is 65,536, but a selection under `shared`
-/// walks no further than [`ANCESTOR_WALK_MAX`]. The coordinator's off-lock
-/// turn is the one that walks as far as the cap.
-#[test]
-fn the_under_lock_walk_stays_at_ancestor_walk_max() {
-    use rbitcoin_ibd::ibd::header_walk::{rewind_depth_cap, UNPROVEN_LEAD_BLOCKS};
-    let (dir, mut hub) = tmp_hub();
-    let fork = fork_three_under_a_two_block_tip(&hub, 1_500_097_100);
-    hub.milestone = floor_just_above(hub.chain_work().unwrap());
-    let mut st =
-        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
-    st.header_walk.origin = true;
-    assert_eq!(rewind_depth_cap(&st, &hub), UNPROVEN_LEAD_BLOCKS);
-    st.reorg
-        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[2]));
-    reset_longest_walk();
-    assert!(maybe_rewind_to_best_work(&mut st, &hub).unwrap());
-    assert_eq!(longest_walk(), ANCESTOR_WALK_MAX);
-    st.reorg.defer(&[fork[2]]);
-    let shared = Mutex::new(st);
-    reset_longest_walk();
-    rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, &hub);
-    assert_eq!(longest_walk(), ancestor_walk_max(UNPROVEN_LEAD_BLOCKS));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// An unplanted walk tip as far above the confirmed tip as the widest walk
