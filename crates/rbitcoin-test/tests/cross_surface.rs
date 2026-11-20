@@ -1633,6 +1633,9 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
 
 /// A client lists the pool over RPC at S1 and S2. Each txid that left in
 /// between has its row on `GET /mempool/removed`, numbered in `[S1, S2)`.
+/// One session causes every reason: a replacement, a block, a block's
+/// double-spend, an `invalidateblock` that makes a coinbase spend immature,
+/// `mempool_expiry` past `setmocktime`, and a full `mempool_size_mb`.
 #[tokio::test(flavor = "multi_thread")]
 async fn listing_diff_finds_each_removal_reason_on_esplora() {
     let td = TestDatadir::new().unwrap();
@@ -1648,7 +1651,7 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
             genesis.header.time,
             1,
             102,
-            2,
+            7,
         );
         q.flush().unwrap();
         cbs
@@ -1663,6 +1666,8 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
     cfg.listen.connect.clear();
     cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(unbound));
     cfg.rpc.listen = Some(unbound);
+    cfg.apply_kv("mempool_expiry", "1").unwrap();
+    cfg.apply_kv("mempool_size_mb", "1").unwrap();
     std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
     #[cfg(unix)]
     {
@@ -1683,9 +1688,42 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
     wait_relay_enabled(rpc_addr).await;
 
     let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let first = acs_spend(cbs[0], 50_0000_0000, 1_000, spk.clone());
-    let other = acs_spend(cbs[1], 50_0000_0000, 1_000, spk.clone());
-    let bump = acs_spend(cbs[0], 50_0000_0000, 50_000, spk);
+    let coin = 50_0000_0000;
+    let child_of = |parent: &Transaction| {
+        acs_spend(
+            parent.compute_txid(),
+            parent.output[0].value.to_sat(),
+            1_000,
+            spk.clone(),
+        )
+    };
+    let first = acs_spend(cbs[0], coin, 1_000, spk.clone());
+    let other = acs_spend(cbs[1], coin, 1_000, spk.clone());
+    let bump = acs_spend(cbs[0], coin, 50_000, spk.clone());
+    let loser = acs_spend(cbs[2], coin, 1_000, spk.clone());
+    let loser_child = child_of(&loser);
+    let winner = acs_spend(cbs[2], coin, 2_000, spk.clone());
+    let young = acs_spend(cbs[6], coin, 1_000, spk.clone());
+    let young_child = child_of(&young);
+    let stale = acs_spend(cbs[3], coin, 1_000, spk.clone());
+    let stale_child = child_of(&stale);
+    // Three max-standard spends overfill the 1 MB pool. The 1 sat/vB one
+    // is the worst chunk.
+    let low = one_sat_vb_max_weight(cbs[4], 0, coin, spk.clone());
+    let paying = |prev: Txid, input_sat: u64, extra: u64| {
+        let mut tx = one_sat_vb_max_weight(prev, 0, input_sat, spk.clone());
+        tx.output[0].value -= Amount::from_sat(extra);
+        tx
+    };
+    let mid = paying(
+        winner.compute_txid(),
+        winner.output[0].value.to_sat(),
+        400_000,
+    );
+    let heavy = paying(cbs[5], coin, 900_000);
+    assert!(tx_wu(&low) + tx_wu(&mid) + tx_wu(&heavy) > 1_000_000);
+    assert!(tx_wu(&mid) + tx_wu(&heavy) <= 1_000_000);
+
     let send = |tx: &Transaction| {
         let hex = encode_tx(tx);
         async move {
@@ -1702,11 +1740,15 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
             .expect("sequence");
         (txids, seq)
     };
+    let mut listings = vec![listing().await];
+
     send(&first).await;
     send(&other).await;
     let (before, s1) = listing().await;
     assert_eq!(before.len(), 2, "{before:?}");
+    listings.push((before, s1));
     send(&bump).await;
+    listings.push(listing().await);
     let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
     assert!(mined["result"].is_array(), "{mined}");
     let (after, s2) = listing().await;
@@ -1716,27 +1758,130 @@ async fn listing_diff_finds_each_removal_reason_on_esplora() {
         s1 + 4,
         "the replacement in and out, the victim, the other"
     );
+    listings.push((after, s2));
+
+    // A block confirms a double-spend of a pool tx. The block's tx was
+    // never in the pool.
+    send(&loser).await;
+    send(&loser_child).await;
+    listings.push(listing().await);
+    let block = jsonrpc(
+        rpc_addr,
+        "generateblock",
+        json!(["raw(51)", [encode_tx(&winner)]]),
+    )
+    .await;
+    assert!(block["result"]["hash"].is_string(), "{block}");
+    let (after, s) = listing().await;
+    assert!(after.is_empty(), "{after:?}");
+    listings.push((after, s));
+
+    // A coinbase spend that is mature one block up. Invalidating that
+    // empty block puts nothing back and makes the spend immature.
+    let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
+    let empty_tip = mined["result"][0].clone();
+    assert!(empty_tip.is_string(), "{mined}");
+    let count = jsonrpc(rpc_addr, "getblockcount", json!([])).await;
+    assert_eq!(count["result"], 106, "cbs[6] is the height 7 coinbase");
+    send(&young).await;
+    send(&young_child).await;
+    listings.push(listing().await);
+    let invalidated = jsonrpc(rpc_addr, "invalidateblock", json!([empty_tip])).await;
+    assert!(invalidated["error"].is_null(), "{invalidated}");
+    let (after, s) = listing().await;
+    assert!(after.is_empty(), "{after:?}");
+    listings.push((after, s));
+
+    // The pool expires a tx on the next admit an hour after it entered.
+    send(&stale).await;
+    send(&stale_child).await;
+    listings.push(listing().await);
+    let entry = jsonrpc(
+        rpc_addr,
+        "getmempoolentry",
+        json!([stale_child.compute_txid().to_string()]),
+    )
+    .await;
+    let entered = entry["result"]["time"].as_u64().expect("entry time");
+    let mocked = jsonrpc(rpc_addr, "setmocktime", json!([entered + 3_600])).await;
+    assert!(mocked["error"].is_null(), "{mocked}");
+    send(&low).await;
+    let (after, s) = listing().await;
+    assert_eq!(after, vec![low.compute_txid().to_string()]);
+    listings.push((after, s));
+
+    send(&mid).await;
+    listings.push(listing().await);
+    send(&heavy).await;
+    let (after, s) = listing().await;
+    assert_eq!(
+        after
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [&mid, &heavy]
+            .map(|tx| tx.compute_txid().to_string())
+            .into_iter()
+            .collect(),
+    );
+    listings.push((after, s));
 
     let (st, body) = http_get(esplora_addr, "/mempool/removed").await;
     assert_eq!(st, 200, "{body}");
     let removed: Value = serde_json::from_str(&body).unwrap();
-    assert!(removed["oldest"].as_u64().unwrap() <= s1, "{removed}");
+    assert!(
+        removed["oldest"].as_u64().unwrap() <= listings[0].1,
+        "{removed}"
+    );
     let rows = removed["removed"].as_array().expect("rows");
-    let row_of = |txid: &str| {
-        let hits: Vec<&Value> = rows
-            .iter()
-            .filter(|r| r["txid"] == txid)
-            .filter(|r| (s1..s2).contains(&r["seq"].as_u64().unwrap()))
-            .collect();
-        assert_eq!(hits.len(), 1, "{txid}: {removed}");
-        hits[0].clone()
-    };
-    let first_row = row_of(&first.compute_txid().to_string());
-    assert_eq!(first_row["reason"], "replaced", "{first_row}");
+    let want: HashMap<String, &str> = [
+        (&first, "replaced"),
+        (&other, "block"),
+        (&bump, "block"),
+        (&loser, "conflict"),
+        (&loser_child, "conflict"),
+        (&young, "reorg"),
+        (&young_child, "reorg"),
+        (&stale, "expiry"),
+        (&stale_child, "expiry"),
+        (&low, "sizelimit"),
+    ]
+    .into_iter()
+    .map(|(tx, reason)| (tx.compute_txid().to_string(), reason))
+    .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for (i, (first_list, s1)) in listings.iter().enumerate() {
+        for (second, s2) in &listings[i..] {
+            for gone in first_list.iter().filter(|t| !second.contains(t)) {
+                let hits: Vec<&Value> = rows
+                    .iter()
+                    .filter(|r| r["txid"] == gone.as_str())
+                    .filter(|r| (*s1..*s2).contains(&r["seq"].as_u64().unwrap()))
+                    .collect();
+                assert_eq!(hits.len(), 1, "{gone} in [{s1}, {s2}): {removed}");
+                assert_eq!(
+                    hits[0]["reason"].as_str(),
+                    want.get(gone).copied(),
+                    "{gone}: {}",
+                    hits[0]
+                );
+                seen.insert(gone.clone());
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        want.keys().cloned().collect(),
+        "each reason left a listing"
+    );
+    let first_row = rows
+        .iter()
+        .find(|r| r["txid"] == first.compute_txid().to_string())
+        .expect("replaced row");
     assert_eq!(first_row["by"], bump.compute_txid().to_string());
-    let other_row = row_of(&other.compute_txid().to_string());
-    assert_eq!(other_row["reason"], "block", "{other_row}");
-    assert!(other_row.get("by").is_none(), "{other_row}");
+    for row in rows.iter().filter(|r| r["reason"] != "replaced") {
+        assert!(row.get("by").is_none(), "{row}");
+    }
 
     let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
     let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
