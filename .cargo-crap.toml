@@ -12,6 +12,7 @@ exclude = [
   "**/core_vectors.rs",
 ]
 allow = [
+  "ChainHub::accept_incoming",
   "NodeConfig::apply_kv",
   "TxTable::open_seqsigwit",
   "UringSession::submit_and_wait_one",
