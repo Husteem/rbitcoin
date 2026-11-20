@@ -129,22 +129,29 @@ fold wrote, to `spent.body` and, for a page a fold already wrote, to `spent.delt
 bytes of `spent.body`. `notes_ram` is the RAM the open and sealed slot notes
 allocate. Open logs the same totals once.
 
-The `timing` line is one checkpoint: `since_ms` since the previous one
-started, the sealed pages and slot notes, the preads and bytes that read back
-the committed records they merge into (records touching in a segment
-share one pread), `hot_folds` (touched pages folded) and `hot_fold_record_bytes`
-(what rewriting those records would have written), the dense touched pages
-kept because their segment is newer than the durable marker
-(`dense_kept_gen`) or they reach the body's end (`dense_kept_tail`), the
-bytes reclaim read from victim segments, the reclaim folds (`folded_now`),
-records dropped because this checkpoint rewrites their page, and the
-milliseconds of each step: composing folds, the `fold` file, the
-`spent.body` writes and sync, the segment writes and sync, the directory
-write and sync, the commit rename, installing in RAM, and unlinking.
-`spend_room_wait_ms` on the `ibd: perf` line is the time confirm waited at
-the 2,000,000-note cap for a checkpoint to start. After 60 failed checkpoints
-in a row (the sync thread retries about once a second at the cap), that wait
-returns a store error and confirm stops instead of stalling.
+A checkpoint emits one compact INFO line:
+`store: spend delta gen= since_ms= new_record_bytes= dense_record_bytes=
+carried= segments= written= notes_ram= total_ms=`. The detailed `timing` line
+(category `store`) is DEBUG for a fast checkpoint and INFO when `total_ms >=
+1000` or `body_sync_ms + seg_sync_ms >= 500`. The `timing` line is one
+checkpoint: `since_ms` since the previous one started, the sealed pages and
+slot notes, the preads and bytes that read back the committed records they
+merge into (records touching in a segment share one pread), `hot_folds`
+(touched pages folded) and `hot_fold_record_bytes` (what rewriting those
+records would have written), the dense touched pages kept because their
+segment is newer than the durable marker (`dense_kept_gen`) or they reach the
+body's end (`dense_kept_tail`), the bytes reclaim read from victim segments,
+the reclaim folds (`folded_now`), records dropped because this checkpoint
+rewrites their page, and the milliseconds of each step: composing folds, the
+`fold` file, the `spent.body` writes and sync, the segment writes and sync,
+the directory write and sync, the commit rename, installing in RAM, and
+unlinking. Reuse `logging include ["store"]` to turn the detail on at a lower
+level. `spend_room_wait_ms` on the `ibd: perf` line is the time confirm waited
+at the 2,000,000-note cap for a checkpoint to start; the compact `spend`
+object also carries the window's checkpoint count, worst `total_ms`, and
+`notes_ram`. After 60 failed checkpoints in a row (the sync thread retries
+about once a second at the cap), that wait returns a store error and confirm
+stops instead of stalling.
 
 ## Schema upgrade
 
