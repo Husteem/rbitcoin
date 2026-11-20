@@ -114,6 +114,24 @@ fn size_snapshot_counts_packs_and_bytes() {
     );
 }
 
+/// The pin estimate falls to zero when every pack is pruned, but the maps
+/// keep the capacity they grew to; `map_bytes` meters that capacity.
+#[test]
+fn map_bytes_meter_the_capacity_a_prune_leaves() {
+    let mut m = InFlight::new();
+    let pins: Vec<CreatePin> = (1..=2_000).map(pin).collect();
+    m.note_pins(
+        pins.iter().enumerate().map(|(i, p)| (Fk(i as u64 + 1), p)),
+        Some(1),
+    );
+    let full = m.map_bytes();
+    let txid_map = rbitcoin_primitives::heap_bytes::hash_table_bytes::<[u8; 32], Fk>(2_000);
+    assert!(full >= txid_map, "{full} < {txid_map}");
+    m.prune_below_height(Some(2));
+    assert_eq!(m.size_snapshot().2, 0);
+    assert!(m.map_bytes() >= txid_map, "{}", m.map_bytes());
+}
+
 #[test]
 fn get_misses_until_note() {
     let mut m = InFlight::new();
@@ -367,4 +385,23 @@ fn empty_note_is_noop() {
     m.note_creates(std::iter::empty(), Some(1));
     assert!(m.is_empty());
     assert_eq!(m.pack_count(), 0);
+}
+
+/// The estimate charges 40 B for each txid entry and each pin beside the
+/// pin's own bytes; the maps' heap past it leaves those out, so the two
+/// together count the pins once and the maps once.
+#[test]
+fn the_estimate_and_the_maps_past_it_count_each_entry_once() {
+    let mut m = InFlight::new();
+    let pins: Vec<CreatePin> = (1..=500).map(pin).collect();
+    m.note_pins(
+        pins.iter().enumerate().map(|(i, p)| (Fk(i as u64 + 1), p)),
+        Some(1),
+    );
+    let payload: u64 = pins
+        .iter()
+        .map(|p| rbitcoin_query::archive::create_pin_approx_bytes(p) as u64)
+        .sum();
+    let est = m.size_snapshot().2;
+    assert_eq!(est + m.map_bytes_past_estimate(), payload + m.map_bytes());
 }
