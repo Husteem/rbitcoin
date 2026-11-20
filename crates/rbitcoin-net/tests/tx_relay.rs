@@ -2629,7 +2629,7 @@ fn maintenance_keeps_a_child_whose_confirmed_parent_the_head_lost() {
         }
         // The parents' block strips them from the pool. The children stay.
         let mut g = hub.lock_write();
-        g.remove_live_txids(&[parent.compute_txid(), spent_parent.compute_txid()])
+        g.remove_live_txids(&[parent.compute_txid(), spent_parent.compute_txid()], MINED)
             .expect("strip the confirmed parents");
         g.flush().expect("persist the pool");
     }
@@ -2781,7 +2781,7 @@ fn maintenance_drops_reloaded_txs_whose_parent_is_gone() {
         }
         // The lost admit: the parent leaves the sidecar, its child stays.
         let mut g = hub.lock_write();
-        g.remove_live_txids(&[lost_parent.compute_txid()])
+        g.remove_live_txids(&[lost_parent.compute_txid()], rbitcoin_net::Removal::Undo)
             .expect("drop the parent alone");
         assert!(g.graph.contains(&lost_child.compute_txid()));
         g.flush().expect("persist the pool");
