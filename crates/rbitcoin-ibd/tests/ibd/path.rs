@@ -266,13 +266,7 @@ fn resume_seed_notes_stored_headers_on_the_milestone_path() {
             min_work_be: [0u8; 32],
         }),
     };
-    hub.query.note_milestone_header(
-        100,
-        anchor.to_byte_array(),
-        [0u8; 32],
-        bitcoin::Work::from_be_bytes([0u8; 32]),
-        None,
-    );
+    hub.query.note_milestone_header(100, anchor.to_byte_array());
 
     let mut prev = hub.tip_hash().unwrap();
     let mut first = None;

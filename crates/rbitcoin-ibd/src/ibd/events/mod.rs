@@ -34,14 +34,13 @@ use tokio::sync::mpsc;
 pub fn prepare_header_store(
     hub: &ChainHub,
     headers: &[bitcoin::block::Header],
-) -> (Vec<rbitcoin_primitives::Fk>, Option<bitcoin::Work>) {
+) -> Vec<rbitcoin_primitives::Fk> {
     let fks = hub.ensure_headers_batch(headers).unwrap_or_default();
-    let work = hub.chain_work().ok();
     if fks.len() == headers.len() {
-        return (fks, work);
+        return fks;
     }
     let accepted = ensure_accepted_prefix(hub, headers);
-    (accepted.into_iter().map(|(_, fk)| fk).collect(), work)
+    accepted.into_iter().map(|(_, fk)| fk).collect()
 }
 
 /// Immediately stop getdata and disconnect every peer (SIGINT / IBD exit).
@@ -342,7 +341,6 @@ pub fn on_headers_batch(
     peer: usize,
     headers: Vec<bitcoin::block::Header>,
     fks: &[rbitcoin_primitives::Fk],
-    work: Option<bitcoin::Work>,
 ) -> usize {
     // A block in this batch can fail while its headers are written outside
     // the lock. The retire already dropped that path.
@@ -363,18 +361,7 @@ pub fn on_headers_batch(
                 disconnect_peer(st, peer);
             }
             if st.is_on_path(&hash, h) {
-                let base = if hub.tip_hash() == Some(prev) {
-                    work
-                } else {
-                    None
-                };
-                hub.query.note_milestone_header(
-                    h,
-                    hash.to_byte_array(),
-                    prev.to_byte_array(),
-                    hdr.work(),
-                    base,
-                );
+                hub.query.note_milestone_header(h, hash.to_byte_array());
             }
             batch_prev = Some((hash, h));
         }
@@ -614,11 +601,11 @@ pub fn run_header_batch(
             known,
             mut inflight,
         } => {
-            let (fks, work) = fks_for_kept(&known, hub, &headers[known.len()..]);
+            let fks = fks_for_kept(&known, hub, &headers[known.len()..]);
             let n = fks.len().min(headers.len());
             let ask = {
                 let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                let added = on_headers_batch(&mut st, hub, peer, headers, &fks, work);
+                let added = on_headers_batch(&mut st, hub, peer, headers, &fks);
                 let ask = complete_stored_headers(&mut st, hub, &mut inflight, added, n);
                 finish_mark(&mut st, hub, peer, &mark);
                 ask
@@ -642,14 +629,13 @@ pub fn fks_for_kept(
     known: &[rbitcoin_primitives::Fk],
     hub: &ChainHub,
     rest: &[bitcoin::block::Header],
-) -> (Vec<rbitcoin_primitives::Fk>, Option<bitcoin::Work>) {
+) -> Vec<rbitcoin_primitives::Fk> {
     if rest.is_empty() {
-        return (known.to_vec(), None);
+        return known.to_vec();
     }
-    let (new_fks, work) = prepare_header_store(hub, rest);
     let mut fks = known.to_vec();
-    fks.extend(new_fks);
-    (fks, work)
+    fks.extend(prepare_header_store(hub, rest));
+    fks
 }
 
 #[doc(hidden)]

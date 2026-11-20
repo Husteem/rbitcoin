@@ -21,8 +21,8 @@ fn stored_batch(
         .iter()
         .map_while(|h| st.header_fks.get(&h.block_hash()).copied())
         .collect();
-    let (fks, work) = rbitcoin_ibd::ibd::events::fks_for_kept(&known, hub, &headers[known.len()..]);
-    on_headers_batch(st, hub, peer, headers, &fks, work)
+    let fks = rbitcoin_ibd::ibd::events::fks_for_kept(&known, hub, &headers[known.len()..]);
+    on_headers_batch(st, hub, peer, headers, &fks)
 }
 
 fn tmp_hub() -> (
@@ -55,7 +55,7 @@ fn rejected_header_batch_does_not_grow_path_or_explore() {
     assert!(st.reorg.explore_tips().is_empty());
 
     let good = mine(gen, 1_500_010_000, 1);
-    let (good_fks, _) = rbitcoin_ibd::ibd::events::prepare_header_store(&hub, &[good.header]);
+    let good_fks = rbitcoin_ibd::ibd::events::prepare_header_store(&hub, &[good.header]);
     assert_eq!(
         good_fks.len(),
         1,
@@ -71,12 +71,6 @@ fn rejected_header_batch_does_not_grow_path_or_explore() {
         st.hash_height.contains_key(&good.block_hash()),
         "a valid header still records path state"
     );
-    let tipped = hub
-        .query
-        .milestone_best_work_be()
-        .expect("a header on the tip passes chain work into the milestone path");
-    let expect = (hub.chain_work().unwrap() + good.header.work()).to_be_bytes();
-    assert_eq!(tipped, expect);
 
     let mut child = mine(good.block_hash(), 1_500_010_600, 2);
     child.header.time = 0;
@@ -99,7 +93,7 @@ fn rejected_header_batch_does_not_grow_path_or_explore() {
     bad_tail.header.time = 0;
     let fresh_hash = fresh.block_hash();
     let tail_hash = bad_tail.header.block_hash();
-    let (prefix_fks, _) =
+    let prefix_fks =
         rbitcoin_ibd::ibd::events::prepare_header_store(&hub, &[fresh.header, bad_tail.header]);
     assert_eq!(
         prefix_fks.len(),

@@ -2486,9 +2486,8 @@ fn two_peers_reserve_the_header_walk() {
     let late = [late0, mine(late0.block_hash(), 45)];
     st.reorg.invalid.mark(late[0].block_hash().to_byte_array());
     let tip = st.header_walk.tip_hash();
-    let (fks, work) = rbitcoin_ibd::ibd::events::prepare_header_store(&hub, &late);
-    let added =
-        rbitcoin_ibd::ibd::events::on_headers_batch(&mut st, &hub, 5, late.to_vec(), &fks, work);
+    let fks = rbitcoin_ibd::ibd::events::prepare_header_store(&hub, &late);
+    let added = rbitcoin_ibd::ibd::events::on_headers_batch(&mut st, &hub, 5, late.to_vec(), &fks);
     assert_eq!(added, 0);
     assert!(!st.ordered_set.contains(&late[1].block_hash()));
     assert_eq!(st.header_walk.tip_hash(), tip);
@@ -8462,31 +8461,8 @@ fn hw_pin_the_milestone_height_records_the_header() {
     hub.milestone = rbitcoin_consensus::Milestone::height(1);
     st.header_walk.tip.height = 1;
     st.header_walk.tip.hash = Some(gen.block_hash());
-    remember_milestone(&mut st.header_walk.tip, &hub, gen.prev_blockhash, &gen);
+    remember_milestone(&mut st.header_walk.tip, &hub, &gen);
     assert_eq!(st.header_walk.milestone_hash(), Some(gen.block_hash()));
-}
-
-/// A matching anchor records checkpoint work. `!=` to `==` returns first.
-#[test]
-fn hw_pin_a_matching_anchor_records_checkpoint_work() {
-    let (_dir, mut hub, mut st, _gen) = opened("hw-anchor-work", false);
-    let anchor = BlockHash::from_byte_array([0x44; 32]);
-    hub.milestone = rbitcoin_consensus::Milestone {
-        height: 1,
-        anchor: Some(rbitcoin_consensus::MilestoneAnchor {
-            hash: anchor,
-            min_work_be: [0; 32],
-        }),
-    };
-    st.header_walk.proven = false;
-    st.header_walk.report_epoch = None;
-    st.header_walk.tip.height = 1;
-    st.header_walk.tip.milestone_hash = Some(anchor);
-    st.header_walk.tip.work = Work::from_be_bytes([0; 32]);
-    publish_work(&mut st, &hub);
-    let path = hub.query.milestone_path_lock();
-    assert!(path.work_valid, "matching anchor records checkpoint work");
-    assert_eq!(path.work_height, 1);
 }
 
 /// At or above the milestone, the remembered header stays. `||` to `&&`
@@ -8705,9 +8681,7 @@ fn hw_pin_a_cut_back_keeps_the_fork_anchor() {
     st.header_walk.checkpoints.push(mark.clone());
     st.hash_height.insert(prev, 5);
     hub.milestone.height = 5;
-    let milestone_prev = byte_hash(9);
     st.header_walk.tip.milestone_hash = Some(byte_hash(8));
-    st.header_walk.tip.milestone_prev = milestone_prev;
     st.header_walk.tip.milestone_header = Some(gen);
     adopt_heavier(&mut st, &hub, prev, &[], Work::from_be_bytes([0; 32]), None);
     let tip = &st.header_walk.tip;
@@ -8718,7 +8692,6 @@ fn hw_pin_a_cut_back_keeps_the_fork_anchor() {
         tip.diff.full_diff_bits,
         Some(CompactTarget::from_consensus(0x1d00ffff))
     );
-    assert_eq!(tip.milestone_prev, milestone_prev);
     assert_eq!(tip.milestone_header, Some(gen));
 }
 
@@ -9016,13 +8989,16 @@ fn hw_pin_off_path_budget_counts_the_header_that_crosses_it() {
     assert!(st.header_walk.off_path[&0].contains(&over));
 }
 
-/// The first stored header above the tip publishes confirmed work through it.
+/// The first stored header above the tip goes on the milestone path.
 #[test]
-fn hw_pin_the_first_stored_header_publishes_tip_work() {
+fn hw_pin_the_first_stored_header_is_noted_on_the_path() {
     let (_dir, hub, mut st, gen) = opened("hw-renote-work", false);
     let child = mine(gen.block_hash(), 91);
     hub.ensure_header(&child).unwrap();
     st.height_to_hash.insert(1, child.block_hash());
     renote_stored_path(&st, &hub);
-    assert!(hub.query.milestone_best_work_be().is_some());
+    assert_eq!(
+        hub.query.milestone_header_at(1),
+        Some(child.block_hash().to_byte_array())
+    );
 }

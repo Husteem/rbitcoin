@@ -357,7 +357,6 @@ pub struct OriginInput {
     pub next_hashes: Vec<(u32, BlockHash)>,
     pub milestone_height: u32,
     pub milestone_hash: Option<BlockHash>,
-    pub milestone_prev: BlockHash,
     pub milestone_header: Option<Header>,
 }
 
@@ -373,7 +372,6 @@ pub struct OriginLoaded {
     pub base_hash: Option<BlockHash>,
     pub base_work: Work,
     pub milestone_hash: Option<BlockHash>,
-    pub milestone_prev: BlockHash,
     pub milestone_header: Option<Header>,
     pub tip_header: Option<Header>,
 }
@@ -404,7 +402,6 @@ pub fn origin_input(st: &IbdWorkState, hub: &ChainHub) -> OriginInput {
         next_hashes,
         milestone_height: hub.milestone.height,
         milestone_hash: st.header_walk.tip.milestone_hash,
-        milestone_prev: st.header_walk.tip.milestone_prev,
         milestone_header: st.header_walk.tip.milestone_header,
     }
 }
@@ -425,7 +422,6 @@ pub fn load_origin(hub: &ChainHub, input: &OriginInput) -> OriginLoaded {
     let mut hash = base_hash;
     let mut work = base_work;
     let mut milestone_hash = input.milestone_hash;
-    let mut milestone_prev = input.milestone_prev;
     let mut milestone_header = input.milestone_header;
     if !input.ordered_empty {
         for (next_h, next) in &input.next_hashes {
@@ -448,9 +444,8 @@ pub fn load_origin(hub: &ChainHub, input: &OriginInput) -> OriginLoaded {
                     hash: Some(*next),
                     ..WalkTip::default()
                 };
-                remember_milestone(&mut latch, hub, hdr.prev_blockhash, &hdr);
+                remember_milestone(&mut latch, hub, &hdr);
                 milestone_hash = latch.milestone_hash;
-                milestone_prev = latch.milestone_prev;
                 milestone_header = latch.milestone_header;
             }
             height = *next_h;
@@ -467,7 +462,6 @@ pub fn load_origin(hub: &ChainHub, input: &OriginInput) -> OriginLoaded {
         base_hash,
         base_work,
         milestone_hash,
-        milestone_prev,
         milestone_header,
         tip_header,
     }
@@ -486,7 +480,6 @@ pub fn install_origin(st: &mut IbdWorkState, hub: &ChainHub, loaded: OriginLoade
         base_hash,
         base_work,
         milestone_hash,
-        milestone_prev,
         milestone_header,
         tip_header,
     } = loaded;
@@ -495,7 +488,6 @@ pub fn install_origin(st: &mut IbdWorkState, hub: &ChainHub, loaded: OriginLoade
         height,
         work,
         milestone_hash,
-        milestone_prev,
         milestone_header,
         ..WalkTip::default()
     };
@@ -1246,7 +1238,6 @@ fn cut_back_to(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u
         times: times_ending_at(st, hub, hash),
         diff: diff_at(st, hub, hash),
         milestone_hash: st.header_walk.tip.milestone_hash,
-        milestone_prev: st.header_walk.tip.milestone_prev,
         milestone_header: st.header_walk.tip.milestone_header,
         ..WalkTip::default()
     };
@@ -1286,14 +1277,12 @@ pub fn rewind_to(st: &mut IbdWorkState, hub: &ChainHub, height: u32, dead: Optio
         }
     }
     let milestone_hash = st.header_walk.tip.milestone_hash;
-    let milestone_prev = st.header_walk.tip.milestone_prev;
     let milestone_header = st.header_walk.tip.milestone_header;
     st.header_walk.tip = match st.header_walk.checkpoints.last() {
         Some(prev) => tip_from_checkpoint(prev),
         None => tip_from_base(st),
     };
     st.header_walk.tip.milestone_hash = milestone_hash;
-    st.header_walk.tip.milestone_prev = milestone_prev;
     st.header_walk.tip.milestone_header = milestone_header;
     let keep = st.header_walk.tip_height();
     st.clear_path_above(keep);
@@ -1466,7 +1455,6 @@ pub struct WalkTip {
     pub times: Vec<u32>,
     pub diff: DiffSnap,
     pub milestone_hash: Option<BlockHash>,
-    pub milestone_prev: BlockHash,
     pub milestone_header: Option<Header>,
 }
 
@@ -1481,7 +1469,6 @@ impl Default for WalkTip {
             times: Vec::new(),
             diff: DiffSnap::default(),
             milestone_hash: None,
-            milestone_prev: BlockHash::from_byte_array([0; 32]),
             milestone_header: None,
         }
     }
@@ -1516,9 +1503,9 @@ pub fn push_header(tip: &mut WalkTip, hub: &ChainHub, hdr: &Header) -> bool {
 #[doc(hidden)]
 pub fn advance_tip(tip: &mut WalkTip, hub: &ChainHub, headers: &[Header]) {
     for hdr in headers {
-        let Some(prev) = tip.hash else {
+        if tip.hash.is_none() {
             break;
-        };
+        }
         if !push_header(tip, hub, hdr) {
             break;
         }
@@ -1526,7 +1513,6 @@ pub fn advance_tip(tip: &mut WalkTip, hub: &ChainHub, headers: &[Header]) {
             // A challenger tip starts with no milestone, and height only
             // increases, so this assignment runs at most once per tip.
             tip.milestone_hash = tip.hash;
-            tip.milestone_prev = prev;
             tip.milestone_header = Some(*hdr);
         }
     }
@@ -1534,18 +1520,13 @@ pub fn advance_tip(tip: &mut WalkTip, hub: &ChainHub, headers: &[Header]) {
 
 #[doc(hidden)]
 pub fn latch_milestone(tip: &WalkTip, hub: &ChainHub) {
-    let (Some(hash), Some(hdr)) = (tip.milestone_hash, tip.milestone_header) else {
+    let (Some(hash), Some(_)) = (tip.milestone_hash, tip.milestone_header) else {
         return;
     };
     // Milestone fields are set only at `milestone.height`, then the tip
     // only grows, so the latched tip is already at or above that height.
-    hub.query.note_milestone_header(
-        hub.milestone.height,
-        hash.to_byte_array(),
-        tip.milestone_prev.to_byte_array(),
-        hdr.work(),
-        None,
-    );
+    hub.query
+        .note_milestone_header(hub.milestone.height, hash.to_byte_array());
 }
 
 #[doc(hidden)]
@@ -1698,12 +1679,10 @@ pub fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
     recompute_witness(st);
     st.header_walk.checkpoints.extend(ch.checkpoints);
     let kept = st.header_walk.tip.milestone_hash;
-    let kept_prev = st.header_walk.tip.milestone_prev;
     let kept_header = st.header_walk.tip.milestone_header;
     st.header_walk.tip = ch.tip;
     if kept.is_some() {
         st.header_walk.tip.milestone_hash = kept;
-        st.header_walk.tip.milestone_prev = kept_prev;
         st.header_walk.tip.milestone_header = kept_header;
     } else {
         latch_milestone(&st.header_walk.tip, hub);
@@ -2045,7 +2024,7 @@ pub fn adopt_heavier(
         if !push_header(&mut tip, hub, hdr) {
             break;
         }
-        remember_milestone(&mut tip, hub, link, hdr);
+        remember_milestone(&mut tip, hub, hdr);
         link = tip.hash.unwrap_or(link);
     }
     // `work` already includes every header that linked. An early break in
@@ -2709,13 +2688,11 @@ fn extend_connected(
     let Some(start) = st.header_walk.tip.hash else {
         return false;
     };
-    let mut prev = start;
     for hdr in headers {
         if !push_header(&mut st.header_walk.tip, hub, hdr) {
             break;
         }
-        remember_milestone(&mut st.header_walk.tip, hub, prev, hdr);
-        prev = st.header_walk.tip.hash.unwrap_or(prev);
+        remember_milestone(&mut st.header_walk.tip, hub, hdr);
     }
     if st.header_walk.tip.hash == Some(start) {
         return false;
@@ -2775,7 +2752,7 @@ pub fn adopt_checkpoint_due(
 }
 
 #[doc(hidden)]
-pub fn remember_milestone(tip: &mut WalkTip, hub: &ChainHub, prev: BlockHash, hdr: &Header) {
+pub fn remember_milestone(tip: &mut WalkTip, hub: &ChainHub, hdr: &Header) {
     if hub.milestone.height == 0 || tip.height != hub.milestone.height {
         return;
     }
@@ -2792,15 +2769,9 @@ pub fn remember_milestone(tip: &mut WalkTip, hub: &ChainHub, prev: BlockHash, hd
         }
     }
     tip.milestone_hash = Some(hash);
-    tip.milestone_prev = prev;
     tip.milestone_header = Some(*hdr);
-    hub.query.note_milestone_header(
-        tip.height,
-        hash.to_byte_array(),
-        prev.to_byte_array(),
-        hdr.work(),
-        None,
-    );
+    hub.query
+        .note_milestone_header(tip.height, hash.to_byte_array());
 }
 
 #[doc(hidden)]
@@ -2828,10 +2799,8 @@ pub fn publish_work(st: &mut IbdWorkState, hub: &ChainHub) {
         }
         return;
     }
-    hub.query
-        .note_milestone_checkpoint_work(st.header_walk.tip_height(), st.header_walk.tip_work());
-    // The milestone info line is the only effect. Checkpoint work is already
-    // written, and the suite cannot see that log line.
+    // The milestone info line is the only effect, and the suite cannot see
+    // that log line.
     #[cfg_attr(false, mutants::skip)]
     if !opened {
         return;
@@ -2842,8 +2811,8 @@ pub fn publish_work(st: &mut IbdWorkState, hub: &ChainHub) {
     );
 }
 
-/// The first proved publish logs. A later one does not. The proved bit and
-/// the checkpoint work are written either way.
+/// The first proved publish logs. A later one does not. The proved bit
+/// is written either way.
 #[cfg_attr(false, mutants::skip)]
 fn publish_just_opened(proven: bool) -> bool {
     !proven
@@ -3956,13 +3925,8 @@ pub fn on_confirmed_rewind(st: &mut IbdWorkState, hub: &ChainHub, lca_h: u32) {
     if !hub.query.has_milestone_path() {
         return;
     }
-    hub.query.note_milestone_header(
-        hub.milestone.height,
-        hash.to_byte_array(),
-        [0u8; 32],
-        Work::from_be_bytes([0u8; 32]),
-        None,
-    );
+    hub.query
+        .note_milestone_header(hub.milestone.height, hash.to_byte_array());
 }
 
 #[doc(hidden)]
@@ -4062,16 +4026,9 @@ pub fn retire_adopt_if_confirmed(st: &mut IbdWorkState, hub: &ChainHub) {
     // The confirmed chain already contains the anchor. Noting only that hash
     // into an empty path would hide the confirmed ancestors.
     if hub.query.has_milestone_path() {
-        hub.query.note_milestone_header(
-            hub.milestone.height,
-            rec.hash,
-            [0u8; 32],
-            Work::from_be_bytes([0u8; 32]),
-            None,
-        );
+        hub.query
+            .note_milestone_header(hub.milestone.height, rec.hash);
     }
-    hub.query
-        .note_milestone_checkpoint_work(tip_h, work.to_be_bytes());
     forget_adopt(hub);
 }
 
@@ -4161,13 +4118,8 @@ pub fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     renote_stored_path(st, hub);
     if let Some(hash) = st.header_walk.milestone_hash() {
         if hub.milestone.height > 0 {
-            hub.query.note_milestone_header(
-                hub.milestone.height,
-                hash.to_byte_array(),
-                [0u8; 32],
-                Work::from_be_bytes([0u8; 32]),
-                None,
-            );
+            hub.query
+                .note_milestone_header(hub.milestone.height, hash.to_byte_array());
         }
     }
     publish_work(st, hub);
@@ -4587,18 +4539,8 @@ pub fn renote_stored_path(st: &IbdWorkState, hub: &ChainHub) {
         if prev.is_some_and(|p| hdr.prev_blockhash != p) {
             break;
         }
-        let base = if hub.tip_hash() == prev {
-            hub.chain_work().ok()
-        } else {
-            None
-        };
-        hub.query.note_milestone_header(
-            next_h,
-            next.to_byte_array(),
-            hdr.prev_blockhash.to_byte_array(),
-            hdr.work(),
-            base,
-        );
+        hub.query
+            .note_milestone_header(next_h, next.to_byte_array());
         height = next_h;
         prev = Some(next);
     }
