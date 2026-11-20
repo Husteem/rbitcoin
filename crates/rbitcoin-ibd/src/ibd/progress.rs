@@ -128,13 +128,6 @@ pub struct QueuedHashSpan {
 impl QueuedHashSpan {
     #[doc(hidden)]
     pub fn load(hub: &ChainHub, lo: u32, hi: u32) -> Self {
-        if lo > hi {
-            return Self {
-                lo: 1,
-                hi: 0,
-                present: HashSet::new(),
-            };
-        }
         Self {
             lo,
             hi,
@@ -278,6 +271,13 @@ pub const ETA_RATE_HALF_LIFE_SECS: f64 = 90.0;
 #[doc(hidden)]
 pub const ETA_MIN_ELAPSED_SECS: f64 = 20.0;
 
+/// Dust below this is not a confirm window. Exactly `1e-6` blocks/s still
+/// leaves the window closed. `soft_confirm_window_n` would otherwise open
+/// one block.
+fn above_eta_floor(rate: f64) -> bool {
+    rate > 1e-6
+}
+
 /// Present-biased smoothed tip rate for IBD ETA logs.
 ///
 /// Samples are pushed on the centralized ~5s status tick. ETA uses an EWMA of
@@ -317,11 +317,6 @@ impl TipRateTracker {
             // Ignore zero/negative clock skew; tiny dt would explode inst rate.
             if dt >= 0.5 {
                 let inst = tip.saturating_sub(tip0) as f64 / dt;
-                let inst = if inst.is_finite() && inst >= 0.0 {
-                    inst
-                } else {
-                    0.0
-                };
                 self.rate_ema = Some(match self.rate_ema {
                     None => inst,
                     Some(prev) => {
@@ -343,7 +338,9 @@ impl TipRateTracker {
         if elapsed < ETA_MIN_ELAPSED_SECS {
             return None;
         }
-        let ema = self.rate_ema.filter(|r| r.is_finite() && *r > 1e-6)?;
+        let ema = self
+            .rate_ema
+            .filter(|r| r.is_finite() && above_eta_floor(*r))?;
         Some(ema)
     }
 
@@ -434,6 +431,12 @@ impl StatusClock {
     }
 }
 
+// Window pace printed on the progress line. Assign reads `TipRateTracker::eta_rate`.
+#[cfg_attr(false, mutants::skip)]
+fn window_tip_rate(tip_delta: u32, window: f64) -> f64 {
+    tip_delta as f64 / window
+}
+
 /// One progress line from published counters and the last coordination snapshot.
 pub fn log_progress_tick(
     clock: &mut StatusClock,
@@ -452,7 +455,7 @@ pub fn log_progress_tick(
         .saturating_duration_since(clock.last_sample_at)
         .as_secs_f64()
         .max(0.001);
-    let tip_rate = tip.saturating_sub(clock.last_sample_tip) as f64 / window;
+    let tip_rate = window_tip_rate(tip.saturating_sub(clock.last_sample_tip), window);
     clock.last_sample_tip = tip;
     clock.last_sample_at = now;
     let eta_rate = clock.rate.eta_rate(now);

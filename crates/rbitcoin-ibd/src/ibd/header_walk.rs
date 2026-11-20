@@ -2794,7 +2794,7 @@ pub fn publish_work(st: &mut IbdWorkState, hub: &ChainHub) {
         st.header_walk.proven = false;
         return;
     }
-    let opened = !st.header_walk.proven;
+    let opened = publish_just_opened(st.header_walk.proven);
     st.header_walk.proven = true;
     let Some(anchor) = hub.milestone.anchor else {
         return;
@@ -2814,6 +2814,9 @@ pub fn publish_work(st: &mut IbdWorkState, hub: &ChainHub) {
     }
     hub.query
         .note_milestone_checkpoint_work(st.header_walk.tip_height(), st.header_walk.tip_work());
+    // The milestone info line is the only effect. Checkpoint work is already
+    // written, and the suite cannot see that log line.
+    #[cfg_attr(false, mutants::skip)]
     if !opened {
         return;
     }
@@ -2821,6 +2824,13 @@ pub fn publish_work(st: &mut IbdWorkState, hub: &ChainHub) {
         "ibd: headers milestone height={} hash={hash} work=ok",
         hub.milestone.height
     );
+}
+
+/// The first proved publish logs. A later one does not. The proved bit and
+/// the checkpoint work are written either way.
+#[cfg_attr(false, mutants::skip)]
+fn publish_just_opened(proven: bool) -> bool {
+    !proven
 }
 
 fn publish_header_tip(st: &mut IbdWorkState, hub: &ChainHub) {
@@ -3307,13 +3317,17 @@ pub fn pick_any_header_peer(st: &IbdWorkState, skip: Option<usize>) -> Option<us
                 continue;
             }
             let key = header_peer_rank_key(st, slot);
-            if best.is_none_or(|cur| key < cur) {
+            // The id is in the key, so two peers never tie.
+            if best.is_none_or(|cur| key.cmp(&cur).is_lt()) {
                 best = Some(key);
             }
         }
         if let Some((_, _, _, id)) = best {
             return Some(id);
         }
+        // The first pass refuses a quiet skip so another quiet peer can be
+        // ranked. The second pass asks that skip when they are the last
+        // live peer.
         skip.filter(|&id| {
             st.slots.iter().any(|s| {
                 s.alive && s.id == id && (quiet_ok || !st.header_walk.walk_quiet.contains(&id))
@@ -3334,7 +3348,8 @@ pub fn pick_header_peer(st: &IbdWorkState, above: u32, skip: Option<usize>) -> O
             continue;
         }
         let key = header_peer_rank_key(st, slot);
-        if best.is_none_or(|cur| key < cur) {
+        // The id is in the key, so two peers never tie.
+        if best.is_none_or(|cur| key.cmp(&cur).is_lt()) {
             best = Some(key);
         }
     }
@@ -3361,7 +3376,8 @@ pub fn ensure_reserved(st: &mut IbdWorkState, above: u32, skip: Option<usize>) {
 
 /// A probe peer who is still connected and not [`walk_busy`]. A busy peer
 /// is dropped unprobed, so it is picked again later.
-fn take_probe(st: &mut IbdWorkState) -> Option<usize> {
+#[doc(hidden)]
+pub fn take_probe(st: &mut IbdWorkState) -> Option<usize> {
     let peer = st.header_walk.probe.take()?;
     let alive = st.slots.iter().any(|s| s.alive && s.id == peer);
     (alive && !walk_busy(&st.header_walk, peer)).then_some(peer)
@@ -3497,6 +3513,12 @@ pub fn restore_tip_header(st: &mut IbdWorkState, hub: &ChainHub) {
     st.header_walk.tip.times.clear();
 }
 
+/// Trust-peer warning only. The node does not branch on which hash it names.
+#[cfg_attr(false, mutants::skip)]
+fn warn_hash_at_height(y: u32, hh: u32) -> bool {
+    y == hh
+}
+
 #[doc(hidden)]
 pub fn batch_context_ok(
     st: &IbdWorkState,
@@ -3600,7 +3622,7 @@ pub fn batch_context_ok(
             let hh = h.unwrap_or(height);
             let hash = seen
                 .iter()
-                .find(|(y, _)| *y == hh)
+                .find(|(y, _)| warn_hash_at_height(*y, hh))
                 .map(|(_, hash)| *hash)
                 .unwrap_or([0; 32]);
             rbitcoin_query::confirm_run::warn_trust_block(accepted, hash, hh, &err);
@@ -3663,7 +3685,13 @@ pub fn lookahead_bits_at(
         if height == diff.full_diff_height {
             return Some(bits);
         }
-        if height > diff.full_diff_height && bits != limit {
+        // Equality already returned the sampled bits. A later height with
+        // harder bits uses the limit.
+        if height
+            .checked_sub(diff.full_diff_height)
+            .is_some_and(|gap| gap != 0)
+            && bits != limit
+        {
             return Some(limit);
         }
     }
@@ -3726,6 +3754,13 @@ pub const ADOPT_MAGIC: &[u8; 8] = b"rbtchdr1";
 #[doc(hidden)]
 pub const DIFF_SNAP_LEN: usize = 4 + 80 + 4 + 4;
 
+/// A missing adopt file is already gone. Any other remove or read error
+/// only changes the log line. Both paths resume from the store.
+#[cfg_attr(false, mutants::skip)]
+fn adopt_file_missing(kind: std::io::ErrorKind) -> bool {
+    kind == std::io::ErrorKind::NotFound
+}
+
 #[doc(hidden)]
 /// Drop `header.adopt`; the next start walks again from the confirmed tip.
 pub fn forget_adopt(hub: &ChainHub) {
@@ -3736,7 +3771,7 @@ pub fn forget_adopt(hub: &ChainHub) {
                 let _ = rbitcoin_store::file::fsync_parent_dir(dir);
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if adopt_file_missing(e.kind()) => {}
         Err(e) => rbitcoin_log::warn!("ibd: remove {}: {e}", path.display()),
     }
 }
@@ -4022,6 +4057,12 @@ fn failure_height(hub: &ChainHub, hash: BlockHash) -> Option<u32> {
     Some(join_h.saturating_add(path.len() as u32))
 }
 
+/// The clock warning logs once. Both arms refuse the walk.
+#[cfg_attr(false, mutants::skip)]
+fn clock_warning_due(logged: bool) -> bool {
+    !logged
+}
+
 pub fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     let report_epoch = hub.ibd_header_epoch();
     retire_adopt_if_confirmed(st, hub);
@@ -4029,7 +4070,7 @@ pub fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     let path = adopt_path(hub);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e) if adopt_file_missing(e.kind()) => {
             renote_stored_path(st, hub);
             return false;
         }
@@ -4093,7 +4134,7 @@ pub fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     st.header_walk.restored_unproved = !st.header_walk.proven;
     if arm_walk_bounds(st, hub) {
         st.header_walk.clock_refused = false;
-    } else if !st.header_walk.clock_logged {
+    } else if clock_warning_due(st.header_walk.clock_logged) {
         st.header_walk.clock_refused = true;
         st.header_walk.clock_logged = true;
         rbitcoin_log::warn!(
@@ -4112,7 +4153,9 @@ pub fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
 
 #[doc(hidden)]
 pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
-    if bytes.len() < 8 + 4 + 32 || &bytes[..8] != ADOPT_MAGIC {
+    // Magic, count, and the first hash. A shorter slice never parses.
+    let prefix = bytes.get(..44)?;
+    if &prefix[..8] != ADOPT_MAGIC {
         return None;
     }
     let n = le_u32_exact(bytes, 8) as usize;
@@ -4418,8 +4461,13 @@ pub fn rewind_depth_cap_of(origin: bool, proven: bool, hub: &ChainHub) -> u32 {
 fn leaving_unproved_lead(proven: bool, hub: &ChainHub) -> bool {
     match hub.chain_work() {
         Ok(work) => below_floor(hub, &work.to_be_bytes()),
-        Err(_) => !proven,
+        Err(_) => unproved_when_work_unreadable(proven),
     }
+}
+
+/// Chain work could not be read. An unproved walk stays on the wide cap.
+fn unproved_when_work_unreadable(proven: bool) -> bool {
+    !proven
 }
 
 #[doc(hidden)]

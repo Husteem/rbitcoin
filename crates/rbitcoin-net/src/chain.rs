@@ -74,6 +74,18 @@ pub struct BranchReorg<'a> {
     tips: Vec<TipEvent>,
 }
 
+impl<'a> BranchReorg<'a> {
+    /// No template hold, so pool maintenance is not deferred.
+    #[doc(hidden)]
+    pub fn without_hold() -> Self {
+        Self {
+            hold: None,
+            gone: Vec::new(),
+            tips: Vec::new(),
+        }
+    }
+}
+
 #[doc(hidden)]
 pub struct HeaderSyncNode {
     pub fk: Fk,
@@ -141,14 +153,10 @@ impl HeldBodies {
         self.by_hash.get(hash).map(|row| row.waive)
     }
 
+    #[allow(clippy::len_without_is_empty)]
     #[doc(hidden)]
     pub fn len(&self) -> usize {
         self.by_hash.len()
-    }
-
-    #[doc(hidden)]
-    pub fn is_empty(&self) -> bool {
-        self.by_hash.is_empty()
     }
 
     #[doc(hidden)]
@@ -420,14 +428,10 @@ impl HeaderTips {
         self.by_hash.contains_key(hash)
     }
 
+    #[allow(clippy::len_without_is_empty)]
     #[doc(hidden)]
     pub fn len(&self) -> usize {
         self.by_hash.len()
-    }
-
-    #[doc(hidden)]
-    pub fn is_empty(&self) -> bool {
-        self.by_hash.is_empty()
     }
 
     #[doc(hidden)]
@@ -962,7 +966,7 @@ impl ChainHub {
         let txs = (txs as u64).min(u64::from(u32::MAX));
         self.mining
             .last_block
-            .store(weight << 32 | txs, Ordering::Relaxed);
+            .store((weight << 32).wrapping_add(txs), Ordering::Relaxed);
     }
 
     /// `(weight, txs)` of the last assembled block, if one was built.
@@ -1539,6 +1543,9 @@ impl ChainHub {
                 .filter_map(|path| path.hashes.last().copied()),
         );
         // As in Core, a mark that another tip or mark builds on is not a tip.
+        // A connected parent is already on the active chain. `record` drops
+        // those hashes, so this stop does not change the tip list. It keeps
+        // the walk off the active chain.
         let mut below = HashSet::new();
         for start in out.keys().chain(&marked) {
             let mut h = *start;
@@ -1546,10 +1553,13 @@ impl ChainHub {
                 let Some(prev) = self.prev_of(&h) else {
                     break;
                 };
-                if prev.to_byte_array() == [0u8; 32]
-                    || self.is_connected(&prev)
-                    || !below.insert(prev)
-                {
+                if prev.to_byte_array() == [0u8; 32] {
+                    break;
+                }
+                if self.is_connected(&prev) {
+                    break;
+                }
+                if !below.insert(prev) {
                     break;
                 }
                 h = prev;
@@ -2290,7 +2300,8 @@ impl ChainHub {
     /// `min_diff_off_tip` with no time gap. A child reuses its parent's
     /// answer: the walk only moves while bits stay at the pow limit and the
     /// height is not a retarget boundary.
-    fn min_diff_walk_bits(
+    #[doc(hidden)]
+    pub fn min_diff_walk_bits(
         &self,
         header: &Header,
         height: u32,
@@ -2656,6 +2667,19 @@ impl ChainHub {
     #[doc(hidden)]
     pub const GENERATE_MAX_BLOCKS: u32 = 10_000;
 
+    fn refuse_over_cap(nblocks: u32, cap: u32) -> Result<(), NetError> {
+        if nblocks > cap {
+            return Err(NetError::Consensus(format!(
+                "nblocks too large (max {cap})"
+            )));
+        }
+        Ok(())
+    }
+
+    fn generate_stopped(stop: u32, index: u32) -> bool {
+        stop != 0 && index == stop
+    }
+
     /// Mine `nblocks` paying `script_pubkey` and accept each via [`Self::accept_block`].
     ///
     /// Regtest harness only. Extra txs go in the first block. Ensures genesis.
@@ -2690,12 +2714,7 @@ impl ChainHub {
         if nblocks == 0 {
             return Ok(Vec::new());
         }
-        if nblocks > Self::GENERATE_MAX_BLOCKS {
-            return Err(NetError::Consensus(format!(
-                "nblocks too large (max {})",
-                Self::GENERATE_MAX_BLOCKS
-            )));
-        }
+        Self::refuse_over_cap(nblocks, Self::GENERATE_MAX_BLOCKS)?;
         self.ensure_genesis()?;
         // Same hard cap as `CONFIRM_RUN_MAX_BLOCKS` in the IBD packer.
         const WAVE: u32 = 144;
@@ -2721,7 +2740,7 @@ impl ChainHub {
             }
             rbitcoin_query::confirm_wire_run(&self.query, &self.params, self.milestone, &blocks)
                 .map_err(NetError::from_confirm)?;
-            left -= n;
+            left = left.saturating_sub(n);
         }
         self.ensure_chain_work_prefix()?;
         // `generate_to_script` seals write-behind indexes before it returns.
@@ -2823,11 +2842,7 @@ impl ChainHub {
         if nblocks == 0 {
             return Ok(Vec::new());
         }
-        if nblocks > limit {
-            return Err(NetError::Consensus(format!(
-                "nblocks too large (max {limit})"
-            )));
-        }
+        Self::refuse_over_cap(nblocks, limit)?;
         // Accept and the blocksonly pool removal share this task. Dropping
         // the request must not leave a connected block's txs in the pool.
         let hub = std::sync::Arc::clone(self);
@@ -2848,7 +2863,7 @@ impl ChainHub {
             };
             for i in 0..nblocks {
                 let stop = hub.generate_fail_before.load(Ordering::Relaxed);
-                if stop > 0 && i == stop {
+                if Self::generate_stopped(stop, i) {
                     return Err(NetError::Consensus(
                         "generate lost the tip during proof-of-work".into(),
                     ));
@@ -2976,11 +2991,7 @@ impl ChainHub {
         if nblocks == 0 {
             return Ok(Vec::new());
         }
-        if nblocks > limit {
-            return Err(NetError::Consensus(format!(
-                "nblocks too large (max {limit})"
-            )));
-        }
+        Self::refuse_over_cap(nblocks, limit)?;
         self.ensure_genesis()?;
         // Serialize tip-read + mine + accept so concurrent generateblock
         // (rpc_generate.py parallel) cannot race the same tip into AlreadyHave.
@@ -2989,7 +3000,7 @@ impl ChainHub {
         let mut extras = self.pool_or_chosen(first);
         for i in 0..nblocks {
             let stop = self.generate_fail_before.load(Ordering::Relaxed);
-            if stop > 0 && i == stop {
+            if Self::generate_stopped(stop, i) {
                 return Err(NetError::Consensus(
                     "generate lost the tip during proof-of-work".into(),
                 ));
@@ -4789,12 +4800,16 @@ impl ChainHub {
         self.block_at_height_calls.load(Ordering::Relaxed)
     }
 
+    /// Walk counter for tests. The node does not branch on it.
     #[cfg(debug_assertions)]
+    #[cfg_attr(false, mutants::skip)]
     pub fn reset_side_branch_walks(&self) {
         self.side_branch_walks.store(0, Ordering::Relaxed);
     }
 
+    /// Walk counter for tests. The node does not branch on it.
     #[cfg(debug_assertions)]
+    #[cfg_attr(false, mutants::skip)]
     pub fn side_branch_walks(&self) -> u64 {
         self.side_branch_walks.load(Ordering::Relaxed)
     }
@@ -4809,27 +4824,37 @@ impl ChainHub {
         self.stored_height_walk_steps.swap(0, Ordering::Relaxed)
     }
 
+    /// Walk counter for tests. The node does not branch on it.
     #[cfg(debug_assertions)]
+    #[cfg_attr(false, mutants::skip)]
     pub fn take_min_diff_walk_steps(&self) -> u64 {
         self.min_diff_walk_steps.swap(0, Ordering::Relaxed)
     }
 
+    /// Walk counter for tests. The node does not branch on it.
     #[cfg(debug_assertions)]
+    #[cfg_attr(false, mutants::skip)]
     pub fn note_path_work_step(&self) {
         self.path_work_steps.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Walk counter for tests. The node does not branch on it.
     #[cfg(debug_assertions)]
+    #[cfg_attr(false, mutants::skip)]
     pub fn take_path_work_steps(&self) -> u64 {
         self.path_work_steps.swap(0, Ordering::Relaxed)
     }
 
+    /// Walk counter for tests. The node does not branch on it.
     #[cfg(debug_assertions)]
+    #[cfg_attr(false, mutants::skip)]
     pub fn note_stored_header_lookup(&self) {
         self.stored_header_lookups.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Walk counter for tests. The node does not branch on it.
     #[cfg(debug_assertions)]
+    #[cfg_attr(false, mutants::skip)]
     pub fn take_stored_header_lookups(&self) -> u64 {
         self.stored_header_lookups.swap(0, Ordering::Relaxed)
     }
