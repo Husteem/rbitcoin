@@ -410,14 +410,6 @@ fn height_map_cut_through_omits_spent_p2tr() {
     let hist_v: Value = serde_json::from_str(&hist).unwrap();
     assert_eq!(hist_v["1"].as_object().unwrap().len(), 1, "{hist}");
 
-    let cut_sub = subscribe(&q, &json!([1, 1, false]), &chain, 0).unwrap();
-    assert!(
-        cut_sub["1"].as_object().unwrap().is_empty(),
-        "subscribe cut-through omits the spent output: {cut_sub}"
-    );
-    let hist_sub = subscribe(&q, &json!([1, 1, true]), &chain, 0).unwrap();
-    assert_eq!(hist_sub["1"].as_object().unwrap().len(), 1, "{hist_sub}");
-
     let _ = std::fs::remove_dir_all(&dir);
 }
 

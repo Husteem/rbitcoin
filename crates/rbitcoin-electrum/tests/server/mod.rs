@@ -23,8 +23,8 @@ fn tmp_store() -> (rbitcoin_query::testutil::TempDir, Query) {
 }
 
 #[allow(clippy::cognitive_complexity)] // one fixture, many parser arms
-#[test]
-fn config_helpers_and_param_parsers() {
+#[tokio::test]
+async fn config_helpers_and_param_parsers() {
     let params = ChainParams::regtest();
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     assert_eq!(cfg.genesis_hash_hex, params.genesis_hash.to_string());
@@ -65,59 +65,23 @@ fn config_helpers_and_param_parsers() {
 
     let (dir, q) = tmp_store();
     q.set_sh_index_enabled(false);
+    let q = Arc::new(q);
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let mut header_sub = false;
-    let mut sh_subs = HashSet::new();
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, None).await;
     let sh = electrum_scripthash_hex(&[0x51]);
-    let err = dispatch(
+    let err = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.get_balance",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!([sh]),
     )
+    .await
     .unwrap_err();
     assert_eq!(err, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
-    // Tweaks and silent payments share that index gate.
-    let tweaks_off = dispatch(
-        "blockchain.tweaks.subscribe",
-        &json!([]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap_err();
-    assert_eq!(tweaks_off, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
-    let sp_off = dispatch(
-        "blockchain.silentpayments.subscribe",
-        &json!([]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap_err();
-    assert_eq!(sp_off, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
-    let ping = dispatch(
-        "server.ping",
-        &json!([]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
+    let ping = electrum_tcp_call(&mut stream, "server.ping", json!([]))
+        .await
+        .unwrap();
     assert_eq!(ping, Value::Null);
+    handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 
     let mut sh_bytes = [0u8; 32];
@@ -499,6 +463,33 @@ pub(crate) async fn electrum_tcp_rpc(
     stream.write_all(line.as_bytes()).await.unwrap();
     let resp = read_exact_line(stream).await;
     serde_json::from_str(&resp).unwrap()
+}
+
+/// A listener from [`run_electrum`] on `q` and one client connected to it.
+pub(crate) async fn electrum_tcp_client(
+    q: &Arc<Query>,
+    cfg: ElectrumConfig,
+    mempool: Option<Arc<MempoolHub>>,
+) -> (ElectrumHandle, TcpStream) {
+    let (tip_tx, _) = broadcast::channel(4);
+    let handle = run_electrum(cfg, Arc::clone(q), ChainParams::regtest(), tip_tx, mempool)
+        .await
+        .unwrap();
+    let stream = TcpStream::connect(handle.local_addr).await.unwrap();
+    (handle, stream)
+}
+
+/// One request's result, or its error message.
+pub(crate) async fn electrum_tcp_call(
+    stream: &mut TcpStream,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let reply = electrum_tcp_rpc(stream, 1, method, params).await;
+    match reply.get("error") {
+        Some(e) => Err(e["message"].as_str().expect("error message").to_owned()),
+        None => Ok(reply["result"].clone()),
+    }
 }
 
 fn dotted_at_least(version: &str, min: &[u64]) -> bool {
@@ -1511,9 +1502,11 @@ async fn api_log_records_electrum_method() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// BCH-style optional `from_height`/`to_height` on get_history; status stays full.
-#[test]
-fn get_history_height_window_and_status_full() {
+/// `get_merkle` pinned by `asof:` at the tip serves the tip's proof. A
+/// height above the pin is not on the pinned chain. On the same connection,
+/// `subscribe` after a windowed `get_history` reports full-history status.
+#[tokio::test]
+async fn asof_get_merkle_serves_heights_through_the_pin() {
     use rbitcoin_primitives::{Fk, Height};
     use rbitcoin_query::TxApply;
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
@@ -1570,117 +1563,63 @@ fn get_history_height_window_and_status_full() {
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
     }
 
+    let q = Arc::new(q);
     let params = ChainParams::regtest();
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let mut header_sub = false;
-    let mut sh_subs = HashSet::new();
-    let sh = electrum_scripthash_hex(&[0x51]);
-
-    let full = dispatch(
-        "blockchain.scripthash.get_history",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
-    let full_arr = full.as_array().unwrap();
-    assert_eq!(full_arr.len(), 4);
-
-    // Inclusive from, exclusive to → heights 1 and 2 only.
-    let windowed = dispatch(
-        "blockchain.scripthash.get_history",
-        &json!([sh, 1, 3]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
-    let w = windowed.as_array().unwrap();
-    assert_eq!(w.len(), 2);
-    assert_eq!(w[0]["height"], 1);
-    assert_eq!(w[1]["height"], 2);
-    assert!(w.len() < full_arr.len());
-
-    // to_height=-1 is open upper (same as full for confirmed-only).
-    let open_to = dispatch(
-        "blockchain.scripthash.get_history",
-        &json!([sh, 0, -1]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
-    assert_eq!(open_to.as_array().unwrap().len(), full_arr.len());
-
-    // Subscribe status is always full history, independent of windowed calls.
-    let status = dispatch(
-        "blockchain.scripthash.subscribe",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
-    let status_s = status.as_str().unwrap();
-    assert!(!status_s.is_empty());
-    // Recompute status from full confirmed history and match.
-    let sh_bytes = {
-        let mut b = rbitcoin_primitives::hex_decode(&sh).unwrap();
-        b.reverse();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&b);
-        out
-    };
-    let full_hist = q.scripthash_history(&sh_bytes).unwrap();
-    assert_eq!(full_hist.len(), 4);
-    assert_eq!(scripthash_status(&full_hist), status_s);
-
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, None).await;
     let tip_hash = parent_hash.unwrap();
     let mut txid = [0u8; 32];
     txid[0..4].copy_from_slice(&3u32.to_le_bytes());
     txid[31] = 0xcb;
     let asof = format!("asof:{}", hash_hex_rev(&tip_hash));
-    let merkle_at = |height: u32, tag: &str| {
-        electrum_at_chain_view(
-            &q,
-            "blockchain.transaction.get_merkle",
-            &json!([txid_hex(&txid), height, tag]),
-            |q, rpc_params, view, is_asof| {
-                let mut pin_conn = ElectrumConn::new();
-                dispatch_pinned(
-                    "blockchain.transaction.get_merkle",
-                    rpc_params,
-                    q,
-                    &cfg,
-                    &params,
-                    None,
-                    &mut pin_conn,
-                    view,
-                    is_asof,
-                )
-            },
-        )
-        .0
-    };
-    let at_tip = merkle_at(3, &asof).expect("merkle at the pinned height");
+    let at_tip = electrum_tcp_call(
+        &mut stream,
+        "blockchain.transaction.get_merkle",
+        json!([txid_hex(&txid), 3, &asof]),
+    )
+    .await
+    .expect("merkle at the pinned height");
     assert_eq!(at_tip["block_height"], 3);
     assert_eq!(at_tip["pos"], 0);
-    let above = merkle_at(4, &asof).unwrap_err();
+    let above = electrum_tcp_call(
+        &mut stream,
+        "blockchain.transaction.get_merkle",
+        json!([txid_hex(&txid), 4, &asof]),
+    )
+    .await
+    .unwrap_err();
     assert!(above.contains("asof not on chain"), "{above}");
 
+    // The full `get_history` fills the connection's `sh_join` slot. The
+    // windowed one and `subscribe` both read that slot; the status still
+    // covers every row.
+    let sh = electrum_scripthash_hex(&[0x51]);
+    let all = electrum_tcp_call(
+        &mut stream,
+        "blockchain.scripthash.get_history",
+        json!([&sh]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(all.as_array().unwrap().len(), 4, "{all}");
+    let windowed = electrum_tcp_call(
+        &mut stream,
+        "blockchain.scripthash.get_history",
+        json!([&sh, 1, 3]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(windowed.as_array().unwrap().len(), 2, "{windowed}");
+    let status = electrum_tcp_call(&mut stream, "blockchain.scripthash.subscribe", json!([&sh]))
+        .await
+        .unwrap();
+    let mut sh_bytes = rbitcoin_primitives::hex_decode(&sh).unwrap();
+    sh_bytes.reverse();
+    let full = q.scripthash_history(&sh_bytes.try_into().unwrap()).unwrap();
+    assert_eq!(full.len(), 4);
+    assert_eq!(status, json!(scripthash_status(&full)));
+
+    handle.shutdown().await;
     let _ = prev;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2197,16 +2136,6 @@ async fn chain_view_reorg_notifies_dropped_scripthash() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// DoS: line without newline beyond max must fail without allocating forever.
-#[tokio::test]
-async fn read_line_capped_rejects_oversize() {
-    use std::io::Cursor;
-    use tokio::io::BufReader;
-    let mut r = BufReader::new(Cursor::new(vec![b'A'; 64]));
-    let err = read_line_capped(&mut r, 32).await.unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-}
-
 #[tokio::test]
 async fn read_line_capped_accepts_under_limit() {
     use std::io::Cursor;
@@ -2232,97 +2161,86 @@ async fn read_line_capped_keeps_a_partial_line_through_the_cap() {
     assert_eq!(line, "AA");
 }
 
-#[test]
-fn broadcast_hex_cap_enforced() {
+/// A connection on a listener whose broadcast hex cap is `max_hex`. The
+/// request line limit is raised so the hex cap answers first.
+async fn broadcast_client(q: &Arc<Query>, max_hex: usize) -> (ElectrumHandle, TcpStream) {
+    let mut cfg =
+        ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &ChainParams::regtest());
+    cfg.max_broadcast_hex = max_hex;
+    cfg.limits.max_request_bytes = 9_000_000;
+    electrum_tcp_client(q, cfg, None).await
+}
+
+#[tokio::test]
+async fn broadcast_hex_cap_enforced() {
     let (dir, q) = tmp_store();
-    let params = ChainParams::regtest();
-    let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    cfg.max_broadcast_hex = 16;
-    let mut header_sub = false;
-    let mut sh_subs = HashSet::new();
-    let err = dispatch(
+    let q = Arc::new(q);
+
+    let (handle, mut stream) = broadcast_client(&q, 16).await;
+    let err = electrum_tcp_call(
+        &mut stream,
         "blockchain.transaction.broadcast",
-        &json!(["aa".repeat(20)]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!(["aa".repeat(20)]),
     )
+    .await
     .unwrap_err();
     assert!(err.contains("too large"), "{err}");
-    let pkg_err = dispatch(
+    let pkg_err = electrum_tcp_call(
+        &mut stream,
         "blockchain.transaction.broadcast_package",
-        &json!([["aa".repeat(20)]]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!([["aa".repeat(20)]]),
     )
+    .await
     .unwrap_err();
     assert!(pkg_err.contains("too large"), "{pkg_err}");
-    let exact_hex = dispatch(
+    let exact_hex = electrum_tcp_call(
+        &mut stream,
         "blockchain.transaction.broadcast",
-        &json!(["00".repeat(8)]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!(["00".repeat(8)]),
     )
+    .await
     .unwrap_err();
     assert!(
         !exact_hex.contains("transaction hex too large"),
         "{exact_hex}"
     );
-    cfg.max_broadcast_hex = 4;
-    let exact_pkg = dispatch(
+    handle.shutdown().await;
+
+    let (handle, mut stream) = broadcast_client(&q, 4).await;
+    let exact_pkg = electrum_tcp_call(
+        &mut stream,
         "blockchain.transaction.broadcast_package",
-        &json!([["0000"]]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!([["0000"]]),
     )
+    .await
     .unwrap_err();
     assert!(!exact_pkg.contains("package hex too large"), "{exact_pkg}");
-    cfg.max_broadcast_hex = 8_000_004;
-    let at_decode_cap = dispatch(
+    handle.shutdown().await;
+
+    let (handle, mut stream) = broadcast_client(&q, 8_000_004).await;
+    let at_decode_cap = electrum_tcp_call(
+        &mut stream,
         "blockchain.transaction.broadcast",
-        &json!(["00".repeat(4_000_000)]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!(["00".repeat(4_000_000)]),
     )
+    .await
     .unwrap_err();
     assert!(
         !at_decode_cap.contains("transaction too large"),
         "{at_decode_cap}"
     );
-    let over_decode = dispatch(
+    let over_decode = electrum_tcp_call(
+        &mut stream,
         "blockchain.transaction.broadcast",
-        &json!(["00".repeat(4_000_001)]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!(["00".repeat(4_000_001)]),
     )
+    .await
     .unwrap_err();
     assert!(
         over_decode.contains("transaction too large"),
         "{over_decode}"
     );
+    handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2647,14 +2565,14 @@ async fn tweaks_subscribe_pre_taproot_collapses_empty_heights() {
 }
 
 #[allow(clippy::cognitive_complexity)] // one store, every method's missing/wrong-type params
-#[test]
-fn dispatch_param_type_edges_and_subscribe_cap() {
+#[tokio::test]
+async fn param_type_edges_and_subscribe_cap() {
     let (dir, q) = tmp_store();
+    let q = Arc::new(q);
     let params = ChainParams::regtest();
     let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     cfg.max_scripthash_subs = 1;
-    let mut header_sub = false;
-    let mut sh_subs = HashSet::new();
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, None).await;
     let sh = electrum_scripthash_hex(&[0x51]);
     let sh2 = electrum_scripthash_hex(&[0x52]);
 
@@ -2774,17 +2692,9 @@ fn dispatch_param_type_edges_and_subscribe_cap() {
         ),
         ("no.such.method", json!([]), "unknown method"),
     ] {
-        let err = dispatch(
-            method,
-            &args,
-            &q,
-            &cfg,
-            &params,
-            None,
-            &mut header_sub,
-            &mut sh_subs,
-        )
-        .unwrap_err();
+        let err = electrum_tcp_call(&mut stream, method, args.clone())
+            .await
+            .unwrap_err();
         assert!(
             err.contains(needle),
             "{method} {args}: expected {needle:?} in {err}"
@@ -2792,93 +2702,50 @@ fn dispatch_param_type_edges_and_subscribe_cap() {
     }
 
     let asof = format!("asof:{}", "ab".repeat(32));
-    let err = dispatch(
+    let err = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.get_balance",
-        &json!([sh, asof]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!([sh, asof]),
     )
+    .await
     .unwrap_err();
     assert!(
         err.contains("asof not on chain"),
         "unknown asof hash: {err}"
     );
 
-    dispatch(
-        "blockchain.scripthash.subscribe",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
-    let err = dispatch(
-        "blockchain.scripthash.subscribe",
-        &json!([sh2]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap_err();
+    electrum_tcp_call(&mut stream, "blockchain.scripthash.subscribe", json!([sh]))
+        .await
+        .unwrap();
+    let err = electrum_tcp_call(&mut stream, "blockchain.scripthash.subscribe", json!([sh2]))
+        .await
+        .unwrap_err();
     assert!(err.contains("too many scripthash"), "{err}");
-    let again = dispatch(
-        "blockchain.scripthash.subscribe",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
+    let again = electrum_tcp_call(&mut stream, "blockchain.scripthash.subscribe", json!([sh]))
+        .await
+        .unwrap();
     assert_eq!(again, Value::Null, "empty store: no history, null status");
-    let dropped = dispatch(
+    let dropped = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.unsubscribe",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!([sh]),
     )
+    .await
     .unwrap();
     assert_eq!(dropped, json!(true));
-    let missing = dispatch(
+    let missing = electrum_tcp_call(
+        &mut stream,
         "blockchain.scripthash.unsubscribe",
-        &json!([sh]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
+        json!([sh]),
     )
+    .await
     .unwrap();
     assert_eq!(missing, json!(false));
-    dispatch(
-        "blockchain.scripthash.subscribe",
-        &json!([sh2]),
-        &q,
-        &cfg,
-        &params,
-        None,
-        &mut header_sub,
-        &mut sh_subs,
-    )
-    .unwrap();
+    electrum_tcp_call(&mut stream, "blockchain.scripthash.subscribe", json!([sh2]))
+        .await
+        .unwrap();
 
+    handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 

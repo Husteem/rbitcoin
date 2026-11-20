@@ -2610,9 +2610,7 @@ pub fn method_stays_on_worker(method: &str) -> bool {
 
 #[doc(hidden)]
 pub fn method_needs_sh_index(method: &str) -> bool {
-    method.starts_with("blockchain.scripthash.")
-        || method.starts_with("blockchain.tweaks.")
-        || method.starts_with("blockchain.silentpayments.")
+    method.starts_with("blockchain.scripthash.") || method.starts_with("blockchain.silentpayments.")
 }
 
 /// Chain-tip stamp and a trailing `asof:` share this set. A method that
@@ -2691,34 +2689,6 @@ where
         },
         Err(e) => (Err(e), None),
     }
-}
-
-#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn dispatch(
-    method: &str,
-    params: &Value,
-    query: &Query,
-    config: &ElectrumConfig,
-    chain: &ChainParams,
-    mempool: Option<&MempoolHub>,
-    header_sub: &mut bool,
-    sh_subs: &mut HashSet<[u8; 32]>,
-) -> Result<Value, String> {
-    let mut conn = ElectrumConn {
-        protocol: String::new(),
-        header_sub: *header_sub,
-        sh_subs: std::mem::take(sh_subs),
-        sh_join: None,
-        outpoint_subs: HashSet::new(),
-        sp_subs: Vec::new(),
-        sp_scans: Vec::new(),
-    };
-    let r = dispatch_with_join(method, params, query, config, chain, mempool, &mut conn);
-    *header_sub = conn.header_sub;
-    *sh_subs = conn.sh_subs;
-    r
 }
 
 #[doc(hidden)]
@@ -2800,7 +2770,7 @@ fn broadcast_tx_from_params(
     decode_broadcast_tx(raw_hex)
 }
 
-/// Hex array plus the verbose flag. One size check for sync and async broadcast.
+/// Hex array plus the verbose flag, under the broadcast hex cap.
 fn decode_broadcast_package(
     params: &Value,
     config: &ElectrumConfig,
@@ -2847,21 +2817,7 @@ fn package_broadcast_value(verbose: bool, accepted: &[rbitcoin_net::AcceptResult
     })
 }
 
-#[doc(hidden)]
-pub fn broadcast_raw_tx(
-    params: &Value,
-    config: &ElectrumConfig,
-    mempool: Option<&MempoolHub>,
-) -> Result<Value, String> {
-    let tx = broadcast_tx_from_params(params, config)?;
-    let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
-    let r = mp
-        .accept_tx_from(&tx, rbitcoin_net::TxOrigin::Local)
-        .map_err(|e| format!("broadcast reject: {e}"))?;
-    Ok(json!(format!("{}", r.txid)))
-}
-
-/// [`broadcast_raw_tx`] with script verify awaited on the connection task.
+/// Accept one raw tx, with script verify awaited on the connection task.
 pub async fn broadcast_raw_tx_async(
     params: &Value,
     config: &ElectrumConfig,
@@ -2881,21 +2837,7 @@ pub async fn broadcast_raw_tx_async(
     Ok(json!(format!("{}", r.txid)))
 }
 
-#[doc(hidden)]
-pub fn broadcast_package(
-    params: &Value,
-    config: &ElectrumConfig,
-    mempool: Option<&MempoolHub>,
-) -> Result<Value, String> {
-    let (txs, verbose) = decode_broadcast_package(params, config)?;
-    let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
-    let accepted = mp
-        .accept_package(&txs)
-        .map_err(|e| format!("broadcast_package reject: {e}"))?;
-    Ok(package_broadcast_value(verbose, &accepted))
-}
-
-/// [`broadcast_package`] with each member's scripts awaited on the connection task.
+/// Accept a package, with each member's scripts awaited on the connection task.
 pub async fn broadcast_package_async(
     params: &Value,
     config: &ElectrumConfig,
@@ -3224,8 +3166,6 @@ pub fn dispatch_pinned(
                 "pos": proof.pos,
             }))
         }
-        "blockchain.transaction.broadcast" => broadcast_raw_tx(params, config, mempool),
-        "blockchain.transaction.broadcast_package" => broadcast_package(params, config, mempool),
         "mempool.get_info" => {
             let inc = MempoolHub::relay_fee_btc_per_kb();
             let min_relay = mempool
@@ -3256,10 +3196,6 @@ pub fn dispatch_pinned(
         "blockchain.outpoint.unsubscribe" => {
             let (txid, vout) = param_outpoint(params)?;
             Ok(json!(conn.outpoint_subs.remove(&(txid, vout))))
-        }
-        "blockchain.silentpayments.subscribe" => {
-            let sub = parse_sp_sub_on_chain(params, query, chain)?;
-            Ok(crate::silent_scan::subscribe_result(&sub))
         }
         "blockchain.silentpayments.unsubscribe" => {
             silentpayments_unsubscribe(conn, query, chain, params)
@@ -3295,9 +3231,6 @@ pub fn dispatch_pinned(
             Ok(Value::Array(arr))
         }
         "server.peers.subscribe" => Ok(json!([])),
-        "blockchain.tweaks.subscribe" => {
-            crate::tweaks::subscribe(query, params, chain, config.tweaks_min_dust)
-        }
         other => Err(format!("unknown method: {other}")),
     }
 }

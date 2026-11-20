@@ -16,7 +16,7 @@ use rbitcoin_query::{Query, ThinTweakRangeLimits, ThinTweakRow};
 use serde_json::Map;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Cake-compatible subscribe chunk: `done` at a wave boundary after this
 /// wall time so Cake resubscribes (persist lags one event; cake_wallet#3574).
@@ -72,18 +72,6 @@ pub fn last_height(start: u32, count: u32, tip: Option<u32>) -> Option<u32> {
         return None;
     }
     Some(start.saturating_add(count.saturating_sub(1)).min(tip))
-}
-
-/// One height key → txs. Cake `fromJson` uses the **last** map key as `block`.
-pub fn height_map(
-    query: &Query,
-    chain: &ChainParams,
-    h: u32,
-    cut_through: bool,
-    min_dust: u64,
-) -> Result<Value, String> {
-    let s = height_map_json(query, chain, h, cut_through, min_dust)?;
-    serde_json::from_str(&s).map_err(|e| e.to_string())
 }
 
 /// Cake height map as JSON text (no `serde_json::Value` tree).
@@ -511,28 +499,6 @@ pub fn done_notify() -> Value {
         "method": "blockchain.tweaks.subscribe",
         "params": [{"message": "done"}],
     })
-}
-
-/// JSON-RPC **result** is the **first** height only. Further heights are
-/// notifications from the server loop.
-pub fn subscribe(
-    query: &Query,
-    params: &Value,
-    chain: &ChainParams,
-    min_dust: u64,
-) -> Result<Value, String> {
-    let req = parse_req(params)?;
-    let t0 = Instant::now();
-    let map = height_map(query, chain, req.start, !req.historical, min_dust)?;
-    rbitcoin_log::trace!(
-        Electrum,
-        "tweaks h={} count={} result_keys={} wall_ms={}",
-        req.start,
-        req.count,
-        map.as_object().map(|o| o.len()).unwrap_or(0),
-        t0.elapsed().as_millis()
-    );
-    Ok(map)
 }
 
 fn param_u32(params: &Value, idx: usize) -> Result<u32, String> {
