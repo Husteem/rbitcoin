@@ -281,7 +281,6 @@ pub struct IbdPerfSample {
 
     pub sh_runs: usize,
 
-    /// Wire rebuild: store body decode count + wall ms.
     pub sh_collect_ms: u64,
     pub sh_sort_ms: u64,
     pub sh_seed_ms: u64,
@@ -340,9 +339,6 @@ pub struct IbdPerfSample {
     pub stamp_prepare_ms: u64,
     pub stamp_filter_ms: u64,
     pub stamp_batch_ms: u64,
-    /// plan_batch internals (from ConfirmWindow archive prep).
-    /// head_fk + head_dens (legacy total).
-    /// Pure get_fk_by_txid_batch wall.
     pub thr_load_recv_wait_ms: u64,
     pub thr_load_pack_ms: u64,
     pub thr_load_clone_ms: u64,
@@ -421,10 +417,10 @@ pub struct IbdPerfSample {
     pub arch_prep_miss_peeks: u64,
     /// Write-behind pending txid→fk hits.
     pub arch_prep_pending_hits: u64,
-    /// Winner sealed-age CDF % (0/3/7/15/31); `cdf3` ≈ wave1 hit % under ages≤3 policy.
+    /// Winner sealed-age CDF % (0/3); `cdf3` ≈ wave1 hit % under ages≤3 policy.
     pub arch_prep_age_cdf0_pct: u64,
     pub arch_prep_age_cdf3_pct: u64,
-    /// Winner age hist compact `h0:h1:…:h7+tail`.
+    /// Winner age hits, the CDF denominator.
     pub arch_prep_age_hit_n: u64,
     pub arch_prep_body_lookups: u64,
     pub arch_prep_stamp_ms: u64,
@@ -444,7 +440,6 @@ pub struct IbdPerfSample {
     pub rss_anon_kb: u64,
     pub rss_file_kb: u64,
     pub vm_hwm_kb: u64,
-    /// `mlock`ed pages only (usually 0); RSS is **not** limited to these.
     /// Work-path + body presence occupancy (O(1) lens).
     pub work: WorkStructureSizes,
     /// Query-side process-owned caches (residency + header plans + SH + tx.head).

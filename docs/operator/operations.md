@@ -496,7 +496,7 @@ that peer's block getdata back to densify when it drops the peer (`apply_peer_de
 
 **Create pins:** pipeline-local only (`batch_pin` / `BatchParents`). No process pin FIFO. Header plans via ConfirmParentCache. Just-confirmed **identity + full create outs** stay on in-flight until a later lookup wave snapshots drain+fence past the pack height and load finishes that wave's last in-flight read. Class A commit drops the decoded block and leaves the outputs. Not a coins cache.
 
-**Archive `tx.head` split (perf_dbg):** `plan_batch … head_rd=` is parent
+**Archive `tx.head` split:** `plan_batch … head_rd=` is parent
 **read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).
 `class_a_commit … head=` is create **insert** (`head_insert_many`). Pipeline pins stay on the plan (`batch_pin`); no process denserels seed.
 
