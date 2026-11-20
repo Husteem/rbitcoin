@@ -189,6 +189,10 @@ pub struct HeaderWalk {
     pub walk: Lane,
     /// Expired asks. Not written to `header.adopt`.
     pub header_misses: HashMap<usize, u8>,
+    /// Walk tip each unanswered headers ask to a peer named, oldest first;
+    /// none for a probe. A headers message has no request id, so each one
+    /// from that peer answers the oldest. Not written to `header.adopt`.
+    pub asked_tips: HashMap<usize, std::collections::VecDeque<Option<BlockHash>>>,
     /// Difficulty at `base_hash`, restored when every checkpoint is rewound.
     pub base_diff: DiffSnap,
     /// Heavier-so-far alternate that has not yet passed the candidate.
@@ -234,6 +238,10 @@ pub const LOOKAHEAD_ASK: Duration = Duration::from_secs(5);
 /// Missed header asks before header-role retirement or disconnection.
 #[doc(hidden)]
 pub const HEADER_MISS_DISCONNECT: u8 = 2;
+/// Unanswered asks remembered per peer; past it the oldest is forgotten. A
+/// peer that answers in order is dropped for its expired asks long before it
+/// has this many open.
+const ASKED_TIPS_MAX: usize = 8;
 /// Recent block traffic permits two extra header misses, not indefinite silence.
 const PRODUCTIVE_HEADER_MISS_DISCONNECT: u8 = 4;
 /// Header-only timeouts must not destroy a productive block session. Match
@@ -827,6 +835,7 @@ pub fn forget_walk_peer(st: &mut IbdWorkState, peer: usize) {
     st.header_walk.walk_quiet.remove(&peer);
     st.header_walk.header_timeout_peers.remove(&peer);
     st.header_walk.header_misses.remove(&peer);
+    st.header_walk.asked_tips.remove(&peer);
     if st.header_walk.reserved == Some(peer) {
         st.header_walk.reserved = None;
     }
@@ -1255,12 +1264,16 @@ pub fn rewind_above(st: &mut IbdWorkState, hub: &ChainHub, height: u32) {
 }
 
 /// Pop checkpoints above `height`, or the current tip when `dead` is set.
-/// `dead` is the hash that every peer left empty.
+/// `dead` is the hash that every peer left empty. The base is not a
+/// look-ahead tip, so it is never marked dead.
 #[doc(hidden)]
 pub fn rewind_to(st: &mut IbdWorkState, hub: &ChainHub, height: u32, dead: Option<BlockHash>) {
     let dead_height = st.header_walk.tip_height();
-    if let Some(dead) = dead {
-        note_dead(st, dead);
+    let marked = dead.filter(|hash| st.header_walk.base_hash != Some(*hash));
+    if dead.is_some() {
+        if let Some(hash) = marked {
+            note_dead(st, hash);
+        }
         st.header_walk.checkpoints.pop();
     } else {
         while st
@@ -1301,7 +1314,7 @@ pub fn rewind_to(st: &mut IbdWorkState, hub: &ChainHub, height: u32, dead: Optio
     drop_queue_above(st, keep, &keep_hashes);
     if dead.is_some() {
         st.header_walk.emptied.clear();
-        if let Some(dead) = dead {
+        if let Some(dead) = marked {
             rbitcoin_log::warn!(
                 "ibd: headers dead-end hash={dead} height={dead_height} rewind={keep}"
             );
@@ -2561,13 +2574,21 @@ pub fn refill_misses_checkpoint(st: &IbdWorkState, tail_h: u32, headers: &[Heade
     false
 }
 
-/// Every alive peer answered empty before the work floor. True when the walk
-/// consumed the reply.
-pub fn note_empty(st: &mut IbdWorkState, hub: &ChainHub, peer: usize) -> bool {
+/// Every alive peer answered an ask empty before the work floor. True when the
+/// walk consumed the reply. `asked` is the walk tip this peer's ask named; an
+/// empty reply says nothing about any other tip.
+pub fn note_empty(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    asked: Option<BlockHash>,
+) -> bool {
     if !st.header_walk.origin || !below_floor(hub, &st.header_walk.tip_work()) {
         return false;
     }
-    st.header_walk.emptied.insert(peer);
+    if asked.is_some() && asked == st.header_walk.tip_hash() {
+        st.header_walk.emptied.insert(peer);
+    }
     let tall: Vec<usize> = st
         .slots
         .iter()
@@ -2959,7 +2980,7 @@ pub enum HeaderAsk {
     Unsolicited,
     /// Reply inside the window.
     InWindow,
-    /// The window expired. The tip has not moved, so the reply can still extend it.
+    /// The window expired. The reply still extends the tip when it builds on it.
     Late,
 }
 
@@ -3203,6 +3224,7 @@ pub fn arm_header_ask(
     let above = path_top(st, hub).map(|(_, height)| height).unwrap_or(0);
     if let Some(peer) = take_challenge(st) {
         if ask_header_peer(st, hub, peer, &tips)? {
+            note_asked_tip(st, peer);
             st.header_walk.challenge_open = Some(peer);
             return Ok(true);
         }
@@ -3239,6 +3261,7 @@ pub fn arm_header_ask(
             }
         };
         if sent {
+            note_ask(st, peer, None);
             st.header_walk.probe_open = Some(peer);
             let now = Instant::now();
             if let Some(slot) = st.slots.iter_mut().find(|s| s.id == peer) {
@@ -3256,7 +3279,33 @@ pub fn arm_header_ask(
     let Some(peer) = st.header_walk.reserved else {
         return Ok(false);
     };
-    ask_header_peer(st, hub, peer, &tips)
+    let sent = ask_header_peer(st, hub, peer, &tips)?;
+    if sent {
+        note_asked_tip(st, peer);
+    }
+    Ok(sent)
+}
+
+/// Record the walk tip a walk or challenge ask to `peer` named.
+#[doc(hidden)]
+pub fn note_asked_tip(st: &mut IbdWorkState, peer: usize) {
+    let tip = st.header_walk.tip_hash();
+    note_ask(st, peer, tip);
+}
+
+/// Queue one sent headers ask behind the asks `peer` has not answered.
+fn note_ask(st: &mut IbdWorkState, peer: usize, tip: Option<BlockHash>) {
+    let asks = st.header_walk.asked_tips.entry(peer).or_default();
+    if asks.len() == ASKED_TIPS_MAX {
+        asks.pop_front();
+    }
+    asks.push_back(tip);
+}
+
+/// The walk tip named by the ask this headers message from `peer` answers.
+#[doc(hidden)]
+pub fn take_asked_tip(st: &mut IbdWorkState, peer: usize) -> Option<BlockHash> {
+    st.header_walk.asked_tips.get_mut(&peer)?.pop_front()?
 }
 
 /// Time from connect to the first block body. `None` until a body arrives.
@@ -4258,6 +4307,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         probe_top: None,
         walk: Lane::default(),
         header_misses: HashMap::new(),
+        asked_tips: HashMap::new(),
         base_diff,
         challenger: None,
         adopt_retired: false,

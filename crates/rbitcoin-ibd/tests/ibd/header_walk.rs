@@ -588,6 +588,15 @@ fn apply(st: &mut IbdWorkState, hub: &ChainHub, peer: usize, headers: Vec<Header
     );
 }
 
+/// An empty reply to a walk ask this peer was sent at the current tip, with
+/// every earlier ask to it already answered.
+fn asked_empty(st: &mut IbdWorkState, hub: &ChainHub, peer: usize) {
+    st.header_walk.asked_tips.remove(&peer);
+    note_lane(st, peer);
+    note_asked_tip(st, peer);
+    apply(st, hub, peer, vec![]);
+}
+
 fn blocks_inv(st: &mut IbdWorkState, hub: &ChainHub, peer: usize, hashes: Vec<BlockHash>) {
     apply_peer_event(
         st,
@@ -3241,7 +3250,7 @@ fn a_heavier_header_chain_keeps_its_context() {
             assert!(send_getheaders(&mut st, &hub).unwrap());
             apply(&mut st, &hub, 0, vec![first, second]);
             set_min_work(&mut hub, [0xff; 32]);
-            apply(&mut st, &hub, 0, vec![]);
+            asked_empty(&mut st, &hub, 0);
             assert_eq!(st.header_walk.tip_hash(), Some(base_hash));
             assert_eq!(st.header_walk.tip_height(), base_height);
             assert_eq!(
@@ -3338,7 +3347,7 @@ fn a_heavier_header_chain_keeps_its_context() {
             assert_eq!(st.header_walk.tip_height(), 46);
 
             set_min_work(&mut hub, [0xff; 32]);
-            apply(&mut st, &hub, 0, vec![]);
+            asked_empty(&mut st, &hub, 0);
             assert_eq!(
                 st.header_walk.tip_height(),
                 36,
@@ -3748,8 +3757,8 @@ fn rewind_clears_a_milestone_hash_from_the_abandoned_chain() {
     plant_on_queue(&mut st, a2.block_hash(), 2);
 
     set_min_work(&mut hub, [0xff; 32]);
-    apply(&mut st, &hub, 0, vec![]);
-    apply(&mut st, &hub, 1, vec![]);
+    asked_empty(&mut st, &hub, 0);
+    asked_empty(&mut st, &hub, 1);
     assert_eq!(st.header_walk.tip_hash(), Some(gen));
     assert!(
         st.header_walk.off_path.is_empty(),
@@ -4008,7 +4017,7 @@ fn a_short_peer_does_not_block_an_empty_rewind() {
     plant_on_queue(&mut st, a1.block_hash(), 1);
     plant_on_queue(&mut st, a2.block_hash(), 2);
     set_min_work(&mut hub, [0xff; 32]);
-    apply(&mut st, &hub, 0, vec![]);
+    asked_empty(&mut st, &hub, 0);
     assert_eq!(st.header_walk.tip_hash(), Some(gen));
     assert!(st.slots.iter().any(|s| s.id == 1 && s.alive));
 }
@@ -4068,7 +4077,7 @@ fn restored_checkpoint_times_accept_a_header_under_the_tip_time() {
     assert!(st.slots[0].alive);
 
     set_min_work(&mut hub, [0xff; 32]);
-    apply(&mut st, &hub, 0, vec![]);
+    asked_empty(&mut st, &hub, 0);
     assert_eq!(st.header_walk.tip_hash(), Some(tip.block_hash()));
     let mtp = rbitcoin_primitives::median_time_past_times(
         rbitcoin_primitives::MedianWindow::new(&st.header_walk.tip.times).unwrap(),
@@ -5099,8 +5108,8 @@ fn two_abandoned_candidates_both_stay_dead() {
     st.ordered.push_back(kept);
     st.ordered_set.insert(kept);
     set_min_work(&mut hub, [0xff; 32]);
-    apply(&mut st, &hub, 0, vec![]);
-    apply(&mut st, &hub, 1, vec![]);
+    asked_empty(&mut st, &hub, 0);
+    asked_empty(&mut st, &hub, 1);
     assert_eq!(st.header_walk.tip_hash(), Some(gen));
     assert!(
         st.header_walk.dead_ends.contains(&a1.block_hash()),
@@ -5115,13 +5124,280 @@ fn two_abandoned_candidates_both_stay_dead() {
     assert!(send_getheaders(&mut st, &hub).unwrap());
     apply(&mut st, &hub, 0, vec![b1]);
     set_min_work(&mut hub, [0xff; 32]);
-    apply(&mut st, &hub, 0, vec![]);
-    apply(&mut st, &hub, 1, vec![]);
+    asked_empty(&mut st, &hub, 0);
+    asked_empty(&mut st, &hub, 1);
     assert!(st.header_walk.dead_ends.contains(&a1.block_hash()));
     assert!(
         st.header_walk.dead_ends.contains(&b1.block_hash()),
         "a second abandoned tip does not forget the first"
     );
+}
+
+/// An empty reply nobody asked for says nothing about the walk tip. Every
+/// peer sending one does not abandon the candidate.
+#[test]
+fn unasked_empty_replies_keep_the_candidate() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-unasked");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let a1 = mine(gen, 1);
+    let (s0, _rx0) = slot(0);
+    let (s1, _rx1) = slot(1);
+    let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+    fill_queue(&mut st);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    apply(&mut st, &hub, 0, vec![a1]);
+    assert_eq!(st.header_walk.tip_hash(), Some(a1.block_hash()));
+    set_min_work(&mut hub, [0xff; 32]);
+    for peer in [0, 1] {
+        st.header_walk.walk = Default::default();
+        st.header_walk.asked_tips.clear();
+        apply(&mut st, &hub, peer, vec![]);
+    }
+    assert_eq!(st.header_walk.tip_hash(), Some(a1.block_hash()));
+    assert!(st.header_walk.dead_ends.is_empty());
+}
+
+/// A late empty reply still answers an expired ask after another ask has
+/// expired since, so the candidate is abandoned once every peer has answered.
+#[test]
+fn a_late_empty_reply_counts_after_a_later_ask_expired() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-late-empty");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let a1 = mine(gen, 1);
+    let (s0, _rx0) = slot(0);
+    let (s1, _rx1) = slot(1);
+    let (s2, _rx2) = slot(2);
+    let mut st = IbdWorkState::new(vec![s0, s1, s2], Some(gen), Some(0));
+    fill_queue(&mut st);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    apply(&mut st, &hub, 0, vec![a1]);
+    set_min_work(&mut hub, [0xff; 32]);
+    for peer in [0, 1] {
+        note_lane(&mut st, peer);
+        note_asked_tip(&mut st, peer);
+        assert_eq!(expire_header_ask(&mut st), Some(peer));
+    }
+    apply(&mut st, &hub, 0, vec![]);
+    assert!(
+        st.header_walk.emptied.contains(&0),
+        "the late reply answers the ask at this tip"
+    );
+    asked_empty(&mut st, &hub, 1);
+    asked_empty(&mut st, &hub, 2);
+    assert_eq!(st.header_walk.tip_hash(), Some(gen));
+    assert!(st.header_walk.dead_ends.contains(&a1.block_hash()));
+}
+
+/// A late empty answers the tip its ask named. Once a later reply has moved
+/// the walk past every other peer's start height, that one late empty is the
+/// whole taller set, and it says nothing about the new tip, which stays live.
+#[test]
+fn a_late_empty_reply_leaves_a_moved_tip_live() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-late-moved");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let a1 = mine(gen, 1);
+    let a2 = mine(a1.block_hash(), 2);
+    let (s0, _rx0) = slot(0);
+    let (s1, _rx1) = slot(1);
+    let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+    fill_queue(&mut st);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    apply(&mut st, &hub, 0, vec![a1]);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.walk.peer, Some(0));
+    assert_eq!(expire_header_ask(&mut st), Some(0));
+    note_lane(&mut st, 1);
+    apply(&mut st, &hub, 1, vec![a2]);
+    assert_eq!(st.header_walk.tip_hash(), Some(a2.block_hash()));
+    st.slots[1].peer_height = 2;
+    set_min_work(&mut hub, [0xff; 32]);
+    apply(&mut st, &hub, 0, vec![]);
+    assert_eq!(st.header_walk.tip_hash(), Some(a2.block_hash()));
+    assert!(!st.header_walk.dead_ends.contains(&a2.block_hash()));
+}
+
+/// A peer asked again at the new tip still owes the answer to its older ask.
+/// Its first empty reply answers the old tip and leaves the new one live; its
+/// second answers the new tip.
+#[test]
+fn a_late_empty_reply_answers_the_older_of_two_asks() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-two-asks");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let a1 = mine(gen, 1);
+    let a2 = mine(a1.block_hash(), 2);
+    let (s0, _rx0) = slot(0);
+    let (s1, _rx1) = slot(1);
+    let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+    fill_queue(&mut st);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    apply(&mut st, &hub, 0, vec![a1]);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.walk.peer, Some(0));
+    assert_eq!(expire_header_ask(&mut st), Some(0));
+    note_lane(&mut st, 1);
+    apply(&mut st, &hub, 1, vec![a2]);
+    assert_eq!(st.header_walk.tip_hash(), Some(a2.block_hash()));
+    st.slots[1].peer_height = 2;
+    set_min_work(&mut hub, [0xff; 32]);
+    st.header_walk.walk = Default::default();
+    note_lane(&mut st, 0);
+    note_asked_tip(&mut st, 0);
+    apply(&mut st, &hub, 0, vec![]);
+    assert!(
+        !st.header_walk.emptied.contains(&0),
+        "the first reply answers the ask at the old tip"
+    );
+    assert_eq!(st.header_walk.tip_hash(), Some(a2.block_hash()));
+    assert!(!st.header_walk.dead_ends.contains(&a2.block_hash()));
+    apply(&mut st, &hub, 0, vec![]);
+    assert!(
+        st.header_walk.dead_ends.contains(&a2.block_hash()),
+        "the second reply answers the ask at the new tip"
+    );
+}
+
+/// A probe ask names no walk tip. Its late empty reply answers the probe, not
+/// the walk ask the same peer was sent after it.
+#[test]
+fn a_late_probe_reply_does_not_answer_a_later_walk_ask() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-late-probe");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let a1 = mine(gen, 1);
+    let (s0, _rx0) = slot(0);
+    let (s1, _rx1) = slot(1);
+    let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+    fill_queue(&mut st);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    apply(&mut st, &hub, 0, vec![a1]);
+    st.header_walk.walk = Default::default();
+    st.header_walk.probe = Some(1);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.probe_open, Some(1));
+    assert_eq!(expire_header_ask(&mut st), None);
+    set_min_work(&mut hub, [0xff; 32]);
+    note_lane(&mut st, 1);
+    note_asked_tip(&mut st, 1);
+    apply(&mut st, &hub, 1, vec![]);
+    assert!(
+        !st.header_walk.emptied.contains(&1),
+        "the first reply answers the probe"
+    );
+    apply(&mut st, &hub, 1, vec![]);
+    assert!(
+        st.header_walk.emptied.contains(&1),
+        "the second reply answers the walk ask at this tip"
+    );
+}
+
+/// A probe's reply takes the probe's entry. The walk ask the same peer is sent
+/// next is then answered by its own reply.
+#[test]
+fn an_answered_probe_leaves_the_next_walk_ask_its_own_reply() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-probe-reply");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let a1 = mine(gen, 1);
+    let (s0, _rx0) = slot(0);
+    let (s1, _rx1) = slot(1);
+    let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+    fill_queue(&mut st);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    apply(&mut st, &hub, 0, vec![a1]);
+    st.header_walk.walk = Default::default();
+    st.header_walk.probe = Some(1);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.probe_open, Some(1));
+    apply(&mut st, &hub, 1, vec![]);
+    assert_eq!(st.header_walk.probe_open, None, "the probe is answered");
+    set_min_work(&mut hub, [0xff; 32]);
+    st.header_walk.walk = Default::default();
+    note_lane(&mut st, 1);
+    note_asked_tip(&mut st, 1);
+    apply(&mut st, &hub, 1, vec![]);
+    assert!(
+        st.header_walk.emptied.contains(&1),
+        "the reply answers the walk ask at this tip"
+    );
+}
+
+/// A reply takes the ask it answers, so a later empty reply nobody asked for
+/// does not count at that tip.
+#[test]
+fn an_answered_ask_does_not_count_a_later_unasked_empty() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-answered-ask");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let a1 = mine(gen, 1);
+    let (s0, _rx0) = slot(0);
+    let (s1, _rx1) = slot(1);
+    let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+    fill_queue(&mut st);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let asked = st.header_walk.walk.peer.unwrap();
+    apply(&mut st, &hub, asked, vec![a1]);
+    set_min_work(&mut hub, [0xff; 32]);
+    st.header_walk.asked_tips.clear();
+    note_lane(&mut st, 0);
+    note_asked_tip(&mut st, 0);
+    apply(&mut st, &hub, 0, vec![mine(a1.block_hash(), 2)]);
+    assert!(st.header_walk.asked_tips[&0].is_empty());
+    apply(&mut st, &hub, 0, vec![]);
+    assert!(!st.header_walk.emptied.contains(&0));
+}
+
+/// A challenge ask names the walk tip too, so its empty answer counts there.
+#[test]
+fn a_challenge_empty_reply_counts_at_the_tip() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-challenge");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let a1 = mine(gen, 1);
+    let (s0, _rx0) = slot(0);
+    let (s1, _rx1) = slot(1);
+    let mut st = IbdWorkState::new(vec![s0, s1], Some(gen), Some(0));
+    fill_queue(&mut st);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    apply(&mut st, &hub, 0, vec![a1]);
+    st.header_walk.walk = Default::default();
+    st.header_walk.challenge = Some(1);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.challenge_open, Some(1));
+    set_min_work(&mut hub, [0xff; 32]);
+    apply(&mut st, &hub, 1, vec![]);
+    assert!(st.header_walk.emptied.contains(&1));
+}
+
+/// With no checkpoint the walk tip is its base. Every peer answering empty
+/// there does not mark it dead, so a later batch on it extends the walk.
+#[test]
+fn empty_replies_at_the_base_leave_it_live() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-empty-base");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let g1 = mine(gen, 1);
+    let (s0, _rx0) = slot(0);
+    let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+    fill_queue(&mut st);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.base_hash, Some(gen));
+    let child = mine(gen, 2).block_hash();
+    plant_on_queue(&mut st, child, 1);
+    set_min_work(&mut hub, [0xff; 32]);
+    apply(&mut st, &hub, 0, vec![]);
+    assert!(!st.header_walk.dead_ends.contains(&gen));
+    assert!(
+        !st.hash_height.contains_key(&child),
+        "the rewind at the base still clears the path above it"
+    );
+    set_min_work(&mut hub, [0; 32]);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    apply(&mut st, &hub, 0, vec![g1]);
+    assert_eq!(st.header_walk.tip_hash(), Some(g1.block_hash()));
 }
 
 /// Equal work is a challenger, not a new tip. One more header promotes
@@ -5886,7 +6162,7 @@ fn note_empty_rewinds_only_when_every_taller_peer_is_empty() {
     st.header_walk.tip.hash = Some(byte_hash(4));
     st.header_walk.tip.height = 3;
     st.header_walk.tip.work = Work::from_be_bytes([0; 32]);
-    assert!(note_empty(&mut st, &hub, 0));
+    assert!(note_empty(&mut st, &hub, 0, Some(byte_hash(4))));
     assert_eq!(st.header_walk.tip_hash(), Some(gen));
 }
 
