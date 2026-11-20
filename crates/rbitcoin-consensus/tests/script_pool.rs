@@ -10,6 +10,12 @@ use std::time::{Duration, Instant};
 
 static OCCUPY: Mutex<()> = Mutex::new(());
 
+/// How long a test waits for the shared pool to reach a state before it
+/// calls the pool stuck. Other tests in this binary queue jobs on the same
+/// workers (a legacy sighash verify holds one for seconds under coverage),
+/// so this only catches a hang.
+const STUCK: Duration = Duration::from_secs(30);
+
 struct OccupyGate {
     gate: Arc<(Mutex<bool>, Condvar)>,
     _occupy: MutexGuard<'static, ()>,
@@ -48,7 +54,7 @@ impl OccupyGate {
         let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
         let start = Instant::now();
         while entered.load(Ordering::SeqCst) < k {
-            let left = Duration::from_secs(2).saturating_sub(start.elapsed());
+            let left = STUCK.saturating_sub(start.elapsed());
             assert!(!left.is_zero(), "failed to occupy steal workers");
             let (g2, _) = cv.wait_timeout(g, left).unwrap_or_else(|p| p.into_inner());
             g = g2;
@@ -279,7 +285,7 @@ fn wait_until(label: &str, pred: impl Fn() -> bool) {
     let start = Instant::now();
     let mut g = SCRIPT_PROGRESS_MU.lock().unwrap_or_else(|p| p.into_inner());
     while !pred() {
-        let left = Duration::from_secs(2).saturating_sub(start.elapsed());
+        let left = STUCK.saturating_sub(start.elapsed());
         assert!(
             !left.is_zero(),
             "{label} idle={} entered={} unparks={}",

@@ -442,7 +442,9 @@ fn the_unconfirmed_check_refuses_exactly_where_the_budget_ends() {
     let types = whole_tx_hash_types();
     let mut accepted_any = false;
     let mut refused_any = false;
-    for checks in (1..=99usize).step_by(7).chain([88, 89, 90, 91, 92, 99]) {
+    // 88 distinct hashes is the last count under the ceiling and 89 the first
+    // over it. Each count past 1 hashes about 32 MB, so the sweep stays short.
+    for checks in [1usize, 88, 89, 99] {
         let (tx, prevouts) = checksig_spend(4, checks, 9_000, |i| types[i]);
         let cost = charged(&tx, &prevouts, checks);
         let want_refused = cost > MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES;
