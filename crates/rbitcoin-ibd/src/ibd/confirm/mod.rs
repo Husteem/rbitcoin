@@ -1760,8 +1760,21 @@ impl ConfirmQueueDepths {
         });
     }
 
-    #[doc(hidden)]
-    pub fn note_load_send(&self, blocks: usize, wire_bytes: usize) {
+    /// Count a lookup→load batch, then `send` it. Load can take the batch and
+    /// count it out before `send` returns, so the count goes first: a late add
+    /// would land after load's clamped decrement and stay. A sender parked on
+    /// a full queue already counts. A failed send takes the count back out.
+    pub fn send_load<E>(
+        &self,
+        blocks: usize,
+        wire_bytes: usize,
+        send: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.note_load_send(blocks, wire_bytes);
+        send().inspect_err(|_| self.note_load_recv(blocks, wire_bytes))
+    }
+
+    fn note_load_send(&self, blocks: usize, wire_bytes: usize) {
         let _ = self
             .lookup_to_load
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -1793,8 +1806,20 @@ impl ConfirmQueueDepths {
             .ok();
     }
 
-    #[doc(hidden)]
-    pub fn note_script_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
+    /// Count a load→scripts batch, then `send` it. Same order as
+    /// [`Self::send_load`].
+    pub fn send_script<E>(
+        &self,
+        blocks: usize,
+        wire_bytes: usize,
+        parents: usize,
+        send: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.note_script_send(blocks, wire_bytes, parents);
+        send().inspect_err(|_| self.note_script_recv(blocks, wire_bytes, parents))
+    }
+
+    fn note_script_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         Self::note_batch_depth_send(&self.load_to_scripts, &self.script_hwm);
         Self::add_stage(
             &self.script_blocks,
@@ -1818,8 +1843,20 @@ impl ConfirmQueueDepths {
         );
     }
 
-    #[doc(hidden)]
-    pub fn note_write_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
+    /// Count a scripts→write batch, then `send` it. Same order as
+    /// [`Self::send_load`].
+    pub fn send_write<E>(
+        &self,
+        blocks: usize,
+        wire_bytes: usize,
+        parents: usize,
+        send: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.note_write_send(blocks, wire_bytes, parents);
+        send().inspect_err(|_| self.note_write_recv(blocks, wire_bytes, parents))
+    }
+
+    fn note_write_send(&self, blocks: usize, wire_bytes: usize, parents: usize) {
         Self::note_batch_depth_send(&self.scripts_to_write, &self.write_hwm);
         Self::add_stage(
             &self.write_blocks,
@@ -2632,15 +2669,18 @@ pub fn spawn_confirm_engine(
                     let ww = outcome.batch.approx_wire_bytes();
                     let parents = outcome.batch.parent_count();
                     let t_send = Instant::now();
-                    if write_tx
-                        .send(rbitcoin_query::ConfirmWriteMsg::Batch(outcome.batch))
+                    if q_sc
+                        .send_write(wb, ww, parents, || {
+                            write_tx
+                                .send(rbitcoin_query::ConfirmWriteMsg::Batch(outcome.batch))
+                                .map_err(drop)
+                        })
                         .is_err()
                     {
                         info!("ibd: confirm write channel closed");
                         return false;
                     }
                     confirm_thr_stats::add_script_send_wait(&stats, t_send.elapsed());
-                    q_sc.note_write_send(wb, ww, parents);
                     !confirm_stage_stopping(feed_sc.stopped(), hub_sc.query.confirm_cancelled())
                 },
                 |e, meta, dropped| {
@@ -3045,8 +3085,12 @@ pub fn spawn_confirm_engine(
                         let wire = outcome.batch.approx_wire_bytes();
                         let parents = outcome.batch.parent_count();
                         let t_send = Instant::now();
-                        if mat_tx
-                            .send((outcome.batch, outcome.work_ns))
+                        if queues_load
+                            .send_script(prepared_n, wire, parents, || {
+                                mat_tx
+                                    .send((outcome.batch, outcome.work_ns))
+                                    .map_err(drop)
+                            })
                             .is_err()
                         {
                             info!("ibd: confirm scripts channel closed");
@@ -3056,7 +3100,6 @@ pub fn spawn_confirm_engine(
                         }
                         rbitcoin_consensus::unpark_script_publisher();
                         confirm_thr_stats::add_load_send_wait(&stats, t_send.elapsed());
-                        queues_load.note_script_send(prepared_n, wire, parents);
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -3333,10 +3376,12 @@ pub fn spawn_confirm_engine(
                                 ) {
                                     break;
                                 }
-                                if load_tx.send(batch).is_err() {
+                                if queues_lookup
+                                    .send_load(n, wire, || load_tx.send(batch).map_err(drop))
+                                    .is_err()
+                                {
                                     break;
                                 }
-                                queues_lookup.note_load_send(n, wire);
                                 confirm_thr_stats::add_lookup_send_wait(&stats, t_send.elapsed());
                             }
                             feed.notify();
