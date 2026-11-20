@@ -23,7 +23,7 @@ steps.
 | M6 | medium | Testnet milestone is height-only | fixed | `p3_default_milestone_heights`, `operator_conf_and_argv` ([073](./073-testnet-milestone-scripts.md)) |
 | M7 | medium | Mempool inv is one message per transaction | fixed | `tx_inv_over_one_thousand_is_two_messages` ([058](./058-tx-inv-batch.md)) |
 | M8 | medium | Pending blocks and orphans are count-capped only | fixed | `pending_block_over_four_megabytes_is_not_parked`, `one_peer_cannot_fill_the_orphanage` ([074](./074-tip-body-orphan-bytes.md)) |
-| M9 | high | io_uring drop can free a buffer the kernel still owns | fixed | `drain_guard_drop_with_leftover_pending_does_not_abort` ([069](./069-uring-drop-drain.md)) |
+| M9 | high | io_uring drop can free a buffer the kernel still owns | fixed | `drain_guard_drop_with_leftover_pending_aborts` ([069](./069-uring-drop-drain.md)) |
 | M10 | low | Secret types derive Debug; create-then-chmod | fixed | `debug_does_not_print_secret_bytes`, `debug_does_not_print_the_token` ([075](./075-secret-debug.md)) |
 | L1 | low | Height-0 BIP68 time lock uses median time 0 | fixed | `bip68_height_zero_time_lock_uses_the_median` ([076](./076-bip68-genesis-median.md)) |
 | L4 | low | Empty median time panics | fixed | `empty_median_time_is_an_error` ([077](./077-empty-median.md)) |

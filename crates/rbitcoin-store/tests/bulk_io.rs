@@ -265,36 +265,36 @@ fn pread_batch_on_pool_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A sync batch that gives up waiting still reports the failure it saw, and
-/// every sync it did not hear back from as failed.
+/// A sync batch that fails after it submitted reports every sync it did not
+/// hear back from as failed, not done (0) and not left to the caller
+/// (`i32::MIN`). A sequential retry would run on the same file description,
+/// which may already have taken the writeback error, and return 0.
 ///
-/// The sequential retry it used to fall back to runs on the same file
-/// description, which already took the writeback error, so it returns 0.
-#[cfg(debug_assertions)]
+/// A stray CQE fails the batch's first harvest (`harvest_ready` Err).
 #[test]
-fn sync_batch_that_gives_up_keeps_its_failed_syncs() {
-    use rbitcoin_store::uring_session::{with_drain_hard_cap, SessionKind, UringSession};
-    let dir = rbitcoin_store::testutil::fresh_path("sync-batch-gives-up");
+fn sync_batch_that_fails_after_submit_fails_its_syncs() {
+    use rbitcoin_store::uring_session::{SessionKind, UringSession};
+    let dir = rbitcoin_store::testutil::fresh_path("sync-batch-fails");
     std::fs::create_dir_all(&dir).unwrap();
     let a = std::fs::File::create(dir.join("a")).unwrap();
     let b = std::fs::File::create(dir.join("b")).unwrap();
     let (ha, hb) = (IoHandle::from_file(&a), IoHandle::from_file(&b));
-    rbitcoin_store::io_handle::arm_fail_sync(ha, 1);
-    // Just past the 200 ms cap. The worker still holds `b` when the batch
-    // gives up; keep both files open until it is done with it.
-    let delay = std::time::Duration::from_millis(300);
-    let start = std::time::Instant::now();
-    rbitcoin_store::io_handle::arm_sync_delay(hb, delay);
-    let res = with_drain_hard_cap(std::time::Duration::from_millis(200), || {
-        let mut sess = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
-        sync_data_batch_on_session(&mut sess, &[ha, hb])
-    });
-    let res = res.expect("a batch that submitted its syncs fell back to a retry");
-    assert_ne!(res[0], 0, "the failed sync was dropped");
-    assert_ne!(res[1], 0, "an unanswered sync counted as done");
-    std::thread::sleep(
-        (delay + std::time::Duration::from_millis(200)).saturating_sub(start.elapsed()),
-    );
+    let mut sess = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
+    // Land a CQE the batch never pushed: complete a pread, then forget its id.
+    let mut stray = [0u8; 1];
+    // SAFETY: the spin below waits for the CQE, so `stray` outlives the op.
+    unsafe { sess.push_pread(ha, 0, &mut stray, 7) }.expect("push stray");
+    sess.submit().expect("submit stray");
+    while sess.pool_inflight() != 0 {
+        std::thread::yield_now();
+    }
+    sess.pending.expect_cqe(7).expect("forget stray");
+    let res = sync_data_batch_on_session(&mut sess, &[ha, hb])
+        .expect("a batch that submitted its syncs fell back to a retry");
+    assert!(sess.is_poisoned());
+    for r in res {
+        assert!(r < 0 && r != i32::MIN, "a submitted sync came back {r}");
+    }
     drop((a, b));
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -73,7 +73,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [066](./066-rpc-wait-cap.md) | medium | RPC accept times out and long-polls release the permit | fixed | `long_poll_does_not_hold_the_work_queue` |
 | [067](./067-fuse8-segment.md) | medium | fuse8 segment length must be a power of two | fixed | `fuse8_segment_length_must_be_power_of_two` |
 | [068](./068-published-end.md) | medium | Body reads compare the caller's published end | fixed | `body_read_past_published_end_is_corrupt` |
-| [069](./069-uring-drop-drain.md) | high | io_uring drop does not free a buffer still in the kernel | fixed | `drain_guard_drop_with_leftover_pending_does_not_abort` |
+| [069](./069-uring-drop-drain.md) | high | io_uring drop does not free a buffer still in the kernel | fixed | `drain_guard_drop_with_leftover_pending_aborts` |
 | [070](./070-manifest-length.md) | low | Manifest and txstat lengths must fit the file | fixed | `map_prefix_longer_than_file_is_corrupt`, `txstat_blob_longer_than_the_file_is_corrupt` |
 | [071](./071-datadir-lock-symlink.md) | low | Datadir lock does not follow a symlink | fixed | `lock_file_does_not_follow_a_symlink` |
 | [072](./072-pool-write-slice.md) | low | Pool write jobs use a shared slice | fixed | `io_session_pool` write arm (`from_raw_parts`) |

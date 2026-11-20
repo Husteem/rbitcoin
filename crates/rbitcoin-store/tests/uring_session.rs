@@ -3,16 +3,38 @@ use rbitcoin_store::uring_session::*;
 use std::path::Path;
 use std::time::Duration;
 
+/// With no pending SQE an enter failure is an ordinary error. With pending
+/// SQEs it aborts like the hard cap: those SQEs still own caller buffers.
 #[test]
 fn enter_failure_with_pending_matches_the_hard_cap() {
+    const CHILD: &str = "RBITCOIN_URING_ENTER_FAILURE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let _ = inflight_enter_failure(2, StoreError::Corrupt("io_uring submit_and_wait failed"));
+        std::process::exit(0);
+    }
     let idle = inflight_enter_failure(0, StoreError::Corrupt("io_uring submit_and_wait failed"))
         .unwrap_err();
     assert!(idle.to_string().contains("submit_and_wait"), "{idle}");
-    let busy = with_drain_hard_cap(Duration::from_secs(120), || {
-        inflight_enter_failure(2, StoreError::Corrupt("io_uring submit_and_wait failed"))
-    })
-    .unwrap_err();
-    assert!(busy.to_string().contains("undrained"), "{busy}");
+    #[cfg(target_os = "linux")]
+    {
+        let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args([
+                "--exact",
+                "uring_session::enter_failure_with_pending_matches_the_hard_cap",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("child test");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            out.status.signal(),
+            Some(6),
+            "enter failure with pending SQEs must SIGABRT: {:?}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -158,33 +180,86 @@ fn drain_budget_eintr_spin_does_not_hit_hard_cap() {
     }
 }
 
+/// A drain guard whose drain leaves an id pending must abort, not return:
+/// the guard's frame frees the buffers right after it drops.
 #[test]
-fn drain_all_leftover_pending_hits_hard_cap_on_linux_or_pool() {
-    let mut session = UringSession::try_open(32)
-        .unwrap_or_else(|_| UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool"));
-    session.pending.insert(1).unwrap();
-    with_drain_hard_cap(Duration::from_millis(200), || {
-        match session.drain_all() {
-            Err(StoreError::Corrupt("invariant: io_uring undrained")) => {}
-            other => panic!("expected undrained after hard cap, got {other:?}"),
-        }
-        assert!(session.is_poisoned());
-        drop(session);
-    });
+#[cfg(target_os = "linux")]
+fn drain_guard_drop_with_leftover_pending_aborts() {
+    const CHILD: &str = "RBITCOIN_URING_GUARD_LEFTOVER_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let Ok(mut session) = UringSession::try_open_kind(SessionKind::Pool, 32) else {
+            std::process::exit(77);
+        };
+        session.pending.insert(1).expect("pending");
+        drop(session.drain_guard());
+        std::process::exit(0);
+    }
+    let exe = std::env::current_exe().expect("current_exe");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "uring_session::drain_guard_drop_with_leftover_pending_aborts",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("RBITCOIN_IO", "pool")
+        .output()
+        .expect("child test");
+    if out.status.code() == Some(77) {
+        return;
+    }
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        out.status.signal(),
+        Some(6),
+        "drain guard drop with a leftover id must SIGABRT: {:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
+/// `RBITCOIN_URING_DRAIN_HARD_SECS` with zero completions aborts an explicit
+/// `drain_all`: the SQE still owns the caller's buffer.
 #[test]
-fn drain_guard_drop_with_leftover_pending_does_not_abort() {
-    let mut session = UringSession::try_open(32)
-        .unwrap_or_else(|_| UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool"));
-    session.pending.insert(1).unwrap();
-    with_drain_hard_cap(Duration::from_millis(200), || {
-        drop(session.drain_guard());
-        let err = take_drop_drain_error();
-        assert_eq!(err, Some("invariant: io_uring undrained"));
-        assert!(session.is_poisoned());
-        drop(session);
-    });
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn drain_all_with_no_completions_for_the_hard_cap_aborts() {
+    const CHILD: &str = "RBITCOIN_URING_DRAIN_HARD_CAP_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let Ok(mut session) = UringSession::try_open_kind(SessionKind::Pool, 32) else {
+            std::process::exit(77);
+        };
+        let exe = std::env::current_exe().expect("current_exe");
+        let file = std::fs::File::open(exe).expect("open child exe");
+        let fd = rbitcoin_store::io_handle::IoHandle::from_file(&file);
+        rbitcoin_store::io_handle::arm_sync_delay(fd, Duration::from_secs(30));
+        session.push_sync_data(fd, 1).expect("push sync");
+        session.submit().expect("submit");
+        let _ = session.drain_all();
+        std::process::exit(0);
+    }
+    let exe = std::env::current_exe().expect("current_exe");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "uring_session::drain_all_with_no_completions_for_the_hard_cap_aborts",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("RBITCOIN_IO", "pool")
+        .env("RBITCOIN_URING_DRAIN_HARD_SECS", "1")
+        .output()
+        .expect("child test");
+    if out.status.code() == Some(77) {
+        return;
+    }
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        out.status.signal(),
+        Some(6),
+        "drain_all past the hard cap must SIGABRT: {:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// A CQE whose `user_data` was removed from `pending` is not a silent
@@ -463,34 +538,6 @@ fn begin_batch_after_explicit_drain_bumps_epoch() {
     session.begin_batch().unwrap();
     assert_ne!(session.epoch(), epoch0);
     assert_eq!(&buf, &[0x11, 0x22, 0x33, 0x44]);
-    let _ = std::fs::remove_file(&path);
-}
-
-/// Phantom pending (no kernel SQE) must not leave the session usable.
-#[test]
-fn begin_batch_poisons_when_leftover_cannot_drain() {
-    use std::io::Write;
-    let (path, mut f) = tmp_rw("begin-batch-poison");
-    f.write_all(&[1u8]).unwrap();
-    f.sync_all().unwrap();
-    let fd = rbitcoin_store::io_handle::IoHandle::from_file(&f);
-    let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
-    session.pending.insert(99).unwrap();
-    with_drain_hard_cap(Duration::from_millis(200), || {
-        match session.begin_batch() {
-            Err(StoreError::Corrupt("invariant: io_uring undrained")) => {}
-            other => panic!("begin_batch must fail closed on undrainable leftover, got {other:?}"),
-        }
-        assert!(session.is_poisoned());
-        let mut buf = [0u8; 1];
-        // SAFETY: `buf` lives until this function returns.
-        let r = unsafe { session.push_pread(fd, 0, &mut buf, pack_ud(KIND_BULK_PREAD, 1, 0)) };
-        assert!(
-            r.is_err(),
-            "push after undrainable leftover must fail, got {r:?}"
-        );
-        drop(session);
-    });
     let _ = std::fs::remove_file(&path);
 }
 
@@ -880,21 +927,40 @@ fn session_drop_aborts_on_leftover_sqe() {
     );
 }
 
-/// The caller-frame guard must not drain either; it only aborts. A real
-/// submitted pread would be cleared by a drain, so this distinguishes them.
+/// The caller-frame guard must not drain either; it only aborts. A drain
+/// would clear the real submitted pread and the child would exit 0.
 #[test]
 #[cfg(target_os = "linux")]
 fn abort_guard_does_not_drain_leftover() {
-    let mut session = UringSession::try_open_kind(SessionKind::Pool, 32).expect("pool");
-    arm_pending_pread(&mut session);
-    with_drain_hard_cap(Duration::from_millis(200), || {
+    const CHILD: &str = "RBITCOIN_URING_ABORT_GUARD_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let Ok(mut session) = UringSession::try_open_kind(SessionKind::Pool, 32) else {
+            std::process::exit(77);
+        };
+        arm_pending_pread(&mut session);
         drop(session.abort_guard());
-        assert_eq!(
-            session.in_flight(),
-            1,
-            "abort_guard must not drain a real pending pread"
-        );
-        assert!(session.is_poisoned());
-        drop(session);
-    });
+        std::process::exit(0);
+    }
+    let exe = std::env::current_exe().expect("current_exe");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "uring_session::abort_guard_does_not_drain_leftover",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("RBITCOIN_IO", "pool")
+        .output()
+        .expect("child test");
+    if out.status.code() == Some(77) {
+        return;
+    }
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        out.status.signal(),
+        Some(6),
+        "abort_guard with a real pending pread must SIGABRT, not drain: {:?}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

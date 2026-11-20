@@ -105,10 +105,6 @@ impl DrainBudget {
 
 #[doc(hidden)]
 pub fn drain_hard_cap() -> Duration {
-    #[cfg(debug_assertions)]
-    if let Some(d) = TEST_DRAIN_HARD.with(|c| c.get()) {
-        return d;
-    }
     static CAP: OnceLock<Duration> = OnceLock::new();
     *CAP.get_or_init(|| {
         let secs = std::env::var("RBITCOIN_URING_DRAIN_HARD_SECS")
@@ -117,27 +113,6 @@ pub fn drain_hard_cap() -> Duration {
             .filter(|&n| n > 0)
             .unwrap_or(DRAIN_HARD_DEFAULT_SECS);
         Duration::from_secs(secs)
-    })
-}
-
-#[cfg(debug_assertions)]
-thread_local! {
-    static TEST_DRAIN_HARD: Cell<Option<Duration>> = const { Cell::new(None) };
-    static DROP_DRAIN_ERROR: Cell<Option<&'static str>> = const { Cell::new(None) };
-}
-
-#[cfg(debug_assertions)]
-pub fn take_drop_drain_error() -> Option<&'static str> {
-    DROP_DRAIN_ERROR.with(Cell::take)
-}
-
-#[cfg(debug_assertions)]
-pub fn with_drain_hard_cap<R>(hard: Duration, f: impl FnOnce() -> R) -> R {
-    TEST_DRAIN_HARD.with(|c| {
-        let prev = c.replace(Some(hard));
-        let out = f();
-        c.set(prev);
-        out
     })
 }
 
@@ -165,18 +140,10 @@ pub fn inflight_enter_failure(pending: usize, err: StoreError) -> Result<(), Sto
 }
 
 #[doc(hidden)]
-pub fn finish_drain_hard_cap(pending: usize) -> Result<(), StoreError> {
+pub fn finish_drain_hard_cap(pending: usize) -> ! {
     let thread = std::thread::current();
     let thread = thread.name().unwrap_or("unnamed");
-    let reason = format!("drain hard cap pending={pending} thread={thread}");
-    // `with_drain_hard_cap` is the only opt-in. A debug node does not set it,
-    // so a leftover SQE still aborts instead of freeing caller buffers.
-    #[cfg(debug_assertions)]
-    if TEST_DRAIN_HARD.with(|c| c.get()).is_some() {
-        let _ = reason;
-        return Err(StoreError::Corrupt("invariant: io_uring undrained"));
-    }
-    abort_uring_unusable(&reason);
+    abort_uring_unusable(&format!("drain hard cap pending={pending} thread={thread}"));
 }
 
 /// Which completion backend [`UringSession`] opens.
@@ -400,7 +367,7 @@ impl UringSession {
     /// returning. Poisoned or leftover is fatal — callers must not push.
     pub fn begin_batch(&mut self) -> Result<(), StoreError> {
         if !self.pending.is_empty() {
-            return self.fail_closed_boundary();
+            self.fail_closed_boundary();
         }
         self.check_live()?;
         self.epoch = self.epoch.wrapping_add(1);
@@ -715,7 +682,7 @@ impl UringSession {
             if fail_closed && !self.pending.is_empty() {
                 // Returning would let the caller free buffers these SQEs own.
                 self.poisoned = true;
-                return finish_drain_hard_cap(self.pending.len());
+                finish_drain_hard_cap(self.pending.len());
             }
             return Err(e);
         }
@@ -726,7 +693,7 @@ impl UringSession {
                 self.note_invariant(UringInvariant::Undrained);
             }
             if fail_closed && !self.pending.is_empty() {
-                return finish_drain_hard_cap(self.pending.len());
+                finish_drain_hard_cap(self.pending.len());
             }
             return Err(e);
         }
@@ -1004,9 +971,9 @@ impl UringSession {
 }
 
 impl UringSession {
-    /// A frame boundary has no buffer owner. Never drain pending SQEs here.
-    /// Aborts unless the `with_drain_hard_cap` test seam is active.
-    fn fail_closed_boundary(&mut self) -> Result<(), StoreError> {
+    /// A frame boundary has no buffer owner. Never drain pending SQEs here;
+    /// abort.
+    fn fail_closed_boundary(&mut self) -> ! {
         self.poisoned = true;
         finish_drain_hard_cap(self.pending.len())
     }
@@ -1015,32 +982,17 @@ impl UringSession {
     /// after those buffers. On unwind, abort instead: a caller-frame guard
     /// cannot know whether a callee already freed them.
     ///
-    /// `fail_closed` aborts unless this thread is inside [`with_drain_hard_cap`].
-    /// Leftover ids stay in `pending`.
+    /// `fail_closed` aborts on leftover ids.
     #[doc(hidden)]
     pub fn drop_drain(&mut self) {
         if std::thread::panicking() && self.in_flight() != 0 {
             abort_uring_unusable("panic with in-flight SQEs during drop");
         }
-        if let Err(err) = self.drain_all_inner(true) {
-            note_drop_drain_error(&err);
-        }
+        let _ = self.drain_all_inner(true);
         if !self.pending.is_empty() {
             // A failed drain left SQEs that may still own caller buffers.
-            let _ = finish_drain_hard_cap(self.pending.len());
+            finish_drain_hard_cap(self.pending.len());
         }
-    }
-}
-
-#[doc(hidden)]
-pub fn note_drop_drain_error(err: &StoreError) {
-    #[cfg(debug_assertions)]
-    if let StoreError::Corrupt(msg) = err {
-        DROP_DRAIN_ERROR.with(|c| c.set(Some(*msg)));
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = err;
     }
 }
 
@@ -1049,7 +1001,7 @@ impl Drop for UringSession {
         if !self.pending.is_empty() {
             // No buffer owner is known at session drop. Draining here could
             // complete into memory a previous frame already freed.
-            let _ = finish_drain_hard_cap(self.pending.len());
+            finish_drain_hard_cap(self.pending.len());
         }
     }
 }
@@ -1106,7 +1058,7 @@ impl UringSession {
 impl Drop for AbortOnDrop<'_> {
     fn drop(&mut self) {
         if !self.session.pending.is_empty() {
-            let _ = self.session.fail_closed_boundary();
+            self.session.fail_closed_boundary();
         }
     }
 }
@@ -1212,10 +1164,7 @@ pub fn with_thread_local<R>(
                 if need_open {
                     if let Some(mut old) = slot.take() {
                         if old.in_flight() != 0 {
-                            let _ = old.fail_closed_boundary();
-                            return Err(StoreError::Corrupt(
-                                "invariant: io_uring leftover at session growth",
-                            ));
+                            old.fail_closed_boundary();
                         }
                         drop(old);
                     }
@@ -1229,22 +1178,14 @@ pub fn with_thread_local<R>(
                 }
                 let session = slot.as_mut().expect("session just ensured");
                 if session.in_flight() != 0 {
-                    let _ = session.fail_closed_boundary();
-                    let _ = slot.take();
-                    return Err(StoreError::Corrupt(
-                        "invariant: io_uring leftover at session entry",
-                    ));
+                    session.fail_closed_boundary();
                 }
                 let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(session)));
                 match out {
                     Ok(out) => {
                         if session.in_flight() != 0 {
                             // `f`'s buffers are already gone. Never drain them.
-                            let _ = session.fail_closed_boundary();
-                            let _ = slot.take();
-                            return Err(StoreError::Corrupt(
-                                "invariant: io_uring leftover after session use",
-                            ));
+                            session.fail_closed_boundary();
                         }
                         if session.is_poisoned() {
                             let _ = slot.take();
