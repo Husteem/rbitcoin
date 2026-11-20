@@ -4,6 +4,7 @@
 
 pub mod chain_fixture;
 pub mod i2p_dest;
+pub mod journey_node;
 pub mod jsonrpc;
 pub mod mine;
 #[cfg(feature = "overlay")]
@@ -17,6 +18,16 @@ pub use chain_fixture::{
 };
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// `default_secs`, or `llvm_secs` when `CARGO_LLVM_COV` is set.
+pub fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
+    if std::env::var_os("CARGO_LLVM_COV").is_some() {
+        Duration::from_secs(llvm_secs)
+    } else {
+        Duration::from_secs(default_secs)
+    }
+}
 
 pub use rbitcoin_store::testutil::TempDir;
 

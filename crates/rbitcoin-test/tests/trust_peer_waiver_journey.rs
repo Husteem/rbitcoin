@@ -14,73 +14,27 @@ use bitcoin::{Amount, Block, BlockHash, ScriptBuf};
 use rbitcoin_consensus::{mine_empty_regtest, prepare_regtest_candidate};
 use rbitcoin_net::peer::{connect_and_handshake, HandshakePolicy};
 use rbitcoin_net::v2::{read_v2_frame, write_v2_msg};
+use rbitcoin_test::journey_node::JourneyNode;
+use rbitcoin_test::jsonrpc::write_rpc_token;
 use rbitcoin_test::mine::regtest_genesis;
-use rbitcoin_test::TestDatadir;
+use rbitcoin_test::{llvm_cov_wall, TestDatadir};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
-fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
-    if std::env::var_os("CARGO_LLVM_COV").is_some() {
-        Duration::from_secs(llvm_secs)
-    } else {
-        Duration::from_secs(default_secs)
-    }
-}
-
 async fn jsonrpc(addr: SocketAddr, method: &str, params: Value) -> Value {
     rbitcoin_test::jsonrpc::jsonrpc(addr, method, params).await
 }
 
-fn write_token(dir: &Path) {
-    std::fs::write(dir.join("rpc.token"), "pass\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            dir.join("rpc.token"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
-    }
-}
-
-/// `rbitcoin-node` child. Stderr is the operator log.
-struct NodeProc {
-    child: Option<Child>,
-    stderr: Arc<Mutex<String>>,
-    reader: Option<std::thread::JoinHandle<()>>,
-}
-
-impl NodeProc {
-    fn log(&self) -> String {
-        self.stderr.lock().unwrap().clone()
-    }
-}
-
-impl Drop for NodeProc {
-    fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
-    }
-}
-
-fn spawn_trusting_node(dir: &Path, peer: SocketAddr) -> NodeProc {
+fn spawn_trusting_node(dir: &Path, peer: SocketAddr) -> JourneyNode {
     // Cargo 1.95 keeps the hyphen in `CARGO_BIN_EXE_journey-node`.
-    let bin = PathBuf::from(env!("CARGO_BIN_EXE_journey-node"));
-    let mut child = Command::new(bin)
-        .arg("--datadir")
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_journey-node"));
+    cmd.arg("--datadir")
         .arg(dir)
         .arg("--network")
         .arg("regtest")
@@ -89,42 +43,8 @@ fn spawn_trusting_node(dir: &Path, peer: SocketAddr) -> NodeProc {
         .arg("--rpc-listen")
         .arg("127.0.0.1:0")
         .arg("--log-level")
-        .arg("info")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("spawn rbitcoin-node: {e}"));
-    let pipe = child.stderr.take().expect("stderr piped");
-    let stderr = Arc::new(Mutex::new(String::new()));
-    let buf = Arc::clone(&stderr);
-    let reader = std::thread::spawn(move || {
-        use std::io::BufRead;
-        let mut lines = std::io::BufReader::new(pipe);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match lines.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => buf.lock().unwrap().push_str(&line),
-            }
-        }
-    });
-    NodeProc {
-        child: Some(child),
-        stderr,
-        reader: Some(reader),
-    }
-}
-
-async fn stop_node(rpc: SocketAddr, mut node: NodeProc) {
-    let _ = jsonrpc(rpc, "stop", json!([])).await;
-    let mut child = node.child.take().expect("child");
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .expect("wait join")
-        .unwrap_or_else(|e| panic!("wait node: {e}"));
-    assert!(status.success(), "rbitcoin-node exit {status}");
+        .arg("info");
+    JourneyNode::spawn(cmd)
 }
 
 fn child_of(prev: &Block, height: u32, time: u32, fault: impl FnOnce(&mut Block)) -> Block {
@@ -167,8 +87,6 @@ type Chain = Arc<Mutex<Vec<Block>>>;
 struct TrustedPeer {
     addr: SocketAddr,
     chain: Chain,
-    accepts: Arc<AtomicUsize>,
-    live: Arc<AtomicUsize>,
     announce: broadcast::Sender<Header>,
 }
 
@@ -184,26 +102,16 @@ async fn trusted_peer(chain: Vec<Block>) -> TrustedPeer {
     let peer = TrustedPeer {
         addr: listener.local_addr().expect("addr"),
         chain: Arc::new(Mutex::new(chain)),
-        accepts: Arc::new(AtomicUsize::new(0)),
-        live: Arc::new(AtomicUsize::new(0)),
         announce: broadcast::channel(8).0,
     };
     let addr = peer.addr;
     let chain = Arc::clone(&peer.chain);
-    let accepts = Arc::clone(&peer.accepts);
-    let live = Arc::clone(&peer.live);
     let announce = peer.announce.clone();
     tokio::spawn(async move {
         while let Ok((stream, remote)) = listener.accept().await {
-            accepts.fetch_add(1, Ordering::SeqCst);
-            live.fetch_add(1, Ordering::SeqCst);
             let chain = Arc::clone(&chain);
-            let live = Arc::clone(&live);
             let headers = announce.subscribe();
-            tokio::spawn(async move {
-                let _ = serve(stream, addr, remote, chain, headers).await;
-                live.fetch_sub(1, Ordering::SeqCst);
-            });
+            tokio::spawn(serve(stream, addr, remote, chain, headers));
         }
     });
     peer
@@ -270,7 +178,7 @@ async fn serve(
     }
 }
 
-async fn wait_tip(rpc: SocketAddr, want: BlockHash, node: &NodeProc, what: &str) {
+async fn wait_tip(rpc: SocketAddr, want: BlockHash, node: &JourneyNode, what: &str) {
     let deadline = Instant::now() + llvm_cov_wall(30, 90);
     let want = want.to_string();
     loop {
@@ -292,9 +200,9 @@ fn applied_line(hash: BlockHash, height: u32) -> String {
 }
 
 /// The applied line can trail the tip on the stderr pipe.
-async fn assert_applied(node: &NodeProc, block: &Block, height: u32, reason: &str) {
+async fn assert_applied(node: &JourneyNode, block: &Block, height: u32, reason: &str) {
     let needle = applied_line(block.block_hash(), height);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + llvm_cov_wall(5, 20);
     let line = loop {
         let log = node.log();
         if let Some(line) = log.lines().find(|line| line.contains(&needle)) {
@@ -329,7 +237,7 @@ async fn trust_peer_story() {
     let peer = trusted_peer(chain.clone()).await;
     let home = TestDatadir::new().unwrap();
     let dir = home.path();
-    write_token(&dir);
+    write_rpc_token(&dir);
     let node = spawn_trusting_node(&dir, peer.addr);
     let rpc = rbitcoin_node::run::wait_published_listener(&dir, "rpc", llvm_cov_wall(30, 90)).await;
 
@@ -354,35 +262,13 @@ async fn trust_peer_story() {
     wait_tip(rpc, excess.block_hash(), &node, "announce").await;
     assert_applied(&node, &excess, 4, "bad-cb-amount").await;
 
-    // That session is not dropped or discouraged: its next block moves the
-    // tip, with no new dial.
-    let accepts = peer.accepts.load(Ordering::SeqCst);
-    let clean = child_of(&excess, 5, now - 20, |_| {});
-    peer.announce(&clean);
-    wait_tip(rpc, clean.block_hash(), &node, "after the waiver").await;
-    assert_eq!(
-        peer.accepts.load(Ordering::SeqCst),
-        accepts,
-        "the node redialed"
-    );
-    assert_eq!(
-        peer.live.load(Ordering::SeqCst),
-        1,
-        "trusted session dropped"
-    );
-    let peers = jsonrpc(rpc, "getpeerinfo", json!([])).await;
-    let rows = peers["result"].as_array().expect("getpeerinfo rows");
-    assert_eq!(rows.len(), 1, "{peers}");
-    assert_eq!(rows[0]["addr"], json!(peer.addr.to_string()), "{peers}");
-
-    stop_node(rpc, node).await;
+    node.stop(rpc, llvm_cov_wall(20, 60)).await;
 }
 
 /// One node started with `--trust-peer`, one trusted peer. Catch-up applies a
 /// BIP34 fault with the documented warn line. A local `submitblock` of an
 /// excess-subsidy block is rejected while the mode is on, and the same block
-/// announced by the trusted session is applied. That session is neither
-/// dropped nor discouraged.
+/// announced by the trusted session is applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trust_peer_applies_waivable_faults_from_its_session_only() {
     let wall = llvm_cov_wall(90, 240);

@@ -16,6 +16,7 @@ use rbitcoin_net::{
 };
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
+use rbitcoin_test::llvm_cov_wall;
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
 use rbitcoin_test::TempDir;
 use std::net::SocketAddr;
@@ -187,14 +188,6 @@ async fn sync_ibd(node: &P2PNode, peer: SocketAddr) -> u32 {
     )
     .await
     .expect("ibd sync")
-}
-
-fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
-    if std::env::var_os("CARGO_LLVM_COV").is_some() {
-        Duration::from_secs(llvm_secs)
-    } else {
-        Duration::from_secs(default_secs)
-    }
 }
 
 fn any_port() -> SocketAddr {

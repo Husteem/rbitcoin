@@ -7,12 +7,12 @@ use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::Amount;
 use rbitcoin_net::{NetAddr, OnlyNet};
 use rbitcoin_node::{NodeConfig, P2pListen};
+use rbitcoin_test::jsonrpc::write_rpc_token;
 use rbitcoin_test::mine::spend_anyone_can_spend;
 use rbitcoin_test::overlay::{
     base_node, ephemeral_addr, i2p_b32_from_dest, jsonrpc, jsonrpc_try, localaddresses,
     require_env, socks_electrum_rpc, socks_http_get, spawn_node, wait_file, wait_i2p_stream,
-    wait_jsonrpc, wait_onion_port, wait_p2p_onion, wait_peer_network, wait_socks_onion,
-    write_rpc_token, OverlayEnv,
+    wait_jsonrpc, wait_onion_port, wait_p2p_onion, wait_peer_network, wait_socks_onion, OverlayEnv,
 };
 use rbitcoin_test::TempDir;
 use serde_json::json;

@@ -16,6 +16,7 @@ use rbitcoin_node::{run_p2p, NodeConfig};
 use rbitcoin_primitives::{Fk, Height, Network};
 use rbitcoin_query::Query;
 use rbitcoin_store::{script_hash, ScriptHashRecord};
+use rbitcoin_test::llvm_cov_wall;
 use rbitcoin_test::mine::{
     coinbase_tx, mine_regtest_block, mine_regtest_block_at, regtest_genesis,
 };
@@ -29,14 +30,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-
-fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
-    if std::env::var_os("CARGO_LLVM_COV").is_some() {
-        Duration::from_secs(llvm_secs)
-    } else {
-        Duration::from_secs(default_secs)
-    }
-}
 
 fn any_port() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()

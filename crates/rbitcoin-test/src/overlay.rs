@@ -54,16 +54,6 @@ pub fn ephemeral_addr() -> SocketAddr {
     addr
 }
 
-pub fn write_rpc_token(datadir: &Path) {
-    let path = datadir.join("rpc.token");
-    std::fs::write(&path, "pass").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    }
-}
-
 pub fn base_node(datadir: &Path) -> NodeConfig {
     let mut cfg = NodeConfig::default()
         .with_datadir(datadir)

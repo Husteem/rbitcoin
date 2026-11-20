@@ -13,6 +13,7 @@ use rbitcoin_net::{AddrMan, NetAddr, P2PNode};
 use rbitcoin_node::{run_p2p, NodeConfig, NodeError, P2pListen};
 use rbitcoin_primitives::Network;
 use rbitcoin_query::Query;
+use rbitcoin_test::llvm_cov_wall;
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
 use rbitcoin_test::TestDatadir;
 use serde_json::{json, Value};
@@ -27,14 +28,6 @@ const MAX_OUT: u32 = 5;
 /// One seed plus enough other listeners that a `getaddr` reply (23% of the
 /// book, at least one) is more than 3 addresses.
 const LEARNED_PEERS: usize = 18;
-
-fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
-    if std::env::var_os("CARGO_LLVM_COV").is_some() {
-        Duration::from_secs(llvm_secs)
-    } else {
-        Duration::from_secs(default_secs)
-    }
-}
 
 fn ip_output(args: &[String]) -> Output {
     let direct = Command::new("ip").args(args).output();
