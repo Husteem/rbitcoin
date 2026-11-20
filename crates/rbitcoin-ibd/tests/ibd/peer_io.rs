@@ -9,10 +9,11 @@ use rbitcoin_ibd::ibd::rate::PeerRate;
 use rbitcoin_net::codec::FramedMessage;
 use rbitcoin_net::error::NetError;
 use rbitcoin_net::peer_dos::{PeerRateLimiter, RATE_LIMIT_BAN_SCORE};
+use rbitcoin_net::peers::PongSlot;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, Semaphore};
 
@@ -338,7 +339,7 @@ fn test_ctx(
         rate: PeerRateLimiter::default_limits(),
         logged_invalid_v2: false,
         ban_score: 0,
-        pong: Arc::new(IbdPong::new()),
+        pong: Arc::new(PongSlot::new()),
     };
     (ctx, out_rx, body_rx, ctrl_rx)
 }
@@ -419,7 +420,7 @@ fn ibd_pings_coalesce_and_overflow_the_message_window() {
         "a second ping does not queue a second pong"
     );
     assert_eq!(
-        ctx.pong.wire_nonce(1),
+        ctx.pong.claimed_nonce_or(1),
         0,
         "nonce 0 is the pong the writer sends"
     );
@@ -469,12 +470,12 @@ fn ibd_pings_coalesce_and_overflow_the_message_window() {
 /// A ping during the extra pong is written, and a later ping still queues.
 #[tokio::test]
 async fn an_extra_ibd_pong_still_answers_the_next_ping() {
-    let pong = IbdPong::new();
+    let pong = PongSlot::new();
     assert!(pong.note(7));
     let mut sent = Vec::new();
     struct Emit<'a> {
         sent: &'a mut Vec<u64>,
-        pong: &'a IbdPong,
+        pong: &'a PongSlot,
     }
     impl IbdPongEmit for Emit<'_> {
         fn emit(
@@ -1037,4 +1038,76 @@ fn v1_addr_fc00_is_cjdns_not_clearnet() {
         "reachable CJDNS is learned as CJDNS: {:?}",
         on.entries()
     );
+}
+
+/// Waits until the other thread posts `round`. Spins briefly so the two
+/// threads stay close together, then yields so a waiter on a small runner
+/// does not hold the core the other thread needs. Fails the round if the
+/// other thread never arrives.
+fn wait_for_round(counter: &AtomicUsize, round: usize, other: &str) {
+    const SPINS: u32 = 256;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut spins = 0u32;
+    while counter.load(Ordering::Acquire) != round {
+        if spins < SPINS {
+            spins += 1;
+            std::hint::spin_loop();
+        } else {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{other} never reached round {round}"
+            );
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// A ping that lands while the pong is written is answered. The reader
+/// stores the nonce then claims; the writer clears the claim then reads the
+/// nonce. With release/acquire each side can miss the other's store (x86
+/// lets the clear sit in the store buffer past the load), and neither queues
+/// the new pong. Many tight rounds give that window a chance.
+#[test]
+fn pong_written_while_a_ping_lands_is_not_lost() {
+    use std::sync::atomic::AtomicBool;
+    const ROUNDS: usize = 200_000;
+    const IDLE: u64 = u64::MAX;
+    let slot = Arc::new(PongSlot::new());
+    let go = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicUsize::new(0));
+    let claimed = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let (slot, go, done, claimed) = (
+            Arc::clone(&slot),
+            Arc::clone(&go),
+            Arc::clone(&done),
+            Arc::clone(&claimed),
+        );
+        std::thread::spawn(move || {
+            for round in 1..=ROUNDS {
+                wait_for_round(&go, round, "writer");
+                claimed.store(slot.note(2 * round as u64 + 1), Ordering::Release);
+                done.store(round, Ordering::Release);
+            }
+        })
+    };
+    let mut lost = 0usize;
+    for round in 1..=ROUNDS {
+        // The writer holds the claim for the previous ping's pong.
+        let written = 2 * round as u64;
+        assert!(slot.note(written), "round {round} starts unclaimed");
+        go.store(round, Ordering::Release);
+        let again = slot.finish(written);
+        wait_for_round(&done, round, "reader");
+        if !claimed.load(Ordering::Acquire) && again.is_none() {
+            lost += 1;
+        }
+        // Write out whatever is still claimed.
+        let mut n = slot.claimed_nonce_or(IDLE);
+        while n != IDLE {
+            n = slot.finish(n).unwrap_or(IDLE);
+        }
+    }
+    reader.join().unwrap();
+    assert_eq!(lost, 0, "{lost} of {ROUNDS} pings were never answered");
 }
