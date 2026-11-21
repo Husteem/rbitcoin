@@ -1,6 +1,6 @@
 //! `std::sync::atomic` behind one import. `--cfg loom` swaps in loom's
-//! atomics so a model can see Class C sequence counters and the UTXO view
-//! word. Production is `std`. Shuttle does not rebuild this crate's atomics:
+//! atomics so a model can see Class C sequence counters, the `VarTable`
+//! publish counter, and the UTXO view word. Production is `std`. Shuttle does not rebuild this crate's atomics:
 //! its model is the script-pool idle turn.
 
 #[cfg(loom)]

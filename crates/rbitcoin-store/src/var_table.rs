@@ -13,9 +13,9 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::io_handle::IoHandle;
+use crate::sync::atomic::{AtomicU64, Ordering};
 use rbitcoin_primitives::{Fk, TableKind};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Encoded Class A append waiting for body write + idx + HWM publish.
 pub struct PreparedAppend {
@@ -575,7 +575,7 @@ impl VarTable {
     pub fn publish_begin(&self) {
         let prev = self.publish_seq.fetch_add(1, Ordering::Relaxed);
         debug_assert_eq!(prev & 1, 0, "nested/concurrent publish_begin");
-        std::sync::atomic::fence(Ordering::Release);
+        crate::sync::atomic::fence(Ordering::Release);
     }
 
     #[inline]
@@ -590,7 +590,7 @@ impl VarTable {
         loop {
             let s1 = self.publish_seq.load(Ordering::Acquire);
             if s1 & 1 != 0 {
-                std::hint::spin_loop();
+                crate::sync::spin();
                 continue;
             }
             let end = self
@@ -598,7 +598,11 @@ impl VarTable {
                 .load(Ordering::Relaxed)
                 .max(FILE_HEADER_LEN as u64);
             let count = self.count.load(Ordering::Relaxed);
-            let s2 = self.publish_seq.load(Ordering::Acquire);
+            // An acquire load of `s2` does not keep the two loads above from
+            // moving after it. The fence does: if either read a store made
+            // after `publish_begin`'s release fence, `s2` sees the odd step.
+            crate::sync::atomic::fence(Ordering::Acquire);
+            let s2 = self.publish_seq.load(Ordering::Relaxed);
             if s1 == s2 {
                 return (count, end);
             }

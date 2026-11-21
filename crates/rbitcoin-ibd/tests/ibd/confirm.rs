@@ -6,8 +6,9 @@ use std::sync::Arc;
 use rbitcoin_ibd::ibd::confirm::{
     format_conf_q, format_queue_depth, format_stamp_reject_missing_prevout, inflight_prune_height,
     stamp_reject_operator_msg, write_drain_max_parts, write_queue_cap, AccountedHeap, ConfirmFeed,
-    ConfirmQueueDepths, ConfirmRejectClass, InflightRetain, RejectParent, CONFIRM_RUN_MAX_BLOCKS,
-    INFLIGHT_PIN_FLOOR_BYTES, INFLIGHT_RETAIN_OWNED_LIMIT, INFLIGHT_RETAIN_STEP,
+    ConfirmPipelineSizes, ConfirmQueueDepths, ConfirmRejectClass, InflightRetain, RejectParent,
+    CONFIRM_RUN_MAX_BLOCKS, INFLIGHT_PIN_FLOOR_BYTES, INFLIGHT_RETAIN_OWNED_LIMIT,
+    INFLIGHT_RETAIN_STEP,
 };
 
 #[test]
@@ -636,8 +637,8 @@ fn lookup_blocks_when_loadq_full() {
 #[test]
 fn pipeline_parents_meter_prep_and_write() {
     let q = ConfirmQueueDepths::new();
-    q.note_script_send(2, 1_000, 50);
-    q.note_write_send(3, 2_000, 80);
+    q.send_script(2, 1_000, 50, || Ok::<(), ()>(())).unwrap();
+    q.send_write(3, 2_000, 80, || Ok::<(), ()>(())).unwrap();
     let c = q.content_snap();
     assert_eq!(c.script_parents, 50);
     assert_eq!(c.write_parents, 80);
@@ -689,11 +690,42 @@ fn requeue_clears_inflight_so_tip_can_retry() {
     assert!(g.ready.contains_key(&88));
 }
 
+/// The receiving stage can take a batch and count it out before the sender's
+/// `send` returns. Each `send` closure here plays that receiver. Every depth
+/// and size must come back to zero, not keep the lost decrement as a +1.
+#[test]
+fn queue_depth_counts_a_batch_before_the_receiver_can_take_it() {
+    let empty = format!("{:?}", ConfirmPipelineSizes::default());
+    let q = ConfirmQueueDepths::new();
+    q.send_load(3, 300, || {
+        q.note_load_recv(3, 300);
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    q.send_script(2, 200, 20, || {
+        q.note_script_recv(2, 200, 20);
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    q.send_write(1, 100, 10, || {
+        q.note_write_recv(1, 100, 10);
+        Ok::<(), ()>(())
+    })
+    .unwrap();
+    assert_eq!(format!("{:?}", q.content_snap()), empty);
+
+    // A failed send leaves nothing counted.
+    assert_eq!(q.send_load(3, 300, || Err(())), Err(()));
+    assert_eq!(q.send_script(2, 200, 20, || Err(())), Err(()));
+    assert_eq!(q.send_write(1, 100, 10, || Err(())), Err(()));
+    assert_eq!(format!("{:?}", q.content_snap()), empty);
+}
+
 #[test]
 fn queue_hwm_tracks_max_depth() {
     let q = ConfirmQueueDepths::new();
-    q.note_script_send(32, 1, 0);
-    q.note_script_send(32, 1, 0);
+    q.send_script(32, 1, 0, || Ok::<(), ()>(())).unwrap();
+    q.send_script(32, 1, 0, || Ok::<(), ()>(())).unwrap();
     assert_eq!(q.snap().1, 2);
     q.note_script_recv(32, 1, 0);
     assert_eq!(q.snap().1, 1);
@@ -908,8 +940,8 @@ fn confirm_queue_depths_content_snap_and_notes() {
     assert_eq!(c0.feed_ready, 0);
     assert_eq!(c0.feed_inflight, 0);
 
-    q.note_script_send(3, 1000, 2);
-    q.note_write_send(2, 500, 7);
+    q.send_script(3, 1000, 2, || Ok::<(), ()>(())).unwrap();
+    q.send_write(2, 500, 7, || Ok::<(), ()>(())).unwrap();
     let c1 = q.content_snap();
     assert_eq!(c1.script_batches, 1);
     assert_eq!(c1.script_blocks, 3);
