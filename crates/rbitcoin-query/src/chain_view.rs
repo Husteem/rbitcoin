@@ -675,7 +675,10 @@ impl Query {
         // Core's `FindForkInGlobalIndex` skips hashes it does not know — the
         // zero hash included — and falls back to genesis when none match.
         // Either way the reply starts after the fork point, so genesis is
-        // never served for a non-empty locator.
+        // never served for a non-empty locator. Core also maps a known hash
+        // on a stale branch that contains our tip to that tip; this layer
+        // only resolves active-chain heights, so such a locator falls
+        // through to the genesis fallback instead.
         let mut start = 1u32;
         'outer: for loc in locator {
             if let Some(h) = self.height_of_hash(&loc.to_byte_array())? {

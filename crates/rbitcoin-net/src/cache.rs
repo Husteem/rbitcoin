@@ -186,9 +186,11 @@ impl BlockCache {
         if g.chain.is_empty() {
             return Vec::new();
         }
-        // Core's `FindForkInGlobalIndex` skips hashes it does not know and
-        // falls back to genesis, then replies from after that fork point.
-        // `base == 0` means `chain[0]` is genesis, which is never served.
+        // Like Core's `FindForkInGlobalIndex` for the cases this cache can
+        // resolve: skip hashes it does not know, fall back to genesis, and
+        // reply from after that fork point. `base == 0` means `chain[0]` is
+        // genesis, which is never served. A known hash on a stale branch is
+        // not resolved against our tip here.
         let mut start = usize::from(g.base == 0);
         'outer: for loc in locator {
             for (i, h) in g.chain.iter().enumerate() {
