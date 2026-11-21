@@ -2151,3 +2151,33 @@ fn wire_plan_fee_stamp_of_a_past_end_vout_is_not_found() {
         "a past-end vout is not found, not corrupt: {err}"
     );
 }
+
+/// Same-header membership over a batch's header ranges (ascending, one per
+/// block): a spend and its create are in the same block exactly when both
+/// fall in the range that holds the spend.
+#[test]
+fn create_in_header_ranges_matches_the_block_of_the_spend() {
+    use rbitcoin_query::ArchiveWritePlan;
+    let mut ranges = Vec::new();
+    let mut first = 10u64;
+    for (h, n) in [3u32, 1, 7, 2, 5].into_iter().enumerate() {
+        ranges.push((Fk(1000 + h as u64), Fk(first), n));
+        first += u64::from(n);
+    }
+    let block_of = |id: u64| {
+        ranges
+            .iter()
+            .position(|&(_, f, n)| id >= f.0 && id < f.0 + u64::from(n))
+    };
+    for spend in 0..first + 3 {
+        for create in 0..first + 3 {
+            let want = block_of(spend).is_some() && block_of(spend) == block_of(create);
+            assert_eq!(
+                ArchiveWritePlan::create_in_header_ranges(&ranges, Fk(spend), create),
+                want,
+                "spend={spend} create={create}"
+            );
+        }
+    }
+    assert!(!ArchiveWritePlan::create_in_header_ranges(&[], Fk(12), 12));
+}
