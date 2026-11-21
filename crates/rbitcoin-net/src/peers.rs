@@ -1284,10 +1284,6 @@ impl LivePeer {
         self.tx_inv().last_inv_sequence
     }
 
-    pub fn inv_to_send(&self) -> u32 {
-        self.tx_inv().inv_to_send
-    }
-
     /// One more tx waits for this peer's next INV batch.
     pub fn count_tx_inv_to_send(&self) {
         let mut g = self.tx_inv();

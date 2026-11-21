@@ -1611,7 +1611,7 @@ mod peer_session_pins {
         assert!(tx_announce_should_queue(Some(&live), &mp, &txid));
         let inn = inbound();
         tx_announce_maybe_count(Some(&inn), &mp, &txid);
-        assert_eq!(inn.inv_to_send(), 1);
+        assert_eq!(inn.snapshot(0).inv_to_send, 1);
     }
 
     fn open_pool(
