@@ -3,7 +3,8 @@
 //! On **datadir create**, a 32-byte CSPRNG secret is written to `store/store.secret`
 //! (mode 0600 when the OS allows). Derived material:
 //!
-//! - **Script XOR:** `xor_key_byte(i) = secret[i % 32] ^ stream_mix(i)` applied to
+//! - **Script XOR:** `xor_key_byte(i) = secret[i % 32] ^ top_byte(i·φ)` (φ =
+//!   `0x9E37_79B9_7F4A_7C15`, wrapping at 2^64) applied to
 //!   on-disk `scriptPubKey`, `scriptSig`, and witness item bytes (Bitcoin Core–style
 //!   at-rest obfuscation of script/witness blobs only — not txids or amounts).
 //! - **TXID mix:** `mix_txid(txid) = SHA256(secret || txid)` is the **page-local**
