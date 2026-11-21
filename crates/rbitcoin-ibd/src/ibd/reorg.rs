@@ -556,6 +556,7 @@ pub fn maybe_rewind_to_best_work_n(
     let cands = rewind_candidate_hashes(st, hub)?;
     let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
     let mut cap = None;
+    let tip_before = tip_pair(hub);
     let picked = select_heavier_path(
         hub,
         &cands,
@@ -568,8 +569,9 @@ pub fn maybe_rewind_to_best_work_n(
         st.reorg.defer(&cands);
         return Ok(false);
     };
+    fire(&BEFORE_PREPARE);
     let others_out_of_reach = walk_max < ancestor_walk_max(cap) && cands.len() > 1;
-    if others_out_of_reach || !apply_header_rewind(st, hub, &path, cap)? {
+    if others_out_of_reach || !apply_header_rewind(st, hub, &path, cap, tip_before)? {
         st.reorg.defer(&cands);
         return Ok(false);
     }
@@ -697,17 +699,43 @@ pub struct RewindPrep {
 
 /// Store side of a rewind: parent lookup and the confirmed-tip disconnect.
 /// No `IbdWorkState` borrow, so the coordination lock is not held.
+///
+/// A rewind whose selection measured `tip_before`. The disconnect takes the
+/// tip commit and compares `tip_before` under it, so confirm cannot extend
+/// the chain the fork was measured against in between. A selected chain that
+/// has not moved the tip forks below it, so a plant is not a rewind: callers
+/// leave it for confirm. A moved tip selects again later.
 #[doc(hidden)]
-pub fn prepare_header_rewind(
+pub fn prepare_header_rewind_at(
     hub: &ChainHub,
     path: &[BlockHash],
     max_depth: u32,
+    tip_before: (Option<u32>, Option<BlockHash>),
 ) -> Result<Option<RewindPrep>, NetError> {
+    let Some((lca, lca_h, tip_h)) = rewind_target(hub, path, max_depth)? else {
+        return Ok(None);
+    };
+    if tip_h > lca_h {
+        let (Some(height), Some(hash)) = tip_before else {
+            return Ok(None);
+        };
+        if !hub.try_rewind_to_height_at(lca_h, (height, hash))? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(finish_header_rewind(hub, path, lca, lca_h, tip_h)))
+}
+
+/// The path's LCA, its height, and the tip `max_depth` is measured from.
+fn rewind_target(
+    hub: &ChainHub,
+    path: &[BlockHash],
+    max_depth: u32,
+) -> Result<Option<(BlockHash, u32, u32)>, NetError> {
     let Some((lca, lca_h)) = path_lca(hub, path)? else {
         return Ok(None);
     };
     let tip_h = hub.tip_height().unwrap_or(0);
-    let rewound = tip_h > lca_h;
     if tip_h.saturating_sub(lca_h) > max_depth {
         warn!(
             "ibd: heavier fork rewind depth {} exceeds cap {max_depth} (lca={lca_h} tip={tip_h})",
@@ -715,10 +743,18 @@ pub fn prepare_header_rewind(
         );
         return Ok(None);
     }
+    Ok(Some((lca, lca_h, tip_h)))
+}
+
+fn finish_header_rewind(
+    hub: &ChainHub,
+    path: &[BlockHash],
+    lca: BlockHash,
+    lca_h: u32,
+    tip_h: u32,
+) -> RewindPrep {
+    let rewound = tip_h > lca_h;
     if rewound {
-        if !hub.try_rewind_to_height(lca_h)? {
-            return Ok(None);
-        }
         info!(
             "ibd: most-work header rewind tip {tip_h} → {lca_h} (winning path {} header(s))",
             path.len()
@@ -748,14 +784,14 @@ pub fn prepare_header_rewind(
                 .map(|(fk, _)| fk)
         })
         .collect();
-    Ok(Some(RewindPrep {
+    RewindPrep {
         lca,
         lca_h,
         archived,
         connected,
         fks,
         rewound,
-    }))
+    }
 }
 
 #[doc(hidden)]
@@ -798,16 +834,37 @@ pub fn commit_header_rewind(
     st.quiesce_refund();
 }
 
-/// Rewind to `path` under the cap its selection used.
+/// Rewind to `path` under the cap its selection used, only while the
+/// confirmed tip is still the `tip_before` its selection measured. Callers
+/// hold `shared` and must not hold the tip commit. A path that reads as a
+/// plant is left for confirm: a selected chain that has not moved the tip
+/// forks below it, so a plant is not a rewind to commit.
 pub fn apply_header_rewind(
     st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
     path: &[BlockHash],
     cap: u32,
+    tip_before: (Option<u32>, Option<BlockHash>),
 ) -> Result<bool, NetError> {
-    let Some(prep) = prepare_header_rewind(hub, path, cap)? else {
+    let Some(prep) = prepare_header_rewind_at(hub, path, cap, tip_before)? else {
         return Ok(false);
     };
+    if !prep.rewound {
+        return Ok(false);
+    }
+    // The prepare dropped the tip commit after its disconnect and read the
+    // path's store rows since. Confirm may have extended from the LCA. The
+    // disconnect is already on disk, so the state commit cannot be
+    // abandoned: wait for the commit and hold it across the recheck and
+    // commit.
+    fire(&AFTER_PREPARE);
+    let _commit = hub
+        .query
+        .lock_tip_commit()
+        .map_err(|e| NetError::Store(e.to_string()))?;
+    if !rewind_tip_still(hub, &prep) {
+        return Ok(false);
+    }
     commit_header_rewind(st, hub, path, &prep);
     Ok(true)
 }
@@ -826,19 +883,10 @@ fn tip_pair(hub: &ChainHub) -> (Option<u32>, Option<BlockHash>) {
     (hub.tip_height(), hub.tip_hash())
 }
 
-/// `prepare_header_rewind` already disconnected when `prep.rewound`. The
-/// commit is for that tip, not whatever tip is current after a later rewind.
-fn rewind_tip_still(
-    hub: &ChainHub,
-    prep: &RewindPrep,
-    tip_before: (Option<u32>, Option<BlockHash>),
-) -> bool {
-    let now = tip_pair(hub);
-    if prep.rewound {
-        now == (Some(prep.lca_h), Some(prep.lca))
-    } else {
-        now == tip_before
-    }
+/// `prepare_header_rewind_at` already disconnected. The commit is for that
+/// tip, not whatever tip is current after a later rewind.
+fn rewind_tip_still(hub: &ChainHub, prep: &RewindPrep) -> bool {
+    tip_pair(hub) == (Some(prep.lca_h), Some(prep.lca))
 }
 
 struct PreparedHook {
@@ -847,22 +895,18 @@ struct PreparedHook {
 }
 
 static AFTER_PREPARE: Mutex<Option<PreparedHook>> = Mutex::new(None);
+static BEFORE_PREPARE: Mutex<Option<PreparedHook>> = Mutex::new(None);
 
-/// Runs on this thread after a rewind is prepared and before it is committed.
-/// The header-thread stand-in in the stale-commit pin uses this. An empty
-/// hook is production.
-#[doc(hidden)]
-pub fn arm_after_header_rewind_prepare_for_test(hook: Option<fn()>) {
-    let mut slot = AFTER_PREPARE.lock().unwrap_or_else(|err| err.into_inner());
-    *slot = hook.map(|hook| PreparedHook {
+fn arm(slot: &Mutex<Option<PreparedHook>>, hook: Option<fn()>) {
+    *slot.lock().unwrap_or_else(|err| err.into_inner()) = hook.map(|hook| PreparedHook {
         thread: std::thread::current().id(),
         hook,
     });
 }
 
-fn fire_after_prepare() {
+fn fire(slot: &Mutex<Option<PreparedHook>>) {
     let hook = {
-        let mut slot = AFTER_PREPARE.lock().unwrap_or_else(|err| err.into_inner());
+        let mut slot = slot.lock().unwrap_or_else(|err| err.into_inner());
         match slot.as_ref() {
             Some(armed) if armed.thread == std::thread::current().id() => {
                 let hook = armed.hook;
@@ -875,6 +919,22 @@ fn fire_after_prepare() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+/// Runs on this thread after a selection and before its rewind is prepared.
+/// The confirm stand-in in the moved-tip pin uses this. An empty hook is
+/// production.
+#[doc(hidden)]
+pub fn arm_before_header_rewind_prepare_for_test(hook: Option<fn()>) {
+    arm(&BEFORE_PREPARE, hook);
+}
+
+/// Runs on this thread after a rewind is prepared and before it is committed.
+/// The header-thread stand-in in the stale-commit pin uses this. An empty
+/// hook is production.
+#[doc(hidden)]
+pub fn arm_after_header_rewind_prepare_for_test(hook: Option<fn()>) {
+    arm(&AFTER_PREPARE, hook);
 }
 
 /// Select the heavier path with the most work, disconnect, and commit it.
@@ -901,13 +961,14 @@ pub(crate) fn apply_off_lock_rewind(
     };
     let cap = super::header_walk::rewind_depth_cap_of(origin, proven, hub);
     let walk_max = ancestor_walk_max(cap);
+    let tip_before = tip_pair(hub);
     let Some((path, cap)) =
         select_heavier_path(hub, cands, invalid, walk_max, &mut || cap, Pick::MostWork)?
     else {
         return Ok(false);
     };
-    let tip_before = tip_pair(hub);
-    let Some(prep) = prepare_header_rewind(hub, &path, cap)? else {
+    fire(&BEFORE_PREPARE);
+    let Some(prep) = prepare_header_rewind_at(hub, &path, cap, tip_before)? else {
         shared
             .lock()
             .unwrap_or_else(|err| err.into_inner())
@@ -915,15 +976,32 @@ pub(crate) fn apply_off_lock_rewind(
             .defer(cands);
         return Ok(false);
     };
+    if !prep.rewound {
+        shared
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .reorg
+            .defer(cands);
+        return Ok(false);
+    }
     // Re-selecting here would see the LCA we just rewound to and return
     // none. The fresh select is the one above, after the other rewind has
     // either committed or is waiting on this gate.
-    fire_after_prepare();
+    fire(&AFTER_PREPARE);
     let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
+    // The prepare has already disconnected, so the state commit cannot be
+    // abandoned. Take `shared` before the commit and then wait for it;
+    // confirm does not take `shared`, so this order cannot cycle. Hold the
+    // commit across the recheck and commit so confirm cannot extend from the
+    // LCA in between.
+    let _commit = hub
+        .query
+        .lock_tip_commit()
+        .map_err(|e| NetError::Store(e.to_string()))?;
     let marked_invalid = path
         .iter()
         .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()));
-    if marked_invalid || !rewind_tip_still(hub, &prep, tip_before) {
+    if marked_invalid || !rewind_tip_still(hub, &prep) {
         st.reorg.defer(cands);
         return Ok(false);
     }

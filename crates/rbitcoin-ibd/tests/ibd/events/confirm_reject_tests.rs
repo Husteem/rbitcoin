@@ -4711,7 +4711,8 @@ fn verdict_applied_after_the_tip_moved_asks_for_the_body_again() {
 
     drop(rig.hub.query.lock_tip_commit().expect("tip flush"));
     let cap = rbitcoin_ibd::ibd::header_walk::rewind_depth_cap(&rig.st, &rig.hub);
-    assert!(apply_header_rewind(&mut rig.st, &rig.hub, &[hp, hb], cap).unwrap());
+    let tip_before = (rig.hub.tip_height(), rig.hub.tip_hash());
+    assert!(apply_header_rewind(&mut rig.st, &rig.hub, &[hp, hb], cap, tip_before).unwrap());
     assert_eq!(rig.hub.tip_hash(), Some(rig.tip), "p is disconnected");
     rig.apply_held(&held);
     assert!(!rig.st.reorg.invalid.contains(hb.to_byte_array()));

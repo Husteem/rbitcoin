@@ -18,7 +18,7 @@ fn unproved_lead_rewinds_past_1024_and_a_proved_walk_does_not() {
     let (kept, side) = confirm_past_1024(&hub, 1_500_080_000);
     let path = [side];
     assert!(
-        prepare_header_rewind(&hub, &path, REWIND_MAX_DEPTH)
+        prepare_now(&hub, &path, REWIND_MAX_DEPTH)
             .unwrap()
             .is_none(),
         "1,025 blocks is past the proved cap, and this call must not move the tip"
@@ -176,6 +176,15 @@ fn floor_just_above(work: bitcoin::Work) -> rbitcoin_consensus::Milestone {
     }
 }
 
+/// [`prepare_header_rewind_at`] against the confirmed tip this call sees.
+fn prepare_now(
+    hub: &ChainHub,
+    path: &[BlockHash],
+    max_depth: u32,
+) -> Result<Option<RewindPrep>, NetError> {
+    prepare_header_rewind_at(hub, path, max_depth, (hub.tip_height(), hub.tip_hash()))
+}
+
 /// [`apply_header_rewind`] under the cap this state puts in force.
 fn rewind_under_own_cap(
     st: &mut rbitcoin_ibd::ibd::state::IbdWorkState,
@@ -183,7 +192,8 @@ fn rewind_under_own_cap(
     path: &[BlockHash],
 ) -> Result<bool, NetError> {
     let cap = rbitcoin_ibd::ibd::header_walk::rewind_depth_cap(st, hub);
-    apply_header_rewind(st, hub, path, cap)
+    let tip_before = (hub.tip_height(), hub.tip_hash());
+    apply_header_rewind(st, hub, path, cap, tip_before)
 }
 
 fn tmp_hub() -> (rbitcoin_query::testutil::TempDir, ChainHub) {
@@ -480,7 +490,7 @@ fn commit_deeper_fork_after_prepare() {
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .expect("side hash armed");
-    let prep = prepare_header_rewind(&hub, &[g1], REWIND_MAX_DEPTH)
+    let prep = prepare_now(&hub, &[g1], REWIND_MAX_DEPTH)
         .unwrap()
         .expect("deeper fork disconnects to genesis");
     let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
@@ -492,6 +502,7 @@ fn commit_deeper_fork_after_prepare() {
 /// to genesis and committed that fork. The prepared L1 commit must not run.
 #[test]
 fn stale_heavier_rewind_does_not_commit_after_the_tip_moves() {
+    let _serial = AFTER_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let _clear = ClearRewindHook;
     HOOK_RAN.store(false, Ordering::Release);
     let (dir, hub) = tmp_hub();
@@ -543,6 +554,425 @@ fn stale_heavier_rewind_does_not_commit_after_the_tip_moves() {
         "losing hashes from the prepared path stay off ordered"
     );
     assert_eq!(st.height_to_hash.get(&1), Some(&g1.block_hash()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+struct ClearBeforeRewindHook;
+impl Drop for ClearBeforeRewindHook {
+    fn drop(&mut self) {
+        arm_before_header_rewind_prepare_for_test(None);
+        *BEFORE_HUB.lock().unwrap_or_else(|err| err.into_inner()) = None;
+        *BEFORE_BLOCKS.lock().unwrap_or_else(|err| err.into_inner()) = None;
+        *BEFORE_LOWER_TO
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = None;
+    }
+}
+
+/// The hooks below share these statics, so one test arms them at a time.
+static BEFORE_LOCK: Mutex<()> = Mutex::new(());
+static BEFORE_HUB: Mutex<Option<Arc<ChainHub>>> = Mutex::new(None);
+static BEFORE_BLOCKS: Mutex<Option<Vec<Block>>> = Mutex::new(None);
+static BEFORE_LOWER_TO: Mutex<Option<u32>> = Mutex::new(None);
+static BEFORE_RAN: AtomicBool = AtomicBool::new(false);
+
+fn before_hub() -> Arc<ChainHub> {
+    BEFORE_HUB
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .expect("hub armed")
+        .clone()
+}
+
+/// Stands in for confirm extending the confirmed chain while the selection
+/// is walking. The fork it selected is heavier than the tip the walk saw,
+/// but not than the chain the extension leaves.
+fn extend_confirmed_tip_after_select() {
+    let hub = before_hub();
+    let blocks = BEFORE_BLOCKS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .take()
+        .expect("extension armed");
+    for block in blocks {
+        hub.accept_block(block).expect("extension connects");
+    }
+    BEFORE_RAN.store(true, Ordering::Release);
+}
+
+/// Stands in for a rewind that lowers the confirmed tip onto the fork's LCA
+/// while the selection is walking. The path then reads as a plant, which
+/// has no disconnect to recheck against the newer tip.
+fn lower_confirmed_tip_after_select() {
+    let hub = before_hub();
+    let keep = BEFORE_LOWER_TO
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .expect("lower target armed");
+    hub.rewind_to_height(keep).expect("tip lowers");
+    BEFORE_RAN.store(true, Ordering::Release);
+}
+
+/// The selection measured a fork against a 2-block tip. Confirm extended the
+/// tip past the fork before the rewind could run, so the rewind would
+/// disconnect a confirmed chain that is now the heavier one. The tip must
+/// stay, and the fork waits for the next selection against the new tip.
+#[test]
+fn an_off_lock_rewind_selected_against_an_older_tip_is_skipped() {
+    let _serial = BEFORE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _clear = ClearBeforeRewindHook;
+    BEFORE_RAN.store(false, Ordering::Release);
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_900;
+    let chain = confirmed_chain(&hub, 2, t);
+    let fork = side_headers(&hub, &chain, 0, 5, t + 1);
+
+    let mut blocks = Vec::new();
+    let mut prev = chain[2];
+    for h in 3..=7u32 {
+        let block = mine(prev, t + 100 * (h - 1), h);
+        prev = block.block_hash();
+        blocks.push(block);
+    }
+    let hub = Arc::new(hub);
+    *BEFORE_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
+    *BEFORE_BLOCKS.lock().unwrap_or_else(|err| err.into_inner()) = Some(blocks);
+
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
+    let shared = Mutex::new(st);
+    arm_before_header_rewind_prepare_for_test(Some(extend_confirmed_tip_after_select));
+
+    assert!(!rewind_off_coord_lock(&shared, &hub).unwrap());
+    assert!(
+        BEFORE_RAN.load(Ordering::Acquire),
+        "confirm extended the tip between select and prepare"
+    );
+    assert_eq!(
+        hub.tip_height(),
+        Some(7),
+        "the confirmed extension must not be disconnected"
+    );
+    let st = shared.lock().unwrap_or_else(|err| err.into_inner());
+    assert!(
+        !st.height_to_hash.contains_key(&5),
+        "the fork that lost to the new tip must not be planted"
+    );
+    assert_eq!(
+        st.reorg.deferred,
+        vec![fork[4]],
+        "the fork is retried against the tip that now exists"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The pass under `shared` selects and prepares in one call, but confirm does
+/// not take that lock. An extension that lands during its walk leaves the
+/// same stale selection, so the tip guard covers this path too.
+#[test]
+fn an_under_lock_rewind_selected_against_an_older_tip_is_skipped() {
+    let _serial = BEFORE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _clear = ClearBeforeRewindHook;
+    BEFORE_RAN.store(false, Ordering::Release);
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_920;
+    let chain = confirmed_chain(&hub, 2, t);
+    let fork = side_headers(&hub, &chain, 0, 5, t + 1);
+
+    let mut blocks = Vec::new();
+    let mut prev = chain[2];
+    for h in 3..=7u32 {
+        let block = mine(prev, t + 100 * (h - 1), h);
+        prev = block.block_hash();
+        blocks.push(block);
+    }
+    let hub = Arc::new(hub);
+    *BEFORE_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
+    *BEFORE_BLOCKS.lock().unwrap_or_else(|err| err.into_inner()) = Some(blocks);
+
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
+    arm_before_header_rewind_prepare_for_test(Some(extend_confirmed_tip_after_select));
+
+    assert!(!maybe_rewind_to_best_work(&mut st, &hub).unwrap());
+    assert!(
+        BEFORE_RAN.load(Ordering::Acquire),
+        "confirm extended the tip between select and prepare"
+    );
+    assert_eq!(
+        hub.tip_height(),
+        Some(7),
+        "the confirmed extension must not be disconnected"
+    );
+    assert!(
+        !st.height_to_hash.contains_key(&5),
+        "the fork that lost to the new tip must not be planted"
+    );
+    assert_eq!(st.reorg.deferred, vec![fork[4]]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A concurrent rewind can lower the tip onto the fork's LCA while the
+/// selection walks, so the path reads as a plant. A plant is not a rewind:
+/// it never reaches the commit, so a busy commit cannot stall or commit it.
+#[test]
+fn a_plant_selected_against_an_older_tip_is_skipped() {
+    let _before = BEFORE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _after = AFTER_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _clear = ClearBeforeRewindHook;
+    let _clear_after = ClearAfterRewindHook;
+    BEFORE_RAN.store(false, Ordering::Release);
+    AFTER_RAN.store(false, Ordering::Release);
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_940;
+    let chain = confirmed_chain(&hub, 3, t);
+    let fork = side_headers(&hub, &chain, 1, 4, t + 1);
+    let hub = Arc::new(hub);
+    *BEFORE_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
+    *BEFORE_LOWER_TO
+        .lock()
+        .unwrap_or_else(|err| err.into_inner()) = Some(1);
+    *AFTER_HOLD_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
+
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[3]));
+    arm_before_header_rewind_prepare_for_test(Some(lower_confirmed_tip_after_select));
+    arm_after_header_rewind_prepare_for_test(Some(hold_commit_after_prepare));
+
+    assert!(!maybe_rewind_to_best_work(&mut st, &hub).unwrap());
+    assert!(
+        BEFORE_RAN.load(Ordering::Acquire),
+        "the tip was lowered between select and prepare"
+    );
+    assert!(
+        !AFTER_RAN.load(Ordering::Acquire),
+        "a plant must not reach the commit"
+    );
+    assert_eq!(hub.tip_height(), Some(1), "the lowering rewind stays");
+    assert!(
+        !st.height_to_hash.contains_key(&2),
+        "the path is not planted against a tip it was not selected for"
+    );
+    assert_eq!(st.reorg.deferred, vec![fork[3]]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A child of the tip is a plant, not a rewrite of the path above it. The
+/// commit is free; apply still leaves it for confirm.
+#[test]
+fn a_plant_with_a_free_commit_is_not_committed() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let side = mine(gen, 1_500_099_950, 1);
+    hub.ensure_header(&side.header).unwrap();
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let tip_before = (hub.tip_height(), hub.tip_hash());
+    assert!(
+        !apply_header_rewind(
+            &mut st,
+            &hub,
+            &[side.block_hash()],
+            REWIND_MAX_DEPTH,
+            tip_before
+        )
+        .unwrap(),
+        "a plant is not a rewind"
+    );
+    assert_eq!(hub.tip_height(), Some(0));
+    assert!(!st.height_to_hash.contains_key(&1));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The hooks that move the tip after prepare share one slot, so one test
+/// arms it at a time.
+static AFTER_LOCK: Mutex<()> = Mutex::new(());
+static AFTER_HUB: Mutex<Option<Arc<ChainHub>>> = Mutex::new(None);
+static AFTER_BLOCKS: Mutex<Option<Vec<Block>>> = Mutex::new(None);
+static AFTER_HOLD_HUB: Mutex<Option<Arc<ChainHub>>> = Mutex::new(None);
+static AFTER_RAN: AtomicBool = AtomicBool::new(false);
+
+struct ClearAfterRewindHook;
+impl Drop for ClearAfterRewindHook {
+    fn drop(&mut self) {
+        arm_after_header_rewind_prepare_for_test(None);
+        *AFTER_HUB.lock().unwrap_or_else(|err| err.into_inner()) = None;
+        *AFTER_BLOCKS.lock().unwrap_or_else(|err| err.into_inner()) = None;
+        *AFTER_HOLD_HUB.lock().unwrap_or_else(|err| err.into_inner()) = None;
+    }
+}
+
+/// Stands in for confirm extending from the LCA after the prepare dropped
+/// the tip commit and read the path's store rows.
+fn extend_tip_after_prepare() {
+    let hub = AFTER_HUB
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .expect("hub armed")
+        .clone();
+    let blocks = AFTER_BLOCKS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .take()
+        .expect("extension armed");
+    for block in blocks {
+        hub.accept_block(block).expect("extension connects");
+    }
+    AFTER_RAN.store(true, Ordering::Release);
+}
+
+/// The under-lock prepare disconnects to the LCA and then builds the path
+/// state while the tip commit is down. Confirm can extend from the LCA in
+/// that gap. The commit must recheck the tip under the commit, or it clears
+/// the path and moves `lookup_taken_hi` back to an LCA the chain has left.
+#[test]
+fn an_under_lock_commit_selected_against_an_older_tip_is_skipped() {
+    let _serial = AFTER_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _clear = ClearAfterRewindHook;
+    AFTER_RAN.store(false, Ordering::Release);
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_960;
+    let chain = confirmed_chain(&hub, 2, t);
+    let fork = side_headers(&hub, &chain, 0, 5, t + 1);
+
+    let mut blocks = Vec::new();
+    let mut prev = chain[0];
+    for h in 1..=5u32 {
+        let block = mine(prev, t + 5_000 + 100 * (h - 1), h);
+        prev = block.block_hash();
+        blocks.push(block);
+    }
+    let hub = Arc::new(hub);
+    *AFTER_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
+    *AFTER_BLOCKS.lock().unwrap_or_else(|err| err.into_inner()) = Some(blocks);
+
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
+    arm_after_header_rewind_prepare_for_test(Some(extend_tip_after_prepare));
+
+    assert!(!maybe_rewind_to_best_work(&mut st, &hub).unwrap());
+    assert!(
+        AFTER_RAN.load(Ordering::Acquire),
+        "confirm extended from the LCA before the commit"
+    );
+    assert_eq!(
+        hub.tip_height(),
+        Some(5),
+        "the extension from the LCA stays"
+    );
+    assert!(
+        !st.height_to_hash.contains_key(&1),
+        "the path is not committed against a tip the selection did not measure"
+    );
+    assert_eq!(st.reorg.deferred, vec![fork[4]]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Stands in for a tip flush or confirm write that owns the commit when the
+/// prepare returns. The holder keeps it just long enough for the caller to
+/// reach its own acquisition.
+fn hold_commit_after_prepare() {
+    let hub = AFTER_HOLD_HUB
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .expect("hub armed")
+        .clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _commit = hub.query.lock_tip_commit().expect("tip commit");
+        ready_tx.send(()).expect("holder ready");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("holder took the commit");
+    AFTER_RAN.store(true, Ordering::Release);
+}
+
+/// The prepare already disconnected to the LCA. A tip flush or confirm write
+/// holds the commit and the tip has not moved. Returning false here leaves
+/// the store tip at the LCA and the work state on the old path; the next pass
+/// plants where it should rewind, so `note_rewind` never runs. The state
+/// commit must wait for the commit and finish.
+#[test]
+fn an_under_lock_commit_survives_a_busy_tip_commit() {
+    let _serial = AFTER_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _clear = ClearAfterRewindHook;
+    AFTER_RAN.store(false, Ordering::Release);
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_980;
+    let chain = confirmed_chain(&hub, 2, t);
+    let fork = side_headers(&hub, &chain, 0, 5, t + 1);
+    let hub = Arc::new(hub);
+    *AFTER_HOLD_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
+
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
+    arm_after_header_rewind_prepare_for_test(Some(hold_commit_after_prepare));
+
+    assert!(maybe_rewind_to_best_work(&mut st, &hub).unwrap());
+    assert!(
+        AFTER_RAN.load(Ordering::Acquire),
+        "the commit was busy after the prepare"
+    );
+    assert_eq!(hub.tip_height(), Some(0), "the prepare disconnected");
+    assert_eq!(st.height_to_hash.get(&1), Some(&fork[0]));
+    assert_eq!(
+        hub.query.lookup_taken_hi(),
+        Some(0),
+        "the state commit ran once the commit was free"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The off-lock caller has the same rule: once its prepare disconnected, a
+/// busy commit delays the state commit rather than dropping it.
+#[test]
+fn an_off_lock_commit_survives_a_busy_tip_commit() {
+    let _serial = AFTER_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _clear = ClearAfterRewindHook;
+    AFTER_RAN.store(false, Ordering::Release);
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_100_020;
+    let chain = confirmed_chain(&hub, 2, t);
+    let fork = side_headers(&hub, &chain, 0, 5, t + 1);
+    let hub = Arc::new(hub);
+    *AFTER_HOLD_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
+
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
+    let shared = Mutex::new(st);
+    arm_after_header_rewind_prepare_for_test(Some(hold_commit_after_prepare));
+
+    assert!(rewind_off_coord_lock(&shared, &hub).unwrap());
+    assert!(
+        AFTER_RAN.load(Ordering::Acquire),
+        "the commit was busy after the prepare"
+    );
+    assert_eq!(hub.tip_height(), Some(0), "the prepare disconnected");
+    let st = shared.lock().unwrap_or_else(|err| err.into_inner());
+    assert_eq!(st.height_to_hash.get(&1), Some(&fork[0]));
+    assert_eq!(
+        hub.query.lookup_taken_hi(),
+        Some(0),
+        "the state commit ran once the commit was free"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -792,7 +1222,7 @@ fn a_fork_deeper_than_the_cap_does_not_end_selection() {
         Some((shallow.clone(), 2)),
         "the fork 3 under the tip is past a cap of 2"
     );
-    let prep = prepare_header_rewind(&hub, &shallow, 2)
+    let prep = prepare_now(&hub, &shallow, 2)
         .unwrap()
         .expect("the rewind takes the path selection returned");
     assert_eq!(prep.lca_h, 1);
@@ -1230,7 +1660,7 @@ fn reorg_pin_a_plant_at_the_tip_is_not_a_rewind() {
     let gen = hub.tip_hash().unwrap();
     let side = mine(gen, hub.tip_header().unwrap().time.saturating_add(1), 1);
     hub.ensure_header(&side.header).unwrap();
-    let prep = prepare_header_rewind(&hub, &[side.block_hash()], 1)
+    let prep = prepare_now(&hub, &[side.block_hash()], 1)
         .unwrap()
         .expect("a child of the tip is a plant");
     assert!(!prep.rewound);
@@ -1251,7 +1681,7 @@ fn reorg_pin_a_rewind_at_the_depth_cap_still_disconnects() {
         tip,
     );
     hub.ensure_header(&side.header).unwrap();
-    let prep = prepare_header_rewind(&hub, &[side.block_hash()], 1)
+    let prep = prepare_now(&hub, &[side.block_hash()], 1)
         .unwrap()
         .expect("depth equal to the cap still rewinds");
     assert!(prep.rewound);

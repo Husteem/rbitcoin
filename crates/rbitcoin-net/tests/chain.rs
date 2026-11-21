@@ -709,6 +709,28 @@ fn rewind_defers_while_a_tip_commit_is_open() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The selection named tip 2 and LCA 1. Another rewind lowers the tip to
+/// genesis before the call. That is a moved tip, not `rewind above tip`.
+#[test]
+fn rewind_at_a_tip_below_the_lca_is_a_retry_not_an_error() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let b1 = mine(gen, 1_300_041_100, 1);
+    hub.accept_block(b1.clone()).unwrap();
+    let b2 = mine(b1.block_hash(), 1_300_041_200, 2);
+    hub.accept_block(b2).unwrap();
+    let expect = (2, hub.tip_hash().unwrap());
+    hub.rewind_to_height(0).unwrap();
+    assert_eq!(hub.tip_height(), Some(0));
+    assert!(
+        !hub.try_rewind_to_height_at(1, expect).unwrap(),
+        "a tip below the LCA is a stale selection, not an error"
+    );
+    assert_eq!(hub.tip_height(), Some(0));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn into_arc_shares_one_hub() {
     let (_dir, hub) = tmp_hub();
