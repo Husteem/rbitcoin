@@ -2567,6 +2567,9 @@ pub fn note_empty(
     }
     if asked.is_some() && asked == st.header_walk.tip_hash() {
         st.header_walk.emptied.insert(peer);
+        if st.header_walk.reserved == Some(peer) {
+            st.header_walk.reserved = None;
+        }
     }
     let tall: Vec<usize> = st
         .slots
@@ -3353,25 +3356,43 @@ pub fn pick_any_header_peer(st: &IbdWorkState, skip: Option<usize>) -> Option<us
 }
 
 /// Lowest time-to-first-byte among peers still on the walk. A peer with no
-/// body yet sorts after one who has delivered. `skip` is the peer whose ask
+/// body yet sorts after one who has delivered. A peer that answered empty at
+/// this tip sorts after every peer that has not. `skip` is the peer whose ask
 /// just expired, unless they are the only one left.
 #[doc(hidden)]
 pub fn pick_header_peer(st: &IbdWorkState, above: u32, skip: Option<usize>) -> Option<usize> {
-    let mut best: Option<(bool, u8, u64, usize)> = None;
-    for slot in &st.slots {
-        if !peer_can_head(st, slot.id, above) || skip == Some(slot.id) {
-            continue;
+    fn rank(
+        st: &IbdWorkState,
+        above: u32,
+        skip: Option<usize>,
+        accept_emptied: bool,
+    ) -> Option<usize> {
+        let mut best: Option<(bool, u8, u64, usize)> = None;
+        for slot in &st.slots {
+            if !peer_can_head(st, slot.id, above) || skip == Some(slot.id) {
+                continue;
+            }
+            if !accept_emptied && st.header_walk.emptied.contains(&slot.id) {
+                continue;
+            }
+            let key = header_peer_rank_key(st, slot);
+            // The id is in the key, so two peers never tie.
+            if best.is_none_or(|cur| key.cmp(&cur).is_lt()) {
+                best = Some(key);
+            }
         }
-        let key = header_peer_rank_key(st, slot);
-        // The id is in the key, so two peers never tie.
-        if best.is_none_or(|cur| key.cmp(&cur).is_lt()) {
-            best = Some(key);
+        if let Some((_, _, _, id)) = best {
+            return Some(id);
         }
+        skip.filter(|&id| {
+            peer_can_head(st, id, above)
+                && (accept_emptied || !st.header_walk.emptied.contains(&id))
+        })
     }
-    if let Some((_, _, _, id)) = best {
-        return Some(id);
-    }
-    skip.filter(|&id| peer_can_head(st, id, above))
+    // A peer that answered empty at this tip cannot extend it. Another taller
+    // peer still can. Fall back to the empty peer only when nobody else can
+    // head, so a probe or a later tip can still use it.
+    rank(st, above, skip, false).or_else(|| rank(st, above, skip, true))
 }
 
 #[doc(hidden)]
@@ -3382,7 +3403,19 @@ pub fn ensure_reserved(st: &mut IbdWorkState, above: u32, skip: Option<usize>) {
         // did not come from them.
         let unjudged_external =
             st.header_walk.challenge_open == Some(id) && st.header_walk.challenge_external;
-        if unjudged_external || (peer_can_head(st, id, above) && skip != Some(id)) {
+        // A peer that answered empty at this tip cannot head it. Give the ask
+        // to another taller peer that has not answered empty here.
+        let tip = st.header_walk.tip_height();
+        let another_can_head = st.slots.iter().any(|s| {
+            s.id != id && !st.header_walk.emptied.contains(&s.id) && peer_can_head(st, s.id, tip)
+        });
+        let empty_at_tip = st.header_walk.emptied.contains(&id) && another_can_head;
+        if unjudged_external || (peer_can_head(st, id, above) && skip != Some(id) && !empty_at_tip)
+        {
+            return;
+        }
+        if empty_at_tip {
+            st.header_walk.reserved = pick_header_peer(st, tip, skip);
             return;
         }
     }

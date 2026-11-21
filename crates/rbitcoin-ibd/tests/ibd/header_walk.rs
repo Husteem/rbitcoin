@@ -5354,6 +5354,60 @@ fn a_challenge_empty_reply_counts_at_the_tip() {
     assert!(st.header_walk.emptied.contains(&1));
 }
 
+/// Below the work floor, an empty reply retires that peer's ask. The next
+/// taller peer gets asked instead of the peer that just answered empty.
+#[test]
+fn an_empty_reply_below_the_floor_moves_the_ask_to_the_next_taller_peer() {
+    let (_dir, mut hub) =
+        rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-empty-next-peer");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let (first, mut first_rx) = slot(0);
+    let (second, mut second_rx) = slot(1);
+    let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.reserved, Some(0));
+    let h1 = mine(gen, 1);
+    apply(&mut st, &hub, 0, vec![h1]);
+    assert_eq!(st.header_walk.tip_hash(), Some(h1.block_hash()));
+    assert_eq!(drain_getheaders(&mut first_rx), 1);
+    set_min_work(&mut hub, [0xff; 32]);
+
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(
+        drain_getheaders(&mut first_rx),
+        1,
+        "the reserved peer gets the ask"
+    );
+    apply(&mut st, &hub, 0, vec![]);
+    assert_eq!(
+        st.header_walk.reserved,
+        Some(1),
+        "an empty reply moves the ask off its peer"
+    );
+    assert_eq!(
+        drain_getheaders(&mut first_rx),
+        0,
+        "the peer that just answered empty is not asked again"
+    );
+    assert_eq!(
+        drain_getheaders(&mut second_rx),
+        1,
+        "the other taller peer gets the ask"
+    );
+
+    apply(&mut st, &hub, 1, vec![]);
+    assert_eq!(
+        st.header_walk.tip_hash(),
+        Some(gen),
+        "every taller peer empty rewinds to the base"
+    );
+    assert!(
+        st.header_walk.dead_ends.contains(&h1.block_hash()),
+        "the abandoned candidate is a dead end"
+    );
+}
+
 /// With no checkpoint the walk tip is its base. Every peer answering empty
 /// there does not mark it dead, so a later batch on it extends the walk.
 #[test]
