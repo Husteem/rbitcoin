@@ -91,7 +91,7 @@ use crate::tx_table::BODY_PAGE_SIZE;
 use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::BuildHasherDefault;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -442,7 +442,7 @@ fn key_rel(key: u64) -> u16 {
 }
 
 /// Slot index to note, for the notes confirm adds between freezes.
-type OpenNotes = HashMap<u64, Slot, BuildHasherDefault<SlotKeyHasher>>;
+type OpenNotes = crate::int_map::SlotMap<Slot>;
 
 /// A map for the next window, sized from the `recent` notes the window
 /// ending now holds plus a quarter: a window at the cap gets
@@ -455,32 +455,6 @@ fn open_notes_after(recent: usize) -> OpenNotes {
 /// What an [`OpenNotes`] allocates: its buckets and their control bytes.
 fn open_notes_bytes(m: &OpenNotes) -> u64 {
     rbitcoin_primitives::heap_bytes::hash_table_bytes::<u64, Slot>(m.capacity())
-}
-
-/// One multiply and a fold. Slot indexes sit far below 2^57, so an identity
-/// hash would leave hashbrown's 7-bit tag (the top bits) zero in every
-/// bucket and each probe would compare keys across its whole group. The
-/// bucket comes from the low bits, which a product alone takes only from
-/// the key's low bits: keys a power-of-two stride apart would share
-/// buckets, so the product's high half folds down.
-#[derive(Default, Clone, Copy)]
-struct SlotKeyHasher(u64);
-
-impl Hasher for SlotKeyHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64((self.0 << 8) | u64::from(b));
-        }
-    }
-
-    fn write_u64(&mut self, i: u64) {
-        let h = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        self.0 = h ^ (h >> 32);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
-    }
 }
 
 /// Frozen notes sorted by slot index, 16 bytes each, so a page's notes are

@@ -1,10 +1,7 @@
 use rbitcoin_primitives::Fk;
 use rbitcoin_query::batch_parents::*;
-use rbitcoin_store::U64Map;
 use rbitcoin_store::{OutputRecord, TxRecord};
 use std::sync::Arc;
-
-use rbitcoin_store::U64IdentityHasher;
 
 fn tx(id: u8) -> TxRecord {
     let mut txid = [0u8; 32];
@@ -280,31 +277,6 @@ fn get_spender_abs_rejects_unknown_rel() {
     bp.set_spent_range_only(Fk(1), (100, 8));
     assert_eq!(bp.get_spender_abs(Fk(1), 0), Some(100));
     assert!(bp.get_spender_abs(Fk(1), 1).is_none());
-}
-
-/// Identity hasher for pack-scale u64 keys is the raw key (no SipHash mix).
-/// Write/lookup structural maps depend on this for the measured CPU win.
-#[test]
-fn u64_identity_hasher_is_raw_key_and_map_roundtrips_pack_scale() {
-    // Shipped path: store identity hasher via U64Map API.
-    use std::hash::Hasher;
-    let mut h = U64IdentityHasher::default();
-    h.write_u64(0xdead_beef_cafe_u64);
-    assert_eq!(h.finish(), 0xdead_beef_cafe_u64);
-
-    // Pack-scale create_fk map: sequential ids must insert + get without loss.
-    let n = 8_000u64;
-    let mut m: U64Map<u32> = U64Map::with_capacity_and_hasher(n as usize, Default::default());
-    for i in 1..=n {
-        m.insert(i, (i % 1_000_000) as u32);
-    }
-    assert_eq!(m.len(), n as usize);
-    for i in 1..=n {
-        assert_eq!(m.get(&i).copied(), Some((i % 1_000_000) as u32));
-    }
-    // Collisions / wrong finish would drop keys under open addressing.
-    assert_eq!(m.get(&0), None);
-    assert_eq!(m.get(&(n + 1)), None);
 }
 
 /// Q-M3: empty checked / already-covered live must not publish a new outs Arc.
