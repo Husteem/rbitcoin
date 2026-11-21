@@ -2984,22 +2984,6 @@ impl MempoolHub {
         id != u64::MAX && id == self.trusted_session.load(Ordering::Relaxed)
     }
 
-    /// Sync [`Self::accept_test_package_member_async`].
-    pub fn accept_test_package_member(
-        &self,
-        tx: &Transaction,
-    ) -> Result<AcceptResult, AcceptError> {
-        crate::reactor::assert_not_reactor("mempool accept");
-        let utxo = self.utxo_provider();
-        self.accept_with_utxo(
-            tx,
-            &utxo,
-            TxOrigin::Relay(None),
-            AcceptPath::TestPackageMember,
-            &[],
-        )
-    }
-
     /// Admit one `submitpackage` member, local origin, without trimming and
     /// without parking.
     ///
