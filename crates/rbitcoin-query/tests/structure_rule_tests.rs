@@ -2170,6 +2170,62 @@ fn spending_an_unspendable_output_is_missing_prevout() {
     let _ = connect(&q, tip, time, h, same_block(coin), Milestone::height(h));
 }
 
+/// A same-block child listed before its parent is a missing prevout. The
+/// block is not resolved out of order, so the parent later in the block does
+/// not satisfy the child.
+#[test]
+fn accept_rejects_a_child_before_its_parent_in_one_block() {
+    use rbitcoin_consensus::{mine_empty_regtest, prepare_regtest_candidate};
+    use rbitcoin_query::accept_and_connect_block;
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("child-before-parent");
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+
+    fn spend(prev: OutPoint, sats: u64) -> Transaction {
+        Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: prev,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(sats),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    let op = OutPoint {
+        txid: b1.txdata[0].compute_txid(),
+        vout: 0,
+    };
+    let parent = spend(op, 1_000);
+    let child = spend(
+        OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        500,
+    );
+    let mut bad_order = mine_empty_regtest(b1.block_hash(), b1.header.time + 600, 2);
+    bad_order.txdata.push(child);
+    bad_order.txdata.push(parent);
+    prepare_regtest_candidate(&mut bad_order, b1.block_hash(), b1.header.time + 600);
+    let err = accept_and_connect_block(&q, &params, Height(2), &bad_order, Milestone::NONE)
+        .expect_err("child-before-parent");
+    assert!(
+        matches!(err, ConfirmError::Rules(ConsensusError::MissingPrevout)),
+        "child-before-parent: {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(1)));
+}
+
 #[test]
 fn assemble_milestone_pin_still_rejects_bad_blk_sigops() {
     use assemble_block_prevouts;
