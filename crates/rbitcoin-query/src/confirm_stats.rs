@@ -173,7 +173,6 @@ confirm_window! {
     pin_body_ns,
     plan_pin_ns,
     pin_range_fill_ns,
-    pin_recent_outs_ns,
     pin_contract_ns,
     cold_io_ns,
     cold_range_ns,

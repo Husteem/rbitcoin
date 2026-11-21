@@ -306,9 +306,8 @@ pub struct IbdPerfSample {
     pub load_pin_new: u64,
     pub load_pin_body_ms: u64,
     pub load_plan_pin_ms: u64,
-    /// Pin residual sub-walls (recent-outs / range-fill insert / contract).
+    /// Pin residual sub-walls (range-fill insert / contract).
     pub load_pin_range_fill_ms: u64,
-    pub load_pin_recent_outs_ms: u64,
     pub load_pin_contract_ms: u64,
     pub load_cold_io_ms: u64,
     /// Cold denserels by plan body range (ms / create count).
@@ -552,7 +551,6 @@ impl Default for IbdPerfSample {
             load_pin_body_ms: 0,
             load_plan_pin_ms: 0,
             load_pin_range_fill_ms: 0,
-            load_pin_recent_outs_ms: 0,
             load_pin_contract_ms: 0,
             load_cold_io_ms: 0,
             load_cold_range_ms: 0,
@@ -1084,7 +1082,6 @@ pub fn sample(
         load_pin_body_ms: ns_ms(w.pin_body_ns),
         load_plan_pin_ms: ns_ms(w.plan_pin_ns),
         load_pin_range_fill_ms: ns_ms(w.pin_range_fill_ns),
-        load_pin_recent_outs_ms: ns_ms(w.pin_recent_outs_ns),
         load_pin_contract_ms: ns_ms(w.pin_contract_ns),
         load_cold_io_ms: ns_ms(w.cold_io_ns),
         load_cold_range_ms: ns_ms(w.cold_range_ns),
