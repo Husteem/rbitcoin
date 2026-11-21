@@ -73,6 +73,7 @@ pub fn outcome_from(
         batch: ScriptOkBatch {
             prepared: batch.prepared,
             wire_blocks: batch.wire_blocks,
+            wire_bytes: batch.wire_bytes,
             batch_parents: batch.batch_parents,
             archive_plan: batch.archive_plan,
             index_seal: seal,

@@ -177,6 +177,9 @@ pub struct LoadedBatch {
     pub prepared: Vec<Prepared>,
     /// Shared wire (Arc) so load→scripts→write does not deep-clone full blocks.
     pub wire_blocks: Vec<Arc<Block>>,
+    /// Wire bytes of `wire_blocks`, measured once here for the queue
+    /// content logs; the script and write stages carry it.
+    pub wire_bytes: usize,
     /// Per-batch pin map: load → assemble → write structural, then drop.
     pub batch_parents: crate::BatchParents,
     /// Mempool preverified txids for scripts stage (tip follow); empty on IBD.
@@ -204,6 +207,9 @@ pub struct LoadedBatch {
 pub struct ScriptOkBatch {
     pub prepared: Vec<Prepared>,
     pub wire_blocks: Vec<Arc<Block>>,
+    /// Wire bytes of `wire_blocks`, measured once at load for the queue
+    /// content logs.
+    pub wire_bytes: usize,
     pub batch_parents: crate::BatchParents,
     pub archive_plan: Option<crate::ArchiveWritePlan>,
     /// Filter bytes and tweak vecs for this batch. Empty when the indexes are off.
@@ -942,7 +948,7 @@ impl LoadedBatch {
 
     /// Approx wire bytes retained in `wire_blocks` (for queue-content size logs).
     pub fn approx_wire_bytes(&self) -> usize {
-        self.wire_blocks.iter().map(|b| b.total_size()).sum()
+        self.wire_bytes
     }
 
     /// Parent handles in this batch (may share payloads with other batches).
@@ -967,7 +973,7 @@ impl ScriptOkBatch {
 
     /// Approx wire bytes retained in `wire_blocks` (for queue-content size logs).
     pub fn approx_wire_bytes(&self) -> usize {
-        self.wire_blocks.iter().map(|b| b.total_size()).sum()
+        self.wire_bytes
     }
 
     /// Parent handles in this batch (may share Arc payloads with other batches).
@@ -1026,6 +1032,7 @@ impl ScriptOkBatch {
         }
         self.prepared.append(&mut other.prepared);
         self.wire_blocks.append(&mut other.wire_blocks);
+        self.wire_bytes = self.wire_bytes.saturating_add(other.wire_bytes);
         self.holds.append(&mut other.holds);
         self.batch_parents.extend_from(other.batch_parents);
         self.index_seal
