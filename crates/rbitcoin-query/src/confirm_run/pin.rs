@@ -138,47 +138,37 @@ pub fn spend_edges_from_stamp(
     (spend_edges, parent_vouts)
 }
 
+/// One plan pin per parent, in one pass: this batch's pin, then an
+/// in-flight create at or above the in-flight floor, then a stamped recent
+/// pin that holds every needed vout.
 #[doc(hidden)]
 pub fn fill_pins(
     parent_vouts: &U64Map<Vec<u32>>,
     batch_pin_by_id: &U64Map<&CreatePin>,
     parent_pin: &ParentPinStamp,
     in_flight: Option<&crate::InFlight>,
-    stats: &crate::ConfirmStats,
 ) -> U64Map<CreatePin> {
-    let mut plan_by_id: U64Map<CreatePin> = U64Map::default();
-    for id in parent_vouts.keys() {
-        if let Some(pin) = batch_pin_by_id.get(id) {
-            plan_by_id.insert(*id, std::sync::Arc::clone(pin));
-        }
-    }
-    if let Some(ifo) = in_flight {
-        if let Some(min_out) = ifo.min_out_id() {
-            for id in parent_vouts.keys() {
-                if plan_by_id.contains_key(id) || *id < min_out {
-                    continue;
-                }
-                if let Some(pin) = ifo.get_out(*id) {
-                    plan_by_id.insert(*id, std::sync::Arc::clone(pin));
-                }
-            }
-        }
-    }
-    let t_recent = Instant::now();
+    let in_flight_from = in_flight.and_then(|ifo| ifo.min_out_id().map(|min| (ifo, min)));
+    let mut plan_by_id: U64Map<CreatePin> =
+        U64Map::with_capacity_and_hasher(parent_vouts.len(), Default::default());
     for (id, need) in parent_vouts {
-        if plan_by_id.contains_key(id) {
-            continue;
-        }
-        let Some(pin) = parent_pin.create_pin(*id).cloned() else {
-            continue;
+        let pin = if let Some(pin) = batch_pin_by_id.get(id) {
+            Some(std::sync::Arc::clone(pin))
+        } else if let Some(pin) = in_flight_from
+            .filter(|(_, min)| id >= min)
+            .and_then(|(ifo, _)| ifo.get_out(*id))
+        {
+            Some(std::sync::Arc::clone(pin))
+        } else {
+            parent_pin
+                .create_pin(*id)
+                .filter(|pin| need.iter().all(|&v| pin.contains_vout(v)))
+                .cloned()
         };
-        if !need.iter().all(|&v| pin.contains_vout(v)) {
-            continue;
+        if let Some(pin) = pin {
+            plan_by_id.insert(*id, pin);
         }
-        plan_by_id.insert(*id, pin);
     }
-    let recent_outs_ns = t_recent.elapsed().as_nanos() as u64;
-    crate::note_confirm(&stats.pin_recent_outs_ns, recent_outs_ns);
     plan_by_id
 }
 
@@ -397,13 +387,7 @@ pub fn pin_for_wire_batch<'a>(
 
     let edges_ns = t_thin.elapsed().as_nanos() as u64;
     let t_fill = Instant::now();
-    let plan_by_id = fill_pins(
-        &parent_vouts,
-        &batch_pin_by_id,
-        parent_pin,
-        in_flight,
-        query.confirm_stats(),
-    );
+    let plan_by_id = fill_pins(&parent_vouts, &batch_pin_by_id, parent_pin, in_flight);
     let fill_ns = t_fill.elapsed().as_nanos() as u64;
     let t_reject = Instant::now();
     reject_vout_past_n_out(&parent_vouts, parent_pin, &plan_by_id)?;
