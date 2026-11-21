@@ -90,7 +90,6 @@ pub const SH_EXTRACT_WORKER_RAM_BYTES: u64 = 3 << 29;
 
 #[doc(hidden)]
 pub struct MaterializeProgress {
-    pub recs_packed: AtomicU64,
     pub keys_packed: AtomicU64,
     pub shards_published: AtomicU32,
     pub creates_published: AtomicU64,
@@ -104,7 +103,6 @@ impl MaterializeProgress {
     #[doc(hidden)]
     pub fn new() -> Self {
         Self {
-            recs_packed: AtomicU64::new(0),
             keys_packed: AtomicU64::new(0),
             shards_published: AtomicU32::new(0),
             creates_published: AtomicU64::new(0),
@@ -1983,9 +1981,6 @@ pub fn pack_and_seal_unsorted_shard(
         .body_flush_ns
         .fetch_add(pack.body_flush_ns, Ordering::Relaxed);
     progress.keys_packed.fetch_add(pack.keys, Ordering::Relaxed);
-    progress
-        .recs_packed
-        .fetch_add(pack.creates, Ordering::Relaxed);
     let done = PackShardDone {
         shard,
         keys: pack.keys,
@@ -2042,9 +2037,6 @@ pub fn materialize_sh_from_unsorted(
     let progress = MaterializeProgress::new();
     let already = (n_shards - jobs.len()) as u32;
     progress.shards_published.store(already, Ordering::Relaxed);
-    progress
-        .recs_packed
-        .store(table.entry_count(), Ordering::Relaxed);
     progress
         .creates_published
         .store(table.entry_count(), Ordering::Relaxed);
