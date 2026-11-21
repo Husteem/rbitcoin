@@ -931,6 +931,8 @@ pub async fn ibd_cancellable(
 
     let mut loop_n = 0u32;
     let mut cadence = IbdLoopCadence::new();
+    let mut perf_log_schedule = perf_log::PerfLogSchedule::default();
+    let mut rss_cadence = perf_log::RssCadence::default();
     let mut halt_err: Option<String> = None;
     let mut give_up: Option<&'static str> = None;
     loop {
@@ -1383,7 +1385,11 @@ pub async fn ibd_cancellable(
                 conf_pipe.feed_inflight = feed_inflight;
                 let work_sizes = st.structure_sizes();
                 let owned_sizes = published.owned;
-                let rss = perf_log::read_platform_rss();
+                let rss = if rss_cadence.deep_due(Instant::now()) {
+                    perf_log::read_platform_rss()
+                } else {
+                    perf_log::read_platform_rss_fast()
+                };
                 let perf = perf_log::sample(
                     &loop_stats,
                     st.inflight.len(),
@@ -1404,7 +1410,7 @@ pub async fn ibd_cancellable(
                     rss,
                     hub.query.confirm_stats(),
                 );
-                perf_log::log_sample(&perf);
+                perf_log::log_sample(&perf, &mut perf_log_schedule);
 
                 last_status = Instant::now();
             }

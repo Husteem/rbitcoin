@@ -143,20 +143,25 @@ ContigPark charge/release is **retired**.
 
 Host check / in-process:
 
-Every ~5s IBD emits one DEBUG **`ibd: perf`** JSON object. RSS and retain
-occupancy are fields on that object (`rss_kb`, `rss_anon_kb`, `rss_file_kb`,
-`vm_hwm_kb`, `work`, `owned`, `conf_pipe`). Tip-follow emits **`tip: perf`**
-(DEBUG) as JSON with `rss.rss_kb` / `rss.anon_kb` / `rss.file_kb` / `rss.hwm_kb`
-plus `cache_bodies`, `held_bodies`, `mp_live`. `rss_anon_kb` growth
-is process heap; `rss_file_kb` growth is mmap page cache.
+Every ~5s IBD emits a compact DEBUG **`ibd: perf`** JSON object (category
+`ibd`). Every ~30s, or when a confirm phase is slow, it emits
+**`ibd: perf_full`** with the full `IbdPerfSample`. RSS and retain occupancy
+are on both (`rss_kb`, `rss_anon_kb`, `rss_file_kb`, `vm_hwm_kb`; the full line
+also has `work`, `owned`, `conf_pipe`). The 5s read takes `VmRSS` / `VmHWM`
+and `RssAnon` / `RssFile` from `/proc/status`; the `smaps_rollup` fallback
+(and `Locked`) refreshes at most every 30s. Tip-follow emits **`tip:
+perf`** (DEBUG, category `tip`) as JSON with `rss.rss_kb` / `rss.anon_kb` /
+`rss.file_kb` / `rss.hwm_kb` plus `cache_bodies`, `held_bodies`, `mp_live`.
+`rss_anon_kb` growth is process heap; `rss_file_kb` growth is mmap page cache.
 
 ```bash
 grep 'ibd: perf {' mainnet.log | sed 's/.*ibd: perf //' | jq -c '{ts, rss_kb, rss_anon_kb, rss_file_kb, vm_hwm_kb}'
+grep 'ibd: perf_full {' mainnet.log | sed 's/.*ibd: perf_full //' | jq -c '{ts, rss_kb, rss_anon_kb, work, owned}'
 grep 'tip: perf {' mainnet.log | sed 's/.*tip: perf //' | jq -c '{ts, rss, cache_bodies, held_bodies, mp_live}'
 # Anon heap no meter names, MiB: anon less the body queue, the open tx.head
 # table, Class C L2, the write loc packs, the height map, the heap meters and
 # the work maps. The queues' wire is left out: `decoded` covers those bodies.
-grep 'ibd: perf {' mainnet.log | sed 's/.*ibd: perf //' | jq -c '{ts, n: .owned.head.class_a_n, anon: (.rss_anon_kb / 1024 | floor), heap: (.owned.heap | del(.decoded_blocks) | map_values(. / 1048576 | floor)), decoded_blocks: .owned.heap.decoded_blocks, work_maps: (.work.map_bytes / 1048576 | floor), unmetered: ((.rss_anon_kb * 1024 - .bq_bytes - .owned.head.head_map_bytes - .owned.head.class_c_l2_bytes - .owned.wloc_bytes - .owned.h2h_keys * 48 - .owned.heap.pin_est - .owned.heap.pin_maps - .owned.heap.decoded - .owned.heap.spend_notes - .owned.heap.spend_dir - .owned.heap.conf_plans - .work.map_bytes) / 1048576 | floor)}'
+grep 'ibd: perf_full {' mainnet.log | sed 's/.*ibd: perf_full //' | jq -c '{ts, n: .owned.head.class_a_n, anon: (.rss_anon_kb / 1024 | floor), heap: (.owned.heap | del(.decoded_blocks) | map_values(. / 1048576 | floor)), decoded_blocks: .owned.heap.decoded_blocks, work_maps: (.work.map_bytes / 1048576 | floor), unmetered: ((.rss_anon_kb * 1024 - .bq_bytes - .owned.head.head_map_bytes - .owned.head.class_c_l2_bytes - .owned.wloc_bytes - .owned.h2h_keys * 48 - .owned.heap.pin_est - .owned.heap.pin_maps - .owned.heap.decoded - .owned.heap.spend_notes - .owned.heap.spend_dir - .owned.heap.conf_plans - .work.map_bytes) / 1048576 | floor)}'
 ```
 
 | Token group | What it meters |
@@ -173,7 +178,7 @@ grep 'ibd: perf {' mainnet.log | sed 's/.*ibd: perf //' | jq -c '{ts, n: .owned.
 
 ## Residual heap audit (872k / ~1.42 B creates)
 
-`ibd: sizes` at `class_a≈1.416B` (mainnet.log, 2026-08-13) showed
+A 2026-08-13 `ibd: sizes` snapshot at `class_a≈1.416B` (mainnet.log) showed
 `anon≈2.2 GiB` vs `accounted≈13 MiB` (`residual≈2.2 GiB`). That gap was a
 **meter hole**, not an unbounded leak. The missing retain is almost all
 intentional:
@@ -197,15 +202,15 @@ Meters `fuse8=` / `mphf_g=` / `mphf_occ=` / `class_c_l2=` enter `accounted`.
 and sealed notes or a checkpoint's merge, the `tx.head` seal build, or the IBD
 work-path maps (`work` is its own token). Those land in `residual`, and the
 in-flight pin allowance (1 GiB less `accounted`) does not see them. The
-`owned.heap` meters and `work.map_bytes` print most of them on each
-`ibd: perf` line; they are meters only and do not enter `accounted`. A
-checkpoint's merge buffers and the `tx.head` seal build are transient and
-not metered.
+The `owned.heap` meters and `work.map_bytes` print most of them on each full
+`ibd: perf_full` line; they are meters only and do not enter `accounted`. The
+compact 5s line prints only the RSS summary. A checkpoint's merge buffers and
+the `tx.head` seal build are transient and not metered.
 `fuse8=` / `mphf_g=` are **0** after open (mmap / FdOnly). `mphf_occ=` is
 supers only (mapped occ is `file=`).
 Mapped fuse / occ RSS is `file=`, not a fake leak.
 
-The same JSON fields (`owned.head.class_a_n`, `rss_anon_kb`, `owned.head.fuse8_bytes`) are on each `ibd: perf` line. The jq above selects them.
+The same JSON fields (`owned.head.class_a_n`, `rss_anon_kb`, `owned.head.fuse8_bytes`) are on each full `ibd: perf_full` line. The jq above selects them.
 
 ## Hard RAM (page-cache working set)
 

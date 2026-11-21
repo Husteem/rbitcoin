@@ -429,16 +429,19 @@ Core functional tests still grep `UpdateTip: …` via the debug.log map
 | `p2p: headers sync timeout` | INFO | Headers-sync peer stalled (`disconnect` or `keep`) |
 | `p2p: session … closed` | DEBUG | Clean session end. Unexpected end stays **WARN** `p2p: session … ended` |
 
-Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: progress` at INFO; enable `ibd: perf` and `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`). Each of those is one JSON object with `ts` (unix milliseconds). A full IBD is every `ibd: perf` line in the log.
+Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: progress` at INFO; enable the DEBUG detail with `--log-level debug` (every category on) or with the runtime `logging` RPC (`logging include ["ibd"]`, `["store"]`). Each JSON line has `ts` (unix milliseconds). A full IBD is every `ibd: perf` compact line; the full line is the slower diagnostic sample.
 
-### IBD status lines (every ~5s)
+### IBD status lines
 
-| Line | Level | Use |
-|------|-------|-----|
-| `ibd: progress` | INFO | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A create count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window, at/over 1 GiB assign-stop holes within that window and not past fetched_hi) |
-| `ibd: perf` | DEBUG | One JSON object of the 5s sample (inflight, queues, stage times, RSS, work path, confirm pipe). Zeros are included. `load_ms` is pin+assemble only |
+| Line | Level | Category | Cadence | Use |
+|------|-------|----------|---------|-----|
+| `ibd: progress` | INFO | — | ~5s | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A create count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window, at/over 1 GiB assign-stop holes within that window and not past fetched_hi) |
+| `ibd: perf {json}` | DEBUG | `ibd` | ~5s | Compact headline: `dominant`, confirm pace, queues, BQ/hole/peers, `load`/`script`/`write`, `class_c`, `tip_flush_wait`, `spend`, RSS |
+| `ibd: perf_full {json}` | DEBUG | `ibd` | ~30s or slow | Full `IbdPerfSample`: every retained stage timer, RSS split, `work`/`owned`/`conf_pipe`. Zeros are included; `load_ms` is pin+assemble only |
+| `store: spend delta gen=` | INFO | — | per checkpoint | Compact checkpoint summary: `gen`, `since_ms`, new/dense bytes, carried, segments, written, `notes_ram`, `total_ms` |
+| `store: spend delta … timing` | DEBUG (INFO when slow) | `store` | per checkpoint | Detailed checkpoint timing. Promoted to INFO when `total_ms >= 1000` or body+segment syncs >= 500ms |
 
-Default INFO is `ibd: progress` only. `--log-level debug` adds the JSON sample. `tip: accept` is the same kind of JSON line at DEBUG; `tip: best` stays INFO. Pipeline roles: [`docs/concurrency.md`](../concurrency.md). Head files: [`docs/heads.md`](../heads.md).
+Default INFO is `ibd: progress` plus the compact spend checkpoint line. `--log-level debug` adds the compact/full JSON and the DEBUG checkpoint detail. `logging exclude ["ibd"]` hides the perf lines while leaving INFO intact; `logging exclude ["store"]` hides the checkpoint detail. `tip: accept` is the same kind of JSON line at DEBUG; `tip: best` stays INFO. Pipeline roles: [`docs/concurrency.md`](../concurrency.md). Head files: [`docs/heads.md`](../heads.md).
 
 `pin_txid%` is stamp `txid→create_fk` from the load-batch skeleton vs leftover `tx.head` (IBD skeleton path should stay at 100%). `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
 
@@ -493,7 +496,7 @@ that peer's block getdata back to densify when it drops the peer (`apply_peer_de
 
 **Create pins:** pipeline-local only (`batch_pin` / `BatchParents`). No process pin FIFO. Header plans via ConfirmParentCache. Just-confirmed **identity + full create outs** stay on in-flight until a later lookup wave snapshots drain+fence past the pack height and load finishes that wave's last in-flight read. Class A commit drops the decoded block and leaves the outputs. Not a coins cache.
 
-**Archive `tx.head` split (perf_dbg):** `plan_batch … head_rd=` is parent
+**Archive `tx.head` split:** `plan_batch … head_rd=` is parent
 **read** resolve (`get_fk_by_txid_batch`, with `probe` / `idx` / `body` subtimers).
 `class_a_commit … head=` is create **insert** (`head_insert_many`). Pipeline pins stay on the plan (`batch_pin`); no process denserels seed.
 

@@ -298,6 +298,19 @@ pub struct CheckpointReport {
     pub total_ms: u64,
 }
 
+/// A checkpoint's detail line is INFO when it is this slow in total.
+pub const CHECKPOINT_SLOW_TOTAL_MS: u64 = 1_000;
+/// A checkpoint's detail line is INFO when its body and segment syncs
+/// together take this long.
+pub const CHECKPOINT_SLOW_SYNC_MS: u64 = 500;
+
+/// Whether the detailed checkpoint line belongs at INFO rather than DEBUG.
+#[doc(hidden)]
+pub fn checkpoint_detail_is_info(r: &CheckpointReport) -> bool {
+    r.total_ms >= CHECKPOINT_SLOW_TOTAL_MS
+        || r.body_sync_ms.saturating_add(r.seg_sync_ms) >= CHECKPOINT_SLOW_SYNC_MS
+}
+
 fn ms_since(t: Instant) -> u64 {
     t.elapsed().as_millis() as u64
 }
@@ -2340,31 +2353,19 @@ impl SpendPageLog {
             )
         };
         rbitcoin_log::info!(
-            "store: spend delta gen={} new_record_bytes={} dense_record_bytes={} folded_segments={} carried={} carried_bytes={} durable={} folds_through={} reclaim_below_permille={} segments={} bytes={} live={} spent_body={} written={} records={} idx={} folded={} fold_records={} written_per_body_permille={} notes_ram={}",
+            "store: spend delta gen={} since_ms={} new_record_bytes={} dense_record_bytes={} carried={} segments={} written={} notes_ram={} total_ms={}",
             generation,
+            r.since_ms,
             new_bytes,
             dense_bytes,
-            r.reclaim_segments,
             r.carried,
-            carried_bytes,
-            durable.map_or_else(|| "none".to_string(), |d| d.to_string()),
-            folds_through,
-            self.policy
-                .reclaim_below(s.segment_bytes, s.segments as usize, body_len),
             s.segments,
-            s.segment_bytes,
-            s.live_bytes,
-            body_len,
             s.written(),
-            s.record_bytes,
-            s.idx_bytes,
-            s.fold_bytes,
-            s.fold_records,
-            s.written().saturating_mul(1000) / body_len.max(1),
-            s.notes_bytes
+            s.notes_bytes,
+            r.total_ms
         );
-        rbitcoin_log::info!(
-            "store: spend delta gen={} timing total_ms={} since_ms={} sealed_pages={} sealed_edges={} merge_reads={} merge_read_bytes={} merge_ms={} hot_folds={} hot_fold_record_bytes={} dense_kept_gen={} dense_kept_tail={} reclaim_read_bytes={} reclaim_read_ms={} folded_now={} dropped={} fold_rounds={} fold_compose_ms={} fold_file_ms={} body_write_ms={} body_sync_ms={} record_bytes={} seg_write_ms={} seg_sync_ms={} idx_entries={} idx_write_ms={} idx_sync_ms={} commit_ms={} install_ms={} unlink_ms={}",
+        let detail = format!(
+            "spend delta gen={} timing total_ms={} since_ms={} sealed_pages={} sealed_edges={} merge_reads={} merge_read_bytes={} merge_ms={} hot_folds={} hot_fold_record_bytes={} dense_kept_gen={} dense_kept_tail={} reclaim_read_bytes={} reclaim_read_ms={} folded_now={} dropped={} fold_rounds={} fold_compose_ms={} fold_file_ms={} body_write_ms={} body_sync_ms={} record_bytes={} seg_write_ms={} seg_sync_ms={} idx_entries={} idx_write_ms={} idx_sync_ms={} commit_ms={} install_ms={} unlink_ms={} folded_segments={} carried_bytes={} durable={} folds_through={} reclaim_below_permille={} bytes={} live={} spent_body={} records={} idx={} folded={} fold_records={} written_per_body_permille={}",
             generation,
             r.total_ms,
             r.since_ms,
@@ -2394,8 +2395,27 @@ impl SpendPageLog {
             r.idx_sync_ms,
             r.commit_ms,
             r.install_ms,
-            r.unlink_ms
+            r.unlink_ms,
+            r.reclaim_segments,
+            carried_bytes,
+            durable.map_or_else(|| "none".to_string(), |d| d.to_string()),
+            folds_through,
+            self.policy
+                .reclaim_below(s.segment_bytes, s.segments as usize, body_len),
+            s.segment_bytes,
+            s.live_bytes,
+            body_len,
+            s.record_bytes,
+            s.idx_bytes,
+            s.fold_bytes,
+            s.fold_records,
+            s.written().saturating_mul(1000) / body_len.max(1)
         );
+        if checkpoint_detail_is_info(r) {
+            rbitcoin_log::info!("store: {detail}");
+        } else {
+            rbitcoin_log::debug!(Store, "{detail}");
+        }
     }
 
     /// Reclaim eligible segments, sparsest first, while their live share is
