@@ -572,6 +572,21 @@ fn a_stale_headers_ask_does_not_bank_credit_for_the_next_one() {
 }
 
 #[test]
+fn a_newer_ask_does_not_keep_an_expired_one() {
+    let asks = HeaderAsks::new();
+    asks.note_ask(0);
+    asks.note_ask(50_000);
+    assert!(
+        asks.take_reply(100_000),
+        "the ask 50 s old is still inside the window"
+    );
+    assert!(
+        !asks.take_reply(100_000),
+        "the ask 100 s old did not bank a second exemption"
+    );
+}
+
+#[test]
 fn a_stale_or_stacked_headers_ask_does_not_bank_exemptions() {
     let asks = HeaderAsks::new();
     asks.note_ask(1_000);

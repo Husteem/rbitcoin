@@ -20,7 +20,7 @@ use rbitcoin_net::peer::{
 use rbitcoin_net::peer_dos::{PeerRateLimiter, RATE_LIMIT_BAN_SCORE};
 use rbitcoin_net::peers::PongSlot;
 use rbitcoin_net::v2::{read_v2_frame_with_progress, write_v2_msg_offload, V2Reader, V2Writer};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -189,8 +189,7 @@ pub struct HeaderAsks {
 
 #[derive(Debug, Default)]
 struct HeaderAskState {
-    owed: usize,
-    newest_ms: u64,
+    asks: VecDeque<u64>,
 }
 
 /// Most `getheaders` asks held for one peer.
@@ -209,29 +208,30 @@ impl HeaderAsks {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Record one `getheaders` sent at `now_ms`. An ask older than the window
-    /// gives up its credit to this one.
+    /// Record one `getheaders` sent at `now_ms`. Each ask carries its own
+    /// expiry; a full record gives up its oldest.
     pub fn note_ask(&self, now_ms: u64) {
         let mut state = self.state();
-        if now_ms.saturating_sub(state.newest_ms) > HEADERS_ASK_TTL_MS {
-            state.owed = 0;
+        state
+            .asks
+            .retain(|at| now_ms.saturating_sub(*at) <= HEADERS_ASK_TTL_MS);
+        if state.asks.len() >= HEADERS_ASKS_MAX {
+            state.asks.pop_front();
         }
-        state.newest_ms = now_ms;
-        state.owed = state.owed.saturating_add(1).min(HEADERS_ASKS_MAX);
+        state.asks.push_back(now_ms);
     }
 
-    /// Take one exemption for a `headers` frame read at `now_ms`.
+    /// Take one exemption for a `headers` frame read at `now_ms`. Expired asks
+    /// leave from the front; the oldest live ask answers this reply.
     pub fn take_reply(&self, now_ms: u64) -> bool {
         let mut state = self.state();
-        if now_ms.saturating_sub(state.newest_ms) > HEADERS_ASK_TTL_MS {
-            state.owed = 0;
-            return false;
+        while let Some(at) = state.asks.front().copied() {
+            if now_ms.saturating_sub(at) <= HEADERS_ASK_TTL_MS {
+                break;
+            }
+            state.asks.pop_front();
         }
-        if state.owed == 0 {
-            return false;
-        }
-        state.owed -= 1;
-        true
+        state.asks.pop_front().is_some()
     }
 }
 
