@@ -443,9 +443,9 @@ impl CreateLoc {
         let win_jobs = &jobs[win.job_lo..win.job_hi];
         match extract_pairs_no_ovf(win, win_jobs, out) {
             Ok(()) => Ok(()),
-            Err(ExtractFail::NeedOvf) => {
+            Err(ExtractFail::NeedOvf(at)) => {
                 let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
-                extract_pairs_ovf(win, &ovf, win_jobs, out)
+                extract_pairs_ovf(win, &ovf, win_jobs, out, at)
             }
         }
     }
@@ -558,9 +558,33 @@ pub struct LocWinRead {
     pub buf: Vec<u8>,
 }
 
+/// Where a window decode stands: the next slot, the next job, and the
+/// running `txout` / `spent` offsets at that slot.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtractAt {
+    pub i: usize,
+    pub j: usize,
+    pub tx: u64,
+    pub sp: u64,
+}
+
+impl ExtractAt {
+    pub fn start(win: &LocWinRead) -> Self {
+        Self {
+            i: 0,
+            j: 0,
+            tx: win.tx0,
+            sp: win.sp0,
+        }
+    }
+}
+
+/// The fast decode met an overflow slot. Pairs before `ExtractAt` are
+/// emitted; the overflow decode resumes there.
 #[doc(hidden)]
 pub enum ExtractFail {
-    NeedOvf,
+    NeedOvf(ExtractAt),
 }
 
 #[doc(hidden)]
@@ -586,6 +610,7 @@ pub fn extract_pairs_ovf(
     ovf: &[(u64, u32, u32)],
     jobs: &[(usize, u64)],
     out: &mut [Option<CreateLocPair>],
+    from: ExtractAt,
 ) -> Result<(), StoreError> {
     let buf = &win.buf;
     let n = win.n;
@@ -594,10 +619,13 @@ pub fn extract_pairs_ovf(
     let lo = ovf.partition_point(|&(fk, _, _)| fk < win_first);
     let hi = ovf.partition_point(|&(fk, _, _)| fk <= last_fk);
     let win_ovf = &ovf[lo..hi];
-    let mut tx = win.tx0;
-    let mut sp = win.sp0;
-    let mut j = 0usize;
-    for i in 0..n {
+    let ExtractAt {
+        i: from_i,
+        mut j,
+        mut tx,
+        mut sp,
+    } = from;
+    for i in from_i..n {
         let fk = win_first + i as u64;
         let (st, n_out) = decode_create_pair(buf[i * 2], buf[i * 2 + 1], fk, win_ovf)?;
         let tlen = u64::from(st).saturating_mul(IDX_STRIDE);
@@ -630,7 +658,7 @@ pub fn extract_pairs_no_ovf(
         chunk.copy_from_slice(&buf[base..base + 16]);
         let (st, no, has_zero) = deinterleave_pairs_u8x8(chunk);
         if has_zero {
-            return Err(ExtractFail::NeedOvf);
+            return Err(ExtractFail::NeedOvf(ExtractAt { i, j, tx, sp }));
         }
         let (tx_inc, sp_inc) = inclusive_u8x8_times_8(&st, &no);
         while j < jobs.len() {
@@ -666,7 +694,7 @@ pub fn extract_pairs_no_ovf(
         let st = buf[i * 2];
         let no = buf[i * 2 + 1];
         if st == 0 || no == 0 {
-            return Err(ExtractFail::NeedOvf);
+            return Err(ExtractFail::NeedOvf(ExtractAt { i, j, tx, sp }));
         }
         let tlen = u64::from(st).saturating_mul(IDX_STRIDE);
         let slen = u64::from(no).saturating_mul(IDX_STRIDE);
