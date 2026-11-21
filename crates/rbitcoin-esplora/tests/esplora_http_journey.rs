@@ -305,6 +305,26 @@ async fn tip_height_overlaps_scripthash_txs(pad: &HttpPad) {
     assert!(t0.elapsed().as_secs() < 2);
 }
 
+/// `POST /tx` of a tx already in the pool is 200 and its txid, as Esplora in
+/// front of Core answers (Core `BroadcastTransaction`): the same bytes, and
+/// the same txid under another witness. A tx with a missing input is still
+/// 400.
+async fn repost_answers_the_txid(pad: &HttpPad, spend: &bitcoin::Transaction) {
+    use bitcoin::consensus::encode::serialize_hex;
+    use bitcoin::hashes::Hash;
+    let txid = spend.compute_txid();
+    let mut rewitnessed = spend.clone();
+    rewitnessed.input[0].witness.push([0x01]);
+    for raw in [serialize_hex(spend), serialize_hex(&rewitnessed)] {
+        let (st, body) = http_post(pad.addr, "/tx", raw.as_bytes()).await;
+        assert_eq!((st, body.as_str()), (200, display_txid(txid).as_str()));
+    }
+    let mut orphan = spend.clone();
+    orphan.input[0].previous_output.txid = bitcoin::Txid::from_byte_array([0x11; 32]);
+    let (st, body) = http_post(pad.addr, "/tx", serialize_hex(&orphan).as_bytes()).await;
+    assert_eq!(st, 400, "{body}");
+}
+
 /// A mempool-only spend is full Esplora JSON (not a stub) on every route.
 async fn mempool_spend_is_full_json(pad: &HttpPad) -> bitcoin::Transaction {
     use bitcoin::absolute::LockTime;
@@ -909,6 +929,7 @@ async fn esplora_tcp_wallet_mempool_and_replace() {
     scripthash_path_is_digest_order(pad.addr, &a1, spk1.as_bytes()).await;
     tip_height_overlaps_scripthash_txs(&pad).await;
     let spend = mempool_spend_is_full_json(&pad).await;
+    repost_answers_the_txid(&pad, &spend).await;
     chain_cursor_matches_chain_page(&pad, &spend).await;
     mempool_spend_outspends_and_hex(&pad, &spend).await;
     confirmed_output_by_position(&pad).await;

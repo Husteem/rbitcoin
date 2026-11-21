@@ -460,6 +460,49 @@ pub async fn listunspent_skips_unused(
     handle.shutdown().await;
 }
 
+/// A broadcast of a tx already in the pool answers its txid, as electrs in
+/// front of Core does (Core `BroadcastTransaction`): the same bytes, and the
+/// same txid under another witness. `fresh` is not pooled yet; `relayed`
+/// came from a peer. A tx with a missing input is still a reject.
+async fn broadcast_of_a_pooled_tx_answers_its_txid(
+    q: &Arc<Query>,
+    hub: &Arc<MempoolHub>,
+    fresh: &Transaction,
+    relayed: &Transaction,
+) {
+    use bitcoin::consensus::encode::serialize_hex;
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &ChainParams::regtest());
+    let (handle, mut stream) = electrum_tcp_client(q, cfg, Some(Arc::clone(hub))).await;
+    let mut rewitnessed = fresh.clone();
+    rewitnessed.input[0].witness.push([0x01]);
+    let mut orphan = fresh.clone();
+    orphan.input[0].previous_output.txid = bitcoin::Txid::from_byte_array([0x11; 32]);
+    let mut broadcast = async |tx: &Transaction| {
+        electrum_tcp_call(
+            &mut stream,
+            "blockchain.transaction.broadcast",
+            json!([serialize_hex(tx)]),
+        )
+        .await
+    };
+    let want = Ok(json!(fresh.compute_txid().to_string()));
+    for (round, tx) in [fresh, fresh, &rewitnessed].into_iter().enumerate() {
+        assert_eq!(broadcast(tx).await, want, "broadcast {round}");
+    }
+    assert!(hub.contains(&fresh.compute_txid()));
+    assert_eq!(
+        broadcast(relayed).await,
+        Ok(json!(relayed.compute_txid().to_string()))
+    );
+    let got = broadcast(&orphan).await;
+    assert!(
+        got.as_ref()
+            .is_err_and(|e| e.starts_with("broadcast reject")),
+        "{got:?}"
+    );
+    handle.shutdown().await;
+}
+
 #[doc(hidden)]
 pub async fn fee_histogram_is_sat_per_vbyte_by_bin(q: &Arc<Query>, hub: &Arc<MempoolHub>) {
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &ChainParams::regtest());
@@ -852,10 +895,15 @@ pub async fn electrum_sh_join() {
     }
     let hub = MempoolHub::open(dir.join("mempool"), Arc::clone(&q)).unwrap();
     hub.set_relay_enabled(true);
-    for (i, cbtxid) in coinbase_txids.iter().enumerate() {
-        hub.admit(&spend_coinbase(*cbtxid, 1_000 + i as u64))
-            .expect("accept spend");
+    let spends: Vec<_> = coinbase_txids
+        .iter()
+        .enumerate()
+        .map(|(i, cbtxid)| spend_coinbase(*cbtxid, 1_000 + i as u64))
+        .collect();
+    for spend in &spends[1..] {
+        hub.admit(spend).expect("accept spend");
     }
+    broadcast_of_a_pooled_tx_answers_its_txid(&q, &hub, &spends[0], &spends[1]).await;
     listunspent_skips_unused(&q, &hub, &coinbase_txids[0]).await;
     fee_histogram_is_sat_per_vbyte_by_bin(&q, &hub).await;
     tip_push_two_clients_and_late(Arc::clone(&q), Some(hub)).await;

@@ -711,6 +711,32 @@ pub enum TxOrigin {
     Relay(Option<u64>),
 }
 
+/// What a broadcast from this node's own client did. Every arm answers the
+/// txid, as Core `BroadcastTransaction` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalBroadcast {
+    /// Admitted now.
+    Admitted,
+    /// These bytes were already pooled.
+    InPool,
+    /// The txid was already pooled under another witness, which stays.
+    OtherWitnessInPool,
+}
+
+impl LocalBroadcast {
+    /// Read a [`TxOrigin::Local`] admit: a txid already pooled is success.
+    pub fn of(accepted: Result<AcceptResult, AcceptError>) -> Result<Self, AcceptError> {
+        match accepted {
+            Ok(_) => Ok(Self::Admitted),
+            Err(AcceptError::Duplicate(_)) => Ok(Self::InPool),
+            Err(AcceptError::Policy("txn-same-nonwitness-data-in-mempool")) => {
+                Ok(Self::OtherWitnessInPool)
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
 impl TxOrigin {
     fn peer(self) -> Option<u64> {
         match self {
@@ -4092,6 +4118,15 @@ impl MempoolHub {
             .await,
             "tx admit",
         )
+    }
+
+    /// Admit `tx` from this node's own client as [`Self::accept_tx_from_async`]
+    /// does, read by [`LocalBroadcast::of`].
+    pub async fn broadcast_local_async(
+        self: &Arc<Self>,
+        tx: Transaction,
+    ) -> Result<LocalBroadcast, AcceptError> {
+        LocalBroadcast::of(self.accept_tx_from_async(tx, TxOrigin::Local).await)
     }
 
     /// [`Self::accept_tx_defer_trim`] without a blocking thread across scripts.

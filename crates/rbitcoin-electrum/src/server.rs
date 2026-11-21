@@ -2856,7 +2856,8 @@ fn package_broadcast_value(verbose: bool, accepted: &[rbitcoin_net::AcceptResult
     })
 }
 
-/// Accept one raw tx, with script verify awaited on the connection task.
+/// Accept one raw tx, with script verify awaited on the connection task. A tx
+/// whose txid is already pooled answers the txid too.
 pub async fn broadcast_raw_tx_async(
     params: &Value,
     config: &ElectrumConfig,
@@ -2866,14 +2867,12 @@ pub async fn broadcast_raw_tx_async(
     let mp = mempool
         .ok_or_else(|| "mempool not available".to_string())?
         .clone();
+    let txid = tx.compute_txid();
     let budget = mp.query.api_read_budget();
-    let r = rbitcoin_net::with_store_budget(
-        budget,
-        mp.accept_tx_from_async(tx, rbitcoin_net::TxOrigin::Local),
-    )
-    .await
-    .map_err(|e| format!("broadcast reject: {e}"))?;
-    Ok(json!(format!("{}", r.txid)))
+    rbitcoin_net::with_store_budget(budget, mp.broadcast_local_async(tx))
+        .await
+        .map_err(|e| format!("broadcast reject: {e}"))?;
+    Ok(json!(txid.to_string()))
 }
 
 /// Accept a package, with each member's scripts awaited on the connection task.
