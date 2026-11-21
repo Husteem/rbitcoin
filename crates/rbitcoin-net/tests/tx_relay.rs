@@ -165,6 +165,44 @@ fn confirm_target_two_is_the_two_block_rate() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// A mark that lands while a refresh waits on the pool lock is a change the
+/// refresh may not read. Each refresh runs against a held write lock. Once it
+/// has taken the mark it entered with, a new mark lands, then the lock drops.
+/// The new mark must still be set when that refresh returns.
+#[test]
+fn snapshot_mark_during_refresh_stays_dirty() {
+    let store_dir = tmp();
+    let mp_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+    let hub: &MempoolHub = &hub;
+    type Refresh<'a> = (&'a str, &'a std::sync::atomic::AtomicBool, fn(&MempoolHub));
+    let refreshes: [Refresh; 2] = [
+        ("fee", &hub.fee_dirty, MempoolHub::refresh_fee_snapshot),
+        ("tx", &hub.tx_snap_dirty, MempoolHub::refresh_tx_snapshot),
+    ];
+    for (name, dirty, refresh) in refreshes {
+        hub.mark_fee_dirty();
+        std::thread::scope(|s| {
+            let pool = hub.lock_write();
+            let run = s.spawn(|| refresh(hub));
+            let t0 = Instant::now();
+            while dirty.load(Ordering::Acquire) && t0.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            hub.mark_fee_dirty();
+            drop(pool);
+            run.join().unwrap();
+        });
+        assert!(
+            dirty.load(Ordering::Acquire),
+            "{name}: a mark made during the refresh was erased"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&mp_dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
 /// Core's `estimateSmartFee` answers target 1 as 2. Ours does while the
 /// 1-block quote still blends in the cold q0.999 history (flow fullness < 1).
 #[test]

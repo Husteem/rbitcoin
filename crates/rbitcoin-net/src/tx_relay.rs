@@ -4895,6 +4895,9 @@ impl MempoolHub {
     /// One graph linearize under short read lock, then pure math off-lock → publish.
     #[doc(hidden)]
     pub fn refresh_fee_snapshot(&self) {
+        // Clear before the pool read, not after the publish: a mark that lands
+        // while this reads stays set for the next refresh.
+        self.fee_dirty.store(false, Ordering::Release);
         let t0 = Instant::now();
         let (chunks, chunk_raw_vsize, count, vsize, total_fee) = {
             let g = self.lock_read();
@@ -4961,7 +4964,6 @@ impl MempoolHub {
             flow_fullness: alpha,
             computed_at: t0,
         }));
-        self.fee_dirty.store(false, Ordering::Release);
     }
 
     /// Lazy singleflight rebuild of the live-tx snapshot.
@@ -4978,6 +4980,8 @@ impl MempoolHub {
 
     #[doc(hidden)]
     pub fn refresh_tx_snapshot(&self) {
+        // Same order as `refresh_fee_snapshot`.
+        self.tx_snap_dirty.store(false, Ordering::Release);
         let t0 = Instant::now();
         let old = self.tx_snapshot.load_full();
         let live = self.list_live_meta();
@@ -5014,7 +5018,6 @@ impl MempoolHub {
             entries,
             computed_at: t0,
         }));
-        self.tx_snap_dirty.store(false, Ordering::Release);
     }
 
     /// Txid-sorted live mempool snapshot (Arc). Does not take the admit write lock.
