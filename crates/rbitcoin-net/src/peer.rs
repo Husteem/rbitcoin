@@ -5392,7 +5392,6 @@ pub fn queue_due_tx_invs(
         dir,
         session.inv_released_seen(),
         crate::tx_relay::RELEASED_INV_SCAN_MAX,
-        |_, w| !inbound_age_gate || mp.tx_inv_due(w),
     );
     let had_released = !released.is_empty();
     // Do not move the cursor past a row whose mempool read was busy.
@@ -5402,6 +5401,11 @@ pub fn queue_due_tx_invs(
     }
     let mut due = Vec::new();
     for (seq, txid, w) in released {
+        // The cursor stays on a live row whose 30 s age has not elapsed.
+        // A dead row was already skipped by `take_released_invs`.
+        if inbound_age_gate && !mp.tx_inv_due(&w) {
+            break;
+        }
         // A tx accepted before this session's handshake is not leaked to it
         // (`p2p_tx_privacy`). A direct announce already ran this gate at
         // accept time; a released log can be read by a later session.

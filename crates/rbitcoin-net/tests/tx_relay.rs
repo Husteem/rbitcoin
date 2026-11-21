@@ -417,32 +417,28 @@ fn expire_stale_reaches_a_live_tx_behind_evicted_ghosts() {
 /// One released-INV read holds the global bucket lock. A session cursor
 /// reads a long log a bounded slice at a time, and the cursor resumes until
 /// the whole log is covered.
-#[test]
-fn released_inv_log_is_bounded_and_resumes_from_the_cursor() {
-    let (_store, q, _cbs) = pad_cbs(1);
+#[tokio::test]
+async fn released_inv_log_is_bounded_and_resumes_from_the_cursor() {
+    let (_store, q, cbs) = pad_cbs(1);
     let dir = tmp();
     let hub = MempoolHub::open(&dir, q).unwrap();
     let rows = RELEASED_INV_SCAN_MAX * 2 + 5;
     let dirn = rbitcoin_net::inv_bucket::InvDirection::Outbound;
-    let mut want = BTreeSet::new();
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let live = spend_true(cbs[0], 1_000, spk);
+    hub.accept_tx_async(live.clone()).await.expect("accept");
+    let (txid, wtxid) = (live.compute_txid(), live.compute_wtxid());
     {
         let mut g = hub.inv_buckets.lock().unwrap();
-        for i in 0..rows {
-            let mut raw = [0u8; 32];
-            raw[0..4].copy_from_slice(&(i as u32 + 1).to_le_bytes());
-            let txid = Txid::from_byte_array(raw);
-            raw[31] = 1;
-            let wtxid = Wtxid::from_byte_array(raw);
+        for _ in 0..rows {
             g.push_released(dirn, txid, wtxid);
-            want.insert(wtxid);
         }
     }
     let mut seen = 0;
-    let mut got = BTreeSet::new();
+    let mut total = 0;
     let mut calls = 0;
     loop {
-        let (last, released) =
-            hub.take_released_invs(dirn, seen, RELEASED_INV_SCAN_MAX, |_, _| true);
+        let (last, released) = hub.take_released_invs(dirn, seen, RELEASED_INV_SCAN_MAX);
         assert!(
             released.len() <= RELEASED_INV_SCAN_MAX,
             "one read returned {} rows",
@@ -452,14 +448,12 @@ fn released_inv_log_is_bounded_and_resumes_from_the_cursor() {
             assert_eq!(last, seen, "an empty read keeps the cursor");
             break;
         }
-        for (_, _, w) in released {
-            assert!(got.insert(w), "a resumed read repeated a row");
-        }
+        total += released.len();
         seen = last;
         calls += 1;
         assert!(calls <= rows, "the cursor never reached the end");
     }
-    assert_eq!(got, want, "the resumed reads cover the whole log");
+    assert_eq!(total, rows, "the resumed reads cover the whole log");
     assert_eq!(calls, 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -7727,10 +7721,8 @@ async fn inv_bucket_caps_a_burst_and_outbound_drains_faster() {
     assert_eq!(mp.inv_backlog_len(InvDirection::Outbound), 700);
 
     mp.drain_inv_backlog(1_000_000);
-    let (in_cursor, inbound) =
-        mp.take_released_invs(InvDirection::Inbound, 0, usize::MAX, |_, _| true);
-    let (out_cursor, outbound) =
-        mp.take_released_invs(InvDirection::Outbound, 0, usize::MAX, |_, _| true);
+    let (in_cursor, inbound) = mp.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
+    let (out_cursor, outbound) = mp.take_released_invs(InvDirection::Outbound, 0, usize::MAX);
     assert_eq!(inbound.len(), 490, "420 tokens overdrawn to the -70 floor");
     assert_eq!(outbound.len(), 490, "outbound shares the count floor");
     assert_eq!(mp.inv_backlog_len(InvDirection::Inbound), 210);
@@ -7739,10 +7731,8 @@ async fn inv_bucket_caps_a_burst_and_outbound_drains_faster() {
     assert_eq!(out_cursor, 980, "outbound read the next 490 releases");
 
     mp.drain_inv_backlog(1_007_000);
-    let (_, inbound) =
-        mp.take_released_invs(InvDirection::Inbound, in_cursor, usize::MAX, |_, _| true);
-    let (_, outbound) =
-        mp.take_released_invs(InvDirection::Outbound, out_cursor, usize::MAX, |_, _| true);
+    let (_, inbound) = mp.take_released_invs(InvDirection::Inbound, in_cursor, usize::MAX);
+    let (_, outbound) = mp.take_released_invs(InvDirection::Outbound, out_cursor, usize::MAX);
     assert_eq!(inbound.len(), 98, "14 tx/s * 7 s from the -70 floor");
     assert_eq!(outbound.len(), 210, "35 tx/s * 7 s drains the rest faster");
     let _ = std::fs::remove_dir_all(&dir);
@@ -7764,17 +7754,47 @@ async fn released_inv_log_drops_a_tx_that_left_the_pool() {
     hub.accept_tx_async(gone.clone()).await.expect("gone");
     hub.accept_tx_async(stay.clone()).await.expect("stay");
     hub.drain_inv_backlog(1_000_000);
-    let before = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX, |_, _| true);
+    let before = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
     assert_eq!(before.1.len(), 2);
 
     hub.remove_for_block(&[gone.compute_txid()], MINED);
     hub.drain_inv_backlog(1_000_000);
-    let (_, after) = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX, |_, _| true);
+    let (_, after) = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
     assert_eq!(
         after.iter().map(|(_, _, w)| *w).collect::<Vec<_>>(),
         vec![stay.compute_wtxid()],
         "the confirmed tx is not replayed from the released log"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A dead row between two live releases is skipped for both directions, so
+/// an inbound 30 s age check on that row cannot stall every later tx.
+#[tokio::test]
+async fn released_inv_skips_a_dead_middle_row() {
+    use rbitcoin_net::inv_bucket::InvDirection;
+    let (_store, q, cbs) = pad_cbs(4);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    hub.set_relay_enabled(true);
+    hub.note_mock_now(1_000);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let txs: Vec<_> = cbs[..3]
+        .iter()
+        .map(|cb| spend_true(*cb, 1_000, spk.clone()))
+        .collect();
+    for tx in &txs {
+        hub.accept_tx_async(tx.clone()).await.expect("accept");
+    }
+    hub.drain_inv_backlog(1_000_000);
+    hub.remove_for_block(&[txs[1].compute_txid()], MINED);
+    let (last, rows) = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
+    assert_eq!(
+        rows.iter().map(|(_, _, w)| *w).collect::<Vec<_>>(),
+        vec![txs[0].compute_wtxid(), txs[2].compute_wtxid()],
+        "the dead middle row is skipped"
+    );
+    assert_eq!(last, 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -7795,19 +7815,15 @@ fn released_inv_cursor_advances_over_a_pruned_gap() {
         g.push_released(out, txid(2), wtxid(2));
         g.released_outbound.pop_first();
     }
-    let (last, rows) = hub.take_released_invs(out, 0, usize::MAX, |_, _| false);
+    let (last, rows) = hub.take_released_invs(out, 0, 0);
     assert!(rows.is_empty());
-    assert_eq!(last, 1, "the cursor lands before the surviving row");
-    let (last, rows) = hub.take_released_invs(out, last, usize::MAX, |_, _| true);
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].1, txid(2));
-    assert_eq!(last, 2);
+    assert_eq!(last, 1, "a pruned front advances the cursor to its gap");
     {
         let mut g = hub.inv_buckets.lock().unwrap();
         g.released_outbound.clear();
     }
-    let (last, rows) = hub.take_released_invs(out, last, usize::MAX, |_, _| true);
+    let (last, rows) = hub.take_released_invs(out, 0, usize::MAX);
     assert!(rows.is_empty());
-    assert_eq!(last, 2, "an emptied log does not rewind the cursor");
+    assert_eq!(last, 2, "an emptied log advances past the last release");
     let _ = std::fs::remove_dir_all(&dir);
 }

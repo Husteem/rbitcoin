@@ -2329,26 +2329,32 @@ impl MempoolHub {
         }
     }
 
-    /// Released `(txid, wtxid)` after `cursor`, at most `limit`. `ready` can
-    /// stop the walk so the cursor stays in front of an inbound tx whose
-    /// 30 s age has not elapsed.
+    /// Released `(txid, wtxid)` after `cursor`, at most `limit`. Rows whose
+    /// tx has left the pool are skipped and the cursor moves past them, so a
+    /// dead row cannot block a later live one. A busy mempool read stops the
+    /// walk without moving the cursor.
     pub fn take_released_invs(
         &self,
         dir: InvDirection,
         cursor: u64,
         limit: usize,
-        ready: impl Fn(Txid, &Wtxid) -> bool,
     ) -> (u64, Vec<(u64, Txid, Wtxid)>) {
         let g = self.inv_buckets.lock().unwrap();
         let log = g.released(dir);
         let mut last = cursor;
         let mut out = Vec::new();
         for (&seq, &(txid, w)) in log.range(cursor.saturating_add(1)..) {
-            if out.len() >= limit || !ready(txid, &w) {
+            if out.len() >= limit {
                 break;
             }
-            out.push((seq, txid, w));
-            last = seq;
+            match self.try_live_txid(&w) {
+                None => break,
+                Some(None) => last = seq,
+                Some(Some(_)) => {
+                    out.push((seq, txid, w));
+                    last = seq;
+                }
+            }
         }
         if out.is_empty() {
             match log.first_key_value() {

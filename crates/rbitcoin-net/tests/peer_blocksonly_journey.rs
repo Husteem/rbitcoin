@@ -582,6 +582,16 @@ async fn returned_tx_ends_the_private_broadcast(
             mp.is_local_origin(&txid),
             "an inv alone does not end the private broadcast"
         );
+        // A standing session ticks while the private broadcast still holds
+        // `skip_standing_inv`. It advances past the release, so ending the
+        // broadcast must enqueue the tx again.
+        assert!(mp.skip_standing_inv(&txid), "private broadcast still holds the tx");
+        let pre_out = other.writer().expect("other writer");
+        queue_due_tx_invs(hub, other.as_ref(), &CappedSet::new(), &pre_out);
+        assert!(
+            !tx_invs(&mut other_rx).contains(&txid),
+            "no INV of the held tx while the private broadcast is live"
+        );
 
         let later = notfound_asks_the_next_announcer(hub, peers, &echo, &echo_out, &mut follow, item).await;
         set_relay_clock(hub, peers, submitted.saturating_add(30));
