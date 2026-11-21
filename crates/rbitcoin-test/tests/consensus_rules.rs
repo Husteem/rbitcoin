@@ -365,10 +365,10 @@ fn coinbase_maturity_holds_inside_one_confirm_batch() {
 
 /// A batch b0 (valid), b1 (spends a create of b2), b2 is rejected at write
 /// after its Class A append and `tx.head` insert. b0 retried alone from the
-/// archive queues no insert. `tx.head` must still count as holding every
-/// connected create, or the missing-parent verdict for b1 alone cannot run.
+/// archive connects without a second append, and b1 retried alone after it
+/// is still a missing input with the tip at b0.
 #[test]
-fn archived_retry_after_a_rejected_write_keeps_head_covering_the_fence() {
+fn archived_retry_after_a_rejected_write_still_rejects_the_forward_spend() {
     let (_td, q) = open_empty_snap(EmptySnap::H100);
     let params = ChainParams::regtest();
     let tip_blk = q.reconstruct_block_at_height(Height(100)).unwrap();
@@ -384,7 +384,6 @@ fn archived_retry_after_a_rejected_write_keeps_head_covering_the_fence() {
     let child_first = mine_regtest_block(b0.block_hash(), time + 1200, 102, vec![child]);
     let parent_second =
         mine_regtest_block(child_first.block_hash(), time + 1800, 103, vec![parent]);
-    assert!(q.head_covers_fence());
     let creates = q.store().txs.count();
     let err = confirm_wire_run(
         &q,
@@ -392,7 +391,7 @@ fn archived_retry_after_a_rejected_write_keeps_head_covering_the_fence() {
         Milestone::NONE,
         &[
             (Height(101), b0.clone()),
-            (Height(102), child_first),
+            (Height(102), child_first.clone()),
             (Height(103), parent_second),
         ],
     );
@@ -417,12 +416,15 @@ fn archived_retry_after_a_rejected_write_keeps_head_covering_the_fence() {
         creates + 5,
         "b0 was not appended again"
     );
+    let err = confirm_wire_run(&q, &params, Milestone::NONE, &[(Height(102), child_first)]);
     assert!(
-        q.head_covers_fence(),
-        "drain {} fence {}",
-        q.head_drain_fk(),
-        q.store().fence_max_connected_fk()
+        matches!(
+            err,
+            Err(ConfirmError::Rules(ConsensusError::MissingPrevout))
+        ),
+        "b1 alone after the retry: {err:?}"
     );
+    assert_eq!(q.tip_height(), Some(Height(101)));
 }
 
 /// Core connects a run one block at a time, so a parent created in a later
@@ -1213,27 +1215,26 @@ fn respend_of_a_same_block_spend_rejects_on_single_block_retry() {
                     part[part.len() - 1].0 .0
                 );
             }
-            // The retry does not annotate S1 (a same-block spend), so P:0's
-            // slot is still the one the rejected write appended. It must
-            // name S1 alone, not h103's spender and not a spender list.
-            let (hfk, _) = q.header_at_height(Height(102)).unwrap().expect("h102");
-            let txs = q
-                .store()
-                .header_txs
-                .get_list(hfk)
+            // The retry does not annotate S1 (a same-block spend), so P:0
+            // keeps the spender the rejected write appended. Esplora's
+            // outspend reads this: S1 alone, not h103's spender and not a
+            // spender list.
+            let s1 = chain[101].1.txdata.last().expect("h102 S1").compute_txid();
+            let spent_by: Vec<_> = q
+                .spenders_at(&p.compute_txid().to_byte_array(), 0, Some(102))
                 .unwrap()
-                .expect("h102 txs");
-            let (p_fk, s1_fk) = (txs[1], txs[txs.len() - 1]);
-            let (off, _) = q.store().tx_spent_range(p_fk).unwrap();
-            let slot = q
-                .store()
-                .txs
-                .get_spender_meta_at_abs_batch(&[rbitcoin_store::spent_abs(off, 0)])
-                .unwrap()[0];
+                .into_iter()
+                .map(|r| {
+                    (
+                        q.store().txs.body_txid(r.spending_tx_fk).unwrap(),
+                        r.spending_vin,
+                    )
+                })
+                .collect();
             assert_eq!(
-                slot,
-                Some((s1_fk, 0, 0)),
-                "{run}: P:0 slot after the h102 retry"
+                spent_by,
+                vec![(s1.to_byte_array(), 0)],
+                "{run}: P:0 outspend after the h102 retry"
             );
             let got =
                 confirm_wire_run(&q, &params, Milestone::NONE, &[(Height(103), last.clone())]);

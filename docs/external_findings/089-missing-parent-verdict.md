@@ -118,4 +118,4 @@ until restart. That is not changed here.
 `forward_spend_behind_a_valid_block_in_one_write_is_invalid`,
 `forward_spend_after_a_valid_block_connected_alone_is_invalid`;
 `rbitcoin-test`
-`consensus_rules::archived_retry_after_a_rejected_write_keeps_head_covering_the_fence`
+`consensus_rules::archived_retry_after_a_rejected_write_still_rejects_the_forward_spend`
