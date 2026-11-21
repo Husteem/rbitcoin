@@ -235,6 +235,8 @@ pub fn apply_plan_pins(
 /// The wire `vout` is peer-chosen. It is checked against the lookup-stamped
 /// `create.loc` count, or the full wire tx of a batch / in-flight pin, before
 /// any body read. A short load after this point stays store `Corrupt`.
+/// `parent_vouts` lists are sorted and deduplicated, so the last vout is
+/// the highest.
 #[doc(hidden)]
 pub fn reject_vout_past_n_out(
     parent_vouts: &U64Map<Vec<u32>>,
@@ -242,7 +244,7 @@ pub fn reject_vout_past_n_out(
     plan_by_id: &U64Map<CreatePin>,
 ) -> Result<(), ConfirmError> {
     for (id, need) in parent_vouts {
-        let Some(&max_vout) = need.iter().max() else {
+        let Some(&max_vout) = need.last() else {
             continue;
         };
         let wire_n_out = || {
