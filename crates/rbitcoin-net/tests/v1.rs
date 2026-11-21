@@ -471,6 +471,12 @@ async fn p2p_v1_tx_inv_follows_wtxidrelay() {
 
         let served = v1_getdata_tx(&mut legacy, Inventory::WitnessTransaction(txid)).await;
         assert_eq!(served, spend, "MSG_WITNESS_TX serves the witness");
+        let served = v1_getdata_tx(&mut legacy, Inventory::Transaction(txid)).await;
+        assert_eq!(served.compute_txid(), txid);
+        assert!(
+            served.input.iter().all(|i| i.witness.is_empty()),
+            "MSG_TX serves the tx without its witness"
+        );
         let served = v1_getdata_tx(&mut modern, Inventory::WTx(wtxid)).await;
         assert_eq!(served, spend);
         node.shutdown().await;

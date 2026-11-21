@@ -1785,8 +1785,14 @@ mod peer_session_pins {
             "the tx this peer sent is not inv'd back"
         );
         let (serve_tx, mut serve_rx) = tokio::sync::mpsc::unbounded_channel();
-        let served =
-            serve_mempool_getdata(&hub, &serve_tx, Some(&live), Some(older_tx)).expect("getdata");
+        let served = serve_mempool_getdata(
+            &hub,
+            &serve_tx,
+            Some(&live),
+            &Inventory::WTx(older_tx.compute_wtxid()),
+            Some(older_tx),
+        )
+        .expect("getdata");
         assert!(
             served,
             "an older tx becomes servable once a later one is inv'd"
@@ -5663,12 +5669,13 @@ pub fn serve_mempool_getdata(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     session: Option<&crate::peers::LivePeer>,
+    item: &Inventory,
     tx: Option<bitcoin::Transaction>,
 ) -> Result<bool, NetError> {
     let Some(mp) = hub.mempool() else {
         return Ok(false);
     };
-    let Some(tx) = tx else {
+    let Some(mut tx) = tx else {
         return Ok(false);
     };
     let txid = tx.compute_txid();
@@ -5677,6 +5684,10 @@ pub fn serve_mempool_getdata(
     let last_inv = session.map(|s| s.last_inv_sequence()).unwrap_or(1);
     if announced || mp.is_relay_servable(&wtxid, last_inv) {
         mp.mark_broadcast(&txid);
+        // Core: only `MSG_WITNESS_TX` and `MSG_WTX` carry the witness.
+        if matches!(item, Inventory::Transaction(_)) {
+            tx.input.iter_mut().for_each(|i| i.witness.clear());
+        }
         queue_accounted(session, out_tx, NetworkMessage::Tx(tx))?;
         return Ok(true);
     }
@@ -6678,7 +6689,9 @@ pub async fn serve_getdata_tail(
             }
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                 let tx = hub.mempool().and_then(|mp| mp.try_get_tx(txid));
-                if !serve_mempool_getdata(hub, out_tx, session, tx)? && hub.mempool().is_some() {
+                if !serve_mempool_getdata(hub, out_tx, session, &item, tx)?
+                    && hub.mempool().is_some()
+                {
                     notfound.push(item);
                 }
             }
@@ -6862,7 +6875,7 @@ pub async fn serve_getdata_wtx(
         rbitcoin_log::trace!(Txrelay, "{}", received_getdata_wtx_log(wtxid, s.id));
     }
     let tx = hub.mempool().and_then(|mp| mp.try_get_tx_by_wtxid(wtxid));
-    if serve_mempool_getdata(hub, out_tx, session, tx)? {
+    if serve_mempool_getdata(hub, out_tx, session, &item, tx)? {
         return Ok(());
     }
     let announced = session.is_some_and(|s| s.has_announced(&item));
