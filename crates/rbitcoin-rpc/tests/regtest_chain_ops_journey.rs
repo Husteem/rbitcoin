@@ -2807,7 +2807,9 @@ fn chain_ops_ephemeral_anchor(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     .unwrap();
     assert_eq!(r["package_msg"], "unspent-dust", "{r}");
     assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
-    // A `version` member fails Core's pre-checks, so no package reason.
+    // Core answers -25 for this 3-generation chain; the dialect path
+    // evaluates it, and the `version` pre-check failure keeps the generic
+    // reason.
     let v4 = Transaction {
         version: TxVersion::non_standard(4),
         ..v3_spend(&skips, &[0], cb - 20_000)
@@ -2820,8 +2822,9 @@ fn chain_ops_ephemeral_anchor(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     .unwrap();
     assert_eq!(r["package_msg"], "transaction failed", "{r}");
     assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
-    // A member that fails alone for a reason no package fixes stops Core
-    // before package evaluation.
+    // Core answers -25 for an unrelated member; the dialect path evaluates
+    // it, and a member that fails alone for a reason no package fixes keeps
+    // the generic reason.
     let h_stray = cbs.take();
     let cb_stray = generated_coinbase_value(ctx, h_stray);
     let mut stray = spend_generated_coinbase(ctx, h_stray, cb_stray - 10_000, true_spk()).1;
