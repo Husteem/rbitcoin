@@ -2805,9 +2805,7 @@ fn chain_ops_ephemeral_anchor(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
         vec![json!([tx_hex(&parent), tx_hex(&skips)])],
     )
     .unwrap();
-    // Core answers `unspent-dust` here (mempool_ephemeral_dust.py
-    // test_unspent_ephemeral); the per-member strings differ too (COMPAT.md).
-    assert_eq!(r["package_msg"], "transaction failed", "{r}");
+    assert_eq!(r["package_msg"], "unspent-dust", "{r}");
     assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
 
     let child = v3_spend(&parent, &[0, 1], cb - 10_000);
