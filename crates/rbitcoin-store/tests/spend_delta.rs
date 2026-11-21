@@ -794,6 +794,34 @@ fn checkpoint_keeps_only_the_slots_it_seals() {
     assert_eq!(log.slot(24).unwrap(), Some(b));
 }
 
+/// Two pages sealed in one checkpoint already have records, written a
+/// generation apart so they do not touch. The merge reads both in one
+/// completion-session batch. A pread per record leaves the bulk count at
+/// zero, and one note per span leaves it at two.
+#[test]
+fn checkpoint_merge_reads_records_in_one_batch() {
+    use rbitcoin_store::spend_delta::{delta_record_io, reset_delta_record_io};
+
+    let d = dir();
+    let log = SpendPageLog::create(&d).unwrap();
+    let pages = [16u64, 4096 + 16];
+    for (i, abs) in pages.iter().enumerate() {
+        log.note_slots(&[(*abs, [i as u8 + 1; 8])]).unwrap();
+        commit(&log, (i + 1) as u32, 0, |_| Ok(true));
+    }
+    reset_delta_record_io();
+    log.note_slots(&[(pages[0], [3; 8]), (pages[1], [4; 8])])
+        .unwrap();
+    commit(&log, 3, 0, |_| Ok(true));
+    assert_eq!(
+        delta_record_io(),
+        (1, 0),
+        "two earlier records are one bulk submission, not a pread each"
+    );
+    assert_eq!(log.slot(pages[0]).unwrap(), Some([3; 8]));
+    assert_eq!(log.slot(pages[1]).unwrap(), Some([4; 8]));
+}
+
 /// A freeze empties the open notes, so it releases a confirm thread parked
 /// at the edge cap before the checkpoint writes anything.
 #[test]
