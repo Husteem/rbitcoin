@@ -1,5 +1,10 @@
 rbitcoin_store::skip_flushes_before_main!();
 
+#[global_allocator]
+static ALLOC: alloc_count::Counting = alloc_count::Counting;
+
+mod alloc_count;
+
 mod archive;
 mod batch_parents;
 mod bip68_store_tests;
