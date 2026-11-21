@@ -1034,6 +1034,11 @@ async fn cap_evicts_only_after_the_store_accepts() {
         !inv_asks_headers(&hub, &out_tx, &mut out_rx, &mut follow, &peer, junk_hash).await,
         "a header the store rejects evicted a non-connecting header"
     );
+    let unseen = BlockHash::from_byte_array([0x5a; 32]);
+    assert!(
+        inv_asks_headers(&hub, &out_tx, &mut out_rx, &mut follow, &peer, unseen).await,
+        "the session still asks for a header it does not hold"
+    );
 
     let parent = hub
         .query
@@ -1408,7 +1413,9 @@ fn bad_diffbits_child(tip: &bitcoin::block::Header) -> bitcoin::block::Header {
 
 /// Whether a block `inv` for `hash` makes the node send `getheaders`. A node
 /// that holds the header, stored or waiting for its parent, asks for nothing.
-/// Only the first block `inv` of a session is answered, so a test probes once.
+/// Only the first block `inv` for an unheld hash is answered per session. A
+/// held hash does not use that one ask, so a probe for an unseen hash can
+/// follow it.
 async fn inv_asks_headers(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,

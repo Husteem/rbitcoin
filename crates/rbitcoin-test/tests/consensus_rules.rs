@@ -1216,9 +1216,10 @@ fn respend_of_a_same_block_spend_rejects_on_single_block_retry() {
                 );
             }
             // The retry does not annotate S1 (a same-block spend), so P:0
-            // keeps the spender the rejected write appended. Esplora's
-            // outspend reads this: S1 alone, not h103's spender and not a
-            // spender list.
+            // keeps the spender the rejected write appended. The assert pins
+            // what Esplora's outspend shows: S1 alone, not h103's spender.
+            // `spenders_at` keeps only strong spenders, so it does not show
+            // whether the slot also lists h103's.
             let s1 = chain[101].1.txdata.last().expect("h102 S1").compute_txid();
             let spent_by: Vec<_> = q
                 .spenders_at(&p.compute_txid().to_byte_array(), 0, Some(102))
