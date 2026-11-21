@@ -18,6 +18,7 @@ use rbitcoin_primitives::{bytes, le_u16, le_u32, le_u64};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Records per data page (170 × 24 B = 4080 B).
@@ -43,6 +44,8 @@ pub struct SortedHead {
     /// First key of each 4 KiB data page + file offset of that page.
     pub idx: Vec<(ShHeadKey, u64)>,
     pub fuse: Option<SealedFuse8>,
+    /// Data pages read by [`Self::get`]. Debug builds only.
+    #[cfg(debug_assertions)]
     pub preads: AtomicU64,
 }
 
@@ -133,6 +136,7 @@ impl SortedHead {
             count,
             idx,
             fuse,
+            #[cfg(debug_assertions)]
             preads: AtomicU64::new(0),
         })
     }
@@ -224,6 +228,7 @@ impl SortedHead {
         let remain = self.count.saturating_sub(page_slot0);
         let n = remain.min(SH_SORTED_RECS_PER_PAGE as u64) as usize;
         let mut page = vec![0u8; n * SH_HEAD_SLOT_SIZE];
+        #[cfg(debug_assertions)]
         self.preads.fetch_add(1, Ordering::Relaxed);
         pread_file_exact(&self.file, page_off, &mut page)
             .map_err(|e| StoreError::io(&self.path, e))?;

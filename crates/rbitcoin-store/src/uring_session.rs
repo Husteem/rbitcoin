@@ -854,8 +854,6 @@ impl UringSession {
 
     #[doc(hidden)]
     pub fn note_invariant(&self, kind: UringInvariant) {
-        kind.counter()
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let thread = std::thread::current();
         let thread = thread.name().unwrap_or("unnamed");
         rbitcoin_log::warn!(
@@ -1228,25 +1226,6 @@ pub fn unpack_ud(ud: u64) -> (u8, u16, u32) {
     (kind, epoch, slot)
 }
 
-/// Process counters for harvest invariants (tests + operator logs).
-#[derive(Default)]
-pub struct UringMeters {
-    pub unexpected_cqe: std::sync::atomic::AtomicU64,
-    pub undrained: std::sync::atomic::AtomicU64,
-    #[cfg(any(debug_assertions, target_os = "linux"))]
-    pub cq_overflow: std::sync::atomic::AtomicU64,
-    pub idx_range_missing: std::sync::atomic::AtomicU64,
-}
-
-#[doc(hidden)]
-pub static URING_METERS: UringMeters = UringMeters {
-    unexpected_cqe: std::sync::atomic::AtomicU64::new(0),
-    undrained: std::sync::atomic::AtomicU64::new(0),
-    #[cfg(any(debug_assertions, target_os = "linux"))]
-    cq_overflow: std::sync::atomic::AtomicU64::new(0),
-    idx_range_missing: std::sync::atomic::AtomicU64::new(0),
-};
-
 #[derive(Clone, Copy)]
 pub enum UringInvariant {
     UnexpectedCqe,
@@ -1257,17 +1236,6 @@ pub enum UringInvariant {
 }
 
 impl UringInvariant {
-    #[doc(hidden)]
-    pub fn counter(self) -> &'static std::sync::atomic::AtomicU64 {
-        match self {
-            Self::UnexpectedCqe => &URING_METERS.unexpected_cqe,
-            Self::Undrained => &URING_METERS.undrained,
-            #[cfg(any(debug_assertions, target_os = "linux"))]
-            Self::CqOverflow => &URING_METERS.cq_overflow,
-            Self::IdxRangeMissing => &URING_METERS.idx_range_missing,
-        }
-    }
-
     #[doc(hidden)]
     pub fn label(self) -> &'static str {
         match self {
@@ -1281,8 +1249,6 @@ impl UringInvariant {
 }
 
 pub fn note_uring_invariant(kind: UringInvariant) {
-    kind.counter()
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let thread = std::thread::current();
     let thread = thread.name().unwrap_or("unnamed");
     rbitcoin_log::warn!(

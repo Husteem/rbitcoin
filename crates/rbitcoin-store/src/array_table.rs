@@ -659,7 +659,8 @@ pub struct ArrayTable {
     pub disk_len: AtomicU64,
     /// One flusher at a time.
     pub flush_lock: Mutex<()>,
-    /// Largest chunk the last flush passed to `write_at`.
+    /// Largest chunk the last flush passed to `write_at`. Debug builds only.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub flush_chunk_max: AtomicUsize,
 }
@@ -720,6 +721,7 @@ impl ArrayTable {
             flushing: AtomicBool::new(false),
             disk_len: AtomicU64::new(n),
             flush_lock: Mutex::new(()),
+            #[cfg(debug_assertions)]
             flush_chunk_max: AtomicUsize::new(0),
         }
     }
@@ -1117,6 +1119,7 @@ impl ArrayTable {
         if start < n {
             let mut scratch = [0u8; FLUSH_SCRATCH];
             let mut off = 0u64;
+            #[cfg(debug_assertions)]
             let mut max_chunk = 0usize;
             let base = FILE_HEADER_LEN as u64 + start * stride;
             let span = (n - start) * stride;
@@ -1126,10 +1129,14 @@ impl ArrayTable {
                 let nbyte = ((span - off) as usize).min(FLUSH_SCRATCH);
                 let src = (start * stride + off) as usize;
                 copy_bit_bytes(words, src, &mut scratch[..nbyte]);
-                max_chunk = max_chunk.max(nbyte);
+                #[cfg(debug_assertions)]
+                {
+                    max_chunk = max_chunk.max(nbyte);
+                }
                 self.file.write_at(base + off, &scratch[..nbyte])?;
                 off += nbyte as u64;
             }
+            #[cfg(debug_assertions)]
             self.flush_chunk_max.store(max_chunk, Ordering::Relaxed);
         }
         let logical = FILE_HEADER_LEN as u64 + n * stride;

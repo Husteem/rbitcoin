@@ -9,6 +9,7 @@ use rbitcoin_primitives::{le_u32, le_u64};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[doc(hidden)]
@@ -46,6 +47,8 @@ pub enum GStore {
         off: u64,
         n_bytes: u64,
         g_bits: u32,
+        /// g pages read by [`BdzMphf::index_batch_fd`]. Debug builds only.
+        #[cfg(debug_assertions)]
         page_preads: AtomicU64,
     },
 }
@@ -259,6 +262,7 @@ impl BdzMphf {
             off,
             n_bytes,
             g_bits,
+            #[cfg(debug_assertions)]
             page_preads,
             ..
         } = &self.g
@@ -288,9 +292,12 @@ impl BdzMphf {
             *off,
             *n_bytes,
             &page_ids,
-            page_preads,
             ctx,
-            &mut |page, buf| scatter.fill(page, buf),
+            &mut |page, buf| {
+                #[cfg(debug_assertions)]
+                page_preads.fetch_add(1, Ordering::Relaxed);
+                scatter.fill(page, buf)
+            },
         )?;
         Ok(scatter
             .words
@@ -475,6 +482,7 @@ impl BdzMphf {
                 off: HEADER_LEN2,
                 n_bytes,
                 g_bits,
+                #[cfg(debug_assertions)]
                 page_preads: AtomicU64::new(0),
             },
             compact: None,
@@ -608,6 +616,7 @@ impl BdzMphf {
                 off: HEADER_LEN3,
                 n_bytes: g_bytes,
                 g_bits: COMPACT_G_BITS,
+                #[cfg(debug_assertions)]
                 page_preads: AtomicU64::new(0),
             },
             compact: Some(CompactRank::from_mapped(map, occ_off, occ_n, n_verts)?),
@@ -675,7 +684,6 @@ pub fn load_g_page(
     Ok(need)
 }
 
-#[allow(clippy::too_many_arguments)] // IO/session args stay unbundled
 #[doc(hidden)]
 pub fn stream_or_load_pages(
     file: &File,
@@ -683,26 +691,15 @@ pub fn stream_or_load_pages(
     off: u64,
     n_bytes: u64,
     page_ids: &[u32],
-    page_preads: &AtomicU64,
     ctx: &mut crate::IoCtx<'_>,
     fill: &mut impl FnMut(u32, &[u8]),
 ) -> Result<(), StoreError> {
     match ctx.session() {
-        Some(session) => stream_g_pages(
-            session,
-            file,
-            path,
-            off,
-            n_bytes,
-            page_ids,
-            page_preads,
-            fill,
-        ),
+        Some(session) => stream_g_pages(session, file, path, off, n_bytes, page_ids, fill),
         None => {
             for &page in page_ids {
                 let mut buf = [0u8; G_PAGE_BYTES];
                 let n = load_g_page(file, path, off, n_bytes, page, &mut buf)?;
-                page_preads.fetch_add(1, Ordering::Relaxed);
                 fill(page, &buf[..n]);
             }
             Ok(())
@@ -710,7 +707,6 @@ pub fn stream_or_load_pages(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // IO/session args stay unbundled
 #[doc(hidden)]
 pub fn stream_g_pages(
     session: &mut crate::uring_session::UringSession,
@@ -719,7 +715,6 @@ pub fn stream_g_pages(
     g_off: u64,
     n_bytes: u64,
     page_ids: &[u32],
-    page_preads: &AtomicU64,
     fill: &mut impl FnMut(u32, &[u8]),
 ) -> Result<(), StoreError> {
     let n_pages = page_ids.len();
@@ -804,7 +799,6 @@ pub fn stream_g_pages(
                     n = need;
                 }
                 n = n.min(need);
-                page_preads.fetch_add(1, Ordering::Relaxed);
                 fill(page, &bufs[slot][..n]);
                 free_slots.push(slot);
             }

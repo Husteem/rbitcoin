@@ -70,11 +70,6 @@ pub const PROBE_REGION_BYTES: usize = (PAGE_SLOTS as usize) * (ENTRY_BYTES as us
 #[doc(hidden)]
 pub static PROBE_INSERT_DEPTH_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Inserts that exhausted [`MAX_PROBE`] (archiver sleeps until resize completes).
-/// Counter only — the retry loop owns operator-facing logs.
-#[doc(hidden)]
-pub static PROBE_INSERT_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
-
 /// Depth threshold above which inserts count as “deep” for ops visibility and
 /// trigger an early online resize request (first event only).
 pub const PROBE_DEPTH_WARN: u32 = 128;
@@ -124,12 +119,6 @@ pub fn note_probe_depth_on_insert(depth: u32) {
              segment may be overfull — roll policy should prevent this)"
         );
     }
-}
-
-#[inline]
-#[doc(hidden)]
-pub fn note_probe_exhausted() {
-    PROBE_INSERT_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
 }
 
 #[doc(hidden)]
@@ -800,7 +789,6 @@ impl AddressHead {
                 return Ok(false);
             }
         }
-        note_probe_exhausted();
         Err(StoreError::Corrupt(
             "address head probe exhausted on insert",
         ))

@@ -710,9 +710,11 @@ pub struct TxTable {
     /// decode the mempool and block-proposal pins count. [`Self::get_full`] is
     /// the confirm write stage's decoder and is not counted; span and pin
     /// machines decode raw spans and are not counted. One Relaxed add per
-    /// decode.
+    /// decode. Debug builds only: tests read it, production does not.
+    #[cfg(debug_assertions)]
     pub body_decodes: std::sync::atomic::AtomicU64,
     /// Output records materialized from packed bodies (instance stats).
+    #[cfg(debug_assertions)]
     pub outputs_decoded: std::sync::atomic::AtomicU64,
 }
 
@@ -1438,7 +1440,9 @@ impl TxTable {
             input: crate::input::Input::create(seqsigwit_dir)?,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
+            #[cfg(debug_assertions)]
             body_decodes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(debug_assertions)]
             outputs_decoded: std::sync::atomic::AtomicU64::new(0),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
@@ -1709,7 +1713,9 @@ impl TxTable {
             input,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
+            #[cfg(debug_assertions)]
             body_decodes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(debug_assertions)]
             outputs_decoded: std::sync::atomic::AtomicU64::new(0),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
@@ -3020,10 +3026,12 @@ impl TxTable {
         let raw = self
             .body
             .with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
+        #[cfg(debug_assertions)]
         self.body_decodes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (mut tx, outs, _) =
             decode_packed_tx_outs_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
+        #[cfg(debug_assertions)]
         self.outputs_decoded
             .fetch_add(outs.len() as u64, std::sync::atomic::Ordering::Relaxed);
         tx.txid = self.txids.get(fk)?;
@@ -3054,20 +3062,24 @@ impl TxTable {
         let (_, live, _) = self.body.with_bytes_at(pair.txout.0, pair.txout.1, |raw| {
             decode_packed_tx_outs_exact(raw, pair.n_out, &need, Some(&self.secret))
         })?;
+        #[cfg(debug_assertions)]
         self.body_decodes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(debug_assertions)]
         self.outputs_decoded
             .fetch_add(live.len() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(live)
     }
 
     /// Sample-and-reset per-fk packed body decodes (instance stats).
+    #[cfg(debug_assertions)]
     pub fn sample_reset_body_decodes(&self) -> u64 {
         self.body_decodes
             .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Sample-and-reset output records materialized (instance stats).
+    #[cfg(debug_assertions)]
     pub fn sample_reset_outputs_decoded(&self) -> u64 {
         self.outputs_decoded
             .swap(0, std::sync::atomic::Ordering::Relaxed)

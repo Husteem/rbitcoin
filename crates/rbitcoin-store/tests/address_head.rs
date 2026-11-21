@@ -835,7 +835,6 @@ fn head_access_env_probe_stats_and_layout_helpers() {
     note_probe_depth_on_insert(PROBE_DEPTH_WARN);
     note_probe_depth_on_insert(PROBE_DEPTH_WARN + 1);
     note_probe_depth_on_insert(PROBE_DEPTH_WARN + 50);
-    note_probe_exhausted();
 
     assert!(is_probe_exhausted_error(&StoreError::Corrupt(
         "address head probe exhausted on insert"
