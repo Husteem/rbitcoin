@@ -3,7 +3,8 @@
 //! On **datadir create**, a 32-byte CSPRNG secret is written to `store/store.secret`
 //! (mode 0600 when the OS allows). Derived material:
 //!
-//! - **Script XOR:** `xor_key_byte(i) = secret[i % 32] ^ stream_mix(i)` applied to
+//! - **Script XOR:** `xor_key_byte(i) = secret[i % 32] ^ top_byte(i·φ)` (φ =
+//!   `0x9E37_79B9_7F4A_7C15`, wrapping at 2^64) applied to
 //!   on-disk `scriptPubKey`, `scriptSig`, and witness item bytes (Bitcoin Core–style
 //!   at-rest obfuscation of script/witness blobs only — not txids or amounts).
 //! - **TXID mix:** `mix_txid(txid) = SHA256(secret || txid)` is the **page-local**
@@ -131,29 +132,18 @@ impl StoreSecret {
 
     /// XOR `buf` in place (encode and decode are the same operation).
     ///
-    /// Same stream as [`Self::xor_key_byte`]: 8-byte words, then a tail.
+    /// Same stream as [`Self::xor_key_byte`]. The mix of offset `o + 1` is
+    /// the top byte of `o·φ + φ`, so the walk adds instead of multiplying per
+    /// byte; both wrap at 2^64, as the offset does.
     #[inline]
     pub fn xor_bytes(&self, start_off: u64, buf: &mut [u8]) {
         const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
-        let secret = &self.bytes;
-        let mut off = start_off;
-        let mut chunks = buf.chunks_exact_mut(8);
-        for chunk in chunks.by_ref() {
-            let mut k = [0u8; 8];
-            for (j, kb) in k.iter_mut().enumerate() {
-                let o = off.wrapping_add(j as u64);
-                *kb = secret[(o as usize) % SECRET_LEN] ^ ((o.wrapping_mul(GOLDEN) >> 56) as u8);
-            }
-            let mut word = [0u8; 8];
-            word.copy_from_slice(chunk);
-            chunk
-                .copy_from_slice(&(u64::from_ne_bytes(word) ^ u64::from_ne_bytes(k)).to_ne_bytes());
-            off = off.wrapping_add(8);
-        }
-        for b in chunks.into_remainder() {
-            let mix = (off.wrapping_mul(GOLDEN) >> 56) as u8;
-            *b ^= secret[(off as usize) % SECRET_LEN] ^ mix;
-            off = off.wrapping_add(1);
+        let mut product = start_off.wrapping_mul(GOLDEN);
+        let mut at = (start_off as usize) % SECRET_LEN;
+        for b in buf.iter_mut() {
+            *b ^= self.bytes[at] ^ ((product >> 56) as u8);
+            product = product.wrapping_add(GOLDEN);
+            at = (at + 1) % SECRET_LEN;
         }
     }
 
