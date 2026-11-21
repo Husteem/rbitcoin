@@ -89,7 +89,7 @@ the same POST with `after_txid` reuse. Idle **30s**; **256** clients (evict
 idle-longest). Not an 8-script LRU and not a >5s process whale cache. Extra
 operator RAM is the kernel page cache of Class A `txout` / SH heads. Public
 explorer second-hit of a whale GET is nginx/CDN (`/api/address/` is cacheable).
-`--max-sh-creates N` (`N>0` → Esplora **503** on an unpaged join) is the fuse; default **10000**. **0** is unlimited. A paged history request is still served.
+`--max-sh-creates N` (`N>0` → Esplora **503** on an unpaged join) is the fuse; default **10000**. **0** is unlimited. A short paged history request is still served; a full newest-first page or a `from_height` window reads every create and takes the cap.
 
 Re-measure fat keys on the operator host (`rbitcoin-bench --suite casa
 --passes 1 --warmup 1`). Do not treat agent-VM times as product numbers.
@@ -206,7 +206,7 @@ surface: [`COMPAT.md`](../../COMPAT.md).
 ```
 
 Conf: `sh_index=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
-Leave `--max-sh-creates` at **10000** (or **0** for an unlimited unpaged join) for explorer backends. Paged history still stops at the page.
+Leave `--max-sh-creates` at **10000** (or **0** for an unlimited unpaged join) for explorer backends. A short page still stops at the page; a full newest-first page takes the cap.
 An explorer on the unix socket can read one script's totals above the cap with
 `GET /internal/address/:address` or `/internal/scripthash/:hash`, and its
 whole confirmed history with the same paths plus `/history`, without

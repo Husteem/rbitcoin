@@ -224,7 +224,7 @@ async fn multi_page_is_one_newest_window_per_script() {
     page2.extend_from_slice(&b_new[..20]);
     let page3: Vec<&str> = b_new[20..].to_vec();
 
-    q.set_max_sh_creates(10);
+    q.set_max_sh_creates(100);
     let q = Arc::new(q);
     let cache = Arc::new(Mutex::new(JoinCache::default()));
     let app = app_with_join(Arc::clone(&q), Arc::clone(&cache), true);

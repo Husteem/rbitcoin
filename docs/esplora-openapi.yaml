@@ -76,7 +76,9 @@ info:
     ## Scripthash index
     Address and scripthash routes need `--sh-index`. Without it they return
     **503** `scripthash index disabled`. Unpaged stats and `/utxo` above
-    `--max-sh-creates` are **503**; paged history is still served. On the unix
+    `--max-sh-creates` are **503**; a short paged history request is still
+    served, while a full newest-first page reads every create and takes the
+    cap. On the unix
     socket, `/internal/address/{address}` and `/internal/scripthash/{scripthash}`
     answer those stats without the `--max-sh-creates` 503.
 
@@ -668,7 +670,8 @@ paths:
       description: |
         Not in Blockstream Esplora API.md; shaped like mempool.space
         `/address/:addr/txs/summary`. Confirmed only, 25 per page, newest first.
-        Served above `--max-sh-creates`.
+        A short page is served above `--max-sh-creates`; a full page reads every
+        create and takes the cap.
       parameters:
         - { $ref: "#/components/parameters/Address" }
         - { $ref: "#/components/parameters/AfterTxid" }

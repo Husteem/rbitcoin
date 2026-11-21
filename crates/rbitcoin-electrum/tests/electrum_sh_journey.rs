@@ -612,10 +612,10 @@ pub fn connect_script_block(
 }
 
 /// Old creates, a tip create, and a tip spend of the oldest coin. A
-/// `from_height` above 0 is that window and is served above the create cap.
-/// Open history, and a window that still starts at height 0, stay capped.
+/// `from_height` above 0 scans that window for every create, so it takes the
+/// same create cap as open history. With the cap off it returns the window.
 #[tokio::test]
-async fn from_height_window_is_served_above_the_create_cap() {
+async fn from_height_window_obeys_the_create_cap() {
     let (dir, q) = tmp_store();
     let q = Arc::new(q);
     let params = ChainParams::regtest();
@@ -670,18 +670,27 @@ async fn from_height_window_is_served_above_the_create_cap() {
         "{from_zero}"
     );
 
-    let window = electrum_tcp_call(
+    let window_err = electrum_tcp_call(
         &mut stream,
         "blockchain.scripthash.get_history",
         json!([sh, tip, tip + 1]),
     )
-    .await;
-    handle.shutdown().await;
+    .await
+    .unwrap_err();
     assert!(
-        window.is_ok(),
-        "a from_height window must not hit the create cap: {window:?}"
+        window_err.contains("scripthash join exceeds --max-sh-creates"),
+        "{window_err}"
     );
-    let rows = window.unwrap();
+
+    q.set_max_sh_creates(0);
+    let rows = electrum_tcp_call(
+        &mut stream,
+        "blockchain.scripthash.get_history",
+        json!([sh, tip, tip + 1]),
+    )
+    .await
+    .expect("cap 0 serves the window");
+    handle.shutdown().await;
     let hashes: Vec<&str> = rows
         .as_array()
         .unwrap()

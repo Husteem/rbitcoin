@@ -241,8 +241,11 @@ before Class A expand: Esplora **503** / Electrum JSON-RPC error
 A create is a transaction that pays the script, not an output: the index
 keeps one transaction key per create, so two outputs to the script in one
 transaction count once. A history request that names a page (Esplora's 25, or
-any caller that sets a limit) is still served: the join stops once that page
-is full.
+any caller that sets a limit) is served when the page closes before reading
+every create. A newest-first page that reaches its full limit reads every
+create at or below the page bound, and an Electrum `from_height` window reads
+every create to match spends in that window; both take the same cap and
+heavy-join turn as an unpaged join.
 
 On the Esplora unix socket, `GET /internal/address/:address` and
 `GET /internal/scripthash/:hash` answer the totals of `/address/:address` and

@@ -839,8 +839,9 @@ impl Query {
 
     /// A `from_height` above 0 scans that window and never fills the join.
     /// Any `to_height` also skips the stored join. A limited newest-first
-    /// page never fills it, at every cap. A height-ascending page skips it
-    /// only when the unpaged join would hit `--max-sh-creates`.
+    /// page never fills it. A height-ascending page skips it only when the
+    /// unpaged join would hit `--max-sh-creates`. The limited paths still
+    /// take that cap and the heavy turn when they read every create.
     #[doc(hidden)]
     pub fn page_without_full_slot(
         &self,
@@ -856,7 +857,8 @@ impl Query {
             return Ok(false);
         }
         // A catch-up from a later height scans that window. It must not
-        // fill the join or trip `--max-sh-creates`.
+        // fill the join. `height_window_history` takes the same cap and
+        // heavy turn as an unpaged join because it reads every create.
         if filter.from_height > 0 {
             return Ok(true);
         }
@@ -1637,10 +1639,11 @@ impl Query {
 
     /// Spends that can land on a newest-first page.
     ///
-    /// A gap inside [`MAX_HISTORY_WINDOW`] still scans those blocks. A wider
-    /// gap reads spend slots of the page's creates and of creates below the
-    /// page bound, and that read is refused above `--max-sh-creates`.
-    /// A spender counts only at a height inside `[low, high]`.
+    /// A gap inside [`MAX_HISTORY_WINDOW`] scans those blocks. A wider gap
+    /// reads spend slots of the page's creates and of creates below the page
+    /// bound. Both read every create, so both are refused above
+    /// `--max-sh-creates` and hold the heavy turn. A spender counts only at a
+    /// height inside `[low, high]`.
     #[doc(hidden)]
     pub fn spends_for_newest_page(
         &self,
@@ -1653,11 +1656,12 @@ impl Query {
         let Some(low) = window.bound else {
             return self.spends_of_retained_creates(scripthash, &window.creates, high, view);
         };
+        // Both a block scan and a spend-slot read walk every create, so each
+        // takes the unpaged cap and keeps the heavy turn for its read.
+        let _admit = self.unpaged_join_admit(scripthash)?;
         if high.saturating_sub(low) <= MAX_HISTORY_WINDOW {
             return self.spends_of_members(members, low, high);
         }
-        // Held across the spend-slot read so a heavy script keeps the turn.
-        let _admit = self.unpaged_join_admit(scripthash)?;
         let mut creates = window.creates.clone();
         let mut kept: Vec<u64> = window.creates.iter().map(|(_, fk)| fk.0).collect();
         kept.sort_unstable();
@@ -1821,7 +1825,8 @@ impl Query {
     /// Creates below `from_height` stay as foreign keys. Spends of those
     /// coins come from [`Self::spends_of_members`] on the window's blocks
     /// (`input.body`), not from their spend slots, and not from [`Self::sh_join`].
-    /// A hit counts only when that input's output pays this script.
+    /// A hit counts only when that input's output pays this script. The scan
+    /// reads every create, so it takes the unpaged cap and heavy turn.
     #[doc(hidden)]
     pub fn height_window_history(
         &self,
@@ -1843,6 +1848,9 @@ impl Query {
         if span > MAX_HISTORY_WINDOW {
             return Err(StoreError::Rejected("history window too wide"));
         }
+        // The window needs every create to decide whether a spend in it
+        // pays the script. Take the unpaged cap and heavy turn for that read.
+        let _admit = self.unpaged_join_admit(scripthash)?;
         let members = self.strong_sh_creates(scripthash, view)?;
         let heights = self.store.tx_height_get_batch(&members)?;
         if heights.len() != members.len() {
