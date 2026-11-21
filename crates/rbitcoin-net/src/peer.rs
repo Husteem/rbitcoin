@@ -5400,10 +5400,13 @@ pub fn queue_due_tx_invs(
         cursor = last;
     }
     let mut due = Vec::new();
-    for (seq, txid, w) in released {
+    let total = released.len();
+    let mut waiting = 0usize;
+    for (i, (seq, txid, w)) in released.into_iter().enumerate() {
         // The cursor stays on a live row whose 30 s age has not elapsed.
         // A dead row was already skipped by `take_released_invs`.
         if inbound_age_gate && !mp.tx_inv_due(&w) {
+            waiting = total - i;
             break;
         }
         // A tx accepted before this session's handshake is not leaked to it
@@ -5433,6 +5436,9 @@ pub fn queue_due_tx_invs(
         // The releases are queued or skipped by now. The per-tx note raised
         // `last_inv_sequence`; this clears the queued count in the same lock.
         session.note_tx_inv_batch_sent(session.last_inv_sequence());
+    }
+    for _ in 0..waiting {
+        session.count_tx_inv_to_send();
     }
 }
 

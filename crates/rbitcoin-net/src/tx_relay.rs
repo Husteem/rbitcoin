@@ -1283,6 +1283,9 @@ pub struct MempoolHub {
     pub parent_req: Mutex<parent_req::ParentTracker>,
     /// Global count+size INV buckets and the released wtxid logs sessions read.
     pub inv_buckets: Mutex<InvBuckets>,
+    /// Serialized size captured at accept, so a rebroadcast or a private
+    /// broadcast handoff can enqueue again without a body read.
+    inv_sizes: Mutex<HashMap<Wtxid, u32>>,
 }
 
 #[doc(hidden)]
@@ -1608,6 +1611,7 @@ impl MempoolHub {
             tip_ctx: Mutex::new(None),
             parent_req: Mutex::new(parent_req::ParentTracker::new()),
             inv_buckets: Mutex::new(InvBuckets::new()),
+            inv_sizes: Mutex::new(HashMap::new()),
         };
         // Schema ≤ 2 records carry no sigop cost: fill (or evict) before serving.
         let loaded = {
@@ -1808,9 +1812,12 @@ impl MempoolHub {
 
     #[doc(hidden)]
     pub fn remove_relay_maps(&self, txid: &Txid) {
-        let mut ix = self.relay_index.lock().unwrap();
-        let ix = &mut *ix;
-        if let Some(w) = ix.wtxid_by_txid.remove(txid) {
+        let removed = {
+            let mut ix = self.relay_index.lock().unwrap();
+            let ix = &mut *ix;
+            let Some(w) = ix.wtxid_by_txid.remove(txid) else {
+                return;
+            };
             ix.relay_seq.remove(&w);
             let at = ix.accept_at.remove(&w);
             ix.accept_gen.remove(&w);
@@ -1823,7 +1830,9 @@ impl MempoolHub {
                     .map_or(u64::MAX, |(&(at, _), _)| at),
                 Ordering::Relaxed,
             );
-        }
+            w
+        };
+        self.inv_sizes.lock().unwrap().remove(&removed);
     }
 
     /// Next accept generation (for peer `inv_gen_floor` at register).
@@ -2236,9 +2245,63 @@ impl MempoolHub {
     /// Queue one wtxid for both direction buckets. One accept or rebroadcast
     /// calls this once, so the backlog is global rather than per peer.
     pub fn enqueue_inv(&self, wtxid: Wtxid, size: u32) {
+        self.inv_sizes.lock().unwrap().insert(wtxid, size);
         let mut g = self.inv_buckets.lock().unwrap();
         g.inbound.enqueue(wtxid, size);
         g.outbound.enqueue(wtxid, size);
+    }
+
+    /// Give a live wtxid a fresh accept generation for a rebroadcast. A peer
+    /// whose handshake set the floor after the original accept then passes
+    /// the floor check, while a peer connecting after this stamp still skips.
+    fn regen_inv(&self, txid: &Txid) -> Option<Wtxid> {
+        let mut ix = self.relay_index.lock().unwrap();
+        let wtxid = *ix.wtxid_by_txid.get(txid)?;
+        if !ix.accept_gen.contains_key(&wtxid) {
+            return None;
+        }
+        let gen = self.next_accept_gen.fetch_add(1, Ordering::Relaxed);
+        ix.accept_gen.insert(wtxid, gen);
+        Some(wtxid)
+    }
+
+    /// Enqueue by txid using the size captured at accept. Falls back to a body
+    /// read only for a tx that was loaded without an announce.
+    fn enqueue_inv_txid(&self, txid: &Txid) -> bool {
+        let wtxid = {
+            let ix = self.relay_index.lock().unwrap();
+            ix.wtxid_by_txid.get(txid).copied()
+        };
+        let Some(wtxid) = wtxid else {
+            return false;
+        };
+        let size = self
+            .inv_sizes
+            .lock()
+            .unwrap()
+            .get(&wtxid)
+            .copied()
+            .or_else(|| self.try_get_tx(txid).map(|tx| tx.total_size() as u32));
+        let Some(size) = size else {
+            return false;
+        };
+        self.enqueue_inv(wtxid, size);
+        true
+    }
+
+    /// Re-enqueue a live tx with a new generation, for a rebroadcast or the
+    /// end of a private broadcast.
+    fn requeue_inv(&self, txid: &Txid) -> bool {
+        if self.regen_inv(txid).is_none() {
+            return false;
+        }
+        self.enqueue_inv_txid(txid)
+    }
+
+    #[doc(hidden)]
+    pub fn set_inv_tokens(&self, dir: InvDirection, count: f64, size: f64) {
+        let mut g = self.inv_buckets.lock().unwrap();
+        g.bucket_mut(dir).set_tokens(count, size);
     }
 
     /// Live txid for a wtxid. `None` means the mempool read lock is busy and
@@ -2290,12 +2353,12 @@ impl MempoolHub {
                 let txid = match self.try_live_txid(&w) {
                     None => break,
                     Some(None) => {
-                        bucket.backlog.pop_front();
+                        bucket.dequeue();
                         continue;
                     }
                     Some(Some(txid)) => txid,
                 };
-                bucket.backlog.pop_front();
+                bucket.dequeue();
                 let count_ok = bucket.count.decrement(1.0);
                 let size_ok = bucket.size.decrement(f64::from(size));
                 log.insert(next, (txid, w));
@@ -6905,8 +6968,15 @@ impl MempoolHub {
         if early.remove(&txid) {
             return;
         }
+        drop(early);
         live.insert(txid);
         persist_unbroadcast_file(&self.dir, &live);
+        drop(live);
+        // Relay is off, so the accept-time release was skipped for a peer
+        // that read it before this note. The note itself may wake them now.
+        if !self.relay_enabled() {
+            let _ = self.enqueue_inv_txid(&txid);
+        }
     }
 
     fn kick_isolated(&self, txid: &Txid) {
@@ -7041,9 +7111,7 @@ impl MempoolHub {
         // set, and the session then advanced past it. Queue it once more now
         // that a standing peer may hear it.
         if removed {
-            if let Some(tx) = self.try_get_tx(txid) {
-                self.enqueue_inv(tx.compute_wtxid(), tx.total_size() as u32);
-            }
+            let _ = self.requeue_inv(txid);
         }
     }
 
@@ -7142,9 +7210,9 @@ impl MempoolHub {
     pub fn rebroadcast_unbroadcast(&self) {
         let ids: Vec<Txid> = self.unbroadcast.lock().unwrap().iter().copied().collect();
         for txid in ids {
-            let Some(tx) = self.try_get_tx(&txid) else {
+            if !self.requeue_inv(&txid) {
                 continue;
-            };
+            }
             let _ = self.announce.send(MempoolAnnounce {
                 txid,
                 replaced: Vec::new(),
@@ -7153,7 +7221,6 @@ impl MempoolHub {
                 outpoints: Arc::default(),
             });
             self.meter_announce.fetch_add(1, Ordering::Relaxed);
-            self.enqueue_inv(tx.compute_wtxid(), tx.total_size() as u32);
         }
     }
 

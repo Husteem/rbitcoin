@@ -7759,11 +7759,29 @@ async fn released_inv_log_drops_a_tx_that_left_the_pool() {
 
     hub.remove_for_block(&[gone.compute_txid()], MINED);
     hub.drain_inv_backlog(1_000_000);
+    assert_eq!(
+        hub.inv_buckets.lock().unwrap().released_inbound.len(),
+        1,
+        "the dead front row is pruned from the log"
+    );
     let (_, after) = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
     assert_eq!(
         after.iter().map(|(_, _, w)| *w).collect::<Vec<_>>(),
         vec![stay.compute_wtxid()],
         "the confirmed tx is not replayed from the released log"
+    );
+    let (stay_id, stay_w) = (stay.compute_txid(), stay.compute_wtxid());
+    {
+        let mut g = hub.inv_buckets.lock().unwrap();
+        for _ in 0..(RELEASED_INV_LOG_CAP + 5) {
+            g.push_released(InvDirection::Inbound, stay_id, stay_w);
+        }
+    }
+    hub.drain_inv_backlog(1_000_000);
+    assert_eq!(
+        hub.inv_buckets.lock().unwrap().released_inbound.len(),
+        RELEASED_INV_LOG_CAP,
+        "the released log is capped"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -7825,5 +7843,77 @@ fn released_inv_cursor_advances_over_a_pruned_gap() {
     let (last, rows) = hub.take_released_invs(out, 0, usize::MAX);
     assert!(rows.is_empty());
     assert_eq!(last, 2, "an emptied log advances past the last release");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The size bucket stops a batch one tx past the -50 kB floor. A relay-off
+/// session does not resume at 20 kB/s; an outbound one resumes at 50 kB/s.
+#[tokio::test]
+async fn inv_size_bucket_stops_at_the_floor_and_resumes() {
+    use bitcoin::transaction::Version as TxVersion;
+    use rbitcoin_net::inv_bucket::InvDirection;
+    let (_store, q, cbs) = pad_cbs(4);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    hub.set_relay_enabled(true);
+    hub.note_mock_now(1_000);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    // ~66 kB: one tx crosses the -50 kB floor from a positive balance.
+    let large = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cbs[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: (0..6_000)
+            .map(|_| TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: spk.clone(),
+            })
+            .collect(),
+    };
+    let small: Vec<_> = cbs[1..3]
+        .iter()
+        .map(|cb| spend_true(*cb, 1_000, spk.clone()))
+        .collect();
+    hub.accept_tx_async(large).await.expect("large");
+    for tx in &small {
+        hub.accept_tx_async(tx.clone()).await.expect("small");
+    }
+    assert_eq!(hub.inv_backlog_len(InvDirection::Inbound), 3);
+    assert_eq!(hub.inv_backlog_len(InvDirection::Outbound), 3);
+
+    let now = 1_000_000;
+    hub.set_inv_tokens(InvDirection::Inbound, 100.0, 1.0);
+    hub.set_inv_tokens(InvDirection::Outbound, 100.0, 1.0);
+    hub.drain_inv_backlog(now);
+    let (in_cursor, inbound) = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
+    let (out_cursor, outbound) = hub.take_released_invs(InvDirection::Outbound, 0, usize::MAX);
+    assert_eq!(inbound.len(), 1, "the tx that crosses the floor still goes");
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(hub.inv_backlog_len(InvDirection::Inbound), 2);
+    assert_eq!(hub.inv_backlog_len(InvDirection::Outbound), 2);
+
+    hub.drain_inv_backlog(now + 2_000);
+    let (in_cursor, inbound) = hub.take_released_invs(InvDirection::Inbound, in_cursor, usize::MAX);
+    let (out_cursor, outbound) =
+        hub.take_released_invs(InvDirection::Outbound, out_cursor, usize::MAX);
+    assert!(
+        inbound.is_empty(),
+        "20 kB/s has not cleared the floor in 2 s"
+    );
+    assert_eq!(outbound.len(), 2, "50 kB/s clears it for outbounds");
+
+    hub.drain_inv_backlog(now + 4_000);
+    let (_, inbound) = hub.take_released_invs(InvDirection::Inbound, in_cursor, usize::MAX);
+    assert_eq!(inbound.len(), 2, "inbound resumes after more time");
+    assert_eq!(hub.inv_backlog_len(InvDirection::Outbound), 0);
+    let _ = out_cursor;
     let _ = std::fs::remove_dir_all(&dir);
 }

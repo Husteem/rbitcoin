@@ -6,7 +6,7 @@
 //! floors follow Core's `InvToSendBucket`.
 
 use bitcoin::{Txid, Wtxid};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 /// Core `INVENTORY_BROADCAST_PER_SECOND`.
 pub const INVENTORY_BROADCAST_PER_SECOND: f64 = 14.0;
@@ -65,6 +65,11 @@ impl TokenBucket {
         self.value
     }
 
+    #[doc(hidden)]
+    pub fn set_value(&mut self, value: f64) {
+        self.value = value.min(self.cap);
+    }
+
     /// Consume `n` tokens. `true` while the balance stays above `floor`.
     pub fn decrement(&mut self, n: f64) -> bool {
         self.value -= n;
@@ -95,6 +100,9 @@ pub struct InvBucket {
     pub count: TokenBucket,
     pub size: TokenBucket,
     pub backlog: VecDeque<(Wtxid, u32)>,
+    /// Wtxids already in `backlog`, so a rebroadcast or unbroadcast note does
+    /// not spend a second pair of tokens on the same tx.
+    queued: HashSet<Wtxid>,
 }
 
 impl InvBucket {
@@ -109,11 +117,27 @@ impl InvBucket {
             ),
             size: TokenBucket::new(SIZE_REFILL * multiplier, SIZE_INIT, SIZE_CAP, SIZE_FLOOR),
             backlog: VecDeque::new(),
+            queued: HashSet::new(),
         }
     }
 
     pub fn enqueue(&mut self, wtxid: Wtxid, size: u32) {
+        if !self.queued.insert(wtxid) {
+            return;
+        }
         self.backlog.push_back((wtxid, size));
+    }
+
+    pub fn dequeue(&mut self) -> Option<(Wtxid, u32)> {
+        let entry = self.backlog.pop_front()?;
+        self.queued.remove(&entry.0);
+        Some(entry)
+    }
+
+    #[doc(hidden)]
+    pub fn set_tokens(&mut self, count: f64, size: f64) {
+        self.count.set_value(count);
+        self.size.set_value(size);
     }
 
     pub fn avail(&self) -> bool {
@@ -200,6 +224,7 @@ impl InvBuckets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::hashes::Hash;
 
     #[test]
     fn count_floor_is_the_old_broadcast_target() {
@@ -225,6 +250,22 @@ mod tests {
         assert_eq!(bucket.value(), 15.0);
         bucket.refill(100_000);
         assert_eq!(bucket.value(), 420.0);
+    }
+
+    #[test]
+    fn enqueue_dedupes_a_wtxid_already_in_the_backlog() {
+        let mut bucket = InvBucket::new(1.0);
+        let w = Wtxid::from_byte_array([7; 32]);
+        bucket.enqueue(w, 100);
+        bucket.enqueue(w, 100);
+        assert_eq!(bucket.backlog.len(), 1, "one tx spends one pair of tokens");
+        assert_eq!(bucket.dequeue().map(|(got, _)| got), Some(w));
+        bucket.enqueue(w, 100);
+        assert_eq!(
+            bucket.backlog.len(),
+            1,
+            "a later rebroadcast may re-enqueue"
+        );
     }
 
     #[test]
