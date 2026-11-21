@@ -907,14 +907,7 @@ pub async fn ibd_cancellable(
     update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
 
     let shared = Arc::new(std::sync::Mutex::new(st));
-    let header_probe = rbitcoin_store::HeaderThreadProbe::arm();
-    rbitcoin_query::reset_header_lookups_under_coord_lock();
-    let header_thread = spawn_header_thread(
-        Arc::clone(&shared),
-        Arc::clone(&hub),
-        header_rx,
-        header_probe,
-    );
+    let header_thread = spawn_header_thread(Arc::clone(&shared), Arc::clone(&hub), header_rx);
     hub.query.publish_progress_snapshots();
     let _ = header_tx.try_send(HeaderCmd::Reseed);
     let _ = header_tx.try_send(HeaderCmd::Ask);

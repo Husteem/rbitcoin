@@ -219,33 +219,6 @@ pub enum UringRecover {
     Exhausted,
 }
 
-thread_local! {
-    static SCRIPTHASH_RUN_COUNT_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static OWNED_SIZE_SNAPSHOT_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[doc(hidden)]
-pub fn note_scripthash_run_count_call() {
-    SCRIPTHASH_RUN_COUNT_N.with(|c| c.set(c.get().saturating_add(1)));
-}
-
-#[doc(hidden)]
-pub fn note_owned_size_snapshot_call() {
-    OWNED_SIZE_SNAPSHOT_N.with(|c| c.set(c.get().saturating_add(1)));
-}
-
-pub fn reset_progress_snapshot_counts() {
-    SCRIPTHASH_RUN_COUNT_N.with(|c| c.set(0));
-    OWNED_SIZE_SNAPSHOT_N.with(|c| c.set(0));
-}
-
-pub fn progress_snapshot_counts() -> (u64, u64) {
-    (
-        SCRIPTHASH_RUN_COUNT_N.with(|c| c.get()),
-        OWNED_SIZE_SNAPSHOT_N.with(|c| c.get()),
-    )
-}
-
 pub fn uring_recover_credit(last_tip: Option<u32>, tip: u32) -> bool {
     match last_tip {
         None => true,
@@ -457,10 +430,7 @@ pub use batch_parents::{
 };
 pub use block_filter::{basic_filter_from_scripts, basic_filter_of};
 pub use catchup::IndexMode;
-pub use chain_view::{
-    header_lookups_under_coord_lock, reset_header_lookups_under_coord_lock, ChainView,
-    ChainViewKind, SlotsAround,
-};
+pub use chain_view::{header_lookup_count, ChainView, ChainViewKind, SlotsAround};
 pub use confirm_load::SpendEdges;
 pub use connect::{spawn_sh_writebehind, ConfirmPrepared};
 pub use in_flight::InFlight;
@@ -2898,7 +2868,6 @@ impl Query {
     /// the spend-delta lock that confirm holds while it notes spends, and only
     /// the perf line ([`Self::publish_progress_snapshots`]) reads it.
     pub fn process_owned_size_snapshot(&self) -> ProcessOwnedSizes {
-        note_owned_size_snapshot_call();
         // Header + tx_fks plans (not the unused scan-watermark `plans` BTreeMap).
         // Wire path always put_header_plan; conf_plans=0 was a metering bug.
         let conf_plans = self.confirm_parents.header_plan_count();

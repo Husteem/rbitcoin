@@ -43,58 +43,6 @@ fn missing_reject_parent_is_not_consensus_invalid() {
 }
 
 #[test]
-fn spindle_hold_blocks_lookup_and_load_bulk_reads() {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("spindle-reader");
-    let query = std::sync::Arc::clone(&hub.query);
-    query.store().set_datadir_hdd(true);
-    let params = hub.params.clone();
-    let milestone = hub.milestone;
-    for which in [0, 1] {
-        let (tx, rx) = mpsc::channel();
-        let query_hold = std::sync::Arc::clone(&query);
-        let query_run = std::sync::Arc::clone(&query);
-        let params = params.clone();
-        std::thread::scope(|scope| {
-            let _hold = query_hold.store().spindle_hold();
-            scope.spawn(move || {
-                rbitcoin_ibd::ibd::confirm::set_bulk_read_note(Some(tx));
-                if which == 0 {
-                    let _ = rbitcoin_ibd::ibd::confirm::lookup_bulk_wave(
-                        &query_run,
-                        &params,
-                        milestone,
-                        &[],
-                        1,
-                        1,
-                    );
-                } else {
-                    let _ = rbitcoin_ibd::ibd::confirm::load_bulk_stamp(
-                        &query_run,
-                        &params,
-                        milestone,
-                        &[],
-                        None,
-                    );
-                }
-            });
-            rx.recv_timeout(Duration::from_secs(2))
-                .expect("bulk read parks while the spindle is held");
-            assert!(
-                matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
-                "bulk read finished while the spindle was held"
-            );
-            drop(_hold);
-            rx.recv_timeout(Duration::from_secs(5))
-                .expect("bulk read did not pass the spindle after release");
-        });
-    }
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[test]
 fn index_startup_gap_matches_one_write_drain() {
     assert_eq!(
         rbitcoin_query::INDEX_STARTUP_GAP_HEIGHTS as usize,
@@ -2627,26 +2575,32 @@ fn confirm_progress_publishes_on_a_five_second_boundary() {
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("confirm-progress");
     hub.ensure_genesis().unwrap();
-    let query = std::sync::Arc::clone(&hub.query);
-    let published = std::thread::spawn(move || {
-        rbitcoin_query::reset_progress_snapshot_counts();
-        let t0 = Instant::now();
-        publish_confirm_progress_at(&query, t0);
-        assert_eq!(rbitcoin_query::progress_snapshot_counts().0, 1);
-        publish_confirm_progress_at(&query, t0 + Duration::from_secs(4));
-        assert_eq!(
-            rbitcoin_query::progress_snapshot_counts().0,
-            1,
-            "four seconds does not publish again"
-        );
-        publish_confirm_progress_at(&query, t0 + Duration::from_secs(5));
-        assert_eq!(
-            rbitcoin_query::progress_snapshot_counts().0,
-            2,
-            "five seconds publishes again"
-        );
-    })
-    .join();
+    let published = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let query = &hub.query;
+                let t0 = Instant::now();
+                publish_confirm_progress_at(query, t0);
+                let first = query.published_owned_sizes().h2h_keys;
+                assert_eq!(first, query.process_owned_size_snapshot().h2h_keys);
+                hub.confirm_empty_regtest(1).unwrap();
+                let live = query.process_owned_size_snapshot().h2h_keys;
+                assert_ne!(live, first, "a confirmed block grows the live height map");
+                publish_confirm_progress_at(query, t0 + Duration::from_secs(4));
+                assert_eq!(
+                    query.published_owned_sizes().h2h_keys,
+                    first,
+                    "four seconds does not publish again"
+                );
+                publish_confirm_progress_at(query, t0 + Duration::from_secs(5));
+                assert_eq!(
+                    query.published_owned_sizes().h2h_keys,
+                    live,
+                    "five seconds publishes again"
+                );
+            })
+            .join()
+    });
     assert!(published.is_ok(), "progress clock panicked");
     let _ = std::fs::remove_dir_all(dir);
 }

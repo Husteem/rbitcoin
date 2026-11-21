@@ -607,12 +607,7 @@ fn ctrl_headers_are_applied_while_the_header_thread_has_room() {
     let (tx, rx) = mpsc::channel(1);
     st.header_cmd = Some(tx.clone());
     let shared = Arc::new(Mutex::new(st));
-    let join = spawn_header_thread(
-        Arc::clone(&shared),
-        Arc::clone(&hub),
-        rx,
-        rbitcoin_store::HeaderThreadProbe::new(),
-    );
+    let join = spawn_header_thread(Arc::clone(&shared), Arc::clone(&hub), rx);
     let gen = hub.tip_hash().unwrap();
     let hdr = mine(gen, 7);
     let hash = hdr.block_hash();

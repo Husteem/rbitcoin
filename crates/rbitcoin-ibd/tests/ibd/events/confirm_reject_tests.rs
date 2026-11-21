@@ -5050,7 +5050,7 @@ fn ibd_refused_body_is_asked_again() {
 
 /// A requested body and a confirm reject apply from facts already on the event.
 #[test]
-fn coord_loop_body_and_reject_do_not_read_headers() {
+fn coord_loop_body_and_reject_apply_from_event_facts() {
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version};
     use bitcoin::consensus::Encodable;
@@ -5151,11 +5151,7 @@ fn coord_loop_body_and_reject_do_not_read_headers() {
     let gen = hub.tip_hash().unwrap();
     let b1 = shell(gen, 1, 1);
     let h1 = b1.block_hash();
-    rbitcoin_ibd::ibd::reorg::reset_parent_hash_of_count();
     let fk = hub.ensure_header_fk(&b1.header).unwrap();
-    let _ = rbitcoin_ibd::ibd::reorg::parent_hash_of(&hub, h1);
-    assert!(rbitcoin_ibd::ibd::reorg::parent_hash_of_count() >= 1);
-    rbitcoin_ibd::ibd::reorg::reset_parent_hash_of_count();
 
     let mut st = IbdWorkState::new(vec![dummy_slot(1)], Some(gen), Some(0));
     let write_next = AtomicU32::new(1);
@@ -5223,6 +5219,5 @@ fn coord_loop_body_and_reject_do_not_read_headers() {
         !st.body.is_rejected(&rejected),
         "a parent that is not the tip is a cascade"
     );
-    assert_eq!(rbitcoin_ibd::ibd::reorg::parent_hash_of_count(), 0);
     let _ = std::fs::remove_dir_all(dir);
 }

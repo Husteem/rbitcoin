@@ -3519,30 +3519,6 @@ pub fn take_unproven_lead(
     out
 }
 
-#[cfg(debug_assertions)]
-thread_local! {
-    static BULK_READ_NOTE: std::cell::Cell<Option<std::sync::mpsc::Sender<()>>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// The calling thread's bulk-read signal. Other confirm tests share this process.
-#[cfg(debug_assertions)]
-pub fn set_bulk_read_note(tx: Option<std::sync::mpsc::Sender<()>>) {
-    BULK_READ_NOTE.with(|slot| slot.set(tx));
-}
-
-#[doc(hidden)]
-pub fn note_confirm_bulk_read() {
-    #[cfg(debug_assertions)]
-    BULK_READ_NOTE.with(|slot| {
-        let tx = slot.take();
-        if let Some(ref tx) = tx {
-            let _ = tx.send(());
-        }
-        slot.set(tx);
-    });
-}
-
 /// The write batch's error carries the batch so the caller can offer it back.
 #[allow(clippy::result_large_err)]
 fn write_batch_trusted(
@@ -3557,15 +3533,8 @@ fn write_batch_trusted(
     })
 }
 
-/// Park note, then the read note. The park note runs under the spindle lock,
-/// so the holder cannot drop until this thread is waiting.
-fn wait_bulk_spindle(query: &rbitcoin_query::Query) {
-    query.store().spindle_wait_with(note_confirm_bulk_read);
-    note_confirm_bulk_read();
-}
-
 /// One lookup batch: wait out a rotating-media write burst, then identity / `create.loc`.
-pub fn lookup_bulk_wave(
+fn lookup_bulk_wave(
     query: &rbitcoin_query::Query,
     params: &rbitcoin_consensus::ChainParams,
     milestone: rbitcoin_consensus::Milestone,
@@ -3573,14 +3542,14 @@ pub fn lookup_bulk_wave(
     max_blocks: usize,
     max_inputs: u32,
 ) -> Result<rbitcoin_query::BqResolveWave, rbitcoin_query::ConfirmError> {
-    wait_bulk_spindle(query);
+    query.store().spindle_wait();
     rbitcoin_query::confirm_bq_resolve_wave_capped(
         query, params, milestone, heights, max_blocks, max_inputs,
     )
 }
 
 /// One load batch: wait out a rotating-media write burst, then pin / stamp IO.
-pub fn load_bulk_stamp(
+fn load_bulk_stamp(
     query: &rbitcoin_query::Query,
     params: &rbitcoin_consensus::ChainParams,
     milestone: rbitcoin_consensus::Milestone,
@@ -3592,6 +3561,6 @@ pub fn load_bulk_stamp(
             load_bulk_stamp(query, params, milestone, blocks, pipeline)
         });
     }
-    wait_bulk_spindle(query);
+    query.store().spindle_wait();
     rbitcoin_query::confirm_wire_lookup_stamp(query, params, milestone, blocks, pipeline)
 }

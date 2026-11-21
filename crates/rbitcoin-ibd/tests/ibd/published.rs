@@ -6,7 +6,6 @@
 
 use rbitcoin_ibd::ibd::published::IBD_HEADER_THREAD_NAME;
 use rbitcoin_ibd::ibd::{spawn_header_thread, IbdWorkState};
-use rbitcoin_store::HeaderThreadProbe;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,12 +16,7 @@ fn header_thread_comm_is_ibd_header() {
     let hub = Arc::new(hub);
     let state = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
     let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let join = spawn_header_thread(
-        Arc::new(Mutex::new(state)),
-        hub,
-        rx,
-        HeaderThreadProbe::new(),
-    );
+    let join = spawn_header_thread(Arc::new(Mutex::new(state)), hub, rx);
     assert_eq!(IBD_HEADER_THREAD_NAME, "ibd-header");
     let deadline = Instant::now() + Duration::from_secs(1);
     let mut comms = linux_task_comms();

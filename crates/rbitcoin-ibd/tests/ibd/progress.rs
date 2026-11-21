@@ -356,19 +356,27 @@ fn progress_tick_reads_published_counters() {
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
     hub.query.publish_confirmed_tip(0, gen.to_byte_array());
-    rbitcoin_query::reset_progress_snapshot_counts();
     hub.query.publish_progress_snapshots();
-    let (sh_calls, owned_calls) = rbitcoin_query::progress_snapshot_counts();
-    assert!(sh_calls >= 1 && owned_calls >= 1);
     let sh = hub.query.published_scripthash_run_count();
     let h2h = hub.query.published_owned_sizes().h2h_keys;
-    rbitcoin_query::reset_progress_snapshot_counts();
     let view = rbitcoin_ibd::ibd::progress::read_progress_published(&hub.query);
     assert_eq!(view.tip, Some(0));
     assert_eq!(view.txs, hub.query.tx_body_count());
     assert_eq!(view.sh_runs, sh);
     assert_eq!(view.owned.h2h_keys, h2h);
-    assert_eq!(rbitcoin_query::progress_snapshot_counts(), (0, 0));
+    hub.confirm_empty_regtest(1).unwrap();
+    assert_ne!(
+        hub.query.process_owned_size_snapshot().h2h_keys,
+        h2h,
+        "a confirmed block grows the live height map"
+    );
+    assert_eq!(
+        rbitcoin_ibd::ibd::progress::read_progress_published(&hub.query)
+            .owned
+            .h2h_keys,
+        h2h,
+        "the tick reads the published sizes, not the live map"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

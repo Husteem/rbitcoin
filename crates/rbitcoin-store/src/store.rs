@@ -1104,22 +1104,10 @@ impl Store {
     /// Wait until the write thread drops [`Self::spindle_hold`]. No-op when the flag is off.
     /// The write thread must not call this.
     pub fn spindle_wait(&self) {
-        self.spindle_wait_with(|| {});
-    }
-
-    /// [`Self::spindle_wait`], and `on_park` runs once under the spindle lock
-    /// after this thread has seen the hold and before it waits. The holder
-    /// cannot drop until the wait releases that lock. `on_park` must not
-    /// call [`Self::spindle_hold`] or [`Self::spindle_wait`].
-    pub fn spindle_wait_with(&self, on_park: impl FnOnce()) {
         if !self.datadir_hdd() {
             return;
         }
         let mut held = self.spindle.held.lock().unwrap_or_else(|p| p.into_inner());
-        if !*held {
-            return;
-        }
-        on_park();
         while *held {
             held = self
                 .spindle
