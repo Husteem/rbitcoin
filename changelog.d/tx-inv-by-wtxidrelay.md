@@ -15,3 +15,7 @@ Fixed
 - **A `wtxidrelay` from a peer below protocol 70016 is ignored,** as Core
   does. We send our own only from that version up, so such a peer still
   hears of a transaction by txid (#1700).
+- **A transaction announced by txid that confirms in the tip block before
+  the peer's `getdata` is still served,** from that block, as one announced
+  by wtxid already was. `MSG_TX` gets it without the witness,
+  `MSG_WITNESS_TX` with it (#1700).

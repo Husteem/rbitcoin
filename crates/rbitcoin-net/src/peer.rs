@@ -5686,7 +5686,7 @@ pub fn serve_mempool_getdata(
     let Some(mp) = hub.mempool() else {
         return Ok(false);
     };
-    let Some(mut tx) = tx else {
+    let Some(tx) = tx else {
         return Ok(false);
     };
     let txid = tx.compute_txid();
@@ -5695,11 +5695,7 @@ pub fn serve_mempool_getdata(
     let last_inv = session.map(|s| s.last_inv_sequence()).unwrap_or(1);
     if announced || mp.is_relay_servable(&wtxid, last_inv) {
         mp.mark_broadcast(&txid);
-        // Core: only `MSG_WITNESS_TX` and `MSG_WTX` carry the witness.
-        if matches!(item, Inventory::Transaction(_)) {
-            tx.input.iter_mut().for_each(|i| i.witness.clear());
-        }
-        queue_accounted(session, out_tx, NetworkMessage::Tx(tx))?;
+        queue_accounted(session, out_tx, NetworkMessage::Tx(getdata_tx(item, tx)))?;
         return Ok(true);
     }
     Ok(false)
@@ -6706,9 +6702,9 @@ pub async fn serve_getdata_tail(
             }
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                 let tx = hub.mempool().and_then(|mp| mp.try_get_tx(txid));
-                if !serve_mempool_getdata(hub, out_tx, session, &item, tx)?
-                    && hub.mempool().is_some()
-                {
+                let served = serve_mempool_getdata(hub, out_tx, session, &item, tx)?
+                    || serve_announced_tip_tx(hub, out_tx, session, &item).await?;
+                if !served && hub.mempool().is_some() {
                     notfound.push(item);
                 }
             }
@@ -6892,34 +6888,57 @@ pub async fn serve_getdata_wtx(
         rbitcoin_log::trace!(Txrelay, "{}", received_getdata_wtx_log(wtxid, s.id));
     }
     let tx = hub.mempool().and_then(|mp| mp.try_get_tx_by_wtxid(wtxid));
-    if serve_mempool_getdata(hub, out_tx, session, &item, tx)? {
+    if serve_mempool_getdata(hub, out_tx, session, &item, tx)?
+        || serve_announced_tip_tx(hub, out_tx, session, &item).await?
+    {
         return Ok(());
-    }
-    let announced = session.is_some_and(|s| s.has_announced(&item));
-    if announced {
-        if let Some(hash) = hub.tip_hash() {
-            if let Some(tx) = tx_from_tip_index(hub, hash, wtxid).await? {
-                queue_accounted(session, out_tx, NetworkMessage::Tx(tx))?;
-                return Ok(());
-            }
-        }
     }
     notfound.push(item);
     Ok(())
 }
 
-/// One tip index for every announced wtxid in this message. A warm index
+/// Core `FindTxForGetData`: a tx announced to this peer that left the pool
+/// for the tip block is served from that block, by txid or wtxid as it was
+/// announced. `true` = queued.
+async fn serve_announced_tip_tx(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    session: Option<&crate::peers::LivePeer>,
+    item: &Inventory,
+) -> Result<bool, NetError> {
+    if !session.is_some_and(|s| s.has_announced(item)) {
+        return Ok(false);
+    }
+    let Some(hash) = hub.tip_hash() else {
+        return Ok(false);
+    };
+    let Some(tx) = tx_from_tip_index(hub, hash, item).await? else {
+        return Ok(false);
+    };
+    queue_accounted(session, out_tx, NetworkMessage::Tx(getdata_tx(item, tx)))?;
+    Ok(true)
+}
+
+/// Core: only `MSG_WITNESS_TX` and `MSG_WTX` carry the witness.
+fn getdata_tx(item: &Inventory, mut tx: Transaction) -> Transaction {
+    if matches!(item, Inventory::Transaction(_)) {
+        tx.input.iter_mut().for_each(|i| i.witness.clear());
+    }
+    tx
+}
+
+/// One tip index for every announced tx in this message. A warm index
 /// does not take a reconstruct permit and does not read the body again.
 async fn tx_from_tip_index(
     hub: &ChainHub,
     hash: BlockHash,
-    wtxid: &bitcoin::Wtxid,
+    item: &Inventory,
 ) -> Result<Option<Transaction>, NetError> {
-    if let Some(found) = hub.cached_tip_wtx(&hash, wtxid) {
+    if let Some(found) = hub.cached_tip_wtx(&hash, item) {
         return Ok(found);
     }
     let permit = block_reconstruct_permit().await?;
-    if let Some(found) = hub.cached_tip_wtx(&hash, wtxid) {
+    if let Some(found) = hub.cached_tip_wtx(&hash, item) {
         return Ok(found);
     }
     let cache = Arc::clone(&hub.cache);
@@ -6938,7 +6957,7 @@ async fn tx_from_tip_index(
     };
     #[cfg(debug_assertions)]
     hub.note_tip_wtx_scan();
-    let tx = index.tx(wtxid);
+    let tx = index.tx(item);
     hub.install_tip_wtx(Arc::new(index));
     Ok(tx)
 }

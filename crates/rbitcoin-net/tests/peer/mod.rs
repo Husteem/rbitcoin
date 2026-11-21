@@ -9280,6 +9280,92 @@ fn announced_wtxid_getdata_scans_the_tip_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A peer without `wtxidrelay` heard of a tx by txid. When the tx confirms in
+/// the tip before its getdata, the tip block still serves it, as Core's
+/// `FindTxForGetData`: `MSG_TX` without the witness, `MSG_WITNESS_TX` with.
+#[test]
+fn announced_txid_getdata_serves_the_tip_tx() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("tip-txid-serve");
+    hub.ensure_genesis().unwrap();
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    assert!(hub.attach_mempool(mp).is_ok());
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let p2wsh = ScriptBuf::new_p2wsh(&op_true.wscript_hash());
+    hub.generate_to_script(1, p2wsh.clone(), vec![]).unwrap();
+    hub.confirm_empty_regtest(100).unwrap();
+    let cb = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap()
+        .txdata[0]
+        .clone();
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cb.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::from_slice(&[op_true.as_bytes()]),
+        }],
+        output: vec![TxOut {
+            value: cb.output[0].value - Amount::from_sat(10_000),
+            script_pubkey: p2wsh,
+        }],
+    };
+    let (txid, wtxid) = (spend.compute_txid(), spend.compute_wtxid());
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let session = live_peer(&peers, 18573, 93, false);
+    assert_eq!(
+        session.claim_announced_tx(txid, wtxid),
+        Some(Inventory::Transaction(txid)),
+        "a peer without wtxidrelay is announced the txid"
+    );
+    hub.generate_to_script(1, op_true, vec![spend.clone()])
+        .unwrap();
+    let _ = hub.take_tip_wtx_scans();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(serve_getdata(
+        &hub,
+        &out_tx,
+        &mut PeerFollowState::new(),
+        Some(session.as_ref()),
+        vec![
+            Inventory::Transaction(txid),
+            Inventory::WitnessTransaction(txid),
+        ],
+    ))
+    .expect("getdata");
+    let mut served = Vec::new();
+    while let Ok(msg) = out_rx.try_recv() {
+        served.push(PeerOut::expect_msg(msg));
+    }
+    let mut bare = spend.clone();
+    bare.input[0].witness.clear();
+    assert_eq!(
+        served,
+        vec![NetworkMessage::Tx(bare), NetworkMessage::Tx(spend)],
+        "MSG_TX serves the tip tx without its witness, MSG_WITNESS_TX with it"
+    );
+    assert_eq!(
+        hub.take_tip_wtx_scans(),
+        1,
+        "both items share one tip index"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A stored side block a month behind the best header is not reconstructed
 /// for a full-block getdata, a compact getdata, or getblocktxn. The tip still is.
 #[test]
