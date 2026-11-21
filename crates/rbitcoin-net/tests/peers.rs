@@ -493,6 +493,51 @@ fn pin_noban_headers_timeout_keep(via_cidr: bool) {
     );
 }
 
+/// The noban headers timeout and the session's own `end_headers_sync` can
+/// both see one started sync. Holding the CIDR table parks the timeout in
+/// its noban check, after it saw the sync started. The session ends the sync
+/// in that gap. The slot is released once, so a new sync can start.
+#[test]
+fn noban_headers_timeout_and_end_release_the_slot_once() {
+    let hub = PeerHub::new();
+    let mut t = rbitcoin_net::NetPermTable::default();
+    t.whitelist
+        .push(rbitcoin_net::parse_whitelist("noban@127.0.0.1").unwrap());
+    hub.set_net_perms(t);
+    let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+    let inbound = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+    let _outbound = hub.register(
+        b,
+        b,
+        &ver("/rbitcoin:0.1.0/"),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let now = 1_700_000_000u64;
+    let best = 1_231_006_505u64;
+    assert!(hub.try_start_headers_sync(&inbound, now, best));
+    assert_eq!(hub.headers_sync_peers.load(Ordering::Relaxed), 1);
+    let deadline = rbitcoin_net::chain::headers_download_timeout_secs(now, best);
+    std::thread::scope(|s| {
+        let perms = hub.net_perms.lock().unwrap();
+        let timeout = s.spawn(|| hub.check_headers_sync_timeouts(deadline + 1));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        hub.end_headers_sync(&inbound);
+        drop(perms);
+        timeout.join().unwrap();
+    });
+    assert_eq!(
+        hub.headers_sync_peers.load(Ordering::Relaxed),
+        0,
+        "one started sync must release its slot once"
+    );
+    assert!(
+        hub.try_start_headers_sync(&inbound, deadline + 1, best),
+        "the released slot must let a new headers sync start"
+    );
+}
+
 #[test]
 fn snapshot_permissions_are_cidr_table_not_hub_noban() {
     let hub = PeerHub::new();
