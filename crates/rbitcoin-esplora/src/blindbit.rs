@@ -25,9 +25,12 @@ use rbitcoin_store::StoreError;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
+#[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+#[cfg(debug_assertions)]
+use tokio::sync::Notify;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Mount point of the v1 surface on the Esplora listener.
 pub const BLINDBIT_V1_PREFIX: &str = "/blindbit/v1";
@@ -54,24 +57,30 @@ pub struct BlindbitPermit(#[allow(dead_code)] Arc<ReleasedPermit>);
 
 struct ReleasedPermit {
     _permit: OwnedSemaphorePermit,
-    held: Arc<AtomicUsize>,
-    wake: Arc<Notify>,
+    /// Debug builds count `held` down when the permit drops.
+    #[cfg(debug_assertions)]
+    limit: Arc<BlindbitLimit>,
 }
 
+#[cfg(debug_assertions)]
 impl Drop for ReleasedPermit {
     fn drop(&mut self) {
-        self.held.fetch_sub(1, Ordering::SeqCst);
-        self.wake.notify_waiters();
+        self.limit.held.fetch_sub(1, Ordering::SeqCst);
+        self.limit.wake.notify_waiters();
     }
 }
 
-/// Shared `/blindbit/v1/` limit. `waiting` is requests that found it full.
+/// Shared `/blindbit/v1/` limit. Debug builds also count requests for tests:
+/// `waiting` is requests that found it full.
 #[doc(hidden)]
 pub struct BlindbitLimit {
     sem: Arc<Semaphore>,
-    waiting: Arc<AtomicUsize>,
-    held: Arc<AtomicUsize>,
-    wake: Arc<Notify>,
+    #[cfg(debug_assertions)]
+    waiting: AtomicUsize,
+    #[cfg(debug_assertions)]
+    held: AtomicUsize,
+    #[cfg(debug_assertions)]
+    wake: Notify,
 }
 
 impl BlindbitLimit {
@@ -79,12 +88,18 @@ impl BlindbitLimit {
     pub fn new(max: usize) -> Arc<Self> {
         Arc::new(Self {
             sem: Arc::new(Semaphore::new(max.max(1))),
-            waiting: Arc::new(AtomicUsize::new(0)),
-            held: Arc::new(AtomicUsize::new(0)),
-            wake: Arc::new(Notify::new()),
+            #[cfg(debug_assertions)]
+            waiting: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            held: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            wake: Notify::new(),
         })
     }
+}
 
+#[cfg(debug_assertions)]
+impl BlindbitLimit {
     #[doc(hidden)]
     pub fn waiting(&self) -> usize {
         self.waiting.load(Ordering::SeqCst)
@@ -108,7 +123,9 @@ pub async fn blindbit_permit_mw(
     mut req: Request,
     next: Next,
 ) -> Response {
+    #[cfg(debug_assertions)]
     struct Waiting(Arc<BlindbitLimit>);
+    #[cfg(debug_assertions)]
     impl Drop for Waiting {
         fn drop(&mut self) {
             self.0.waiting.fetch_sub(1, Ordering::SeqCst);
@@ -118,8 +135,11 @@ pub async fn blindbit_permit_mw(
     let permit = match limit.sem.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
+            #[cfg(debug_assertions)]
             limit.waiting.fetch_add(1, Ordering::SeqCst);
+            #[cfg(debug_assertions)]
             limit.wake.notify_waiters();
+            #[cfg(debug_assertions)]
             let _waiting = Waiting(Arc::clone(&limit));
             let Ok(permit) = limit.sem.clone().acquire_owned().await else {
                 return error(StatusCode::SERVICE_UNAVAILABLE, "shutting down");
@@ -127,13 +147,16 @@ pub async fn blindbit_permit_mw(
             permit
         }
     };
-    limit.held.fetch_add(1, Ordering::SeqCst);
-    limit.wake.notify_waiters();
+    #[cfg(debug_assertions)]
+    {
+        limit.held.fetch_add(1, Ordering::SeqCst);
+        limit.wake.notify_waiters();
+    }
     req.extensions_mut()
         .insert(BlindbitPermit(Arc::new(ReleasedPermit {
             _permit: permit,
-            held: Arc::clone(&limit.held),
-            wake: Arc::clone(&limit.wake),
+            #[cfg(debug_assertions)]
+            limit,
         })));
     next.run(req).await
 }

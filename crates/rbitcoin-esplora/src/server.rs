@@ -29,7 +29,9 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, Semaphore};
@@ -548,13 +550,18 @@ impl EsploraStop {
     }
 }
 
-/// Listener admission. `waiting` counts requests that found the limit full.
+/// Listener admission. Debug builds also count requests for tests:
+/// `waiting` is requests that found the limit full.
 #[doc(hidden)]
 pub struct AdmitGate {
     sem: Arc<Semaphore>,
+    #[cfg(debug_assertions)]
     arrived: AtomicUsize,
+    #[cfg(debug_assertions)]
     waiting: AtomicUsize,
+    #[cfg(debug_assertions)]
     holding: AtomicUsize,
+    #[cfg(debug_assertions)]
     wake: Notify,
 }
 
@@ -562,13 +569,20 @@ impl AdmitGate {
     fn new(max: usize) -> Arc<Self> {
         Arc::new(Self {
             sem: Arc::new(Semaphore::new(max.max(1))),
+            #[cfg(debug_assertions)]
             arrived: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
             waiting: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
             holding: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
             wake: Notify::new(),
         })
     }
+}
 
+#[cfg(debug_assertions)]
+impl AdmitGate {
     #[doc(hidden)]
     pub fn arrived(&self) -> usize {
         self.arrived.load(Ordering::SeqCst)
@@ -595,20 +609,28 @@ async fn admit_connection(
     req: Request,
     next: Next,
 ) -> Response {
+    #[cfg(debug_assertions)]
     struct Waiting(Arc<AdmitGate>);
+    #[cfg(debug_assertions)]
     impl Drop for Waiting {
         fn drop(&mut self) {
             self.0.waiting.fetch_sub(1, Ordering::SeqCst);
             self.0.wake.notify_waiters();
         }
     }
-    gate.arrived.fetch_add(1, Ordering::SeqCst);
-    gate.wake.notify_waiters();
+    #[cfg(debug_assertions)]
+    {
+        gate.arrived.fetch_add(1, Ordering::SeqCst);
+        gate.wake.notify_waiters();
+    }
     let permit = match gate.sem.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
+            #[cfg(debug_assertions)]
             gate.waiting.fetch_add(1, Ordering::SeqCst);
+            #[cfg(debug_assertions)]
             gate.wake.notify_waiters();
+            #[cfg(debug_assertions)]
             let _waiting = Waiting(Arc::clone(&gate));
             let Ok(permit) = gate.sem.clone().acquire_owned().await else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -616,17 +638,22 @@ async fn admit_connection(
             permit
         }
     };
-    gate.holding.fetch_add(1, Ordering::SeqCst);
-    gate.wake.notify_waiters();
     let _permit = permit;
+    #[cfg(debug_assertions)]
     struct Hold(Arc<AdmitGate>);
+    #[cfg(debug_assertions)]
     impl Drop for Hold {
         fn drop(&mut self) {
             self.0.holding.fetch_sub(1, Ordering::SeqCst);
             self.0.wake.notify_waiters();
         }
     }
-    let _hold = Hold(Arc::clone(&gate));
+    #[cfg(debug_assertions)]
+    let _hold = {
+        gate.holding.fetch_add(1, Ordering::SeqCst);
+        gate.wake.notify_waiters();
+        Hold(Arc::clone(&gate))
+    };
     next.run(req).await
 }
 
@@ -680,16 +707,20 @@ pub const JOIN_BULK_CAP: usize = 16 * 1024 * 1024;
 pub struct InflightJoin {
     /// `None` = still running. `Some(slot)` = finished (`slot` may be empty).
     pub done: Mutex<Option<Option<Arc<ShJoinSlot>>>>,
-    pub cv: std::sync::Condvar,
+    pub cv: Condvar,
     /// Start order of the leader. Waiters publish this stamp.
     pub seq: u64,
-    /// Set under this mutex before a waiter sleeps. The wait, not the join result.
+    /// Set under this mutex before a waiter sleeps. The wait, not the join
+    /// result. Debug builds only.
+    #[cfg(debug_assertions)]
     pub queued: Mutex<bool>,
+    #[cfg(debug_assertions)]
     pub queued_cv: Condvar,
 }
 
 impl InflightJoin {
     /// `true` once a waiter has observed an unfinished leader and is in `cv.wait`.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn wait_queued(&self, timeout: std::time::Duration) -> bool {
         let g = self.queued.lock().unwrap_or_else(|p| p.into_inner());
@@ -925,9 +956,11 @@ impl AppState {
                 let seq = take_join_seq(c);
                 let inf = Arc::new(InflightJoin {
                     done: Mutex::new(None),
-                    cv: std::sync::Condvar::new(),
+                    cv: Condvar::new(),
                     seq,
+                    #[cfg(debug_assertions)]
                     queued: Mutex::new(false),
+                    #[cfg(debug_assertions)]
                     queued_cv: Condvar::new(),
                 });
                 c.inflight.insert(*sh, Arc::clone(&inf));
@@ -938,6 +971,7 @@ impl AppState {
             Err((inf, seq)) => {
                 let mut d = inf.done.lock().unwrap_or_else(|p| p.into_inner());
                 while d.is_none() {
+                    #[cfg(debug_assertions)]
                     {
                         let mut queued = inf.queued.lock().unwrap_or_else(|p| p.into_inner());
                         *queued = true;
