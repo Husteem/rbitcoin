@@ -794,6 +794,20 @@ async fn internal_history_lifts_the_cap(
     let rows = history_rows(&body);
     let totals: Value = serde_json::from_str(&totals).unwrap();
     assert_eq!(totals["chain_stats"]["tx_count"], rows.len(), "{rows:?}");
+    let digest = rbitcoin_primitives::hex_encode(rbitcoin_store::script_hash(p2wsh.as_bytes()));
+    let reversed = rbitcoin_primitives::scripthash_display_hex(p2wsh.as_bytes());
+    assert_ne!(digest, reversed);
+    let by_digest = format!("/internal/scripthash/{digest}/history{pin}");
+    let (st, body) = http_get_unix(sock, &by_digest).await;
+    assert_eq!(st, 200, "{by_digest}: {body}");
+    assert_eq!(history_rows(&body), rows, "digest order is this script");
+    let by_reversed = format!("/internal/scripthash/{reversed}/history{pin}");
+    let (st, body) = http_get_unix(sock, &by_reversed).await;
+    assert_eq!(
+        (st, body.as_str()),
+        (200, "[]"),
+        "Electrum order is a different key"
+    );
     let (st, body) = http_get_tcp(tcp, &listed).await;
     assert_eq!(
         (st, body.as_str()),
