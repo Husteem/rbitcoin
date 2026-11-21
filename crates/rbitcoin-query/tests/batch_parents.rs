@@ -764,3 +764,28 @@ fn spent_range_does_not_republish_the_layout() {
     assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(1008));
     assert!(bp.get_spender_abs(Fk(1), 2).is_none());
 }
+
+/// A later batch's pin for the same create brings its spent range along when
+/// the write batch absorbs it, so the kept pin needs no loc read for it.
+#[test]
+fn extend_from_carries_the_spent_range() {
+    let pin = |bp: &mut BatchParents| {
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            Some(false),
+            Some((100, 50)),
+            vec![(0, SPENDER_REL_UNKNOWN)],
+        );
+    };
+    let mut kept = BatchParents::new();
+    pin(&mut kept);
+    let mut later = BatchParents::new();
+    pin(&mut later);
+    later.set_spent_range_only(Fk(1), (2000, 8));
+    kept.extend_from(later);
+    assert!(kept.has_abs_layout(Fk(1)));
+    assert_eq!(kept.get_spender_abs(Fk(1), 0), Some(2000));
+}

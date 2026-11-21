@@ -450,6 +450,13 @@ impl SharedParentPin {
         }
     }
 
+    /// Set the spent range once. It is fixed at the create's append, so a
+    /// later set must carry the same range.
+    pub fn set_spent(&self, range: (u64, u64)) {
+        let held = *self.spent.get_or_init(|| range);
+        debug_assert_eq!(held, range, "a create's spent range moved");
+    }
+
     #[inline]
     #[doc(hidden)]
     pub fn load_outs(&self) -> Arc<PinOuts> {
@@ -1059,7 +1066,7 @@ impl BatchParents {
             return;
         };
         if let Some(e) = self.pins.get(&id) {
-            let _ = e.spent.set(spent_range);
+            e.set_spent(spent_range);
         }
     }
 
@@ -1108,6 +1115,9 @@ impl BatchParents {
                         let src_lay = src.load_layout();
                         o.get().absorb_outs(src_outs.as_ref());
                         o.get().set_coinbase_if_known(src.coinbase_opt());
+                        if let Some(range) = src.spent.get() {
+                            o.get().set_spent(*range);
+                        }
                         o.get()
                             .maybe_merge_layout(src_lay.body_range, &src_lay.spender_rels);
                     }
