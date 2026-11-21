@@ -82,7 +82,7 @@ fn dummy_slot(id: usize, a: SocketAddr, alive: bool) -> PeerSlot {
         addr: a,
         net: rbitcoin_net::NetAddr::from_socket(a),
         cmd_tx,
-        in_flight: HashSet::new(),
+        in_flight: Default::default(),
         requested: solicit_track().0,
         headers_asks: Default::default(),
         solicited_bytes: solicit_track().1,

@@ -836,7 +836,6 @@ fn apply_peer_event_body_and_control_surface() {
     use rbitcoin_ibd::ibd::state::InflightReq;
     use rbitcoin_net::seeds::AddrMan;
 
-    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
@@ -857,7 +856,7 @@ fn apply_peer_event_body_and_control_surface() {
             addr: a,
             net: rbitcoin_net::NetAddr::from_socket(a),
             cmd_tx,
-            in_flight: HashSet::new(),
+            in_flight: Default::default(),
             requested: rbitcoin_ibd::ibd::peer_io::solicit_track().0,
             headers_asks: Default::default(),
             solicited_bytes: rbitcoin_ibd::ibd::peer_io::solicit_track().1,
@@ -1260,7 +1259,6 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     use rbitcoin_ibd::ibd::peer_io::{PeerEvent, PeerSlot};
     use rbitcoin_net::seeds::AddrMan;
 
-    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
@@ -1281,7 +1279,7 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
                 18444,
             )),
             cmd_tx,
-            in_flight: HashSet::new(),
+            in_flight: Default::default(),
             requested: rbitcoin_ibd::ibd::peer_io::solicit_track().0,
             headers_asks: Default::default(),
             solicited_bytes: rbitcoin_ibd::ibd::peer_io::solicit_track().1,
@@ -5081,7 +5079,7 @@ fn coord_loop_body_and_reject_apply_from_event_facts() {
                 18444,
             )),
             cmd_tx,
-            in_flight: std::collections::HashSet::new(),
+            in_flight: Default::default(),
             requested: rbitcoin_ibd::ibd::peer_io::solicit_track().0,
             headers_asks: Default::default(),
             solicited_bytes: rbitcoin_ibd::ibd::peer_io::solicit_track().1,

@@ -20,7 +20,7 @@ use rbitcoin_net::peer::{
 use rbitcoin_net::peer_dos::{PeerRateLimiter, RATE_LIMIT_BAN_SCORE};
 use rbitcoin_net::peers::PongSlot;
 use rbitcoin_net::v2::{read_v2_frame_with_progress, write_v2_msg_offload, V2Reader, V2Writer};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -114,10 +114,10 @@ pub struct PeerSlot {
     pub net: rbitcoin_net::NetAddr,
     pub cmd_tx: mpsc::UnboundedSender<PeerCmd>,
     /// Hashes currently requested from this peer.
-    pub in_flight: HashSet<BlockHash>,
+    pub in_flight: super::state::BlockHashSet,
     /// Same hashes, shared with the reader. One extra set per live peer so a
     /// block check does not take the IBD work state.
-    pub requested: Arc<Mutex<HashSet<BlockHash>>>,
+    pub requested: Arc<Mutex<super::state::BlockHashSet>>,
     /// `getheaders` asks the reader may exempt one `headers` reply for.
     pub headers_asks: Arc<HeaderAsks>,
     /// Bytes of blocks this peer was asked for. Stall-clock input.
@@ -148,7 +148,7 @@ pub struct PeerSlot {
     /// Getdata this peer was sent and has not answered, withdrawn from
     /// `in_flight` at the mono ms stored. It stays solicited on the reader
     /// for [`LATE_ANSWER_MS`].
-    pub late_answers: HashMap<BlockHash, u64>,
+    pub late_answers: super::state::BlockHashMap<u64>,
     pub alive: bool,
     pub task: JoinHandle<()>,
 }
@@ -164,12 +164,12 @@ pub const LATE_ANSWER_MS: u64 = 120_000;
 /// New counters at zero. `Default` builds the same triple.
 #[cfg_attr(false, mutants::skip)]
 pub fn solicit_track() -> (
-    Arc<Mutex<HashSet<BlockHash>>>,
+    Arc<Mutex<super::state::BlockHashSet>>,
     Arc<AtomicU64>,
     Arc<AtomicU64>,
 ) {
     (
-        Arc::new(Mutex::new(HashSet::new())),
+        Arc::new(Mutex::new(Default::default())),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
     )
@@ -453,7 +453,7 @@ impl PeerSlot {
     }
 
     #[doc(hidden)]
-    pub fn requested_set(&self) -> std::sync::MutexGuard<'_, HashSet<BlockHash>> {
+    pub fn requested_set(&self) -> std::sync::MutexGuard<'_, super::state::BlockHashSet> {
         self.requested.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -522,7 +522,7 @@ impl PeerSlot {
 /// `true` when `hash` was requested: record `len` and the read time.
 /// An absent hash leaves both counters unchanged.
 pub fn note_solicited_block(
-    requested: &Mutex<HashSet<BlockHash>>,
+    requested: &Mutex<super::state::BlockHashSet>,
     bytes: &AtomicU64,
     ms: &AtomicU64,
     hash: &BlockHash,
@@ -728,7 +728,7 @@ impl LightDecodes {
 #[doc(hidden)]
 pub fn note_open_block(
     open: &AtomicU64,
-    requested: &Mutex<HashSet<BlockHash>>,
+    requested: &Mutex<super::state::BlockHashSet>,
     contents_len: usize,
     buffered: usize,
 ) {
@@ -783,7 +783,7 @@ pub struct IbdReadCtx {
     pub net: rbitcoin_net::NetAddr,
     pub out_tx: mpsc::UnboundedSender<NetworkMessage>,
     pub sinks: PeerEventSinks,
-    pub requested: Arc<Mutex<HashSet<BlockHash>>>,
+    pub requested: Arc<Mutex<super::state::BlockHashSet>>,
     pub headers_asks: Arc<HeaderAsks>,
     pub solicited_bytes: Arc<AtomicU64>,
     pub solicited_ms: Arc<AtomicU64>,
@@ -1020,7 +1020,7 @@ pub async fn read_ibd_peer(
     out_tx: mpsc::UnboundedSender<NetworkMessage>,
     sinks_r: PeerEventSinks,
     bytes_io: Arc<AtomicU64>,
-    requested: Arc<Mutex<HashSet<BlockHash>>>,
+    requested: Arc<Mutex<super::state::BlockHashSet>>,
     headers_asks: Arc<HeaderAsks>,
     solicited_bytes: Arc<AtomicU64>,
     open_block_bytes: Arc<AtomicU64>,
@@ -1342,7 +1342,7 @@ pub async fn spawn_peer(
         addr: version_socket,
         net: addr,
         cmd_tx,
-        in_flight: HashSet::new(),
+        in_flight: Default::default(),
         requested,
         headers_asks,
         solicited_bytes,
@@ -1362,7 +1362,7 @@ pub async fn spawn_peer(
         chain: Default::default(),
         conn_type,
         block_download_paused_until: None,
-        late_answers: HashMap::new(),
+        late_answers: Default::default(),
         alive: true,
         task,
     })

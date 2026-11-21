@@ -136,7 +136,7 @@ pub(crate) fn dummy_slot(id: usize) -> PeerSlot {
             18444 + id as u16,
         )),
         cmd_tx,
-        in_flight: HashSet::new(),
+        in_flight: Default::default(),
         requested: solicit_track().0,
         headers_asks: Default::default(),
         solicited_bytes: solicit_track().1,

@@ -10,7 +10,6 @@ use rbitcoin_net::codec::FramedMessage;
 use rbitcoin_net::error::NetError;
 use rbitcoin_net::peer_dos::{PeerRateLimiter, RATE_LIMIT_BAN_SCORE};
 use rbitcoin_net::peers::PongSlot;
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -32,8 +31,8 @@ fn dummy_slot(id: usize) -> PeerSlot {
             18444,
         )),
         cmd_tx,
-        in_flight: HashSet::new(),
-        requested: Arc::new(Mutex::new(HashSet::new())),
+        in_flight: Default::default(),
+        requested: Arc::new(Mutex::new(Default::default())),
         headers_asks: Default::default(),
         solicited_bytes: Arc::new(AtomicU64::new(0)),
         solicited_ms: Arc::new(AtomicU64::new(0)),
@@ -256,13 +255,16 @@ fn track_retain_judges_each_hash_once() {
         "a withdrawn getdata is still owed an answer"
     );
     let requested = slot.requested.lock().unwrap().clone();
-    assert_eq!(requested, HashSet::from([keep_hash, drop_hash]));
+    assert_eq!(
+        requested,
+        rbitcoin_ibd::ibd::state::BlockHashSet::from_iter([keep_hash, drop_hash])
+    );
 }
 
 #[test]
 fn unsolicited_block_does_not_refresh_progress() {
     let hash = BlockHash::from_byte_array([7u8; 32]);
-    let requested = Mutex::new(HashSet::new());
+    let requested = Mutex::new(Default::default());
     let bytes = AtomicU64::new(0);
     let ms = AtomicU64::new(0);
     assert!(
@@ -345,7 +347,7 @@ fn block_progress_stamp_records_solicited_bytes() {
 #[test]
 fn open_block_bytes_count_a_frame_past_a_headers_message() {
     let hash = BlockHash::from_byte_array([9u8; 32]);
-    let requested = Mutex::new(HashSet::from([hash]));
+    let requested = Mutex::new(rbitcoin_ibd::ibd::state::BlockHashSet::from_iter([hash]));
     let open = AtomicU64::new(0);
     let step = rbitcoin_ibd::ibd::rate::PROGRESS_STEP as usize;
     let headers = rbitcoin_net::codec::MAX_HEADERS_CONTENTS;
@@ -625,7 +627,7 @@ fn test_ctx(
             body: body_tx,
             ctrl: ctrl_tx,
         },
-        requested: Arc::new(Mutex::new(HashSet::new())),
+        requested: Arc::new(Mutex::new(Default::default())),
         headers_asks: Default::default(),
         solicited_bytes: Arc::new(AtomicU64::new(0)),
         solicited_ms: Arc::new(AtomicU64::new(0)),
