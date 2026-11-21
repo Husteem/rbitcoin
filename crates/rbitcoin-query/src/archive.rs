@@ -664,6 +664,10 @@ impl ArchiveWritePlan {
     }
 
     /// Same-header create: assemble uses the wire `TxOut` (do not pin).
+    ///
+    /// `per_header` is one `(header, first tx fk, n)` row per block in
+    /// height order, so first fks ascend and a binary search finds the
+    /// spend's block.
     pub fn create_in_header_ranges(
         per_header: &[(Fk, Fk, u32)],
         spend: Fk,
@@ -672,16 +676,15 @@ impl ArchiveWritePlan {
         let Some(sid) = spend.get() else {
             return false;
         };
-        for &(_, first, n) in per_header {
-            let Some(start) = first.get() else {
-                continue;
-            };
-            let end = start.saturating_add(u64::from(n));
-            if sid >= start && sid < end {
-                return create_id >= start && create_id < end;
-            }
-        }
-        false
+        let after = per_header.partition_point(|&(_, first, _)| first.0 <= sid);
+        let Some(&(_, first, n)) = after.checked_sub(1).and_then(|i| per_header.get(i)) else {
+            return false;
+        };
+        let Some(start) = first.get() else {
+            return false;
+        };
+        let end = start.saturating_add(u64::from(n));
+        sid < end && create_id >= start && create_id < end
     }
 
     /// Ids in [`Self::planned_fks`]. One build per plan, then O(1) probes.
