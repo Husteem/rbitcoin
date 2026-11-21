@@ -969,6 +969,10 @@ impl ActiveMempool {
         ingested
             .graph
             .set_block_reserved_sigops(self.graph.block_reserved_sigops());
+        // A rollback puts a dead victim's mark back, then restores victims one
+        // at a time. A compact between two restores cannot see that DEAD slot,
+        // so keep the pending marks beside the ones rebuilt from LIVE rows.
+        ingested.trust_kept.extend(self.trust_kept.iter().copied());
         self.graph = ingested.graph;
         self.bodies = ingested.bodies;
         self.vin_aux = ingested.vin_aux;

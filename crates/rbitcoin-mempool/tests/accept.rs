@@ -2488,6 +2488,52 @@ fn sustained_slot_reuse_compacts_the_dead_body() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A package rollback re-inserts each replaced tx's trust mark after unlinking
+/// it, then re-accepts the victims one at a time. A compact between two
+/// re-accepts sees the still-dead victim only in the old set; its mark must
+/// survive or the warn-and-applied tx fails its restore.
+#[test]
+fn restored_victims_keep_their_trust_across_a_compaction() {
+    let dir = tmp_dir();
+    let tip = ChainTipCtx {
+        height: 100,
+        mtp: u32::MAX,
+    };
+    let (ops, utxos) = chain_coins(&[100_000, 100_000]);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let mut victims = Vec::new();
+    for op in ops {
+        let mut tx = spend_tx(op, 90_000);
+        tx.lock_time = LockTime::from_height(500).unwrap();
+        tx.input[0].sequence = Sequence::from_consensus(0xffff_fffe);
+        let txid = tx.compute_txid();
+        let wtxid = tx.compute_wtxid();
+        let slot = mp
+            .store
+            .append_live_tx(&tx, &txid, &wtxid, 10_000, tx.weight().to_wu(), 0, 1, &[])
+            .unwrap();
+        mp.store.mark_slot_dead(slot).unwrap();
+        mp.trust_kept.insert(txid);
+        victims.push(tx);
+    }
+    assert!(
+        mp.store.body_compaction_due().unwrap(),
+        "the rollback left dead payloads that the first restore reclaims"
+    );
+    let restored = mp.restore_victims(
+        &victims,
+        &HashMap::new(),
+        &utxos,
+        tip,
+        RestoreOrphans::Defer,
+    );
+    assert_eq!(restored.len(), 2, "both warn-and-applied victims restored");
+    for tx in &victims {
+        assert!(mp.graph.contains(&tx.compute_txid()));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Prepare/commit gap. A second `sendrawtransaction` takes `accept_tx`,
 /// not a `PreparedAdmit` another thread already committed. The hub hits
 /// this when the tx lands between prepare and commit.
