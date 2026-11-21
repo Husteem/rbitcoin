@@ -64,6 +64,15 @@ cleanup() {
       tail -n 40 "$log" >&2
     done
   fi
+  if [[ "$st" -ne 0 && -d "$WORKDIR/cjdns" ]]; then
+    echo "overlay-functional: cjdns logs" >&2
+    local log
+    for log in "$WORKDIR"/cjdns/a.log "$WORKDIR"/cjdns/b.log; do
+      [[ -f "$log" ]] || continue
+      echo "----- $log -----" >&2
+      tail -n 60 "$log" >&2
+    done
+  fi
   if [[ -d "$WORKDIR/tor" ]]; then
     find "$WORKDIR/tor" -name tor.pid -print0 2>/dev/null \
       | xargs -0 -r -I{} sh -c 'kill "$(cat "$1")" 2>/dev/null' _ {}
@@ -80,7 +89,13 @@ cleanup() {
   fi
   if [[ -d "$WORKDIR/cjdns" ]]; then
     for p in "$WORKDIR/cjdns/a.pid" "$WORKDIR/cjdns/b.pid"; do
-      [[ -f "$p" ]] && sudo kill "$(cat "$p")" 2>/dev/null
+      [[ -f "$p" ]] || continue
+      pid="$(cat "$p")"
+      # Only the session leader we recorded gets a group kill: a reused PID
+      # must not take out an unrelated group on the runner.
+      if tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'cjdns-run\.sh'; then
+        sudo kill -TERM -- "-$pid" 2>/dev/null
+      fi
     done
     sudo pkill -f "cjdroute core $WORKDIR/cjdns" 2>/dev/null || true
     sudo ip link del rbtc0 2>/dev/null
@@ -93,10 +108,15 @@ trap cleanup EXIT INT TERM
 
 echo "overlay-functional: workdir $WORKDIR" >&2
 
+# Build before the meshes. A broken build fails here in seconds instead of
+# after three minutes of daemons, and the TUN a journey binds is fresh: a
+# cjdroute crash during a long build would otherwise leave a dead address.
+cargo build -p rbitcoin-node
+
 python3 "$HERE/tornet.py" "$WORKDIR/tor"
 # shellcheck disable=SC1091
 source "$WORKDIR/tor/env"
-chmod +x "$HERE/i2pnet.sh" "$HERE/cjdns.sh"
+chmod +x "$HERE/i2pnet.sh" "$HERE/cjdns.sh" "$HERE/cjdns-run.sh"
 "$HERE/i2pnet.sh" "$WORKDIR/i2p"
 # shellcheck disable=SC1091
 source "$WORKDIR/i2p/env"
@@ -112,6 +132,5 @@ echo "overlay-functional: TOR_SOCKS=$OVERLAY_TOR_SOCKS TOR_CONTROL=$OVERLAY_TOR_
 echo "overlay-functional: I2P_SAM=$OVERLAY_I2P_SAM I2P_SAM_B=$OVERLAY_I2P_SAM_B" >&2
 echo "overlay-functional: CJDNS_A=$OVERLAY_CJDNS_A CJDNS_B=$OVERLAY_CJDNS_B" >&2
 
-cargo build -p rbitcoin-node
 cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --test-threads=1 "$@"
 echo "overlay-functional: journeys done"
