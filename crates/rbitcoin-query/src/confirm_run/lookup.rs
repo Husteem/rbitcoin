@@ -588,6 +588,7 @@ fn load_from_plan_inner(
         t_load.elapsed().as_nanos() as u64,
     );
 
+    let wire_bytes = metas.iter().map(meta_wire_bytes).sum();
     let Assembled {
         prepared,
         tx_fees,
@@ -624,7 +625,7 @@ fn load_from_plan_inner(
     Ok(ConfirmLoadOutcome {
         batch: LoadedBatch {
             prepared,
-            wire_bytes: wire_blocks.iter().map(|b| b.total_size()).sum(),
+            wire_bytes,
             wire_blocks,
             batch_parents,
             script_preverified: preverified.clone(),
@@ -637,6 +638,16 @@ fn load_from_plan_inner(
         },
         work_ns,
     })
+}
+
+/// A block's wire size from its structure pass: header, transaction count,
+/// and each transaction's wire length, without walking its inputs and outputs.
+fn meta_wire_bytes(m: &BodyMeta) -> usize {
+    let n_tx = bitcoin::consensus::encode::VarInt(m.pres.len() as u64).size();
+    m.pres
+        .iter()
+        .map(|p| p.total_size)
+        .fold(80 + n_tx, usize::saturating_add)
 }
 
 struct ResolvedPrev {
