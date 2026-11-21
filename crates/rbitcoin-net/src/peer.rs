@@ -45,6 +45,11 @@ use tokio::sync::{broadcast, mpsc};
 #[doc(hidden)]
 pub const OUR_PROTOCOL_VERSION: u32 = 70016;
 
+/// Core `WTXID_RELAY_VERSION`: BIP339 `wtxidrelay` goes both ways only from
+/// this peer version up.
+#[doc(hidden)]
+pub const WTXID_RELAY_VERSION: u32 = 70016;
+
 /// How often an established session re-issues `getheaders` so a quiet peer or
 /// a gap opened while we were offline still gets filled (signet ~10m blocks).
 #[doc(hidden)]
@@ -1075,7 +1080,7 @@ mod peer_session_pins {
         tx_announce_maybe_count, tx_announce_peer_ok, tx_announce_should_queue, tx_inv_candidate,
         wait_peer_verack, DecodeQueue, FullBlockReply, HandshakePolicy, PeerFollowState,
         ADDRFETCH_TIMEOUT_SECS, BLOCK_GETDATA_TIMEOUT, MAX_BLOCKS_TO_ANNOUNCE,
-        MIN_PEER_PROTO_VERSION,
+        MIN_PEER_PROTO_VERSION, WTXID_RELAY_VERSION,
     };
     use crate::peers::{PeerConnType, PeerHub, PeerOut};
     use bitcoin::hashes::Hash;
@@ -2384,6 +2389,7 @@ mod peer_session_pins {
             &mut reader,
             magic,
             &HandshakePolicy::plain(),
+            WTXID_RELAY_VERSION,
         ))
         .expect("verack");
     }
@@ -3538,12 +3544,12 @@ pub async fn application_handshake<R: FrameRead, W: FrameWrite>(
     }
 
     // BIP339 / BIP155 feature negotiation starts at 70016 (`p2p_leak` pre-wtxid).
-    if !private && their_version.version >= 70016 {
+    if !private && their_version.version >= WTXID_RELAY_VERSION {
         writer.write_msg(NetworkMessage::WtxidRelay).await?;
         writer.write_msg(NetworkMessage::SendAddrV2).await?;
     }
     writer.write_msg(NetworkMessage::Verack).await?;
-    wait_peer_verack(reader, magic, &policy).await?;
+    wait_peer_verack(reader, magic, &policy, their_version.version).await?;
 
     nonce_guard.clear = false;
     if let Some(peers) = policy.peers {
@@ -3593,16 +3599,18 @@ pub async fn read_peer_version<R: FrameRead>(
     }
 }
 
+/// `peer_version` is the version the peer's VERSION claimed.
 pub async fn wait_peer_verack<R: FrameRead>(
     reader: &mut R,
     magic: Magic,
     policy: &HandshakePolicy<'_>,
+    peer_version: u32,
 ) -> Result<(), NetError> {
     loop {
         let frame = read_handshake_frame(reader, magic, policy).await?;
         let cmd = command_label(&frame.command);
         let msg = frame.decode();
-        if apply_pre_verack(policy.session, msg.payload(), &cmd) {
+        if apply_pre_verack(policy.session, peer_version, msg.payload(), &cmd) {
             return Ok(());
         }
         // The read already applied the handshake deadline. Repeating it
@@ -3614,6 +3622,7 @@ pub async fn wait_peer_verack<R: FrameRead>(
 #[doc(hidden)]
 pub fn apply_pre_verack(
     session: Option<&crate::peers::LivePeer>,
+    peer_version: u32,
     payload: &NetworkMessage,
     cmd: &str,
 ) -> bool {
@@ -3625,8 +3634,10 @@ pub fn apply_pre_verack(
             }
             false
         }
+        // Core ignores it below the version we send our own `wtxidrelay`
+        // at, so a tx is never named by wtxid to a peer we did not send it.
         NetworkMessage::WtxidRelay => {
-            if let Some(s) = session {
+            if let Some(s) = session.filter(|_| peer_version >= WTXID_RELAY_VERSION) {
                 s.set_wtxid_relay();
             }
             false

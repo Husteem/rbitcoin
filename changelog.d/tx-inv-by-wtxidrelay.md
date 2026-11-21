@@ -12,3 +12,6 @@ Fixed
 - **A peer that sends `wtxidrelay` after `verack` is disconnected,** as
   Core does. The relay mode is fixed when the handshake ends, so a tx INV is
   never matched against the other hash (#1700).
+- **A `wtxidrelay` from a peer below protocol 70016 is ignored,** as Core
+  does. We send our own only from that version up, so such a peer still
+  hears of a transaction by txid (#1700).

@@ -21,9 +21,9 @@ fn v1_frame(magic: Magic, msg: NetworkMessage) -> Vec<u8> {
     serialize(&RawNetworkMessage::new(magic, msg))
 }
 
-fn v1_version(to: SocketAddr, from: SocketAddr) -> NetworkMessage {
+fn v1_version(to: SocketAddr, from: SocketAddr, version: u32) -> NetworkMessage {
     NetworkMessage::Version(VersionMessage {
-        version: 70016,
+        version,
         services: ServiceFlags::NONE,
         timestamp: 0,
         receiver: Address::new(&to, ServiceFlags::NONE),
@@ -98,20 +98,22 @@ async fn closed(s: &mut TcpStream) {
 }
 
 async fn v1_handshake(v1_bind: SocketAddr) -> TcpStream {
-    v1_handshake_split(v1_bind, &[], &[]).await
+    v1_handshake_split(v1_bind, &[], 70016, &[]).await
 }
 
 /// A v1 handshake whose `version` frame is cut at `cuts`, with a pause longer
 /// than the handshake read's 50 ms poll after each piece but the last.
-/// `features` (such as `wtxidrelay`) go out after `version`, before `verack`.
+/// It claims protocol `version`. `features` (such as `wtxidrelay`) go out
+/// after `version`, before `verack`.
 async fn v1_handshake_split(
     v1_bind: SocketAddr,
     cuts: &[usize],
+    version: u32,
     features: &[NetworkMessage],
 ) -> TcpStream {
     let mut s = TcpStream::connect(v1_bind).await.unwrap();
     let ours = s.local_addr().unwrap();
-    let version = v1_frame(Magic::REGTEST, v1_version(v1_bind, ours));
+    let version = v1_frame(Magic::REGTEST, v1_version(v1_bind, ours, version));
     let mut from = 0;
     for &cut in cuts {
         s.write_all(&version[from..cut]).await.unwrap();
@@ -175,13 +177,16 @@ async fn p2p_v1_wallet_sync_listener() {
         let mut primary = TcpStream::connect(node.local_addr).await.unwrap();
         let ours = primary.local_addr().unwrap();
         primary
-            .write_all(&v1_frame(Magic::REGTEST, v1_version(node.local_addr, ours)))
+            .write_all(&v1_frame(
+                Magic::REGTEST,
+                v1_version(node.local_addr, ours, 70016),
+            ))
             .await
             .unwrap();
         closed_silently(&mut primary).await;
 
         // Cut inside the header and inside the body.
-        let mut wallet = v1_handshake_split(v1_bind, &[20, 34], &[]).await;
+        let mut wallet = v1_handshake_split(v1_bind, &[20, 34], 70016, &[]).await;
         let (pong, _) = {
             wallet
                 .write_all(&v1_frame(Magic::REGTEST, NetworkMessage::Ping(7)))
@@ -380,7 +385,9 @@ async fn v1_getdata_tx(s: &mut TcpStream, item: Inventory) -> bitcoin::Transacti
 
 /// BIP339: a peer that never sent `wtxidrelay` (bitcoinj, protocol 70013)
 /// hears of a tx as `MSG_TX` by txid and fetches it by txid. Only a peer that
-/// sent `wtxidrelay` hears `MSG_WTX` by wtxid.
+/// sent `wtxidrelay` at protocol 70016 or above hears `MSG_WTX` by wtxid: we
+/// send our own `wtxidrelay` only to such a peer, and Core ignores one from
+/// an older peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_v1_tx_inv_follows_wtxidrelay() {
     use bitcoin::absolute::LockTime;
@@ -433,9 +440,12 @@ async fn p2p_v1_tx_inv_follows_wtxidrelay() {
         node.peers.set_net_perms(perms);
 
         let mut legacy = v1_handshake(v1_bind).await;
-        let mut modern = v1_handshake_split(v1_bind, &[], &[NetworkMessage::WtxidRelay]).await;
+        let mut modern =
+            v1_handshake_split(v1_bind, &[], 70016, &[NetworkMessage::WtxidRelay]).await;
+        let mut old = v1_handshake_split(v1_bind, &[], 70015, &[NetworkMessage::WtxidRelay]).await;
         v1_ping(&mut legacy, 1).await;
         v1_ping(&mut modern, 2).await;
+        v1_ping(&mut old, 3).await;
 
         let spend = Transaction {
             version: TxVersion::TWO,
@@ -467,6 +477,11 @@ async fn p2p_v1_tx_inv_follows_wtxidrelay() {
             v1_tx_inv(&mut modern, &spend).await,
             vec![Inventory::WTx(wtxid)],
             "a wtxidrelay peer hears MSG_WTX by wtxid"
+        );
+        assert_eq!(
+            v1_tx_inv(&mut old, &spend).await,
+            vec![Inventory::Transaction(txid)],
+            "a wtxidrelay from a pre-70016 peer does not count"
         );
 
         let served = v1_getdata_tx(&mut legacy, Inventory::WitnessTransaction(txid)).await;
