@@ -187,7 +187,5 @@ pub use tx_table::{
     spend_meta_backend, spent_abs, InputParent, InputRecord, OutputRecord, PackedCreate, TxRecord,
 };
 pub use txstat::TxStatRow;
+pub use uring_session::abort_uring_unusable;
 pub use uring_session::IoCtx;
-pub use uring_session::{
-    abort_uring_unusable, note_uring_recover, uring_recover_count, uring_slow_drain_count,
-};

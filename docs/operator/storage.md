@@ -146,10 +146,10 @@ rewrites their page, and the milliseconds of each step: composing folds, the
 `fold` file, the `spent.body` writes and sync, the segment writes and sync,
 the directory write and sync, the commit rename, installing in RAM, and
 unlinking. Reuse `logging include ["store"]` to turn the detail on at a lower
-level. `spend_room_wait_ms` on the `ibd: perf` line is the time confirm waited
-at the 2,000,000-note cap for a checkpoint to start; the compact `spend`
-object also carries the window's checkpoint count, worst `total_ms`, and
-`notes_ram`. After 60 failed checkpoints in a row (the sync thread retries
+level. `spend_room_wait_ms` on the `ibd: perf_full` line is the time confirm
+waited at the 2,000,000-note cap for a checkpoint to start; the compact
+`spend` object on `ibd: perf` also carries the window's checkpoint count,
+worst `total_ms`, and `notes_ram`. After 60 failed checkpoints in a row (the sync thread retries
 about once a second at the cap), that wait returns a store error and confirm
 stops instead of stalling.
 

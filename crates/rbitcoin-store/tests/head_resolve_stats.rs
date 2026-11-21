@@ -3,7 +3,7 @@ use rbitcoin_store::head_resolve_stats::*;
 
 /// Pure Sample math (no process atomics — safe under parallel cargo test).
 #[test]
-fn sample_age_cdf_and_compact() {
+fn sample_age_cdf_and_rank() {
     let mut s = Sample::default();
     s.age_hit[0] = 2;
     s.age_hit[3] = 1;
@@ -13,7 +13,6 @@ fn sample_age_cdf_and_compact() {
     assert!((s.age_cdf(3) - 0.75).abs() < 1e-9);
     assert!((s.age_cdf(47) - 1.0).abs() < 1e-9);
     assert_eq!(s.age_cdf_pct(3), 75);
-    assert!(s.age_hit_compact().starts_with("2:0:0:1:"));
     s.hit_rank_sum = 4;
     s.hit_rank_n = 2;
     assert!((s.hit_rank_avg() - 2.0).abs() < 1e-9);

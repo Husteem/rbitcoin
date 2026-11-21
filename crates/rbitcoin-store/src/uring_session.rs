@@ -713,9 +713,6 @@ impl UringSession {
 
     #[doc(hidden)]
     pub fn note_slow_drain(&self, waited: Duration) {
-        URING_METERS
-            .slow_drain
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let thread = std::thread::current();
         let thread = thread.name().unwrap_or("unnamed");
         rbitcoin_log::warn!(
@@ -1093,24 +1090,6 @@ pub fn require_full_cqe(res: i32, want: usize, path: &Path) -> Result<(), StoreE
     Ok(())
 }
 
-pub fn note_uring_recover() {
-    URING_METERS
-        .recover_n
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub fn uring_slow_drain_count() -> u64 {
-    URING_METERS
-        .slow_drain
-        .load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub fn uring_recover_count() -> u64 {
-    URING_METERS
-        .recover_n
-        .load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// Run `f` with this **OS thread's** long-lived io_uring session.
 ///
 /// - Opens once on first use; reopens only if `min_entries` exceeds the current
@@ -1257,8 +1236,6 @@ pub struct UringMeters {
     #[cfg(any(debug_assertions, target_os = "linux"))]
     pub cq_overflow: std::sync::atomic::AtomicU64,
     pub idx_range_missing: std::sync::atomic::AtomicU64,
-    pub slow_drain: std::sync::atomic::AtomicU64,
-    pub recover_n: std::sync::atomic::AtomicU64,
 }
 
 #[doc(hidden)]
@@ -1268,8 +1245,6 @@ pub static URING_METERS: UringMeters = UringMeters {
     #[cfg(any(debug_assertions, target_os = "linux"))]
     cq_overflow: std::sync::atomic::AtomicU64::new(0),
     idx_range_missing: std::sync::atomic::AtomicU64::new(0),
-    slow_drain: std::sync::atomic::AtomicU64::new(0),
-    recover_n: std::sync::atomic::AtomicU64::new(0),
 };
 
 #[derive(Clone, Copy)]

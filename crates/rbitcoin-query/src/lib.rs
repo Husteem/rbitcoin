@@ -3014,7 +3014,6 @@ impl Query {
                 .compare_exchange(last, tip, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
                 .is_ok()
             {
-                rbitcoin_store::note_uring_recover();
                 rbitcoin_log::warn!("ibd: uring recover tip={tip} reason={reason}");
                 return UringRecover::Recovered;
             }

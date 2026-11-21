@@ -258,8 +258,6 @@ confirm_window! {
     stamp_filter_ns,
     stamp_batch_ns,
     // wire reconstruct
-    wf_body_store,
-    wf_body_store_ns,
     // IBD OS-thread occupancy
     thr_lookup_claim_ns,
     thr_lookup_stamp_ns,

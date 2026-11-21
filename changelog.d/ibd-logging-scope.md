@@ -9,8 +9,9 @@ Changed
   full `ibd: perf_full` object is written every 30s or on a slow phase.
   `ibd: perf` gains a nested `spend` object with the checkpoint count, worst
   wall time, and `notes_ram`.
-- **The 5s RSS path no longer reads `smaps_rollup`.** `rss_kb` stays fresh;
-  the anon/file/locked split refreshes at most every 30s.
+- **The 5s RSS path no longer reads `smaps_rollup`.** `rss_kb` and the
+  `RssAnon` / `RssFile` split stay fresh from `/proc/status`; the
+  `smaps_rollup` fallback (and `Locked`) is on the 30s deep read.
 - **A slow confirm phase warns on entry, once a minute, and on recovery**
   instead of every 5s.
 - **Dropped duplicate `ibd: perf` keys:** the six `stamp_batch_*` child

@@ -262,20 +262,6 @@ impl Sample {
     pub fn age_cdf_pct(&self, k: u32) -> u64 {
         (self.age_cdf(k) * 100.0).round() as u64
     }
-
-    /// Compact `h0:h1:…:h7+tail` (first 8 ages + sum of the rest).
-    pub fn age_hit_compact(&self) -> String {
-        let mut parts = Vec::with_capacity(9);
-        for i in 0..8.min(AGE_CAP) {
-            parts.push(self.age_hit[i].to_string());
-        }
-        let mut tail = 0u64;
-        for i in 8..AGE_CAP {
-            tail = tail.saturating_add(self.age_hit[i]);
-        }
-        parts.push(tail.to_string());
-        parts.join(":")
-    }
 }
 
 /// Sealed age from tip for segment index `si` in a vec of `n_segs` (last = tip).

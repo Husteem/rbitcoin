@@ -6,7 +6,6 @@ use rbitcoin_consensus::block::{
     check_witness_commitment_with_wtxids, coinbase_has_witness_commitment,
     witness_commitment_script, witness_commitment_vout_index,
 };
-use std::time::Instant;
 
 #[doc(hidden)]
 pub const TXSTAT_BODY_ROW_BYTES: u64 = 8;
@@ -116,8 +115,6 @@ impl Query {
             return Ok((tx, outs, inputs));
         }
         self.require_seqsigwit_fk(fk)?;
-        let t0 = Instant::now();
-        crate::note_confirm(&self.confirm_stats().wf_body_store, 1);
         let (tx, inputs, outs) = match self.store.get_tx_full(fk) {
             Ok(v) => v,
             Err(StoreError::NotFound) if self.prune_seqsigwit() => {
@@ -126,10 +123,6 @@ impl Query {
             }
             Err(e) => return Err(e),
         };
-        crate::note_confirm(
-            &self.confirm_stats().wf_body_store_ns,
-            t0.elapsed().as_nanos() as u64,
-        );
         Ok((tx, outs, inputs))
     }
 
