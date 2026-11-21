@@ -467,6 +467,10 @@ async fn p2p_v1_tx_inv_follows_wtxidrelay() {
         let (txid, wtxid) = (spend.compute_txid(), spend.compute_wtxid());
         assert_ne!(txid.to_byte_array(), wtxid.to_byte_array());
         mp.admit(&spend).expect("segwit spend enters the pool");
+        // The accept's announce reaches a session that finds the pool lock
+        // busy as nothing. A flush after the accept returns names the tx to
+        // these noban peers either way; the claim keeps it to one inv.
+        mp.notify_inv_flush();
 
         assert_eq!(
             v1_tx_inv(&mut legacy, &spend).await,
