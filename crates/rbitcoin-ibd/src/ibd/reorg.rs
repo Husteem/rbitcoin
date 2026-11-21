@@ -882,22 +882,18 @@ struct PreparedHook {
 }
 
 static AFTER_PREPARE: Mutex<Option<PreparedHook>> = Mutex::new(None);
+static BEFORE_PREPARE: Mutex<Option<PreparedHook>> = Mutex::new(None);
 
-/// Runs on this thread after a rewind is prepared and before it is committed.
-/// The header-thread stand-in in the stale-commit pin uses this. An empty
-/// hook is production.
-#[doc(hidden)]
-pub fn arm_after_header_rewind_prepare_for_test(hook: Option<fn()>) {
-    let mut slot = AFTER_PREPARE.lock().unwrap_or_else(|err| err.into_inner());
-    *slot = hook.map(|hook| PreparedHook {
+fn arm(slot: &Mutex<Option<PreparedHook>>, hook: Option<fn()>) {
+    *slot.lock().unwrap_or_else(|err| err.into_inner()) = hook.map(|hook| PreparedHook {
         thread: std::thread::current().id(),
         hook,
     });
 }
 
-fn fire_after_prepare() {
+fn fire(slot: &Mutex<Option<PreparedHook>>) {
     let hook = {
-        let mut slot = AFTER_PREPARE.lock().unwrap_or_else(|err| err.into_inner());
+        let mut slot = slot.lock().unwrap_or_else(|err| err.into_inner());
         match slot.as_ref() {
             Some(armed) if armed.thread == std::thread::current().id() => {
                 let hook = armed.hook;
@@ -910,6 +906,22 @@ fn fire_after_prepare() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+/// Runs on this thread after a selection and before its rewind is prepared.
+/// The confirm stand-in in the moved-tip pin uses this. An empty hook is
+/// production.
+#[doc(hidden)]
+pub fn arm_before_header_rewind_prepare_for_test(hook: Option<fn()>) {
+    arm(&BEFORE_PREPARE, hook);
+}
+
+/// Runs on this thread after a rewind is prepared and before it is committed.
+/// The header-thread stand-in in the stale-commit pin uses this. An empty
+/// hook is production.
+#[doc(hidden)]
+pub fn arm_after_header_rewind_prepare_for_test(hook: Option<fn()>) {
+    arm(&AFTER_PREPARE, hook);
 }
 
 /// Select the heavier path with the most work, disconnect, and commit it.
@@ -941,6 +953,7 @@ pub(crate) fn apply_off_lock_rewind(
     else {
         return Ok(false);
     };
+    fire(&BEFORE_PREPARE);
     let tip_before = tip_pair(hub);
     let Some(prep) = prepare_header_rewind(hub, &path, cap)? else {
         shared
@@ -953,7 +966,7 @@ pub(crate) fn apply_off_lock_rewind(
     // Re-selecting here would see the LCA we just rewound to and return
     // none. The fresh select is the one above, after the other rewind has
     // either committed or is waiting on this gate.
-    fire_after_prepare();
+    fire(&AFTER_PREPARE);
     let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
     let marked_invalid = path
         .iter()
