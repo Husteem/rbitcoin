@@ -229,7 +229,6 @@ fn a_budget_pass_syncs_its_deaths_once() {
     let meta = dir.path().join("meta");
     let before = std::fs::read(&meta).unwrap().len();
     mp.store.meta_file = std::fs::OpenOptions::new()
-        .write(true)
         .append(true)
         .open(&meta)
         .unwrap();
