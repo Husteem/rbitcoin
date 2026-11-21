@@ -99,3 +99,34 @@ fn slot_pair_is_one_generation() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+/// One `VarTable` publish of `(count, published_body_end)` against one
+/// `published_meta`. The reader gets the pair from before the publish or
+/// the pair it stored, never one field from each.
+#[test]
+fn var_table_meta_is_one_generation() {
+    super::engine::check_at_most(2, || {
+        let dir = std::env::temp_dir().join("rbtc-seq-var-meta");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = std::sync::Arc::new(
+            rbitcoin_store::var_table::VarTable::create(&dir, "tx", TableKind::TxOut).unwrap(),
+        );
+        let start = table.published_meta();
+        let next = (7, start.1 + 700);
+        let table_w = std::sync::Arc::clone(&table);
+        let writer = loom::thread::spawn(move || {
+            table_w.truncate_body_to(next.0, next.1).unwrap();
+        });
+        let reader = loom::thread::spawn(move || {
+            let meta = table.published_meta();
+            assert!(
+                meta == start || meta == next,
+                "torn meta {meta:?} (before {start:?}, after {next:?})"
+            );
+        });
+        writer.join().unwrap();
+        reader.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
