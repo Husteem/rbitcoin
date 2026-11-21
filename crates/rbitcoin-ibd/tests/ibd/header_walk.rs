@@ -8629,7 +8629,7 @@ fn hw_pin_the_milestone_height_records_the_header() {
     hub.milestone = rbitcoin_consensus::Milestone::height(1);
     st.header_walk.tip.height = 1;
     st.header_walk.tip.hash = Some(gen.block_hash());
-    remember_milestone(&mut st.header_walk.tip, &hub, &gen);
+    remember_milestone(&mut st.header_walk.tip, &hub);
     assert_eq!(st.header_walk.milestone_hash(), Some(gen.block_hash()));
 }
 
@@ -8873,7 +8873,6 @@ fn hw_pin_a_cut_back_keeps_the_fork_anchor() {
     st.hash_height.insert(prev, 5);
     hub.milestone.height = 5;
     st.header_walk.tip.milestone_hash = Some(byte_hash(8));
-    st.header_walk.tip.milestone_header = Some(gen);
     adopt_heavier(&mut st, &hub, prev, &[], Work::from_be_bytes([0; 32]), None);
     let tip = &st.header_walk.tip;
     assert_eq!(tip.work, Work::from_be_bytes(raw));
@@ -8883,7 +8882,7 @@ fn hw_pin_a_cut_back_keeps_the_fork_anchor() {
         tip.diff.full_diff_bits,
         Some(CompactTarget::from_consensus(0x1d00ffff))
     );
-    assert_eq!(tip.milestone_header, Some(gen));
+    assert_eq!(tip.milestone_hash, Some(byte_hash(8)));
 }
 
 /// A stored successor does not cancel an owed probe.
