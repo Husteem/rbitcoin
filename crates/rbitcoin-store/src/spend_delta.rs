@@ -354,6 +354,8 @@ const ZERO: Slot = [0u8; SLOT];
 thread_local! {
     static DELTA_RECORD_BULK: Cell<u64> = const { Cell::new(0) };
     static DELTA_RECORD_SERIAL: Cell<u64> = const { Cell::new(0) };
+    /// 0 unset, 1 every span still shared its file, 2 a span was the sole owner.
+    static DELTA_RECORD_OWNER: Cell<u8> = const { Cell::new(0) };
 }
 
 fn note_delta_record_serial() {
@@ -364,11 +366,21 @@ fn note_delta_record_bulk() {
     DELTA_RECORD_BULK.with(|n| n.set(n.get() + 1));
 }
 
+fn note_delta_record_owner(held: bool) {
+    DELTA_RECORD_OWNER.with(|c| {
+        let next = if held { 1 } else { 2 };
+        if c.get() != 2 {
+            c.set(next);
+        }
+    });
+}
+
 /// Clear [`delta_record_io`] on this thread.
 #[doc(hidden)]
 pub fn reset_delta_record_io() {
     DELTA_RECORD_BULK.with(|n| n.set(0));
     DELTA_RECORD_SERIAL.with(|n| n.set(0));
+    DELTA_RECORD_OWNER.with(|n| n.set(0));
 }
 
 /// `(bulk submissions, serial record preads)` since [`reset_delta_record_io`]
@@ -379,6 +391,14 @@ pub fn delta_record_io() -> (u64, u64) {
         DELTA_RECORD_BULK.with(Cell::get),
         DELTA_RECORD_SERIAL.with(Cell::get),
     )
+}
+
+/// Whether every bulk span since [`reset_delta_record_io`] still shared its
+/// segment file with another owner at the read. A sole owner means this
+/// lookup already dropped the `Arc` `unlink_doomed` is waiting on.
+#[doc(hidden)]
+pub fn delta_record_owner_held() -> bool {
+    DELTA_RECORD_OWNER.with(|c| c.get() == 1)
 }
 /// [`Placed`] fields: `segment:22 | offset:23 | len:12 | base:7`.
 const SEG_BITS: u32 = 22;
@@ -1946,8 +1966,9 @@ impl SpendPageLog {
             wanted: Vec<(u16, usize)>,
         }
         struct Span {
-            path: PathBuf,
-            fd: crate::io_handle::IoHandle,
+            /// Kept until the batch returns. `unlink_doomed` closes a segment
+            /// once this is the last `Arc`.
+            file: Arc<TableFile>,
             offset: u64,
             buf: Vec<u8>,
             recs: Vec<SpanRec>,
@@ -2002,8 +2023,7 @@ impl SpendPageLog {
                     })
                     .collect();
                 spans.push(Span {
-                    path: file.path.clone(),
-                    fd: file.io_handle(),
+                    file: Arc::clone(&file),
                     offset: start,
                     buf: vec![0u8; (end - start) as usize],
                     recs,
@@ -2013,15 +2033,19 @@ impl SpendPageLog {
         let depth = crate::uring_session::DEFAULT_ENTRIES as usize;
         for chunk in spans.chunks_mut(depth.max(1)) {
             note_delta_record_bulk();
-            let paths: Vec<PathBuf> = chunk.iter().map(|span| span.path.clone()).collect();
+            note_delta_record_owner(chunk.iter().all(|span| Arc::strong_count(&span.file) >= 2));
+            let paths: Vec<PathBuf> = chunk.iter().map(|span| span.file.path.clone()).collect();
             let lens: Vec<usize> = chunk.iter().map(|span| span.buf.len()).collect();
             let mut ops: Vec<crate::bulk_io::ReadOp<'_>> = chunk
                 .iter_mut()
-                .map(|span| crate::bulk_io::ReadOp {
-                    fd: span.fd,
-                    offset: span.offset,
-                    buf: span.buf.as_mut_slice(),
-                    result: i32::MIN,
+                .map(|span| {
+                    let fd = span.file.io_handle();
+                    crate::bulk_io::ReadOp {
+                        fd,
+                        offset: span.offset,
+                        buf: span.buf.as_mut_slice(),
+                        result: i32::MIN,
+                    }
                 })
                 .collect();
             crate::bulk_io::pread_batch_backend(&mut ops, backend);
