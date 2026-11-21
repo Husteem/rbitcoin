@@ -20,7 +20,7 @@ use rbitcoin_net::peer::{
 use rbitcoin_net::peer_dos::{PeerRateLimiter, RATE_LIMIT_BAN_SCORE};
 use rbitcoin_net::peers::PongSlot;
 use rbitcoin_net::v2::{read_v2_frame_with_progress, write_v2_msg_offload, V2Reader, V2Writer};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -118,6 +118,8 @@ pub struct PeerSlot {
     /// Same hashes, shared with the reader. One extra set per live peer so a
     /// block check does not take the IBD work state.
     pub requested: Arc<Mutex<HashSet<BlockHash>>>,
+    /// `getheaders` asks the reader may exempt one `headers` reply for.
+    pub headers_asks: Arc<HeaderAsks>,
     /// Bytes of blocks this peer was asked for. Stall-clock input.
     pub solicited_bytes: Arc<AtomicU64>,
     /// Bytes of the block frame still on the socket. Zero for pings and headers.
@@ -171,6 +173,66 @@ pub fn solicit_track() -> (
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
     )
+}
+
+/// Asks sent on this peer that a `headers` reply may still answer.
+///
+/// A solicited reply is a normal part of header sync, so it stays off the
+/// session window once per ask. The count is capped, and an ask older than
+/// [`HEADERS_ASK_TTL_MS`] is forgotten when the next ask arrives or a reply
+/// is taken, so a peer that never answers cannot bank exemptions for an
+/// unsolicited burst.
+#[derive(Debug, Default)]
+pub struct HeaderAsks {
+    state: Mutex<HeaderAskState>,
+}
+
+#[derive(Debug, Default)]
+struct HeaderAskState {
+    asks: VecDeque<u64>,
+}
+
+/// Most `getheaders` asks held for one peer.
+#[doc(hidden)]
+pub const HEADERS_ASKS_MAX: usize = 2;
+/// How long a `getheaders` ask can exempt a reply.
+#[doc(hidden)]
+pub const HEADERS_ASK_TTL_MS: u64 = 60_000;
+
+impl HeaderAsks {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, HeaderAskState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record one `getheaders` sent at `now_ms`. Each ask carries its own
+    /// expiry; a full record gives up its oldest.
+    pub fn note_ask(&self, now_ms: u64) {
+        let mut state = self.state();
+        state
+            .asks
+            .retain(|at| now_ms.saturating_sub(*at) <= HEADERS_ASK_TTL_MS);
+        if state.asks.len() >= HEADERS_ASKS_MAX {
+            state.asks.pop_front();
+        }
+        state.asks.push_back(now_ms);
+    }
+
+    /// Take one exemption for a `headers` frame read at `now_ms`. Expired asks
+    /// leave from the front; the oldest live ask answers this reply.
+    pub fn take_reply(&self, now_ms: u64) -> bool {
+        let mut state = self.state();
+        while let Some(at) = state.asks.front().copied() {
+            if now_ms.saturating_sub(at) <= HEADERS_ASK_TTL_MS {
+                break;
+            }
+            state.asks.pop_front();
+        }
+        state.asks.pop_front().is_some()
+    }
 }
 
 /// Outstanding getdata that has not left the process, and when this stall
@@ -722,12 +784,14 @@ pub struct IbdReadCtx {
     pub out_tx: mpsc::UnboundedSender<NetworkMessage>,
     pub sinks: PeerEventSinks,
     pub requested: Arc<Mutex<HashSet<BlockHash>>>,
+    pub headers_asks: Arc<HeaderAsks>,
     pub solicited_bytes: Arc<AtomicU64>,
     pub solicited_ms: Arc<AtomicU64>,
     pub light_decode: Arc<Semaphore>,
     pub light: LightDecodes,
-    /// Decoys and unknown types only. Requested block bodies stay off
-    /// this window so a fast peer is not clipped at the tip-follow cap.
+    /// Decoys, unknown types, short or unsolicited bodies, and heavy frames.
+    /// Requested block bodies and the reply to each `getheaders` stay off
+    /// this window so a fast peer is not clipped.
     pub rate: PeerRateLimiter,
     pub logged_invalid_v2: bool,
     pub ban_score: u32,
@@ -818,8 +882,7 @@ impl IbdReadCtx {
         if !frame.decode_is_cpu_heavy() {
             return self.on_light(frame);
         }
-        self.on_heavy(frame);
-        false
+        self.on_heavy(frame)
     }
 
     #[doc(hidden)]
@@ -887,9 +950,15 @@ impl IbdReadCtx {
         }
     }
 
-    /// Never await a decode permit on the reader (stalls TCP).
+    /// Never await a decode permit on the reader (stalls TCP). A heavy frame
+    /// takes the session window before its decode is spawned; one `headers`
+    /// reply per outstanding ask is exempt.
     #[doc(hidden)]
-    pub fn on_heavy(&self, frame: FramedMessage) {
+    pub fn on_heavy(&mut self, frame: FramedMessage) -> bool {
+        let solicited_headers = frame.is_headers() && self.headers_asks.take_reply(ibd_mono_ms());
+        if !solicited_headers && self.score_overflow(frame.payload.len()) {
+            return true;
+        }
         let id = self.id;
         let net = self.net;
         let sinks_ok = self.sinks.clone();
@@ -899,6 +968,7 @@ impl IbdReadCtx {
             move |msg| on_heavy_decoded(id, net, &sinks_ok, msg),
             move |err| on_heavy_err(id, &sinks_err, err),
         );
+        false
     }
 
     #[doc(hidden)]
@@ -951,6 +1021,7 @@ pub async fn read_ibd_peer(
     sinks_r: PeerEventSinks,
     bytes_io: Arc<AtomicU64>,
     requested: Arc<Mutex<HashSet<BlockHash>>>,
+    headers_asks: Arc<HeaderAsks>,
     solicited_bytes: Arc<AtomicU64>,
     open_block_bytes: Arc<AtomicU64>,
     any_rx_ms: Arc<AtomicU64>,
@@ -966,6 +1037,7 @@ pub async fn read_ibd_peer(
         out_tx,
         sinks: sinks_r,
         requested,
+        headers_asks,
         solicited_bytes,
         solicited_ms,
         light_decode,
@@ -1207,11 +1279,13 @@ pub async fn spawn_peer(
     let bytes_rx_total = Arc::new(AtomicU64::new(0));
     let bytes_io = Arc::clone(&bytes_rx_total);
     let (requested, solicited_bytes, solicited_ms) = solicit_track();
+    let headers_asks = HeaderAsks::new();
     let open_block_bytes = Arc::new(AtomicU64::new(0));
     let any_rx_ms = Arc::new(AtomicU64::new(0));
     let getdata_wire = GetdataWire::new();
     let wire_w = Arc::clone(&getdata_wire);
     let req_r = Arc::clone(&requested);
+    let headers_asks_r = Arc::clone(&headers_asks);
     let sol_bytes_r = Arc::clone(&solicited_bytes);
     let open_block_r = Arc::clone(&open_block_bytes);
     let any_rx_r = Arc::clone(&any_rx_ms);
@@ -1236,6 +1310,7 @@ pub async fn spawn_peer(
             sinks_r,
             bytes_io,
             req_r,
+            headers_asks_r,
             sol_bytes_r,
             open_block_r,
             any_rx_r,
@@ -1269,6 +1344,7 @@ pub async fn spawn_peer(
         cmd_tx,
         in_flight: HashSet::new(),
         requested,
+        headers_asks,
         solicited_bytes,
         open_block_bytes,
         solicited_ms,
