@@ -18,7 +18,7 @@ fn unproved_lead_rewinds_past_1024_and_a_proved_walk_does_not() {
     let (kept, side) = confirm_past_1024(&hub, 1_500_080_000);
     let path = [side];
     assert!(
-        prepare_header_rewind(&hub, &path, REWIND_MAX_DEPTH)
+        prepare_now(&hub, &path, REWIND_MAX_DEPTH)
             .unwrap()
             .is_none(),
         "1,025 blocks is past the proved cap, and this call must not move the tip"
@@ -174,6 +174,15 @@ fn floor_just_above(work: bitcoin::Work) -> rbitcoin_consensus::Milestone {
             min_work_be,
         }),
     }
+}
+
+/// [`prepare_header_rewind_at`] against the confirmed tip this call sees.
+fn prepare_now(
+    hub: &ChainHub,
+    path: &[BlockHash],
+    max_depth: u32,
+) -> Result<Option<RewindPrep>, NetError> {
+    prepare_header_rewind_at(hub, path, max_depth, (hub.tip_height(), hub.tip_hash()))
 }
 
 /// [`apply_header_rewind`] under the cap this state puts in force.
@@ -487,7 +496,7 @@ fn commit_deeper_fork_after_prepare() {
         .lock()
         .unwrap_or_else(|err| err.into_inner())
         .expect("side hash armed");
-    let prep = prepare_header_rewind(&hub, &[g1], REWIND_MAX_DEPTH)
+    let prep = prepare_now(&hub, &[g1], REWIND_MAX_DEPTH)
         .unwrap()
         .expect("deeper fork disconnects to genesis");
     let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
@@ -499,6 +508,7 @@ fn commit_deeper_fork_after_prepare() {
 /// to genesis and committed that fork. The prepared L1 commit must not run.
 #[test]
 fn stale_heavier_rewind_does_not_commit_after_the_tip_moves() {
+    let _serial = AFTER_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let _clear = ClearRewindHook;
     HOOK_RAN.store(false, Ordering::Release);
     let (dir, hub) = tmp_hub();
@@ -752,6 +762,91 @@ fn a_plant_selected_against_an_older_tip_is_skipped() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The hooks that move the tip after prepare share one slot, so one test
+/// arms it at a time.
+static AFTER_LOCK: Mutex<()> = Mutex::new(());
+static AFTER_HUB: Mutex<Option<Arc<ChainHub>>> = Mutex::new(None);
+static AFTER_BLOCKS: Mutex<Option<Vec<Block>>> = Mutex::new(None);
+static AFTER_RAN: AtomicBool = AtomicBool::new(false);
+
+struct ClearAfterRewindHook;
+impl Drop for ClearAfterRewindHook {
+    fn drop(&mut self) {
+        arm_after_header_rewind_prepare_for_test(None);
+        *AFTER_HUB.lock().unwrap_or_else(|err| err.into_inner()) = None;
+        *AFTER_BLOCKS.lock().unwrap_or_else(|err| err.into_inner()) = None;
+    }
+}
+
+/// Stands in for confirm extending from the LCA after the prepare dropped
+/// the tip commit and read the path's store rows.
+fn extend_tip_after_prepare() {
+    let hub = AFTER_HUB
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .expect("hub armed")
+        .clone();
+    let blocks = AFTER_BLOCKS
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .take()
+        .expect("extension armed");
+    for block in blocks {
+        hub.accept_block(block).expect("extension connects");
+    }
+    AFTER_RAN.store(true, Ordering::Release);
+}
+
+/// The under-lock prepare disconnects to the LCA and then builds the path
+/// state while the tip commit is down. Confirm can extend from the LCA in
+/// that gap. The commit must recheck the tip under the commit, or it clears
+/// the path and moves `lookup_taken_hi` back to an LCA the chain has left.
+#[test]
+fn an_under_lock_commit_selected_against_an_older_tip_is_skipped() {
+    let _serial = AFTER_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _clear = ClearAfterRewindHook;
+    AFTER_RAN.store(false, Ordering::Release);
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_960;
+    let chain = confirmed_chain(&hub, 2, t);
+    let fork = side_headers(&hub, &chain, 0, 5, t + 1);
+
+    let mut blocks = Vec::new();
+    let mut prev = chain[0];
+    for h in 1..=5u32 {
+        let block = mine(prev, t + 5_000 + 100 * (h - 1), h);
+        prev = block.block_hash();
+        blocks.push(block);
+    }
+    let hub = Arc::new(hub);
+    *AFTER_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
+    *AFTER_BLOCKS.lock().unwrap_or_else(|err| err.into_inner()) = Some(blocks);
+
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
+    arm_after_header_rewind_prepare_for_test(Some(extend_tip_after_prepare));
+
+    assert!(!maybe_rewind_to_best_work(&mut st, &hub).unwrap());
+    assert!(
+        AFTER_RAN.load(Ordering::Acquire),
+        "confirm extended from the LCA before the commit"
+    );
+    assert_eq!(
+        hub.tip_height(),
+        Some(5),
+        "the extension from the LCA stays"
+    );
+    assert!(
+        !st.height_to_hash.contains_key(&1),
+        "the path is not committed against a tip the selection did not measure"
+    );
+    assert_eq!(st.reorg.deferred, vec![fork[4]]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A real block whose prev is not a stored header fails the live confirm
 /// load as BadPrev. That reject is soft reget: the tip stays, the slot is
 /// evicted, and the hash is not blacklisted or fetched again.
@@ -998,7 +1093,7 @@ fn a_fork_deeper_than_the_cap_does_not_end_selection() {
         Some((shallow.clone(), 2)),
         "the fork 3 under the tip is past a cap of 2"
     );
-    let prep = prepare_header_rewind(&hub, &shallow, 2)
+    let prep = prepare_now(&hub, &shallow, 2)
         .unwrap()
         .expect("the rewind takes the path selection returned");
     assert_eq!(prep.lca_h, 1);
@@ -1479,7 +1574,7 @@ fn reorg_pin_a_plant_at_the_tip_is_not_a_rewind() {
     let gen = hub.tip_hash().unwrap();
     let side = mine(gen, hub.tip_header().unwrap().time.saturating_add(1), 1);
     hub.ensure_header(&side.header).unwrap();
-    let prep = prepare_header_rewind(&hub, &[side.block_hash()], 1)
+    let prep = prepare_now(&hub, &[side.block_hash()], 1)
         .unwrap()
         .expect("a child of the tip is a plant");
     assert!(!prep.rewound);
@@ -1500,7 +1595,7 @@ fn reorg_pin_a_rewind_at_the_depth_cap_still_disconnects() {
         tip,
     );
     hub.ensure_header(&side.header).unwrap();
-    let prep = prepare_header_rewind(&hub, &[side.block_hash()], 1)
+    let prep = prepare_now(&hub, &[side.block_hash()], 1)
         .unwrap()
         .expect("depth equal to the cap still rewinds");
     assert!(prep.rewound);

@@ -734,28 +734,13 @@ pub struct RewindPrep {
 
 /// Store side of a rewind: parent lookup and the confirmed-tip disconnect.
 /// No `IbdWorkState` borrow, so the coordination lock is not held.
-#[doc(hidden)]
-pub fn prepare_header_rewind(
-    hub: &ChainHub,
-    path: &[BlockHash],
-    max_depth: u32,
-) -> Result<Option<RewindPrep>, NetError> {
-    let Some((lca, lca_h, tip_h)) = rewind_target(hub, path, max_depth)? else {
-        return Ok(None);
-    };
-    if tip_h > lca_h && !hub.try_rewind_to_height(lca_h)? {
-        return Ok(None);
-    }
-    Ok(Some(finish_header_rewind(hub, path, lca, lca_h, tip_h)))
-}
-
+///
 /// A rewind whose selection measured `tip_before`. The tip commit is held
 /// while the tip is compared to it and the disconnect runs, so confirm cannot
 /// extend the chain the fork was measured against in between. A moved tip
-/// selects again on a later turn instead. The plant branch has no disconnect
-/// to pin; it is the only recheck for [`apply_header_rewind`], whose commit
-/// follows immediately, while the off-lock pass checks again before commit.
-fn prepare_header_rewind_at(
+/// selects again on a later turn instead.
+#[doc(hidden)]
+pub fn prepare_header_rewind_at(
     hub: &ChainHub,
     path: &[BlockHash],
     max_depth: u32,
@@ -904,6 +889,17 @@ pub fn apply_header_rewind(
     let Some(prep) = prepare_header_rewind_at(hub, path, cap, tip_before)? else {
         return Ok(false);
     };
+    // The prepare dropped the tip commit after its disconnect and read the
+    // path's store rows since. Confirm may have extended from the LCA. Hold
+    // the commit across the recheck and the commit so the path is never
+    // planted on a tip the selection did not measure.
+    fire(&AFTER_PREPARE);
+    let Some(_commit) = hub.query.try_lock_tip_commit() else {
+        return Ok(false);
+    };
+    if !rewind_tip_still(hub, &prep, tip_before) {
+        return Ok(false);
+    }
     commit_header_rewind(st, hub, path, &prep);
     Ok(true)
 }
@@ -922,7 +918,7 @@ fn tip_pair(hub: &ChainHub) -> (Option<u32>, Option<BlockHash>) {
     (hub.tip_height(), hub.tip_hash())
 }
 
-/// `prepare_header_rewind` already disconnected when `prep.rewound`. The
+/// `prepare_header_rewind_at` already disconnected when `prep.rewound`. The
 /// commit is for that tip, not whatever tip is current after a later rewind.
 fn rewind_tip_still(
     hub: &ChainHub,
