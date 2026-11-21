@@ -1,6 +1,7 @@
 //! External parent create_fk stamp: in-flight → skeleton → leftover TipOnly.
 //!
-//! IBD load passes a lookup-filled [`BatchParentIds`] and never leftover-probes.
+//! IBD load passes a lookup-filled [`BatchParentIds`]. It reads `tx.head` only
+//! for a parent that neither in-flight nor that skeleton holds.
 //! plan=None / S0 (`skeleton = None`) is in-flight → leftover TipOnly.
 //! One function for S0 plan (`archive_plan_batch_from_wire`) and plan=None
 //! rehydrate. In-flight holds CreatePins until load drops map rows below a
@@ -109,6 +110,9 @@ pub struct ExternalParentStamp {
     pub head_fk_ns: u64,
     pub head_need_n: u64,
     pub head_hit_n: u64,
+    /// IBD: parents in neither in-flight nor the skeleton that `tx.head`
+    /// held. Lookup left them out of its read, so the caller warns.
+    pub from_head: Vec<[u8; 32]>,
 }
 
 impl ExternalParentStamp {
@@ -175,8 +179,9 @@ pub fn external_parent_stamp(need_len: usize) -> ExternalParentStamp {
 
 /// Bind `need` txids: in-flight → skeleton → leftover TipOnly.
 ///
-/// `skeleton = Some` is the IBD path: miss of in-flight and skeleton is
-/// `Corrupt` with no leftover `tx.head` probe. In-flight identity still takes
+/// `skeleton = Some` is the IBD path: the keys in neither in-flight nor the
+/// skeleton are read from `tx.head` once, and one it does not hold either
+/// is `Corrupt` ([`bind_left_out_from_head`]). In-flight identity still takes
 /// skeleton loc when TipOnly already has that create (later wave). Creates
 /// above the wave's snapshot are omitted from the skeleton; those holes stay
 /// for write fill.
@@ -220,11 +225,8 @@ pub fn stamp_external_parents(
         }
         stamp.pin_txid_ns = t_pin_txid.elapsed().as_nanos() as u64;
         if !after_skel.is_empty() {
-            return Err(rbitcoin_store::StoreError::Corrupt(
-                "archive: parent create_fk unresolved (contiguous batch required)",
-            ));
+            bind_left_out_from_head(store, &mut stamp, &after_skel)?;
         }
-        stamp.head_need_n = 0;
         stats.note_pin_txid(stamp.pin_txid_n, stamp.pin_txid_ns);
         stats.note_recent(stamp.recent_n, stamp.recent_ns);
         return Ok(stamp);
@@ -295,6 +297,46 @@ pub fn stamp_external_parents(
 
     fill_missing_parent_ranges(store, in_flight, &mut stamp.idents)?;
     Ok(stamp)
+}
+
+/// IBD: read the parents in neither in-flight nor the skeleton from
+/// `tx.head`, and bind the ones it holds.
+///
+/// Lookup leaves out of its read a prev its undrained-creates table holds.
+/// A tag that table shares with another create can hold a parent that is
+/// already on disk, which in-flight never has. A parent `tx.head` does not
+/// hold either is `parent create_fk unresolved`, as before.
+fn bind_left_out_from_head(
+    store: &Store,
+    stamp: &mut ExternalParentStamp,
+    left_out: &[&[u8; 32]],
+) -> Result<(), QueryError> {
+    let t_head = Instant::now();
+    let keys: Vec<[u8; 32]> = left_out.iter().map(|t| **t).collect();
+    stamp.head_need_n = keys.len() as u64;
+    let mut missed = false;
+    for (txid, row) in store.get_fk_by_txid_batch(&keys)? {
+        let Some((fk, pair)) = row else {
+            missed = true;
+            continue;
+        };
+        stamp.resolved.insert(txid, fk);
+        if let Some(id) = fk.get() {
+            let e = stamp.bind(id, txid);
+            e.body = Some(pair.txout);
+            e.spent = Some(pair.spent);
+            e.n_out = Some(pair.n_out);
+        }
+        stamp.head_hit_n = stamp.head_hit_n.saturating_add(1);
+        stamp.from_head.push(txid);
+    }
+    stamp.head_fk_ns = t_head.elapsed().as_nanos() as u64;
+    if missed {
+        return Err(rbitcoin_store::StoreError::Corrupt(
+            "archive: parent create_fk unresolved (contiguous batch required)",
+        ));
+    }
+    Ok(())
 }
 
 /// Loc body_range and spent_range for stamped create_fks with no in-flight outs.

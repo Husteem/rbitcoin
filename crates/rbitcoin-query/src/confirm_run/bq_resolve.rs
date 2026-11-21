@@ -12,8 +12,9 @@
 
 use super::*;
 use crate::{BatchParentIds, IdMap, ResolvedWire, TxPrecompute, TxidHasher, U32Map, U64Map};
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
+use std::hash::{BuildHasher, BuildHasherDefault};
 use std::sync::Arc;
 
 /// Hard cap on BQ heights in one TipOnly wave (~1 week of 10-minute blocks).
@@ -89,10 +90,13 @@ struct Bucket([u64; BUCKET_SLOTS]);
 /// spends of it are read from `tx.head` as before.
 ///
 /// Two txids with one tag in one bucket answer as one. A prev held that way
-/// is in neither in-flight nor the wave's skeleton.
-pub struct UndrainedCreates {
+/// is in neither in-flight nor the wave's skeleton, and load reads it from
+/// `tx.head` ([`crate::stamp_external_parents`]).
+///
+/// `S` is the keyed hash. A test can give one that collides on purpose.
+pub struct UndrainedCreates<S = RandomState> {
     gen: Option<u32>,
-    hasher: std::collections::hash_map::RandomState,
+    hasher: S,
     /// Empty until the first block is recorded.
     table: Box<[Bucket]>,
     /// A level at or below it is dead.
@@ -103,17 +107,11 @@ pub struct UndrainedCreates {
 
 impl Default for UndrainedCreates {
     fn default() -> Self {
-        Self {
-            gen: None,
-            hasher: std::collections::hash_map::RandomState::new(),
-            table: Box::default(),
-            dead_through: 0,
-            top: 0,
-        }
+        Self::with_hasher(RandomState::new())
     }
 }
 
-impl std::fmt::Debug for UndrainedCreates {
+impl<S> std::fmt::Debug for UndrainedCreates<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UndrainedCreates")
             .field("gen", &self.gen)
@@ -124,10 +122,29 @@ impl std::fmt::Debug for UndrainedCreates {
     }
 }
 
-impl UndrainedCreates {
+impl<S> UndrainedCreates<S> {
+    /// An empty set that places txids with `hasher`.
+    #[doc(hidden)]
+    pub fn with_hasher(hasher: S) -> Self {
+        Self {
+            gen: None,
+            hasher,
+            table: Box::default(),
+            dead_through: 0,
+            top: 0,
+        }
+    }
+
+    /// Heap the set holds: the table, once a block has been recorded.
+    #[doc(hidden)]
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.table)
+    }
+}
+
+impl<S: BuildHasher> UndrainedCreates<S> {
     /// The bucket and the tag of `txid`.
     fn place(&self, txid: &[u8; 32]) -> (usize, u64) {
-        use std::hash::BuildHasher;
         let hash = self.hasher.hash_one(txid);
         ((hash as usize) & (BUCKETS - 1), hash >> LEVEL_BITS)
     }
@@ -143,12 +160,6 @@ impl UndrainedCreates {
             .0
             .iter()
             .any(|&slot| slot >> LEVEL_BITS == tag && slot_level(slot) > self.dead_through)
-    }
-
-    /// Heap the set holds: the table, once a block has been recorded.
-    #[doc(hidden)]
-    pub fn heap_bytes(&self) -> usize {
-        std::mem::size_of_val(&*self.table)
     }
 
     /// Empty the set unless it was filled under re-arm generation `gen`.
@@ -247,7 +258,7 @@ impl WaveKeys {
     /// Move every skipped prev that `skip` no longer holds back into the
     /// need. Returns the inputs still left out.
     #[doc(hidden)]
-    pub fn readmit(&mut self, skip: &UndrainedCreates) -> u32 {
+    pub fn readmit<S: BuildHasher>(&mut self, skip: &UndrainedCreates<S>) -> u32 {
         let mut left_out = 0u32;
         for prev in self.skipped.drain(..) {
             if skip.holds(&prev) {
@@ -381,12 +392,12 @@ pub struct BqResolveWaveStats {
 /// holds) so a later load chunk can bind in-flight. A prev `skip` holds goes
 /// to [`WaveKeys::skipped`], not the need.
 #[doc(hidden)]
-pub fn push_resolve_keys(
+pub fn push_resolve_keys<S: BuildHasher>(
     params: &ChainParams,
     height: u32,
     block: &Block,
     pres: &[TxPrecompute],
-    skip: &UndrainedCreates,
+    skip: &UndrainedCreates<S>,
     keys: &mut WaveKeys,
     n_inputs: u32,
 ) -> Vec<[u8; 32]> {
@@ -427,14 +438,14 @@ pub fn push_resolve_keys(
 /// in-flight remainder is load's job). Connected-only (fence) resolve.
 /// `max_blocks` / `max_inputs` cap emit (remaining loadq). `undrained` is
 /// the calling lookup thread's set, carried from wave to wave.
-pub fn confirm_bq_resolve_wave_capped(
+pub fn confirm_bq_resolve_wave_capped<S: BuildHasher>(
     query: &Query,
     params: &ChainParams,
     milestone: Milestone,
     heights: &[u32],
     max_blocks: usize,
     max_inputs: u32,
-    undrained: &mut UndrainedCreates,
+    undrained: &mut UndrainedCreates<S>,
 ) -> Result<BqResolveWave, ConfirmError> {
     let t0 = Instant::now();
     // The caller read the generation before it selected heights and takes

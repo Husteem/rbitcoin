@@ -611,6 +611,10 @@ pub struct ArchiveWritePlan {
     pub external_parents: crate::U64Map<crate::ParentIdent>,
     /// create_fk_id → spent need-vouts, filled while packing (load pin reuses).
     pub external_parent_vouts: crate::U64Map<Vec<u32>>,
+    /// External parents IBD load read from `tx.head` because neither
+    /// in-flight nor the skeleton held them
+    /// ([`crate::ExternalParentStamp::from_head`]).
+    pub external_from_head: Vec<[u8; 32]>,
     /// Prep-ahead pin material for **this batch's creates**, parallel to
     /// [`Self::planned_fks`]: same [`CreatePin`] Arcs as [`Self::packed`] (refcount
     /// only). Confirm `note_lookup_ok` only `Arc::clone`s into in-flight outs.
@@ -637,6 +641,7 @@ impl ArchiveWritePlan {
             batch_creates: Vec::new(),
             external_parents: crate::U64Map::default(),
             external_parent_vouts: crate::U64Map::default(),
+            external_from_head: Vec::new(),
             batch_pin: Vec::new(),
             index_tx: false,
             body_est: 0,
@@ -843,6 +848,7 @@ impl ArchiveWritePlan {
         other.external_parent_vouts.clear();
         self.external_parents.clear();
         self.external_parent_vouts.clear();
+        self.external_from_head.clear();
 
         let fees_aligned =
             self.tx_fees.len() == self.packed.len() && other.tx_fees.len() == other.packed.len();
@@ -1637,6 +1643,7 @@ impl Query {
         let head_fk_ns = ext.head_fk_ns;
         let resolved = ext.resolved;
         let external_parents = ext.idents;
+        let external_from_head = ext.from_head;
         self.confirm_stats().note_resolve_counts(
             n_headers,
             need_vec.len() as u64,
@@ -1777,6 +1784,7 @@ impl Query {
             batch_creates,
             external_parents,
             external_parent_vouts,
+            external_from_head,
             batch_pin,
             index_tx,
             body_est,

@@ -488,7 +488,8 @@ fn a_height_the_snapshot_has_reached_is_not_held() {
 /// plans it, which puts its create in in-flight. Wave 2 decodes block 2,
 /// which spends that create, and leaves the parent out of its read. Load
 /// binds it to the fk it planned for block 1. Without in-flight the same
-/// need is an unresolved parent: a skipped key binds there or nowhere.
+/// need reads `tx.head`, which block 1 has not reached, so it is an
+/// unresolved parent.
 #[test]
 fn a_skipped_parent_binds_from_in_flight_or_not_at_all() {
     use rbitcoin_query::{
@@ -560,6 +561,125 @@ fn a_skipped_parent_binds_from_in_flight_or_not_at_all() {
             "a skipped parent with no in-flight create bound to {:?}",
             stamp.resolved.get(&parent)
         ),
+    }
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+/// Hashes every txid to one value, so all of them share one bucket and one
+/// tag in the [`UndrainedCreates`] table.
+#[derive(Clone, Copy, Default)]
+struct OneSlot;
+
+impl std::hash::BuildHasher for OneSlot {
+    type Hasher = OneSlot;
+    fn build_hasher(&self) -> OneSlot {
+        OneSlot
+    }
+}
+
+impl std::hash::Hasher for OneSlot {
+    fn finish(&self) -> u64 {
+        0
+    }
+    fn write(&mut self, _bytes: &[u8]) {}
+}
+
+/// A tag shared with a recorded create leaves a parent out of the read
+/// although nothing in the pipeline creates it. Here every txid shares one
+/// slot, so block 2's own creates hide block 1's coinbase, which is
+/// connected and in `tx.head`. Load finds the parent in neither in-flight
+/// nor the skeleton, reads that one key from `tx.head`, binds it there, and
+/// warns with the block, its height, and the prev.
+#[test]
+fn a_forced_tag_collision_reads_the_parent_from_tx_head_and_warns() {
+    use rbitcoin_query::{confirm_wire_lookup_stamp, InFlight, WireLoadPipeline};
+    use std::sync::Arc;
+
+    let (path, q) = tmp_query();
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let parent = b1.txdata[0].compute_txid();
+    let b2 = mine_with_txs(
+        b1.block_hash(),
+        b1.header.time + 600,
+        2,
+        vec![spend_op_true(parent, 0, Amount::from_sat(48_0000_0000))],
+    );
+    q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
+        .unwrap();
+    let on_disk = q
+        .store()
+        .get_fk_by_txid_batch(&[parent.to_byte_array()])
+        .unwrap()[0]
+        .1
+        .map(|(fk, _)| fk)
+        .expect("block 1's coinbase is in tx.head");
+
+    let mut undrained = UndrainedCreates::with_hasher(OneSlot);
+    let wave = confirm_bq_resolve_wave_capped(
+        &q,
+        &params,
+        Milestone::NONE,
+        &[2],
+        BQ_RESOLVE_WAVE_MAX_BLOCKS,
+        BQ_RESOLVE_WAVE_MAX_INPUTS,
+        &mut undrained,
+    )
+    .unwrap();
+    assert_eq!(
+        wave.stats.undrained_skip, 1,
+        "the shared slot hid the parent"
+    );
+    assert!(wave.parent_ids.get(&parent.to_byte_array()).is_none());
+
+    let in_flight = InFlight::new();
+    let pipe = WireLoadPipeline {
+        path_lo: 2,
+        parent_hash: None,
+        next_tx_start: q.tx_body_count().saturating_add(1),
+        in_flight: &in_flight,
+        skeleton: Some(wave.parent_ids.clone()),
+        // IBD load carries every wave item's spend keys.
+        carried_need: wave
+            .items
+            .iter()
+            .flat_map(|(_, _, wire)| wire.spend_keys.iter().copied())
+            .collect(),
+        carried_header_fks: Vec::new(),
+        carried_header_hashes: Vec::new(),
+    };
+    let items = [(Height(2), Arc::new(b2.clone()), None)];
+    rbitcoin_log::capture_logs(true);
+    let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe));
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+
+    let plan = stamped
+        .expect("the parent binds from tx.head")
+        .plan
+        .expect("block 2 is a new body");
+    let spend = plan
+        .edges
+        .values()
+        .flatten()
+        .find(|e| e.vout != u32::MAX)
+        .expect("block 2 spends block 1's coinbase");
+    assert_eq!(spend.create_fk, on_disk);
+    let warns: Vec<&String> = logs
+        .iter()
+        .filter(|(level, _)| *level == rbitcoin_log::Level::Warn)
+        .map(|(_, line)| line)
+        .collect();
+    assert_eq!(warns.len(), 1, "{logs:?}");
+    for part in [
+        b2.block_hash().to_string(),
+        "height 2".to_string(),
+        parent.to_string(),
+    ] {
+        assert!(warns[0].contains(&part), "{part} not in {}", warns[0]);
     }
     let _ = std::fs::remove_dir_all(&path);
 }

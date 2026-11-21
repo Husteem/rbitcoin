@@ -57,7 +57,8 @@
 //! `scriptq` can stay empty. Prefer `lookup_thr busy=` / `thr load=busy/wait=` /
 //! `ready=` + `scriptq_hwm=` (OS-thread occupancy + queue high-water). High
 //! `load_thr stamp=` nests `pack=` (plan HashMap) vs `head=` (leftover TipOnly
-//! `prep_head_fk_ns`). IBD skeleton path keeps `head=` ~0. High `head=` +
+//! `prep_head_fk_ns`). IBD skeleton path keeps `head=` ~0: its one read is a
+//! parent lookup left out that in-flight lacks, and that warns. High `head=` +
 //! `ready>0` + `scriptq=1` ⇒ leftover TipOnly on load, not “scripts hungry.”
 //! High load_recv_wait + ready=0 ⇒ lookup is the pole.
 //!
