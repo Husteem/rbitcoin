@@ -4217,7 +4217,9 @@ impl ChainHub {
     /// [`Self::try_rewind_to_height`] only while the confirmed tip is still
     /// `expect`. The tip commit is taken and the tip compared under it, so a
     /// confirm that moved the tip returns `Ok(false)` without disconnecting.
-    /// The heavier-fork rewind passes the tip its selection measured.
+    /// A concurrent rewind that lowered the tip below `keep_height` is the
+    /// same moved tip, not a protocol error. The heavier-fork rewind passes
+    /// the tip its selection measured.
     pub fn try_rewind_to_height_at(
         &self,
         keep_height: u32,
@@ -4249,6 +4251,12 @@ impl ChainHub {
     ) -> Result<bool, NetError> {
         let tip = self.tip_height().unwrap_or(0);
         if keep_height > tip {
+            // A caller that named the tip it selected treats a tip now below
+            // the LCA as the race it is, not as a bad request. Another rewind
+            // can lower the tip between the selection and this call.
+            if expect.is_some() {
+                return Ok(false);
+            }
             return Err(NetError::Protocol("rewind above tip"));
         }
         // Before the commit lock, same order as `disconnect_to`. This rewind
