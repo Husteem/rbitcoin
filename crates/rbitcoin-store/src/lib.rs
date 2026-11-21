@@ -153,7 +153,9 @@ pub use idx_body_pipeline::run_idx_body_pipeline;
 pub use idx_body_pipeline::{BodyMode as IdxBodyMode, IdxBodyJob, SpendSlotRun};
 pub use index_build_uring::{read_index_window, IndexBlock, IndexHeight, IndexWindow};
 pub use input::InputEdge;
-pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
+pub use int_map::{
+    FkMap, FkSet, SlotMap, SlotSet, StrideHasher, U32Map, U64IdentityHasher, U64Map, U64Set,
+};
 pub use integrity::VERIFY_TIP_BLOCKS;
 pub use io_backend::{ReadIoBackend, WriteIoBackend};
 pub use point_table::PointRecord;

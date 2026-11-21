@@ -9,3 +9,6 @@ Changed
   buckets and locality are unchanged, and puts a multiplied tag in the top
   7. These maps sit on every confirm thread (pins, stamp, structural spend
   checks).
+  The structural spend check's set of `spent.body` slot offsets (8 bytes
+  apart) now uses the spend-delta's stride hasher, which spreads those
+  keys over every bucket instead of one in eight.

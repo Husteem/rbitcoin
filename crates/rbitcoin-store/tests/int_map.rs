@@ -28,6 +28,28 @@ fn u64_identity_hasher_keeps_the_key_low_and_spreads_the_probe_tag() {
     assert_eq!(h3.finish() & LOW_57, 0xabcd_u64);
 }
 
+/// `spent.body` slots are 8 bytes apart. Identity low bits put them in one
+/// bucket of every 8; the stride hasher spreads them and still varies the tag.
+#[test]
+fn stride_hasher_spreads_eight_byte_slots_over_buckets_and_tags() {
+    use std::hash::BuildHasher;
+    let build = std::hash::BuildHasherDefault::<StrideHasher>::default();
+    let mut low = std::collections::HashSet::new();
+    let mut tags = std::collections::HashSet::new();
+    for i in 0..1024u64 {
+        let h = build.hash_one(4096 + 8 * i);
+        low.insert(h & 1023);
+        tags.insert(h >> 57);
+    }
+    assert!(low.len() >= 600, "{} of 1024 low-bit buckets", low.len());
+    assert!(tags.len() >= 120, "{} distinct tags of 128", tags.len());
+
+    let mut seen = SlotSet::default();
+    assert!(seen.insert(4096));
+    assert!(!seen.insert(4096));
+    assert!(seen.insert(4104));
+}
+
 #[test]
 fn u64_identity_hasher_map_roundtrips_pack_scale() {
     // Byte-path mix (Hash trait fallback for non-u64 keys).

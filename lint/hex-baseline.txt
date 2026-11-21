@@ -41,7 +41,6 @@ crates/rbitcoin-store/src/int_map.rs	2
 crates/rbitcoin-store/src/open_address.rs	2
 crates/rbitcoin-store/src/readonly_map.rs	2
 crates/rbitcoin-store/src/scripthash_layout.rs	2
-crates/rbitcoin-store/src/spend_delta.rs	1
 crates/rbitcoin-store/src/store.rs	3
 crates/rbitcoin-store/src/store_secret.rs	2
 crates/rbitcoin-store/src/tx_table/mod.rs	1

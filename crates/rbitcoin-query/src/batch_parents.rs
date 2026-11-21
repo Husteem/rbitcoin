@@ -30,7 +30,7 @@ use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub use rbitcoin_store::{FkMap, FkSet, U32Map, U64Map, U64Set};
+pub use rbitcoin_store::{FkMap, FkSet, SlotSet, U32Map, U64Map, U64Set};
 
 /// Relative offset sentinel: layout unknown for this out.
 pub const SPENDER_REL_UNKNOWN: u32 = u32::MAX;
@@ -1018,7 +1018,7 @@ impl BatchParents {
         edges: impl IntoIterator<Item = (Fk, u32, Fk, u32)>,
     ) -> Result<Vec<(u64, u32, u64, Fk, u32)>, StoreError> {
         let mut out = Vec::new();
-        let mut seen = U64Set::default();
+        let mut seen = SlotSet::default();
         self.spend_abs_jobs_into(edges, &mut out, &mut seen)?;
         Ok(out)
     }
@@ -1029,7 +1029,7 @@ impl BatchParents {
         &self,
         edges: impl IntoIterator<Item = (Fk, u32, Fk, u32)>,
         out: &mut Vec<(u64, u32, u64, Fk, u32)>,
-        seen: &mut U64Set,
+        seen: &mut SlotSet,
     ) -> Result<(), StoreError> {
         for (fk, vout, sfk, vin) in edges {
             if fk.is_null() {
