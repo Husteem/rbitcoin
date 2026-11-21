@@ -3642,6 +3642,13 @@ pub fn framed_cmd(frame: &FramedMessage) -> String {
     String::from_utf8_lossy(&frame.command[..end]).into_owned()
 }
 
+/// A command [`crate::v2::v2_command`] already checked, without the NUL
+/// padding. Borrowed, so the writer does not allocate per frame.
+fn command_str(cmd: &[u8; 12]) -> &str {
+    let end = cmd.iter().position(|&b| b == 0).unwrap_or(12);
+    std::str::from_utf8(&cmd[..end]).unwrap_or("*other*")
+}
+
 #[doc(hidden)]
 pub fn rand_nonce() -> u64 {
     let mut buf = [0u8; 8];
@@ -3725,14 +3732,25 @@ pub async fn run_writer_task(
                 PeerOut::Msg(NetworkMessage::Pong(queued)) => Some(*queued),
                 _ => None,
             };
-            let err = match out {
-                PeerOut::Msg(msg) | PeerOut::Served(msg) => {
-                    writer.write_msg_offload(msg).await.is_err()
+            // A heavy payload encodes on `rbtc-scripts-*`.
+            let contents = match out {
+                PeerOut::Msg(msg) | PeerOut::Served(msg) => crate::v2::encode_v2_payload(msg).await,
+                PeerOut::Encoded(bytes) => Ok(bytes),
+            };
+            let (err, sent) = match contents {
+                Ok(contents) => {
+                    let sent = crate::v2::v2_command(&contents)
+                        .ok()
+                        .map(|(cmd, prefix)| (cmd, contents.len().saturating_sub(prefix)));
+                    (writer.write_contents(contents).await.is_err(), sent)
                 }
-                PeerOut::Encoded(bytes) => writer.write_contents(bytes).await.is_err(),
+                Err(_) => (true, None),
             };
             if let Some(s) = &writer_session {
                 s.note_out_written(serve_slot, n);
+                if let (false, Some((cmd, payload))) = (err, sent) {
+                    s.note_sent(command_str(&cmd), payload as u64);
+                }
             }
             if err {
                 return;

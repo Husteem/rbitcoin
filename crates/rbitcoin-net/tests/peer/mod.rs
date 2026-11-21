@@ -9751,6 +9751,41 @@ fn wire_pongs(wire: &[NetworkMessage]) -> Vec<u64> {
         .collect()
 }
 
+/// `getpeerinfo.bytessent_per_msg` counts what the writer put on the wire,
+/// per command, as payload plus Core's 24-byte header (the same rule as
+/// `bytesrecv_per_msg`). A pre-encoded getdata block counts as `block`.
+#[tokio::test(flavor = "current_thread")]
+async fn writer_counts_bytes_sent_per_message() {
+    let peer = addrfetch_peer();
+    let block = bitcoin::constants::genesis_block(Network::Regtest);
+    let block_len = serialize(&block).len() as u64;
+    let encoded = rbitcoin_net::v2::encode_v2_contents(NetworkMessage::Block(block)).unwrap();
+    let wire = messages_from_writer(
+        &peer,
+        |tx| {
+            tx.send(PeerOut::Msg(NetworkMessage::Ping(7))).unwrap();
+            tx.send(PeerOut::Msg(NetworkMessage::GetData(Vec::new())))
+                .unwrap();
+            tx.send(PeerOut::Msg(NetworkMessage::GetData(Vec::new())))
+                .unwrap();
+            tx.send(PeerOut::Encoded(encoded)).unwrap();
+        },
+        4,
+    )
+    .await;
+    assert_eq!(wire.len(), 4, "every queued message is written: {wire:?}");
+    let sent = peer.snapshot(0).bytessent_per_msg;
+    let want: HashMap<String, u64> = [
+        ("ping", 8 + 24),
+        ("getdata", 2 * (1 + 24)),
+        ("block", block_len + 24),
+    ]
+    .into_iter()
+    .map(|(cmd, n)| (cmd.to_owned(), n))
+    .collect();
+    assert_eq!(sent, want, "bytessent_per_msg after the writer ran");
+}
+
 /// The writer puts the nonce from the queued pong on the wire. A newer
 /// nonce stored on the session is a second pong, after replies that were
 /// already queued past the 64-message batch.

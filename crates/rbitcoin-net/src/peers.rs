@@ -700,14 +700,17 @@ impl LivePeer {
             .or_insert(0) += nbytes;
     }
 
+    /// The session writer calls this once per frame it wrote. A command
+    /// already in the map takes no allocation.
     pub fn note_sent(&self, cmd: &str, nbytes: u64) {
         let n = acct_bytes(cmd, nbytes);
-        *self
-            .sent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(cmd.into())
-            .or_insert(0) += n;
+        let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+        match sent.get_mut(cmd) {
+            Some(total) => *total += n,
+            None => {
+                sent.insert(cmd.to_owned(), n);
+            }
+        }
     }
 
     pub fn request_disconnect(&self) {
