@@ -828,6 +828,7 @@ pub fn forget_walk_peer(st: &mut IbdWorkState, peer: usize) {
     st.header_walk.header_timeout_peers.remove(&peer);
     st.header_walk.header_misses.remove(&peer);
     st.header_walk.asked_tips.remove(&peer);
+    st.header_walk.emptied.remove(&peer);
     if st.header_walk.reserved == Some(peer) {
         st.header_walk.reserved = None;
     }
@@ -2565,9 +2566,11 @@ pub fn note_empty(
     if !st.header_walk.origin || !below_floor(hub, &st.header_walk.tip_work()) {
         return false;
     }
-    if asked.is_some() && asked == st.header_walk.tip_hash() {
+    let counted = asked.is_some() && asked == st.header_walk.tip_hash();
+    let retired = counted && st.header_walk.reserved == Some(peer);
+    if counted {
         st.header_walk.emptied.insert(peer);
-        if st.header_walk.reserved == Some(peer) {
+        if retired {
             st.header_walk.reserved = None;
         }
     }
@@ -2582,7 +2585,11 @@ pub fn note_empty(
     } else {
         tall
     };
-    if alive.is_empty() || alive.iter().any(|id| !st.header_walk.emptied.contains(id)) {
+    let waiting = alive.iter().any(|id| !st.header_walk.emptied.contains(id));
+    if alive.is_empty() || waiting {
+        if retired && waiting {
+            st.header_walk.reserved = pick_header_peer(st, st.header_walk.tip_height(), Some(peer));
+        }
         let _ = send_getheaders(st, hub);
         return true;
     }

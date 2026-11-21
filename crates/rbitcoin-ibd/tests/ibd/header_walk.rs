@@ -397,9 +397,14 @@ fn header_timeouts_move_header_role_without_releasing_block_work() {
     assert_eq!(pick_header_peer(&st, 0, None), Some(0));
     st.header_walk.header_timeout_peers.insert(0);
     st.header_walk.header_misses.insert(0, 1);
+    st.header_walk.emptied.insert(0);
     forget_walk_peer(&mut st, 0);
     assert!(!st.header_walk.header_timeout_peers.contains(&0));
     assert!(!st.header_walk.header_misses.contains_key(&0));
+    assert!(
+        !st.header_walk.emptied.contains(&0),
+        "a reused slot id does not inherit an empty answer"
+    );
 }
 
 #[test]
@@ -5408,6 +5413,38 @@ fn an_empty_reply_below_the_floor_moves_the_ask_to_the_next_taller_peer() {
     );
 }
 
+/// A peer whose advertised height is at the walk tip does not take the ask
+/// from a taller peer that has not answered empty, even when its record
+/// ranks better.
+#[test]
+fn note_empty_prefers_a_taller_peer_over_one_at_the_tip() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-empty-taller");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    floor_above(&mut hub);
+    let (mut first, _rx0) = slot(0);
+    first.peer_height = 10;
+    let (mut second, _rx1) = slot(1);
+    second.peer_height = 10;
+    let (mut level, _rx2) = slot(2);
+    level.peer_height = 1;
+    level.first_data_ms = 10;
+    let mut st = IbdWorkState::new(vec![first, second, level], Some(gen), Some(0));
+    st.header_walk.origin = true;
+    st.header_walk.base_hash = Some(gen);
+    st.header_walk.base_height = 0;
+    st.header_walk.tip.hash = Some(byte_hash(4));
+    st.header_walk.tip.height = 1;
+    st.header_walk.tip.work = Work::from_be_bytes([0; 32]);
+    st.header_walk.reserved = Some(0);
+    assert!(note_empty(&mut st, &hub, 0, Some(byte_hash(4))));
+    assert_eq!(
+        st.header_walk.reserved,
+        Some(1),
+        "the taller peer keeps the ask"
+    );
+}
+
 /// With no checkpoint the walk tip is its base. Every peer answering empty
 /// there does not mark it dead, so a later batch on it extends the walk.
 #[test]
@@ -8652,6 +8689,29 @@ fn hw_pin_a_reserved_peer_who_cannot_head_gives_way() {
         st.header_walk.reserved,
         Some(1),
         "the peer whose ask just expired gives way to a faster one"
+    );
+}
+
+/// An emptied reservation stays when no other peer can head, and gives way
+/// to a taller peer once that peer is askable again.
+#[test]
+fn hw_pin_an_empty_reserved_peer_gives_way_to_a_taller_peer() {
+    let (_dir, _hub, mut st, _gen) = opened("hw-empty-reserved-gives", false);
+    st.header_walk.emptied.insert(0);
+    st.header_walk.reserved = Some(0);
+    st.header_walk.walk_quiet.insert(1);
+    ensure_reserved(&mut st, 0, None);
+    assert_eq!(
+        st.header_walk.reserved,
+        Some(0),
+        "with no other askable peer the empty peer keeps the reservation"
+    );
+    note_block_inv(&mut st, 1);
+    ensure_reserved(&mut st, 0, None);
+    assert_eq!(
+        st.header_walk.reserved,
+        Some(1),
+        "a taller peer that can head again takes the ask"
     );
 }
 
