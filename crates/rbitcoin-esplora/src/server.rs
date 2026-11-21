@@ -27,13 +27,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -1135,6 +1139,142 @@ impl CappedAccept for tokio::net::UnixListener {
     }
 }
 
+/// A pending response write is cancelled after `timeout` without progress.
+/// Reads keep their header/idle deadline; this bounds only the write side, so
+/// a client that stops reading cannot hold the connection and its accept slot
+/// until the process drops it.
+struct WriteDeadline<S> {
+    inner: S,
+    timeout: Duration,
+    armed: bool,
+    sleep: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<S> WriteDeadline<S> {
+    fn new(inner: S, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            armed: false,
+            sleep: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+
+    fn progressed(&mut self) {
+        self.armed = false;
+    }
+
+    fn stalled(&mut self, cx: &mut Context<'_>) -> bool {
+        if !self.armed {
+            self.sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + self.timeout);
+            self.armed = true;
+        }
+        self.sleep.as_mut().poll(cx).is_ready()
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for WriteDeadline<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(result) => {
+                this.progressed();
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                if this.stalled(cx) {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "esplora: response write stalled",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_flush(cx) {
+            Poll::Ready(result) => {
+                this.progressed();
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                if this.stalled(cx) {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "esplora: response flush stalled",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_shutdown(cx) {
+            Poll::Ready(result) => {
+                this.progressed();
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                if this.stalled(cx) {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "esplora: response shutdown stalled",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+/// Serve one accepted socket with the header and response-write deadlines.
+/// Kept apart from the accept loop so its write deadline can be driven over a
+/// duplex stream in tests.
+#[doc(hidden)]
+pub fn serve_http_connection<S>(
+    io: S,
+    app: Router,
+    header_timeout: Duration,
+    write_timeout: Duration,
+) -> impl Future<Output = ()> + Send
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = TowerToHyperService::new(app);
+    async move {
+        let mut http = http1::Builder::new();
+        http.timer(TokioTimer::new())
+            .header_read_timeout(header_timeout);
+        let _ = http
+            .serve_connection(TokioIo::new(WriteDeadline::new(io, write_timeout)), service)
+            .await;
+    }
+}
+
 /// Accepted sockets include requests waiting on the in-flight gate, so this
 /// is above `--esplora-max-inflight`. A connection past it is closed.
 pub fn esplora_accept_cap(max_inflight: usize) -> usize {
@@ -1151,6 +1291,7 @@ fn spawn_capped<L: CappedAccept>(
     app: Router,
     max_conn: usize,
     header_timeout: Duration,
+    write_timeout: Duration,
     shutdown: Arc<EsploraStop>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1191,13 +1332,15 @@ fn spawn_capped<L: CappedAccept>(
                                 drop(io);
                                 continue;
                             };
-                            let service = TowerToHyperService::new(app.clone());
+                            let conn = serve_http_connection(
+                                io,
+                                app.clone(),
+                                header_timeout,
+                                write_timeout,
+                            );
                             conns.0.push(tokio::spawn(async move {
                                 let _permit = permit;
-                                let mut http = http1::Builder::new();
-                                http.timer(TokioTimer::new())
-                                    .header_read_timeout(header_timeout);
-                                let _ = http.serve_connection(TokioIo::new(io), service).await;
+                                conn.await;
                             }));
                         }
                         Err(e) => {
@@ -1437,6 +1580,7 @@ pub async fn run_esplora(
                 app,
                 esplora_accept_cap(max_conn),
                 idle,
+                timeout,
                 shutdown_c,
             );
             Ok(EsploraHandle {
@@ -1460,6 +1604,7 @@ pub async fn run_esplora(
                 app,
                 esplora_accept_cap(max_conn),
                 idle,
+                timeout,
                 shutdown_c,
             );
             Ok(EsploraHandle {

@@ -79,9 +79,11 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   (`--esplora-max-inflight`) and accepted TCP at 8× that cap. A further
   TCP connection is closed.
   A connection that never sends headers is closed at the idle timeout. A
-  request that finds the in-flight cap full waits. That wait counts against
-  the request timeout and the answer is then 408 (`admit_connection`,
-  `TimeoutLayer`). Health, Esplora, Electrum, and inbound P2P leave a
+  response write that makes no progress is cancelled at the request timeout,
+  so a client that stops reading cannot hold its socket. A request that finds
+  the in-flight cap full waits. That wait counts against the request timeout
+  and the answer is then 408 (`admit_connection`, `TimeoutLayer`). Health,
+  Esplora, Electrum, and inbound P2P leave a
   descriptor reserve so the store and RPC can still open files. That reserve
   is Unix; Windows does not count descriptors and does not apply it. The numbers are
   [`docs/operator/interfaces.md`](docs/operator/interfaces.md). Esplora is

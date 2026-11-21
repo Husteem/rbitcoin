@@ -44,6 +44,30 @@ fn esplora_accept_cap_stays_inside_the_semaphore() {
     );
 }
 
+/// A client that stops reading a response cannot hold the connection. The
+/// write deadline cancels the response once it makes no progress. A duplex
+/// stream with a small buffer stalls the write without a large body.
+#[tokio::test]
+async fn stalled_response_write_is_cancelled() {
+    let (server, mut client) = tokio::io::duplex(64);
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let app = Router::new().route("/", get(|| async { "ok" }));
+    let task = tokio::spawn(serve_http_connection(
+        server,
+        app,
+        Duration::from_secs(30),
+        Duration::from_millis(50),
+    ));
+    let joined = tokio::time::timeout(Duration::from_secs(2), task).await;
+    assert!(
+        joined.is_ok(),
+        "a response write that made no progress held the connection"
+    );
+}
+
 /// Esplora caps accepted TCP sockets, not only in-flight requests, and closes
 /// a connection that never sends headers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
