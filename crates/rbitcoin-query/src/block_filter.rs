@@ -5,8 +5,9 @@
 //! `input.body` parent edges), so heights below a seqsigwit prune still build.
 //! The watermark is the last committed height.
 
-use bitcoin::bip158::{BlockFilter, FilterHash, FilterHeader, GcsFilterWriter};
-use bitcoin::hashes::Hash;
+use bitcoin::bip158::{BitStreamWriter, BlockFilter, FilterHash, FilterHeader};
+use bitcoin::consensus::encode::{Encodable, VarInt};
+use bitcoin::hashes::{siphash24, Hash};
 use bitcoin::{Block, OutPoint};
 use rbitcoin_primitives::{le_u64, Fk, Height};
 use rbitcoin_store::{
@@ -103,6 +104,11 @@ pub fn basic_filter_from_scripts<'a>(
 }
 
 /// GCS-encode a basic filter keyed by `block_hash` (internal byte order).
+///
+/// The same bytes as rust-bitcoin's `GcsFilterWriter`, which copies every
+/// element into an ordered set. Here elements stay borrowed: each is keyed by
+/// its SipHash, sorted by (hash, bytes), and deduplicated on equal bytes. The
+/// range map is monotonic in the hash, so the mapped values come out sorted.
 #[doc(hidden)]
 pub fn encode_basic_filter<'a>(
     block_hash: &[u8; 32],
@@ -110,15 +116,43 @@ pub fn encode_basic_filter<'a>(
 ) -> Result<BlockFilter, QueryError> {
     let k0 = le_u64!(block_hash, 0);
     let k1 = le_u64!(block_hash, 8);
-    let mut content = Vec::new();
-    let mut writer = GcsFilterWriter::new(&mut content, k0, k1, BASIC_FILTER_M, BASIC_FILTER_P);
-    for e in elements {
-        writer.add_element(e);
-    }
-    writer
-        .finish()
+    let mut keyed: Vec<(u64, &[u8])> = elements
+        .filter(|e| !e.is_empty())
+        .map(|e| (siphash24::Hash::hash_to_u64_with_keys(k0, k1, e), e))
+        .collect();
+    keyed.sort_unstable();
+    keyed.dedup();
+    let content = golomb_rice_set(keyed.iter().map(|(hash, _)| *hash), keyed.len())
         .map_err(|_| StoreError::Corrupt("invariant: blockfilter encode"))?;
-    Ok(BlockFilter::new(&content))
+    Ok(BlockFilter { content })
+}
+
+/// Count, then the Golomb-Rice deltas of `sorted` hashes mapped to `[0, n·M)`.
+fn golomb_rice_set(
+    sorted: impl Iterator<Item = u64>,
+    n: usize,
+) -> Result<Vec<u8>, bitcoin::io::Error> {
+    let nm = u128::from(n as u64 * BASIC_FILTER_M);
+    let p = BASIC_FILTER_P;
+    let mut content = Vec::with_capacity(9 + n * (usize::from(p) + 2) / 8);
+    VarInt::from(n).consensus_encode(&mut content)?;
+    let mut bits = BitStreamWriter::new(&mut content);
+    let mut last = 0u64;
+    for hash in sorted {
+        let mapped = ((u128::from(hash) * nm) >> 64) as u64;
+        let delta = mapped - last;
+        let mut q = delta >> p;
+        while q > 0 {
+            let run = q.min(64);
+            bits.write(u64::MAX, run as u8)?;
+            q -= run;
+        }
+        bits.write(0, 1)?;
+        bits.write(delta, p)?;
+        last = mapped;
+    }
+    bits.flush()?;
+    Ok(content)
 }
 
 impl Query {
