@@ -1,3 +1,4 @@
+use crate::Admit;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{
@@ -612,7 +613,7 @@ fn conflicting_mempool_spend_leaves_with_the_block() {
     let live = spend(Sequence::ENABLE_RBF_NO_LOCKTIME.to_consensus_u32());
     let in_block = spend(Sequence::MAX.to_consensus_u32());
     let live_id = live.compute_txid();
-    mp.accept_tx(&live).expect("mature coinbase spend");
+    mp.admit(&live).expect("mature coinbase spend");
     assert!(mp.contains(&live_id));
     let prev = hub.tip_hash().unwrap();
     let time = hub.tip_header().unwrap().time.saturating_add(1);
@@ -799,7 +800,8 @@ async fn confirmed_private_broadcast_is_not_sent_again_before_the_pool_is_mainta
     hub.confirm_empty_regtest(101).unwrap();
     let local = mature_spend_tx(&hub, 1);
     let txid = local.compute_txid();
-    mp.accept_tx_from(&local, rbitcoin_net::TxOrigin::Local)
+    mp.accept_tx_from_async(local.clone(), rbitcoin_net::TxOrigin::Local)
+        .await
         .expect("local");
     assert_eq!(mp.next_isolated().await.0, txid);
     mp.isolated_sent(&txid);
@@ -979,7 +981,7 @@ fn chain_hub_prefill_and_version() {
         "tx absent from mempool rides the generate announce"
     );
     let live = mature_spend_tx(&hub, 2);
-    mp.accept_tx(&live).expect("in mempool");
+    mp.admit(&live).expect("in mempool");
     let hashes = hub.generate_to_script(1, op_true(), vec![live]).unwrap();
     assert_eq!(
         hub.cmpct_prefill_indexes(&hashes[0]),
@@ -1457,7 +1459,7 @@ fn fresh_tip_accept_maintains_pool_without_peer_relay() {
     assert!(!mp.relay_enabled());
     let spend = mature_spend_tx(&hub, 1);
     let txid = spend.compute_txid();
-    mp.accept_tx(&spend).expect("mature coinbase spend");
+    mp.admit(&spend).expect("mature coinbase spend");
     assert_eq!(mp.live_count(), 1);
     let prev = hub.tip_hash().unwrap();
     let time = hub.tip_header().unwrap().time.saturating_add(1);
@@ -1498,7 +1500,7 @@ fn bulk_confirm_strips_once_the_pool_is_maintained() {
     hub.confirm_empty_regtest(100).unwrap();
     let spend = mature_spend_tx(&hub, 1);
     let txid = spend.compute_txid();
-    mp.accept_tx(&spend).expect("mature coinbase spend");
+    mp.admit(&spend).expect("mature coinbase spend");
     let prev = hub.tip_hash().unwrap();
     let time = hub.tip_header().unwrap().time.saturating_add(1);
     let height = hub.tip_height().unwrap().saturating_add(1);
@@ -3664,7 +3666,7 @@ fn exclusive_sh_handoff_mempool_to_pending() {
         }],
     };
     let spend_id = spend.compute_txid().to_byte_array();
-    mp.accept_tx(&spend).expect("accept spend");
+    mp.admit(&spend).expect("accept spend");
     let in_mp = |mp: &rbitcoin_net::tx_relay::MempoolHub| {
         mp.scripthash_mempool(&sh)
             .iter()
@@ -3783,7 +3785,7 @@ fn invalidate_evicts_immature_coinbase_spend() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    mp.accept_tx(&spend).expect("mature coinbase spend");
+    mp.admit(&spend).expect("mature coinbase spend");
     let child = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -3801,7 +3803,7 @@ fn invalidate_evicts_immature_coinbase_spend() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    mp.accept_tx(&child).expect("child of coinbase spend");
+    mp.admit(&child).expect("child of coinbase spend");
     assert_eq!(mp.live_count(), 2);
 
     // QueryUtxoProvider must see a coinbase at height 1 (same path evict uses).
@@ -6283,9 +6285,9 @@ fn review_trust_local_block_rechecks_marked_script() {
     let mp = attach_mp(dir.path(), &hub);
     let session = 7u64;
     mp.set_trusted_session(Some(session));
-    mp.accept_tx_from(&bad, rbitcoin_net::TxOrigin::Relay(Some(session)))
+    mp.admit_from(&bad, rbitcoin_net::TxOrigin::Relay(Some(session)))
         .expect("trusted script admit");
-    mp.accept_tx(&clean).expect("clean spend");
+    mp.admit(&clean).expect("clean spend");
     assert!(mp.lock_read().trust_kept.contains(&bad_id));
 
     let (_, skip) = mp.tip_script_pres(&[bad.clone(), clean.clone()]);
@@ -6619,7 +6621,7 @@ fn async_generate_commits_mined_txids_off_the_request_task() {
     assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
     let tx = mature_spend_tx(&hub, 1);
     let txid = tx.compute_txid();
-    mp.accept_tx(&tx).expect("admit");
+    mp.admit(&tx).expect("admit");
     assert!(mp.contains(&txid));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -6660,7 +6662,7 @@ fn dropped_generate_still_commits_mined_txids() {
     assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
     let tx = mature_spend_tx(&hub, 1);
     let txid = tx.compute_txid();
-    mp.accept_tx(&tx).expect("admit");
+    mp.admit(&tx).expect("admit");
     let before = hub.tip_height().unwrap();
     hub.pause_before_generate_commit
         .store(true, Ordering::Release);

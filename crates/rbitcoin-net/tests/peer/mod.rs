@@ -1,3 +1,4 @@
+use crate::Admit;
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
@@ -3496,7 +3497,7 @@ fn resent_parked_tx_is_not_validated_again() {
         OutPoint::new(parent.compute_txid(), 0),
         50_0000_0000 - 20_000,
     );
-    mp.accept_tx_from(&parent, rbitcoin_net::tx_relay::TxOrigin::Local)
+    mp.admit_from(&parent, rbitcoin_net::tx_relay::TxOrigin::Local)
         .expect("the parent pays for itself");
     assert!(mp.lock_write().orphanage.insert_from(
         child.clone(),
@@ -3574,7 +3575,7 @@ fn resent_parked_tx_is_not_validated_again() {
         "a resent orphan adds no announcer"
     );
 
-    mp.accept_tx_from(&child, rbitcoin_net::tx_relay::TxOrigin::Local)
+    mp.admit_from(&child, rbitcoin_net::tx_relay::TxOrigin::Local)
         .expect("a local submit ignores the orphanage");
     assert_eq!(announcers(&child), vec![4], "still parked");
     rbitcoin_log::capture_logs(true);
@@ -3640,7 +3641,7 @@ fn inv_of_a_pooled_tx_that_is_also_parked_is_not_requested() {
     let child_bad = spend(pout, 50_0000_0000 - 20_000, Witness::from_slice(&[[1u8]]));
     for tx in [&child, &child_bad] {
         let err = mp
-            .accept_tx_from(tx, rbitcoin_net::tx_relay::TxOrigin::Relay(Some(4)))
+            .admit_from(tx, rbitcoin_net::tx_relay::TxOrigin::Relay(Some(4)))
             .unwrap_err();
         assert!(
             matches!(err, rbitcoin_mempool::AcceptError::Orphaned { .. }),
@@ -7615,7 +7616,7 @@ async fn tx_inv_over_one_thousand_is_two_messages() {
             }],
         };
         mempool
-            .accept_tx(&child)
+            .admit(&child)
             .unwrap_or_else(|e| panic!("accept vout {vout}: {e}"));
     }
     let peers = rbitcoin_net::peers::PeerHub::new();
@@ -9381,7 +9382,7 @@ fn headers_poll_expires_a_stale_tx_off_the_tokio_worker() {
         }],
     };
     let tid = tx.compute_txid();
-    mp.accept_tx(&tx).expect("admit");
+    mp.admit(&tx).expect("admit");
     assert_eq!(mp.live_count(), 1);
     mp.set_expiry_hours(1);
     mp.note_mock_now(mp.relay_now_secs() + 3600 + 5);

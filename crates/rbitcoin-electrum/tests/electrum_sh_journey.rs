@@ -1,3 +1,4 @@
+use crate::Admit;
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::script::ScriptBuf;
@@ -852,7 +853,7 @@ pub async fn electrum_sh_join() {
     let hub = MempoolHub::open(dir.join("mempool"), Arc::clone(&q)).unwrap();
     hub.set_relay_enabled(true);
     for (i, cbtxid) in coinbase_txids.iter().enumerate() {
-        hub.accept_tx(&spend_coinbase(*cbtxid, 1_000 + i as u64))
+        hub.admit(&spend_coinbase(*cbtxid, 1_000 + i as u64))
             .expect("accept spend");
     }
     listunspent_skips_unused(&q, &hub, &coinbase_txids[0]).await;
@@ -896,8 +897,8 @@ async fn unconfirmed_until_sh_visible() {
     let spend_b = spend_coinbase(cbs[1], FEE_B);
     let id_a = spend_a.compute_txid().to_byte_array();
     let id_b = spend_b.compute_txid().to_byte_array();
-    hub.accept_tx(&spend_a).expect("accept blink spend");
-    hub.accept_tx(&spend_b).expect("accept covered spend");
+    hub.admit(&spend_a).expect("accept blink spend");
+    hub.admit(&spend_b).expect("accept covered spend");
 
     let sh = rbitcoin_store::script_hash(&[0x51]);
     let hex_a = rbitcoin_primitives::display_hash_hex(id_a);
@@ -1085,7 +1086,7 @@ async fn unconfirmed_until_sh_visible() {
     let pay = tx_spending(cbs[2], pay_value, &pay_script);
     let id_pay = pay.compute_txid().to_byte_array();
     let hex_pay = rbitcoin_primitives::display_hash_hex(id_pay);
-    hub.accept_tx(&pay).expect("accept foreign-script payment");
+    hub.admit(&pay).expect("accept foreign-script payment");
     let height_pay = height_a + 1;
     let block_pay = connect_spend(
         block_a.block_hash(),
@@ -1124,7 +1125,7 @@ async fn unconfirmed_until_sh_visible() {
     let child = tx_spending(bitcoin::Txid::from_byte_array(id_b), child_value, &[0x51]);
     let id_child = child.compute_txid().to_byte_array();
     let hex_child = rbitcoin_primitives::display_hash_hex(id_child);
-    hub.accept_tx(&child)
+    hub.admit(&child)
         .expect("accept spend of a covered parent that is still in the pool");
     let height_child = height_pay + 1;
     let _block_child = connect_spend(
@@ -1193,7 +1194,7 @@ async fn pooled_unspendable_output_is_not_unspent() {
         value: Amount::from_sat(BURN),
         script_pubkey: ScriptBuf::from_bytes(burn_script.clone()),
     });
-    hub.accept_tx(&tx).expect("accept burn");
+    hub.admit(&tx).expect("accept burn");
 
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
     let (handle, mut stream) = electrum_tcp_client(&q, cfg, Some(Arc::clone(&hub))).await;

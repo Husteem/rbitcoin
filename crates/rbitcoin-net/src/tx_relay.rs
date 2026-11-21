@@ -683,7 +683,7 @@ pub struct RecentAccept {
     pub value_sat: u64,
 }
 
-/// Who handed a tx to [`MempoolHub::accept_tx_from`].
+/// Who handed a tx to [`MempoolHub::accept_tx_from_async`].
 ///
 /// A `Local` admit is marked local origin under the write lock that commits
 /// it, so with isolated broadcast on no session can see the tx live, in the
@@ -2746,10 +2746,6 @@ impl MempoolHub {
         id != u64::MAX && id == self.trusted_session.load(Ordering::Relaxed)
     }
 
-    pub fn accept_tx(&self, tx: &Transaction) -> Result<AcceptResult, AcceptError> {
-        self.accept_tx_from(tx, TxOrigin::Relay(None))
-    }
-
     /// Sync [`Self::accept_test_package_member_async`].
     pub fn accept_test_package_member(
         &self,
@@ -2764,22 +2760,6 @@ impl MempoolHub {
             AcceptPath::TestPackageMember,
             &[],
         )
-    }
-
-    /// Accept from `origin`. A relayed tx that parks records its peer as an
-    /// orphan announcer.
-    pub fn accept_tx_from(
-        &self,
-        tx: &Transaction,
-        origin: TxOrigin,
-    ) -> Result<AcceptResult, AcceptError> {
-        crate::reactor::assert_not_reactor("mempool accept");
-        let result =
-            self.accept_with_utxo(tx, &self.utxo_provider(), origin, AcceptPath::Relay, &[]);
-        if let (TxOrigin::Local, Ok(r)) = (origin, &result) {
-            self.kick_isolated_if_live(&[r.txid]);
-        }
-        result
     }
 
     /// Admit one `submitpackage` member, local origin, without trimming and
@@ -4023,8 +4003,7 @@ impl MempoolHub {
     /// Accept without holding a Tokio blocking thread across script verify.
     ///
     /// Prepare and commit run on `rbtc-off-pool`. Scripts are awaited here via
-    /// [`rbitcoin_consensus::verify_tx_scripts_unconfirmed_cpu`]. Sync [`Self::accept_tx_from`]
-    /// stays for stack hubs, Electrum `broadcast_raw_tx`, and tests. This is relay origin;
+    /// [`rbitcoin_consensus::verify_tx_scripts_unconfirmed_cpu`]. This is relay origin;
     /// RPC and the other local APIs pass [`TxOrigin::Local`].
     pub async fn accept_tx_async(
         self: &Arc<Self>,

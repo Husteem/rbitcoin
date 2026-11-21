@@ -164,7 +164,7 @@ async fn blocksonly_sendraw_invs_inbound(
 ) {
     let mp = hub.mempool().unwrap();
     let mut ann_rx = mp.subscribe_announces();
-    mp.accept_tx(tx).expect("sendraw accept");
+    mp.admit(tx).expect("sendraw accept");
     assert_eq!(
         ann_rx.try_recv().expect("accept publishes announce").txid,
         tx.compute_txid()
@@ -359,7 +359,7 @@ fn relay_on_purges_confirmed(hub: &rbitcoin_net::chain::ChainHub, confirmed: Vec
 /// `force_announce_txid` INVs only to a full-relay peer that asked for txs,
 /// has a writer, has not seen the wtx, and whose feefilter the tx clears. Isolated
 /// broadcast keeps a local-origin tx off standing peers until it confirms.
-fn force_announce_picks_peers(
+async fn force_announce_picks_peers(
     hub: &rbitcoin_net::chain::ChainHub,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
     heights: [u32; 3],
@@ -390,7 +390,7 @@ fn force_announce_picks_peers(
     let mut ok_rx = writer_of(&ok);
 
     rbitcoin_net::force_announce_txid(hub, peers, missing);
-    mp.accept_tx(&relayed).expect("accept");
+    mp.admit(&relayed).expect("accept");
     seen.note_announced_wtx(relayed.compute_wtxid());
     rbitcoin_net::force_announce_txid(hub, peers, relayed.compute_txid());
     assert!(block_relay_rx.try_recv().is_err(), "block-relay skips INV");
@@ -499,9 +499,10 @@ fn force_announce_picks_peers(
     );
 
     mp.set_isolated_broadcast(true);
-    mp.accept_tx_from(&local, rbitcoin_net::TxOrigin::Local)
+    mp.accept_tx_from_async(local.clone(), rbitcoin_net::TxOrigin::Local)
+        .await
         .expect("local");
-    mp.accept_tx(&from_p2p).expect("p2p");
+    mp.admit(&from_p2p).expect("p2p");
     rbitcoin_net::force_announce_txid(hub, peers, local.compute_txid());
     assert!(
         ok_rx.try_recv().is_err(),
@@ -556,7 +557,8 @@ async fn returned_tx_ends_the_private_broadcast(
         let echo = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
         let other = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
         let mut other_rx = writer_of(&other);
-        mp.accept_tx_from(&local, rbitcoin_net::TxOrigin::Local)
+        mp.accept_tx_from_async(local.clone(), rbitcoin_net::TxOrigin::Local)
+            .await
             .expect("local");
         let submitted = mp.relay_now_secs();
 
@@ -760,7 +762,7 @@ fn relay_on_inbound_age_gate(
     let block_only = peer_with_relay(peers, [127, 0, 0, 1], Inbound, false);
     let txs: Vec<_> = heights.map(|h| spend_coinbase(hub, h)).collect();
     for tx in &txs {
-        mp.accept_tx(tx).expect("accept");
+        mp.admit(tx).expect("accept");
     }
     mp.note_unbroadcast(txs[0].compute_txid());
     let late = relay_peer(peers, [127, 0, 0, 1], Inbound);
@@ -852,8 +854,8 @@ async fn getdata_until_announced_or_reorg(
     let mp = hub.mempool().unwrap();
     set_relay_clock(hub, peers, now);
     let [old_a, old_b, disconnected, fresh] = heights.map(|h| spend_coinbase(hub, h));
-    mp.accept_tx(&old_a).expect("old_a");
-    mp.accept_tx(&old_b).expect("old_b");
+    mp.admit(&old_a).expect("old_a");
+    mp.admit(&old_b).expect("old_b");
     let stale = hub
         .generate_to_script(1, op_true(), vec![disconnected.clone()])
         .unwrap()[0];
@@ -888,7 +890,7 @@ async fn getdata_until_announced_or_reorg(
         other => panic!("announced tx must serve, got {other:?}"),
     }
 
-    mp.accept_tx(&fresh).expect("fresh sendraw");
+    mp.admit(&fresh).expect("fresh sendraw");
     mp.note_unbroadcast(fresh.compute_txid());
     sess.request_tx_inv();
     queue_due_tx_invs(hub, sess.as_ref(), &CappedSet::new(), &out_tx);
@@ -993,7 +995,7 @@ async fn orphan_parks_then_asks_missing_parent(
         getdata_txs(&mut out_rx).is_empty(),
         "NONPREF alone must not GETDATA by txid"
     );
-    mp.accept_tx(&parent_arrives).expect("parent arrives");
+    mp.admit(&parent_arrives).expect("parent arrives");
     set_relay_clock(hub, peers, now + 4);
     push(hub, &out_tx, &mut follow, Some(spy.as_ref()), NetworkMessage::Ping(3)).await;
     assert_eq!(
@@ -1041,7 +1043,7 @@ fn peer_blocksonly_and_orphan_tx() {
         getdata_type0_then_tip_block(&hub, &peers).await;
 
         relay_on_purges_confirmed(&hub, vec![sendraw, whitelisted]);
-        force_announce_picks_peers(&hub, &peers, [3, 4, 5]);
+        force_announce_picks_peers(&hub, &peers, [3, 4, 5]).await;
         relay_on_inbound_age_gate(&hub, &peers, t0 + 100, 6..=21);
         getdata_until_announced_or_reorg(&hub, &peers, t0 + 200, [22, 23, 24, 25]).await;
         orphan_parks_then_asks_missing_parent(&hub, &peers, t0 + 600, 26).await;

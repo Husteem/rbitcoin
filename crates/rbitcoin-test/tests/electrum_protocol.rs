@@ -1,5 +1,6 @@
 //! Electrum protocol fixtures against a local server + mature regtest chain.
 
+use crate::Admit;
 use bitcoin::hashes::Hash;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_electrum::{electrum_scripthash_hex, run_electrum, ElectrumConfig, TipNotify};
@@ -532,7 +533,7 @@ async fn mempool_status_matches_history_row_order(
             script_pubkey: spk,
         }],
     };
-    hub.accept_tx(&tx).expect("mempool accept");
+    hub.admit(&tx).expect("mempool accept");
     let sh = electrum_scripthash_hex(&[0x51]);
     let hist = rpc(
         stream,
@@ -1325,7 +1326,7 @@ async fn electrum_mempool_notify_follows_funding_and_rbf_on() {
         pays(&watched, 20_0000_0000),
         pays(&watched, 29_9999_0000),
     ]);
-    mp.accept_tx(&first).expect("accept first");
+    mp.admit(&first).expect("accept first");
     let push = read_notify(&mut stream, "outpoint spend").await;
     assert_eq!(push, coin_spent_by(&first));
     let push = read_notify(&mut stream, "funded scripthash").await;
@@ -1339,7 +1340,7 @@ async fn electrum_mempool_notify_follows_funding_and_rbf_on() {
     // replaced_scripthashes, and its status must be pushed again.
     let other = ScriptBuf::from_bytes(vec![0x53]);
     let replacement = spend(vec![pays(&other, 49_9990_0000)]);
-    mp.accept_tx(&replacement).expect("accept replacement");
+    mp.admit(&replacement).expect("accept replacement");
     let push = read_notify(&mut stream, "outpoint replacer").await;
     assert_eq!(push, coin_spent_by(&replacement));
     let push = read_notify(&mut stream, "victim scripthash").await;
@@ -1554,7 +1555,7 @@ async fn electrum_leftover_mempool_does_not_double_count() {
             script_pubkey: spk.clone(),
         }],
     };
-    mp.accept_tx(&parent).expect("accept");
+    mp.admit(&parent).expect("accept");
     mp.set_relay_enabled(false);
 
     let blk = rbitcoin_consensus::mine_regtest_paying(

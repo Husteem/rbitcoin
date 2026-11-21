@@ -1,3 +1,4 @@
+use crate::Admit;
 use bitcoin::absolute::LockTime;
 use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds, ShortId};
 use bitcoin::block::Header;
@@ -867,7 +868,7 @@ fn cmpct_wtxid_shortid_collision_held_fork_journey() {
         rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
     assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
     assert!(matches!(
-        mp.accept_tx(&collider),
+        mp.admit(&collider),
         Err(rbitcoin_net::AcceptError::Orphaned { .. })
     ));
     let owned = mp

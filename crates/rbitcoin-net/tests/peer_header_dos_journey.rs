@@ -3448,7 +3448,7 @@ async fn bad_pow_cmpct_scores_and_asks_for_nothing() {
         }],
     };
     let spend_id = spend.compute_txid();
-    mp.accept_tx(&spend).expect("mature coinbase spend");
+    mp.admit(&spend).expect("mature coinbase spend");
     let prev = hub.tip_hash().unwrap();
     let time = hub.tip_header().unwrap().time.saturating_add(1);
     let height = hub.tip_height().unwrap().saturating_add(1);

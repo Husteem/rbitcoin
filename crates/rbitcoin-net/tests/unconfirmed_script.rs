@@ -7,6 +7,7 @@
 //! hash type each time is what reaches it, so these scripts push a different
 //! hash type per CHECKSIG.
 
+use crate::Admit;
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::transaction::Version;
@@ -181,7 +182,7 @@ fn admit_rejects_codeseparator_and_legacy_sighash_work_block_connect_accepts() {
     let codesep_cb = coinbase_at(&hub, 1);
     let codesep_spend = spend(&codesep_cb, ScriptBuf::new());
     let err = mp
-        .accept_tx(&codesep_spend)
+        .admit(&codesep_spend)
         .expect_err("constant scriptCode rejects OP_CODESEPARATOR");
     assert!(err.to_string().contains("OP_CODESEPARATOR"), "admit: {err}");
     assert_eq!(rbitcoin_net::peer::tx_reject_ban_score(&err), 0);
@@ -199,7 +200,7 @@ fn admit_rejects_codeseparator_and_legacy_sighash_work_block_connect_accepts() {
     let under = wide_spend(&[coinbase_at(&hub, 2)], &sig, WIDE_OUTPUTS);
     let under_cost = CHECKS * preimage_len(&under, spk.as_bytes());
     assert!(under_cost < MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES);
-    mp.accept_tx(&under)
+    mp.admit(&under)
         .expect("99 legacy sighashes of one input stay under the cap");
     assert!(mp.contains(&under.compute_txid()));
 
@@ -211,7 +212,7 @@ fn admit_rejects_codeseparator_and_legacy_sighash_work_block_connect_accepts() {
         5 * CHECKS * preimage_len(&over, spk.as_bytes()) > MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES
     );
     let err = mp
-        .accept_tx(&over)
+        .admit(&over)
         .expect_err("repeated full-tx legacy sighashes exceed the cap");
     assert!(
         err.to_string().contains("legacy sighash work"),
@@ -321,7 +322,7 @@ fn admit_counts_scriptcode_in_the_budget_and_refuses_other_script_failures() {
     let wide = wide_spend(&coins, &code_sig, outputs);
     assert!(wide.weight().to_wu() <= 400_000);
     let err = mp
-        .accept_tx(&wide)
+        .admit(&wide)
         .expect_err("scriptCode bytes count toward the cap");
     assert!(
         err.to_string().contains("legacy sighash work"),
@@ -330,12 +331,12 @@ fn admit_counts_scriptcode_in_the_budget_and_refuses_other_script_failures() {
     assert_eq!(rbitcoin_net::peer::tx_reject_ban_score(&err), 0);
     // Four inputs of the same script and body are inside it.
     let four = wide_spend(&coins[..4], &code_sig, outputs);
-    mp.accept_tx(&four).expect("four inputs stay under the cap");
+    mp.admit(&four).expect("four inputs stay under the cap");
     assert!(mp.contains(&four.compute_txid()));
 
     let deleted = spend(&coinbase_at(&hub, 6), delete_sig);
     let err = mp
-        .accept_tx(&deleted)
+        .admit(&deleted)
         .expect_err("a signature inside scriptCode is policy");
     assert!(
         err.to_string().contains("SIG_FINDANDDELETE"),
@@ -345,7 +346,7 @@ fn admit_counts_scriptcode_in_the_budget_and_refuses_other_script_failures() {
 
     let failed = spend(&coinbase_at(&hub, 7), ScriptBuf::new());
     let err = mp
-        .accept_tx(&failed)
+        .admit(&failed)
         .expect_err("a false script is still a script failure");
     assert_eq!(rbitcoin_net::peer::tx_reject_ban_score(&err), 10, "{err}");
     let _ = std::fs::remove_dir_all(dir);
@@ -464,8 +465,7 @@ fn admit_accepts_p2sh_multisig_spends_of_any_input_count_and_hash_types() {
             tx.input[i].script_sig = ScriptBuf::from_bytes(script_sig);
         }
         assert!(tx.weight().to_wu() <= 400_000, "{n} inputs");
-        mp.accept_tx(&tx)
-            .unwrap_or_else(|e| panic!("{n} inputs: {e}"));
+        mp.admit(&tx).unwrap_or_else(|e| panic!("{n} inputs: {e}"));
         assert!(mp.contains(&tx.compute_txid()), "{n} inputs");
         first += n;
     }

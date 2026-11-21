@@ -833,7 +833,7 @@ pub fn amount_sat_from_json(v: &Value) -> Result<u64, Value> {
 }
 
 /// RPC-submit `maxfeerate` (Core BTC/kvB) as sat/kvB. Omitted → 0.10 BTC/kvB.
-/// `0` → unlimited. `>= 1` BTC/kvB is a parameter error. P2P `accept_tx` does
+/// `0` → unlimited. `>= 1` BTC/kvB is a parameter error. P2P relay admit does
 /// not read this cap.
 #[doc(hidden)]
 pub fn opt_maxfeerate_sat_kvb(params: &RpcParams, index: usize) -> Result<u64, Value> {
