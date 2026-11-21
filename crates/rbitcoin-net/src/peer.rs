@@ -9157,7 +9157,6 @@ pub async fn on_tx(
                     if let Ok(r) = &result {
                         if !mp_task.relay_enabled() {
                             mp_task.note_unbroadcast(r.txid);
-                            mp_task.rebroadcast_unbroadcast();
                             mp_task.notify_inv_flush();
                             if let (Some(h), Some(ph)) = (hub_arc.as_ref(), peers.as_ref()) {
                                 flush_tx_invs(h, ph.as_ref());

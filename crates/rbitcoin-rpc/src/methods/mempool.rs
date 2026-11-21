@@ -1117,11 +1117,11 @@ fn sendraw_after_accept(
         Ok(rbitcoin_net::LocalBroadcast::Admitted) => {
             mp.note_unbroadcast(tx.compute_txid());
             // `-blocksonly`: accept-time announce is skipped (relay off + not
-            // yet unbroadcast). Re-announce after noting so inbound peers INV
-            // (`p2p_blocksonly.py:48`). When relay is on, leave the 30s inbound
-            // age gate alone (`mempool_reorg` / `mempool_unbroadcast`).
+            // yet unbroadcast). `note_unbroadcast` queues the tx again; wake
+            // sessions so inbound peers INV (`p2p_blocksonly.py:48`). When
+            // relay is on, leave the 30s inbound age gate alone
+            // (`mempool_reorg` / `mempool_unbroadcast`).
             if !mp.relay_enabled() {
-                mp.rebroadcast_unbroadcast();
                 mp.notify_inv_flush();
                 if let (Some(peers), Some(chain)) = (ctx.peers.as_ref(), ctx.chain.as_ref()) {
                     rbitcoin_net::flush_tx_invs(chain, peers);

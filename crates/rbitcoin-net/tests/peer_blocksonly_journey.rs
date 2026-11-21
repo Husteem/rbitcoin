@@ -1141,6 +1141,7 @@ async fn rebroadcast_reaches_a_peer_that_joined_after_the_accept() {
 /// the new local tx. The note itself must enqueue it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn note_unbroadcast_requeues_after_a_relay_off_tick() {
+    use rbitcoin_net::inv_bucket::InvDirection;
     use rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("rebroadcast-note");
     hub.ensure_genesis().unwrap();
@@ -1172,6 +1173,11 @@ async fn note_unbroadcast_requeues_after_a_relay_off_tick() {
     );
 
     mp.note_unbroadcast(second.compute_txid());
+    assert_eq!(
+        mp.inv_backlog_len(InvDirection::Inbound),
+        1,
+        "the note queues only the tx just noted, not every unbroadcast tx"
+    );
     queue_due_tx_invs(&hub, peer.as_ref(), &CappedSet::new(), &out);
     assert!(
         tx_invs(&mut rx).contains(&second.compute_txid()),

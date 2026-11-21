@@ -6972,11 +6972,10 @@ impl MempoolHub {
         live.insert(txid);
         persist_unbroadcast_file(&self.dir, &live);
         drop(live);
-        // Relay is off, so the accept-time release was skipped for a peer
-        // that read it before this note. The note itself may wake them now.
-        if !self.relay_enabled() {
-            let _ = self.enqueue_inv_txid(&txid);
-        }
+        // A peer whose own relay flag is off may have read the accept-time
+        // release before this note and skipped it. The note itself queues the
+        // tx again; the backlog dedupe drops a duplicate still pending.
+        let _ = self.enqueue_inv_txid(&txid);
     }
 
     fn kick_isolated(&self, txid: &Txid) {
