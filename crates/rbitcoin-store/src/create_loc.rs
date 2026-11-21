@@ -441,13 +441,13 @@ impl CreateLoc {
         out: &mut [Option<CreateLocPair>],
     ) -> Result<(), StoreError> {
         let win_jobs = &jobs[win.job_lo..win.job_hi];
-        match extract_pairs_no_ovf(win, win_jobs, out) {
-            Ok(()) => Ok(()),
-            Err(ExtractFail::NeedOvf(at)) => {
-                let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
-                extract_pairs_ovf(win, &ovf, win_jobs, out, at)
-            }
+        let mut at = ExtractAt::start(win);
+        while let Err(ExtractFail::NeedOvf(stop)) = extract_pairs_no_ovf(win, win_jobs, out, at) {
+            let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
+            let chunk_end = stop.i.saturating_add(8).min(win.n);
+            at = extract_pairs_ovf(win, &ovf, win_jobs, out, stop, chunk_end)?;
         }
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -581,7 +581,8 @@ impl ExtractAt {
 }
 
 /// The fast decode met an overflow slot. Pairs before `ExtractAt` are
-/// emitted; the overflow decode resumes there.
+/// emitted; the overflow decode takes that chunk, then the fast decode
+/// goes on.
 #[doc(hidden)]
 pub enum ExtractFail {
     NeedOvf(ExtractAt),
@@ -611,7 +612,8 @@ pub fn extract_pairs_ovf(
     jobs: &[(usize, u64)],
     out: &mut [Option<CreateLocPair>],
     from: ExtractAt,
-) -> Result<(), StoreError> {
+    to: usize,
+) -> Result<ExtractAt, StoreError> {
     let buf = &win.buf;
     let n = win.n;
     let win_first = win.win_first;
@@ -625,7 +627,8 @@ pub fn extract_pairs_ovf(
         mut tx,
         mut sp,
     } = from;
-    for i in from_i..n {
+    let to = to.min(n);
+    for i in from_i..to {
         let fk = win_first + i as u64;
         let (st, n_out) = decode_create_pair(buf[i * 2], buf[i * 2 + 1], fk, win_ovf)?;
         let tlen = u64::from(st).saturating_mul(IDX_STRIDE);
@@ -637,7 +640,7 @@ pub fn extract_pairs_ovf(
         tx = tx.saturating_add(tlen);
         sp = sp.saturating_add(slen);
     }
-    Ok(())
+    Ok(ExtractAt { i: to, j, tx, sp })
 }
 
 #[doc(hidden)]
@@ -645,13 +648,16 @@ pub fn extract_pairs_no_ovf(
     win: &LocWinRead,
     jobs: &[(usize, u64)],
     out: &mut [Option<CreateLocPair>],
+    from: ExtractAt,
 ) -> Result<(), ExtractFail> {
     let buf = &win.buf;
     let n = win.n;
-    let mut tx = win.tx0;
-    let mut sp = win.sp0;
-    let mut i = 0usize;
-    let mut j = 0usize;
+    let ExtractAt {
+        mut i,
+        mut j,
+        mut tx,
+        mut sp,
+    } = from;
     while i + 8 <= n {
         let base = i * 2;
         let mut chunk = [0u8; 16];

@@ -659,9 +659,9 @@ fn range_batch_multi_window_matches_serial_and_held() {
     }
 }
 
-/// A window whose fast decode stops at an overflow slot resumes from the
-/// 8-slot chunk it stopped in, not from the window start, and the pairs
-/// match a scalar decode of the whole window.
+/// A window whose fast decode stops at an overflow slot decodes only that
+/// 8-slot chunk with the overflow rows and returns to the fast path. The
+/// pairs match a scalar decode of the whole window.
 #[test]
 fn ovf_window_resumes_where_the_fast_decode_stopped() {
     let n = 40usize;
@@ -686,15 +686,20 @@ fn ovf_window_resumes_where_the_fast_decode_stopped() {
     let jobs: Vec<(usize, u64)> = (0..n).map(|i| (i, 1 + i as u64)).collect();
 
     let mut want = vec![None; n];
-    extract_pairs_ovf(&win, &ovf, &jobs, &mut want, ExtractAt::start(&win)).unwrap();
+    let end = extract_pairs_ovf(&win, &ovf, &jobs, &mut want, ExtractAt::start(&win), n).unwrap();
+    assert_eq!(end.i, n);
     assert_eq!(want[20].unwrap().n_out, 70_000);
 
     let mut got = vec![None; n];
-    let Err(ExtractFail::NeedOvf(at)) = extract_pairs_no_ovf(&win, &jobs, &mut got) else {
+    let Err(ExtractFail::NeedOvf(at)) =
+        extract_pairs_no_ovf(&win, &jobs, &mut got, ExtractAt::start(&win))
+    else {
         panic!("slot 20 needs the overflow rows");
     };
     assert_eq!(at.i, 16, "stopped at the chunk holding slot 20");
     assert!(got[..16].iter().all(Option::is_some));
-    extract_pairs_ovf(&win, &ovf, &jobs, &mut got, at).unwrap();
+    let next = extract_pairs_ovf(&win, &ovf, &jobs, &mut got, at, 24).unwrap();
+    assert_eq!(next.i, 24, "the overflow decode covers one chunk");
+    assert!(extract_pairs_no_ovf(&win, &jobs, &mut got, next).is_ok());
     assert_eq!(got, want);
 }
