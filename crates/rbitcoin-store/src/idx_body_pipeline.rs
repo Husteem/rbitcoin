@@ -78,8 +78,8 @@ pub struct IdxBodyIoStats {
     /// Bytes the body reads asked for. A merged group asks for its whole
     /// page span, holes included.
     pub read_bytes: u64,
-    /// Bytes those reads handed to job bodies. `read_bytes - kept_bytes` is
-    /// what page grouping copied and dropped.
+    /// Bytes of the requested windows. `read_bytes - kept_bytes` is what page
+    /// grouping copied and dropped.
     pub kept_bytes: u64,
 }
 
@@ -92,6 +92,14 @@ pub struct PeekIo {
     pub read_bytes: u64,
     /// Bytes of the requested windows.
     pub kept_bytes: u64,
+}
+
+impl PeekIo {
+    pub fn add(&mut self, other: PeekIo) {
+        self.sqe_n = self.sqe_n.saturating_add(other.sqe_n);
+        self.read_bytes = self.read_bytes.saturating_add(other.read_bytes);
+        self.kept_bytes = self.kept_bytes.saturating_add(other.kept_bytes);
+    }
 }
 
 impl IdxBodyIoStats {

@@ -379,11 +379,14 @@ pub fn structural_run(
     if !reuse.scratch.meta_offs.is_empty() {
         let meta_backend = rbitcoin_store::spend_meta_backend();
         let t_meta = Instant::now();
-        reuse.scratch.meta_prefetch = query
+        let (slots, io) = query
             .store()
             .get_spender_meta_at_abs_batch_backend(&reuse.scratch.meta_offs, meta_backend)
             .map_err(ConfirmError::from)?;
+        reuse.scratch.meta_prefetch = slots;
         let meta_ns = t_meta.elapsed().as_nanos() as u64;
+        crate::note_confirm(&query.confirm_stats().spend_meta_read_bytes, io.read_bytes);
+        crate::note_confirm(&query.confirm_stats().spend_meta_kept_bytes, io.kept_bytes);
         crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
         crate::note_confirm(
             &query.confirm_stats().spend_meta_n,

@@ -5,6 +5,8 @@ Changed
   asked for (a merged group reads its whole page span, holes included);
   `load_cold_range_kept_kb` is what reached the parent jobs. The gap is the
   hole the grouping copied, the number a change to the merge limits needs.
+  The write thread's `spent.body` slot peeks report the same pair as
+  `meta_read_kb` / `meta_kept_kb`.
 - **Merged spend-slot reads reuse the thread's kept buffer.** The write
   thread's `spent.body` peeks allocated and zeroed a fresh buffer for every
   merged group. They now read into the same per-thread bounce pool as the

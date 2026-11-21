@@ -38,6 +38,8 @@ pub type OutsByRangeOut = (
 );
 /// `spent.body` slot: spender fk + flags + vin.
 pub type SpenderSlot = (Fk, u8, u32);
+/// Slots at each asked offset, and what the `spent.body` peeks read.
+pub type SpendMetaRead = (Vec<Option<SpenderSlot>>, crate::idx_body_pipeline::PeekIo);
 
 pub fn parse_rebuild_seal_bits(raw: Option<&str>) -> u32 {
     raw.and_then(|s| s.parse::<u32>().ok())
@@ -604,7 +606,7 @@ pub fn read_spend_peek_chunk(
     body_fd: crate::io_handle::IoHandle,
     body_path: &std::path::Path,
     backend: crate::io_backend::ReadIoBackend,
-) -> Result<(), StoreError> {
+) -> Result<crate::idx_body_pipeline::PeekIo, StoreError> {
     use crate::bulk_io::{self, ReadOp};
     const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
     let mut singles = vec![[0u8; META_LEN]; chunk.len()];
@@ -647,6 +649,14 @@ pub fn read_spend_peek_chunk(
             result: i32::MIN,
         });
     }
+    let io = crate::idx_body_pipeline::PeekIo {
+        sqe_n: ops.len() as u64,
+        read_bytes: ops.iter().map(|op| op.buf.len() as u64).sum(),
+        kept_bytes: chunk
+            .iter()
+            .map(|g| (g.members.len() * META_LEN) as u64)
+            .sum(),
+    };
     bulk_io::pread_batch_backend(&mut ops, backend);
     let results: Vec<i32> = ops.iter().map(|ro| ro.result).collect();
     drop(ops);
@@ -674,7 +684,7 @@ pub fn read_spend_peek_chunk(
         }
     }
     crate::idx_body_pipeline::keep_bounce(bounce);
-    Ok(())
+    Ok(io)
 }
 
 pub struct TxTable {
@@ -2618,32 +2628,35 @@ impl TxTable {
         abs_offs: &[u64],
     ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
         self.get_spender_meta_at_abs_batch_backend(abs_offs, spend_meta_backend())
+            .map(|(slots, _)| slots)
     }
 
-    /// Like [`Self::get_spender_meta_at_abs_batch`] with an explicit backend.
+    /// Like [`Self::get_spender_meta_at_abs_batch`] with an explicit backend,
+    /// plus what the `spent.body` peeks read.
     pub fn get_spender_meta_at_abs_batch_backend(
         &self,
         abs_offs: &[u64],
         backend: crate::io_backend::ReadIoBackend,
-    ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
+    ) -> Result<SpendMetaRead, StoreError> {
+        use crate::io_backend::ReadIoBackend;
         if abs_offs.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Default::default()));
         }
         match backend {
-            crate::io_backend::ReadIoBackend::Uring => {
-                match self.get_spender_meta_at_abs_batch_uring(abs_offs) {
+            ReadIoBackend::Uring => {
+                match self.get_spender_meta_at_abs_batch_fd(abs_offs, ReadIoBackend::Uring) {
                     Ok(v) => Ok(v),
                     Err(e) => {
                         rbitcoin_log::debug!(
                             Store,
                             "structural meta uring failed ({e}); pread fallback"
                         );
-                        self.get_spender_meta_at_abs_batch_pread(abs_offs)
+                        self.get_spender_meta_at_abs_batch_fd(abs_offs, ReadIoBackend::Pread)
                     }
                 }
             }
-            crate::io_backend::ReadIoBackend::Pread => {
-                self.get_spender_meta_at_abs_batch_pread(abs_offs)
+            ReadIoBackend::Pread => {
+                self.get_spender_meta_at_abs_batch_fd(abs_offs, ReadIoBackend::Pread)
             }
         }
     }
@@ -2655,6 +2668,7 @@ impl TxTable {
         abs_offs: &[u64],
     ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
         self.get_spender_meta_at_abs_batch_fd(abs_offs, crate::io_backend::ReadIoBackend::Uring)
+            .map(|(slots, _)| slots)
     }
 
     /// libc pread_batch 9B peeks (no ring).
@@ -2664,6 +2678,7 @@ impl TxTable {
         abs_offs: &[u64],
     ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
         self.get_spender_meta_at_abs_batch_fd(abs_offs, crate::io_backend::ReadIoBackend::Pread)
+            .map(|(slots, _)| slots)
     }
 
     #[doc(hidden)]
@@ -2671,7 +2686,7 @@ impl TxTable {
         &self,
         abs_offs: &[u64],
         backend: crate::io_backend::ReadIoBackend,
-    ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
+    ) -> Result<SpendMetaRead, StoreError> {
         const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
         let body_fd = self.spent.body_read_fd();
         let body_pub = self.spent.body_published_len();
@@ -2694,19 +2709,20 @@ impl TxTable {
         }
         if submitted.is_empty() {
             note_spend_meta_read(0);
-            return Ok(out);
+            return Ok((out, Default::default()));
         }
 
         let live: Vec<u64> = submitted.iter().map(|&i| abs_offs[i]).collect();
         let plan = crate::idx_body_pipeline::plan_spend_slot_peeks(&live);
         note_spend_meta_read(plan.len());
         let depth = crate::uring_session::DEFAULT_ENTRIES as usize;
+        let mut io = crate::idx_body_pipeline::PeekIo::default();
         for chunk in plan.chunks(depth.max(1)) {
-            read_spend_peek_chunk(
+            io.add(read_spend_peek_chunk(
                 chunk, &live, &submitted, &mut out, body_fd, body_path, backend,
-            )?;
+            )?);
         }
-        Ok(out)
+        Ok((out, io))
     }
 
     /// Directory spend annotate using structural-known meta.

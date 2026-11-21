@@ -470,7 +470,7 @@ fn spend_slot_peeks_reuse_the_merged_bounce() {
     let path = t.spent.body_file_path();
     let read = || {
         let mut out = vec![None; live.len()];
-        read_spend_peek_chunk(
+        let io = read_spend_peek_chunk(
             &plan,
             &live,
             &orig,
@@ -480,12 +480,13 @@ fn spend_slot_peeks_reuse_the_merged_bounce() {
             ReadIoBackend::Pread,
         )
         .unwrap();
-        out
+        (out, io)
     };
 
-    let first = read();
+    let (first, io) = read();
     assert!(first.iter().all(Option::is_some), "both slots are read");
-    let (again, asked) = crate::alloc_count::asked_by(read);
+    assert_eq!((io.sqe_n, io.read_bytes, io.kept_bytes), (1, span, 16));
+    let ((again, _), asked) = crate::alloc_count::asked_by(read);
     assert_eq!(again, first);
     assert!(
         asked.largest < span,

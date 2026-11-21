@@ -264,6 +264,10 @@ pub struct IbdPerfSample {
     /// Structural meta bulk read wall ms / peek count.
     pub meta_ms: u64,
     pub meta_n: u64,
+    /// KiB the `spent.body` peeks asked for: a merged group's whole span.
+    pub meta_read_kb: u64,
+    /// KiB of 8-byte slots those peeks wanted.
+    pub meta_kept_kb: u64,
     pub load_ms: u64,
     /// Wire load residual (inside load/pre_asm, outside pin): Arc clone.
     pub prep_wire_arc_ms: u64,
@@ -520,6 +524,8 @@ impl Default for IbdPerfSample {
             spend: SpendWindow::default(),
             meta_ms: 0,
             meta_n: 0,
+            meta_read_kb: 0,
+            meta_kept_kb: 0,
             load_ms: 0,
             prep_wire_arc_ms: 0,
             prep_struct_ms: 0,
@@ -1050,6 +1056,8 @@ pub fn sample(
         },
         meta_ms: ns_ms(meta_ns),
         meta_n,
+        meta_read_kb: w.spend_meta_read_bytes / 1024,
+        meta_kept_kb: w.spend_meta_kept_bytes / 1024,
         load_ms: ns_ms(load_ns),
         prep_wire_arc_ms: ns_ms(prep_wire_arc_ns),
         prep_struct_ms: ns_ms(prep_struct_ns),

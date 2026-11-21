@@ -2369,13 +2369,15 @@ fn get_output_spender_metas_at_one_walk() {
             &abs,
             rbitcoin_store::io_backend::ReadIoBackend::Pread,
         )
-        .unwrap();
+        .unwrap()
+        .0;
     let uring = t
         .get_spender_meta_at_abs_batch_backend(
             &abs,
             rbitcoin_store::io_backend::ReadIoBackend::Uring,
         )
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(mmap, bulk);
     assert_eq!(uring, bulk);
     let _ = std::fs::remove_dir_all(&dir);
@@ -4963,7 +4965,8 @@ fn spend_meta_batch_reads_merged_slots_past_one_ring() {
             &offs,
             rbitcoin_store::io_backend::ReadIoBackend::Pread,
         )
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(pread, got);
     let _ = std::fs::remove_dir_all(&dir);
 }

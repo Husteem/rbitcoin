@@ -154,6 +154,8 @@ confirm_window! {
     spend_notes_ram,
     spend_meta_ns,
     spend_meta_n,
+    spend_meta_read_bytes,
+    spend_meta_kept_bytes,
     phase_prep_wire_arc_ns,
     phase_prep_struct_ns,
     phase_prep_header_ns,
