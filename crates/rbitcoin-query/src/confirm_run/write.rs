@@ -94,6 +94,23 @@ pub fn submit_queued<'a>(
     drain
 }
 
+fn join_head_drain(
+    query: &Query,
+    drain: super::head_drain::HeadDrainHandle<'_>,
+) -> (
+    Result<u64, rbitcoin_store::StoreError>,
+    Vec<super::head_drain::HeadInsert>,
+) {
+    spindle_mark("join");
+    let t_join = Instant::now();
+    let joined = drain.join_restore();
+    let drain_join_ns = t_join.elapsed().as_nanos() as u64;
+    if drain_join_ns > 0 {
+        crate::note_confirm(&query.confirm_stats().write_drain_join_ns, drain_join_ns);
+    }
+    joined
+}
+
 pub fn write_height_needed(tip: Option<u32>, height: u32) -> bool {
     match tip {
         None => true,
@@ -470,13 +487,7 @@ fn write_phase_inner(
     } else {
         submit_queued(query, take_queued_batch(&mut queued))
     };
-    spindle_mark("join");
-    let t_join = Instant::now();
-    let (drain_res, restore) = drain.join_restore();
-    let drain_join_ns = t_join.elapsed().as_nanos() as u64;
-    if drain_join_ns > 0 {
-        crate::note_confirm(&query.confirm_stats().write_drain_join_ns, drain_join_ns);
-    }
+    let (drain_res, restore) = join_head_drain(query, drain);
     // The insert ran whether or not the checks below reject: a reject after
     // the Class A append leaves these keys in `tx.head`, and an archived
     // retry of the same blocks queues none. Note the drain on every joined
@@ -587,8 +598,7 @@ pub fn finish_post_commit_hashes(
     };
 
     if let Some(drain) = drain {
-        spindle_mark("join");
-        let (drain_res, restore) = drain.join_restore();
+        let (drain_res, restore) = join_head_drain(query, drain);
         if drain_res.is_err() {
             query.store().txs.head_note_pending(&restore);
         }

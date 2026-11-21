@@ -3642,6 +3642,25 @@ fn spindle_mark_records_only_while_armed() {
 }
 
 #[test]
+fn finish_post_commit_notes_the_head_join() {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::confirm_run::finish_post_commit_hashes;
+
+    let (path, q) = tmp_query();
+    q.set_spend_index(false);
+    q.store().txs.head_note_pending(&[([0x11; 32], Fk(1))]);
+    let _ = q.confirm_stats().take_window();
+    finish_post_commit_hashes(&q, &[]).expect("finish");
+    let window = q.confirm_stats().take_window();
+    assert!(
+        window.write_drain_join_ns > 0,
+        "the retry join is drain_join, got {}",
+        window.write_drain_join_ns
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
 fn datadir_hdd_submits_head_after_annotate() {
     use bitcoin::hashes::Hash;
     use rbitcoin_consensus::mine_empty_regtest;
