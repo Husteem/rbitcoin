@@ -298,7 +298,7 @@ pub fn denserels_by_stamped_range(
         return Ok(());
     }
     let n_range = range_jobs.len() as u64;
-    let (decoded, body_ns, dec_ns, extend_n, body_sqe_n, guess_full_n) = query
+    let (decoded, body_ns, dec_ns, io) = query
         .store()
         .get_outs_by_range_batch(&range_jobs)
         .map_err(ConfirmError::from)?;
@@ -309,9 +309,12 @@ pub fn denserels_by_stamped_range(
     crate::note_confirm(&query.confirm_stats().cold_range_body_ns, body_ns);
     crate::note_confirm(&query.confirm_stats().cold_range_decode_ns, dec_ns);
     crate::note_confirm(&query.confirm_stats().cold_range_n, n_range);
-    crate::note_confirm(&query.confirm_stats().cold_range_extend_n, extend_n);
-    crate::note_confirm(&query.confirm_stats().cold_range_body_sqe_n, body_sqe_n);
-    crate::note_confirm(&query.confirm_stats().cold_range_guess_full_n, guess_full_n);
+    let stats = query.confirm_stats();
+    crate::note_confirm(&stats.cold_range_extend_n, io.extend_n);
+    crate::note_confirm(&stats.cold_range_body_sqe_n, io.body_sqe_n);
+    crate::note_confirm(&stats.cold_range_guess_full_n, io.guess_full_n);
+    crate::note_confirm(&stats.cold_range_read_bytes, io.read_bytes);
+    crate::note_confirm(&stats.cold_range_kept_bytes, io.kept_bytes);
     crate::note_confirm(&query.confirm_stats().body_tx_reads, n_range);
     crate::note_confirm(&query.confirm_stats().pin_new, n_range);
     let t_range_fill = Instant::now();

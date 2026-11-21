@@ -449,3 +449,48 @@ fn a_spend_slot_past_the_published_body_is_refused() {
     assert!(matches!(err, StoreError::Corrupt(_)), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Spend slots merged across a hole read into the thread's kept bounce, as
+/// body peeks do: a second read of the same slots allocates no span buffer.
+#[test]
+fn spend_slot_peeks_reuse_the_merged_bounce() {
+    use rbitcoin_store::idx_body_pipeline::plan_spend_slot_peeks;
+    use rbitcoin_store::io_backend::ReadIoBackend;
+    use rbitcoin_store::tx_table::read_spend_peek_chunk;
+
+    let (dir, t, _spenders) = temp_table();
+    let (_fk, off, _len) = put_n_outs(&t, 2000, 0x5b);
+    let t = reopen_as_older_schema(&dir, t);
+    let live = [off, off + 8 * 1024];
+    let orig = [0usize, 1];
+    let plan = plan_spend_slot_peeks(&live);
+    assert_eq!(plan.len(), 1, "one merged group");
+    let span = plan[0].len;
+    let fd = t.spent.body_read_fd();
+    let path = t.spent.body_file_path();
+    let read = || {
+        let mut out = vec![None; live.len()];
+        read_spend_peek_chunk(
+            &plan,
+            &live,
+            &orig,
+            &mut out,
+            fd,
+            path,
+            ReadIoBackend::Pread,
+        )
+        .unwrap();
+        out
+    };
+
+    let first = read();
+    assert!(first.iter().all(Option::is_some), "both slots are read");
+    let (again, asked) = crate::alloc_count::asked_by(read);
+    assert_eq!(again, first);
+    assert!(
+        asked.largest < span,
+        "largest={} span={span}: the spend-slot bounce was reallocated",
+        asked.largest
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

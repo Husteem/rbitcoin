@@ -319,6 +319,10 @@ pub struct IbdPerfSample {
     pub load_cold_range_body_sqe_n: u64,
     /// First-wave Outs jobs that pread the full idx span (spill guess).
     pub load_cold_range_guess_full_n: u64,
+    /// KiB the body preads asked for: a merged group's whole page span.
+    pub load_cold_range_read_kb: u64,
+    /// KiB of those reads handed to jobs. `read - kept` is the copied hole.
+    pub load_cold_range_kept_kb: u64,
     pub load_body_tx_reads: u64,
     pub conf_ready: usize,
     pub conf_script_q: usize,
@@ -552,6 +556,8 @@ impl Default for IbdPerfSample {
             load_cold_range_extend_n: 0,
             load_cold_range_body_sqe_n: 0,
             load_cold_range_guess_full_n: 0,
+            load_cold_range_read_kb: 0,
+            load_cold_range_kept_kb: 0,
             load_body_tx_reads: 0,
             conf_ready: 0,
             conf_script_q: 0,
@@ -1080,6 +1086,8 @@ pub fn sample(
         load_cold_range_extend_n: w.cold_range_extend_n,
         load_cold_range_body_sqe_n: w.cold_range_body_sqe_n,
         load_cold_range_guess_full_n: w.cold_range_guess_full_n,
+        load_cold_range_read_kb: w.cold_range_read_bytes / 1024,
+        load_cold_range_kept_kb: w.cold_range_kept_bytes / 1024,
         load_body_tx_reads: w.body_tx_reads,
         conf_ready,
         conf_script_q,

@@ -29,8 +29,13 @@ pub type PackedTx = (TxRecord, Vec<InputRecord>, Vec<OutputRecord>);
 pub type PackedTxRels = (TxRecord, Vec<InputRecord>, Vec<OutputRecord>, Vec<u32>);
 /// Prep denserels job: create fk, body range, known txid, loc n_out, need-vouts.
 pub type OutsByRangeJob = (Fk, (u64, u64), [u8; 32], u32, Vec<u32>);
-/// `(rows, body_ns, decode_ns, extend_n, body_sqe_n, guess_full_n)` from [`TxTable::get_outs_by_range_batch`].
-pub type OutsByRangeOut = (Vec<Option<SparseOutsRow>>, u64, u64, u64, u64, u64);
+/// `(rows, body_ns, decode_ns, io)` from [`TxTable::get_outs_by_range_batch`].
+pub type OutsByRangeOut = (
+    Vec<Option<SparseOutsRow>>,
+    u64,
+    u64,
+    crate::idx_body_pipeline::IdxBodyIoStats,
+);
 /// `spent.body` slot: spender fk + flags + vin.
 pub type SpenderSlot = (Fk, u8, u32);
 
@@ -587,8 +592,9 @@ pub fn pread_two_spans(
 
 /// Read one ring of spend peeks. `members` index `live`, which indexes `orig`.
 ///
-/// A chunk is at most [`crate::uring_session::DEFAULT_ENTRIES`] groups, so a
-/// merged 256 KiB bounce is not allocated for every group in a megakey.
+/// Merged groups read into one bounce from the thread's kept pool, as body
+/// peeks do, so a repeat wave does not allocate and zero its spans again. A
+/// chunk is at most [`crate::uring_session::DEFAULT_ENTRIES`] groups.
 #[doc(hidden)]
 pub fn read_spend_peek_chunk(
     chunk: &[crate::idx_body_pipeline::SpendSlotPeek],
@@ -601,49 +607,61 @@ pub fn read_spend_peek_chunk(
 ) -> Result<(), StoreError> {
     use crate::bulk_io::{self, ReadOp};
     const META_LEN: usize = OutputRecord::SPENT_SLOT_LEN;
-    enum Store {
-        Single([u8; META_LEN]),
-        Bounce(Vec<u8>),
+    let mut singles = vec![[0u8; META_LEN]; chunk.len()];
+    let mut bounce_at: Vec<Option<std::ops::Range<usize>>> = Vec::with_capacity(chunk.len());
+    let mut bounce_need = 0usize;
+    for g in chunk {
+        if g.members.len() == 1 {
+            bounce_at.push(None);
+            continue;
+        }
+        let end = usize::try_from(g.len)
+            .ok()
+            .and_then(|len| bounce_need.checked_add(len))
+            .ok_or(StoreError::Corrupt("spend peek span"))?;
+        bounce_at.push(Some(bounce_need..end));
+        bounce_need = end;
     }
-    let mut storage: Vec<Store> = chunk
-        .iter()
-        .map(|g| {
-            if g.members.len() == 1 {
-                Store::Single([0u8; META_LEN])
-            } else {
-                let n = usize::try_from(g.len).unwrap_or(0);
-                Store::Bounce(vec![0u8; n])
-            }
-        })
-        .collect();
+    let mut bounce = crate::idx_body_pipeline::take_bounce(bounce_need);
+    let bounce_base = bounce.as_mut_ptr();
     let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(chunk.len());
-    for (g, store) in chunk.iter().zip(storage.iter_mut()) {
-        let (ptr, len) = match store {
-            Store::Single(b) => (b.as_mut_ptr(), META_LEN),
-            Store::Bounce(b) => (b.as_mut_ptr(), b.len()),
+    for ((g, single), at) in chunk.iter().zip(singles.iter_mut()).zip(&bounce_at) {
+        let buf: &mut [u8] = match at {
+            None => single,
+            Some(at) => {
+                if at.end > bounce.len() {
+                    return Err(StoreError::Corrupt(
+                        "invariant: merged spend peek past its bounce",
+                    ));
+                }
+                // SAFETY: `at` lies inside `bounce` (checked) and is this
+                // group's range alone; `bounce` is not touched until the
+                // reads are done.
+                unsafe { std::slice::from_raw_parts_mut(bounce_base.add(at.start), at.len()) }
+            }
         };
-        // SAFETY: `ptr`/`len` are this slot's own buffer in `storage`, live for `ops`.
-        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
         ops.push(ReadOp {
             fd: body_fd,
             offset: g.off,
-            buf: slice,
+            buf,
             result: i32::MIN,
         });
     }
     bulk_io::pread_batch_backend(&mut ops, backend);
-    for ((g, store), ro) in chunk.iter().zip(storage.iter()).zip(ops.iter()) {
-        if ro.result < 0 {
+    let results: Vec<i32> = ops.iter().map(|ro| ro.result).collect();
+    drop(ops);
+    for (((g, single), at), result) in chunk.iter().zip(&singles).zip(&bounce_at).zip(results) {
+        if result < 0 {
             return Err(StoreError::io(
                 body_path,
-                std::io::Error::from_raw_os_error(-ro.result),
+                std::io::Error::from_raw_os_error(-result),
             ));
         }
-        let raw: &[u8] = match store {
-            Store::Single(b) => b,
-            Store::Bounce(b) => b,
+        let raw: &[u8] = match at {
+            None => single,
+            Some(at) => &bounce[at.clone()],
         };
-        let got = ro.result as usize;
+        let got = result as usize;
         for &m in &g.members {
             let rel = usize::try_from(live[m].saturating_sub(g.off)).unwrap_or(usize::MAX);
             if rel.saturating_add(META_LEN) > got.min(raw.len()) {
@@ -655,6 +673,7 @@ pub fn read_spend_peek_chunk(
             out[orig[m]] = Some((field, flags, vin));
         }
     }
+    crate::idx_body_pipeline::keep_bounce(bounce);
     Ok(())
 }
 
@@ -2355,7 +2374,7 @@ impl TxTable {
     ///   OS page unless `(max_vout+1)*40` (empty need: the loc span) is likely to
     ///   spill onto the next page — then the first wave is the full loc span.
     ///
-    /// Returns `(rows, body_ns, decode_ns, extend_n, body_sqe_n, guess_full_n)` where each row is
+    /// Returns `(rows, body_ns, decode_ns, io)` where each row is
     /// `Some((tx, live (vout,out), sparse denserels (vout,rel)))` (N2.0 timers).
     pub fn get_outs_by_range_batch(
         &self,
@@ -2364,7 +2383,7 @@ impl TxTable {
         use crate::idx_body_pipeline::{run_idx_body_pipeline_backend, BodyMode, IdxBodyJob};
         use std::time::Instant;
         if items.is_empty() {
-            return Ok((Vec::new(), 0, 0, 0, 0, 0));
+            return Ok((Vec::new(), 0, 0, Default::default()));
         }
         let mut jobs: Vec<IdxBodyJob> = items
             .iter()
@@ -2407,14 +2426,7 @@ impl TxTable {
             }
         }
         let decode_ns = t_dec.elapsed().as_nanos() as u64;
-        Ok((
-            out,
-            body_ns,
-            decode_ns,
-            io.extend_n,
-            io.body_sqe_n,
-            io.guess_full_n,
-        ))
+        Ok((out, body_ns, decode_ns, io))
     }
 
     /// Bulk `body_range` for many fks (confirm load / reconstruct).

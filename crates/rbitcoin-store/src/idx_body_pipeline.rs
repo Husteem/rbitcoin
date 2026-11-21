@@ -75,6 +75,31 @@ pub struct IdxBodyIoStats {
     pub body_sqe_n: u64,
     /// First-wave Outs jobs that pread the full idx span (spill guess).
     pub guess_full_n: u64,
+    /// Bytes the body reads asked for. A merged group asks for its whole
+    /// page span, holes included.
+    pub read_bytes: u64,
+    /// Bytes those reads handed to job bodies. `read_bytes - kept_bytes` is
+    /// what page grouping copied and dropped.
+    pub kept_bytes: u64,
+}
+
+/// What one grouped peek wave read.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PeekIo {
+    /// `ReadOp`s submitted, after page grouping.
+    pub sqe_n: u64,
+    /// Bytes those reads asked for.
+    pub read_bytes: u64,
+    /// Bytes of the requested windows.
+    pub kept_bytes: u64,
+}
+
+impl IdxBodyIoStats {
+    fn add_peeks(&mut self, io: PeekIo) {
+        self.body_sqe_n = self.body_sqe_n.saturating_add(io.sqe_n);
+        self.read_bytes = self.read_bytes.saturating_add(io.read_bytes);
+        self.kept_bytes = self.kept_bytes.saturating_add(io.kept_bytes);
+    }
 }
 
 #[doc(hidden)]
@@ -407,7 +432,7 @@ thread_local! {
 }
 
 /// At least `need` bounce bytes. Hand them back with [`keep_bounce`].
-fn take_bounce(need: usize) -> Vec<u8> {
+pub(crate) fn take_bounce(need: usize) -> Vec<u8> {
     if need > BOUNCE_KEEP_BYTES {
         return vec![0u8; need];
     }
@@ -419,7 +444,7 @@ fn take_bounce(need: usize) -> Vec<u8> {
     buf
 }
 
-fn keep_bounce(buf: Vec<u8>) {
+pub(crate) fn keep_bounce(buf: Vec<u8>) {
     if buf.capacity() <= BOUNCE_KEEP_BYTES {
         BOUNCE.with(|kept| *kept.borrow_mut() = buf);
     }
@@ -433,9 +458,9 @@ pub fn pread_grouped_peeks(
     body_path: &std::path::Path,
     backend: ReadIoBackend,
     mark_ok: bool,
-) -> Result<u64, StoreError> {
+) -> Result<PeekIo, StoreError> {
     if dests.is_empty() {
-        return Ok(0);
+        return Ok(PeekIo::default());
     }
     let windows: Vec<(u64, u64)> = dests.iter().map(|d| (d.off, d.len as u64)).collect();
     let groups = group_body_peeks(&windows);
@@ -491,6 +516,11 @@ pub fn pread_grouped_peeks(
             result: i32::MIN,
         });
     }
+    let io = PeekIo {
+        sqe_n: ops.len() as u64,
+        read_bytes: ops.iter().map(|op| op.buf.len() as u64).sum(),
+        kept_bytes: dests.iter().map(|d| d.len as u64).sum(),
+    };
     bulk_io::pread_batch_backend(&mut ops, backend);
     for (g, ((page_off, _, members), ro)) in groups.iter().zip(ops.iter()).enumerate() {
         if ro.result < 0 {
@@ -536,7 +566,7 @@ pub fn pread_grouped_peeks(
         }
     }
     keep_bounce(bounce);
-    Ok(groups.len() as u64)
+    Ok(io)
 }
 
 /// Resolve idx (FdOnly pread) then body (backend from env). Mutates `jobs` in place.
@@ -607,14 +637,16 @@ pub fn run_idx_body_pipeline_backend(
         })
         .collect();
     let mut stats = IdxBodyIoStats {
-        body_sqe_n: pread_grouped_peeks(jobs, &dests, body_fd, body_path, backend, true)?,
         guess_full_n,
         ..Default::default()
     };
+    stats.add_peeks(pread_grouped_peeks(
+        jobs, &dests, body_fd, body_path, backend, true,
+    )?);
     if mode == BodyMode::Outs {
-        let (extend_n, extend_sqe) = extend_truncated_txout_jobs(table, jobs, backend)?;
+        let (extend_n, extend_io) = extend_truncated_txout_jobs(table, jobs, backend)?;
         stats.extend_n = extend_n;
-        stats.body_sqe_n = stats.body_sqe_n.saturating_add(extend_sqe);
+        stats.add_peeks(extend_io);
     }
     Ok(stats)
 }
@@ -627,7 +659,7 @@ pub fn extend_truncated_txout_jobs(
     table: &VarTable,
     jobs: &mut [IdxBodyJob],
     backend: ReadIoBackend,
-) -> Result<(u64, u64), StoreError> {
+) -> Result<(u64, PeekIo), StoreError> {
     let mut rest: Vec<(usize, usize)> = Vec::new();
     let body_pub = table.body_published_len();
     for (i, j) in jobs.iter_mut().enumerate() {
@@ -652,7 +684,7 @@ pub fn extend_truncated_txout_jobs(
         rest.push((i, have));
     }
     if rest.is_empty() {
-        return Ok((0, 0));
+        return Ok((0, PeekIo::default()));
     }
     let extend_n = rest.len() as u64;
     rest.sort_unstable_by_key(|&(i, have)| {
@@ -670,7 +702,7 @@ pub fn extend_truncated_txout_jobs(
             len: jobs[i].body.len().saturating_sub(have),
         })
         .collect();
-    let sqe = pread_grouped_peeks(
+    let io = pread_grouped_peeks(
         jobs,
         &dests,
         table.body_read_fd(),
@@ -678,5 +710,5 @@ pub fn extend_truncated_txout_jobs(
         backend,
         false,
     )?;
-    Ok((extend_n, sqe))
+    Ok((extend_n, io))
 }

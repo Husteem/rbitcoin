@@ -507,6 +507,7 @@ fn merged_bytes(offs: &[u64]) -> u64 {
 struct PeekWave {
     jobs: Vec<IdxBodyJob>,
     groups: u64,
+    io: PeekIo,
     asked: crate::alloc_count::Asked,
 }
 
@@ -535,12 +536,13 @@ fn peek_wave(t: &TxTable, offs: &[u64]) -> PeekWave {
     let fd = t.body.body_read_fd();
     let path = t.body.body_file_path();
     let backend = rbitcoin_store::io_backend::ReadIoBackend::Pread;
-    let (groups, asked) = crate::alloc_count::asked_by(|| {
+    let (io, asked) = crate::alloc_count::asked_by(|| {
         pread_grouped_peeks(&mut jobs, &dests, fd, path, backend, true).unwrap()
     });
     PeekWave {
         jobs,
-        groups,
+        groups: io.sqe_n,
+        io,
         asked,
     }
 }
@@ -552,6 +554,39 @@ fn assert_peeked(t: &TxTable, offs: &[u64], wave: &PeekWave) {
         assert!(job.ok, "window at {off} not read");
         assert_eq!(job.body, file[at..at + PEEK_LEN], "window at {off}");
     }
+}
+
+/// A merged read asks for its whole page span and keeps only the windows.
+/// Both are counted, so the hole it copied shows on the perf line.
+#[test]
+fn grouped_peeks_count_bytes_read_and_kept() {
+    let (dir, t, base) = peek_body_file();
+    let offs = large_group(base);
+    let wave = peek_wave(&t, &offs);
+    assert_peeked(&t, &offs, &wave);
+    assert_eq!(wave.io.sqe_n, 1);
+    assert_eq!(wave.io.read_bytes, merged_bytes(&offs));
+    assert_eq!(wave.io.kept_bytes, (offs.len() * PEEK_LEN) as u64);
+    let lone = peek_wave(&t, &[base]);
+    assert_eq!(
+        (lone.io.read_bytes, lone.io.kept_bytes),
+        (PEEK_LEN as u64, PEEK_LEN as u64)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let (dir, t) = temp_tx();
+    let fks = put_n(&t, 8);
+    let mut jobs: Vec<IdxBodyJob> = fks.iter().map(|fk| IdxBodyJob::new(fk.0, None)).collect();
+    stamp_txout(&t, &mut jobs);
+    let stats = run_idx_body_pipeline(&t.body, &mut jobs, BodyMode::Full).unwrap();
+    let kept: u64 = jobs.iter().map(|j| j.body.len() as u64).sum();
+    assert_eq!(stats.kept_bytes, kept);
+    assert!(
+        stats.read_bytes >= kept,
+        "read={} kept={kept}",
+        stats.read_bytes
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

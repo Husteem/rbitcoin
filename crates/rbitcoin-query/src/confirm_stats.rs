@@ -181,6 +181,8 @@ confirm_window! {
     cold_range_extend_n,
     cold_range_body_sqe_n,
     cold_range_guess_full_n,
+    cold_range_read_bytes,
+    cold_range_kept_bytes,
     body_tx_reads,
     thin_ns,
     thin_edges_ns,
