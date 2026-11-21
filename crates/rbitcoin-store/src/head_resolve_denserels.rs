@@ -467,7 +467,9 @@ pub fn key_finished(
 /// Sidefile ID (at most two page-grouped shots) then BIP30 match.
 ///
 /// Shot A is the first four cands of unfinished keys; shot B is the rest only
-/// when the key is still unfinished. A fence-connected win skips shot B; an
+/// when the key is still unfinished. Shot B is skipped when no unfinished key
+/// has cands past its filled prefix: it would read nothing and re-walk the
+/// same prefixes. A fence-connected win skips shot B; an
 /// unconnected body match does not. Loc fill is **one** batch after the
 /// sealed walk (`attach_loc_to_identity`), never on this held probe ring.
 ///
@@ -509,6 +511,13 @@ pub fn id_idx_wave(
     for take in [ID_FILL_CHUNK, usize::MAX] {
         if cancelled() {
             return Err(StoreError::Cancelled("txid batch"));
+        }
+        let prefixes_full = cands_by_key
+            .iter()
+            .zip(filled.iter().zip(&skip))
+            .all(|((_, cands), (nfill, done))| *done || *nfill >= cands.len());
+        if take == usize::MAX && prefixes_full {
+            break;
         }
         let shot = next_id_shot(cands_by_key.iter().map(|(_, c)| c), &filled, &skip, take);
         let mut need: Vec<Fk> = Vec::new();
