@@ -6023,7 +6023,7 @@ pub fn handle_peer_control_msg(
             rbitcoin_log::info!("invalid sendcmpct announce field");
             punish_disconnect(&mut follow.ban_score, session);
         }
-        NetworkMessage::WtxidRelay => on_wtxid_relay(follow, session),
+        NetworkMessage::WtxidRelay => on_wtxid_relay(session),
         NetworkMessage::SendAddrV2 => on_sendaddrv2(follow, session),
         _ => return Ok(false),
     }
@@ -6331,11 +6331,17 @@ pub fn on_sendcmpct(
 }
 
 #[doc(hidden)]
-pub fn on_wtxid_relay(follow: &mut PeerFollowState, session: Option<&crate::peers::LivePeer>) {
-    // BIP339 mutual: we already sent wtxidrelay pre-verack; remember theirs.
-    follow.wtxid_relay = true;
+pub fn on_wtxid_relay(session: Option<&crate::peers::LivePeer>) {
+    // BIP339 negotiates before verack. Core disconnects a peer that switches
+    // after, with no misbehavior score: the tx INVs already sent name the
+    // tx by the hash of the mode they were sent in.
     if let Some(s) = session {
-        s.set_wtxid_relay();
+        rbitcoin_log::debug!(
+            P2p,
+            "wtxidrelay received after verack, disconnecting peer={}",
+            s.id
+        );
+        s.request_disconnect();
     }
 }
 

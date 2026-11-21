@@ -9,3 +9,6 @@ Fixed
 - **`getdata` `MSG_TX` is answered without the witness,** as Core does.
   Only `MSG_WITNESS_TX` and `MSG_WTX` carry it, so a client that asks by
   `MSG_TX` gets a transaction it can parse (#1700).
+- **A peer that sends `wtxidrelay` after `verack` is disconnected,** as
+  Core does. The relay mode is fixed when the handshake ends, so a tx INV is
+  never matched against the other hash (#1700).

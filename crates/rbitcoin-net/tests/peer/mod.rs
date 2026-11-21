@@ -2616,6 +2616,42 @@ fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
     });
 }
 
+/// BIP339: `wtxidrelay` after verack disconnects, as Core sets `fDisconnect`
+/// without a misbehavior score, so a noban peer goes too. The relay mode the
+/// handshake fixed does not change.
+#[test]
+fn wtxidrelay_after_verack_disconnects() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("wtxidrelay-late");
+    hub.ensure_genesis().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_noban(true);
+    let session = live_peer(&peers, 18572, 92, true);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(handle_peer_frame(
+        frame_for(NetworkMessage::WtxidRelay),
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(session.as_ref()),
+    ))
+    .expect("wtxidrelay after verack");
+    assert!(
+        session.stop.load(Ordering::SeqCst),
+        "wtxidrelay after verack disconnects"
+    );
+    assert!(
+        !session.wtxid_relay(),
+        "the relay mode stays as the handshake fixed it"
+    );
+    assert_eq!(follow.ban_score, 0, "Core scores no misbehavior for it");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn handle_peer_frame_control_and_inv_paths() {
     use bitcoin::hashes::Hash as _;
@@ -2629,16 +2665,16 @@ fn handle_peer_frame_control_and_inv_paths() {
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
 
-        // SendHeaders / SendCmpct / WtxidRelay / Pong / GetAddr / Ping
+        // SendHeaders / SendCmpct / Pong / GetAddr / Ping
         // (MemPool disconnects — covered by bloom_disabled_messages_request_disconnect.)
-        // SendAddrV2 after verack disconnects (`p2p_addrv2_relay.py`).
+        // SendAddrV2 after verack disconnects (`p2p_addrv2_relay.py`), and so
+        // does WtxidRelay (wtxidrelay_after_verack_disconnects).
         for msg in [
             NetworkMessage::SendHeaders,
             NetworkMessage::SendCmpct(SendCmpct {
                 send_compact: true,
                 version: 2,
             }),
-            NetworkMessage::WtxidRelay,
             NetworkMessage::Pong(7),
             NetworkMessage::GetAddr,
             NetworkMessage::Ping(42),
@@ -2648,7 +2684,6 @@ fn handle_peer_frame_control_and_inv_paths() {
                 .unwrap();
         }
         assert!(follow.wants_headers);
-        assert!(follow.wtxid_relay);
         assert!(follow.send_cmpct);
         assert_eq!(follow.cmpct_version, 2);
 
