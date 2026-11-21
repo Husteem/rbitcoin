@@ -1391,7 +1391,7 @@ impl Query {
     /// Durable creates and pending RAM creates from one even `publish_seq`.
     fn stable_sh_postings(&self, scripthash: &[u8; 32]) -> Result<(Vec<Fk>, Vec<Fk>), QueryError> {
         self.read_stable_sh_publish(|query| {
-            let durable = query.store.scripthash.create_fks(scripthash)?;
+            let durable = query.sh_create_fks(scripthash)?;
             note_sh_posting_gap(query)?;
             Ok((durable, query.pending_sh_create_fks(scripthash)))
         })
@@ -2329,7 +2329,7 @@ impl Query {
     /// Durable SH create count plus pending write-behind for this key.
     pub fn scripthash_create_count(&self, scripthash: &[u8; 32]) -> Result<u32, QueryError> {
         self.read_stable_sh_publish(|query| {
-            let durable = query.store.scripthash.create_count(scripthash)?;
+            let durable = query.sh_create_count(scripthash)?;
             let pending = query.pending_sh_create_fks(scripthash).len() as u32;
             Ok(durable.saturating_add(pending))
         })

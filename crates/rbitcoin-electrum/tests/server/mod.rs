@@ -342,6 +342,172 @@ fn restatus_notes_scans_intermediate_tick_heights() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A degraded or rebuilding scripthash index reads as empty history. The
+/// subscription push must hold (None: the caller reads every sub again once the
+/// index serves) instead of telling a wallet its address emptied.
+#[test]
+fn settled_restatus_holds_while_sh_index_degraded() {
+    let (dir, q) = tmp_store();
+    let sh = rbitcoin_store::script_hash(&[0x51]);
+    assert!(settled_restatus_notes(&q, None, &[sh], None).is_some());
+    q.mark_sh_degraded("test fault");
+    assert!(
+        settled_restatus_notes(&q, None, &[sh], None).is_none(),
+        "degraded index must not produce statuses"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A history read that finds a torn extent key answers `scripthash index
+/// rebuilding` itself (not a corrupt-record error), latches the degraded state
+/// so every other script is refused too, and holds the subscription push. The
+/// same read after the rebuild answers.
+#[tokio::test]
+async fn torn_key_read_answers_rebuilding_and_latches_for_every_script() {
+    let (_dir, q, _key) = rbitcoin_query::testutil::heavy_sh_extent_query("electrum-torn", 0);
+    let q = Arc::new(q);
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let (handle, _first) = electrum_tcp_client(&q, cfg, None).await;
+    // A fresh connection per read: a connection keeps its own join cache, which
+    // would serve the pre-tear answer at the same tip.
+    async fn history(addr: std::net::SocketAddr, script: &[u8]) -> Result<Value, String> {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        electrum_tcp_call(
+            &mut stream,
+            "blockchain.scripthash.get_history",
+            json!([electrum_scripthash_hex(script)]),
+        )
+        .await
+    }
+    let heavy = rbitcoin_query::testutil::SH_HEAVY_SCRIPT;
+    let healthy = history(handle.local_addr, heavy).await.unwrap();
+    assert!(healthy.as_array().is_some_and(|h| h.len() > 200));
+    rbitcoin_query::testutil::tear_sh_extent_head(&q, &rbitcoin_store::script_hash(heavy));
+    assert_eq!(
+        history(handle.local_addr, heavy).await.unwrap_err(),
+        "scripthash index rebuilding"
+    );
+    assert!(q.sh_degraded(), "the read latched");
+    assert_eq!(
+        history(handle.local_addr, &[0x51]).await.unwrap_err(),
+        "scripthash index rebuilding"
+    );
+    let sh = rbitcoin_store::script_hash(heavy);
+    assert!(settled_restatus_notes(&q, None, &[sh], None).is_none());
+    assert!(q.rebuild_sh_if_degraded(None).unwrap());
+    assert_eq!(history(handle.local_addr, heavy).await.unwrap(), healthy);
+    assert!(settled_restatus_notes(&q, None, &[sh], None).is_some());
+    handle.shutdown().await;
+}
+
+/// `scripthash.unsubscribe` only edits the connection's own set. A rebuild must
+/// not keep a wallet from dropping a subscription, while the reads stay refused.
+#[tokio::test]
+async fn unsubscribe_works_while_the_index_rebuilds() {
+    let (dir, q) = tmp_store();
+    let q = Arc::new(q);
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, None).await;
+    let arg = json!([electrum_scripthash_hex(&[0x51])]);
+    electrum_tcp_call(&mut stream, "blockchain.scripthash.subscribe", arg.clone())
+        .await
+        .unwrap();
+    q.mark_sh_degraded("test fault");
+    assert_eq!(
+        electrum_tcp_call(
+            &mut stream,
+            "blockchain.scripthash.get_history",
+            arg.clone()
+        )
+        .await
+        .unwrap_err(),
+        "scripthash index rebuilding"
+    );
+    assert_eq!(
+        electrum_tcp_call(
+            &mut stream,
+            "blockchain.scripthash.unsubscribe",
+            arg.clone()
+        )
+        .await
+        .unwrap(),
+        json!(true)
+    );
+    // The subscription is gone: a second unsubscribe finds nothing to drop.
+    assert_eq!(
+        electrum_tcp_call(&mut stream, "blockchain.scripthash.unsubscribe", arg)
+            .await
+            .unwrap(),
+        json!(false)
+    );
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `--sh-index` off the unsubscribe still answers the disabled error.
+#[tokio::test]
+async fn unsubscribe_is_refused_when_the_sh_index_is_off() {
+    let (dir, q) = tmp_store();
+    q.set_sh_index_enabled(false);
+    let q = Arc::new(q);
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, None).await;
+    let err = electrum_tcp_call(
+        &mut stream,
+        "blockchain.scripthash.unsubscribe",
+        json!([electrum_scripthash_hex(&[0x51])]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err, "scripthash index disabled");
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A read whose guard went stale answers 503 and its join cache goes with it.
+/// The join may be short (creates were still queued when a fault cleared
+/// them), and a cache hit at the same tip would serve it after the rebuild.
+#[test]
+fn stale_read_discards_the_join_it_filled() {
+    let (dir, q) = tmp_store();
+    let mut conn = ElectrumConn::new();
+    conn.sh_join = Some(rbitcoin_query::testutil::sh_join_slot_small());
+    let guard = q.sh_read_enter();
+    assert!(guard.is_some());
+    // A fault (or any unlink batch) begins while the read runs.
+    q.mark_sh_degraded("test fault");
+    let out = settle_sh_dispatch(guard, &q, &mut conn, Ok(json!("short")));
+    assert_eq!(out.unwrap_err(), "scripthash index rebuilding");
+    assert!(conn.sh_join.is_none(), "the short join is not cached");
+
+    // A read that stayed valid keeps both its answer and its join.
+    let (dir2, healthy) = tmp_store();
+    conn.sh_join = Some(rbitcoin_query::testutil::sh_join_slot_small());
+    let guard = healthy.sh_read_enter();
+    let out = settle_sh_dispatch(guard, &healthy, &mut conn, Ok(json!("whole")));
+    assert_eq!(out.unwrap(), json!("whole"));
+    assert!(conn.sh_join.is_some());
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// A subscriber tick while the index cannot serve schedules a full re-read for
+/// when it can, and does not read.
+#[test]
+fn sh_tick_waits_out_a_degraded_index_then_rereads_every_sub() {
+    let (dir, q) = tmp_store();
+    let mut rescan = false;
+    assert!(!sh_tick_blocked(&q, &mut rescan), "healthy: read");
+    assert!(!rescan);
+    q.mark_sh_degraded("test fault");
+    assert!(sh_tick_blocked(&q, &mut rescan), "degraded: skip");
+    assert!(rescan, "every sub is read again once it serves");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn negotiate_protocol_intersection_and_asof_dialect() {
     assert_eq!(negotiate_protocol(&json!([])).unwrap(), PROTOCOL_MAX);
