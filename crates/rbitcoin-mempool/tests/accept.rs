@@ -2447,6 +2447,47 @@ fn maybe_compact_runs_when_dead_catches_live_or_nothing_live_remains() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A pool pinned at its slot cap reuses the slot each admit evicts, so the
+/// dead payload that slot named stays in the body while the new admit appends.
+/// Dead slot counts stay at zero after every append, so a body that only
+/// compacts on dead slots grows with the churn. Sustained admission must
+/// compact the orphaned bytes too.
+#[test]
+fn sustained_slot_reuse_compacts_the_dead_body() {
+    let dir = tmp_dir();
+    let values = [100_000u64; 64];
+    let (ops, utxos) = chain_coins(&values);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    for op in &ops[..16] {
+        mp.accept_tx(&spend_tx(*op, 90_000), &utxos, TIP_OK)
+            .unwrap();
+    }
+    mp.store.testing_pin_full_slot_table();
+    let live_body = mp.store.body_logical_len().unwrap();
+    for (i, op) in ops[16..].iter().enumerate() {
+        // Each admit raises the evicted-rate floor, so the next one pays more
+        // than the chunk the last admit evicted.
+        let fee = 12_000 + i as u64 * 1_500;
+        mp.accept_tx(&spend_tx(*op, 100_000 - fee), &utxos, TIP_OK)
+            .unwrap();
+    }
+    assert_eq!(mp.live_count(), 16);
+    let body = mp.store.body_logical_len().unwrap();
+    assert!(
+        body <= live_body * 5 / 2 + 512,
+        "48 slot reuses grew the body from {live_body} to {body}"
+    );
+    mp.flush().unwrap();
+    let on_disk = std::fs::metadata(dir.join("tx.body")).unwrap().len() as u64;
+    assert!(
+        on_disk <= live_body as u64 * 5 / 2 + 512,
+        "48 slot reuses grew the on-disk body to {on_disk} (live was {live_body})"
+    );
+    let mp = ActiveMempool::open_or_create(&dir).unwrap();
+    assert_eq!(mp.live_count(), 16, "the compacted live set reopens");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Prepare/commit gap. A second `sendrawtransaction` takes `accept_tx`,
 /// not a `PreparedAdmit` another thread already committed. The hub hits
 /// this when the tx lands between prepare and commit.

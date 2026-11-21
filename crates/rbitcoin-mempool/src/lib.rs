@@ -24,7 +24,9 @@
 //! accept time.
 //!
 //! Packed decode uses stored txid/wtxid (no SHA256d). Vin aux is hashed at
-//! admit from resolved prevouts. Compact copies packed payload ranges.
+//! admit from resolved prevouts. Compact copies packed payload ranges; an
+//! admit compacts first when dead payloads reach the live payload bytes, so
+//! sustained eviction and slot reuse does not grow `tx.body` until a block.
 //!
 //! **Memory rule:** graph + body buffers stay proportional to the live set
 //! (`Arc<Transaction>` shared by load/accept). Sidecars use process `Vec` +
