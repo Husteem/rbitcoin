@@ -555,3 +555,54 @@ fn compact_header_fields_survive_the_read() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The g-page pool is kept per thread: a second wave of the same pages
+/// allocates no page buffers, and every page still reads its file bytes.
+#[test]
+fn g_page_waves_reuse_the_page_pool() {
+    use rbitcoin_store::bdz::{stream_g_pages, G_PAGE_BYTES};
+    if !rbitcoin_store::bulk_io::io_uring_enabled() {
+        return;
+    }
+    let dir = rbitcoin_store::testutil::fresh_path("bdz-g-pool");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("g");
+    let n_pages = 64u32;
+    let bytes: Vec<u8> = (0..n_pages as usize * G_PAGE_BYTES)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(&path, &bytes).unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let pages: Vec<u32> = (0..n_pages).collect();
+    let mut session = rbitcoin_store::uring_session::UringSession::new(
+        rbitcoin_store::uring_session::DEFAULT_ENTRIES,
+    )
+    .unwrap();
+    let mut wave = || {
+        let mut seen = Vec::new();
+        stream_g_pages(
+            &mut session,
+            &file,
+            &path,
+            0,
+            bytes.len() as u64,
+            &pages,
+            &mut |page, got: &[u8]| {
+                let at = page as usize * G_PAGE_BYTES;
+                assert_eq!(got, &bytes[at..at + G_PAGE_BYTES], "page {page}");
+                seen.push(page);
+            },
+        )
+        .unwrap();
+        seen.len()
+    };
+    assert_eq!(wave(), n_pages as usize);
+    let (n, asked) = crate::alloc_count::asked_by(&mut wave);
+    assert_eq!(n, n_pages as usize);
+    assert!(
+        asked.largest < G_PAGE_BYTES as u64,
+        "largest={}: the page pool was reallocated",
+        asked.largest
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

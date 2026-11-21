@@ -697,14 +697,22 @@ pub fn stream_or_load_pages(
     match ctx.session() {
         Some(session) => stream_g_pages(session, file, path, off, n_bytes, page_ids, fill),
         None => {
+            let mut buf = [0u8; G_PAGE_BYTES];
             for &page in page_ids {
-                let mut buf = [0u8; G_PAGE_BYTES];
                 let n = load_g_page(file, path, off, n_bytes, page, &mut buf)?;
                 fill(page, &buf[..n]);
             }
             Ok(())
         }
     }
+}
+
+thread_local! {
+    /// Page buffers one thread keeps between g-page waves: at most the ring
+    /// depth of pages (512 KiB), RAM traded for allocating and zeroing a pool
+    /// on every resolve wave of every sealed segment.
+    static G_PAGE_POOL: std::cell::RefCell<Vec<[u8; G_PAGE_BYTES]>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[doc(hidden)]
@@ -725,7 +733,10 @@ pub fn stream_g_pages(
     let pool_n = (crate::uring_session::DEFAULT_ENTRIES as usize)
         .min(n_pages)
         .max(1);
-    let mut bufs: Vec<[u8; G_PAGE_BYTES]> = vec![[0u8; G_PAGE_BYTES]; pool_n];
+    let mut bufs = G_PAGE_POOL.with(|kept| std::mem::take(&mut *kept.borrow_mut()));
+    if bufs.len() < pool_n {
+        bufs.resize(pool_n, [0u8; G_PAGE_BYTES]);
+    }
     let mut slot_page: Vec<Option<usize>> = vec![None; pool_n];
     let mut free_slots: Vec<usize> = (0..pool_n).collect();
     let mut next_page = 0usize;
@@ -751,8 +762,9 @@ pub fn stream_g_pages(
                     continue;
                 }
                 let off = g_off + u64::from(page) * G_PAGE_BYTES as u64;
+                // A short read re-reads the whole page (`load_g_page`), so
+                // the kept bytes under `need` are never handed to `fill`.
                 let buf = &mut bufs[slot][..need];
-                buf.fill(0);
                 let ud = crate::uring_session::pack_ud(
                     crate::uring_session::KIND_MPHF_G,
                     epoch,
@@ -806,6 +818,7 @@ pub fn stream_g_pages(
         Ok(())
     })();
     session.drain_all()?;
+    G_PAGE_POOL.with(|kept| *kept.borrow_mut() = bufs);
     run
 }
 
