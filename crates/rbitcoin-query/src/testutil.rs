@@ -1,12 +1,16 @@
 //! Drop-cleaning Tiny [`crate::Query`] for tests. Not an operator API.
 //!
 //! TxApply → dummy [`bitcoin::Block`] conversion lives here, not in
-//! production [`Query`] archive.
+//! production [`Query`] archive. So does wire-block Class A without confirm
+//! ([`commit_class_a_block`], [`commit_class_a_run`]).
 
 pub use rbitcoin_store::testutil::TempDir;
 
-use crate::{Query, QueryError, ShJoinSlot, TxApply};
+use crate::convert::header_to_record;
+use crate::{ConfirmError, Query, QueryError, ShJoinSlot, TxApply, WirePlanNeed};
 use bitcoin::hashes::Hash;
+use rbitcoin_consensus::block::{validate_block_structure_hashed, ValidationContext};
+use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::HeaderRecord;
 use std::sync::Arc;
@@ -141,6 +145,75 @@ impl FixtureChain for Query {
         self.apply_sh_pending()?;
         Ok(fk)
     }
+}
+
+fn class_a_header_and_txids(
+    query: &Query,
+    params: &ChainParams,
+    block: &bitcoin::Block,
+) -> Result<(HeaderRecord, Vec<[u8; 32]>), ConfirmError> {
+    let ctx = ValidationContext::archive_structure(params);
+    let txids = validate_block_structure_hashed(block, &ctx)?;
+    let hash = block.header.block_hash().to_byte_array();
+    rbitcoin_consensus::header::pow_hash_meets_target(hash, block.header.bits, params.pow_limit)?;
+    let prev = block.header.prev_blockhash;
+    let prev_fk = if prev.to_byte_array() == [0u8; 32] {
+        Fk::NULL
+    } else {
+        rbitcoin_consensus::block::require_linked_parent(
+            query
+                .get_header_by_hash(prev.as_byte_array())
+                .map_err(ConfirmError::from)?
+                .map(|(fk, _)| fk),
+        )?
+    };
+    Ok((header_to_record(prev_fk, &block.header, hash), txids))
+}
+
+/// Class A only (no tip / Class C) for a wire block. Crash and `plan=None`
+/// tests. Confirm write uses `archive_plan_batch_from_wire` + commit instead.
+pub fn commit_class_a_block(
+    query: &Query,
+    params: &ChainParams,
+    height: Height,
+    block: &bitcoin::Block,
+    milestone: Milestone,
+) -> Result<(), ConfirmError> {
+    let _ = (height, milestone);
+    let (header, txids) = class_a_header_and_txids(query, params, block)?;
+    let fk = query.ensure_header(&header).map_err(ConfirmError::from)?;
+    let arc = Arc::new(block.clone());
+    query
+        .archive_class_a_from_wire(&[(fk, &arc, txids.as_slice())])
+        .map_err(ConfirmError::from)?;
+    Ok(())
+}
+
+/// Class A for a contiguous run in one plan (same-batch parent stamp).
+///
+/// Use this instead of N×[`commit_class_a_block`] when later blocks spend
+/// earlier unconfirmed creates.
+pub fn commit_class_a_run(
+    query: &Query,
+    params: &ChainParams,
+    blocks: &[(Height, bitcoin::Block)],
+    milestone: Milestone,
+) -> Result<(), ConfirmError> {
+    let _ = milestone;
+    let mut owned = Vec::with_capacity(blocks.len());
+    for (_, block) in blocks {
+        let (header, txids) = class_a_header_and_txids(query, params, block)?;
+        let fk = query.ensure_header(&header).map_err(ConfirmError::from)?;
+        owned.push((fk, Arc::new(block.clone()), txids));
+    }
+    let refs: Vec<WirePlanNeed<'_>> = owned
+        .iter()
+        .map(|(fk, b, ids)| (*fk, b, ids.as_slice()))
+        .collect();
+    query
+        .archive_class_a_from_wire(&refs)
+        .map_err(ConfirmError::from)?;
+    Ok(())
 }
 
 /// One-output join that fits Esplora's last-1 cap.

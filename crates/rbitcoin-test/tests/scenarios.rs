@@ -1359,7 +1359,8 @@ fn failed_ibd_tip_flush_stops_commits_until_restart() {
 #[test]
 fn confirm_survives_partial_class_c_without_tip_advance() {
     use rbitcoin_consensus::{ChainParams, Milestone};
-    use rbitcoin_query::{accept_and_connect_block, commit_class_a_block, confirm_wire_run};
+    use rbitcoin_query::testutil::commit_class_a_block;
+    use rbitcoin_query::{accept_and_connect_block, confirm_wire_run};
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
     let td = TestDatadir::new().unwrap();
@@ -1671,7 +1672,8 @@ fn pin_plan_none_stamp_of_archived_spend(
 #[test]
 fn resume_tx_head_resolves_external_prev() {
     use rbitcoin_consensus::{ChainParams, Milestone};
-    use rbitcoin_query::{accept_and_connect_block, commit_class_a_block, confirm_wire_run};
+    use rbitcoin_query::testutil::commit_class_a_block;
+    use rbitcoin_query::{accept_and_connect_block, confirm_wire_run};
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
     let td = TestDatadir::new().unwrap();
@@ -1769,7 +1771,8 @@ fn resume_tx_head_resolves_external_prev() {
 fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
     use bitcoin::p2p::ServiceFlags;
     use rbitcoin_net::local_service_flags;
-    use rbitcoin_query::{commit_class_a_block, confirm_wire_run};
+    use rbitcoin_query::confirm_wire_run;
+    use rbitcoin_query::testutil::commit_class_a_block;
     use rbitcoin_store::script_hash;
 
     let td = TestDatadir::new().unwrap();
@@ -2157,7 +2160,7 @@ fn pin_archived_sibling_bodies(
 ) {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::{ScriptBuf, TxOut};
-    use rbitcoin_query::commit_class_a_block;
+    use rbitcoin_query::testutil::commit_class_a_block;
 
     let tip_h = chain.tip_height();
     let bad_hash = double_spend.block_hash().to_byte_array();
@@ -2551,7 +2554,8 @@ fn pin_same_run_create_then_spend(
     parent_cb: bitcoin::Txid,
     create_h: u32,
 ) -> (BlockHash, u32) {
-    use rbitcoin_query::{commit_class_a_run, confirm_wire_run};
+    use rbitcoin_query::confirm_wire_run;
+    use rbitcoin_query::testutil::commit_class_a_run;
 
     let mk_parent = spend_anyone_can_spend(parent_cb, 0, Amount::from_sat(49_0000_0000));
     let b_create = mine_regtest_block(tip, tip_time + 600, create_h, vec![mk_parent]);
@@ -2591,7 +2595,8 @@ fn pin_both_vouts_of_one_input_parent(
     use bitcoin::absolute::LockTime;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
-    use rbitcoin_query::{commit_class_a_block, commit_class_a_run, confirm_wire_run};
+    use rbitcoin_query::confirm_wire_run;
+    use rbitcoin_query::testutil::{commit_class_a_block, commit_class_a_run};
     use rbitcoin_test::mine::{spend_many_anyone_can_spend, split_anyone_can_spend};
 
     let split = split_anyone_can_spend(
@@ -2782,9 +2787,10 @@ fn pin_already_at_height_retry_annotates_spend(
 #[test]
 fn three_stage_confirm_and_parent_pin_surface() {
     use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::testutil::commit_class_a_run;
     use rbitcoin_query::{
-        accept_and_connect_block, commit_class_a_run, confirm_scripts_phase,
-        confirm_wire_load_phase, confirm_write_phase, ScriptPreverified,
+        accept_and_connect_block, confirm_scripts_phase, confirm_wire_load_phase,
+        confirm_write_phase, ScriptPreverified,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
@@ -2903,10 +2909,11 @@ fn three_stage_confirm_and_parent_pin_surface() {
 #[test]
 fn confirm_load_ahead_of_write_does_not_badprev() {
     use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::testutil::commit_class_a_block;
     use rbitcoin_query::{
-        accept_and_connect_block, commit_class_a_block, confirm_scripts_phase,
-        confirm_wire_load_phase, confirm_wire_load_phase_pipelined, confirm_write_phase,
-        ScriptPreverified, WireLoadPipeline,
+        accept_and_connect_block, confirm_scripts_phase, confirm_wire_load_phase,
+        confirm_wire_load_phase_pipelined, confirm_write_phase, ScriptPreverified,
+        WireLoadPipeline,
     };
     use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis};
 
@@ -3142,9 +3149,10 @@ fn block_cache_and_mempool_hub_surface() {
 #[test]
 fn unified_wire_pipeline_multi_block_to_tip() {
     use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_query::testutil::commit_class_a_block;
     use rbitcoin_query::{
-        commit_class_a_block, confirm_scripts_phase, confirm_wire_load_phase, confirm_wire_run,
-        confirm_write_phase, ScriptPreverified,
+        confirm_scripts_phase, confirm_wire_load_phase, confirm_wire_run, confirm_write_phase,
+        ScriptPreverified,
     };
 
     let td = TestDatadir::new().unwrap();
@@ -3501,9 +3509,9 @@ fn pin_wire_prep_already_archived(
     cb: bitcoin::Txid,
     ha: u32,
 ) -> (BlockHash, u32) {
+    use rbitcoin_query::testutil::commit_class_a_run;
     use rbitcoin_query::{
-        commit_class_a_run, confirm_scripts_phase, confirm_wire_load_phase, confirm_write_phase,
-        ScriptPreverified,
+        confirm_scripts_phase, confirm_wire_load_phase, confirm_write_phase, ScriptPreverified,
     };
 
     let tip_before = q.tip_height();

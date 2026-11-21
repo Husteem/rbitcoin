@@ -330,7 +330,7 @@ fn seed_work_path_archives_ahead_of_tip() {
         Amount, Block, CompactTarget, OutPoint, Sequence, Target, Transaction, TxIn, TxOut, Witness,
     };
     use rbitcoin_ibd::ibd::path::seed_work_path_from_store;
-    use rbitcoin_query::commit_class_a_block;
+    use rbitcoin_query::testutil::commit_class_a_block;
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("path-seed-arch");
     hub.ensure_genesis().unwrap();

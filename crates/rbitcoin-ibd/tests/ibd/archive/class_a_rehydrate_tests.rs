@@ -87,7 +87,7 @@ fn class_a_rehydrate_makes_tip_plus_one_claim_ready() {
     for h in 1u32..=3 {
         let b = mine(tip, time + h * 600, h);
         hub.ensure_header(&b.header).unwrap();
-        rbitcoin_query::commit_class_a_block(
+        rbitcoin_query::testutil::commit_class_a_block(
             &hub.query,
             &hub.params,
             rbitcoin_primitives::Height(h),
@@ -371,7 +371,7 @@ fn class_a_rehydrate_offers_store_without_known_cache() {
     let gen = hub.tip_hash().unwrap();
     let b = mine(gen, 1_300_000_600, 1);
     let hash = b.block_hash();
-    rbitcoin_query::commit_class_a_block(
+    rbitcoin_query::testutil::commit_class_a_block(
         &hub.query,
         &hub.params,
         rbitcoin_primitives::Height(1),
@@ -401,7 +401,7 @@ fn class_a_rehydrate_rejects_a_hash_mismatch() {
     let gen = hub.tip_hash().unwrap();
     let b = mine(gen, 1_300_000_600, 1);
     let hash = b.block_hash();
-    rbitcoin_query::commit_class_a_block(
+    rbitcoin_query::testutil::commit_class_a_block(
         &hub.query,
         &hub.params,
         rbitcoin_primitives::Height(1),

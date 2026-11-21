@@ -5,14 +5,12 @@ use bitcoin::hashes::Hash;
 use bitcoin::Block;
 use rbitcoin_consensus::block::{validate_block_structure_hashed, ValidationContext};
 use rbitcoin_consensus::{ChainParams, Milestone};
-use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_store::HeaderRecord;
+use rbitcoin_primitives::Height;
 use std::sync::Arc;
 
 use crate::confirm_run;
 use crate::connect::ConfirmPrepared;
-use crate::convert::header_to_record;
-use crate::{Query, TxPrecompute, WirePlanNeed};
+use crate::{Query, TxPrecompute};
 use rbitcoin_store::StoreError;
 
 /// Confirm a contiguous tip-extension run of wire blocks (sync all stages).
@@ -159,76 +157,4 @@ pub fn accept_and_connect_block_pair_preverified(
     confirm_run::confirm_wire_run_pair_preverified(
         query, params, milestone, &a_in, a_pre, &b_in, b_pre, phase,
     )
-}
-
-#[doc(hidden)]
-pub fn class_a_header_and_txids(
-    query: &Query,
-    params: &ChainParams,
-    block: &Block,
-) -> Result<(HeaderRecord, Vec<[u8; 32]>), ConfirmError> {
-    let ctx = ValidationContext::archive_structure(params);
-    let txids = validate_block_structure_hashed(block, &ctx)?;
-    let hash = block.header.block_hash().to_byte_array();
-    rbitcoin_consensus::header::pow_hash_meets_target(hash, block.header.bits, params.pow_limit)?;
-    let prev = block.header.prev_blockhash;
-    let prev_fk = if prev.to_byte_array() == [0u8; 32] {
-        Fk::NULL
-    } else {
-        rbitcoin_consensus::block::require_linked_parent(
-            query
-                .get_header_by_hash(prev.as_byte_array())
-                .map_err(ConfirmError::from)?
-                .map(|(fk, _)| fk),
-        )?
-    };
-    Ok((header_to_record(prev_fk, &block.header, hash), txids))
-}
-
-/// Class A only (no tip / Class C). Crash and `plan=None` tests.
-///
-/// Not a production IBD API — confirm write uses `archive_plan_batch_from_wire`
-/// + commit (wire `seqsigwit` is encoded from the block and plan edges).
-pub fn commit_class_a_block(
-    query: &Query,
-    params: &ChainParams,
-    height: Height,
-    block: &Block,
-    milestone: Milestone,
-) -> Result<(), ConfirmError> {
-    let _ = (height, milestone);
-    let (header, txids) = class_a_header_and_txids(query, params, block)?;
-    let fk = query.ensure_header(&header).map_err(ConfirmError::from)?;
-    let arc = Arc::new(block.clone());
-    query
-        .archive_class_a_from_wire(&[(fk, &arc, txids.as_slice())])
-        .map_err(ConfirmError::from)?;
-    Ok(())
-}
-
-/// Class A for a contiguous run in one plan (same-batch parent stamp).
-///
-/// Use this instead of N×[`commit_class_a_block`] when later blocks spend
-/// earlier unconfirmed creates.
-pub fn commit_class_a_run(
-    query: &Query,
-    params: &ChainParams,
-    blocks: &[(Height, Block)],
-    milestone: Milestone,
-) -> Result<(), ConfirmError> {
-    let _ = milestone;
-    let mut owned = Vec::with_capacity(blocks.len());
-    for (_, block) in blocks {
-        let (header, txids) = class_a_header_and_txids(query, params, block)?;
-        let fk = query.ensure_header(&header).map_err(ConfirmError::from)?;
-        owned.push((fk, Arc::new(block.clone()), txids));
-    }
-    let refs: Vec<WirePlanNeed<'_>> = owned
-        .iter()
-        .map(|(fk, b, ids)| (*fk, b, ids.as_slice()))
-        .collect();
-    query
-        .archive_class_a_from_wire(&refs)
-        .map_err(ConfirmError::from)?;
-    Ok(())
 }

@@ -2755,11 +2755,12 @@ fn store_start_states_lookup_load_confirm() {
     use bitcoin::CompactTarget;
     use bitcoin::{Amount, Block, BlockHash, ScriptBuf, Sequence, TxMerkleNode, Witness};
     use rbitcoin_primitives::Height;
+    use rbitcoin_query::accept_and_connect_block;
     use rbitcoin_query::confirm_run::{
         confirm_scripts_phase, confirm_wire_load_from_plan, confirm_wire_lookup_stamp,
         confirm_write_phase, ScriptPreverified,
     };
-    use rbitcoin_query::{accept_and_connect_block, commit_class_a_block};
+    use rbitcoin_query::testutil::commit_class_a_block;
     use std::sync::Arc;
 
     let (path, q) = tmp_query();

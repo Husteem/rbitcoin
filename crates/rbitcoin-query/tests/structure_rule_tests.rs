@@ -3041,10 +3041,10 @@ fn n1_assemble_cold_why_reasons() {
 /// - rapid tip+1/tip+2 accept; genuine double-spend still `PrevoutSpent`
 #[test]
 fn already_archived_schema13_pin_identity_tip_follow() {
+    use rbitcoin_query::testutil::commit_class_a_block;
     use rbitcoin_query::{
-        accept_and_connect_block, commit_class_a_block, confirm_scripts_phase,
-        confirm_wire_load_from_plan, confirm_wire_lookup_stamp, confirm_write_phase,
-        ScriptPreverified,
+        accept_and_connect_block, confirm_scripts_phase, confirm_wire_load_from_plan,
+        confirm_wire_lookup_stamp, confirm_write_phase, ScriptPreverified,
     };
 
     use std::sync::Arc;
