@@ -187,9 +187,13 @@ fn snapshot_mark_during_refresh_stays_dirty() {
             let pool = hub.lock_write();
             let run = s.spawn(|| refresh(hub));
             let t0 = Instant::now();
-            while dirty.load(Ordering::Acquire) && t0.elapsed() < Duration::from_secs(2) {
+            while dirty.load(Ordering::Acquire) && t0.elapsed() < Duration::from_secs(10) {
                 std::thread::sleep(Duration::from_millis(1));
             }
+            assert!(
+                !dirty.load(Ordering::Acquire),
+                "{name}: the refresh did not take its mark before reading the pool"
+            );
             hub.mark_fee_dirty();
             drop(pool);
             run.join().unwrap();

@@ -1,8 +1,8 @@
 Fixed
 
 - **Four races in shared counters and flags:**
-  - A noban peer's headers-sync timeout and that peer ending its own sync
-    could both release the one sync slot. The count wrapped, so no headers
+  - Two peers' heartbeats could both time out a noban peer's headers sync
+    and both release the one sync slot. The count wrapped, so no headers
     sync could start again until restart while the header tip was more
     than a day old.
   - The IBD confirm queues counted a batch after handing it over, so the

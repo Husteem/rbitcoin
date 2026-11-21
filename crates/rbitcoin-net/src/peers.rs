@@ -3198,16 +3198,19 @@ impl PeerHub {
         true
     }
 
-    /// Release `peer`'s headers-sync slot. Only the caller that turns
-    /// `sync_started` off releases it, so a session ending its sync and a
-    /// timeout racing it release the slot once. Returns whether this call did.
+    /// End `peer`'s headers sync and release its slot. Only the caller that
+    /// turns `sync_started` off releases it, so two heartbeats timing out the
+    /// same sync release the slot once. The slot goes last: with an old tip,
+    /// a sync that takes it next keeps its own deadline and getheaders mark.
+    /// Returns whether this call ended the sync.
     #[doc(hidden)]
     pub fn end_headers_sync(&self, peer: &LivePeer) -> bool {
         if !peer.sync_started.swap(false, Ordering::Relaxed) {
             return false;
         }
-        self.headers_sync_peers.fetch_sub(1, Ordering::Relaxed);
         peer.headers_sync_timeout.store(0, Ordering::Relaxed);
+        let _ = peer.take_awaiting_headers();
+        self.headers_sync_peers.fetch_sub(1, Ordering::Relaxed);
         true
     }
 
@@ -3235,10 +3238,10 @@ impl PeerHub {
                 continue;
             }
             if p.session_noban() {
-                // The session may have ended this sync since the check above.
+                // Another heartbeat may have timed this sync out since the
+                // check above.
                 if self.end_headers_sync(p) {
                     rbitcoin_log::info!("{}", crate::chain::headers_timeout_noban_log(p.id));
-                    let _ = p.take_awaiting_headers();
                 }
             } else {
                 rbitcoin_log::info!("{}", crate::chain::headers_timeout_disconnect_log(p.id));

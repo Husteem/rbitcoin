@@ -1593,8 +1593,11 @@ pub fn confirm_row_is_ready(
 
 /// Live depths **and contents** of the bounded confirm pipeline queues.
 ///
-/// Updated on successful send/recv so the status loop can log pressure and
-/// process-owned retain without peeking into the OS channels.
+/// Counted before each send and out on recv, so the status loop can log
+/// pressure and process-owned retain without peeking into the OS channels.
+/// A sender parked on a full queue already counts: a depth can read one
+/// past the cap, and the parked batch's bytes count toward in-flight retain
+/// (they are live heap either way). See [`Self::send_load`].
 ///
 /// High-water marks (`*_hwm`) track max depth since the last
 /// [`ConfirmQueueDepths::sample_hwm_and_reset`] (≈5s status tick). Point

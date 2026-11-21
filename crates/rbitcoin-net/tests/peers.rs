@@ -493,12 +493,16 @@ fn pin_noban_headers_timeout_keep(via_cidr: bool) {
     );
 }
 
-/// The noban headers timeout and the session's own `end_headers_sync` can
-/// both see one started sync. Holding the CIDR table parks the timeout in
-/// its noban check, after it saw the sync started. The session ends the sync
-/// in that gap. The slot is released once, so a new sync can start.
+/// Two sessions' heartbeats can time out one noban headers sync at once.
+/// Both read the sync as started under the `live` read guard, then park on
+/// the CIDR table in their noban check, which this test holds. The slot is
+/// released once, so a new sync can start.
+///
+/// Linux only: the test waits until `/proc` shows each heartbeat asleep in
+/// the kernel, which before the table lock it never is.
+#[cfg(target_os = "linux")]
 #[test]
-fn noban_headers_timeout_and_end_release_the_slot_once() {
+fn concurrent_noban_headers_timeouts_release_the_slot_once() {
     let hub = PeerHub::new();
     let mut t = rbitcoin_net::NetPermTable::default();
     t.whitelist
@@ -519,13 +523,27 @@ fn noban_headers_timeout_and_end_release_the_slot_once() {
     assert!(hub.try_start_headers_sync(&inbound, now, best));
     assert_eq!(hub.headers_sync_peers.load(Ordering::Relaxed), 1);
     let deadline = rbitcoin_net::chain::headers_download_timeout_secs(now, best);
+    let hub = &hub;
     std::thread::scope(|s| {
         let perms = hub.net_perms.lock().unwrap();
-        let timeout = s.spawn(|| hub.check_headers_sync_timeouts(deadline + 1));
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        hub.end_headers_sync(&inbound);
+        let heartbeats: Vec<_> = (0..2)
+            .map(|_| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                let heartbeat = s.spawn(move || {
+                    tx.send(std::fs::read_link("/proc/thread-self").unwrap())
+                        .unwrap();
+                    hub.check_headers_sync_timeouts(deadline + 1);
+                });
+                (heartbeat, rx.recv().unwrap())
+            })
+            .collect();
+        for (_, task) in &heartbeats {
+            wait_until_asleep(task);
+        }
         drop(perms);
-        timeout.join().unwrap();
+        for (heartbeat, _) in heartbeats {
+            heartbeat.join().unwrap();
+        }
     });
     assert_eq!(
         hub.headers_sync_peers.load(Ordering::Relaxed),
@@ -536,6 +554,27 @@ fn noban_headers_timeout_and_end_release_the_slot_once() {
         hub.try_start_headers_sync(&inbound, deadline + 1, best),
         "the released slot must let a new headers sync start"
     );
+}
+
+/// Wait until the thread at `/proc/<task>` is asleep (`S`), with a deadline.
+#[cfg(target_os = "linux")]
+fn wait_until_asleep(task: &std::path::Path) {
+    let stat = std::path::Path::new("/proc").join(task).join("stat");
+    let t0 = std::time::Instant::now();
+    loop {
+        let line = std::fs::read_to_string(&stat).unwrap();
+        // The state follows the parenthesized command name.
+        let state = line.rsplit_once(") ").map(|(_, rest)| &rest[..1]);
+        if state == Some("S") {
+            return;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "{} never parked: {line}",
+            stat.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 #[test]
