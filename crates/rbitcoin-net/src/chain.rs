@@ -5886,7 +5886,7 @@ pub struct TipAcceptShInput {
     pub lookup_ns: u64,
     /// Write structural (spentness / maturity / BIP68).
     pub structural_ns: u64,
-    /// Inline `tx.head` insert (`write_head_sub_ns`), including a seal wait.
+    /// Residual wait on `tx.head` drain after structural/Class C overlap.
     pub drain_ns: u64,
     /// `remove_for_block_spent` after confirm (not inside confirm_write).
     pub mp_strip_ns: u64,
@@ -5965,7 +5965,7 @@ pub fn log_tip_accept_sh(
     let load_ns = w.load_ns;
     let structural_ns = w.structural_ns;
     let lookup_ns = w.lookup_total_ns;
-    let drain_ns = w.write_head_sub_ns;
+    let drain_ns = w.write_drain_join_ns;
     let sh = rbitcoin_query::TipShSnap {
         collect_ns: w.sh_collect_ns,
         sort_ns: w.sh_sort_ns,
