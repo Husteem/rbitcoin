@@ -461,7 +461,7 @@ async fn address_page_under_cap_matches_summary() {
 /// and every other script answers 503 too until the rebuild publishes a head.
 #[tokio::test]
 async fn torn_key_read_is_503_for_every_script_until_rebuilt() {
-    use rbitcoin_primitives::scripthash_display_hex as display;
+    let display = |s: &[u8]| hex_encode(script_hash(s));
     use rbitcoin_query::testutil::{heavy_sh_extent_query, tear_sh_extent_head, SH_HEAVY_SCRIPT};
     let (dir, q, key) = heavy_sh_extent_query("esplora-torn", 0);
     let q = Arc::new(q);

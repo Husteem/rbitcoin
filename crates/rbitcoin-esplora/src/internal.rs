@@ -395,7 +395,7 @@ pub async fn get_internal_scripthash_history(
     Path(sh_hex): Path<String>,
     AsOf(asof): AsOf,
 ) -> Response {
-    let Ok(sh) = parse_hash32(&sh_hex) else {
+    let Ok(sh) = parse_scripthash(&sh_hex) else {
         return not_found();
     };
     sh_history_stream(st, sh, asof).await
