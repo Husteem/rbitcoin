@@ -37,7 +37,7 @@ crates/rbitcoin-store/src/block_wire.rs	3
 crates/rbitcoin-store/src/chain.rs	1
 crates/rbitcoin-store/src/compact.rs	2
 crates/rbitcoin-store/src/file.rs	3
-crates/rbitcoin-store/src/int_map.rs	1
+crates/rbitcoin-store/src/int_map.rs	2
 crates/rbitcoin-store/src/open_address.rs	2
 crates/rbitcoin-store/src/readonly_map.rs	2
 crates/rbitcoin-store/src/scripthash_layout.rs	2
