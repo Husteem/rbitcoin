@@ -98,7 +98,7 @@ pub struct WriteStageSample {
     /// Write-thread pin Arc copies: plan take + create-pin FkMap (`pins=`)
     pub pins_ms: u64,
     pub pins_ns: u64,
-    /// `take_pending_queued` + `submit_head_insert` (`head_sub=`)
+    /// Submit of the `tx.head` insert (`head_sub=`).
     pub head_sub_ms: u64,
     pub head_sub_ns: u64,
     /// `class_c_commit` join/flush minus tables (`class_c_join=`)
