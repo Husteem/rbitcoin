@@ -656,6 +656,26 @@ fn generate_refuses_one_past_its_cap() {
     assert_eq!(fresh.tip_height(), None, "refusal must not mine");
 }
 
+/// A count equal to the production cap is not refused; one more is. This
+/// runs from `tests/`, where the net suite actually compiles.
+#[test]
+fn generate_cap_is_inclusive() {
+    assert!(ChainHub::refuse_over_cap(
+        ChainHub::GENERATE_MAX_BLOCKS,
+        ChainHub::GENERATE_MAX_BLOCKS
+    )
+    .is_ok());
+    let err = ChainHub::refuse_over_cap(
+        ChainHub::GENERATE_MAX_BLOCKS + 1,
+        ChainHub::GENERATE_MAX_BLOCKS,
+    )
+    .expect_err("one past the production cap");
+    assert!(
+        err.to_string().contains("nblocks too large (max 10000)"),
+        "{err}"
+    );
+}
+
 /// Block 1 on a real clock is still the pow limit (the min-difficulty gap).
 /// Block 2 takes the overlay. `0x1b7fffff` does not fit one nonce span, so
 /// generate returns instead of panicking inside the grind.

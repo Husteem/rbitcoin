@@ -419,9 +419,7 @@ async fn p2p_v1_tx_inv_follows_wtxidrelay() {
         assert!(node.hub.attach_mempool(std::sync::Arc::clone(&mp)).is_ok());
         let op_true = ScriptBuf::from_bytes(vec![0x51]);
         let p2wsh = ScriptBuf::new_p2wsh(&op_true.wscript_hash());
-        node.hub
-            .mine(1, p2wsh.clone(), vec![])
-            .unwrap();
+        node.hub.mine(1, p2wsh.clone(), vec![]).unwrap();
         node.hub.confirm_empty_regtest(100).unwrap();
         let cb = node
             .hub

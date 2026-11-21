@@ -9653,8 +9653,7 @@ fn announced_txid_getdata_serves_the_tip_tx() {
         Some(Inventory::Transaction(txid)),
         "a peer without wtxidrelay is announced the txid"
     );
-    hub.mine(1, op_true, vec![spend.clone()])
-        .unwrap();
+    hub.mine(1, op_true, vec![spend.clone()]).unwrap();
     let _ = hub.take_tip_wtx_scans();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let rt = tokio::runtime::Builder::new_current_thread()

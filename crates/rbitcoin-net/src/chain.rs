@@ -2762,7 +2762,8 @@ impl ChainHub {
     #[doc(hidden)]
     pub const GENERATE_MAX_BLOCKS: u32 = 10_000;
 
-    fn refuse_over_cap(nblocks: u32, cap: u32) -> Result<(), NetError> {
+    #[doc(hidden)]
+    pub fn refuse_over_cap(nblocks: u32, cap: u32) -> Result<(), NetError> {
         if nblocks > cap {
             return Err(NetError::Consensus(format!(
                 "nblocks too large (max {cap})"
@@ -2833,8 +2834,6 @@ impl ChainHub {
             nblocks,
             script_pubkey,
             GenerateFirst::Chosen(extra_txs),
-            Self::GENERATE_MAX_BLOCKS,
-            true,
             record_assembly,
         )
         .await
@@ -2850,15 +2849,8 @@ impl ChainHub {
         nblocks: u32,
         script_pubkey: ScriptBuf,
     ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying_async(
-            nblocks,
-            script_pubkey,
-            GenerateFirst::Pool,
-            Self::GENERATE_MAX_BLOCKS,
-            true,
-            true,
-        )
-        .await
+        self.generate_paying_async(nblocks, script_pubkey, GenerateFirst::Pool, true)
+            .await
     }
 
     async fn generate_paying_async(
@@ -2866,14 +2858,12 @@ impl ChainHub {
         nblocks: u32,
         script_pubkey: ScriptBuf,
         first: GenerateFirst,
-        limit: u32,
-        commit_on_accept: bool,
         record_assembly: bool,
     ) -> Result<Vec<BlockHash>, NetError> {
         if nblocks == 0 {
             return Ok(Vec::new());
         }
-        Self::refuse_over_cap(nblocks, limit)?;
+        Self::refuse_over_cap(nblocks, Self::GENERATE_MAX_BLOCKS)?;
         // Accept and the blocksonly pool removal share this task. Dropping
         // the request must not leave a connected block's txs in the pool.
         let hub = std::sync::Arc::clone(self);
@@ -2904,11 +2894,7 @@ impl ChainHub {
                 } else {
                     Vec::new()
                 };
-                let ids = commit_on_accept.then(|| {
-                    txs.iter()
-                        .map(|tx| tx.compute_txid())
-                        .collect::<Vec<Txid>>()
-                });
+                let ids: Vec<Txid> = txs.iter().map(|tx| tx.compute_txid()).collect();
                 if record_assembly {
                     let weight = txs.iter().map(|tx| tx.weight().to_wu()).sum();
                     hub.note_block_assembled(weight, txs.len());
@@ -2917,7 +2903,7 @@ impl ChainHub {
                     hub.mine_and_accept_paying_async(&script_pubkey, txs)
                         .await?,
                 );
-                if let Some(ids) = ids.filter(|ids| !ids.is_empty()) {
+                if !ids.is_empty() {
                     Self::park_before_generate_commit(&hub).await;
                     if let Some(mp) = hub.mempool().cloned() {
                         crate::reactor::off_pool(move || mp.commit_generated_txids(&ids))
@@ -5913,23 +5899,6 @@ pub fn sixty_four_byte_body(prev: BlockHash, time: u32) -> Block {
     rbitcoin_consensus::grind_regtest_pow(&mut block.header);
     assert!(block.check_merkle_root());
     block
-}
-
-#[cfg(test)]
-mod generate_cap {
-    use super::ChainHub;
-
-    /// The cap itself mines; one more is refused. A stand-in cap of 2 pins
-    /// the same `>` that guards [`ChainHub::GENERATE_MAX_BLOCKS`].
-    #[test]
-    fn the_cap_is_inclusive() {
-        assert!(ChainHub::refuse_over_cap(2, 2).is_ok());
-        let err = ChainHub::refuse_over_cap(3, 2).expect_err("one past the cap");
-        assert!(
-            err.to_string().contains("nblocks too large (max 2)"),
-            "{err}"
-        );
-    }
 }
 
 #[cfg(test)]
