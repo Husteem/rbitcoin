@@ -556,6 +556,64 @@ fn concurrent_noban_headers_timeouts_release_the_slot_once() {
     );
 }
 
+/// A heartbeat that read an expired deadline, then parked on the CIDR table,
+/// must not end a sync that started after it read. The test stands in for the
+/// heartbeat that timed the sync out and for the peer restarting its sync,
+/// then lets the parked heartbeat run.
+///
+/// Linux only, as above.
+#[cfg(target_os = "linux")]
+#[test]
+fn parked_noban_headers_timeout_leaves_a_restarted_sync_alone() {
+    let hub = PeerHub::new();
+    let mut t = rbitcoin_net::NetPermTable::default();
+    t.whitelist
+        .push(rbitcoin_net::parse_whitelist("noban@127.0.0.1").unwrap());
+    hub.set_net_perms(t);
+    let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+    let inbound = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+    let _outbound = hub.register(
+        b,
+        b,
+        &ver("/rbitcoin:0.1.0/"),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let now = 1_700_000_000u64;
+    let best = 1_231_006_505u64;
+    assert!(hub.try_start_headers_sync(&inbound, now, best));
+    let deadline = rbitcoin_net::chain::headers_download_timeout_secs(now, best);
+    let restarted = rbitcoin_net::chain::headers_download_timeout_secs(deadline + 1, best);
+    let hub = &hub;
+    let inbound = &inbound;
+    std::thread::scope(|s| {
+        let perms = hub.net_perms.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let heartbeat = s.spawn(move || {
+            tx.send(std::fs::read_link("/proc/thread-self").unwrap())
+                .unwrap();
+            hub.check_headers_sync_timeouts(deadline + 1);
+        });
+        wait_until_asleep(&rx.recv().unwrap());
+        assert!(hub.end_headers_sync(inbound));
+        assert!(hub.try_start_headers_sync(inbound, deadline + 1, best));
+        inbound.note_awaiting_headers();
+        drop(perms);
+        heartbeat.join().unwrap();
+    });
+    assert!(
+        inbound.is_sync_started(),
+        "a stale timeout ended the restarted sync"
+    );
+    assert_eq!(
+        inbound.headers_sync_timeout.load(Ordering::Relaxed),
+        restarted
+    );
+    assert!(inbound.is_awaiting_headers());
+    assert_eq!(hub.headers_sync_peers.load(Ordering::Relaxed), 1);
+}
+
 /// Wait until the thread at `/proc/<task>` is asleep (`S`), with a deadline.
 #[cfg(target_os = "linux")]
 fn wait_until_asleep(task: &std::path::Path) {

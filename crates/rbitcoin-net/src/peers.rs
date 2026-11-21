@@ -3239,8 +3239,14 @@ impl PeerHub {
             }
             if p.session_noban() {
                 // Another heartbeat may have timed this sync out since the
-                // check above.
-                if self.end_headers_sync(p) {
+                // check above, and the peer may have started a new one. Only
+                // the sync whose deadline was read here is ended: a restarted
+                // sync holds 0 or a later deadline.
+                let still_this_sync = p
+                    .headers_sync_timeout
+                    .compare_exchange(deadline, 0, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok();
+                if still_this_sync && self.end_headers_sync(p) {
                     rbitcoin_log::info!("{}", crate::chain::headers_timeout_noban_log(p.id));
                 }
             } else {
