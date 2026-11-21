@@ -8,6 +8,7 @@
 
 use crate::fee_history::{FeeHistory, HistoricalFeeBlock};
 use crate::fee_history_file;
+use crate::inv_bucket::{InvBuckets, InvDirection};
 use crate::perf_meter::{PerfCounter, PerfMax};
 use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
@@ -24,7 +25,6 @@ use rbitcoin_query::Query;
 use rbitcoin_store::durability::Durable as _;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::ops::Bound;
 use std::path::{Path, PathBuf};
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicUsize;
@@ -873,10 +873,12 @@ pub const GETDATA_TX_INTERVAL_SECS: u64 = 60;
 /// Core `MAX_PEER_TX_REQUEST_IN_FLIGHT`.
 #[doc(hidden)]
 pub const MAX_PARENTS_PER_PARK: usize = 100;
-/// Most age-INV log rows one [`MempoolHub::try_age_inv_since`] call walks.
-/// It holds `relay_index`, which every session point lookup takes, so a new
-/// session's first walk from `(0, 0)` resumes on later ticks.
-pub const AGE_INV_SCAN_MAX: usize = 1024;
+/// Most released INV rows one session tick reads. A long log resumes from
+/// the session's cursor on the next tick.
+pub const RELEASED_INV_SCAN_MAX: usize = 1024;
+/// Hard bound on one direction's released log. A live tx at the front would
+/// otherwise keep every later dead row until it leaves the pool.
+pub const RELEASED_INV_LOG_CAP: usize = 100_000;
 
 /// INV AlreadyHave for recently confirmed txid/wtxid (Core rolling bloom is ~100k).
 #[doc(hidden)]
@@ -1124,13 +1126,20 @@ pub struct RelayIndex {
     pub accept_at: HashMap<Wtxid, u64>,
     /// Accept generation for `p2p_tx_privacy` (skip pre-handshake txs).
     pub accept_gen: HashMap<Wtxid, u64>,
-    /// Age-INV log: `(due_secs, accept_gen) → (txid, wtxid)`. Not `inner`.
-    pub age_inv: BTreeMap<(u64, u64), (Txid, Wtxid)>,
     /// Accept-time order for expiry: `(accept_at, wtxid) → txid`, one row per
     /// live tx. Extra RAM beside `accept_at` (key + txid, plus tree nodes;
     /// about 8 MiB at 100k txs) so a 256-entry scan reads the oldest accepts
     /// and does not walk `wtxid_by_txid`.
     pub expiry_order: BTreeMap<(u64, Wtxid), Txid>,
+}
+
+/// The live fields the INV filter needs, read under one mempool read guard.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct RelayInvView {
+    pub wtxid: Wtxid,
+    pub fee_sat: u64,
+    pub weight: u64,
 }
 
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
@@ -1272,6 +1281,8 @@ pub struct MempoolHub {
     pub tip_ctx: Mutex<Option<(Fk, ChainTipCtx)>>,
     /// TxRequestTracker-shaped missing-parent GETDATA.
     pub parent_req: Mutex<parent_req::ParentTracker>,
+    /// Global count+size INV buckets and the released wtxid logs sessions read.
+    pub inv_buckets: Mutex<InvBuckets>,
 }
 
 #[doc(hidden)]
@@ -1596,6 +1607,7 @@ impl MempoolHub {
             min_live_accept_at: AtomicU64::new(u64::MAX),
             tip_ctx: Mutex::new(None),
             parent_req: Mutex::new(parent_req::ParentTracker::new()),
+            inv_buckets: Mutex::new(InvBuckets::new()),
         };
         // Schema ≤ 2 records carry no sigop cost: fill (or evict) before serving.
         let loaded = {
@@ -1610,7 +1622,7 @@ impl MempoolHub {
         for (txid, wtxid, at) in loaded {
             if hub.contains(&txid) {
                 let seq = hub.next_relay_seq.fetch_add(1, Ordering::Relaxed);
-                hub.insert_relay_maps(txid, wtxid, seq, at, false);
+                hub.insert_relay_maps(txid, wtxid, seq, at);
             }
         }
         {
@@ -1775,12 +1787,11 @@ impl MempoolHub {
             .unwrap_or(0)
     }
 
-    /// Index a live tx accepted at `at` (node seconds). `age_inv` queues the
-    /// delayed INV for a fresh accept.
+    /// Index a live tx accepted at `at` (node seconds). The global INV
+    /// backlog decides when it is announced, not this index.
     #[doc(hidden)]
-    pub fn insert_relay_maps(&self, txid: Txid, wtxid: Wtxid, seq: u64, at: u64, age_inv: bool) {
+    pub fn insert_relay_maps(&self, txid: Txid, wtxid: Wtxid, seq: u64, at: u64) {
         let gen = self.next_accept_gen.fetch_add(1, Ordering::Relaxed);
-        let due = at.saturating_add(30);
         let mut ix = self.relay_index.lock().unwrap();
         let ix = &mut *ix;
         if let Some(prev_w) = ix.wtxid_by_txid.insert(txid, wtxid) {
@@ -1791,9 +1802,6 @@ impl MempoolHub {
         ix.relay_seq.insert(wtxid, seq);
         ix.accept_at.insert(wtxid, at);
         ix.accept_gen.insert(wtxid, gen);
-        if age_inv {
-            ix.age_inv.insert((due, gen), (txid, wtxid));
-        }
         ix.expiry_order.insert((at, wtxid), txid);
         self.min_live_accept_at.fetch_min(at, Ordering::Relaxed);
     }
@@ -1805,10 +1813,7 @@ impl MempoolHub {
         if let Some(w) = ix.wtxid_by_txid.remove(txid) {
             ix.relay_seq.remove(&w);
             let at = ix.accept_at.remove(&w);
-            let gen = ix.accept_gen.remove(&w);
-            if let (Some(at), Some(gen)) = (at, gen) {
-                ix.age_inv.remove(&(at.saturating_add(30), gen));
-            }
+            ix.accept_gen.remove(&w);
             if let Some(at) = at {
                 ix.expiry_order.remove(&(at, w));
             }
@@ -2228,36 +2233,148 @@ impl MempoolHub {
         Some(g.graph.iter().map(|(txid, e)| (*txid, e.wtxid)).collect())
     }
 
-    #[allow(clippy::type_complexity)] // age-inv cursor `(due, gen)` plus the due txid/wtxid list
-    /// Newly age-due INVs after `seen` (`(due_secs, accept_gen)` cursor), at
-    /// most [`AGE_INV_SCAN_MAX`] per call; the next tick resumes after `last`.
-    /// Session tick: `try_lock` — busy skip.
-    pub fn try_age_inv_since(
-        &self,
-        seen: (u64, u64),
-        now: u64,
-    ) -> Option<((u64, u64), Vec<(Txid, Wtxid)>)> {
-        let ix = self.relay_index.try_lock().ok()?;
-        let mut last = seen;
-        let mut out = Vec::new();
-        for (&(due, gen), &(txid, wtxid)) in ix
-            .age_inv
-            .range((Bound::Excluded(seen), Bound::Included((now, u64::MAX))))
-            .take(AGE_INV_SCAN_MAX)
-        {
-            out.push((txid, wtxid));
-            last = (due, gen);
-        }
-        Some((last, out))
+    /// Queue one wtxid for both direction buckets. One accept or rebroadcast
+    /// calls this once, so the backlog is global rather than per peer.
+    pub fn enqueue_inv(&self, wtxid: Wtxid, size: u32) {
+        let mut g = self.inv_buckets.lock().unwrap();
+        g.inbound.enqueue(wtxid, size);
+        g.outbound.enqueue(wtxid, size);
     }
 
-    /// Last due-log key with `due <= now` (advance cursor after a rare full walk).
-    pub fn try_age_inv_watermark(&self, now: u64) -> Option<(u64, u64)> {
-        let ix = self.relay_index.try_lock().ok()?;
-        ix.age_inv
-            .range(..=(now, u64::MAX))
-            .next_back()
-            .map(|(k, _)| *k)
+    /// Live txid for a wtxid. `None` means the mempool read lock is busy and
+    /// the caller must retry; `Some(None)` means the tx left the pool.
+    fn try_live_txid(&self, wtxid: &Wtxid) -> Option<Option<Txid>> {
+        let g = self.inner.try_read().ok()?;
+        Some(g.graph.txid_for_wtxid(wtxid))
+    }
+
+    /// One live mempool lookup for the INV filter path. `None` is a busy
+    /// mempool read (retry), `Some(None)` is a tx that left the pool.
+    #[doc(hidden)]
+    pub fn try_relay_inv_view(&self, txid: &Txid) -> Option<Option<RelayInvView>> {
+        let g = self.inner.try_read().ok()?;
+        let Some(e) = g.graph.get(txid) else {
+            return Some(None);
+        };
+        let Some(tx) = g.get_tx(txid) else {
+            return Some(None);
+        };
+        Some(Some(RelayInvView {
+            wtxid: tx.compute_wtxid(),
+            fee_sat: e.fee_sat,
+            weight: e.adjusted_weight(g.graph.bytes_per_sigop()),
+        }))
+    }
+
+    /// Refill both buckets and release the wtxids the tokens cover. A dead
+    /// backlog entry is dropped without spending a token.
+    pub fn drain_inv_backlog(&self, now_ms: u64) {
+        let mut g = self.inv_buckets.lock().unwrap();
+        let g = &mut *g;
+        g.inbound.refill(now_ms);
+        g.outbound.refill(now_ms);
+        let mut next = g.next_release;
+        for dir in [InvDirection::Inbound, InvDirection::Outbound] {
+            let (bucket, log) = match dir {
+                InvDirection::Inbound => (&mut g.inbound, &mut g.released_inbound),
+                InvDirection::Outbound => (&mut g.outbound, &mut g.released_outbound),
+            };
+            // `avail` starts one batch. Core then decrements past zero down
+            // to the count floor, so a full bucket releases 490 rather than
+            // stopping at 420.
+            if !bucket.avail() {
+                bucket.shrink_if_idle();
+                continue;
+            }
+            while let Some(&(w, size)) = bucket.backlog.front() {
+                let txid = match self.try_live_txid(&w) {
+                    None => break,
+                    Some(None) => {
+                        bucket.backlog.pop_front();
+                        continue;
+                    }
+                    Some(Some(txid)) => txid,
+                };
+                bucket.backlog.pop_front();
+                let count_ok = bucket.count.decrement(1.0);
+                let size_ok = bucket.size.decrement(f64::from(size));
+                log.insert(next, (txid, w));
+                next = next.saturating_add(1);
+                if !count_ok || !size_ok {
+                    break;
+                }
+            }
+            bucket.shrink_if_idle();
+        }
+        g.next_release = next;
+        // A released tx that confirmed or was evicted before a slow session
+        // read it is not announced. Drop it from the front so the log stays
+        // bounded by the live pool.
+        for dir in [InvDirection::Inbound, InvDirection::Outbound] {
+            let log = match dir {
+                InvDirection::Inbound => &mut g.released_inbound,
+                InvDirection::Outbound => &mut g.released_outbound,
+            };
+            while let Some(w) = log.first_key_value().map(|(_, (_, w))| *w) {
+                match self.try_live_txid(&w) {
+                    None | Some(Some(_)) => break,
+                    Some(None) => {
+                        log.pop_first();
+                    }
+                }
+            }
+            while log.len() > RELEASED_INV_LOG_CAP {
+                log.pop_first();
+            }
+        }
+    }
+
+    /// Released `(txid, wtxid)` after `cursor`, at most `limit`. `ready` can
+    /// stop the walk so the cursor stays in front of an inbound tx whose
+    /// 30 s age has not elapsed.
+    pub fn take_released_invs(
+        &self,
+        dir: InvDirection,
+        cursor: u64,
+        limit: usize,
+        ready: impl Fn(Txid, &Wtxid) -> bool,
+    ) -> (u64, Vec<(u64, Txid, Wtxid)>) {
+        let g = self.inv_buckets.lock().unwrap();
+        let log = g.released(dir);
+        let mut last = cursor;
+        let mut out = Vec::new();
+        for (&seq, &(txid, w)) in log.range(cursor.saturating_add(1)..) {
+            if out.len() >= limit || !ready(txid, &w) {
+                break;
+            }
+            out.push((seq, txid, w));
+            last = seq;
+        }
+        if out.is_empty() {
+            match log.first_key_value() {
+                Some((&first, _)) if first > cursor.saturating_add(1) => {
+                    last = first.saturating_sub(1);
+                }
+                None if g.next_release > cursor => {
+                    last = g.next_release.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+        (last, out)
+    }
+
+    pub fn inv_backlog_len(&self, dir: InvDirection) -> usize {
+        self.inv_buckets.lock().unwrap().backlog_len(dir)
+    }
+
+    pub fn inv_bucket_tokens(&self, dir: InvDirection) -> (f64, f64) {
+        let g = self.inv_buckets.lock().unwrap();
+        let bucket = match dir {
+            InvDirection::Inbound => &g.inbound,
+            InvDirection::Outbound => &g.outbound,
+        };
+        (bucket.count.value(), bucket.size.value())
     }
 
     /// Drop live mempool entries that are confirmed-strong on tip, then live
@@ -2522,6 +2639,7 @@ impl MempoolHub {
             outpoints: outpoints.into(),
         });
         self.meter_announce.fetch_add(1, Ordering::Relaxed);
+        self.enqueue_inv(tx.compute_wtxid(), tx.total_size() as u32);
     }
 
     pub fn live_count(&self) -> usize {
@@ -3889,7 +4007,7 @@ impl MempoolHub {
         self.unindex_evicted(&r.evicted);
         let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
         let w = tx.compute_wtxid();
-        self.insert_relay_maps(r.txid, w, seq, r.accept_secs, true);
+        self.insert_relay_maps(r.txid, w, seq, r.accept_secs);
         self.reorg_servable.lock().unwrap().remove(&w);
         self.push_recent(tx, r);
         self.index_txid(r.txid, tx, prevouts);
@@ -5254,7 +5372,7 @@ impl MempoolHub {
             self.unindex_evicted(&r.evicted);
             // Same relay-age clock as an individual admit (`mempool_limit.py` INV).
             let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
-            self.insert_relay_maps(r.txid, tx.compute_wtxid(), seq, r.accept_secs, true);
+            self.insert_relay_maps(r.txid, tx.compute_wtxid(), seq, r.accept_secs);
             self.index_txid(
                 r.txid,
                 tx,
@@ -5709,7 +5827,8 @@ impl MempoolHub {
             if let Ok(prevouts) = self.staged_reorg_admit(tx, &utxo) {
                 let w = tx.compute_wtxid();
                 self.reorg_servable.lock().unwrap().insert(w);
-                self.insert_relay_maps(tx.compute_txid(), w, 0, self.relay_now_secs(), true);
+                self.insert_relay_maps(tx.compute_txid(), w, 0, self.relay_now_secs());
+                self.enqueue_inv(w, tx.total_size() as u32);
                 admitted.push((tx, prevouts));
             }
         }
@@ -6903,9 +7022,22 @@ impl MempoolHub {
     /// row already gone still reads the submit time and can INV an inbound peer.
     fn end_local_origin(&self, txid: &Txid) {
         self.restamp_relay_age(txid);
-        let mut origin = self.local_origin.lock().unwrap();
-        if matches!(origin.txs.get(txid), Some(IsolatedTurn::Sent { .. })) {
-            origin.txs.remove(txid);
+        let removed = {
+            let mut origin = self.local_origin.lock().unwrap();
+            if matches!(origin.txs.get(txid), Some(IsolatedTurn::Sent { .. })) {
+                origin.txs.remove(txid);
+                true
+            } else {
+                false
+            }
+        };
+        // The bucket may have released this tx while `skip_standing_inv` was
+        // set, and the session then advanced past it. Queue it once more now
+        // that a standing peer may hear it.
+        if removed {
+            if let Some(tx) = self.try_get_tx(txid) {
+                self.enqueue_inv(tx.compute_wtxid(), tx.total_size() as u32);
+            }
         }
     }
 
@@ -6925,11 +7057,6 @@ impl MempoolHub {
             return;
         }
         ix.accept_at.insert(wtxid, now);
-        if let Some(gen) = ix.accept_gen.get(&wtxid).copied() {
-            let pair = (*txid, wtxid);
-            ix.age_inv.remove(&(old.saturating_add(30), gen));
-            ix.age_inv.insert((now.saturating_add(30), gen), pair);
-        }
         ix.expiry_order.remove(&(old, wtxid));
         ix.expiry_order.insert((now, wtxid), *txid);
         if old == self.min_live_accept_at.load(Ordering::Relaxed) {
@@ -7009,9 +7136,9 @@ impl MempoolHub {
     pub fn rebroadcast_unbroadcast(&self) {
         let ids: Vec<Txid> = self.unbroadcast.lock().unwrap().iter().copied().collect();
         for txid in ids {
-            if !self.try_contains(&txid) {
+            let Some(tx) = self.try_get_tx(&txid) else {
                 continue;
-            }
+            };
             let _ = self.announce.send(MempoolAnnounce {
                 txid,
                 replaced: Vec::new(),
@@ -7020,6 +7147,7 @@ impl MempoolHub {
                 outpoints: Arc::default(),
             });
             self.meter_announce.fetch_add(1, Ordering::Relaxed);
+            self.enqueue_inv(tx.compute_wtxid(), tx.total_size() as u32);
         }
     }
 

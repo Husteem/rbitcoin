@@ -1076,11 +1076,9 @@ mod peer_session_pins {
         on_headers_poll, on_heartbeat, on_inv, on_inv_block_needs_headers, on_tip_event,
         queue_due_tx_invs, read_peer_version, reconstruct_cmpct_from_mempool, requeue_later_pong,
         schedule_orphan_parent_getdata, serve_getdata_full_block, serve_mempool_getdata,
-        tip_event_for_announce, tip_follow_locator, tx_announce_inbound_gated,
-        tx_announce_maybe_count, tx_announce_peer_ok, tx_announce_should_queue, tx_inv_candidate,
-        wait_peer_verack, DecodeQueue, FullBlockReply, HandshakePolicy, PeerFollowState,
-        ADDRFETCH_TIMEOUT_SECS, BLOCK_GETDATA_TIMEOUT, MAX_BLOCKS_TO_ANNOUNCE,
-        MIN_PEER_PROTO_VERSION, WTXID_RELAY_VERSION,
+        tip_event_for_announce, tip_follow_locator, tx_announce_inbound_gated, wait_peer_verack,
+        DecodeQueue, FullBlockReply, HandshakePolicy, PeerFollowState, ADDRFETCH_TIMEOUT_SECS,
+        BLOCK_GETDATA_TIMEOUT, MAX_BLOCKS_TO_ANNOUNCE, MIN_PEER_PROTO_VERSION, WTXID_RELAY_VERSION,
     };
     use crate::peers::{PeerConnType, PeerHub, PeerOut};
     use bitcoin::hashes::Hash;
@@ -1192,7 +1190,6 @@ mod peer_session_pins {
         assert!(!tx_announce_inbound_gated(&inn, &mp, &txid));
         mp.set_relay_enabled(true);
         assert!(tx_announce_inbound_gated(&inn, &mp, &txid));
-        assert!(!tx_announce_peer_ok(Some(&inn), &mp, &txid));
     }
 
     /// A matching pong clears the outstanding ping.
@@ -1228,25 +1225,6 @@ mod peer_session_pins {
         hub.ensure_genesis().expect("genesis");
         let tip = hub.tip_hash().expect("tip");
         assert_eq!(tip_follow_locator(&hub), vec![tip]);
-    }
-
-    /// An inv is not queued for a transaction the pool does not have.
-    #[test]
-    fn peer_relay_announce_needs_the_tx() {
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("relay-ann");
-        let pool_dir = dir.path().join("pool");
-        std::fs::create_dir_all(&pool_dir).expect("pool dir");
-        let mp = crate::tx_relay::MempoolHub::open_with_weight_persist(
-            &pool_dir,
-            hub.query.clone(),
-            400_000,
-            false,
-        )
-        .expect("mempool");
-        mp.set_relay_enabled(true);
-        let (_peers, live) = peer(PeerConnType::OutboundFullRelay);
-        let txid = bitcoin::Txid::from_byte_array([6; 32]);
-        assert!(!tx_announce_should_queue(Some(&live), &mp, &txid));
     }
 
     fn saw_getdata(rx: &mut tokio::sync::mpsc::UnboundedReceiver<PeerOut>) -> bool {
@@ -1592,33 +1570,6 @@ mod peer_session_pins {
         assert_eq!(served, FullBlockReply::Withheld);
     }
 
-    /// A confirmed coinbase is still announced when the peer's filter is above
-    /// a rate we do not have. An inbound relay peer counts that inv.
-    #[test]
-    fn peer_announce_coinbase_ignores_a_missing_rate() {
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("ann-cb");
-        hub.ensure_genesis().expect("genesis");
-        let pool_dir = dir.path().join("pool");
-        std::fs::create_dir_all(&pool_dir).expect("pool dir");
-        let mp = crate::tx_relay::MempoolHub::open_with_weight_persist(
-            &pool_dir,
-            hub.query.clone(),
-            400_000,
-            false,
-        )
-        .expect("mempool");
-        mp.set_relay_enabled(true);
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        let txid = genesis.txdata[0].compute_txid();
-        assert!(mp.try_contains(&txid), "the genesis coinbase is at the tip");
-        let (_peers, live) = peer(PeerConnType::OutboundFullRelay);
-        live.note_minfeefilter_sat_kvb(u64::MAX);
-        assert!(tx_announce_should_queue(Some(&live), &mp, &txid));
-        let inn = inbound();
-        tx_announce_maybe_count(Some(&inn), &mp, &txid);
-        assert_eq!(inn.snapshot(0).inv_to_send, 1);
-    }
-
     fn open_pool(
         label: &str,
     ) -> (
@@ -1637,34 +1588,6 @@ mod peer_session_pins {
         )
         .expect("mempool");
         (dir, hub, mp)
-    }
-
-    /// An accept generation equal to the floor is still announced. A local
-    /// unbroadcast tx is not held for the clock, and it is announced while
-    /// node relay is off.
-    #[test]
-    fn peer_tx_inv_candidate_respects_floor_and_local() {
-        let (_dir, _hub, mp) = open_pool("inv-cand");
-        mp.set_relay_enabled(true);
-        let from = crate::peers::CappedSet::new();
-        let txid = bitcoin::Txid::from_byte_array([7; 32]);
-        let w = bitcoin::Wtxid::from_byte_array([9; 32]);
-        mp.insert_relay_maps(txid, w, 1, mp.relay_now_secs(), false);
-        let gen = mp.accept_gen(&w).expect("gen");
-        let (_peers, live) = peer(PeerConnType::OutboundFullRelay);
-        live.set_inv_gen_floor(gen);
-        assert!(tx_inv_candidate(&mp, &live, &from, txid, w, true, false).is_some());
-        let local_id = bitcoin::Txid::from_byte_array([8; 32]);
-        let local_w = bitcoin::Wtxid::from_byte_array([10; 32]);
-        mp.note_unbroadcast(local_id);
-        let (_peers, outbound) = peer(PeerConnType::OutboundFullRelay);
-        assert!(tx_inv_candidate(&mp, &outbound, &from, local_id, local_w, false, false).is_none());
-        mp.set_relay_enabled(false);
-        let off_id = bitcoin::Txid::from_byte_array([6; 32]);
-        let off_w = bitcoin::Wtxid::from_byte_array([11; 32]);
-        mp.note_unbroadcast(off_id);
-        let (_peers, blocks_only) = peer(PeerConnType::OutboundFullRelay);
-        assert!(tx_inv_candidate(&mp, &blocks_only, &from, off_id, off_w, false, false).is_some());
     }
 
     fn wtx_invs(rx: &mut tokio::sync::mpsc::UnboundedReceiver<PeerOut>) -> Vec<bitcoin::Wtxid> {
@@ -1782,7 +1705,6 @@ mod peer_session_pins {
         from.insert(older, 8);
         let (_peers, live) = peer(PeerConnType::OutboundFullRelay);
         live.set_wtxid_relay();
-        live.request_tx_inv();
         queue_due_tx_invs(&hub, &live, &from, &out_tx);
         assert_eq!(
             wtx_invs(&mut out_rx),
@@ -4055,12 +3977,12 @@ pub fn on_tx_announce(
     session: Option<&crate::peers::LivePeer>,
     ann: Option<Result<crate::tx_relay::MempoolAnnounce, broadcast::error::RecvError>>,
 ) -> Result<(), NetError> {
-    let Some(ann) = ann else {
-        return Ok(());
-    };
-    match ann {
-        Ok(ann) => on_tx_announce_ok(hub, out_tx, follow, session, ann)?,
-        Err(broadcast::error::RecvError::Lagged(_)) | Err(broadcast::error::RecvError::Closed) => {}
+    // The announce only wakes this session. The global buckets decide which
+    // wtxids are released, and `queue_due_tx_invs` queues that slice.
+    if ann.is_some() {
+        if let Some(s) = session {
+            queue_due_tx_invs(hub, s, &follow.from_this_peer, out_tx);
+        }
     }
     Ok(())
 }
@@ -4073,60 +3995,80 @@ pub fn on_tx_announce_ok(
     session: Option<&crate::peers::LivePeer>,
     ann: crate::tx_relay::MempoolAnnounce,
 ) -> Result<(), NetError> {
-    let txid = ann.txid;
-    if follow.from_this_peer.contains_key(&txid) {
-        return Ok(());
+    match announce_ready_txid(hub, &follow.from_this_peer, session, ann.txid, false) {
+        ReadyInv::Queued(inv) => queue_accounted(session, out_tx, NetworkMessage::Inv(vec![inv])),
+        ReadyInv::Skipped | ReadyInv::Retry => Ok(()),
+    }
+}
+
+/// One release's result. `Retry` means the mempool read was busy and the
+/// session cursor must stay in front of this row so a later tick tries it
+/// again; `Skipped` is a permanent per-peer decision.
+enum ReadyInv {
+    Queued(Inventory),
+    Skipped,
+    Retry,
+}
+
+/// Filter one released txid for `session`. Both the bucket release path and a
+/// direct announce test use this one filter body.
+fn announce_ready_txid(
+    hub: &ChainHub,
+    from_this_peer: &CappedSet<bitcoin::Txid>,
+    session: Option<&crate::peers::LivePeer>,
+    txid: bitcoin::Txid,
+    released: bool,
+) -> ReadyInv {
+    if from_this_peer.contains_key(&txid) {
+        return ReadyInv::Skipped;
     }
     let Some(mp) = hub.mempool() else {
-        return Ok(());
+        return ReadyInv::Skipped;
     };
-    tx_announce_maybe_count(session, mp, &txid);
-    if !tx_announce_peer_ready(session, mp, &txid) {
-        return Ok(());
+    let Some(view) = mp.try_relay_inv_view(&txid) else {
+        return ReadyInv::Retry;
+    };
+    let Some(view) = view else {
+        return ReadyInv::Skipped;
+    };
+    if mp.skip_standing_inv(&txid)
+        || !tx_announce_peer_ok_at(session, mp, &txid, released)
+        || !(mp.relay_enabled() || mp.is_unbroadcast(&txid))
+    {
+        return ReadyInv::Skipped;
     }
-    let Some(wtxid) = tx_announce_wtxid(mp, &txid) else {
-        return Ok(());
-    };
+    if let Some(s) = session {
+        if tx_announce_inbound_gated(s, mp, &txid) && !s.session_noban() {
+            s.count_tx_inv_to_send();
+        }
+    }
     // Core erases a below-filter tx from this peer's to-send set. A later
     // lower feefilter does not announce it (`p2p_feefilter.py`).
-    if tx_announce_below_feefilter(session, mp, &txid) {
-        if let Some(s) = session {
-            s.note_announced_tx(txid, wtxid);
+    let peer_min = session.map(|s| s.minfeefilter_sat_kvb()).unwrap_or(0);
+    if peer_min > 0 {
+        let modified = i128::from(view.fee_sat)
+            .saturating_add(i128::from(mp.fee_delta(&txid)))
+            .max(0) as u64;
+        let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(modified, view.weight);
+        if rate < peer_min {
+            if let Some(s) = session {
+                s.note_announced_tx(txid, view.wtxid);
+            }
+            return ReadyInv::Skipped;
         }
-        return Ok(());
     }
     // A later rebroadcast still reaches a peer that has not heard this tx.
     // The claim is shared with flush, so the two cannot both queue. With no
     // session row, the peer never sent `wtxidrelay`.
     let inv = match session {
-        Some(s) => s.claim_announced_tx(txid, wtxid),
+        Some(s) => s.claim_announced_tx(txid, view.wtxid),
         None => Some(Inventory::Transaction(txid)),
     };
     let Some(inv) = inv else {
-        return Ok(());
+        return ReadyInv::Skipped;
     };
-    tx_announce_note_seq(session, mp, &wtxid);
-    queue_out(out_tx, NetworkMessage::Inv(vec![inv]))
-}
-
-#[doc(hidden)]
-pub fn tx_announce_maybe_count(
-    session: Option<&crate::peers::LivePeer>,
-    mp: &crate::tx_relay::MempoolHub,
-    txid: &bitcoin::Txid,
-) {
-    let Some(s) = session else {
-        return;
-    };
-    if !tx_announce_inbound_gated(s, mp, txid) {
-        return;
-    }
-    if s.session_noban() {
-        return;
-    }
-    if mp.try_contains(txid) {
-        s.count_tx_inv_to_send();
-    }
+    tx_announce_note_seq(session, mp, &view.wtxid);
+    ReadyInv::Queued(inv)
 }
 
 #[doc(hidden)]
@@ -4148,37 +4090,6 @@ fn tx_inv_peer_ok(
     s.conn_type != crate::peers::PeerConnType::BlockRelay && (s.relay || mp.is_unbroadcast(txid))
 }
 
-#[doc(hidden)]
-fn tx_announce_peer_ready(
-    session: Option<&crate::peers::LivePeer>,
-    mp: &crate::tx_relay::MempoolHub,
-    txid: &bitcoin::Txid,
-) -> bool {
-    !mp.skip_standing_inv(txid)
-        && tx_announce_peer_ok(session, mp, txid)
-        && mp.try_contains(txid)
-        && (mp.relay_enabled() || mp.is_unbroadcast(txid))
-}
-
-#[doc(hidden)]
-pub fn tx_announce_should_queue(
-    session: Option<&crate::peers::LivePeer>,
-    mp: &crate::tx_relay::MempoolHub,
-    txid: &bitcoin::Txid,
-) -> bool {
-    tx_announce_peer_ready(session, mp, txid) && !tx_announce_below_feefilter(session, mp, txid)
-}
-
-/// `None` when the tx left the pool after the ready check. Core skips such a
-/// tx.
-#[doc(hidden)]
-pub fn tx_announce_wtxid(
-    mp: &crate::tx_relay::MempoolHub,
-    txid: &bitcoin::Txid,
-) -> Option<bitcoin::Wtxid> {
-    mp.try_get_tx(txid).map(|tx| tx.compute_wtxid())
-}
-
 fn tx_announce_note_seq(
     session: Option<&crate::peers::LivePeer>,
     mp: &crate::tx_relay::MempoolHub,
@@ -4192,15 +4103,14 @@ fn tx_announce_note_seq(
     }
 }
 
+/// `None` when the tx left the pool after the ready check. Core skips such a
+/// tx.
 #[doc(hidden)]
-pub fn tx_announce_peer_ok(
-    session: Option<&crate::peers::LivePeer>,
+pub fn tx_announce_wtxid(
     mp: &crate::tx_relay::MempoolHub,
     txid: &bitcoin::Txid,
-) -> bool {
-    session.is_none_or(|s| {
-        tx_inv_peer_ok(s, mp, txid) && (!s.inbound || s.session_noban() || !mp.relay_enabled())
-    })
+) -> Option<bitcoin::Wtxid> {
+    mp.try_get_tx(txid).map(|tx| tx.compute_wtxid())
 }
 
 #[doc(hidden)]
@@ -4218,17 +4128,19 @@ pub fn announce_fee_rate_sat_kvb(
     ))
 }
 
-#[doc(hidden)]
-pub fn tx_announce_below_feefilter(
+/// `released` is a wtxid the global bucket let out. An inbound relay peer
+/// has already passed the 30 s gate by the time the release is read, so the
+/// direct-announce inbound hold does not apply.
+fn tx_announce_peer_ok_at(
     session: Option<&crate::peers::LivePeer>,
     mp: &crate::tx_relay::MempoolHub,
     txid: &bitcoin::Txid,
+    released: bool,
 ) -> bool {
-    let peer_min = session.map(|s| s.minfeefilter_sat_kvb()).unwrap_or(0);
-    if peer_min == 0 {
-        return false;
-    }
-    announce_fee_rate_sat_kvb(mp, txid).is_some_and(|rate| rate < peer_min)
+    session.is_none_or(|s| {
+        tx_inv_peer_ok(s, mp, txid)
+            && (released || !s.inbound || s.session_noban() || !mp.relay_enabled())
+    })
 }
 
 #[doc(hidden)]
@@ -4241,7 +4153,6 @@ pub fn on_inv_flush(
 ) {
     if matches!(flush, Some(Ok(()))) {
         if let Some(s) = session {
-            s.request_tx_inv();
             queue_due_tx_invs(hub, s, &follow.from_this_peer, out_tx);
             queue_due_parent_getdata(hub, s, out_tx);
             let _ = maybe_queue_initial_getheaders(out_tx, hub, s);
@@ -5364,7 +5275,6 @@ pub fn log_cmpct_getdata(hash: BlockHash, missing_n: usize) {
 pub fn flush_tx_invs(hub: &ChainHub, peers: &crate::peers::PeerHub) {
     let rows = peers.live_peers();
     for s in rows {
-        s.request_tx_inv();
         if let Some(out) = s.writer() {
             queue_due_tx_invs(hub, s.as_ref(), &CappedSet::new(), &out);
             queue_due_parent_getdata(hub, s.as_ref(), &out);
@@ -5451,55 +5361,6 @@ pub fn maybe_force_relay_duplicate(
     }
 }
 
-/// The INV to queue for this tx, or `None` when it is not due to `session`.
-#[doc(hidden)]
-pub fn tx_inv_candidate(
-    mp: &crate::tx_relay::MempoolHub,
-    session: &crate::peers::LivePeer,
-    from_this_peer: &CappedSet<bitcoin::Txid>,
-    txid: bitcoin::Txid,
-    w: bitcoin::Wtxid,
-    clock_due: bool,
-    inbound_age_gate: bool,
-) -> Option<Inventory> {
-    if mp.skip_standing_inv(&txid) {
-        return None;
-    }
-    if from_this_peer.contains_key(&txid) {
-        return None;
-    }
-    if !tx_inv_peer_ok(session, mp, &txid) {
-        return None;
-    }
-    if !mp.relay_enabled() && !mp.is_unbroadcast(&txid) {
-        return None;
-    }
-    if mp
-        .accept_gen(&w)
-        .is_some_and(|g| g < session.inv_gen_floor())
-    {
-        return None;
-    }
-    let peer_min = session.minfeefilter_sat_kvb();
-    if peer_min > 0 && announce_fee_rate_sat_kvb(mp, &txid).is_some_and(|rate| rate < peer_min) {
-        // Same erase as the announce path: a later lower filter does not inv it.
-        session.note_announced_tx(txid, w);
-        return None;
-    }
-    let local = !mp.relay_enabled() && mp.is_unbroadcast(&txid);
-    let age_due_this = mp.tx_inv_due(&w);
-    if inbound_age_gate {
-        if !age_due_this {
-            return None;
-        }
-    } else if !clock_due && !local && !age_due_this {
-        return None;
-    }
-    // Every `Some` is queued. The claim is the only insert, so a flush and
-    // an announce cannot both pass and each send an INV.
-    session.claim_announced_tx(txid, w)
-}
-
 #[doc(hidden)]
 pub fn queue_due_tx_invs(
     hub: &ChainHub,
@@ -5515,80 +5376,59 @@ pub fn queue_due_tx_invs(
     {
         return;
     }
+    // The buckets are global: whichever session ticks first releases the
+    // slice this instant's tokens cover. Every session then reads its own
+    // cursor over the released log. Bucket time is the mempool's mock/wall
+    // clock, so `setmocktime` refills the same buckets every session reads.
+    let now = mp.relay_now_secs();
+    mp.drain_inv_backlog(now.saturating_mul(1000));
+
     // `-blocksonly` (relay off) still INV locally submitted (unbroadcast)
     // txs immediately (`p2p_blocksonly.py:48`). When relay is on, inbound
     // keeps the 30s age gate (`mempool_reorg.py:71`).
-    let now = session.clock_now();
-    let clock_due = session.take_tx_inv_due(now);
-    let age_due = mp.any_tx_inv_due();
-    let unbroadcast_due = !mp.relay_enabled() && mp.unbroadcast_count() > 0;
-    if !clock_due && !age_due && !unbroadcast_due {
-        return;
-    }
     let inbound_age_gate = session.inbound && mp.relay_enabled() && !session.session_noban();
-    let mut n = 0u32;
-    let mut max_ann = 0u64;
-    let mp_now = mp.relay_now_secs();
-    if clock_due || unbroadcast_due {
-        let Some(live_wtx) = mp.try_list_live_wtxids() else {
-            return;
-        };
-        let mut due = Vec::new();
-        for (txid, w) in live_wtx {
-            let Some(inv) = tx_inv_candidate(
-                mp,
-                session,
-                from_this_peer,
-                txid,
-                w,
-                clock_due,
-                inbound_age_gate,
-            ) else {
-                continue;
-            };
-            due.push(inv);
-            n += 1;
-            if let Some(seq) = mp.relay_seq_of(&w) {
-                max_ann = max_ann.max(seq.saturating_add(1));
+    let dir = crate::inv_bucket::InvDirection::for_inbound(session.inbound);
+    let (last, released) = mp.take_released_invs(
+        dir,
+        session.inv_released_seen(),
+        crate::tx_relay::RELEASED_INV_SCAN_MAX,
+        |_, w| !inbound_age_gate || mp.tx_inv_due(w),
+    );
+    let had_released = !released.is_empty();
+    // Do not move the cursor past a row whose mempool read was busy.
+    let mut cursor = session.inv_released_seen();
+    if released.is_empty() {
+        cursor = last;
+    }
+    let mut due = Vec::new();
+    for (seq, txid, w) in released {
+        // A tx accepted before this session's handshake is not leaked to it
+        // (`p2p_tx_privacy`). A direct announce already ran this gate at
+        // accept time; a released log can be read by a later session.
+        if mp
+            .accept_gen(&w)
+            .is_some_and(|g| g < session.inv_gen_floor())
+        {
+            cursor = seq;
+            continue;
+        }
+        match announce_ready_txid(hub, from_this_peer, Some(session), txid, true) {
+            ReadyInv::Queued(inv) => {
+                due.push(inv);
+                cursor = seq;
             }
+            ReadyInv::Skipped => cursor = seq,
+            ReadyInv::Retry => break,
         }
-        queue_tx_inv_batches(session, out_tx, due);
-        if let Some((due, gen)) = mp.try_age_inv_watermark(mp_now) {
-            session.note_age_inv_seen(due, gen);
-        }
-    } else {
-        let Some((last, due_wtx)) = mp.try_age_inv_since(session.age_inv_seen(), mp_now) else {
-            return;
-        };
-        session.note_age_inv_seen(last.0, last.1);
-        let mut due = Vec::new();
-        for (txid, w) in due_wtx {
-            let Some(inv) = tx_inv_candidate(
-                mp,
-                session,
-                from_this_peer,
-                txid,
-                w,
-                false,
-                inbound_age_gate,
-            ) else {
-                continue;
-            };
-            due.push(inv);
-            // `-=` from zero wraps and still passes `n > 0`. The count is
-            // only compared with zero, so this site adds without `+=`.
-            n = n.saturating_add(1);
-            if let Some(seq) = mp.relay_seq_of(&w) {
-                max_ann = max_ann.max(seq.saturating_add(1));
-            }
-        }
+    }
+    session.note_inv_released_seen(cursor);
+    if !due.is_empty() {
         queue_tx_inv_batches(session, out_tx, due);
     }
-    if n > 0 {
-        // Only INV txs that existed when this INV was built.
-        // Never snap to the hub's next_relay_seq — a later accept can race in
-        // and make the new entry servable (mempool_reorg.py:122).
-        session.note_tx_inv_batch_sent(max_ann);
+    if had_released {
+        // The releases are queued or skipped by now. The per-tx note raised
+        // `last_inv_sequence`; this clears the queued count in the same lock.
+        session.note_tx_inv_batch_sent(session.last_inv_sequence());
     }
 }
 

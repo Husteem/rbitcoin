@@ -7886,9 +7886,10 @@ async fn forgotten_announcer_takes_no_orphan_parent_row() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// 1001 due wtxids are two inv messages, and both charge the send budget.
+/// 1001 due wtxids drain under the global count cap, and each INV charges
+/// the send budget.
 #[tokio::test(flavor = "current_thread")]
-async fn tx_inv_over_one_thousand_is_two_messages() {
+async fn tx_inv_drains_one_thousand_under_the_count_cap() {
     use bitcoin::absolute::LockTime;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
@@ -7974,24 +7975,37 @@ async fn tx_inv_over_one_thousand_is_two_messages() {
         false,
         rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
     );
-    peer.request_tx_inv();
     let (out_tx, mut rx) = mpsc::unbounded_channel();
     let before = peer.send_queued();
-    queue_due_tx_invs(&hub, peer.as_ref(), &CappedSet::new(), &out_tx);
-    let mut msgs = 0usize;
-    let mut items = 0usize;
-    while let Ok(msg) = rx.try_recv() {
-        match msg.expect_msg() {
-            NetworkMessage::Inv(v) => {
-                msgs += 1;
-                assert!(v.len() <= 1000, "one inv holds at most 1000");
-                items += v.len();
+    let mut total = 0usize;
+    for step in 0..40 {
+        if step > 0 {
+            let now = u64::from(t) + 1 + step * 10;
+            hub.clock.set_mock(now as i64);
+            mempool.note_mock_now(now);
+        }
+        queue_due_tx_invs(&hub, peer.as_ref(), &CappedSet::new(), &out_tx);
+        while let Ok(msg) = rx.try_recv() {
+            match msg.expect_msg() {
+                NetworkMessage::Inv(v) => {
+                    assert!(
+                        v.len() <= 490,
+                        "a full count bucket releases 490, got {}",
+                        v.len()
+                    );
+                    total += v.len();
+                }
+                other => panic!("expected inv, got {other:?}"),
             }
-            other => panic!("expected inv, got {other:?}"),
+        }
+        if total == 1001 {
+            break;
         }
     }
-    assert_eq!(items, 1001, "every accepted tx is announced");
-    assert_eq!(msgs, 2, "1001 tx invs are two messages");
+    assert_eq!(
+        total, 1001,
+        "every accepted tx is announced as tokens refill"
+    );
     assert!(
         peer.send_queued() > before,
         "batched inv must charge the send budget"

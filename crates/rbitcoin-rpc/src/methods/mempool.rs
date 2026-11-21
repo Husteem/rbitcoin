@@ -1125,8 +1125,6 @@ fn sendraw_after_accept(
                 mp.notify_inv_flush();
                 if let (Some(peers), Some(chain)) = (ctx.peers.as_ref(), ctx.chain.as_ref()) {
                     rbitcoin_net::flush_tx_invs(chain, peers);
-                } else if let Some(peers) = ctx.peers.as_ref() {
-                    peers.request_all_tx_inv();
                 }
             }
             Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))

@@ -187,7 +187,6 @@ async fn blocksonly_sendraw_invs_inbound(
 
     let inbound = relay_peer(peers, [127, 0, 0, 1], rbitcoin_net::peers::PeerConnType::Inbound);
     let block_relay = relay_peer(peers, [127, 0, 0, 1], rbitcoin_net::peers::PeerConnType::BlockRelay);
-    peers.request_all_tx_inv();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &out_tx);
     assert_eq!(tx_invs(&mut out_rx), vec![tx.compute_txid()]);
@@ -464,11 +463,9 @@ async fn force_announce_picks_peers(
     let due_equal = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
     let _due_equal_rx = writer_of(&due_equal);
     due_equal.note_minfeefilter_sat_kvb(rate);
-    due_equal.request_tx_inv();
     let due_above = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
     let _due_above_rx = writer_of(&due_above);
     due_above.note_minfeefilter_sat_kvb(rate.saturating_add(1));
-    due_above.request_tx_inv();
     let (due_eq_tx, mut due_eq_rx) = mpsc::unbounded_channel();
     let (due_hi_tx, mut due_hi_rx) = mpsc::unbounded_channel();
     queue_due_tx_invs(hub, due_equal.as_ref(), &CappedSet::new(), &due_eq_tx);
@@ -479,7 +476,6 @@ async fn force_announce_picks_peers(
         "periodic inv skips a filter above the fee"
     );
     due_above.note_minfeefilter_sat_kvb(0);
-    due_above.request_tx_inv();
     queue_due_tx_invs(hub, due_above.as_ref(), &CappedSet::new(), &due_hi_tx);
     assert!(
         due_hi_rx.try_recv().is_err(),
@@ -595,11 +591,9 @@ async fn returned_tx_ends_the_private_broadcast(
             "the tx coming back from a standing peer ends the private broadcast"
         );
         assert!(tx_invs(&mut other_rx).is_empty(), "no announce before the inv timer");
-        other.request_tx_inv();
         let (due_out, mut due_rx) = mpsc::unbounded_channel();
         queue_due_tx_invs(hub, other.as_ref(), &CappedSet::new(), &due_out);
         assert!(tx_invs(&mut due_rx).contains(&txid), "announce on the next inv tick");
-        echo.request_tx_inv();
         let (back_out, mut back_rx) = mpsc::unbounded_channel();
         queue_due_tx_invs(hub, echo.as_ref(), &follow.from_this_peer, &back_out);
         assert!(
@@ -724,19 +718,16 @@ async fn inbound_waits_thirty_seconds_from_the_echo(
     let quiet = |rx: &mut mpsc::UnboundedReceiver<PeerOut>, why: &str| {
         assert!(!tx_invs(rx).contains(&txid), "{why}");
     };
-    inbound.request_tx_inv();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &in_out);
     quiet(&mut in_rx, "an inbound peer stays quiet at the echo");
     let echoed = hub.mempool().unwrap().relay_now_secs();
     set_relay_clock(hub, peers, echoed.saturating_add(29));
-    inbound.request_tx_inv();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &in_out);
     quiet(
         &mut in_rx,
         "an inbound peer stays quiet until 30s after the echo",
     );
     set_relay_clock(hub, peers, echoed.saturating_add(30));
-    inbound.request_tx_inv();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &in_out);
     assert!(
         tx_invs(&mut in_rx).contains(&txid),
@@ -783,7 +774,6 @@ fn relay_on_inbound_age_gate(
     );
 
     let outbound = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
-    outbound.request_tx_inv();
     queue_due_tx_invs(hub, outbound.as_ref(), &CappedSet::new(), &out_tx);
     assert_eq!(
         mp.sample_reset_perf().list_live,
@@ -823,7 +813,6 @@ fn relay_on_inbound_age_gate(
         "a relay=false inbound gets only the unbroadcast tx"
     );
     mp.mark_broadcast(&txs[0].compute_txid());
-    block_only.request_tx_inv();
     let _ = mp.sample_reset_perf();
     queue_due_tx_invs(hub, block_only.as_ref(), &CappedSet::new(), &out_tx);
     assert!(
@@ -893,7 +882,6 @@ async fn getdata_until_announced_or_reorg(
 
     mp.admit(&fresh).expect("fresh sendraw");
     mp.note_unbroadcast(fresh.compute_txid());
-    sess.request_tx_inv();
     queue_due_tx_invs(hub, sess.as_ref(), &CappedSet::new(), &out_tx);
     assert!(
         out_rx.try_recv().is_err(),

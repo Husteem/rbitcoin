@@ -120,12 +120,8 @@ struct TxInvState {
     last_inv_sequence: u64,
     /// Queued tx INV hashes not yet sent.
     inv_to_send: u32,
-    /// Last clock we considered for delayed tx INV (`0` = not initialized).
-    last_tx_inv_now: u64,
-    /// Set when mocktime jumps; next ping/tick announces mempool txs.
-    tx_inv_requested: bool,
-    /// Age-INV due-log cursor (`due_secs`, `accept_gen`).
-    age_inv_seen: (u64, u64),
+    /// Last global INV release this session read.
+    released_seen: u64,
 }
 
 impl TxInvState {
@@ -134,9 +130,7 @@ impl TxInvState {
             announced: CappedSet::new(),
             last_inv_sequence: 1,
             inv_to_send: 0,
-            last_tx_inv_now: 0,
-            tx_inv_requested: false,
-            age_inv_seen: (0, 0),
+            released_seen: 0,
         }
     }
 }
@@ -1320,29 +1314,6 @@ impl LivePeer {
         g.inv_to_send = 0;
     }
 
-    pub fn request_tx_inv(&self) {
-        self.tx_inv().tx_inv_requested = true;
-    }
-
-    /// True when mock/wall clock jumped enough to announce queued mempool txs.
-    pub fn take_tx_inv_due(&self, now: u64) -> bool {
-        let mut g = self.tx_inv();
-        if std::mem::take(&mut g.tx_inv_requested) {
-            g.last_tx_inv_now = now;
-            return true;
-        }
-        let prev = g.last_tx_inv_now;
-        if prev == 0 {
-            g.last_tx_inv_now = now;
-            return false;
-        }
-        if now.saturating_sub(prev) >= 30 {
-            g.last_tx_inv_now = now;
-            return true;
-        }
-        false
-    }
-
     pub fn queue_ping(&self) {
         self.ping_queued.store(true, Ordering::Relaxed);
     }
@@ -1651,12 +1622,12 @@ impl LivePeer {
         self.inv_gen_floor.load(Ordering::Relaxed)
     }
 
-    pub fn age_inv_seen(&self) -> (u64, u64) {
-        self.tx_inv().age_inv_seen
+    pub fn inv_released_seen(&self) -> u64 {
+        self.tx_inv().released_seen
     }
 
-    pub fn note_age_inv_seen(&self, due: u64, gen: u64) {
-        self.tx_inv().age_inv_seen = (due, gen);
+    pub fn note_inv_released_seen(&self, seq: u64) {
+        self.tx_inv().released_seen = seq;
     }
 
     /// Core `BlockRequested`: the first block in flight from this peer
@@ -3429,19 +3400,10 @@ impl PeerHub {
         crate::v2::system_secs()
     }
 
-    /// Ask every live session to flush due tx INVs (`p2p_blocksonly` RPC relay).
-    pub fn request_all_tx_inv(&self) {
-        let g = self.live.read().unwrap_or_else(|e| e.into_inner());
-        for p in g.values() {
-            p.request_tx_inv();
-        }
-    }
-
     pub fn set_mock_now(&self, ts: u64) {
         self.mock_now.store(ts, Ordering::Release);
         let g = self.live.read().unwrap_or_else(|e| e.into_inner());
         for p in g.values() {
-            p.request_tx_inv();
             p.queue_self_announce_if_due();
         }
         drop(g);
