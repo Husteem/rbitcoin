@@ -52,6 +52,7 @@ async fn peer_catchup_compact_reorg() {
 
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     let (src_dir, src) = rbitcoin_net::chain::tiny_regtest_hub_labeled("catchup-journey-src");
+    let src = std::sync::Arc::new(src);
     src.ensure_genesis().unwrap();
     src.confirm_empty_regtest(160).unwrap();
 
@@ -615,7 +616,7 @@ async fn peer_catchup_compact_reorg() {
 
 #[allow(clippy::cognitive_complexity)] // one reorg chapter; the tokio test owns the story
 async fn catchup_reorg_and_drain(
-    src: &rbitcoin_net::chain::ChainHub,
+    src: &std::sync::Arc<rbitcoin_net::chain::ChainHub>,
     hub: &rbitcoin_net::chain::ChainHub,
     live: &std::sync::Arc<rbitcoin_net::peers::LivePeer>,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -663,8 +664,12 @@ async fn catchup_reorg_and_drain(
     assert_eq!(stale_asks.len(), MAX_SERVE_BLOCKS);
     let stale_first = stale_asks[0];
     run_on_tip_accept(|| src.invalidate_block_inner(stale_first)).unwrap();
-    src.generate_to_script(MAX_SERVE_BLOCKS as u32 - 2, ScriptBuf::from_bytes(vec![0x52]), vec![])
-        .unwrap();
+    src.mine(
+        MAX_SERVE_BLOCKS as u32 - 2,
+        ScriptBuf::from_bytes(vec![0x52]),
+        vec![],
+    )
+    .unwrap();
     let weak_headers: Vec<Header> = ((FORK_PARENT + 1)..=(FORK_PARENT + MAX_SERVE_BLOCKS as u32 - 2))
         .map(|h| header_at(src, h))
         .collect();
@@ -692,7 +697,8 @@ async fn catchup_reorg_and_drain(
     );
     assert_ne!(hub.tip_hash(), Some(src.tip_hash().unwrap()));
 
-    src.generate_to_script(10, ScriptBuf::from_bytes(vec![0x52]), vec![]).unwrap();
+    src.mine(10, ScriptBuf::from_bytes(vec![0x52]), vec![])
+        .unwrap();
     let heavy_tip = src.tip_height().unwrap();
     let stem = block_at(src, FORK_PARENT + 1);
     let want = src.tip_hash().unwrap();
@@ -902,7 +908,8 @@ async fn catchup_reorg_and_drain(
     let shallow_parent = shallow_tip - 2;
     let shallow_stale = block_at(src, shallow_parent + 1).block_hash();
     run_on_tip_accept(|| src.invalidate_block_inner(shallow_stale)).unwrap();
-    src.generate_to_script(6, ScriptBuf::from_bytes(vec![0x53]), vec![]).unwrap();
+    src.mine(6, ScriptBuf::from_bytes(vec![0x53]), vec![])
+        .unwrap();
     let shallow_stem = block_at(src, shallow_parent + 1);
     let shallow_want = src.tip_hash().unwrap();
     let shallow_headers: Vec<Header> = ((shallow_parent + 1)..=src.tip_height().unwrap())

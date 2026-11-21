@@ -18,10 +18,11 @@ fn tip_announce_pad() -> &'static TipAnnouncePad {
     static PAD: OnceLock<TipAnnouncePad> = OnceLock::new();
     PAD.get_or_init(|| {
         let (built, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("tip-announce-build");
+        let hub = std::sync::Arc::new(hub);
         hub.ensure_genesis().unwrap();
         // `tip_announce_decision` walks cached body prev links. Batch confirm
         // does not leave those bodies cached, so this pad stays on accept.
-        hub.generate_to_script(102, op_true(), vec![]).unwrap();
+        hub.mine(102, op_true(), vec![]).unwrap();
         hub.query.flush().expect("flush tip-announce pad");
         let store = rbitcoin_query::testutil::TempDir::labeled("tip-announce-pad")
             .expect("tip pad");
@@ -336,8 +337,9 @@ fn getdata_out(
 #[test]
 fn getblocks_full_page_continues_with_a_tip_inv() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getblocks-continue");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(510, op_true(), vec![]).unwrap();
+    hub.mine(510, op_true(), vec![]).unwrap();
     let chain = best_chain_from_1(&hub, 510);
     let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
     let mut follow = PeerFollowState::new();
@@ -505,10 +507,11 @@ fn getdata_msg_block_is_served_without_witness() {
     use bitcoin::absolute::LockTime;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getdata-strip");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let ws = op_true();
     let p2wsh = ScriptBuf::new_p2wsh(&ws.wscript_hash());
-    hub.generate_to_script(101, p2wsh, vec![]).unwrap();
+    hub.mine(101, p2wsh, vec![]).unwrap();
     let cb = hub
         .query
         .reconstruct_block_at_height(Height(1))
@@ -532,7 +535,7 @@ fn getdata_msg_block_is_served_without_witness() {
             script_pubkey: op_true(),
         }],
     };
-    let h = hub.generate_to_script(1, op_true(), vec![spend]).unwrap()[0];
+    let h = hub.mine(1, op_true(), vec![spend]).unwrap()[0];
     let full = hub.query.reconstruct_block_at_height(Height(102)).unwrap();
     assert_eq!(full.block_hash(), h);
     let mut stripped = full.clone();
@@ -1772,7 +1775,7 @@ fn tip_announce_skips_a_stump_the_peer_already_has() {
 #[test]
 fn tip_announce_reorg_inv_until_caught_up() {
     let (_dir, hub) = open_tip_announce_hub("tip-reorg-inv-until-caught-up");
-    let hub = &hub;
+    let hub = &std::sync::Arc::new(hub);
     use rbitcoin_primitives::Height;
     let sent_tip = hub.tip_hash().unwrap();
     let fork_h = hub.tip_height().unwrap() - 4;
@@ -1796,7 +1799,7 @@ fn tip_announce_reorg_inv_until_caught_up() {
         Ann::Inv,
         "large reorg must inv tip",
     );
-    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
     let after = tip_event(hub, 0);
     assert_ann(
         hub,

@@ -1,4 +1,5 @@
 use crate::Admit;
+use crate::Mine;
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
@@ -371,9 +372,10 @@ fn headers_sync_locator_from_unknown_starts_at_that_hash() {
 #[test]
 fn headers_sync_locator_from_mid_height_starts_there() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("loc-mid");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let hashes = hub
-        .generate_to_script(3, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .mine(3, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let mid = hashes[0];
     let loc = headers_sync_locator(&hub, Some(mid));
@@ -384,10 +386,11 @@ fn headers_sync_locator_from_mid_height_starts_there() {
 #[test]
 fn should_poll_peer_headers_skips_behind_and_weaker_fork() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("poll-skip");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
     assert!(should_poll_peer_headers(&hub, None));
-    hub.generate_to_script(3, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(3, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip = hub.tip_hash().unwrap();
     assert!(
@@ -423,12 +426,12 @@ fn should_poll_peer_headers_skips_behind_and_weaker_fork() {
 #[tokio::test]
 async fn session_start_does_not_announce_a_quiet_tip() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("quiet-tip");
+    let hub = hub.into_arc();
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(3, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(3, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     assert_eq!(hub.tip_height(), Some(3));
     let tip = hub.tip_hash().unwrap();
-    let hub = hub.into_arc();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let mut sess = open_decode_session(Arc::clone(&hub), &peers, 18470, Some(tip)).await;
     assert_eq!(sess.live.header_marks().0, None);
@@ -448,13 +451,13 @@ async fn session_start_does_not_announce_a_quiet_tip() {
 #[tokio::test]
 async fn session_start_announces_a_tip_mined_during_handshake() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("moved-tip");
+    let hub = hub.into_arc();
     hub.ensure_genesis().unwrap();
     let at_handshake = hub.tip_hash().unwrap();
-    hub.generate_to_script(3, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(3, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip = hub.tip_hash().unwrap();
     assert_ne!(at_handshake, tip);
-    let hub = hub.into_arc();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let mut sess = open_decode_session(Arc::clone(&hub), &peers, 18471, Some(at_handshake)).await;
     assert_eq!(
@@ -497,7 +500,7 @@ async fn queued_tip_before_session_start_is_one_inv() {
     let at_handshake = hub.tip_hash().unwrap();
     let hub = hub.into_arc();
     let tip_rx = hub.subscribe_tips();
-    hub.generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip = hub.tip_hash().unwrap();
     assert_ne!(at_handshake, tip);
@@ -558,7 +561,7 @@ async fn inv_then_non_descendant_waits_out_the_batch() {
         "a quiet connect offers nothing"
     );
     let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, script.clone(), vec![]).unwrap();
+    hub.mine(1, script.clone(), vec![]).unwrap();
     let offered = hub.tip_hash().unwrap();
     assert_eq!(
         count_block_invs(
@@ -583,7 +586,7 @@ async fn inv_then_non_descendant_waits_out_the_batch() {
         early.is_empty(),
         "a non-descendant tip waits out the batch, got {early:?}"
     );
-    hub.generate_to_script(1, script, vec![]).unwrap();
+    hub.mine(1, script, vec![]).unwrap();
     let next = hub.tip_hash().unwrap();
     assert_ne!(next, offered);
     let later = collect_block_invs(&mut sess.reader, sess.magic, Duration::from_millis(500)).await;
@@ -612,7 +615,7 @@ async fn child_of_an_inv_is_not_held() {
     let mut sess = open_decode_session(Arc::clone(&hub), &peers, 18474, Some(genesis)).await;
     let _ = collect_block_invs(&mut sess.reader, sess.magic, Duration::from_millis(200)).await;
     let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, script.clone(), vec![]).unwrap();
+    hub.mine(1, script.clone(), vec![]).unwrap();
     let offered = hub.tip_hash().unwrap();
     assert_eq!(
         count_block_invs(
@@ -625,7 +628,7 @@ async fn child_of_an_inv_is_not_held() {
         1
     );
     assert_eq!(sess.live.header_marks().0, None);
-    hub.generate_to_script(1, script, vec![]).unwrap();
+    hub.mine(1, script, vec![]).unwrap();
     let child = hub.tip_hash().unwrap();
     assert_ne!(child, offered);
     let early = collect_block_invs(&mut sess.reader, sess.magic, Duration::from_millis(150)).await;
@@ -660,7 +663,7 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
         .unwrap();
     wait_pong(&mut sess.reader, sess.magic, 1).await;
     let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, script.clone(), vec![]).unwrap();
+    hub.mine(1, script.clone(), vec![]).unwrap();
     let parent = hub.tip_hash().unwrap();
     let parent_hdrs =
         collect_header_tips(&mut sess.reader, sess.magic, Duration::from_secs(2)).await;
@@ -668,7 +671,7 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
         parent_hdrs.contains(&parent),
         "the parent is announced, got {parent_hdrs:?}"
     );
-    hub.generate_to_script(1, script.clone(), vec![]).unwrap();
+    hub.mine(1, script.clone(), vec![]).unwrap();
     let offered = hub.tip_hash().unwrap();
     let offered_hdrs =
         collect_header_tips(&mut sess.reader, sess.magic, Duration::from_secs(2)).await;
@@ -718,7 +721,7 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
             break;
         }
     }
-    hub.generate_to_script(1, script, vec![]).unwrap();
+    hub.mine(1, script, vec![]).unwrap();
     let child = hub.tip_hash().unwrap();
     assert_ne!(child, offered);
     assert_ne!(child, parent);
@@ -737,11 +740,12 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
 #[tokio::test]
 async fn getheaders_parent_of_the_tip_is_the_offer() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("gh-parent-offer");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, script.clone(), vec![]).unwrap();
+    hub.mine(1, script.clone(), vec![]).unwrap();
     let parent = hub.tip_hash().unwrap();
-    hub.generate_to_script(1, script, vec![]).unwrap();
+    hub.mine(1, script, vec![]).unwrap();
     let child = hub.tip_hash().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18480);
@@ -803,11 +807,12 @@ async fn getheaders_parent_of_the_tip_is_the_offer() {
 #[tokio::test]
 async fn getheaders_keeps_a_newer_offer() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("gh-keep-newer");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, script.clone(), vec![]).unwrap();
+    hub.mine(1, script.clone(), vec![]).unwrap();
     let parent = hub.tip_hash().unwrap();
-    hub.generate_to_script(1, script, vec![]).unwrap();
+    hub.mine(1, script, vec![]).unwrap();
     let child = hub.tip_hash().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18481);
@@ -2799,6 +2804,7 @@ fn handle_peer_frame_control_and_inv_paths() {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("handle-frame");
+        let hub = std::sync::Arc::new(hub);
         hub.ensure_genesis().unwrap();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let mut follow = PeerFollowState::new();
@@ -2983,7 +2989,7 @@ fn handle_peer_frame_control_and_inv_paths() {
 
         // Depth 10 still answers with the transactions. One past that is a full block
         // (`p2p_compactblocks` :635).
-        hub.generate_to_script(10, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        hub.mine(10, ScriptBuf::from_bytes(vec![0x51]), vec![])
             .unwrap();
         handle_peer_frame(
             frame_for(NetworkMessage::GetBlockTxn(GetBlockTxn {
@@ -3006,7 +3012,7 @@ fn handle_peer_frame_control_and_inv_paths() {
             ),
             "getblocktxn at depth 10 still serves the transactions"
         );
-        hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        hub.mine(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
             .unwrap();
         handle_peer_frame(
             frame_for(NetworkMessage::GetBlockTxn(GetBlockTxn {
@@ -3281,6 +3287,7 @@ fn handle_peer_frame_mempool_tx_and_inv_paths() {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("handle-mp");
+        let hub = std::sync::Arc::new(hub);
         hub.ensure_genesis().unwrap();
         let t = hub.tip_header().unwrap().time;
         hub.clock.set_mock(i64::from(t) + 1);
@@ -3354,7 +3361,7 @@ fn handle_peer_frame_mempool_tx_and_inv_paths() {
             "Class A txid INV must not GETDATA"
         );
 
-        hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        hub.mine(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
             .unwrap();
         let mined = hub
             .query
@@ -4373,8 +4380,9 @@ fn inv_of_already_asked_block_does_not_getdata() {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let (src_dir, src) = rbitcoin_net::chain::tiny_regtest_hub_labeled("inv-asked-src");
+        let src = Arc::new(src);
         src.ensure_genesis().unwrap();
-        src.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        src.mine(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
             .unwrap();
         let hdr = src.query.wire_header_at_height(Height(1)).unwrap();
         let hash = hdr.block_hash();
@@ -4659,7 +4667,7 @@ fn announced_tip_is_hopeless_less_and_288_behind() {
 
 struct ServeSession {
     _dir: rbitcoin_query::testutil::TempDir,
-    hub: rbitcoin_net::chain::ChainHub,
+    hub: std::sync::Arc<rbitcoin_net::chain::ChainHub>,
     hashes: Vec<BlockHash>,
     _peers: std::sync::Arc<rbitcoin_net::peers::PeerHub>,
     sess: std::sync::Arc<rbitcoin_net::peers::LivePeer>,
@@ -4668,9 +4676,10 @@ struct ServeSession {
 fn serve_session(label: &str, blocks: u32) -> ServeSession {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled(label);
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let hashes = hub
-        .generate_to_script(blocks, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .mine(blocks, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     assert_eq!(hashes.len(), blocks as usize);
     let peers = rbitcoin_net::peers::PeerHub::new();
@@ -5203,7 +5212,7 @@ async fn paused_serve(label: &str, blocks: u32, agents: &[&str]) -> PausedServe 
     .unwrap();
     let hashes = node
         .hub
-        .generate_to_script(blocks, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .mine(blocks, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     node.peers.set_mock_now(node.peers.now_secs());
     let mut clients = Vec::new();
@@ -6340,7 +6349,7 @@ async fn tip_burst_past_broadcast_capacity_still_syncs_peer() {
     // traffic it could not decode in time under load ("decode queue full").
     const BURST: u32 = 80;
     na.hub
-        .generate_to_script(BURST, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .mine(BURST, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let want = na.tip_height().unwrap();
     assert!(want >= BURST, "miner tip {want}");
@@ -6519,7 +6528,7 @@ async fn disconnect_after_tip_sync_clears_far_side_within_5s() {
 
     const BURST: u32 = 3;
     na.hub
-        .generate_to_script(BURST, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .mine(BURST, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let want = na.tip_height().unwrap();
     // The tip-accept lane is one per process, so the far side's connect
@@ -6622,8 +6631,9 @@ fn persist_pending_path_starts_after_the_last_stored_header() {
     use bitcoin::ScriptBuf;
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("persist-path");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(20, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(20, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let fork_at = hub
         .query
@@ -7896,6 +7906,7 @@ async fn tx_inv_drains_one_thousand_under_the_count_cap() {
     use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("inv-batch");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     hub.confirm_empty_regtest(101).unwrap();
     let t = hub.tip_header().unwrap().time;
@@ -7928,8 +7939,7 @@ async fn tx_inv_drains_one_thousand_under_the_count_cap() {
             })
             .collect(),
     };
-    hub.generate_to_script(1, op_true(), vec![fanout.clone()])
-        .unwrap();
+    hub.mine(1, op_true(), vec![fanout.clone()]).unwrap();
     let mp =
         rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
             .unwrap();
@@ -9603,13 +9613,14 @@ fn announced_txid_getdata_serves_the_tip_tx() {
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("tip-txid-serve");
+    let hub = Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let mp =
         rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
     assert!(hub.attach_mempool(mp).is_ok());
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     let p2wsh = ScriptBuf::new_p2wsh(&op_true.wscript_hash());
-    hub.generate_to_script(1, p2wsh.clone(), vec![]).unwrap();
+    hub.mine(1, p2wsh.clone(), vec![]).unwrap();
     hub.confirm_empty_regtest(100).unwrap();
     let cb = hub
         .query
@@ -9642,7 +9653,7 @@ fn announced_txid_getdata_serves_the_tip_tx() {
         Some(Inventory::Transaction(txid)),
         "a peer without wtxidrelay is announced the txid"
     );
-    hub.generate_to_script(1, op_true, vec![spend.clone()])
+    hub.mine(1, op_true, vec![spend.clone()])
         .unwrap();
     let _ = hub.take_tip_wtx_scans();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
@@ -9937,9 +9948,10 @@ fn outbound_peer() -> Arc<rbitcoin_net::peers::LivePeer> {
 #[test]
 fn getcfilters_stops_after_the_filter_that_crosses_the_send_budget() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cf-budget");
+    let hub = std::sync::Arc::new(hub);
     hub.query.set_block_filter_index(true).unwrap();
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip_h = hub.tip_height().unwrap();
     assert_eq!(

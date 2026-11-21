@@ -1070,7 +1070,7 @@ async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub)
 }
 
 /// Empty locator returns a header only when that hash has a body.
-fn empty_locator_needs_a_body(hub: &rbitcoin_net::chain::ChainHub) {
+fn empty_locator_needs_a_body(hub: &std::sync::Arc<rbitcoin_net::chain::ChainHub>) {
     let tip = hub.tip_hash().unwrap();
     let connected =
         headers_reply_for_getheaders(hub, &GetHeadersMessage::new(vec![], tip)).unwrap();
@@ -1092,7 +1092,7 @@ fn empty_locator_needs_a_body(hub: &rbitcoin_net::chain::ChainHub) {
         "header-only hashstop is not served"
     );
 
-    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
     let stale = hub.tip_hash().unwrap();
     run_on_tip_accept(|| hub.invalidate_block_inner(stale)).unwrap();
     assert!(!hub.is_connected(&stale));
@@ -1289,10 +1289,10 @@ async fn empty_body_null_merkle_bans_before_the_header(
 /// `bad-prevblk` and does not index it. The ask is released, so after
 /// `reconsiderblock` of the parent a peer can serve that child again.
 async fn invalid_parent_child_is_fetched_after_reconsider(
-    hub: &rbitcoin_net::chain::ChainHub,
+    hub: &std::sync::Arc<rbitcoin_net::chain::ChainHub>,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
 ) {
-    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
     let parent = hub.tip_hash().unwrap();
     let time = hub.tip_header().unwrap().time.saturating_add(1);
     let height = hub.tip_height().unwrap().saturating_add(1);
@@ -2789,7 +2789,7 @@ async fn peer_header_dos_and_self_announce() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("hdr-dos");
     let mut params = ChainParams::regtest();
     params.apply_test_activation_height("cltv", 111).unwrap();
-    let hub = ChainHub::new(q, params, Milestone::NONE);
+    let hub = Arc::new(ChainHub::new(q, params, Milestone::NONE));
     hub.ensure_genesis().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
 
@@ -2845,13 +2845,14 @@ async fn outbound_low_work_headers_disconnect_during_ibd() {
     use std::sync::atomic::Ordering;
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-low-work");
+    let hub = std::sync::Arc::new(hub);
     let mut floor = [0u8; 32];
     floor[30] = 0x10;
     // The floor has to be set before the first block lands. Leaving IBD
     // latches, and a later raise does not enter it again.
     hub.set_minimum_chain_work(Some(floor));
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    hub.mine(4, op_true(), vec![]).unwrap();
     assert!(
         hub.in_ibd(),
         "a chain under the floor is still in initial block download"
@@ -2981,11 +2982,12 @@ async fn known_good_chain_survives_a_later_low_work_fork() {
     use std::sync::atomic::Ordering;
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-best-known");
+    let hub = std::sync::Arc::new(hub);
     let mut floor = [0u8; 32];
     floor[30] = 0x10;
     hub.set_minimum_chain_work(Some(floor));
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    hub.mine(4, op_true(), vec![]).unwrap();
     let met = hub.chain_work().unwrap().to_be_bytes();
     hub.set_minimum_chain_work(Some(met));
     let tip_time = u64::from(hub.tip_header().unwrap().time);
@@ -3053,11 +3055,12 @@ async fn earlier_block_does_not_replace_best_known() {
     use std::sync::atomic::Ordering;
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-best-known-inv");
+    let hub = std::sync::Arc::new(hub);
     let mut floor = [0u8; 32];
     floor[30] = 0x10;
     hub.set_minimum_chain_work(Some(floor));
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    hub.mine(4, op_true(), vec![]).unwrap();
     let met = hub.chain_work().unwrap().to_be_bytes();
     hub.set_minimum_chain_work(Some(met));
     let tip_time = u64::from(hub.tip_header().unwrap().time);
@@ -3176,11 +3179,12 @@ async fn equal_work_fork_keeps_its_work_after_pending_drop() {
     use std::sync::atomic::Ordering;
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-equal-work");
+    let hub = std::sync::Arc::new(hub);
     let mut floor = [0u8; 32];
     floor[30] = 0x10;
     hub.set_minimum_chain_work(Some(floor));
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    hub.mine(4, op_true(), vec![]).unwrap();
     let met = hub.chain_work().unwrap().to_be_bytes();
     hub.set_minimum_chain_work(Some(met));
     let tip_time = u64::from(hub.tip_header().unwrap().time);
@@ -3333,8 +3337,9 @@ async fn bad_pow_cmpct_scores_and_asks_for_nothing() {
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cmpct-pow");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
     let floor = hub.chain_work().unwrap().to_be_bytes();
     hub.set_minimum_chain_work(Some(floor));
     assert!(hub.meets_minimum_chain_work());
@@ -3522,8 +3527,9 @@ async fn below_floor_headers_are_not_stored_or_fetched() {
     hub.ensure_genesis().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let (src_dir, src) = rbitcoin_net::chain::tiny_regtest_hub_labeled("below-floor-src");
+    let src = std::sync::Arc::new(src);
     src.ensure_genesis().unwrap();
-    src.generate_to_script(3, op_true(), vec![]).unwrap();
+    src.mine(3, op_true(), vec![]).unwrap();
     hub.set_minimum_chain_work(Some(work_floor(0xff)));
     assert!(!hub.meets_minimum_chain_work());
     let hdrs: Vec<_> = (1..=3u32).map(|h| header_at(&src, h)).collect();
@@ -3583,8 +3589,9 @@ async fn below_floor_headers_are_not_stored_or_fetched() {
 async fn below_floor_header_answers_getheaders_only_on_our_chain() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("below-floor-disc");
     let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(2, op_true(), vec![]).unwrap();
+    hub.mine(2, op_true(), vec![]).unwrap();
     let tip_parent = hub.tip_header().unwrap().prev_blockhash;
     hub.set_minimum_chain_work(Some(work_floor(0xff)));
     assert!(!hub.meets_minimum_chain_work());
@@ -3877,8 +3884,9 @@ fn regtest_headers_after(parent: &bitcoin::block::Header, n: u32) -> Vec<bitcoin
 #[tokio::test]
 async fn parked_headers_are_walked_once_per_message() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-once");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
     let have = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18621, 61, true);
@@ -3992,8 +4000,9 @@ async fn parked_headers_are_walked_once_per_message() {
 #[tokio::test]
 async fn parked_chain_that_connects_becomes_best_known() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-connects");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(2, op_true(), vec![]).unwrap();
+    hub.mine(2, op_true(), vec![]).unwrap();
     let tip = hub.tip_header().unwrap();
     let low = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
@@ -4056,8 +4065,9 @@ async fn parked_chain_that_connects_becomes_best_known() {
 #[tokio::test]
 async fn path_work_memo_keeps_a_bounded_number_of_stored_headers() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-stored-cap");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
     let tip = hub.tip_header().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18624, 64, true);
@@ -4114,8 +4124,9 @@ async fn path_work_memo_keeps_a_bounded_number_of_stored_headers() {
 #[tokio::test]
 async fn failure_walk_does_not_spend_the_work_walk_cache() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-split-cap");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
     let tip = hub.tip_header().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18625, 65, true);
@@ -4175,8 +4186,9 @@ async fn failure_walk_does_not_spend_the_work_walk_cache() {
 #[tokio::test]
 async fn full_pending_map_eviction_walks_each_header_once() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-evict");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
     let tip = hub.tip_header().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18623, 63, true);
