@@ -3238,3 +3238,286 @@ fn notes_a_failed_checkpoint_sealed_still_hold_the_edge_cap() {
         .expect("the wait gives up");
     assert!(got.is_err());
 }
+
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short read",
+                ));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+fn write_all_at(file: &std::fs::File, bytes: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(bytes, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < bytes.len() {
+            let n = file.seek_write(&bytes[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "short write",
+                ));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+/// `spent.body` of a real store, so a fold lands in the file confirm reads.
+struct FileBody {
+    file: std::fs::File,
+    len: u64,
+    path: PathBuf,
+}
+
+impl SpentBody for FileBody {
+    fn published_len(&self) -> u64 {
+        self.len
+    }
+
+    fn read(&self, abs: u64, buf: &mut [u8]) -> Result<(), rbitcoin_store::error::StoreError> {
+        read_exact_at(&self.file, buf, abs)
+            .map_err(|e| rbitcoin_store::error::StoreError::io(&self.path, e))
+    }
+
+    fn write(&mut self, abs: u64, bytes: &[u8]) -> Result<(), rbitcoin_store::error::StoreError> {
+        write_all_at(&self.file, bytes, abs)
+            .map_err(|e| rbitcoin_store::error::StoreError::io(&self.path, e))
+    }
+
+    fn sync(&mut self) -> Result<(), rbitcoin_store::error::StoreError> {
+        self.file
+            .sync_all()
+            .map_err(|e| rbitcoin_store::error::StoreError::io(&self.path, e))
+    }
+}
+
+fn spent_meta(tag: u64) -> [u8; 8] {
+    rbitcoin_store::tx_table::encode_spent_slot(
+        0,
+        rbitcoin_primitives::Fk(tag),
+        (tag as u32) & 0xffff,
+    )
+    .unwrap()
+}
+
+fn decoded(raw: [u8; 8]) -> rbitcoin_store::tx_table::SpenderSlot {
+    let (flags, field, vin) = rbitcoin_store::tx_table::decode_spent_slot(&raw).unwrap();
+    (field, flags, vin)
+}
+
+/// Confirm's spender-meta batch reads every delta record it still needs in
+/// one completion-session submission. A folded page with no record is not in
+/// that read. A zero-base miss and an explicit zero stay unspent even when
+/// the body bytes would not decode.
+#[test]
+fn confirm_spend_meta_reads_delta_records_in_one_bulk() {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::spend_delta::{
+        arm_delta_record_owner_probe, delta_record_io, delta_record_owner_held,
+        reset_delta_record_io,
+    };
+    use rbitcoin_store::Store;
+
+    const PAGE: u64 = 4096;
+    /// Half the slots on a fresh page: the fold rule's threshold.
+    const DENSE: u16 = 256;
+    let folded = PAGE;
+    let touched = 2 * PAGE;
+    let present = 3 * PAGE;
+    let hidden = 4 * PAGE;
+    let ram_only = 5 * PAGE;
+    let published_need = 6 * PAGE;
+
+    let d = dir();
+    let (body_path, published) = {
+        let s = Store::create_tiny(&d).unwrap();
+        // One create whose spent slots cover every page the lookup reads.
+        // A bare body append has no locator, and open cuts it back to the header.
+        let n_out = 4096u32;
+        s.put_tx_full_batch_indexed(
+            &[(
+                rbitcoin_store::tx_table::TxRecord {
+                    txid: [0x11; 32],
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: n_out,
+                },
+                vec![rbitcoin_store::tx_table::InputRecord::coinbase(
+                    u32::MAX,
+                    vec![0x01],
+                    vec![],
+                )],
+                vec![rbitcoin_store::tx_table::OutputRecord::unspent(0, vec![]); n_out as usize],
+            )],
+            false,
+        )
+        .unwrap();
+        s.txs.sync_class_a_named(1).unwrap();
+        let published = s.txs.spent.body_published_len();
+        assert!(
+            published >= published_need,
+            "published {published} covers the pages under test"
+        );
+        let path = s.txs.spent.body_file_path().to_path_buf();
+        (path, published)
+    };
+
+    // One dense record fills a segment. The next rolls. Reclaim, past the
+    // ceiling, folds a segment it is not rewriting and drops the one this
+    // checkpoint rewrites.
+    let policy = Policy {
+        segment_cap: 2580,
+        reclaim_from_segments: 2,
+        keep_segments: 1,
+        sparse_permille: 1000,
+        reclaim_slope: u64::MAX,
+        reclaim_rate: 4,
+        fold_round_pages: 64,
+        log_fold_min: 4 << 20,
+    };
+    let mut body = FileBody {
+        file: std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&body_path)
+            .unwrap(),
+        len: published,
+        path: body_path.clone(),
+    };
+    let log = SpendPageLog::load_with(&d, &mut body, policy).unwrap();
+    let dense = |page: u64| {
+        let notes: Vec<(u64, [u8; 8])> = (0..DENSE)
+            .map(|rel| (page + u64::from(rel) * 8, spent_meta(page + u64::from(rel))))
+            .collect();
+        log.note_slots(&notes).unwrap();
+    };
+    dense(folded);
+    dense(touched);
+    log.note_slots(&[(present + 16, spent_meta(present + 2))])
+        .unwrap();
+    log.note_slots(&[(hidden + 16, [0u8; 8])]).unwrap();
+    log.checkpoint(
+        |l| l.freeze_open(1, Some(|_: &[u8; 8]| Ok(true))),
+        &mut body,
+        None,
+    )
+    .unwrap();
+
+    let meta_new = spent_meta(0x81_0003);
+    log.note_slots(&[(touched + 16, [0u8; 8]), (touched + 24, meta_new)])
+        .unwrap();
+    let folded_round = log
+        .checkpoint(
+            |l| l.freeze_open(2, Some(|_: &[u8; 8]| Ok(true))),
+            &mut body,
+            Some(u32::MAX),
+        )
+        .unwrap();
+    assert!(
+        folded_round.hot_folds >= 1 && folded_round.folded >= 1,
+        "touch-fold and reclaim both ran: {folded_round:?}"
+    );
+    assert!(
+        !delta_dir(&d).join(segment_name(1)).exists(),
+        "the reclaimed page has no record file"
+    );
+    drop(log);
+    drop(body);
+
+    // Zeros decode as unspent. Poison the slots a zero answer must not read,
+    // so a body peek comes back as None.
+    let poison = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&body_path)
+        .unwrap();
+    for abs in [hidden + 16, hidden + 24, ram_only + 8] {
+        write_all_at(&poison, &[0xff; 8], abs).unwrap();
+    }
+    drop(poison);
+
+    let s = Store::open_tiny(&d).unwrap();
+    assert!(
+        s.txs.spent.body_published_len() >= published_need,
+        "open kept the spent body"
+    );
+    let ram = spent_meta(0x12_0004);
+    let ram_page = spent_meta(0x20_0001);
+    s.note_open_spend_slots(&[(present + 32, ram), (ram_only + 8, ram_page)])
+        .unwrap();
+
+    let queries = [
+        folded + 16,
+        touched + 16,
+        touched + 24,
+        touched + 32,
+        present + 16,
+        present + 32,
+        hidden + 16,
+        hidden + 24,
+        ram_only + 8,
+    ];
+    let unspent = Some((Fk::NULL, 0, 0));
+    let expect = [
+        Some(decoded(spent_meta(folded + 2))),
+        unspent,
+        Some(decoded(meta_new)),
+        Some(decoded(spent_meta(touched + 4))),
+        Some(decoded(spent_meta(present + 2))),
+        Some(decoded(ram)),
+        unspent,
+        unspent,
+        Some(decoded(ram_page)),
+    ];
+    reset_delta_record_io();
+    let got = s.get_spender_meta_at_abs_batch(&queries).unwrap();
+    assert_eq!(got, expect);
+    assert_eq!(
+        delta_record_io(),
+        (1, 0),
+        "three record pages are one bulk submission, not a pread each"
+    );
+    assert!(
+        !delta_record_owner_held(),
+        "an unarmed lookup counted segment owners"
+    );
+    reset_delta_record_io();
+    arm_delta_record_owner_probe();
+    let armed = s.get_spender_meta_at_abs_batch(&queries).unwrap();
+    assert_eq!(armed, expect);
+    assert_eq!(
+        delta_record_io(),
+        (1, 0),
+        "three record pages are one bulk submission, not a pread each"
+    );
+    assert!(
+        delta_record_owner_held(),
+        "the bulk read dropped the segment file before the pread"
+    );
+    reset_delta_record_io();
+}

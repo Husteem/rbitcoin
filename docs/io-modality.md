@@ -153,7 +153,7 @@ RAM fence (~15 MiB at 1M blocks), not a file.
 |------|-----|----------|
 | Pin outs / body pipeline | `RBITCOIN_IO` | uring/pread on **`txout.body` FD** (Full also zips `seqsigwit`). `group_body_peeks` also merges a hole of at most 64 KiB when the span stays at most 256 KiB. |
 | Head-resolve identity | `RBITCOIN_IO` | uring/pread on **`txid.body`** (not a packed body prefix) |
-| Spend-meta 8 B peeks | `RBITCOIN_IO` | Directory hit, else uring/pread on **`spent.body` FD**, only on a page a fold wrote; any other page reads zero without IO. Misses are page-grouped with the pin caps (`group_body_peeks`), pipelined at ring depth 128. A singleton stays an 8-byte pread. |
+| Spend-meta 8 B peeks | `RBITCOIN_IO` | A directory entry that still names a record is read with the other record misses in one completion-session batch (ring depth 128; records that touch share a span). A RAM note is not read. A folded page with no record is not in that batch: its miss is uring/pread on **`spent.body` FD**, page-grouped with the pin caps (`group_body_peeks`), pipelined at ring depth 128. Any other page reads zero without IO. A singleton body peek stays an 8-byte pread. |
 | Spend annotate | `RBITCOIN_IO` | Every published slot, including the short tail, is a directory insert. That path does not set `POSIX_FADV_RANDOM`. Unknown meta decides sole / multi / promote before the slot write, so `MULTI_SPENDER` is visible only once the overflow node is appended. |
 | Class C create-height | (RAM fence) | no IO |
 | Class A body/idx **linear append** | always | **pwrite** (three stems + three idx). `--datadir-hdd` submits each body stem as its own `pwrite_batch`; otherwise the stems are one wave |
