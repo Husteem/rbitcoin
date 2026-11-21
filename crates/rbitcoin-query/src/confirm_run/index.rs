@@ -12,7 +12,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::{ConfirmError, ParentPinView, Query};
-use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Block, ScriptBuf, Transaction, TxOut};
 use rbitcoin_primitives::{Fk, Height};
 
@@ -54,6 +53,8 @@ pub struct SpendRef {
 pub struct BlockWork {
     pub block: Arc<Block>,
     pub hash: [u8; 32],
+    /// The batch's txids for this block, one per transaction.
+    pub txids: Vec<[u8; 32]>,
     pub parents: Arc<ParentPinView>,
     /// Spends grouped by tx index, sorted by `vin`. Parallel jobs read their own slot.
     pub spends_by_tx: Arc<[Vec<SpendRef>]>,
@@ -122,6 +123,9 @@ pub fn prepare_index_jobs(batch: &LoadedBatch) -> Result<IndexJobs, ConfirmError
         if !want.filters && !want_tweaks {
             continue;
         }
+        if prep.txids.len() != block.txdata.len() {
+            return Err(corrupt("invariant: live index txids"));
+        }
         let spends_by_tx = group_spends(prep, block.txdata.len())?;
         let tweak_cells: TweakSlots = block
             .txdata
@@ -148,6 +152,7 @@ pub fn prepare_index_jobs(batch: &LoadedBatch) -> Result<IndexJobs, ConfirmError
         let work = Arc::new(BlockWork {
             block: Arc::clone(block),
             hash: prep.hash,
+            txids: prep.txids.clone(),
             parents: Arc::clone(&parents),
             spends_by_tx: spends_by_tx.into(),
             same_block: OnceLock::new(),
@@ -218,7 +223,7 @@ pub fn apply_tweak_range(work: &BlockWork, txs: &[usize]) -> Result<(), ConfirmE
 pub fn apply_filter(work: &BlockWork) -> Result<(), ConfirmError> {
     let mut prevouts = Vec::with_capacity(work.block.txdata.len());
     for ti in 0..work.block.txdata.len() {
-        prevouts.push(prevouts_cached(work, ti)?.clone());
+        prevouts.push(prevouts_cached(work, ti)?);
     }
     let filter = basic_filter_from_wire(&work.hash, &work.block, &prevouts)?;
     let Some(slot) = work.filter.as_ref() else {
@@ -290,10 +295,10 @@ pub fn group_spends(prep: &Prepared, n_tx: usize) -> Result<Vec<Vec<SpendRef>>, 
 }
 
 #[doc(hidden)]
-pub fn basic_filter_from_wire(
+pub fn basic_filter_from_wire<P: AsRef<[TxOut]>>(
     hash: &[u8; 32],
     block: &Block,
-    prevouts: &[Vec<TxOut>],
+    prevouts: &[P],
 ) -> Result<bitcoin::bip158::BlockFilter, ConfirmError> {
     let outputs = block
         .txdata
@@ -301,7 +306,7 @@ pub fn basic_filter_from_wire(
         .flat_map(|tx| tx.output.iter().map(|o| o.script_pubkey.as_bytes()));
     let spent = prevouts
         .iter()
-        .flatten()
+        .flat_map(|txs| txs.as_ref())
         .map(|prev| prev.script_pubkey.as_bytes());
     crate::basic_filter_from_scripts(hash, outputs, spent).map_err(ConfirmError::from)
 }
@@ -342,9 +347,9 @@ pub fn prevouts_for_tx(
 pub fn resolve_prevout(work: &BlockWork, spend: &SpendRef) -> Result<TxOut, ConfirmError> {
     if spend.create_fk.is_null() {
         let same_block = work.same_block.get_or_init(|| {
-            let mut map = HashMap::with_capacity(work.block.txdata.len());
-            for (i, tx) in work.block.txdata.iter().enumerate() {
-                map.insert(tx.compute_txid().to_byte_array(), i);
+            let mut map = HashMap::with_capacity(work.txids.len());
+            for (i, txid) in work.txids.iter().enumerate() {
+                map.insert(*txid, i);
             }
             map
         });

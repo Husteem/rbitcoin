@@ -525,6 +525,38 @@ fn index_jobs_are_filters_then_tweak_ranges() {
     assert_eq!(&rows.filters[0].1, &expect_filter);
 }
 
+/// The filter job takes the block's txids from the batch and borrows the
+/// cached prevouts: it hashes no transaction and copies no prevout script.
+/// A batch whose txids do not cover its block is corrupt.
+#[test]
+fn filter_job_uses_batch_txids_and_borrows_cached_prevouts() {
+    let (ser, p2wpkh, p2tr) = keys();
+    let mut short = two_block_index_batch(&ser, &p2wpkh, &p2tr);
+    short.prepared[0].txids.pop();
+    let Err(err) = prepare_index_jobs(&short) else {
+        panic!("a short txid list is corrupt");
+    };
+    assert!(err.to_string().contains("live index txids"), "{err}");
+
+    let batch = two_block_index_batch(&ser, &p2wpkh, &p2tr);
+    let jobs = prepare_index_jobs(&batch).expect("prepare");
+    let IndexJob::Filter(work) = &jobs.jobs[0] else {
+        panic!("first job is a filter");
+    };
+    for (ti, tx) in work.block.txdata.iter().enumerate() {
+        let prev = prevouts_for_tx(work, ti, tx).expect("prevouts");
+        work.prevouts[ti].set(prev).expect("seed once");
+    }
+    let (done, asked) = crate::alloc_count::asked_by(|| apply_filter(work));
+    done.expect("filter");
+    assert!(
+        asked.calls < 24,
+        "{} allocator calls for {} transactions",
+        asked.calls,
+        work.block.txdata.len()
+    );
+}
+
 fn expected_tweaks(
     block: &bitcoin::Block,
     seeded: Option<(usize, &[TxOut])>,
@@ -652,6 +684,10 @@ fn index_block(
         let vout = tx.input[0].previous_output.vout;
         spends.push((cb_bytes, vout, tx_fks[i], Fk::NULL, 0));
     }
+    let txids = txs
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .collect();
     let block = bare_block(txs);
     let prep = Prepared {
         height: Height(height),
@@ -664,7 +700,7 @@ fn index_block(
         time: block.header.time,
         bits: block.header.bits,
         hash: [height as u8; 32],
-        txids: Vec::new(),
+        txids,
         prev_mtp: 0,
     };
     (block, prep)
