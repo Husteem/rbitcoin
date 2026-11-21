@@ -413,6 +413,52 @@ fn expire_stale_reaches_a_live_tx_behind_evicted_ghosts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// One age-INV walk holds the relay index that every session point lookup
+/// takes. A session starting at `(0, 0)` reads a long log a bounded slice
+/// at a time, and the cursor resumes until the whole log is covered.
+#[test]
+fn age_inv_walk_is_bounded_and_resumes_from_the_cursor() {
+    let (_store, q, _cbs) = pad_cbs(1);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    let rows = AGE_INV_SCAN_MAX * 2 + 5;
+    let mut want = BTreeSet::new();
+    for i in 0..rows {
+        let mut raw = [0u8; 32];
+        raw[0..4].copy_from_slice(&(i as u32 + 1).to_le_bytes());
+        let txid = Txid::from_byte_array(raw);
+        raw[31] = 1;
+        let wtxid = Wtxid::from_byte_array(raw);
+        hub.insert_relay_maps(txid, wtxid, i as u64 + 1, 1, true);
+        want.insert(wtxid);
+    }
+    let now = 1_000;
+    let mut seen = (0, 0);
+    let mut got = BTreeSet::new();
+    let mut calls = 0;
+    loop {
+        let (last, due) = hub.try_age_inv_since(seen, now).expect("index free");
+        assert!(
+            due.len() <= AGE_INV_SCAN_MAX,
+            "one walk returned {} rows",
+            due.len()
+        );
+        if due.is_empty() {
+            assert_eq!(last, seen, "an empty walk keeps the cursor");
+            break;
+        }
+        for (_, w) in due {
+            assert!(got.insert(w), "a resumed walk repeated a row");
+        }
+        seen = last;
+        calls += 1;
+        assert!(calls <= rows, "the cursor never reached the end");
+    }
+    assert_eq!(got, want, "the resumed walks cover the whole log");
+    assert_eq!(calls, 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn try_expire_stale_skips_when_the_relay_index_is_held() {
     let (_store, owned_q, owned_cbs) = pad_cbs(3);

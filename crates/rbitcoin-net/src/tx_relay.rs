@@ -841,6 +841,10 @@ pub const GETDATA_TX_INTERVAL_SECS: u64 = 60;
 /// Core `MAX_PEER_TX_REQUEST_IN_FLIGHT`.
 #[doc(hidden)]
 pub const MAX_PARENTS_PER_PARK: usize = 100;
+/// Most age-INV log rows one [`MempoolHub::try_age_inv_since`] call walks.
+/// It holds `relay_index`, which every session point lookup takes, so a new
+/// session's first walk from `(0, 0)` resumes on later ticks.
+pub const AGE_INV_SCAN_MAX: usize = 1024;
 
 /// INV AlreadyHave for recently confirmed txid/wtxid (Core rolling bloom is ~100k).
 #[doc(hidden)]
@@ -2190,7 +2194,8 @@ impl MempoolHub {
     }
 
     #[allow(clippy::type_complexity)] // age-inv cursor `(due, gen)` plus the due txid/wtxid list
-    /// Newly age-due INVs after `seen` (`(due_secs, accept_gen)` cursor).
+    /// Newly age-due INVs after `seen` (`(due_secs, accept_gen)` cursor), at
+    /// most [`AGE_INV_SCAN_MAX`] per call; the next tick resumes after `last`.
     /// Session tick: `try_lock` — busy skip.
     pub fn try_age_inv_since(
         &self,
@@ -2203,6 +2208,7 @@ impl MempoolHub {
         for (&(due, gen), &(txid, wtxid)) in ix
             .age_inv
             .range((Bound::Excluded(seen), Bound::Included((now, u64::MAX))))
+            .take(AGE_INV_SCAN_MAX)
         {
             out.push((txid, wtxid));
             last = (due, gen);
