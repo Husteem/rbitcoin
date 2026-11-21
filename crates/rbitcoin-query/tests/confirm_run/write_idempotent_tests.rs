@@ -84,11 +84,11 @@ fn script_ok_append_contiguous_and_gap() {
         }
     }
     fn batch_one(h: u32) -> ScriptOkBatch {
+        let block = rbitcoin_consensus::genesis_block(&rbitcoin_consensus::ChainParams::regtest());
         ScriptOkBatch {
             prepared: vec![empty_prepared(h, h as u8)],
-            wire_blocks: vec![Arc::new(rbitcoin_consensus::genesis_block(
-                &rbitcoin_consensus::ChainParams::regtest(),
-            ))],
+            wire_bytes: block.total_size(),
+            wire_blocks: vec![Arc::new(block)],
             batch_parents: rbitcoin_query::BatchParents::new(),
             archive_plan: None,
             index_seal: rbitcoin_query::confirm_run::index::IndexSeal::default(),
@@ -130,6 +130,7 @@ fn script_ok_append_contiguous_and_gap() {
             archive_plan: None,
             index_seal: rbitcoin_query::confirm_run::index::IndexSeal::default(),
             trust_script_warns: Vec::new(),
+            wire_bytes: 0,
             holds: Vec::new(),
         })
         .is_ok());
@@ -142,13 +143,18 @@ fn script_ok_append_contiguous_and_gap() {
         archive_plan: None,
         index_seal: rbitcoin_query::confirm_run::index::IndexSeal::default(),
         trust_script_warns: Vec::new(),
+        wire_bytes: 0,
         holds: Vec::new(),
     };
     assert!(empty.append_contiguous(batch_one(50)).is_ok());
     assert_eq!(empty.len(), 1);
     assert_eq!(empty.heights_hashes()[0].0, 50);
     assert!(!empty.is_empty());
-    assert!(empty.approx_wire_bytes() > 0);
+    let one = batch_one(51).approx_wire_bytes();
+    assert!(one > 0);
+    assert_eq!(empty.approx_wire_bytes(), one);
+    assert!(empty.append_contiguous(batch_one(51)).is_ok());
+    assert_eq!(empty.approx_wire_bytes(), 2 * one, "a merge sums the parts");
     assert_eq!(empty.parent_count(), 0);
 
     let mut good = batch_one(60);
@@ -225,6 +231,7 @@ fn three_stage_write_filter_and_scripts_surface() {
         stats: std::sync::Arc::new(rbitcoin_query::ConfirmStats::default()),
         trust_peer: false,
         trust_warns: Vec::new(),
+        wire_bytes: 0,
         holds: Vec::new(),
     };
     assert!(batch.is_empty());
@@ -233,6 +240,7 @@ fn three_stage_write_filter_and_scripts_surface() {
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
     let mut metered = LoadedBatch {
         prepared: Vec::new(),
+        wire_bytes: genesis.total_size(),
         wire_blocks: vec![std::sync::Arc::new(genesis)],
         batch_parents: rbitcoin_query::BatchParents::new(),
         script_preverified: ScriptPreverified::new(),
@@ -269,6 +277,7 @@ fn three_stage_write_filter_and_scripts_surface() {
         archive_plan: None,
         index_seal: rbitcoin_query::confirm_run::index::IndexSeal::default(),
         trust_script_warns: Vec::new(),
+        wire_bytes: 0,
         holds: Vec::new(),
     };
     assert_eq!(script_ok.parent_count(), 1);
@@ -323,6 +332,7 @@ fn empty_loaded_batch() -> rbitcoin_query::confirm_run::LoadedBatch {
         stats: std::sync::Arc::new(rbitcoin_query::ConfirmStats::default()),
         trust_peer: false,
         trust_warns: Vec::new(),
+        wire_bytes: 0,
         holds: Vec::new(),
     }
 }
@@ -554,6 +564,7 @@ fn loaded_at(
         stats: std::sync::Arc::new(rbitcoin_query::ConfirmStats::default()),
         trust_peer: false,
         trust_warns: Vec::new(),
+        wire_bytes: 0,
         holds: Vec::new(),
     }
 }
@@ -759,6 +770,7 @@ fn expected_bits_extending_height0_and_no_retarget() {
         stats: std::sync::Arc::new(rbitcoin_query::ConfirmStats::default()),
         trust_peer: false,
         trust_warns: Vec::new(),
+        wire_bytes: 0,
         holds: Vec::new(),
     };
     let ok = confirm_scripts_phase(loaded).unwrap();
@@ -956,6 +968,7 @@ fn script_wave_skips_preverified_txids() {
         stats: std::sync::Arc::new(rbitcoin_query::ConfirmStats::default()),
         trust_peer: false,
         trust_warns: Vec::new(),
+        wire_bytes: 0,
         holds: Vec::new(),
     };
     confirm_scripts_phase(batch).expect("preverified skip avoids bad script fail");
@@ -3118,7 +3131,18 @@ fn one_shot_load_matches_stamp_then_load_from_plan() {
         from_plan.batch.parent_count()
     );
     assert_eq!(one_shot.batch.len(), 2);
-    assert!(one_shot.batch.approx_wire_bytes() > 0);
+    let measured: usize = one_shot
+        .batch
+        .wire_blocks
+        .iter()
+        .map(|b| b.total_size())
+        .sum();
+    assert!(measured > 0);
+    assert_eq!(
+        one_shot.batch.wire_bytes, measured,
+        "load measures its wire blocks once"
+    );
+    assert_eq!(one_shot.batch.approx_wire_bytes(), measured);
     assert!(
         qa.confirm_stats()
             .phase_prep_wire_arc_ns

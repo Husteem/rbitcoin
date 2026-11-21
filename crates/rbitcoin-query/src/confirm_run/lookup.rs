@@ -624,6 +624,7 @@ fn load_from_plan_inner(
     Ok(ConfirmLoadOutcome {
         batch: LoadedBatch {
             prepared,
+            wire_bytes: wire_blocks.iter().map(|b| b.total_size()).sum(),
             wire_blocks,
             batch_parents,
             script_preverified: preverified.clone(),
