@@ -26,7 +26,9 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -1160,8 +1162,11 @@ pub struct MempoolHub {
     isolated_wake: tokio::sync::Notify,
     /// One isolated-broadcast lap: skipped an unknown tx, blocked on a write,
     /// or found no dial targets. The wait; the send or the skip is the assert.
+    #[cfg(debug_assertions)]
     isolated_skipped_unknown: AtomicU64,
+    #[cfg(debug_assertions)]
     isolated_lagged: AtomicU64,
+    #[cfg(debug_assertions)]
     isolated_no_targets: AtomicU64,
     isolated_lap: tokio::sync::Notify,
     /// Wtxids re-admitted from a disconnected block. Core serves these
@@ -1184,6 +1189,7 @@ pub struct MempoolHub {
     template_prev: Mutex<Option<[u8; 32]>>,
     /// Readers blocked in [`Self::template_prev`]. The uncontended path does
     /// not touch it.
+    #[cfg(debug_assertions)]
     template_prev_waiters: AtomicUsize,
     /// Hash the active [`TemplateHold`] will publish on drop. Nested holds
     /// write this; only the outer hold sends it.
@@ -1277,8 +1283,10 @@ std::thread_local! {
     static TEMPLATE_HOLD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(debug_assertions)]
 struct TemplatePrevWait<'a>(&'a AtomicUsize);
 
+#[cfg(debug_assertions)]
 impl Drop for TemplatePrevWait<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
@@ -1358,6 +1366,7 @@ pub enum IsolatedLap {
 }
 
 /// [`MempoolHub::isolated_laps`] snapshot.
+#[cfg(debug_assertions)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct IsolatedLapCounts {
@@ -1503,8 +1512,11 @@ impl MempoolHub {
             local_origin: Mutex::new(LocalOrigin::default()),
             isolated_broadcast: AtomicBool::new(false),
             isolated_wake: tokio::sync::Notify::new(),
+            #[cfg(debug_assertions)]
             isolated_skipped_unknown: AtomicU64::new(0),
+            #[cfg(debug_assertions)]
             isolated_lagged: AtomicU64::new(0),
+            #[cfg(debug_assertions)]
             isolated_no_targets: AtomicU64::new(0),
             isolated_lap: tokio::sync::Notify::new(),
             reorg_servable: Mutex::new(HashSet::new()),
@@ -1528,6 +1540,7 @@ impl MempoolHub {
             template_updates: AtomicU64::new(0),
             template_watch: tokio::sync::watch::channel(0).0,
             template_prev: Mutex::new(None),
+            #[cfg(debug_assertions)]
             template_prev_waiters: AtomicUsize::new(0),
             template_commit: Mutex::new(None),
             pool_settle: AtomicU64::new(0),
@@ -5905,7 +5918,9 @@ impl MempoolHub {
             Ok(guard) => *guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => *poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(debug_assertions)]
                 self.template_prev_waiters.fetch_add(1, Ordering::SeqCst);
+                #[cfg(debug_assertions)]
                 let _leave = TemplatePrevWait(&self.template_prev_waiters);
                 let guard = self
                     .template_prev
@@ -5917,6 +5932,7 @@ impl MempoolHub {
     }
 
     /// Readers parked in [`Self::template_prev`].
+    #[cfg(debug_assertions)]
     pub fn template_prev_waiters(&self) -> usize {
         self.template_prev_waiters.load(Ordering::SeqCst)
     }
@@ -6864,16 +6880,22 @@ impl MempoolHub {
     /// One finished isolated-broadcast lap. The counter is the wait.
     #[doc(hidden)]
     pub fn note_isolated_lap(&self, kind: IsolatedLap) {
-        let slot = match kind {
-            IsolatedLap::SkippedUnknown => &self.isolated_skipped_unknown,
-            IsolatedLap::Lagged => &self.isolated_lagged,
-            IsolatedLap::NoTargets => &self.isolated_no_targets,
-        };
-        slot.fetch_add(1, Ordering::Release);
+        #[cfg(debug_assertions)]
+        {
+            let slot = match kind {
+                IsolatedLap::SkippedUnknown => &self.isolated_skipped_unknown,
+                IsolatedLap::Lagged => &self.isolated_lagged,
+                IsolatedLap::NoTargets => &self.isolated_no_targets,
+            };
+            slot.fetch_add(1, Ordering::Release);
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = kind;
         self.isolated_lap.notify_one();
     }
 
     /// How many isolated-broadcast laps of each kind have finished.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn isolated_laps(&self) -> IsolatedLapCounts {
         IsolatedLapCounts {

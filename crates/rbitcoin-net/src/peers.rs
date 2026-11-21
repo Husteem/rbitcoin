@@ -472,6 +472,7 @@ pub struct LivePeer {
     /// Wakes the reader after the writer drains under [`PEER_SEND_BUDGET`].
     pub send_resume: tokio::sync::Notify,
     /// Times [`Self::wait_send_budget`] armed that wait. The wait, not the contract.
+    #[cfg(debug_assertions)]
     send_budget_parks: AtomicUsize,
     /// Inbound `getaddr` is answered once per connection.
     pub getaddr_answered: AtomicBool,
@@ -600,6 +601,7 @@ pub struct LivePeer {
     /// Frames pushed onto this session's decode queue. Already-applied
     /// frames stay counted, so a test can wait until the reader has taken
     /// the bytes off the socket.
+    #[cfg(debug_assertions)]
     pub decode_enqueued: AtomicUsize,
 }
 
@@ -668,10 +670,12 @@ impl LivePeer {
         self.wire_load(|w| &w.sent)
     }
 
+    #[cfg(debug_assertions)]
     pub fn decode_enqueued(&self) -> usize {
         self.decode_enqueued.load(Ordering::Acquire)
     }
 
+    #[cfg(debug_assertions)]
     pub(crate) fn note_decode_enqueued(&self) {
         self.decode_enqueued.fetch_add(1, Ordering::Release);
     }
@@ -1375,6 +1379,7 @@ impl LivePeer {
     }
 
     /// Times this peer has armed [`Self::wait_send_budget`]. The wait, not the contract.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn send_budget_parks(&self) -> usize {
         self.send_budget_parks.load(Ordering::Acquire)
@@ -1387,6 +1392,7 @@ impl LivePeer {
             if self.stop.load(Ordering::SeqCst) || !self.send_over_budget() {
                 return;
             }
+            #[cfg(debug_assertions)]
             self.send_budget_parks.fetch_add(1, Ordering::Release);
             notified.await;
         }
@@ -2087,8 +2093,10 @@ pub struct PeerHub {
     /// on that call. A `watch` keeps the jump if it lands between waits.
     session_heartbeat: watch::Sender<u64>,
     /// Times a session has entered `on_heartbeat`. The wait, not the contract.
+    #[cfg(debug_assertions)]
     heartbeat_laps: AtomicU64,
     /// Outbound version nonces registered. Stays after the nonce is cleared.
+    #[cfg(debug_assertions)]
     outbound_attempts: AtomicU64,
     /// Refill and stale-tip passes. The wait, not the peer-row contract.
     pass_skipped_pinned: AtomicU64,
@@ -2367,7 +2375,9 @@ impl PeerHub {
             hb_selected: Mutex::new(Vec::new()),
             mock_now: AtomicU64::new(0),
             session_heartbeat: watch::channel(0).0,
+            #[cfg(debug_assertions)]
             heartbeat_laps: AtomicU64::new(0),
+            #[cfg(debug_assertions)]
             outbound_attempts: AtomicU64::new(0),
             pass_skipped_pinned: AtomicU64::new(0),
             pass_not_stagnant: AtomicU64::new(0),
@@ -3004,6 +3014,7 @@ impl PeerHub {
 
     /// Core: register local version nonce while an outbound handshake is open.
     pub fn note_outbound_nonce(&self, nonce: u64) {
+        #[cfg(debug_assertions)]
         self.outbound_attempts.fetch_add(1, Ordering::Release);
         self.pending_outbound_nonces
             .lock()
@@ -3012,17 +3023,20 @@ impl PeerHub {
     }
 
     /// Outbound handshakes that registered a version nonce.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn outbound_attempts(&self) -> u64 {
         self.outbound_attempts.load(Ordering::Acquire)
     }
 
     /// How many times a live session has entered its heartbeat.
+    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn heartbeat_laps(&self) -> u64 {
         self.heartbeat_laps.load(Ordering::Acquire)
     }
 
+    #[cfg(debug_assertions)]
     pub(crate) fn note_heartbeat_lap(&self) {
         self.heartbeat_laps.fetch_add(1, Ordering::Release);
     }
@@ -3638,6 +3652,7 @@ impl PeerHub {
             serve_inflight: AtomicUsize::new(0),
             send_queued: AtomicUsize::new(0),
             send_resume: tokio::sync::Notify::new(),
+            #[cfg(debug_assertions)]
             send_budget_parks: AtomicUsize::new(0),
             getaddr_answered: AtomicBool::new(false),
             hb_to: AtomicBool::new(false),
@@ -3704,6 +3719,7 @@ impl PeerHub {
                 .flatten(),
             version_timestamp: ver.timestamp,
             version: ver.version,
+            #[cfg(debug_assertions)]
             decode_enqueued: AtomicUsize::new(0),
         })
     }
