@@ -90,6 +90,19 @@ fn height_window_obeys_create_cap(
         .collect();
     assert!(txids.contains(&tip_cb_txid), "{txids:?}");
     assert!(txids.contains(&spend_txid), "{txids:?}");
+    #[cfg(debug_assertions)]
+    {
+        q.set_heavy_sh_creates(1);
+        q.sh_join_probe.arm();
+        q.scripthash_history_filtered(sh, &filter)
+            .expect("cap 0 serves the height window under the heavy turn");
+        assert_eq!(
+            q.sh_join_probe.entered(),
+            (0, 1),
+            "a height window above --heavy-sh-creates takes the turn"
+        );
+        q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
+    }
     q.set_max_sh_creates(2);
 }
 
@@ -437,6 +450,19 @@ fn newest_page_gap_obeys_create_cap() {
             spend_of_oldest(open),
             "the {gap} gap returns the spend of the create below the page bound"
         );
+    }
+    #[cfg(debug_assertions)]
+    {
+        q.set_heavy_sh_creates(1);
+        q.sh_join_probe.arm();
+        q.spends_for_newest_page(&sh, &members, &window, 2, &view)
+            .expect("an in-window page under the heavy turn");
+        assert_eq!(
+            q.sh_join_probe.entered(),
+            (0, 1),
+            "an in-window page above --heavy-sh-creates takes the turn"
+        );
+        q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1210,6 +1210,34 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
         }
     }
 
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
+            Poll::Ready(result) => {
+                this.progressed();
+                Poll::Ready(result)
+            }
+            Poll::Pending => {
+                if this.stalled(cx) {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "esplora: response write stalled",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         match Pin::new(&mut this.inner).poll_flush(cx) {

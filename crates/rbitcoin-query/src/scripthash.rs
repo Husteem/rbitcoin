@@ -1658,7 +1658,13 @@ impl Query {
         };
         // Both a block scan and a spend-slot read walk every create, so each
         // takes the unpaged cap and keeps the heavy turn for its read.
-        let _admit = self.unpaged_join_admit(scripthash)?;
+        let admit = self.unpaged_join_admit(scripthash)?;
+        // Debug drops the probe before `admit`, so a released heavy turn is
+        // not counted as still running.
+        #[cfg(debug_assertions)]
+        let _probe = self.sh_join_probe.enter(admit.heavy);
+        #[cfg(not(debug_assertions))]
+        let _admit = admit;
         if high.saturating_sub(low) <= MAX_HISTORY_WINDOW {
             return self.spends_of_members(members, low, high);
         }
@@ -1850,7 +1856,11 @@ impl Query {
         }
         // The window needs every create to decide whether a spend in it
         // pays the script. Take the unpaged cap and heavy turn for that read.
-        let _admit = self.unpaged_join_admit(scripthash)?;
+        let admit = self.unpaged_join_admit(scripthash)?;
+        #[cfg(debug_assertions)]
+        let _probe = self.sh_join_probe.enter(admit.heavy);
+        #[cfg(not(debug_assertions))]
+        let _admit = admit;
         let members = self.strong_sh_creates(scripthash, view)?;
         let heights = self.store.tx_height_get_batch(&members)?;
         if heights.len() != members.len() {
