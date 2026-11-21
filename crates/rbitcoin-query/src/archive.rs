@@ -674,7 +674,7 @@ impl ArchiveWritePlan {
 
     /// Same-header create: assemble uses the wire `TxOut` (do not pin).
     ///
-    /// The search needs the order [`debug_assert_header_ranges_ascend`]
+    /// The search needs the order `debug_assert_header_ranges_ascend`
     /// checks where the rows are built, rebased, and appended.
     ///
     /// `per_header` is one `(header, first tx fk, n)` row per block in
