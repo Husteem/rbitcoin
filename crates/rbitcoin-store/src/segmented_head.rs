@@ -589,26 +589,24 @@ impl SegmentedTxHead {
         Ok(out)
     }
 
-    /// One sealed segment, newest-first caller order. Unsealed `si` returns
-    /// empty lists (the open wave already probed those OAs).
+    /// One sealed segment for the `active` key indices (ascending): each key
+    /// with candidates, with them. Unsealed `si` returns none (the open wave
+    /// already probed those OAs). The cost follows `active`, not the wave.
     pub fn probe_sealed_segment(
         &self,
         mixed: &[[u8; 32]],
         si: usize,
-        active: Option<&[bool]>,
+        active: &[usize],
         ctx: &mut crate::IoCtx<'_>,
-    ) -> Result<Vec<Vec<Fk>>, StoreError> {
-        let n = mixed.len();
-        let mut out = vec![Vec::new(); n];
-        if n == 0 {
-            return Ok(out);
+    ) -> Result<Vec<(usize, Vec<Fk>)>, StoreError> {
+        if active.is_empty() {
+            return Ok(Vec::new());
         }
         let segs = self.segments_snapshot();
         if si >= segs.len() {
-            return Ok(out);
+            return Ok(Vec::new());
         }
-        self.fill_sealed_segment(&segs, si, mixed, active, ctx, &mut out)?;
-        Ok(out)
+        self.sealed_segment_cands(&segs, si, mixed, active.iter().copied(), ctx)
     }
 
     #[doc(hidden)]
@@ -659,60 +657,58 @@ impl SegmentedTxHead {
         out: &mut [Vec<Fk>],
     ) -> Result<(), StoreError> {
         let segs = self.segments_snapshot();
+        let key_on = |i: usize| active.map(|a| a[i]).unwrap_or(true);
         for si in (0..segs.len()).rev() {
-            if !segs[si].sealed {
-                continue;
+            let keys = (0..mixed.len()).filter(|&i| key_on(i));
+            for (i, cands) in self.sealed_segment_cands(&segs, si, mixed, keys, ctx)? {
+                out[i].extend(cands);
             }
-            self.fill_sealed_segment(&segs, si, mixed, active, ctx, out)?;
         }
         Ok(())
     }
 
-    /// Fuse-filter `active` keys, then one MPHF batch (or the sealed OA).
-    #[doc(hidden)]
-    pub fn fill_sealed_segment(
+    /// Fuse-filter `keys`, then one MPHF batch (or the sealed OA). Returns
+    /// each key with candidates, in `keys` order.
+    fn sealed_segment_cands(
         &self,
         segs: &[Arc<Segment>],
         si: usize,
         mixed: &[[u8; 32]],
-        active: Option<&[bool]>,
+        keys: impl Iterator<Item = usize>,
         ctx: &mut crate::IoCtx<'_>,
-        out: &mut [Vec<Fk>],
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<(usize, Vec<Fk>)>, StoreError> {
         let seg = &segs[si];
         if !seg.sealed {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let Some(fuse) = seg.fuse.as_ref() else {
             return Err(StoreError::Corrupt("sealed segment missing fuse"));
         };
-        let key_on = |i: usize| active.map(|a| a[i]).unwrap_or(true);
-
         let mut pass_i: Vec<usize> = Vec::new();
         let mut pass_keys: Vec<[u8; 32]> = Vec::new();
-        for (i, m) in mixed.iter().enumerate() {
-            if !key_on(i) {
-                continue;
-            }
-            let fuse_key = fuse_key_from_mixed(m);
-            if !fuse.contains(fuse_key) {
+        for i in keys {
+            let m = &mixed[i];
+            if !fuse.contains(fuse_key_from_mixed(m)) {
                 continue;
             }
             pass_i.push(i);
             pass_keys.push(*m);
         }
         if pass_keys.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
+        let mut out = Vec::new();
         if let Some(pack) = seg.pack.as_ref() {
             let mixed_u: Vec<u64> = pass_keys.iter().map(fuse_key_from_mixed).collect();
             let slots = pack.slots_for_ctx(&mixed_u, ctx)?;
             let rel_lists = pack.read_rels_batch(&slots, ctx)?;
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
-                for r in rels {
-                    if let Some(fk) = rel_to_abs(seg.first_fk, u64::from(r)) {
-                        out[orig_i].push(fk);
-                    }
+                let fks: Vec<Fk> = rels
+                    .into_iter()
+                    .filter_map(|r| rel_to_abs(seg.first_fk, u64::from(r)))
+                    .collect();
+                if !fks.is_empty() {
+                    out.push((orig_i, fks));
                 }
             }
         } else {
@@ -722,14 +718,17 @@ impl SegmentedTxHead {
                 .ok_or(StoreError::Corrupt("tx.head sealed probe: missing pack"))?
                 .probe_fks_batch(&pass_keys);
             for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
-                for r in rels.into_iter().rev() {
-                    if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
-                        out[orig_i].push(fk);
-                    }
+                let fks: Vec<Fk> = rels
+                    .into_iter()
+                    .rev()
+                    .filter_map(|r| rel_to_abs(seg.first_fk, r.0))
+                    .collect();
+                if !fks.is_empty() {
+                    out.push((orig_i, fks));
                 }
             }
         }
-        Ok(())
+        Ok(out)
     }
 
     /// Rewrite this head as a meta v1 head: untagged slots, no `FLAG_TAGGED`.
