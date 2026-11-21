@@ -2450,6 +2450,7 @@ mod peer_session_pins {
             &mut announces,
             &mut flushes,
             false,
+            false,
         ))
         .unwrap();
         assert!(follow.requested_blocks.is_empty());
@@ -3817,6 +3818,7 @@ pub async fn on_heartbeat(
     tx_announce_rx: &mut Option<broadcast::Receiver<crate::tx_relay::MempoolAnnounce>>,
     inv_flush_rx: &mut Option<broadcast::Receiver<()>>,
     decode_waiting: bool,
+    decode_queued: bool,
 ) -> Result<(), NetError> {
     if tx_announce_rx.is_none() {
         *tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
@@ -3867,9 +3869,10 @@ pub async fn on_heartbeat(
         ph.note_heartbeat_lap();
         ph.on_session_heartbeat();
     }
-    // A block or compact frame already sits in `decode_q`. Expiring the
-    // ask here forgets it before that frame is applied.
-    if !decode_waiting {
+    // A block or compact frame already sits in `decode_q`, even when it is
+    // behind a front held for the send budget. Expiring the ask here forgets
+    // it before that frame is applied.
+    if !decode_queued {
         if maybe_expire_block_requests(
             hub,
             &mut follow.requested_blocks,
@@ -4424,8 +4427,10 @@ pub async fn peer_session_with(
             }
             // The decode arm and the heartbeat must agree on whether the
             // front is waiting to decode (suspend timeouts) or held for the
-            // send budget (do not).
-            let front_waiting = !decode_q.is_empty() && !hold_front;
+            // send budget (do not). Any queued frame still blocks request
+            // expiry, including one sitting behind a held front.
+            let decode_queued = !decode_q.is_empty();
+            let front_waiting = decode_queued && !hold_front;
             let tail_pending =
                 !follow.getdata_tail.is_empty() || !follow.getblocktxn_tail.is_empty();
             let reading = !over_budget && !tail_pending;
@@ -4840,6 +4845,7 @@ pub async fn peer_session_with(
                         &mut tx_announce_rx,
                         &mut inv_flush_rx,
                         front_waiting,
+                        decode_queued,
                     )
                     .await?;
                     last_hb = std::time::Instant::now();
