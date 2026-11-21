@@ -202,6 +202,13 @@ fn resolve_records_winner_age_open_segment() {
         s.age_hit[0],
         &s.age_hit[..8]
     );
+    // Hit ranks are 1-based, so the sum is at least the count.
+    assert!(
+        s.hit_rank_n >= hits && s.hit_rank_sum >= s.hit_rank_n,
+        "hit_rank_n={} hit_rank_sum={} hits={hits}",
+        s.hit_rank_n,
+        s.hit_rank_sum
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
