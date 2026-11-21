@@ -530,9 +530,12 @@ impl DecodeQueue {
     ) -> bool {
         self.q.push_back(QueuedDecode { rx, n, heavy });
         self.account(n, heavy);
+        #[cfg(debug_assertions)]
         if let Some(session) = session {
             session.note_decode_enqueued();
         }
+        #[cfg(not(debug_assertions))]
+        let _ = session;
         decode_queue_over_cap(
             self.heavy_frames,
             self.heavy_bytes,
@@ -3793,6 +3796,7 @@ pub async fn on_heartbeat(
         let _ = queue_out(out_tx, NetworkMessage::Ping(nonce));
     }
     if let Some(ph) = s.peer_hub() {
+        #[cfg(debug_assertions)]
         ph.note_heartbeat_lap();
         ph.on_session_heartbeat();
     }

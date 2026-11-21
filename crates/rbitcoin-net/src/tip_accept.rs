@@ -20,12 +20,9 @@ pub const TIP_ACCEPT_THREAD_NAME: &str = "tip-accept";
 #[doc(hidden)]
 pub const QUEUE_CAP: usize = 8;
 
-/// Sync senders blocked in the permit mutex. An async poll must not join them.
-#[doc(hidden)]
-pub static LANE_SEND_GUARD_WAITERS: AtomicUsize = AtomicUsize::new(0);
-
 /// Callers inside [`hold_lane_mutex_for_tests`] after the lock is taken.
 /// Condvar waiters do not increment this.
+#[cfg(debug_assertions)]
 #[doc(hidden)]
 pub static LANE_MUTEX_HOLDERS: AtomicUsize = AtomicUsize::new(0);
 
@@ -35,6 +32,7 @@ pub static LANE_MUTEX_HOLDERS: AtomicUsize = AtomicUsize::new(0);
 pub static FULL_QUEUE_SPINS: AtomicUsize = AtomicUsize::new(0);
 
 /// Successful `try_send`s from [`run_on_tip_accept_async`].
+#[cfg(debug_assertions)]
 #[doc(hidden)]
 pub static TIP_ASYNC_ENQUEUED: AtomicUsize = AtomicUsize::new(0);
 
@@ -282,9 +280,7 @@ fn lane_send_guard(exempt: bool) -> Option<std::sync::MutexGuard<'static, ()>> {
         }
         let mut g = LANE_EXCLUSIVE_MU.lock().unwrap_or_else(|p| p.into_inner());
         while LANE_EXCLUSIVE.load(Ordering::Acquire) {
-            LANE_SEND_GUARD_WAITERS.fetch_add(1, Ordering::SeqCst);
             g = LANE_EXCLUSIVE_CV.wait(g).unwrap_or_else(|p| p.into_inner());
-            LANE_SEND_GUARD_WAITERS.fetch_sub(1, Ordering::SeqCst);
         }
         Some(g)
     }
@@ -417,12 +413,14 @@ pub fn try_enqueue(job: Job) -> Result<(), TrySendError<Job>> {
 pub fn hold_lane_mutex_for_tests(release: &std::sync::Arc<(Mutex<bool>, Condvar)>) {
     #[cfg(debug_assertions)]
     let _gate = LANE_EXCLUSIVE_MU.lock().unwrap_or_else(|p| p.into_inner());
+    #[cfg(debug_assertions)]
     LANE_MUTEX_HOLDERS.fetch_add(1, Ordering::SeqCst);
     let (lock, cv) = &**release;
     let mut w = lock.lock().unwrap_or_else(|p| p.into_inner());
     while !*w {
         w = cv.wait(w).unwrap_or_else(|p| p.into_inner());
     }
+    #[cfg(debug_assertions)]
     LANE_MUTEX_HOLDERS.fetch_sub(1, Ordering::SeqCst);
 }
 
@@ -668,6 +666,7 @@ fn note_send_parked() {
 }
 
 fn note_async_enqueued() {
+    #[cfg(debug_assertions)]
     TIP_ASYNC_ENQUEUED.fetch_add(1, Ordering::Relaxed);
     // The recv that opened this slot may have coalesced with an earlier
     // `notify_one`. Wake one parked sender so it observes the free slot.
