@@ -28,7 +28,7 @@ use rbitcoin_store::{OutputRecord, StoreError, TxRecord};
 use std::cell::RefCell;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 pub use rbitcoin_store::{FkMap, FkSet, SlotSet, U32Map, U64Map, U64Set};
 
@@ -282,12 +282,11 @@ impl PinOuts {
     }
 }
 
-/// `txout` range + `spent` range. Abs = spent_off + 9×vout (no denserels).
+/// `txout` range and spender rels. The spent range is [`SharedParentPin::spent`].
 #[derive(Debug, Clone, Default)]
 #[doc(hidden)]
 pub struct ParentLayout {
     pub body_range: Option<(u64, u64)>,
-    pub spent_range: Option<(u64, u64)>,
     pub spender_rels: Vec<(u32, u32)>,
 }
 
@@ -296,7 +295,6 @@ impl ParentLayout {
     pub fn new(body_range: Option<(u64, u64)>, spender_rels: Vec<(u32, u32)>) -> Self {
         Self {
             body_range,
-            spent_range: None,
             spender_rels,
         }
     }
@@ -399,6 +397,10 @@ pub struct SharedParentPin {
     pub outs: PinHalf<PinOuts>,
     /// Abs layout for spentness/annotate (write fill).
     pub layout: PinHalf<ParentLayout>,
+    /// `spent.body` `(off, len)`. Fixed at the create's Class A append, so
+    /// the first set is the value: no lock and no snapshot on the per-spend
+    /// read.
+    pub spent: OnceLock<(u64, u64)>,
 }
 
 impl SharedParentPin {
@@ -421,6 +423,7 @@ impl SharedParentPin {
             coinbase: AtomicU8::new(cb),
             outs: PinHalf::new(PinOuts::new(live, checked)),
             layout: PinHalf::new(ParentLayout::new(body_range, spender_rels)),
+            spent: OnceLock::new(),
         }
     }
 
@@ -443,6 +446,7 @@ impl SharedParentPin {
             coinbase: AtomicU8::new(cb),
             outs: PinHalf::new(PinOuts::full(pin, checked)),
             layout: PinHalf::new(ParentLayout::new(body_range, spender_rels)),
+            spent: OnceLock::new(),
         }
     }
 
@@ -988,8 +992,7 @@ impl BatchParents {
         let Some(e) = self.pins.get(&id) else {
             return false;
         };
-        let lay = e.load_layout();
-        lay.spent_range.is_some()
+        e.spent.get().is_some()
     }
 
     #[inline]
@@ -1000,8 +1003,7 @@ impl BatchParents {
     pub fn get_spender_abs(&self, fk: Fk, vout: u32) -> Option<u64> {
         let id = fk.get()?;
         let e = self.pins.get(&id)?;
-        let lay = e.load_layout();
-        let (off, len) = lay.spent_range?;
+        let (off, len) = *e.spent.get()?;
         let abs = rbitcoin_store::spent_abs(off, vout);
         if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
             > off.saturating_add(len)
@@ -1050,19 +1052,14 @@ impl BatchParents {
         Ok(())
     }
 
+    /// A create's spent range does not move once appended: a later set for
+    /// the same pin is the same range, and the first one stays.
     pub fn set_spent_range_only(&mut self, fk: Fk, spent_range: (u64, u64)) {
         let Some(id) = fk.get() else {
             return;
         };
         if let Some(e) = self.pins.get(&id) {
-            e.publish_layout(|cur| {
-                if cur.spent_range == Some(spent_range) {
-                    return None;
-                }
-                let mut next = cur.clone();
-                next.spent_range = Some(spent_range);
-                Some(next)
-            });
+            let _ = e.spent.set(spent_range);
         }
     }
 
