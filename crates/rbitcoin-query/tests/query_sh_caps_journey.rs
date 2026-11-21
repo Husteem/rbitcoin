@@ -107,9 +107,10 @@ fn height_window_obeys_create_cap(
 }
 
 /// One scripthash with more creates than `--max-sh-creates`: the full join
-/// refuses, a page that closes before the cap is still served in either
-/// order and past a cursor, and the create count includes the write-behind
-/// that has not reached the durable index yet.
+/// refuses; height-ascending and cursor pages that close before the cap are
+/// still served; a full newest-first page refuses above the cap; and the
+/// create count includes the write-behind that has not reached the durable
+/// index yet.
 #[test]
 fn sh_history_caps() {
     use rbitcoin_query::scripthash::HistoryOrder::{HeightAsc, NewestFirst};

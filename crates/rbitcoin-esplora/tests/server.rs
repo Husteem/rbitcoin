@@ -68,6 +68,119 @@ async fn stalled_response_write_is_cancelled() {
     );
 }
 
+/// A stall followed by a client that starts reading is not cut off by the
+/// first stall's deadline. The write deadline resets when a write progresses.
+#[tokio::test]
+async fn response_write_deadline_resets_after_progress() {
+    const BODY: usize = 64 * 1024;
+    let (server, mut client) = tokio::io::duplex(128);
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let app = Router::new().route("/", get(|| async { vec![0u8; BODY] }));
+    let server_task = tokio::spawn(serve_http_connection(
+        server,
+        app,
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+    ));
+    let reader = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut total = 0usize;
+        let mut buf = [0u8; 1024];
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total += n;
+                    if total > BODY {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        }
+        total
+    });
+    let total = tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("reader")
+        .expect("read task");
+    let joined = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+    assert!(
+        joined.is_ok(),
+        "a write that made progress still hit the first stall's deadline"
+    );
+    assert!(
+        total > BODY,
+        "the response was cut after a stall: {total} bytes"
+    );
+}
+
+/// The real listener cancels a stalled response write. A client asks for a
+/// body larger than the socket buffers and never reads; after the request
+/// timeout the connection is closed with only part of the body sent. Without
+/// the deadline the client drains the whole response once it starts reading.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_response_write_closes_the_esplora_listener() {
+    const TXS: u32 = 50;
+    const SCRIPT: usize = 4_000;
+    let (dir, q) = temp_query("esplora-write-stall");
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    let mut txs = vec![cb0];
+    for i in 0..TXS {
+        let mut pay = pay_height(0, bitcoin::ScriptBuf::from_bytes(vec![0x51; SCRIPT]));
+        pay.tx.txid[0..4].copy_from_slice(&i.to_le_bytes());
+        pay.tx.txid[31] = 0xaa;
+        txs.push(pay);
+    }
+    q.connect_block(Height(0), &h0, &txs).unwrap();
+
+    let sock = dir.path().join("esplora-write.sock");
+    let mut cfg = EsploraConfig::with_listen(EsploraListen::Unix(sock), Network::Regtest);
+    cfg.limits.idle_timeout = Duration::from_secs(1);
+    let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+    let path = handle.socket_path.clone().expect("unix socket");
+    let mut stream = tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("connect");
+    let req = format!(
+        "GET /internal/block/{}/txs HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        block_hash_hex(&h0.hash)
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
+    .await;
+    handle.shutdown().await;
+
+    let text = String::from_utf8_lossy(&buf);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let len: usize = header_value(head, "content-length")
+        .expect("content-length")
+        .parse()
+        .expect("content-length number");
+    assert!(
+        body.len() < len,
+        "stalled response sent {body_len} of {len} bytes",
+        body_len = body.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Esplora caps accepted TCP sockets, not only in-flight requests, and closes
 /// a connection that never sends headers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
