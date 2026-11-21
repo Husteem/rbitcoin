@@ -8751,15 +8751,24 @@ fn apply_cmpct_accept(
         Err(e @ NetError::Store(_)) if !net_error_is_store_not_found(&e) => {
             note_store_fault_keep_session(hub, hash, &e);
         }
+        // Core `FillBlock` returns `READ_STATUS_FAILED` and asks the same
+        // peer for the full block, without `Misbehaving`: a short-id
+        // collision is not the sender's fault. A mutated full block is
+        // punished in `on_block`.
         Err(e) if e.is_mutated() => {
-            hub.forget_asked_block(&hash);
-            follow.pending_headers.remove(&hash);
-            follow.requested_blocks.remove(&hash);
+            log_cmpct_getdata(hash, 0);
             if let Some(s) = session {
                 s.note_failed_cmpct(hash);
                 s.release_cmpct_taken(hash);
             }
-            follow.ban_score = follow.ban_score.saturating_add(10);
+            let _ = queue_block_getdata(
+                hub,
+                out_tx,
+                session,
+                &mut follow.requested_blocks,
+                &[hash],
+                false,
+            );
             ask_other_hb_for_block(session, hash);
         }
         _ => {
