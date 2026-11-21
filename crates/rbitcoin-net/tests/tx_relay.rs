@@ -3781,7 +3781,9 @@ fn orphan_witnesses_wait_until_a_resent_parent_finds_their_txid_pooled() {
         "a parked orphan is not a tx the node has"
     );
 
-    let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
+    let rows = hub
+        .submit_package_rpc(&[parent.clone(), child.clone()])
+        .rows;
     assert!(rows.iter().all(|r| r.result.is_ok()), "{rows:?}");
     assert!(
         parked(&child) && parked(&child_bad),
@@ -4355,7 +4357,7 @@ fn submit_package_rpc_admits_zero_fee_anchor() {
         matches!(err, AcceptError::Policy("min relay fee")),
         "{err:?}"
     );
-    let alone = hub.submit_package_rpc(std::slice::from_ref(&parent));
+    let alone = hub.submit_package_rpc(std::slice::from_ref(&parent)).rows;
     assert!(alone[0].result.is_err(), "{alone:?}");
 
     let skips = v3_spend(
@@ -4369,7 +4371,7 @@ fn submit_package_rpc_admits_zero_fee_anchor() {
         matches!(err, AcceptError::Policy("missing-ephemeral-spends")),
         "{err:?}"
     );
-    let rows = hub.submit_package_rpc(&[parent.clone(), skips]);
+    let rows = hub.submit_package_rpc(&[parent.clone(), skips]).rows;
     assert!(rows.iter().all(|r| r.result.is_err()), "{rows:?}");
     assert!(!hub.try_contains(&parent.compute_txid()));
 
@@ -4383,7 +4385,9 @@ fn submit_package_rpc_admits_zero_fee_anchor() {
             vec![pay_true(COINBASE_SAT - 10_000), pay_true(0)],
         )
     };
-    let rows = hub.submit_package_rpc(&[parent.clone(), child.clone(), stray]);
+    let rows = hub
+        .submit_package_rpc(&[parent.clone(), child.clone(), stray])
+        .rows;
     assert!(rows[0].result.is_ok(), "{rows:?}");
     assert!(rows[1].result.is_ok(), "{rows:?}");
     assert!(
@@ -4411,7 +4415,9 @@ fn failed_package_restores_the_anchor_pair_it_replaced() {
 
     let parent = zero_fee_anchor(cbs[3]);
     let child = spend_anchor(&parent, cbs[4], 50_000);
-    let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
+    let rows = hub
+        .submit_package_rpc(&[parent.clone(), child.clone()])
+        .rows;
     assert!(rows.iter().all(|r| r.result.is_ok()), "{rows:?}");
 
     let replacer = v3_spend(
@@ -4738,13 +4744,15 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
         }],
         ..child.clone()
     };
-    let missed = hub.submit_package_rpc(&[parent.clone(), unpaid]);
+    let missed = hub.submit_package_rpc(&[parent.clone(), unpaid]).rows;
     assert!(
         missed.iter().all(|r| r.fee_with.is_none()),
         "a remainder that does not land has no package feerate set, got {missed:?}"
     );
     assert!(!hub.try_contains(&parent.compute_txid()));
-    let held = hub.submit_package_rpc_eval(&[parent.clone(), child.clone()], false);
+    let held = hub
+        .submit_package_rpc_eval(&[parent.clone(), child.clone()], false)
+        .rows;
     assert!(
         held[0].result.is_err(),
         "package_eval off must keep the individual min-relay failure"
@@ -4754,7 +4762,9 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
         "a disabled package eval has no effective-feerate set"
     );
     assert!(!hub.try_contains(&parent.compute_txid()));
-    let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
+    let rows = hub
+        .submit_package_rpc(&[parent.clone(), child.clone()])
+        .rows;
     assert!(
         rows.iter().all(|r| r.result.is_ok()),
         "below-min-relay parent + paying child must admit, got {rows:?}"
@@ -4805,7 +4815,9 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x63]),
         }],
     };
-    let rows = hub.submit_package_rpc(&[poor.clone(), sponsored.clone()]);
+    let rows = hub
+        .submit_package_rpc(&[poor.clone(), sponsored.clone()])
+        .rows;
     assert!(
         rows.iter().all(|r| r.result.is_ok()),
         "in-mempool sponsor must not hide the CPFP remainder, got {rows:?}"
@@ -4845,14 +4857,16 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
         }],
     };
     let held =
-        block_on(hub2.submit_package_rpc_eval_async(vec![parent.clone(), child.clone()], false));
+        block_on(hub2.submit_package_rpc_eval_async(vec![parent.clone(), child.clone()], false))
+            .rows;
     assert!(
         held[0].result.is_err(),
         "async package_eval off must keep the individual min-relay failure, got {held:?}"
     );
     assert!(!hub2.try_contains(&parent.compute_txid()));
     let rows =
-        block_on(hub2.submit_package_rpc_eval_async(vec![parent.clone(), child.clone()], true));
+        block_on(hub2.submit_package_rpc_eval_async(vec![parent.clone(), child.clone()], true))
+            .rows;
     assert!(
         rows.iter().all(|r| r.result.is_ok()),
         "async below-min-relay parent + paying child must admit, got {rows:?}"
@@ -4922,7 +4936,8 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
         block_on(hub4.submit_package_rpc_eval_async(
             vec![parent.clone(), child.clone(), locked.clone()],
             true,
-        ));
+        ))
+        .rows;
     assert!(
         rows[0].result.is_ok() && rows[1].result.is_ok(),
         "retryable remainder must still package-eval, got {rows:?}"
@@ -5392,7 +5407,9 @@ fn submit_package_rpc_cpf_ps_parent_under_mempool_min_fee() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x63]),
         }],
     };
-    let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
+    let rows = hub
+        .submit_package_rpc(&[parent.clone(), child.clone()])
+        .rows;
     assert!(
         rows.iter().all(|r| r.result.is_ok()),
         "dynamic-floor parent + paying child must admit, got {rows:?}"
