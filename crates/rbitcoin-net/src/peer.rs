@@ -5579,8 +5579,8 @@ pub struct PeerFollowState {
     pub continuation_block: Option<BlockHash>,
 }
 
-/// A live session's follow state. Dropping it, including when
-/// `PeerHub::disconnect_id` aborts the session task, releases the body asks
+/// A live session's follow state. Dropping it, including when the session
+/// task is aborted at shutdown, releases the body asks
 /// the peer never answered: `asked_blocks` is hub-wide, so a held ask would
 /// keep every other peer from fetching that body.
 #[doc(hidden)]

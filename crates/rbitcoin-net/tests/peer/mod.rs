@@ -1859,7 +1859,6 @@ async fn open_decode_session_with(
         )
         .await;
     });
-    live.set_session_abort(session.abort_handle());
     DecodeSession {
         live,
         reader: c_reader,
