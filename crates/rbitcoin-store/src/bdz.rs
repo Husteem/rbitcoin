@@ -697,8 +697,8 @@ pub fn stream_or_load_pages(
     match ctx.session() {
         Some(session) => stream_g_pages(session, file, path, off, n_bytes, page_ids, fill),
         None => {
+            let mut buf = [0u8; G_PAGE_BYTES];
             for &page in page_ids {
-                let mut buf = [0u8; G_PAGE_BYTES];
                 let n = load_g_page(file, path, off, n_bytes, page, &mut buf)?;
                 fill(page, &buf[..n]);
             }
