@@ -58,7 +58,7 @@ pub struct BlockWork {
     pub parents: Arc<ParentPinView>,
     /// Spends grouped by tx index, sorted by `vin`. Parallel jobs read their own slot.
     pub spends_by_tx: Arc<[Vec<SpendRef>]>,
-    pub same_block: OnceLock<HashMap<[u8; 32], usize>>,
+    pub same_block: OnceLock<crate::TxidMap<usize>>,
     /// One cell per transaction. The filter and a tweak range share it.
     pub prevouts: PrevoutSlots,
     pub tweaks: TweakSlots,
@@ -347,7 +347,8 @@ pub fn prevouts_for_tx(
 pub fn resolve_prevout(work: &BlockWork, spend: &SpendRef) -> Result<TxOut, ConfirmError> {
     if spend.create_fk.is_null() {
         let same_block = work.same_block.get_or_init(|| {
-            let mut map = HashMap::with_capacity(work.txids.len());
+            let mut map =
+                crate::TxidMap::with_capacity_and_hasher(work.txids.len(), Default::default());
             for (i, txid) in work.txids.iter().enumerate() {
                 map.insert(*txid, i);
             }
