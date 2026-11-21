@@ -89,21 +89,39 @@ for name, cfg in (("a", a), ("b", b)):
 PY
 
 CJDNS_BIN="$(command -v cjdroute)"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # cjdroute reads stdin until EOF as JSON conf, then `--nobg` keeps the
 # client in the event loop so the core is not reaped (parent would
-# otherwise `return 0`). setsid: cargo/nix must not SIGHUP the pair.
+# otherwise `return 0`). cjdns-run.sh restarts the angel/core pair after a
+# crash: cjdns 22.3 segfaults on the runner around the first TCP and would
+# otherwise take the TUN (and the address a journey binds) with it. setsid:
+# cargo/nix must not SIGHUP the pair, and the supervisor is the session
+# leader so cleanup can kill the whole group.
 start_cjdroute() {
   local name="$1"
-  sudo bash -c 'exec setsid "$1" --nobg <"$2" >"$3" 2>&1' \
-    _ "$CJDNS_BIN" "$ROOT/$name.conf" "$ROOT/$name.log" &
-  echo $! >"$ROOT/$name.pid"
+  local dev="$2"
+  local i
+  rm -f "$ROOT/$name.pid"
+  sudo bash -c 'exec setsid bash "$1" "$2" "$3" "$4" "$5" "$6" "$7"' \
+    _ "$HERE/cjdns-run.sh" "$CJDNS_BIN" "$ROOT/$name.conf" "$ROOT/$name.log" \
+    "$ROOT/$name.pid" "$ROOT/$name.cjdns.sock" "$dev" &
+  for i in $(seq 1 50); do
+    if [[ -s "$ROOT/$name.pid" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "cjdns: $name supervisor never wrote $name.pid" >&2
+  return 1
 }
 
 wait_tun() {
   local dev="$1"
   local i
-  for i in $(seq 1 50); do
+  # A crashed pair comes back on the same device; allow the supervisor's
+  # 5s stuck-core gate plus a fresh start before calling it dead.
+  for i in $(seq 1 125); do
     if ip link show "$dev" >/dev/null 2>&1; then
       return 0
     fi
@@ -113,9 +131,9 @@ wait_tun() {
   return 1
 }
 
-start_cjdroute a
+start_cjdroute a rbtc0
 wait_tun rbtc0
-start_cjdroute b
+start_cjdroute b rbtc1
 wait_tun rbtc1
 
 IPV6_A="$(cat "$ROOT/a.ipv6")"
@@ -160,7 +178,7 @@ then
   echo "cjdns TCP timeout ($IPV6_A <-> $IPV6_B)" >&2
   for name in a b; do
     echo "--- $name pid ---" >&2
-    if [[ -f "$ROOT/$name.pid" ]] && kill -0 "$(cat "$ROOT/$name.pid")" 2>/dev/null; then
+    if [[ -f "$ROOT/$name.pid" ]] && sudo kill -0 "$(cat "$ROOT/$name.pid")" 2>/dev/null; then
       echo "alive $(cat "$ROOT/$name.pid")" >&2
     else
       echo "dead" >&2
@@ -174,27 +192,42 @@ then
   exit 1
 fi
 
-for name in a b; do
-  if [[ ! -f "$ROOT/$name.pid" ]] || ! kill -0 "$(cat "$ROOT/$name.pid")" 2>/dev/null; then
-    echo "cjdns: $name not running after TCP wait" >&2
+for pair in a:rbtc0 b:rbtc1; do
+  name="${pair%%:*}"
+  dev="${pair#*:}"
+  # A supervisor that kept the survivor after an angel crash is fine: the
+  # device and its address are what the journeys bind, so require those.
+  if [[ ! -e "/sys/class/net/$dev" ]]; then
+    echo "cjdns: $dev not up after TCP wait" >&2
     tail -n 40 "$ROOT/$name.log" >&2 || true
     exit 1
   fi
 done
-# GHA: angel/core can crash ~1s after the first TCP; require the addrs
-# still bind after a settle so we do not hand a dead TUN to the journey.
+# GHA: the core can crash ~1s after the first TCP. The supervisor puts a
+# fresh one back, TUN and address included; wait for both addresses to bind
+# again so the journeys never get a dead TUN. A crash loop never settles
+# and fails here, with the log.
 sleep 2
 python3 - "$IPV6_A" "$IPV6_B" <<'PY'
-import socket, sys
-for ip in sys.argv[1:]:
-    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    try:
-        s.bind((ip, 0))
-    except OSError as e:
-        print(f"cjdns: bind {ip} after settle: {e}", file=sys.stderr)
-        sys.exit(1)
-    finally:
-        s.close()
+import socket, sys, time
+end = time.time() + 15
+last = ""
+while time.time() < end:
+    live = 0
+    for ip in sys.argv[1:]:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        try:
+            s.bind((ip, 0))
+            live += 1
+        except OSError as e:
+            last = f"{ip}: {e}"
+        finally:
+            s.close()
+    if live == len(sys.argv) - 1:
+        sys.exit(0)
+    time.sleep(0.5)
+print(f"cjdns: TUN still dead after supervisor restart: {last}", file=sys.stderr)
+sys.exit(1)
 PY
 
 cat >"$ROOT/env" <<EOF

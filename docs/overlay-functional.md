@@ -20,7 +20,7 @@ GitHub Actions starts:
 |------|-----|----------|
 | Tor | TestingTorNetwork (chutney `basic-min` equivalent: dirauths + client). `AssumeReachable`, short voting. Client SOCKS + control cookie. | Bootstrap public Tor / public HSDir wait |
 | i2pd | Six floodfills, **`netid` 16** (not mainnet 2), empty `reseed.urls`, zip-seeded RouterInfos, NTCP2 on `127.0.0.0/8` (`/32` aliases), exploratory tunnels length 1, SAM on n0/n1 | Public I2P reseed / netid 2 |
-| cjdns | Two `cjdroute` processes, UDP peer on `127.0.0.1`, real TUN (`rbtc0` / `rbtc1`) | Silent bind to `127.0.0.1` if TUN fails |
+| cjdns | Two `cjdroute` nodes on one UDP peer, each an angel over a core, real TUN (`rbtc0` / `rbtc1`). `cjdns-run.sh` restarts the pair when the runner's cjdns 22.3 crashes; the TUN comes back on the same address. | Silent bind to `127.0.0.1` if TUN fails. Hand a dead TUN to a journey. |
 
 Tor SOCKS CONNECT to `127.0.0.1` is unsafe/rejected. Tor journeys are
 **onion hidden services** (SOCKS domain CONNECT to `.onion`). Do not “prove
@@ -38,8 +38,9 @@ proxy” by CONNECT to loopback.
 the default flake shell, plus `tor` / `i2pd` / `cjdns` from `flake.lock`).
 Then:
 
-1. Start the three private meshes.
-2. `cargo build -p rbitcoin-node`
+1. `cargo build -p rbitcoin-node` (a broken build fails in seconds, and the
+   meshes are not left running through it)
+2. Start the three private meshes.
 3. `cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet …`
 
 Timeout **45 minutes** (i2pd tunnel build on a tiny net is the long pole).
