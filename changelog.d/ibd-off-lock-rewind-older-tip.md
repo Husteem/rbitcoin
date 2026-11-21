@@ -6,6 +6,6 @@ Fixed
   became the tip the depth check measured, and the rewind disconnected it
   even though the fork was now the lighter chain. Both the off-lock pass and
   the pass under the coordinator lock now read the tip before selection,
-  compare it again under the tip commit before disconnecting or planting, and
-  hold that commit through the commit. A tip that moved leaves the chain
-  alone, and the fork is selected again on a later turn (#1736).
+  compare it again under the tip commit before disconnecting, and hold that
+  commit through the commit. A path that no longer disconnects is left for
+  confirm, and a moved tip selects again on a later turn (#1736).

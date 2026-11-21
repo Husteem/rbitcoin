@@ -724,13 +724,16 @@ fn an_under_lock_rewind_selected_against_an_older_tip_is_skipped() {
 }
 
 /// A concurrent rewind can lower the tip onto the fork's LCA while the
-/// selection walks, so the path reads as a plant. A plant has no disconnect;
-/// the caller's recheck under the commit is what refuses it.
+/// selection walks, so the path reads as a plant. A plant is not a rewind:
+/// it never reaches the commit, so a busy commit cannot stall or commit it.
 #[test]
 fn a_plant_selected_against_an_older_tip_is_skipped() {
-    let _serial = BEFORE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _before = BEFORE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _after = AFTER_LOCK.lock().unwrap_or_else(|err| err.into_inner());
     let _clear = ClearBeforeRewindHook;
+    let _clear_after = ClearAfterRewindHook;
     BEFORE_RAN.store(false, Ordering::Release);
+    AFTER_RAN.store(false, Ordering::Release);
     let (dir, hub) = tmp_hub();
     let t = 1_500_099_940;
     let chain = confirmed_chain(&hub, 3, t);
@@ -740,17 +743,23 @@ fn a_plant_selected_against_an_older_tip_is_skipped() {
     *BEFORE_LOWER_TO
         .lock()
         .unwrap_or_else(|err| err.into_inner()) = Some(1);
+    *AFTER_HOLD_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
 
     let mut st =
         rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
     st.reorg
         .register_explore(std::iter::empty::<BlockHash>(), Some(fork[3]));
     arm_before_header_rewind_prepare_for_test(Some(lower_confirmed_tip_after_select));
+    arm_after_header_rewind_prepare_for_test(Some(hold_commit_after_prepare));
 
     assert!(!maybe_rewind_to_best_work(&mut st, &hub).unwrap());
     assert!(
         BEFORE_RAN.load(Ordering::Acquire),
         "the tip was lowered between select and prepare"
+    );
+    assert!(
+        !AFTER_RAN.load(Ordering::Acquire),
+        "a plant must not reach the commit"
     );
     assert_eq!(hub.tip_height(), Some(1), "the lowering rewind stays");
     assert!(
@@ -758,6 +767,34 @@ fn a_plant_selected_against_an_older_tip_is_skipped() {
         "the path is not planted against a tip it was not selected for"
     );
     assert_eq!(st.reorg.deferred, vec![fork[3]]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A child of the tip is a plant, not a rewrite of the path above it. The
+/// commit is free; apply still leaves it for confirm.
+#[test]
+fn a_plant_with_a_free_commit_is_not_committed() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let side = mine(gen, 1_500_099_950, 1);
+    hub.ensure_header(&side.header).unwrap();
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let tip_before = (hub.tip_height(), hub.tip_hash());
+    assert!(
+        !apply_header_rewind(
+            &mut st,
+            &hub,
+            &[side.block_hash()],
+            REWIND_MAX_DEPTH,
+            tip_before
+        )
+        .unwrap(),
+        "a plant is not a rewind"
+    );
+    assert_eq!(hub.tip_height(), Some(0));
+    assert!(!st.height_to_hash.contains_key(&1));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -899,6 +936,43 @@ fn an_under_lock_commit_survives_a_busy_tip_commit() {
         "the commit was busy after the prepare"
     );
     assert_eq!(hub.tip_height(), Some(0), "the prepare disconnected");
+    assert_eq!(st.height_to_hash.get(&1), Some(&fork[0]));
+    assert_eq!(
+        hub.query.lookup_taken_hi(),
+        Some(0),
+        "the state commit ran once the commit was free"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The off-lock caller has the same rule: once its prepare disconnected, a
+/// busy commit delays the state commit rather than dropping it.
+#[test]
+fn an_off_lock_commit_survives_a_busy_tip_commit() {
+    let _serial = AFTER_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _clear = ClearAfterRewindHook;
+    AFTER_RAN.store(false, Ordering::Release);
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_100_020;
+    let chain = confirmed_chain(&hub, 2, t);
+    let fork = side_headers(&hub, &chain, 0, 5, t + 1);
+    let hub = Arc::new(hub);
+    *AFTER_HOLD_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
+
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
+    let shared = Mutex::new(st);
+    arm_after_header_rewind_prepare_for_test(Some(hold_commit_after_prepare));
+
+    assert!(rewind_off_coord_lock(&shared, &hub).unwrap());
+    assert!(
+        AFTER_RAN.load(Ordering::Acquire),
+        "the commit was busy after the prepare"
+    );
+    assert_eq!(hub.tip_height(), Some(0), "the prepare disconnected");
+    let st = shared.lock().unwrap_or_else(|err| err.into_inner());
     assert_eq!(st.height_to_hash.get(&1), Some(&fork[0]));
     assert_eq!(
         hub.query.lookup_taken_hi(),

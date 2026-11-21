@@ -737,9 +737,9 @@ pub struct RewindPrep {
 ///
 /// A rewind whose selection measured `tip_before`. The disconnect takes the
 /// tip commit and compares `tip_before` under it, so confirm cannot extend
-/// the chain the fork was measured against in between. Both callers take the
-/// commit again for their state commit and recheck the tip there, so the
-/// plant branch needs no compare here. A moved tip selects again later.
+/// the chain the fork was measured against in between. A selected chain that
+/// has not moved the tip forks below it, so a plant is not a rewind: callers
+/// leave it for confirm. A moved tip selects again later.
 #[doc(hidden)]
 pub fn prepare_header_rewind_at(
     hub: &ChainHub,
@@ -871,9 +871,9 @@ pub fn commit_header_rewind(
 
 /// Rewind to `path` under the cap its selection used, only while the
 /// confirmed tip is still the `tip_before` its selection measured. Callers
-/// hold `shared` and must not hold the tip commit. A confirm that moved the
-/// tip during the walk leaves the path for the next pass instead of
-/// disconnecting or planting on the new tip.
+/// hold `shared` and must not hold the tip commit. A path that reads as a
+/// plant is left for confirm: a selected chain that has not moved the tip
+/// forks below it, so a plant is not a rewind to commit.
 pub fn apply_header_rewind(
     st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
@@ -884,22 +884,20 @@ pub fn apply_header_rewind(
     let Some(prep) = prepare_header_rewind_at(hub, path, cap, tip_before)? else {
         return Ok(false);
     };
-    // The prepare dropped the tip commit after its disconnect and read the
-    // path's store rows since. Confirm may have extended from the LCA. A
-    // rewind already disconnected, so its state commit cannot be abandoned:
-    // wait for the commit. A plant can defer instead, without stalling the
-    // caller on a flush. Hold the commit across the recheck and commit.
-    fire(&AFTER_PREPARE);
-    let _commit = if prep.rewound {
-        hub.query
-            .lock_tip_commit()
-            .map_err(|e| NetError::Store(e.to_string()))?
-    } else if let Some(commit) = hub.query.try_lock_tip_commit() {
-        commit
-    } else {
+    if !prep.rewound {
         return Ok(false);
-    };
-    if !rewind_tip_still(hub, &prep, tip_before) {
+    }
+    // The prepare dropped the tip commit after its disconnect and read the
+    // path's store rows since. Confirm may have extended from the LCA. The
+    // disconnect is already on disk, so the state commit cannot be
+    // abandoned: wait for the commit and hold it across the recheck and
+    // commit.
+    fire(&AFTER_PREPARE);
+    let _commit = hub
+        .query
+        .lock_tip_commit()
+        .map_err(|e| NetError::Store(e.to_string()))?;
+    if !rewind_tip_still(hub, &prep) {
         return Ok(false);
     }
     commit_header_rewind(st, hub, path, &prep);
@@ -920,19 +918,10 @@ fn tip_pair(hub: &ChainHub) -> (Option<u32>, Option<BlockHash>) {
     (hub.tip_height(), hub.tip_hash())
 }
 
-/// `prepare_header_rewind_at` already disconnected when `prep.rewound`. The
-/// commit is for that tip, not whatever tip is current after a later rewind.
-fn rewind_tip_still(
-    hub: &ChainHub,
-    prep: &RewindPrep,
-    tip_before: (Option<u32>, Option<BlockHash>),
-) -> bool {
-    let now = tip_pair(hub);
-    if prep.rewound {
-        now == (Some(prep.lca_h), Some(prep.lca))
-    } else {
-        now == tip_before
-    }
+/// `prepare_header_rewind_at` already disconnected. The commit is for that
+/// tip, not whatever tip is current after a later rewind.
+fn rewind_tip_still(hub: &ChainHub, prep: &RewindPrep) -> bool {
+    tip_pair(hub) == (Some(prep.lca_h), Some(prep.lca))
 }
 
 struct PreparedHook {
@@ -1022,30 +1011,32 @@ pub(crate) fn apply_off_lock_rewind(
             .defer(cands);
         return Ok(false);
     };
+    if !prep.rewound {
+        shared
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .reorg
+            .defer(cands);
+        return Ok(false);
+    }
     // Re-selecting here would see the LCA we just rewound to and return
     // none. The fresh select is the one above, after the other rewind has
     // either committed or is waiting on this gate.
     fire(&AFTER_PREPARE);
     let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
-    // The prepare has already disconnected when it was a rewind, so the
-    // state commit cannot be abandoned. Take `shared` before the commit and
-    // then wait for it; confirm does not take `shared`, so this order cannot
-    // cycle. A plant can defer on a busy commit instead. Hold the commit
-    // across the recheck and commit so confirm cannot extend from the LCA.
-    let _commit = if prep.rewound {
-        hub.query
-            .lock_tip_commit()
-            .map_err(|e| NetError::Store(e.to_string()))?
-    } else if let Some(commit) = hub.query.try_lock_tip_commit() {
-        commit
-    } else {
-        st.reorg.defer(cands);
-        return Ok(false);
-    };
+    // The prepare has already disconnected, so the state commit cannot be
+    // abandoned. Take `shared` before the commit and then wait for it;
+    // confirm does not take `shared`, so this order cannot cycle. Hold the
+    // commit across the recheck and commit so confirm cannot extend from the
+    // LCA in between.
+    let _commit = hub
+        .query
+        .lock_tip_commit()
+        .map_err(|e| NetError::Store(e.to_string()))?;
     let marked_invalid = path
         .iter()
         .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()));
-    if marked_invalid || !rewind_tip_still(hub, &prep, tip_before) {
+    if marked_invalid || !rewind_tip_still(hub, &prep) {
         st.reorg.defer(cands);
         return Ok(false);
     }
