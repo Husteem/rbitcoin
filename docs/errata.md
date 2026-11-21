@@ -65,3 +65,6 @@ The old dual-path names are gone.
 
 `tx_apply_to_tx`, `connect_block`, and `commit_class_a_only` exist only on
 `rbitcoin_query::testutil::FixtureChain`.
+The wire-block Class A helpers `commit_class_a_block` and
+`commit_class_a_run` live in `rbitcoin_query::testutil`, not on the
+production connect façade.

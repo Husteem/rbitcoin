@@ -2803,11 +2803,12 @@ fn store_start_states_lookup_load_confirm() {
     use bitcoin::CompactTarget;
     use bitcoin::{Amount, Block, BlockHash, ScriptBuf, Sequence, TxMerkleNode, Witness};
     use rbitcoin_primitives::Height;
+    use rbitcoin_query::accept_and_connect_block;
     use rbitcoin_query::confirm_run::{
         confirm_scripts_phase, confirm_wire_load_from_plan, confirm_wire_lookup_stamp,
         confirm_write_phase, ScriptPreverified,
     };
-    use rbitcoin_query::{accept_and_connect_block, commit_class_a_block};
+    use rbitcoin_query::testutil::commit_class_a_block;
     use std::sync::Arc;
 
     let (path, q) = tmp_query();
@@ -2959,7 +2960,7 @@ fn store_start_states_lookup_load_confirm() {
     // S1: already-archived (plan=None) — lookup stamps parent pin; load by range.
     let h_s1 = h_s0 + 1;
     let b_s1 = mine_cb(tip, tip_time + 600, h_s1);
-    commit_class_a_block(&q, &params, Height(h_s1), &b_s1, ms).unwrap();
+    commit_class_a_block(&q, &params, &b_s1).unwrap();
     assert_eq!(q.tip_height().map(|h| h.0), Some(h_s0));
     {
         let arcs = [(Height(h_s1), Arc::new(b_s1.clone()), None)];
@@ -2981,7 +2982,7 @@ fn store_start_states_lookup_load_confirm() {
     // One-shot mixed need-body + already-bodied must fail closed (split into two calls).
     let h_have = h_s1 + 1;
     let b_have = mine_cb(b_s1.block_hash(), b_s1.header.time + 600, h_have);
-    commit_class_a_block(&q, &params, Height(h_have), &b_have, ms).unwrap();
+    commit_class_a_block(&q, &params, &b_have).unwrap();
     let h_need = h_have + 1;
     let b_need = mine_cb(b_have.block_hash(), b_have.header.time + 600, h_need);
     let mixed_arcs = [
