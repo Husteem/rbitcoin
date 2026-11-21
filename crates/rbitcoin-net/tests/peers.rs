@@ -1,9 +1,10 @@
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::{AddrV2Message, Address};
 use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
-use bitcoin::{BlockHash, Wtxid};
+use bitcoin::{BlockHash, Txid, Wtxid};
 pub use rbitcoin_net::peers::*;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -382,28 +383,36 @@ fn peerhub_hb_select() {
     assert!(!a.is_sync_started());
     assert!(hub.try_start_headers_sync(&c, now, genesis_time));
 
-    // Announced wtxids are per peer, roll the oldest at the cap, and
-    // tx inv is due on a timer or on request.
-    let wtxid_n = |i: u32| {
-        let mut w = [0u8; 32];
-        w[..4].copy_from_slice(&i.to_le_bytes());
-        Wtxid::from_byte_array(w)
+    // Announced txs are per peer, by the hash the INV carried, roll the
+    // oldest at the cap, and tx inv is due on a timer or on request.
+    let tx_n = |i: u32| {
+        let mut t = [0u8; 32];
+        t[..4].copy_from_slice(&i.to_le_bytes());
+        let mut w = t;
+        w[31] = 1;
+        (Txid::from_byte_array(t), Wtxid::from_byte_array(w))
     };
-    e.note_announced_wtx(wtxid_n(0));
-    assert!(e.has_announced_wtx(&wtxid_n(0)));
-    assert!(!e.has_announced_wtx(&wtxid_n(1)));
-    assert!(!f.has_announced_wtx(&wtxid_n(0)));
+    let txid_inv = |i: u32| Inventory::Transaction(tx_n(i).0);
+    e.note_announced_tx(tx_n(0).0, tx_n(0).1);
+    assert!(e.has_announced(&txid_inv(0)));
+    assert!(e.has_announced(&Inventory::WitnessTransaction(tx_n(0).0)));
+    assert!(
+        !e.has_announced(&Inventory::WTx(tx_n(0).1)),
+        "a peer without wtxidrelay was sent the txid"
+    );
+    assert!(!e.has_announced(&txid_inv(1)));
+    assert!(!f.has_announced(&txid_inv(0)));
     assert!(!e.take_tx_inv_due(1_700_000_000));
     assert!(!e.take_tx_inv_due(1_700_000_010));
     assert!(e.take_tx_inv_due(1_700_000_040));
     e.request_tx_inv();
     assert!(e.take_tx_inv_due(1_700_000_041));
     for i in 1..=50_000 {
-        e.note_announced_wtx(wtxid_n(i));
+        e.note_announced_tx(tx_n(i).0, tx_n(i).1);
     }
-    assert!(!e.has_announced_wtx(&wtxid_n(0)));
-    assert!(e.has_announced_wtx(&wtxid_n(1)));
-    assert!(e.has_announced_wtx(&wtxid_n(50_000)));
+    assert!(!e.has_announced(&txid_inv(0)));
+    assert!(e.has_announced(&txid_inv(1)));
+    assert!(e.has_announced(&txid_inv(50_000)));
 }
 
 #[test]

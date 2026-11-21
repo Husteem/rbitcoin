@@ -2616,6 +2616,42 @@ fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
     });
 }
 
+/// BIP339: `wtxidrelay` after verack disconnects, as Core sets `fDisconnect`
+/// without a misbehavior score, so a noban peer goes too. The relay mode the
+/// handshake fixed does not change.
+#[test]
+fn wtxidrelay_after_verack_disconnects() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("wtxidrelay-late");
+    hub.ensure_genesis().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_noban(true);
+    let session = live_peer(&peers, 18572, 92, true);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(handle_peer_frame(
+        frame_for(NetworkMessage::WtxidRelay),
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(session.as_ref()),
+    ))
+    .expect("wtxidrelay after verack");
+    assert!(
+        session.stop.load(Ordering::SeqCst),
+        "wtxidrelay after verack disconnects"
+    );
+    assert!(
+        !session.wtxid_relay(),
+        "the relay mode stays as the handshake fixed it"
+    );
+    assert_eq!(follow.ban_score, 0, "Core scores no misbehavior for it");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn handle_peer_frame_control_and_inv_paths() {
     use bitcoin::hashes::Hash as _;
@@ -2629,16 +2665,16 @@ fn handle_peer_frame_control_and_inv_paths() {
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
 
-        // SendHeaders / SendCmpct / WtxidRelay / Pong / GetAddr / Ping
+        // SendHeaders / SendCmpct / Pong / GetAddr / Ping
         // (MemPool disconnects — covered by bloom_disabled_messages_request_disconnect.)
-        // SendAddrV2 after verack disconnects (`p2p_addrv2_relay.py`).
+        // SendAddrV2 after verack disconnects (`p2p_addrv2_relay.py`), and so
+        // does WtxidRelay (wtxidrelay_after_verack_disconnects).
         for msg in [
             NetworkMessage::SendHeaders,
             NetworkMessage::SendCmpct(SendCmpct {
                 send_compact: true,
                 version: 2,
             }),
-            NetworkMessage::WtxidRelay,
             NetworkMessage::Pong(7),
             NetworkMessage::GetAddr,
             NetworkMessage::Ping(42),
@@ -2648,7 +2684,6 @@ fn handle_peer_frame_control_and_inv_paths() {
                 .unwrap();
         }
         assert!(follow.wants_headers);
-        assert!(follow.wtxid_relay);
         assert!(follow.send_cmpct);
         assert_eq!(follow.cmpct_version, 2);
 
@@ -9090,7 +9125,8 @@ fn compact_and_wtxid_serve_run_off_the_reactor() {
     let wtxid = block.txdata[0].compute_wtxid();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let session = live_peer(&peers, 18450, 11, false);
-    session.note_announced_wtx(wtxid);
+    session.set_wtxid_relay();
+    session.note_announced_tx(block.txdata[0].compute_txid(), wtxid);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -9172,7 +9208,8 @@ fn announced_wtxid_getdata_scans_the_tip_once() {
     let _ = hub.cache.take_body_loads();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let session = live_peer(&peers, 18570, 90, false);
-    session.note_announced_wtx(real);
+    session.set_wtxid_relay();
+    session.note_announced_tx(block.txdata[0].compute_txid(), real);
     let missing: Vec<bitcoin::Wtxid> = (1..5u8)
         .map(|n| {
             let mut bytes = [0u8; 32];
@@ -9181,7 +9218,10 @@ fn announced_wtxid_getdata_scans_the_tip_once() {
         })
         .collect();
     for wtxid in &missing {
-        session.note_announced_wtx(*wtxid);
+        session.note_announced_tx(
+            bitcoin::Txid::from_byte_array(wtxid.to_byte_array()),
+            *wtxid,
+        );
     }
     let _ = hub.take_tip_wtx_scans();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
@@ -9236,6 +9276,92 @@ fn announced_wtxid_getdata_scans_the_tip_once() {
         notfound.len(),
         4,
         "each missing wtxid is notfound: {notfound:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A peer without `wtxidrelay` heard of a tx by txid. When the tx confirms in
+/// the tip before its getdata, the tip block still serves it, as Core's
+/// `FindTxForGetData`: `MSG_TX` without the witness, `MSG_WITNESS_TX` with.
+#[test]
+fn announced_txid_getdata_serves_the_tip_tx() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("tip-txid-serve");
+    hub.ensure_genesis().unwrap();
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    assert!(hub.attach_mempool(mp).is_ok());
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let p2wsh = ScriptBuf::new_p2wsh(&op_true.wscript_hash());
+    hub.generate_to_script(1, p2wsh.clone(), vec![]).unwrap();
+    hub.confirm_empty_regtest(100).unwrap();
+    let cb = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap()
+        .txdata[0]
+        .clone();
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cb.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::from_slice(&[op_true.as_bytes()]),
+        }],
+        output: vec![TxOut {
+            value: cb.output[0].value - Amount::from_sat(10_000),
+            script_pubkey: p2wsh,
+        }],
+    };
+    let (txid, wtxid) = (spend.compute_txid(), spend.compute_wtxid());
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let session = live_peer(&peers, 18573, 93, false);
+    assert_eq!(
+        session.claim_announced_tx(txid, wtxid),
+        Some(Inventory::Transaction(txid)),
+        "a peer without wtxidrelay is announced the txid"
+    );
+    hub.generate_to_script(1, op_true, vec![spend.clone()])
+        .unwrap();
+    let _ = hub.take_tip_wtx_scans();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(serve_getdata(
+        &hub,
+        &out_tx,
+        &mut PeerFollowState::new(),
+        Some(session.as_ref()),
+        vec![
+            Inventory::Transaction(txid),
+            Inventory::WitnessTransaction(txid),
+        ],
+    ))
+    .expect("getdata");
+    let mut served = Vec::new();
+    while let Ok(msg) = out_rx.try_recv() {
+        served.push(PeerOut::expect_msg(msg));
+    }
+    let mut bare = spend.clone();
+    bare.input[0].witness.clear();
+    assert_eq!(
+        served,
+        vec![NetworkMessage::Tx(bare), NetworkMessage::Tx(spend)],
+        "MSG_TX serves the tip tx without its witness, MSG_WITNESS_TX with it"
+    );
+    assert_eq!(
+        hub.take_tip_wtx_scans(),
+        1,
+        "both items share one tip index"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

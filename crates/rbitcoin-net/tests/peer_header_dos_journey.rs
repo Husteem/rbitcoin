@@ -97,6 +97,7 @@ async fn handshake_verack_and_addrv2(
     rbitcoin_log::capture_logs(true);
     let done = apply_pre_verack(
         Some(sess.as_ref()),
+        70016,
         &NetworkMessage::WtxidRelay,
         "wtxidrelay",
     );
@@ -110,6 +111,7 @@ async fn handshake_verack_and_addrv2(
     rbitcoin_log::capture_logs(true);
     let done = apply_pre_verack(
         Some(sess.as_ref()),
+        70016,
         &NetworkMessage::SendAddrV2,
         "sendaddrv2",
     );
@@ -121,7 +123,7 @@ async fn handshake_verack_and_addrv2(
     );
 
     rbitcoin_log::capture_logs(true);
-    let done = apply_pre_verack(Some(sess.as_ref()), &NetworkMessage::Ping(1), "ping");
+    let done = apply_pre_verack(Some(sess.as_ref()), 70016, &NetworkMessage::Ping(1), "ping");
     assert!(!done);
     assert!(
         logs_have("Unsupported message \"ping\" prior to verack"),
@@ -129,6 +131,7 @@ async fn handshake_verack_and_addrv2(
     );
     assert!(apply_pre_verack(
         Some(sess.as_ref()),
+        70016,
         &NetworkMessage::Verack,
         "verack"
     ));
