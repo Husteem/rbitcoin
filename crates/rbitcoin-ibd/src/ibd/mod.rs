@@ -55,7 +55,9 @@ pub mod state;
 #[doc(hidden)]
 pub mod status;
 
-pub use perf_log::{read_platform_rss, tip_perf_json, ProcessRss, TipPerfLog};
+pub use perf_log::{
+    read_platform_rss, read_platform_rss_fast, tip_perf_json, ProcessRss, TipPerfLog,
+};
 
 use archive::{rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue};
 pub use assign_plan::need_ready_headroom;
