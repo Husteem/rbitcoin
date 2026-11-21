@@ -591,6 +591,7 @@ pub fn maybe_rewind_to_best_work_n(
     let cands = rewind_candidate_hashes(st, hub)?;
     let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
     let mut cap = None;
+    let tip_before = tip_pair(hub);
     let picked = select_heavier_path(
         hub,
         &cands,
@@ -603,8 +604,9 @@ pub fn maybe_rewind_to_best_work_n(
         st.reorg.defer(&cands);
         return Ok(false);
     };
+    fire(&BEFORE_PREPARE);
     let others_out_of_reach = walk_max < ancestor_walk_max(cap) && cands.len() > 1;
-    if others_out_of_reach || !apply_header_rewind(st, hub, &path, cap)? {
+    if others_out_of_reach || !apply_header_rewind(st, hub, &path, cap, tip_before)? {
         st.reorg.defer(&cands);
         return Ok(false);
     }
@@ -747,11 +749,12 @@ pub fn prepare_header_rewind(
     Ok(Some(finish_header_rewind(hub, path, lca, lca_h, tip_h)))
 }
 
-/// [`prepare_header_rewind`] for the off-lock pass. `tip_before` is the
-/// confirmed tip the selection measured. The tip commit is held while the
-/// tip is compared to it and the disconnect runs, so confirm cannot extend
-/// the chain the fork was measured against in between. A moved tip selects
-/// again on a later turn instead.
+/// A rewind whose selection measured `tip_before`. The tip commit is held
+/// while the tip is compared to it and the disconnect runs, so confirm cannot
+/// extend the chain the fork was measured against in between. A moved tip
+/// selects again on a later turn instead. The plant branch has no disconnect
+/// to pin; it is the only recheck for [`apply_header_rewind`], whose commit
+/// follows immediately, while the off-lock pass checks again before commit.
 fn prepare_header_rewind_at(
     hub: &ChainHub,
     path: &[BlockHash],
@@ -887,14 +890,18 @@ pub fn commit_header_rewind(
     st.quiesce_refund();
 }
 
-/// Rewind to `path` under the cap its selection used.
+/// Rewind to `path` under the cap its selection used, only while the
+/// confirmed tip is still the `tip_before` its selection measured. Callers
+/// hold `shared`; a confirm that moved the tip during the walk leaves the
+/// path for the next pass instead of disconnecting or planting on the new tip.
 pub fn apply_header_rewind(
     st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
     path: &[BlockHash],
     cap: u32,
+    tip_before: (Option<u32>, Option<BlockHash>),
 ) -> Result<bool, NetError> {
-    let Some(prep) = prepare_header_rewind(hub, path, cap)? else {
+    let Some(prep) = prepare_header_rewind_at(hub, path, cap, tip_before)? else {
         return Ok(false);
     };
     commit_header_rewind(st, hub, path, &prep);
