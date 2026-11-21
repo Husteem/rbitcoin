@@ -145,8 +145,19 @@ impl<S> UndrainedCreates<S> {
 impl<S: BuildHasher> UndrainedCreates<S> {
     /// The bucket and the tag of `txid`.
     fn place(&self, txid: &[u8; 32]) -> (usize, u64) {
-        let hash = self.hasher.hash_one(txid);
+        use std::hash::Hasher;
+        let mut hasher = self.hasher.build_hasher();
+        hasher.write(txid);
+        let hash = hasher.finish();
         ((hash as usize) & (BUCKETS - 1), hash >> LEVEL_BITS)
+    }
+
+    /// A live slot in `bucket` carries `tag`.
+    fn bucket_holds(&self, bucket: usize, tag: u64) -> bool {
+        self.table[bucket]
+            .0
+            .iter()
+            .any(|&slot| slot >> LEVEL_BITS == tag && slot_level(slot) > self.dead_through)
     }
 
     /// A create of `txid` is recorded at a height above the last snapshot.
@@ -156,10 +167,22 @@ impl<S: BuildHasher> UndrainedCreates<S> {
             return false;
         }
         let (bucket, tag) = self.place(txid);
-        self.table[bucket]
-            .0
-            .iter()
-            .any(|&slot| slot >> LEVEL_BITS == tag && slot_level(slot) > self.dead_through)
+        self.bucket_holds(bucket, tag)
+    }
+
+    /// [`Self::holds`] for each of `txids`, in order. Every txid is hashed
+    /// before any bucket is read, so the bucket reads do not wait on one
+    /// another's hash.
+    #[doc(hidden)]
+    pub fn holds_each(&self, txids: &[[u8; 32]]) -> Vec<bool> {
+        if self.table.is_empty() {
+            return vec![false; txids.len()];
+        }
+        let places: Vec<(usize, u64)> = txids.iter().map(|txid| self.place(txid)).collect();
+        places
+            .into_iter()
+            .map(|(bucket, tag)| self.bucket_holds(bucket, tag))
+            .collect()
     }
 
     /// Empty the set unless it was filled under re-arm generation `gen`.
@@ -197,16 +220,16 @@ impl<S: BuildHasher> UndrainedCreates<S> {
         if self.table.is_empty() {
             self.table = vec![Bucket::default(); BUCKETS].into_boxed_slice();
         }
-        for txid in txids {
-            self.insert(&txid, level);
+        let places: Vec<(usize, u64)> = txids.into_iter().map(|txid| self.place(&txid)).collect();
+        for (bucket, tag) in places {
+            self.insert(bucket, tag, level);
         }
         self.top = self.top.max(level);
     }
 
-    /// Put `txid` at `level` in its bucket: over a live slot with its tag,
+    /// Put `tag` at `level` in `bucket`: over a live slot with that tag,
     /// else in the first dead or empty slot, else over the lowest level.
-    fn insert(&mut self, txid: &[u8; 32], level: u32) {
-        let (bucket, tag) = self.place(txid);
+    fn insert(&mut self, bucket: usize, tag: u64, level: u32) {
         let dead_through = self.dead_through;
         let slots = &mut self.table[bucket].0;
         let mut free = None;
@@ -260,8 +283,9 @@ impl WaveKeys {
     #[doc(hidden)]
     pub fn readmit<S: BuildHasher>(&mut self, skip: &UndrainedCreates<S>) -> u32 {
         let mut left_out = 0u32;
-        for prev in self.skipped.drain(..) {
-            if skip.holds(&prev) {
+        let held = skip.holds_each(&self.skipped);
+        for (prev, held) in self.skipped.drain(..).zip(held) {
+            if held {
                 left_out = left_out.saturating_add(1);
             } else {
                 self.need.insert(prev);
@@ -403,6 +427,7 @@ pub fn push_resolve_keys<S: BuildHasher>(
 ) -> Vec<[u8; 32]> {
     let bip34 = params.bip34_active_at(height);
     let mut spends = Vec::with_capacity(n_inputs as usize);
+    let mut bip30 = Vec::new();
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
         for inp in &tx.input {
             if inp.previous_output.is_null() {
@@ -413,14 +438,21 @@ pub fn push_resolve_keys<S: BuildHasher>(
                 continue;
             }
             spends.push(prev);
-            if skip.holds(&prev) {
-                keys.skipped.push(prev);
-            } else {
-                keys.need.insert(prev);
-            }
         }
-        if !bip34 && !skip.holds(&p.txid) {
-            keys.need.insert(p.txid);
+        if !bip34 {
+            bip30.push(p.txid);
+        }
+    }
+    for (prev, held) in spends.iter().zip(skip.holds_each(&spends)) {
+        if held {
+            keys.skipped.push(*prev);
+        } else {
+            keys.need.insert(*prev);
+        }
+    }
+    for (txid, held) in bip30.iter().zip(skip.holds_each(&bip30)) {
+        if !held {
+            keys.need.insert(*txid);
         }
     }
     // One key per parent txid: inputs spending the same parent share it.

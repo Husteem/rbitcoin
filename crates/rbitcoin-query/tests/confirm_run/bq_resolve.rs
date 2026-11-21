@@ -794,9 +794,10 @@ fn undrained_set_cost_per_block() {
                     }
                 })
                 .collect();
+            let txids: Vec<[u8; 32]> = probes.iter().map(|(_, p)| *p).collect();
             let t = std::time::Instant::now();
             set.note_block(h, creates);
-            let held: Vec<bool> = probes.iter().map(|(_, p)| set.holds(p)).collect();
+            let held = set.holds_each(&txids);
             set.drop_through(h.checked_sub(depth + 1));
             if h < warm {
                 continue;
