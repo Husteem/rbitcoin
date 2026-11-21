@@ -2407,7 +2407,8 @@ impl Query {
         self.block_queue.lock().unwrap().max_height()
     }
 
-    /// Refresh soft-assign restricted flag from current BQ bytes (no latch).
+    /// Publish the confirm window and check current BQ bytes (no latch).
+    /// Debug builds also store the result for `block_queue_soft_pressure`.
     ///
     /// Returns true when payload is over [`BQ_SOFT_FREE_BYTES`] (densify limited
     /// to the confirm-time window). Does **not** affect peer reads or
