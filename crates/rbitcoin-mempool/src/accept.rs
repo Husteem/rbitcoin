@@ -2006,26 +2006,25 @@ impl ActiveMempool {
                     }
                 }
             }
-            let n = self.evict_worst_chunk_once(protect)?;
+            let n = self.evict_worst_chunk_once(protect);
             if n.is_empty() {
                 break;
             }
             gone.extend(n);
         }
+        // One death sync for every chunk this pass dropped.
+        let _ = self.store.sync_deaths();
         Ok(gone)
     }
 
-    /// One worst-chunk pass. Empty means stop.
+    /// Drop the worst chunk. Empty means stop. `pwrite`s DEAD without a sync.
     #[doc(hidden)]
-    pub fn evict_worst_chunk_once(
-        &mut self,
-        protect: Option<Txid>,
-    ) -> Result<Vec<Txid>, AcceptError> {
+    pub fn evict_worst_chunk_once(&mut self, protect: Option<Txid>) -> Vec<Txid> {
         let Some((_rep, chunk)) = self.graph.worst_chunk() else {
-            return Ok(Vec::new());
+            return Vec::new();
         };
         if chunk.txids.len() == 1 && protect == chunk.txids.first().copied() {
-            return Ok(Vec::new());
+            return Vec::new();
         }
         let evicted_rate = chunk.fee_rate_sat_per_kvb();
         self.note_evicted_feerate(evicted_rate);
@@ -2038,8 +2037,7 @@ impl ActiveMempool {
                 gone.extend(self.unlink_tree(t, Removal::Committed(RemovalReason::SizeLimit)));
             }
         }
-        let _ = self.store.sync_deaths();
-        Ok(gone)
+        gone
     }
 
     /// Count / weight / topo checks for an ancestor package (no graph lock).

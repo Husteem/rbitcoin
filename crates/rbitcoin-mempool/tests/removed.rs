@@ -211,6 +211,41 @@ fn each_pool_removal_keeps_its_reason_and_sequence() {
     assert_eq!(mp.removed_rows().oldest, 1);
 }
 
+/// A full pool of durable chunks pays one death sync per budget pass, and
+/// that sync publishes the final count before the pass returns. `meta` is
+/// reopened for append, so each sync adds one record to its file.
+#[test]
+fn a_budget_pass_syncs_its_deaths_once() {
+    use rbitcoin_mempool::store::{write_meta_bytes, META_LEN};
+
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(4);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    for (i, op) in ops.iter().enumerate() {
+        let tx = spend(*op, 99_000 - 100 * i as u64);
+        mp.accept_tx(&tx, &utxos, TIP_OK).expect("admit");
+    }
+    mp.store.flush().unwrap();
+    let meta = dir.path().join("meta");
+    let before = std::fs::read(&meta).unwrap().len();
+    mp.store.meta_file = std::fs::OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(&meta)
+        .unwrap();
+
+    mp.max_weight = 0;
+    assert_eq!(mp.evict_to_budget(None).unwrap().len(), 4, "four chunks");
+
+    let synced = std::fs::read(&meta).unwrap()[before..].to_vec();
+    let records: Vec<&[u8]> = synced.chunks(META_LEN).collect();
+    assert_eq!(records.len(), 1, "death syncs in one budget pass");
+    let mut want = [0u8; META_LEN];
+    let m = mp.store.meta();
+    write_meta_bytes(&mut want, m.generation, m.slot_cap, 0);
+    assert_eq!(records[0], want, "the sync publishes the final count");
+}
+
 #[test]
 fn a_replacement_that_does_not_commit_leaves_no_replaced_row() {
     let dir = tmp_dir();
