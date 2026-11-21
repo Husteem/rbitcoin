@@ -356,6 +356,8 @@ thread_local! {
     static DELTA_RECORD_SERIAL: Cell<u64> = const { Cell::new(0) };
     /// 0 unset, 1 every span still shared its file, 2 a span was the sole owner.
     static DELTA_RECORD_OWNER: Cell<u8> = const { Cell::new(0) };
+    /// Off on a node. A test arms it for one lookup. The walk is `strong_count`.
+    static DELTA_RECORD_OWNER_ARM: Cell<bool> = const { Cell::new(false) };
 }
 
 fn note_delta_record_serial() {
@@ -364,6 +366,10 @@ fn note_delta_record_serial() {
 
 fn note_delta_record_bulk() {
     DELTA_RECORD_BULK.with(|n| n.set(n.get() + 1));
+}
+
+fn owner_probe_armed() -> bool {
+    DELTA_RECORD_OWNER_ARM.with(Cell::get)
 }
 
 fn note_delta_record_owner(held: bool) {
@@ -381,6 +387,14 @@ pub fn reset_delta_record_io() {
     DELTA_RECORD_BULK.with(|n| n.set(0));
     DELTA_RECORD_SERIAL.with(|n| n.set(0));
     DELTA_RECORD_OWNER.with(|n| n.set(0));
+    DELTA_RECORD_OWNER_ARM.with(|n| n.set(false));
+}
+
+/// Count shared owners on the next bulk read on this thread.
+/// [`reset_delta_record_io`] clears it. A node leaves it off.
+#[doc(hidden)]
+pub fn arm_delta_record_owner_probe() {
+    DELTA_RECORD_OWNER_ARM.with(|c| c.set(true));
 }
 
 /// `(bulk submissions, serial record preads)` since [`reset_delta_record_io`]
@@ -2033,7 +2047,11 @@ impl SpendPageLog {
         let depth = crate::uring_session::DEFAULT_ENTRIES as usize;
         for chunk in spans.chunks_mut(depth.max(1)) {
             note_delta_record_bulk();
-            note_delta_record_owner(chunk.iter().all(|span| Arc::strong_count(&span.file) >= 2));
+            if owner_probe_armed() {
+                note_delta_record_owner(
+                    chunk.iter().all(|span| Arc::strong_count(&span.file) >= 2),
+                );
+            }
             let paths: Vec<PathBuf> = chunk.iter().map(|span| span.file.path.clone()).collect();
             let lens: Vec<usize> = chunk.iter().map(|span| span.buf.len()).collect();
             let mut ops: Vec<crate::bulk_io::ReadOp<'_>> = chunk

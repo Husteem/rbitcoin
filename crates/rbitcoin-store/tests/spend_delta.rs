@@ -3338,7 +3338,8 @@ fn decoded(raw: [u8; 8]) -> rbitcoin_store::tx_table::SpenderSlot {
 fn confirm_spend_meta_reads_delta_records_in_one_bulk() {
     use rbitcoin_primitives::Fk;
     use rbitcoin_store::spend_delta::{
-        delta_record_io, delta_record_owner_held, reset_delta_record_io,
+        arm_delta_record_owner_probe, delta_record_io, delta_record_owner_held,
+        reset_delta_record_io,
     };
     use rbitcoin_store::Store;
 
@@ -3502,7 +3503,21 @@ fn confirm_spend_meta_reads_delta_records_in_one_bulk() {
         "three record pages are one bulk submission, not a pread each"
     );
     assert!(
+        !delta_record_owner_held(),
+        "an unarmed lookup counted segment owners"
+    );
+    reset_delta_record_io();
+    arm_delta_record_owner_probe();
+    let armed = s.get_spender_meta_at_abs_batch(&queries).unwrap();
+    assert_eq!(armed, expect);
+    assert_eq!(
+        delta_record_io(),
+        (1, 0),
+        "three record pages are one bulk submission, not a pread each"
+    );
+    assert!(
         delta_record_owner_held(),
         "the bulk read dropped the segment file before the pread"
     );
+    reset_delta_record_io();
 }
