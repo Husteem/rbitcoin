@@ -466,6 +466,7 @@ fn pair_write_started(
 fn note_pair_loser(run: PairRun) -> PairRun {
     if let Some(e) = &run.loser_error {
         rbitcoin_log::debug!(
+            Query,
             "tip pair: {} lost: {e}",
             bitcoin::BlockHash::from_byte_array(run.loser)
         );
