@@ -3844,8 +3844,10 @@ pub async fn on_heartbeat(
     } else {
         s.ping_timeout(now)
     };
-    // A body already in `decode_q` is still the oldest block in flight.
-    // Timing that window out would drop the frame before it is applied.
+    // A block or compact frame still waiting to decode is the oldest block
+    // in flight, so timing that window out would race its decode. A frame
+    // held for the send budget does not suspend this window: the disconnect
+    // drain still applies block bodies already off the socket.
     let download_timed_out = if decode_waiting {
         None
     } else {
@@ -4420,6 +4422,10 @@ pub async fn peer_session_with(
             if !over_budget {
                 hold_front = false;
             }
+            // The decode arm and the heartbeat must agree on whether the
+            // front is waiting to decode (suspend timeouts) or held for the
+            // send budget (do not).
+            let front_waiting = !decode_q.is_empty() && !hold_front;
             let tail_pending =
                 !follow.getdata_tail.is_empty() || !follow.getblocktxn_tail.is_empty();
             let reading = !over_budget && !tail_pending;
@@ -4434,7 +4440,7 @@ pub async fn peer_session_with(
                         return Poll::Pending;
                     };
                     std::pin::Pin::new(rx).poll(cx)
-                }), if !decode_q.is_empty() && !hold_front => {
+                }), if front_waiting => {
                     let n = decode_q.front_len();
                     let heavy = decode_q.front_heavy();
                     let _ = decode_q.pop_front();
@@ -4833,7 +4839,7 @@ pub async fn peer_session_with(
                         &mut requested_since,
                         &mut tx_announce_rx,
                         &mut inv_flush_rx,
-                        !decode_q.is_empty() && !hold_front,
+                        front_waiting,
                     )
                     .await?;
                     last_hb = std::time::Instant::now();
