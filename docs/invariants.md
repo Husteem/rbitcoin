@@ -163,8 +163,9 @@ wave marks the heights its own snapshot has reached dead before it reads,
 so a create load may have dropped is always read. Every re-arm changes the
 generation. Load clears in-flight on that change and the set empties on
 it. A height decoded again replaces itself and every height above it. The
-set keys on whole txids, so it leaves out no prev whose create it did not
-record.
+set is a fixed table of 40-bit txid tags, hashed under a random key of its
+own, so two txids can share a slot: a prev that does is left out though
+lookup recorded no create of it.
 
 A key lookup left out can bind only from in-flight, to the create load
 itself planned for that txid. If in-flight does not hold it, the stamp is

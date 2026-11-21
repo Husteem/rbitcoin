@@ -437,42 +437,31 @@ fn unsent_heights_walked_again_are_still_the_waves_own_creates() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// No chain a test can build fills the set, so the cap is driven directly.
-/// The block that needs a third map pushes the older map out: spends of its
-/// creates are TipOnly need again, and the newest block is always recorded.
+/// The table never grows. A create that finds its bucket full overwrites
+/// the lowest height there, so the newest creates are always held and the
+/// oldest give way, and their spends are read from `tx.head` as before.
+/// Twice the table's slots go in here with nothing drained.
 #[test]
-fn undrained_creates_drop_the_older_map_at_the_cap() {
+fn a_full_table_overwrites_the_oldest_create() {
     let per_block = 1_000u32;
-    let per_map = UNDRAINED_MAP_TXIDS as u32 / per_block;
-    let full = UNDRAINED_MAPS as u32 * per_map;
-    let first_of = |height: u32| numbered_txid(height * per_block);
+    let blocks = 2 * UNDRAINED_SLOTS as u32 / per_block;
     let mut undrained = UndrainedCreates::default();
-    for height in 0..full {
+    for height in 0..blocks {
         let lo = height * per_block;
         undrained.note_block(height, (lo..lo + per_block).map(numbered_txid));
     }
-    assert!(undrained.holds(&first_of(0)), "the maps hold every height");
-    assert!(undrained.holds(&first_of(full - 1)));
-    let held = undrained.approx_bytes();
+    let newest = (blocks - 20) * per_block..blocks * per_block;
+    let held_newest = newest
+        .clone()
+        .filter(|&i| undrained.holds(&numbered_txid(i)))
+        .count();
+    assert_eq!(held_newest, newest.len(), "the newest 20 blocks are held");
+    let held_oldest = (0..per_block)
+        .filter(|&i| undrained.holds(&numbered_txid(i)))
+        .count();
     assert!(
-        held >= (full * per_block) as usize * 37,
-        "a slot for every txid held, got {held}"
-    );
-
-    undrained.note_block(full, std::iter::once(first_of(full)));
-    assert!(undrained.holds(&first_of(full)));
-    assert!(
-        !undrained.holds(&first_of(per_map - 1)),
-        "the older map left to make room"
-    );
-    assert!(undrained.holds(&first_of(per_map)), "the newer map stays");
-
-    undrained.drop_through(Some(full));
-    assert!(!undrained.holds(&first_of(full)));
-    assert_eq!(
-        undrained.approx_bytes(),
-        0,
-        "the snapshot passed every height"
+        held_oldest < per_block as usize / 10,
+        "the oldest block gave way, {held_oldest} of its creates held"
     );
 }
 
@@ -599,83 +588,112 @@ fn a_height_decoded_again_replaces_it_and_every_height_above() {
 
     undrained.drop_through(Some(11));
     assert!(!undrained.holds(&numbered_txid(99)));
-    assert_eq!(undrained.approx_bytes(), 0, "no stale height keeps a map");
 }
 
-/// A height decoded again below the newer map takes that map with it and
-/// the heights from there up in the older one. The older map is then freed
-/// as soon as the snapshot passes the last height it still holds.
+/// The set's heap is its table: none until lookup records a block, then
+/// the same 8 MiB however many creates it holds or has dropped.
 #[test]
-fn a_height_decoded_again_below_the_newer_map_drops_that_map() {
-    let per_block = 1_000u32;
-    let per_map = UNDRAINED_MAP_TXIDS as u32 / per_block;
-    let full = UNDRAINED_MAPS as u32 * per_map;
-    let first_of = |height: u32| numbered_txid(height * per_block);
+fn the_sets_heap_is_its_fixed_table() {
+    assert_eq!(UNDRAINED_TABLE_BYTES, 8 << 20);
     let mut undrained = UndrainedCreates::default();
-    for height in 0..full {
-        let lo = height * per_block;
-        undrained.note_block(height, (lo..lo + per_block).map(numbered_txid));
-    }
-    let again = per_map - 5;
-    let fresh = full * per_block;
-
-    undrained.note_block(again, (fresh..fresh + per_block).map(numbered_txid));
-    assert!(undrained.holds(&numbered_txid(fresh)));
-    assert!(undrained.holds(&first_of(again - 1)), "lower heights stay");
-    for gone in [again, per_map - 1, per_map, full - 1] {
-        assert!(!undrained.holds(&first_of(gone)), "height {gone} left");
-    }
-
-    undrained.drop_through(Some(again - 1));
-    assert!(undrained.holds(&numbered_txid(fresh)));
-    let held = undrained.approx_bytes();
-    assert!(
-        held < (1 << 19) * 37,
-        "the older map holds no live height, got {held}"
-    );
-}
-
-/// Lookup fills the set first in, first out, and every tenth height here is
-/// decoded again as a different block. However long that runs, the set
-/// holds no more than two maps of 2^19 slots at 37 B a slot.
-#[test]
-fn the_heap_stays_within_two_maps_through_churn() {
-    let two_maps = 2 * (1 << 19) * 37;
-    let mut undrained = UndrainedCreates::default();
-    let mut next = 0u32;
-    for height in 0..400u32 {
-        undrained.note_block(height, (next..next + 5_000).map(numbered_txid));
-        next += 5_000;
-        if height % 10 == 9 {
-            undrained.note_block(height, (next..next + 5_000).map(numbered_txid));
-            next += 5_000;
-        }
-        if let Some(passed) = height.checked_sub(180) {
-            undrained.drop_through(Some(passed));
-        }
-        let held = undrained.approx_bytes();
-        assert!(
-            held <= two_maps,
-            "height {height}: {held} B is over two maps"
-        );
-    }
-}
-
-/// A snapshot that passes every recorded height gives the heap back.
-#[test]
-fn undrained_creates_give_their_heap_back_when_every_height_is_dead() {
-    let mut undrained = UndrainedCreates::default();
-    assert_eq!(undrained.approx_bytes(), 0);
+    assert_eq!(undrained.heap_bytes(), 0);
 
     undrained.note_block(10, (0..1_000).map(numbered_txid));
-    let held = undrained.approx_bytes();
-    assert!(
-        held >= 1_000 * 37,
-        "1,000 txids with a height each, got {held}"
-    );
-
+    assert_eq!(undrained.heap_bytes(), UNDRAINED_TABLE_BYTES);
     undrained.drop_through(Some(10));
-    assert_eq!(undrained.approx_bytes(), 0);
+    undrained.rearm(7);
+    undrained.note_block(11, (0..1_000).map(numbered_txid));
+    assert_eq!(undrained.heap_bytes(), UNDRAINED_TABLE_BYTES);
+}
+
+/// A slot keeps a height in 24 bits. A block above that is not recorded, so
+/// spends of its creates are read from `tx.head` as before, and a snapshot
+/// that high passes every height the table holds.
+#[test]
+fn a_height_past_the_slot_width_is_not_recorded() {
+    let widest = (1u32 << 24) - 2;
+    let mut undrained = UndrainedCreates::default();
+    undrained.note_block(widest, std::iter::once(numbered_txid(1)));
+    assert!(undrained.holds(&numbered_txid(1)));
+
+    undrained.note_block(widest + 1, std::iter::once(numbered_txid(2)));
+    assert!(!undrained.holds(&numbered_txid(2)));
+    assert!(undrained.holds(&numbered_txid(1)), "the lower height stays");
+
+    undrained.drop_through(Some(u32::MAX));
+    assert!(!undrained.holds(&numbered_txid(1)));
+}
+
+/// Wall-clock cost of the set per block at three pipeline depths. Each
+/// block records 3,600 creates, probes 7,200 prevs (43% of them creates of
+/// the live blocks, the rest txids the set never held), then moves the
+/// snapshot up. `UNDRAINED_BENCH_EVICT=1` rewrites a 64 MiB buffer before
+/// each block so the set starts cold, as it does between waves on a node.
+#[test]
+#[ignore = "wall-clock bench: cargo test --release -p rbitcoin-query --test suite undrained_set_cost_per_block -- --ignored --nocapture"]
+fn undrained_set_cost_per_block() {
+    const CREATES: u64 = 3_600;
+    const PROBES: u64 = 7_200;
+    const LIVE_PCT: u64 = 43;
+    fn mix(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    fn txid(i: u64) -> [u8; 32] {
+        let mut t = [0u8; 32];
+        for (k, chunk) in t.chunks_exact_mut(8).enumerate() {
+            chunk.copy_from_slice(&mix(i.wrapping_mul(4).wrapping_add(k as u64)).to_le_bytes());
+        }
+        t
+    }
+    let evict = std::env::var_os("UNDRAINED_BENCH_EVICT").is_some();
+    let mut buf = vec![0u8; if evict { 64 << 20 } else { 0 }];
+    for live in [50_000u64, 200_000, 450_000] {
+        let depth = (live / CREATES) as u32;
+        let (warm, timed) = (depth + 200, 1_000u32);
+        let mut set = UndrainedCreates::default();
+        let mut busy = std::time::Duration::ZERO;
+        let (mut live_n, mut live_miss, mut old_hit) = (0u64, 0u64, 0u64);
+        let mut rng = u64::from(depth);
+        for h in 0..warm + timed {
+            for b in buf.iter_mut().step_by(64) {
+                *b = b.wrapping_add(1);
+            }
+            let first = u64::from(h) * CREATES;
+            let creates: Vec<[u8; 32]> = (first..first + CREATES).map(txid).collect();
+            let lo = u64::from(h.saturating_sub(depth)) * CREATES;
+            let probes: Vec<(bool, [u8; 32])> = (0..PROBES)
+                .map(|_| {
+                    rng = mix(rng);
+                    if h > 0 && rng % 100 < LIVE_PCT {
+                        (true, txid(lo + (rng >> 8) % (first - lo)))
+                    } else {
+                        (false, txid(u64::MAX - (rng >> 1)))
+                    }
+                })
+                .collect();
+            let t = std::time::Instant::now();
+            set.note_block(h, creates);
+            let held: Vec<bool> = probes.iter().map(|(_, p)| set.holds(p)).collect();
+            set.drop_through(h.checked_sub(depth + 1));
+            if h < warm {
+                continue;
+            }
+            busy += t.elapsed();
+            for ((is_live, _), held) in probes.iter().zip(held) {
+                live_n += u64::from(*is_live);
+                live_miss += u64::from(*is_live && !held);
+                old_hit += u64::from(!*is_live && held);
+            }
+        }
+        println!(
+            "live {live}: {:.3} ms a block, live misses {:.3}%, false hits {old_hit}",
+            busy.as_secs_f64() * 1e3 / f64::from(timed),
+            live_miss as f64 * 100.0 / live_n as f64,
+        );
+    }
 }
 
 #[test]

@@ -11,10 +11,8 @@
 //! generation) are omitted from TipOnly need.
 
 use super::*;
-use crate::{
-    BatchParentIds, IdMap, ResolvedWire, TxPrecompute, TxidHasher, TxidMap, U32Map, U64Map,
-};
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::{BatchParentIds, IdMap, ResolvedWire, TxPrecompute, TxidHasher, U32Map, U64Map};
+use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 use std::sync::Arc;
 
@@ -37,23 +35,36 @@ pub const BQ_RESOLVE_WAVE_MIN_INPUTS: u32 = 8000;
 /// Safety cap so one megablock run cannot stall the wave.
 pub const BQ_RESOLVE_WAVE_MAX_KEYS: usize = 256_000;
 
-/// Txids one map of [`UndrainedCreates`] takes. The block that would pass
-/// it starts the next map.
+/// Slots in the [`UndrainedCreates`] table: 2^17 buckets of 8.
 #[doc(hidden)]
-pub const UNDRAINED_MAP_TXIDS: usize = 450_000;
-/// Maps [`UndrainedCreates`] keeps. The block that needs a third pushes the
-/// older map out whole, and spends of its creates are read from `tx.head`
-/// as before.
+pub const UNDRAINED_SLOTS: usize = 1 << 20;
+/// Heap of the [`UndrainedCreates`] table once lookup has recorded a block:
+/// 8 B a slot, 8 MiB.
 #[doc(hidden)]
-pub const UNDRAINED_MAPS: usize = 2;
+pub const UNDRAINED_TABLE_BYTES: usize = UNDRAINED_SLOTS * std::mem::size_of::<u64>();
 
-/// What a map stores for a txid: the height that created it plus one. Zero
-/// is left for a txid whose height was decoded again.
-fn level(height: u32) -> u32 {
-    height.saturating_add(1)
+const BUCKET_SLOTS: usize = 8;
+const BUCKETS: usize = UNDRAINED_SLOTS / BUCKET_SLOTS;
+/// A slot is a 40-bit txid tag above a 24-bit level.
+const LEVEL_BITS: u32 = 24;
+const LEVEL_MASK: u64 = (1 << LEVEL_BITS) - 1;
+
+/// What a slot stores for the height that created a txid: the height plus
+/// one, so a zero slot is empty. `None` past the 24 bits a slot keeps.
+fn level(height: u32) -> Option<u32> {
+    height
+        .checked_add(1)
+        .filter(|&level| u64::from(level) <= LEVEL_MASK)
 }
 
-const FORGOTTEN: u32 = 0;
+fn slot_level(slot: u64) -> u32 {
+    (slot & LEVEL_MASK) as u32
+}
+
+/// One cache line of slots.
+#[derive(Clone, Copy, Default)]
+#[repr(align(64))]
+struct Bucket([u64; BUCKET_SLOTS]);
 
 /// Creates of blocks this lookup thread has decoded that the `tx.head`
 /// drain and the fence have not passed.
@@ -66,61 +77,78 @@ const FORGOTTEN: u32 = 0;
 /// txid only removes a key from the store read. It binds nothing, and a
 /// txid the set does not hold is read as before.
 ///
-/// The keys are whole txids. A prev held by mistake is left to an in-flight
-/// bind that cannot happen, which is `parent create_fk unresolved`, so the
-/// set never answers from a shortened hash.
+/// The set is one fixed table of [`UNDRAINED_SLOTS`] slots in 64 B buckets
+/// of 8, [`UNDRAINED_TABLE_BYTES`] in all. A slot is a 40-bit tag of the
+/// txid and the 24-bit [`level`] of the height that created it. The bucket
+/// and the tag come from the whole txid hashed with SipHash-1-3 under a
+/// random key of this set's own, so a txid that shares a slot with another
+/// cannot be built offline. Nothing is removed by itself: a slot whose
+/// height the snapshot has reached is dead, and an insert takes a dead or
+/// empty slot, or else overwrites the lowest height in the bucket. Heights
+/// die in the order they were inserted, so that is the oldest create, and
+/// spends of it are read from `tx.head` as before.
 ///
-/// RAM for CPU. A txid is stored once, with its level, in a map that only
-/// fills and is freed whole. Nothing removes a txid by itself: a height the
-/// snapshot has reached or that was decoded again is dead where it lies,
-/// and a map goes when its last height is dead. Dead txids count toward a
-/// map's fill, so the set always holds the newest [`UNDRAINED_MAP_TXIDS`]
-/// and at most twice that. By [`Self::approx_bytes`] a full map is 18.5 MiB
-/// and both are 37 MiB. A miss probes each map, and a height decoded again
-/// walks the one map it lies in. The set saves a probe of every sealed
-/// `tx.head` segment per txid it holds.
-#[derive(Debug, Default)]
+/// Two txids with one tag in one bucket answer as one. A prev held that way
+/// is in neither in-flight nor the wave's skeleton.
 pub struct UndrainedCreates {
     gen: Option<u32>,
-    /// Ascending by height. Only the last one takes blocks.
-    runs: VecDeque<CreateRun>,
-    /// A [`level`] at or below it is dead.
+    hasher: std::collections::hash_map::RandomState,
+    /// Empty until the first block is recorded.
+    table: Box<[Bucket]>,
+    /// A level at or below it is dead.
     dead_through: u32,
+    /// No live slot is above this level.
+    top: u32,
 }
 
-/// The creates of the heights `first..=top`, each with its [`level`].
-#[derive(Debug)]
-struct CreateRun {
-    first: u32,
-    top: u32,
-    levels: TxidMap<u32>,
+impl Default for UndrainedCreates {
+    fn default() -> Self {
+        Self {
+            gen: None,
+            hasher: std::collections::hash_map::RandomState::new(),
+            table: Box::default(),
+            dead_through: 0,
+            top: 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for UndrainedCreates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UndrainedCreates")
+            .field("gen", &self.gen)
+            .field("heap_bytes", &self.heap_bytes())
+            .field("dead_through", &self.dead_through)
+            .field("top", &self.top)
+            .finish()
+    }
 }
 
 impl UndrainedCreates {
+    /// The bucket and the tag of `txid`.
+    fn place(&self, txid: &[u8; 32]) -> (usize, u64) {
+        use std::hash::BuildHasher;
+        let hash = self.hasher.hash_one(txid);
+        ((hash as usize) & (BUCKETS - 1), hash >> LEVEL_BITS)
+    }
+
     /// A create of `txid` is recorded at a height above the last snapshot.
     #[doc(hidden)]
     pub fn holds(&self, txid: &[u8; 32]) -> bool {
-        let live = |level: &u32| *level > self.dead_through;
-        self.runs
+        if self.table.is_empty() {
+            return false;
+        }
+        let (bucket, tag) = self.place(txid);
+        self.table[bucket]
+            .0
             .iter()
-            .rev()
-            .any(|run| run.levels.get(txid).is_some_and(live))
+            .any(|&slot| slot >> LEVEL_BITS == tag && slot_level(slot) > self.dead_through)
     }
 
-    /// Estimated heap the set holds: every map's slots, each a 32 B txid,
-    /// its level, and a control byte, eight slots for every seven of
-    /// capacity.
+    /// Heap the set holds: the table, once a block has been recorded.
     #[doc(hidden)]
-    pub fn approx_bytes(&self) -> usize {
-        let slot = std::mem::size_of::<([u8; 32], u32)>().saturating_add(1);
-        self.runs
-            .iter()
-            .map(|run| match run.levels.capacity() {
-                0 => 0,
-                capacity => (capacity.saturating_mul(8) / 7).next_power_of_two(),
-            })
-            .fold(0usize, |slots, n| slots.saturating_add(n))
-            .saturating_mul(slot)
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.table)
     }
 
     /// Empty the set unless it was filled under re-arm generation `gen`.
@@ -129,75 +157,80 @@ impl UndrainedCreates {
         if self.gen == Some(gen) {
             return;
         }
-        *self = Self {
-            gen: Some(gen),
-            ..Self::default()
-        };
+        self.gen = Some(gen);
+        self.table.fill(Bucket::default());
+        self.dead_through = 0;
+        self.top = 0;
     }
 
-    /// Mark the heights a drain+fence snapshot has reached dead, and free
-    /// the maps that hold no other height. `None` keeps all.
+    /// Mark the heights a drain+fence snapshot has reached dead. `None`
+    /// keeps all.
     #[doc(hidden)]
     pub fn drop_through(&mut self, hi: Option<u32>) {
         let Some(hi) = hi else {
             return;
         };
-        self.dead_through = self.dead_through.max(level(hi));
-        while self
-            .runs
-            .front()
-            .is_some_and(|run| level(run.top) <= self.dead_through)
-        {
-            self.runs.pop_front();
-        }
+        let through = level(hi).unwrap_or(LEVEL_MASK as u32);
+        self.dead_through = self.dead_through.max(through);
     }
 
     /// Record the block decoded at `height`. It replaces that height and
     /// every height above it: lookup decodes in ascending order, so a
     /// height seen again means the rows from there up were queued again.
     #[doc(hidden)]
-    pub fn note_block(&mut self, height: u32, txids: impl ExactSizeIterator<Item = [u8; 32]>) {
+    pub fn note_block(&mut self, height: u32, txids: impl IntoIterator<Item = [u8; 32]>) {
         self.forget_from(height);
-        let fits = self
-            .runs
-            .back()
-            .is_some_and(|run| run.levels.len().saturating_add(txids.len()) <= UNDRAINED_MAP_TXIDS);
-        if !fits {
-            if self.runs.len() >= UNDRAINED_MAPS {
-                self.runs.pop_front();
-            }
-            self.runs.push_back(CreateRun {
-                first: height,
-                top: height,
-                levels: TxidMap::default(),
-            });
-        }
-        let Some(run) = self.runs.back_mut() else {
+        let Some(level) = level(height) else {
             return;
         };
-        run.top = height;
-        run.levels.extend(txids.map(|txid| (txid, level(height))));
+        if self.table.is_empty() {
+            self.table = vec![Bucket::default(); BUCKETS].into_boxed_slice();
+        }
+        for txid in txids {
+            self.insert(&txid, level);
+        }
+        self.top = self.top.max(level);
     }
 
-    /// Forget `height` and every height above it. A map that starts there
-    /// or above leaves whole. The one map that starts below keeps its
-    /// txids and has those heights marked.
-    fn forget_from(&mut self, height: u32) {
-        while self.runs.back().is_some_and(|run| run.first >= height) {
-            self.runs.pop_back();
-        }
-        let Some(run) = self.runs.back_mut() else {
-            return;
-        };
-        if run.top < height {
-            return;
-        }
-        for at in run.levels.values_mut() {
-            if *at > height {
-                *at = FORGOTTEN;
+    /// Put `txid` at `level` in its bucket: over a live slot with its tag,
+    /// else in the first dead or empty slot, else over the lowest level.
+    fn insert(&mut self, txid: &[u8; 32], level: u32) {
+        let (bucket, tag) = self.place(txid);
+        let dead_through = self.dead_through;
+        let slots = &mut self.table[bucket].0;
+        let mut free = None;
+        let mut oldest = (u32::MAX, 0);
+        for (i, &slot) in slots.iter().enumerate() {
+            let at = slot_level(slot);
+            if at <= dead_through {
+                free.get_or_insert(i);
+            } else if slot >> LEVEL_BITS == tag {
+                free = Some(i);
+                break;
+            } else if at < oldest.0 {
+                oldest = (at, i);
             }
         }
-        run.top = height.saturating_sub(1);
+        slots[free.unwrap_or(oldest.1)] = (tag << LEVEL_BITS) | u64::from(level);
+    }
+
+    /// Forget `height` and every height above it, in one pass over the
+    /// table when any of them is recorded.
+    fn forget_from(&mut self, height: u32) {
+        let Some(from) = level(height) else {
+            return;
+        };
+        if self.top < from {
+            return;
+        }
+        for bucket in self.table.iter_mut() {
+            for slot in bucket.0.iter_mut() {
+                if slot_level(*slot) >= from {
+                    *slot = 0;
+                }
+            }
+        }
+        self.top = from - 1;
     }
 }
 

@@ -3312,7 +3312,7 @@ pub fn spawn_confirm_engine(
                         max_inputs,
                         &mut undrained,
                     );
-                    queues_lookup.note_undrained_bytes(undrained.approx_bytes());
+                    queues_lookup.note_undrained_bytes(undrained.heap_bytes());
                     match wave {
                         Ok(wave) if wave.items.is_empty() && wave.undecodable.is_none() => {
                             lookup_faults.on_success();
