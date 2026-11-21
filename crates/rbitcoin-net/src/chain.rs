@@ -4217,7 +4217,7 @@ impl ChainHub {
     /// [`Self::try_rewind_to_height`] only while the confirmed tip is still
     /// `expect`. The tip commit is taken and the tip compared under it, so a
     /// confirm that moved the tip returns `Ok(false)` without disconnecting.
-    /// The off-lock rewind passes the tip its header selection measured.
+    /// The heavier-fork rewind passes the tip its selection measured.
     pub fn try_rewind_to_height_at(
         &self,
         keep_height: u32,

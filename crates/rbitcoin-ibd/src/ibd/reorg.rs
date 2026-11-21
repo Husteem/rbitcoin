@@ -871,8 +871,9 @@ pub fn commit_header_rewind(
 
 /// Rewind to `path` under the cap its selection used, only while the
 /// confirmed tip is still the `tip_before` its selection measured. Callers
-/// hold `shared`; a confirm that moved the tip during the walk leaves the
-/// path for the next pass instead of disconnecting or planting on the new tip.
+/// hold `shared` and must not hold the tip commit. A confirm that moved the
+/// tip during the walk leaves the path for the next pass instead of
+/// disconnecting or planting on the new tip.
 pub fn apply_header_rewind(
     st: &mut super::state::IbdWorkState,
     hub: &ChainHub,
@@ -884,14 +885,20 @@ pub fn apply_header_rewind(
         return Ok(false);
     };
     // The prepare dropped the tip commit after its disconnect and read the
-    // path's store rows since. Confirm may have extended from the LCA. After
-    // a disconnect the state commit cannot be abandoned, so wait for the
-    // commit rather than try it, and hold it across the recheck and commit.
+    // path's store rows since. Confirm may have extended from the LCA. A
+    // rewind already disconnected, so its state commit cannot be abandoned:
+    // wait for the commit. A plant can defer instead, without stalling the
+    // caller on a flush. Hold the commit across the recheck and commit.
     fire(&AFTER_PREPARE);
-    let _commit = hub
-        .query
-        .lock_tip_commit()
-        .map_err(|e| NetError::Store(e.to_string()))?;
+    let _commit = if prep.rewound {
+        hub.query
+            .lock_tip_commit()
+            .map_err(|e| NetError::Store(e.to_string()))?
+    } else if let Some(commit) = hub.query.try_lock_tip_commit() {
+        commit
+    } else {
+        return Ok(false);
+    };
     if !rewind_tip_still(hub, &prep, tip_before) {
         return Ok(false);
     }
@@ -1023,12 +1030,18 @@ pub(crate) fn apply_off_lock_rewind(
     // The prepare has already disconnected when it was a rewind, so the
     // state commit cannot be abandoned. Take `shared` before the commit and
     // then wait for it; confirm does not take `shared`, so this order cannot
-    // cycle. Hold it across the recheck and commit so confirm cannot extend
-    // from the LCA in between.
-    let _commit = hub
-        .query
-        .lock_tip_commit()
-        .map_err(|e| NetError::Store(e.to_string()))?;
+    // cycle. A plant can defer on a busy commit instead. Hold the commit
+    // across the recheck and commit so confirm cannot extend from the LCA.
+    let _commit = if prep.rewound {
+        hub.query
+            .lock_tip_commit()
+            .map_err(|e| NetError::Store(e.to_string()))?
+    } else if let Some(commit) = hub.query.try_lock_tip_commit() {
+        commit
+    } else {
+        st.reorg.defer(cands);
+        return Ok(false);
+    };
     let marked_invalid = path
         .iter()
         .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()));

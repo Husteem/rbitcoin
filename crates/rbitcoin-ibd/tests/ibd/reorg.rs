@@ -724,9 +724,8 @@ fn an_under_lock_rewind_selected_against_an_older_tip_is_skipped() {
 }
 
 /// A concurrent rewind can lower the tip onto the fork's LCA while the
-/// selection walks, so the path reads as a plant. A plant has no disconnect
-/// to recheck, and the direct commit follows prepare at once; the tip
-/// compare under the commit is what refuses it.
+/// selection walks, so the path reads as a plant. A plant has no disconnect;
+/// the caller's recheck under the commit is what refuses it.
 #[test]
 fn a_plant_selected_against_an_older_tip_is_skipped() {
     let _serial = BEFORE_LOCK.lock().unwrap_or_else(|err| err.into_inner());
