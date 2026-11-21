@@ -86,15 +86,16 @@ fn orphan_of(parents: &[bitcoin::OutPoint]) -> bitcoin::Transaction {
     }
 }
 
-fn tx_invs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<bitcoin::Wtxid> {
+/// Txids INV'd to a peer that never sent `wtxidrelay` (BIP339: `MSG_TX`).
+fn tx_invs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<bitcoin::Txid> {
     let mut out = Vec::new();
     for msg in take_msgs(rx) {
         match msg {
             NetworkMessage::Inv(v) => {
                 for i in v {
                     match i {
-                        Inventory::WTx(w) => out.push(w),
-                        other => panic!("expected WTx inv, got {other:?}"),
+                        Inventory::Transaction(t) => out.push(t),
+                        other => panic!("expected MSG_TX inv, got {other:?}"),
                     }
                 }
             }
@@ -180,7 +181,7 @@ async fn blocksonly_sendraw_invs_inbound(
     flush_tx_invs(hub, peers.as_ref());
     assert_eq!(
         tx_invs(&mut first_rx),
-        vec![tx.compute_wtxid()],
+        vec![tx.compute_txid()],
         "unbroadcast INV without clock_due"
     );
 
@@ -189,7 +190,7 @@ async fn blocksonly_sendraw_invs_inbound(
     peers.request_all_tx_inv();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &out_tx);
-    assert_eq!(tx_invs(&mut out_rx), vec![tx.compute_wtxid()]);
+    assert_eq!(tx_invs(&mut out_rx), vec![tx.compute_txid()]);
     queue_due_tx_invs(hub, block_relay.as_ref(), &CappedSet::new(), &out_tx);
     assert!(
         out_rx.try_recv().is_err(),
@@ -261,7 +262,7 @@ async fn blocksonly_relay_perm_tx_invs_other_inbound(
     assert!(follow.from_this_peer.contains_key(&tx.compute_txid()));
     assert_eq!(
         tx_invs(&mut other_rx),
-        vec![tx.compute_wtxid()],
+        vec![tx.compute_txid()],
         "second inbound gets only the unbroadcast wtx"
     );
     assert!(
@@ -306,7 +307,7 @@ async fn blocksonly_relay_perm_tx_invs_other_inbound(
     assert!(late_applied, "a later rebroadcast still publishes");
     assert_eq!(
         tx_invs(&mut late_rx),
-        vec![tx.compute_wtxid()],
+        vec![tx.compute_txid()],
         "a peer not yet told still gets the unbroadcast rebroadcast"
     );
     peers.unregister(listed.id);
@@ -391,7 +392,7 @@ async fn force_announce_picks_peers(
 
     rbitcoin_net::force_announce_txid(hub, peers, missing);
     mp.admit(&relayed).expect("accept");
-    seen.note_announced_wtx(relayed.compute_wtxid());
+    seen.note_announced_tx(relayed.compute_txid(), relayed.compute_wtxid());
     rbitcoin_net::force_announce_txid(hub, peers, relayed.compute_txid());
     assert!(block_relay_rx.try_recv().is_err(), "block-relay skips INV");
     assert!(
@@ -400,7 +401,7 @@ async fn force_announce_picks_peers(
     );
     assert!(seen_rx.try_recv().is_err(), "already-announced skips INV");
     assert!(pricey_rx.try_recv().is_err(), "minfeefilter skips INV");
-    assert_eq!(tx_invs(&mut ok_rx), vec![relayed.compute_wtxid()]);
+    assert_eq!(tx_invs(&mut ok_rx), vec![relayed.compute_txid()]);
 
     let (fee, weight) = mp
         .try_get_live_meta(&relayed.compute_txid())
@@ -439,7 +440,7 @@ async fn force_announce_picks_peers(
         announce(relayed.compute_txid()),
     )
     .unwrap();
-    assert_eq!(tx_invs(&mut eq_ann), vec![relayed.compute_wtxid()]);
+    assert_eq!(tx_invs(&mut eq_ann), vec![relayed.compute_txid()]);
     assert!(
         hi_ann.try_recv().is_err(),
         "a filter above the fee is not announced"
@@ -472,7 +473,7 @@ async fn force_announce_picks_peers(
     let (due_hi_tx, mut due_hi_rx) = mpsc::unbounded_channel();
     queue_due_tx_invs(hub, due_equal.as_ref(), &CappedSet::new(), &due_eq_tx);
     queue_due_tx_invs(hub, due_above.as_ref(), &CappedSet::new(), &due_hi_tx);
-    assert_eq!(tx_invs(&mut due_eq_rx), vec![relayed.compute_wtxid()]);
+    assert_eq!(tx_invs(&mut due_eq_rx), vec![relayed.compute_txid()]);
     assert!(
         due_hi_rx.try_recv().is_err(),
         "periodic inv skips a filter above the fee"
@@ -492,7 +493,7 @@ async fn force_announce_picks_peers(
     let mut force_above_rx = writer_of(&force_above);
     force_above.note_minfeefilter_sat_kvb(rate.saturating_add(1));
     rbitcoin_net::force_announce_txid(hub, peers, relayed.compute_txid());
-    assert_eq!(tx_invs(&mut force_equal_rx), vec![relayed.compute_wtxid()]);
+    assert_eq!(tx_invs(&mut force_equal_rx), vec![relayed.compute_txid()]);
     assert!(
         force_above_rx.try_recv().is_err(),
         "force relay skips a filter above the fee"
@@ -509,7 +510,7 @@ async fn force_announce_picks_peers(
         "isolated local-origin must not INV standing peers"
     );
     rbitcoin_net::force_announce_txid(hub, peers, from_p2p.compute_txid());
-    assert_eq!(tx_invs(&mut ok_rx), vec![from_p2p.compute_wtxid()]);
+    assert_eq!(tx_invs(&mut ok_rx), vec![from_p2p.compute_txid()]);
 
     assert!(mp.is_local_origin(&local.compute_txid()));
     hub.generate_to_script(1, op_true(), vec![relayed, local.clone(), from_p2p])
@@ -597,15 +598,15 @@ async fn returned_tx_ends_the_private_broadcast(
         other.request_tx_inv();
         let (due_out, mut due_rx) = mpsc::unbounded_channel();
         queue_due_tx_invs(hub, other.as_ref(), &CappedSet::new(), &due_out);
-        assert!(tx_invs(&mut due_rx).contains(&wtxid), "announce on the next inv tick");
+        assert!(tx_invs(&mut due_rx).contains(&txid), "announce on the next inv tick");
         echo.request_tx_inv();
         let (back_out, mut back_rx) = mpsc::unbounded_channel();
         queue_due_tx_invs(hub, echo.as_ref(), &follow.from_this_peer, &back_out);
         assert!(
-            !tx_invs(&mut back_rx).contains(&wtxid),
+            !tx_invs(&mut back_rx).contains(&txid),
             "the peer that sent it does not get it back"
         );
-        let inbound = inbound_waits_thirty_seconds_from_the_echo(hub, peers, wtxid).await;
+        let inbound = inbound_waits_thirty_seconds_from_the_echo(hub, peers, txid).await;
         for s in [block_only, echo, other, later, inbound] {
             peers.unregister(s.id);
         }
@@ -715,13 +716,13 @@ async fn notfound_asks_the_next_announcer(
 async fn inbound_waits_thirty_seconds_from_the_echo(
     hub: &rbitcoin_net::chain::ChainHub,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
-    wtxid: bitcoin::Wtxid,
+    txid: bitcoin::Txid,
 ) -> std::sync::Arc<rbitcoin_net::peers::LivePeer> {
     use rbitcoin_net::peers::PeerConnType::Inbound;
     let inbound = relay_peer(peers, [127, 0, 0, 1], Inbound);
     let (in_out, mut in_rx) = mpsc::unbounded_channel();
     let quiet = |rx: &mut mpsc::UnboundedReceiver<PeerOut>, why: &str| {
-        assert!(!tx_invs(rx).contains(&wtxid), "{why}");
+        assert!(!tx_invs(rx).contains(&txid), "{why}");
     };
     inbound.request_tx_inv();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &in_out);
@@ -738,7 +739,7 @@ async fn inbound_waits_thirty_seconds_from_the_echo(
     inbound.request_tx_inv();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &in_out);
     assert!(
-        tx_invs(&mut in_rx).contains(&wtxid),
+        tx_invs(&mut in_rx).contains(&txid),
         "an inbound peer hears the tx 30s after the echo"
     );
     inbound
@@ -818,7 +819,7 @@ fn relay_on_inbound_age_gate(
     queue_due_tx_invs(hub, block_only.as_ref(), &CappedSet::new(), &out_tx);
     assert_eq!(
         tx_invs(&mut out_rx),
-        vec![txs[0].compute_wtxid()],
+        vec![txs[0].compute_txid()],
         "a relay=false inbound gets only the unbroadcast tx"
     );
     mp.mark_broadcast(&txs[0].compute_txid());

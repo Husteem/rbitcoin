@@ -9090,7 +9090,8 @@ fn compact_and_wtxid_serve_run_off_the_reactor() {
     let wtxid = block.txdata[0].compute_wtxid();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let session = live_peer(&peers, 18450, 11, false);
-    session.note_announced_wtx(wtxid);
+    session.set_wtxid_relay();
+    session.note_announced_tx(block.txdata[0].compute_txid(), wtxid);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -9172,7 +9173,8 @@ fn announced_wtxid_getdata_scans_the_tip_once() {
     let _ = hub.cache.take_body_loads();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let session = live_peer(&peers, 18570, 90, false);
-    session.note_announced_wtx(real);
+    session.set_wtxid_relay();
+    session.note_announced_tx(block.txdata[0].compute_txid(), real);
     let missing: Vec<bitcoin::Wtxid> = (1..5u8)
         .map(|n| {
             let mut bytes = [0u8; 32];
@@ -9181,7 +9183,10 @@ fn announced_wtxid_getdata_scans_the_tip_once() {
         })
         .collect();
     for wtxid in &missing {
-        session.note_announced_wtx(*wtxid);
+        session.note_announced_tx(
+            bitcoin::Txid::from_byte_array(wtxid.to_byte_array()),
+            *wtxid,
+        );
     }
     let _ = hub.take_tip_wtx_scans();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();

@@ -1072,9 +1072,9 @@ mod peer_session_pins {
         queue_due_tx_invs, read_peer_version, reconstruct_cmpct_from_mempool, requeue_later_pong,
         schedule_orphan_parent_getdata, serve_getdata_full_block, serve_mempool_getdata,
         tip_event_for_announce, tip_follow_locator, tx_announce_inbound_gated,
-        tx_announce_maybe_count, tx_announce_peer_ok, tx_announce_should_queue,
-        tx_inv_candidate_ok, wait_peer_verack, DecodeQueue, FullBlockReply, HandshakePolicy,
-        PeerFollowState, ADDRFETCH_TIMEOUT_SECS, BLOCK_GETDATA_TIMEOUT, MAX_BLOCKS_TO_ANNOUNCE,
+        tx_announce_maybe_count, tx_announce_peer_ok, tx_announce_should_queue, tx_inv_candidate,
+        wait_peer_verack, DecodeQueue, FullBlockReply, HandshakePolicy, PeerFollowState,
+        ADDRFETCH_TIMEOUT_SECS, BLOCK_GETDATA_TIMEOUT, MAX_BLOCKS_TO_ANNOUNCE,
         MIN_PEER_PROTO_VERSION,
     };
     use crate::peers::{PeerConnType, PeerHub, PeerOut};
@@ -1648,28 +1648,18 @@ mod peer_session_pins {
         let gen = mp.accept_gen(&w).expect("gen");
         let (_peers, live) = peer(PeerConnType::OutboundFullRelay);
         live.set_inv_gen_floor(gen);
-        assert!(tx_inv_candidate_ok(&mp, &live, &from, txid, w, true, false));
+        assert!(tx_inv_candidate(&mp, &live, &from, txid, w, true, false).is_some());
         let local_id = bitcoin::Txid::from_byte_array([8; 32]);
         let local_w = bitcoin::Wtxid::from_byte_array([10; 32]);
         mp.note_unbroadcast(local_id);
         let (_peers, outbound) = peer(PeerConnType::OutboundFullRelay);
-        assert!(!tx_inv_candidate_ok(
-            &mp, &outbound, &from, local_id, local_w, false, false
-        ));
+        assert!(tx_inv_candidate(&mp, &outbound, &from, local_id, local_w, false, false).is_none());
         mp.set_relay_enabled(false);
         let off_id = bitcoin::Txid::from_byte_array([6; 32]);
         let off_w = bitcoin::Wtxid::from_byte_array([11; 32]);
         mp.note_unbroadcast(off_id);
         let (_peers, blocks_only) = peer(PeerConnType::OutboundFullRelay);
-        assert!(tx_inv_candidate_ok(
-            &mp,
-            &blocks_only,
-            &from,
-            off_id,
-            off_w,
-            false,
-            false
-        ));
+        assert!(tx_inv_candidate(&mp, &blocks_only, &from, off_id, off_w, false, false).is_some());
     }
 
     fn wtx_invs(rx: &mut tokio::sync::mpsc::UnboundedReceiver<PeerOut>) -> Vec<bitcoin::Wtxid> {
@@ -1754,6 +1744,7 @@ mod peer_session_pins {
         mp.note_unbroadcast(older);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_peers, local) = peer(PeerConnType::OutboundFullRelay);
+        local.set_wtxid_relay();
         queue_due_tx_invs(&hub, &local, &crate::peers::CappedSet::new(), &out_tx);
         assert_eq!(
             wtx_invs(&mut out_rx),
@@ -1764,6 +1755,7 @@ mod peer_session_pins {
         mp.set_relay_enabled(true);
         mp.note_mock_now(now + 30);
         let (_peers, aged) = peer(PeerConnType::OutboundFullRelay);
+        aged.set_wtxid_relay();
         queue_due_tx_invs(&hub, &aged, &crate::peers::CappedSet::new(), &out_tx);
         assert_eq!(
             wtx_invs(&mut out_rx),
@@ -1784,6 +1776,7 @@ mod peer_session_pins {
         let mut from = crate::peers::CappedSet::new();
         from.insert(older, 8);
         let (_peers, live) = peer(PeerConnType::OutboundFullRelay);
+        live.set_wtxid_relay();
         live.request_tx_inv();
         queue_due_tx_invs(&hub, &live, &from, &out_tx);
         assert_eq!(
@@ -4067,25 +4060,28 @@ pub fn on_tx_announce_ok(
     if !tx_announce_peer_ready(session, mp, &txid) {
         return Ok(());
     }
-    let Some(inv) = tx_announce_inv(mp, &txid) else {
+    let Some(wtxid) = tx_announce_wtxid(mp, &txid) else {
         return Ok(());
     };
     // Core erases a below-filter tx from this peer's to-send set. A later
     // lower feefilter does not announce it (`p2p_feefilter.py`).
     if tx_announce_below_feefilter(session, mp, &txid) {
-        if let (Some(s), Inventory::WTx(w)) = (session, inv) {
-            let _ = s.claim_announced_wtx(w);
+        if let Some(s) = session {
+            s.note_announced_tx(txid, wtxid);
         }
         return Ok(());
     }
-    // A later rebroadcast still reaches a peer that has not heard this
-    // wtxid. The claim is shared with flush, so the two cannot both queue.
-    if let Inventory::WTx(w) = inv {
-        if session.is_some_and(|s| !s.claim_announced_wtx(w)) {
-            return Ok(());
-        }
-    }
-    tx_announce_note_wtx(session, mp, inv);
+    // A later rebroadcast still reaches a peer that has not heard this tx.
+    // The claim is shared with flush, so the two cannot both queue. With no
+    // session row, the peer never sent `wtxidrelay`.
+    let inv = match session {
+        Some(s) => s.claim_announced_tx(txid, wtxid),
+        None => Some(Inventory::Transaction(txid)),
+    };
+    let Some(inv) = inv else {
+        return Ok(());
+    };
+    tx_announce_note_seq(session, mp, &wtxid);
     queue_out(out_tx, NetworkMessage::Inv(vec![inv]))
 }
 
@@ -4150,30 +4146,24 @@ pub fn tx_announce_should_queue(
 }
 
 /// `None` when the tx left the pool after the ready check. Core skips such a
-/// tx; `MSG_WITNESS_TX` is a `getdata` type and never goes in an `inv`.
+/// tx.
 #[doc(hidden)]
-pub fn tx_announce_inv(
+pub fn tx_announce_wtxid(
     mp: &crate::tx_relay::MempoolHub,
     txid: &bitcoin::Txid,
-) -> Option<Inventory> {
-    mp.try_get_tx(txid)
-        .map(|tx| Inventory::WTx(tx.compute_wtxid()))
+) -> Option<bitcoin::Wtxid> {
+    mp.try_get_tx(txid).map(|tx| tx.compute_wtxid())
 }
 
-#[doc(hidden)]
-pub fn tx_announce_note_wtx(
+fn tx_announce_note_seq(
     session: Option<&crate::peers::LivePeer>,
     mp: &crate::tx_relay::MempoolHub,
-    inv: Inventory,
+    wtxid: &bitcoin::Wtxid,
 ) {
     let Some(s) = session else {
         return;
     };
-    let Inventory::WTx(w) = inv else {
-        return;
-    };
-    s.note_announced_wtx(w);
-    if let Some(seq) = mp.relay_seq_of(&w) {
+    if let Some(seq) = mp.relay_seq_of(wtxid) {
         s.note_tx_inv_seq_at_least(seq.saturating_add(1));
     }
 }
@@ -5374,10 +5364,10 @@ pub fn force_announce_txid(hub: &ChainHub, peers: &crate::peers::PeerHub, txid: 
         let Some(out) = s.writer() else {
             continue;
         };
-        if !s.claim_announced_wtx(w) {
+        let Some(inv) = s.claim_announced_tx(txid, w) else {
             continue;
-        }
-        queue_tx_inv_batches(&s, &out, vec![Inventory::WTx(w)]);
+        };
+        queue_tx_inv_batches(&s, &out, vec![inv]);
         if let Some(seq) = mp.relay_seq_of(&w) {
             s.note_tx_inv_seq_at_least(seq.saturating_add(1));
         }
@@ -5428,8 +5418,9 @@ pub fn maybe_force_relay_duplicate(
     }
 }
 
+/// The INV to queue for this tx, or `None` when it is not due to `session`.
 #[doc(hidden)]
-pub fn tx_inv_candidate_ok(
+pub fn tx_inv_candidate(
     mp: &crate::tx_relay::MempoolHub,
     session: &crate::peers::LivePeer,
     from_this_peer: &CappedSet<bitcoin::Txid>,
@@ -5437,43 +5428,43 @@ pub fn tx_inv_candidate_ok(
     w: bitcoin::Wtxid,
     clock_due: bool,
     inbound_age_gate: bool,
-) -> bool {
+) -> Option<Inventory> {
     if mp.skip_standing_inv(&txid) {
-        return false;
+        return None;
     }
     if from_this_peer.contains_key(&txid) {
-        return false;
+        return None;
     }
     if !tx_inv_peer_ok(session, mp, &txid) {
-        return false;
+        return None;
     }
     if !mp.relay_enabled() && !mp.is_unbroadcast(&txid) {
-        return false;
+        return None;
     }
     if mp
         .accept_gen(&w)
         .is_some_and(|g| g < session.inv_gen_floor())
     {
-        return false;
+        return None;
     }
     let peer_min = session.minfeefilter_sat_kvb();
     if peer_min > 0 && announce_fee_rate_sat_kvb(mp, &txid).is_some_and(|rate| rate < peer_min) {
         // Same erase as the announce path: a later lower filter does not inv it.
-        let _ = session.claim_announced_wtx(w);
-        return false;
+        session.note_announced_tx(txid, w);
+        return None;
     }
     let local = !mp.relay_enabled() && mp.is_unbroadcast(&txid);
     let age_due_this = mp.tx_inv_due(&w);
     if inbound_age_gate {
         if !age_due_this {
-            return false;
+            return None;
         }
     } else if !clock_due && !local && !age_due_this {
-        return false;
+        return None;
     }
-    // Every `true` is queued. The claim is the only insert, so a flush and
+    // Every `Some` is queued. The claim is the only insert, so a flush and
     // an announce cannot both pass and each send an INV.
-    session.claim_announced_wtx(w)
+    session.claim_announced_tx(txid, w)
 }
 
 #[doc(hidden)]
@@ -5511,7 +5502,7 @@ pub fn queue_due_tx_invs(
         };
         let mut due = Vec::new();
         for (txid, w) in live_wtx {
-            if !tx_inv_candidate_ok(
+            let Some(inv) = tx_inv_candidate(
                 mp,
                 session,
                 from_this_peer,
@@ -5519,10 +5510,10 @@ pub fn queue_due_tx_invs(
                 w,
                 clock_due,
                 inbound_age_gate,
-            ) {
+            ) else {
                 continue;
-            }
-            due.push(Inventory::WTx(w));
+            };
+            due.push(inv);
             n += 1;
             if let Some(seq) = mp.relay_seq_of(&w) {
                 max_ann = max_ann.max(seq.saturating_add(1));
@@ -5539,7 +5530,7 @@ pub fn queue_due_tx_invs(
         session.note_age_inv_seen(last.0, last.1);
         let mut due = Vec::new();
         for (txid, w) in due_wtx {
-            if !tx_inv_candidate_ok(
+            let Some(inv) = tx_inv_candidate(
                 mp,
                 session,
                 from_this_peer,
@@ -5547,10 +5538,10 @@ pub fn queue_due_tx_invs(
                 w,
                 false,
                 inbound_age_gate,
-            ) {
+            ) else {
                 continue;
-            }
-            due.push(Inventory::WTx(w));
+            };
+            due.push(inv);
             // `-=` from zero wraps and still passes `n > 0`. The count is
             // only compared with zero, so this site adds without `+=`.
             n = n.saturating_add(1);
@@ -5680,11 +5671,12 @@ pub fn serve_mempool_getdata(
     let Some(tx) = tx else {
         return Ok(false);
     };
+    let txid = tx.compute_txid();
     let wtxid = tx.compute_wtxid();
-    let announced = session.is_some_and(|s| s.has_announced_wtx(&wtxid));
+    let announced = session.is_some_and(|s| s.has_announced(&s.tx_announcement(txid, wtxid)));
     let last_inv = session.map(|s| s.last_inv_sequence()).unwrap_or(1);
     if announced || mp.is_relay_servable(&wtxid, last_inv) {
-        mp.mark_broadcast(&tx.compute_txid());
+        mp.mark_broadcast(&txid);
         queue_accounted(session, out_tx, NetworkMessage::Tx(tx))?;
         return Ok(true);
     }
@@ -6873,7 +6865,7 @@ pub async fn serve_getdata_wtx(
     if serve_mempool_getdata(hub, out_tx, session, tx)? {
         return Ok(());
     }
-    let announced = session.is_some_and(|s| s.has_announced_wtx(wtxid));
+    let announced = session.is_some_and(|s| s.has_announced(&item));
     if announced {
         if let Some(hash) = hub.tip_hash() {
             if let Some(tx) = tx_from_tip_index(hub, hash, wtxid).await? {
@@ -9157,13 +9149,14 @@ pub fn queue_due_parent_getdata(
 fn note_blocksonly_sender(
     mp: &crate::tx_relay::MempoolHub,
     session: Option<&crate::peers::LivePeer>,
+    txid: bitcoin::Txid,
     wtxid: bitcoin::Wtxid,
 ) {
     if mp.relay_enabled() {
         return;
     }
     if let Some(s) = session {
-        s.note_announced_wtx(wtxid);
+        s.note_announced_tx(txid, wtxid);
     }
 }
 
@@ -9234,7 +9227,7 @@ pub async fn on_tx(
             if trusted {
                 mp.set_trusted_session(from);
             }
-            note_blocksonly_sender(mp, session, wtxid);
+            note_blocksonly_sender(mp, session, txid, wtxid);
             let mp_task = Arc::clone(mp);
             let tx_task = tx.clone();
             let peers = session.and_then(|s| s.peer_hub());

@@ -392,7 +392,7 @@ fn tx_announce_skips_a_tx_gone_from_the_pool() {
     let mp = hub.mempool().expect("mempool");
     let gone = bitcoin::Txid::from_byte_array([0x5a; 32]);
     assert!(!mp.try_contains(&gone));
-    assert_eq!(tx_announce_inv(mp, &gone), None);
+    assert_eq!(tx_announce_wtxid(mp, &gone), None);
 }
 
 /// Core fires the continuation only after it sends the block. A body that is

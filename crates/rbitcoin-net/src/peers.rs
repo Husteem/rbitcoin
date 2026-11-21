@@ -2,11 +2,13 @@
 
 use crate::error::NetError;
 use crate::netaddr::ExternalEndpoint;
+use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::address::{AddrV2Message, Address};
 use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
-use bitcoin::{BlockHash, Wtxid};
+use bitcoin::{BlockHash, Txid, Wtxid};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
@@ -109,9 +111,11 @@ impl PeerOut {
 /// One peer's tx-INV state (`LivePeer::tx_inv`). The lock is a leaf: no
 /// mempool, hub, `live`, or writer call runs while it is held.
 struct TxInvState {
-    /// Wtxids we INV'd to this peer. GetData for a live mempool tx is
-    /// answered only if announced here or the tx is reorg-servable.
-    announced: CappedSet<Wtxid>,
+    /// The hash each tx INV to this peer carried: wtxid after `wtxidrelay`,
+    /// else txid, as Core keys `m_tx_inventory_known_filter`. GetData for a
+    /// live mempool tx is answered only if announced here or the tx is
+    /// reorg-servable.
+    announced: CappedSet<[u8; 32]>,
     /// Mempool sequence at last tx INV (starts at 1).
     last_inv_sequence: u64,
     /// Queued tx INV hashes not yet sent.
@@ -134,6 +138,16 @@ impl TxInvState {
             tx_inv_requested: false,
             age_inv_seen: (0, 0),
         }
+    }
+}
+
+fn tx_inv_hash(inv: &Inventory) -> Option<[u8; 32]> {
+    match inv {
+        Inventory::WTx(wtxid) => Some(wtxid.to_byte_array()),
+        Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+            Some(txid.to_byte_array())
+        }
+        _ => None,
     }
 }
 
@@ -1207,24 +1221,37 @@ impl LivePeer {
         sent != 0 && self.clock_now().saturating_sub(sent) <= HEADERS_RESPONSE_TIME_SECS
     }
 
-    pub fn note_announced_wtx(&self, wtxid: Wtxid) {
-        let _ = self.claim_announced_wtx(wtxid);
-    }
-
-    /// `true` when this call recorded `wtxid`. A flush and an announce can
-    /// both pass a separate `has_announced_wtx` check; only the claim that
-    /// wins may queue the INV.
-    pub fn claim_announced_wtx(&self, wtxid: Wtxid) -> bool {
-        let mut g = self.tx_inv();
-        if g.announced.contains(&wtxid) {
-            return false;
+    /// BIP339: a peer that sent `wtxidrelay` hears of a tx by wtxid
+    /// (`MSG_WTX`), any other peer by txid (`MSG_TX`).
+    pub fn tx_announcement(&self, txid: Txid, wtxid: Wtxid) -> Inventory {
+        if self.wtxid_relay() {
+            Inventory::WTx(wtxid)
+        } else {
+            Inventory::Transaction(txid)
         }
-        g.announced.insert(wtxid, 50_000);
-        true
     }
 
-    pub fn has_announced_wtx(&self, wtxid: &Wtxid) -> bool {
-        self.tx_inv().announced.contains(wtxid)
+    pub fn note_announced_tx(&self, txid: Txid, wtxid: Wtxid) {
+        let _ = self.claim_announced_tx(txid, wtxid);
+    }
+
+    /// The INV to send when this call recorded the tx. A flush and an
+    /// announce can both pass a separate `has_announced` check; only the
+    /// claim that wins may queue the INV.
+    pub fn claim_announced_tx(&self, txid: Txid, wtxid: Wtxid) -> Option<Inventory> {
+        let inv = self.tx_announcement(txid, wtxid);
+        let hash = tx_inv_hash(&inv)?;
+        let mut g = self.tx_inv();
+        if g.announced.contains(&hash) {
+            return None;
+        }
+        g.announced.insert(hash, 50_000);
+        Some(inv)
+    }
+
+    /// `inv` names a tx by a hash this peer was sent in a tx INV.
+    pub fn has_announced(&self, inv: &Inventory) -> bool {
+        tx_inv_hash(inv).is_some_and(|hash| self.tx_inv().announced.contains(&hash))
     }
 
     fn tx_inv(&self) -> std::sync::MutexGuard<'_, TxInvState> {

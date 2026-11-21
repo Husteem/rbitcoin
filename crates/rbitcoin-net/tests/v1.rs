@@ -1,3 +1,4 @@
+use crate::Admit;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
@@ -97,12 +98,17 @@ async fn closed(s: &mut TcpStream) {
 }
 
 async fn v1_handshake(v1_bind: SocketAddr) -> TcpStream {
-    v1_handshake_split(v1_bind, &[]).await
+    v1_handshake_split(v1_bind, &[], &[]).await
 }
 
 /// A v1 handshake whose `version` frame is cut at `cuts`, with a pause longer
 /// than the handshake read's 50 ms poll after each piece but the last.
-async fn v1_handshake_split(v1_bind: SocketAddr, cuts: &[usize]) -> TcpStream {
+/// `features` (such as `wtxidrelay`) go out after `version`, before `verack`.
+async fn v1_handshake_split(
+    v1_bind: SocketAddr,
+    cuts: &[usize],
+    features: &[NetworkMessage],
+) -> TcpStream {
     let mut s = TcpStream::connect(v1_bind).await.unwrap();
     let ours = s.local_addr().unwrap();
     let version = v1_frame(Magic::REGTEST, v1_version(v1_bind, ours));
@@ -113,6 +119,11 @@ async fn v1_handshake_split(v1_bind: SocketAddr, cuts: &[usize]) -> TcpStream {
         from = cut;
     }
     s.write_all(&version[from..]).await.unwrap();
+    for feature in features {
+        s.write_all(&v1_frame(Magic::REGTEST, feature.clone()))
+            .await
+            .unwrap();
+    }
     let (theirs, _) = v1_until(&mut s, |m| matches!(m, NetworkMessage::Version(_))).await;
     let NetworkMessage::Version(theirs) = theirs else {
         unreachable!()
@@ -170,7 +181,7 @@ async fn p2p_v1_wallet_sync_listener() {
         closed_silently(&mut primary).await;
 
         // Cut inside the header and inside the body.
-        let mut wallet = v1_handshake_split(v1_bind, &[20, 34]).await;
+        let mut wallet = v1_handshake_split(v1_bind, &[20, 34], &[]).await;
         let (pong, _) = {
             wallet
                 .write_all(&v1_frame(Magic::REGTEST, NetworkMessage::Ping(7)))
@@ -317,4 +328,154 @@ async fn p2p_v1_wallet_sync_listener() {
     tokio::time::timeout(Duration::from_secs(30), fut)
         .await
         .expect("p2p_v1_wallet_sync_listener wall");
+}
+
+/// A pong for `nonce` proves the session loop runs, and so hears mempool
+/// announces.
+async fn v1_ping(s: &mut TcpStream, nonce: u64) {
+    s.write_all(&v1_frame(Magic::REGTEST, NetworkMessage::Ping(nonce)))
+        .await
+        .unwrap();
+    let (pong, _) = v1_until(s, |m| matches!(m, NetworkMessage::Pong(_))).await;
+    assert!(
+        matches!(pong, NetworkMessage::Pong(n) if n == nonce),
+        "{pong:?}"
+    );
+}
+
+/// The first `inv` that names `tx` by txid or wtxid, whatever its type.
+async fn v1_tx_inv(s: &mut TcpStream, tx: &bitcoin::Transaction) -> Vec<Inventory> {
+    let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+    let (inv, _) = v1_until(s, |m| match m {
+        NetworkMessage::Inv(inv) => inv.iter().any(|i| match i {
+            Inventory::Transaction(t) | Inventory::WitnessTransaction(t) => *t == txid,
+            Inventory::WTx(w) => *w == wtxid,
+            _ => false,
+        }),
+        _ => false,
+    })
+    .await;
+    let NetworkMessage::Inv(inv) = inv else {
+        unreachable!()
+    };
+    inv
+}
+
+async fn v1_getdata_tx(s: &mut TcpStream, item: Inventory) -> bitcoin::Transaction {
+    s.write_all(&v1_frame(
+        Magic::REGTEST,
+        NetworkMessage::GetData(vec![item]),
+    ))
+    .await
+    .unwrap();
+    let (tx, _) = v1_until(s, |m| {
+        matches!(m, NetworkMessage::Tx(_) | NetworkMessage::NotFound(_))
+    })
+    .await;
+    match tx {
+        NetworkMessage::Tx(tx) => tx,
+        other => panic!("getdata {item:?} answered {other:?}"),
+    }
+}
+
+/// BIP339: a peer that never sent `wtxidrelay` (bitcoinj, protocol 70013)
+/// hears of a tx as `MSG_TX` by txid and fetches it by txid. Only a peer that
+/// sent `wtxidrelay` hears `MSG_WTX` by wtxid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2p_v1_tx_inv_follows_wtxidrelay() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    let fut = async {
+        let dir = rbitcoin_query::testutil::TempDir::labeled("v1-tx-inv").unwrap();
+        let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
+        let mut node = rbitcoin_net::P2PNode::start_with_agent(
+            "127.0.0.1:0".parse().unwrap(),
+            q,
+            ChainParams::regtest(),
+            Milestone::NONE,
+            "/rbitcoin:test/".into(),
+            rbitcoin_net::DEFAULT_MAX_INBOUND,
+            rbitcoin_net::REDIAL_INTERVAL_TEST,
+        )
+        .await
+        .unwrap();
+        node.hub.set_max_tip_age_secs(u64::MAX);
+        let mp = rbitcoin_net::tx_relay::MempoolHub::open(
+            dir.path().join("mp"),
+            std::sync::Arc::clone(&node.hub.query),
+        )
+        .unwrap();
+        mp.set_relay_enabled(true);
+        assert!(node.hub.attach_mempool(std::sync::Arc::clone(&mp)).is_ok());
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        let p2wsh = ScriptBuf::new_p2wsh(&op_true.wscript_hash());
+        node.hub
+            .generate_to_script(1, p2wsh.clone(), vec![])
+            .unwrap();
+        node.hub.confirm_empty_regtest(100).unwrap();
+        let cb = node
+            .hub
+            .query
+            .reconstruct_block_at_height(rbitcoin_primitives::Height(1))
+            .unwrap()
+            .txdata[0]
+            .clone();
+        let v1_bind = node
+            .add_listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let mut perms = NetPermTable::default();
+        perms
+            .whitebind
+            .push(parse_whitebind(&format!("v1,noban@{v1_bind}")).unwrap());
+        node.peers.set_net_perms(perms);
+
+        let mut legacy = v1_handshake(v1_bind).await;
+        let mut modern = v1_handshake_split(v1_bind, &[], &[NetworkMessage::WtxidRelay]).await;
+        v1_ping(&mut legacy, 1).await;
+        v1_ping(&mut modern, 2).await;
+
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: cb.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::from_slice(&[op_true.as_bytes()]),
+            }],
+            output: vec![TxOut {
+                value: cb.output[0].value - Amount::from_sat(10_000),
+                script_pubkey: p2wsh,
+            }],
+        };
+        let (txid, wtxid) = (spend.compute_txid(), spend.compute_wtxid());
+        assert_ne!(txid.to_byte_array(), wtxid.to_byte_array());
+        mp.admit(&spend).expect("segwit spend enters the pool");
+
+        assert_eq!(
+            v1_tx_inv(&mut legacy, &spend).await,
+            vec![Inventory::Transaction(txid)],
+            "a peer without wtxidrelay hears MSG_TX by txid"
+        );
+        assert_eq!(
+            v1_tx_inv(&mut modern, &spend).await,
+            vec![Inventory::WTx(wtxid)],
+            "a wtxidrelay peer hears MSG_WTX by wtxid"
+        );
+
+        let served = v1_getdata_tx(&mut legacy, Inventory::WitnessTransaction(txid)).await;
+        assert_eq!(served, spend, "MSG_WITNESS_TX serves the witness");
+        let served = v1_getdata_tx(&mut modern, Inventory::WTx(wtxid)).await;
+        assert_eq!(served, spend);
+        node.shutdown().await;
+    };
+    tokio::time::timeout(Duration::from_secs(30), fut)
+        .await
+        .expect("p2p_v1_tx_inv_follows_wtxidrelay wall");
 }
