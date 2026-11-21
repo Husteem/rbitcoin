@@ -637,7 +637,8 @@ pub struct Query {
     pub block_queue: Mutex<rbitcoin_store::BlockQueue>,
     /// Lookup's decoded wires. Getdata enqueue and `has_hash` never lock this.
     pub bq_resolved: Mutex<HashMap<u32, ResolvedWire>>,
-    /// Last soft-assign restricted flag (over free-byte floor; cache for meters).
+    /// Last soft-assign restricted flag (over free-byte floor). Debug builds only.
+    #[cfg(debug_assertions)]
     pub block_queue_pressure: AtomicBool,
     /// Last 1-min confirm window (`bq soft=n/win` `win`). 0 = rate unknown.
     pub soft_confirm_window: AtomicU32,
@@ -648,6 +649,8 @@ pub struct Query {
     /// Highest height whose TipOnly **started** (`u32::MAX` = none).
     pub lookup_started_hi: AtomicU32,
     /// Max height whose Class A append committed (`u32::MAX` = none).
+    /// Debug builds only.
+    #[cfg(debug_assertions)]
     pub class_a_hi: AtomicU32,
     /// Post-IBD SH SEAL + leftover-run discard (unsorted collect is tip finalize).
     pub sh_run: sh_builder::ShRunBuilder,
@@ -690,6 +693,8 @@ pub struct Query {
     /// Avoids O(tip) header walks on Esplora/P2P `height_of_hash`.
     pub height_by_hash: std::sync::RwLock<HeightByHashIndex>,
     /// `reconstruct_archived_block` calls (`/raw` and Esplora size/weight).
+    /// Debug builds only.
+    #[cfg(debug_assertions)]
     pub reconstruct_archived: AtomicU64,
     /// Network genesis coinbase txid ([`Self::set_genesis_coinbase_txid`]).
     pub genesis_coinbase_txid: std::sync::OnceLock<[u8; 32]>,
@@ -709,7 +714,8 @@ pub struct Query {
     /// Unpaged SH join overlap by kind. Tests only.
     #[cfg(debug_assertions)]
     pub sh_join_probe: crate::scripthash::ShJoinProbe,
-    /// Packed `tx.body` bytes read by [`Self::load_thin_tweaks`].
+    /// Packed `tx.body` bytes read by [`Self::load_thin_tweaks`]. Debug builds only.
+    #[cfg(debug_assertions)]
     pub thin_tweak_body_bytes: AtomicU64,
     /// Max fk `head_insert_many` has published (0 = never). Load polls this
     /// with the fence to prune in-flight **after** bind.
@@ -1029,10 +1035,12 @@ impl Query {
             disconnected: std::sync::Mutex::new(std::collections::HashSet::new()),
             block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(&store_path)?),
             bq_resolved: Mutex::new(HashMap::new()),
+            #[cfg(debug_assertions)]
             block_queue_pressure: AtomicBool::new(false),
             soft_confirm_window: AtomicU32::new(0),
             lookup_taken: AtomicU64::new(u32::MAX as u64),
             lookup_started_hi: AtomicU32::new(u32::MAX),
+            #[cfg(debug_assertions)]
             class_a_hi: AtomicU32::new(u32::MAX),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
             // Library default: SH on (tests / enter_direct). Node sets false for
@@ -1054,6 +1062,7 @@ impl Query {
             #[cfg(debug_assertions)]
             header_read_cancel: std::sync::atomic::AtomicBool::new(false),
             height_by_hash: std::sync::RwLock::new(HeightByHashIndex::default()),
+            #[cfg(debug_assertions)]
             reconstruct_archived: AtomicU64::new(0),
             genesis_coinbase_txid: std::sync::OnceLock::new(),
             genesis_coinbase_fk: std::sync::OnceLock::new(),
@@ -1065,6 +1074,7 @@ impl Query {
             heavy_sh_join: Mutex::new(()),
             #[cfg(debug_assertions)]
             sh_join_probe: crate::scripthash::ShJoinProbe::default(),
+            #[cfg(debug_assertions)]
             thin_tweak_body_bytes: AtomicU64::new(0),
             head_drain_fk: AtomicU64::new(head_drained),
             disconnect_height: AtomicU32::new(0),
@@ -2061,6 +2071,7 @@ impl Query {
         };
         self.set_lookup_taken_hi(rewind);
         self.set_lookup_started_hi(rewind);
+        #[cfg(debug_assertions)]
         self.set_class_a_hi(rewind);
         self.block_queue_drop_resolved_from(height);
     }
@@ -2202,6 +2213,7 @@ impl Query {
     }
 
     /// Sample-and-reset archived wire-block reconstructs (Esplora `/raw` vs summary).
+    #[cfg(debug_assertions)]
     pub fn sample_reset_reconstruct_archived(&self) -> u64 {
         self.reconstruct_archived.swap(0, AtomicOrdering::Relaxed)
     }
@@ -2253,16 +2265,19 @@ impl Query {
             .unwrap_or_else(|e| e.into_inner()) = Arc::new(tokio::sync::Semaphore::new(n));
     }
 
+    #[cfg(debug_assertions)]
     pub fn note_reconstruct_archived(&self) {
         self.reconstruct_archived
             .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     /// Sample-and-reset packed body bytes read by thin BIP-352 serve.
+    #[cfg(debug_assertions)]
     pub fn sample_reset_thin_tweak_body_bytes(&self) -> u64 {
         self.thin_tweak_body_bytes.swap(0, AtomicOrdering::Relaxed)
     }
 
+    #[cfg(debug_assertions)]
     pub fn note_thin_tweak_body_bytes(&self, n: u64) {
         if n > 0 {
             self.thin_tweak_body_bytes
@@ -2405,6 +2420,7 @@ impl Query {
         );
         let depth_bytes = self.block_queue.lock().unwrap().bytes();
         let restricted = soft_assign_restricted(depth_bytes);
+        #[cfg(debug_assertions)]
         self.block_queue_pressure
             .store(restricted, AtomicOrdering::Relaxed);
         restricted
@@ -2474,6 +2490,7 @@ impl Query {
         self.set_lookup_started_hi(Some(next));
     }
 
+    #[cfg(debug_assertions)]
     pub fn class_a_hi(&self) -> Option<u32> {
         let h = self.class_a_hi.load(AtomicOrdering::Acquire);
         if h == u32::MAX {
@@ -2483,6 +2500,7 @@ impl Query {
         }
     }
 
+    #[cfg(debug_assertions)]
     pub fn set_class_a_hi(&self, hi: Option<u32>) {
         self.class_a_hi
             .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
@@ -2529,6 +2547,7 @@ impl Query {
     }
 
     /// Current soft-assign restricted flag (over free-byte floor).
+    #[cfg(debug_assertions)]
     pub fn block_queue_soft_pressure(&self) -> bool {
         self.block_queue_pressure.load(AtomicOrdering::Relaxed)
     }

@@ -740,6 +740,7 @@ impl Query {
                     }
                     Ok(())
                 })?;
+            #[cfg(debug_assertions)]
             self.note_thin_tweak_body_bytes(span_len);
             loc
         };

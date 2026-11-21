@@ -455,6 +455,7 @@ impl Query {
     }
 
     pub fn reconstruct_archived_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, QueryError> {
+        #[cfg(debug_assertions)]
         self.note_reconstruct_archived();
         if let Some(h) = self.height_of_hash(hash)? {
             self.require_seqsigwit_at(h)?;
@@ -486,6 +487,7 @@ impl Query {
         let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
             return Ok(None);
         };
+        #[cfg(debug_assertions)]
         self.note_reconstruct_archived();
         let block = self.reconstruct_archived_block_from_parts(rec, tx_fks)?;
         let size = u32::try_from(block.total_size())

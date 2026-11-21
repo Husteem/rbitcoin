@@ -264,6 +264,7 @@ pub fn apply_archive_plan(
         return Err(e);
     }
     ns.ensure_ns = t_ens.elapsed().as_nanos() as u64;
+    #[cfg(debug_assertions)]
     if let Some(last) = batch.prepared.last() {
         query.set_class_a_hi(Some(last.height.0));
     }
