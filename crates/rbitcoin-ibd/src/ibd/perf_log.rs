@@ -98,8 +98,7 @@ pub struct WriteStageSample {
     /// Write-thread pin Arc copies: plan take + create-pin FkMap (`pins=`)
     pub pins_ms: u64,
     pub pins_ns: u64,
-    /// Inline `head_insert_queued` on the write thread (`head_sub=`).
-    /// Includes a seal the insert waits for.
+    /// `take_pending_queued` + `submit_head_insert` (`head_sub=`)
     pub head_sub_ms: u64,
     pub head_sub_ns: u64,
     /// `class_c_commit` join/flush minus tables (`class_c_join=`)
@@ -108,7 +107,8 @@ pub struct WriteStageSample {
     /// Commit wait for the previous batch's background tip flush (`tip_flush_wait=`)
     pub tip_flush_wait_ms: u64,
     pub tip_flush_wait_ns: u64,
-    /// Former background-insert join (`drain_join=`). The insert is `head_sub`.
+    /// Residual `head_insert_queued` join after Class C (`drain_join=`).
+    /// Includes seal-sidecar collect of `txid.body` keys plus fuse/MPHF build.
     pub drain_join_ms: u64,
     pub drain_join_ns: u64,
     /// Body-queue dequeue after confirm (`dequeue=`)
