@@ -1142,7 +1142,9 @@ impl CappedAccept for tokio::net::UnixListener {
 /// A pending response write is cancelled after `timeout` without progress.
 /// Reads keep their header/idle deadline; this bounds only the write side, so
 /// a client that stops reading cannot hold the connection and its accept slot
-/// until the process drops it.
+/// until the process drops it. It is not a total response budget: a reader
+/// that accepts a few bytes before each deadline keeps a large response open.
+/// See #1884.
 struct WriteDeadline<S> {
     inner: S,
     timeout: Duration,

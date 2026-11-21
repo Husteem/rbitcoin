@@ -206,7 +206,7 @@ surface: [`COMPAT.md`](../../COMPAT.md).
 ```
 
 Conf: `sh_index=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
-Leave `--max-sh-creates` at **10000** (or **0** for an unlimited unpaged join) for explorer backends. A short page still stops at the page; a full newest-first page takes the cap.
+For explorer backends, keep `--max-sh-creates` at **10000** unless the public listener must serve the first newest-first page of an address with more creates than that: such an address needs a cap above its create count, or **0**. A short page still stops at the page; a full newest-first page takes the cap. The unix `/internal/*` totals and history routes stay available above the cap to the trusted local process.
 An explorer on the unix socket can read one script's totals above the cap with
 `GET /internal/address/:address` or `/internal/scripthash/:hash`, and its
 whole confirmed history with the same paths plus `/history`, without

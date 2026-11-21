@@ -245,7 +245,9 @@ any caller that sets a limit) is served when the page closes before reading
 every create. A newest-first page that reaches its full limit reads every
 create at or below the page bound, and an Electrum `from_height` window reads
 every create to match spends in that window; both take the same cap and
-heavy-join turn as an unpaged join.
+heavy-join turn as an unpaged join. An explorer that must page a busy address
+above the cap needs a higher `--max-sh-creates` or **0**; without that, the
+first full newest-first page is refused even when its newest rows are recent.
 
 On the Esplora unix socket, `GET /internal/address/:address` and
 `GET /internal/scripthash/:hash` answer the totals of `/address/:address` and
