@@ -450,16 +450,14 @@ fn layout_publish_releases_the_superseded_snapshot() {
         1,
         "pin kept the insert layout"
     );
-    assert_eq!(
-        Arc::strong_count(&with_body),
-        1,
-        "pin kept the body-only layout"
-    );
     assert_eq!(inserted.body_range, None);
-    assert_eq!(with_body.spent_range, None);
     let now = pin.load_layout();
+    assert!(
+        Arc::ptr_eq(&with_body, &now),
+        "the spent range is not a layout publish"
+    );
     assert_eq!(now.body_range, Some((100, 50)));
-    assert_eq!(now.spent_range, Some((1000, 24)));
+    assert_eq!(bp.get_spender_abs(Fk(1), 0), Some(1000));
     bp.set_body_range_only(Fk(1), (100, 50));
     bp.set_spent_range_only(Fk(1), (1000, 24));
     assert!(
@@ -737,4 +735,57 @@ fn has_layout_helpers_null_and_missing() {
     assert!(bp.get_parent_tx(Fk::NULL).is_none());
     assert!(bp.get_parent_coinbase(Fk::NULL).is_none());
     assert!(bp.get_body_range(Fk::NULL).is_none());
+}
+
+/// A create's spent range is fixed at its Class A append, so setting it does
+/// not publish a new layout snapshot (no `spender_rels` clone), and spend
+/// slots resolve from it without the layout half.
+#[test]
+fn spent_range_does_not_republish_the_layout() {
+    let mut bp = BatchParents::new();
+    bp.insert_owned(
+        Fk(1),
+        tx(1),
+        vec![(0, out(10)), (1, out(11))],
+        vec![0, 1],
+        Some(false),
+        Some((100, 50)),
+        vec![(0, SPENDER_REL_UNKNOWN), (1, SPENDER_REL_UNKNOWN)],
+    );
+    let pin = Arc::clone(bp.pins.get(&1).unwrap());
+    let layout = pin.load_layout();
+    assert!(!bp.has_abs_layout(Fk(1)));
+    bp.set_spent_range_only(Fk(1), (1000, 16));
+    assert!(
+        Arc::ptr_eq(&pin.load_layout(), &layout),
+        "the spent range republished the layout"
+    );
+    assert!(bp.has_abs_layout(Fk(1)));
+    assert_eq!(bp.get_spender_abs(Fk(1), 1), Some(1008));
+    assert!(bp.get_spender_abs(Fk(1), 2).is_none());
+}
+
+/// A later batch's pin for the same create brings its spent range along when
+/// the write batch absorbs it, so the kept pin needs no loc read for it.
+#[test]
+fn extend_from_carries_the_spent_range() {
+    let pin = |bp: &mut BatchParents| {
+        bp.insert_owned(
+            Fk(1),
+            tx(1),
+            vec![(0, out(10))],
+            vec![0],
+            Some(false),
+            Some((100, 50)),
+            vec![(0, SPENDER_REL_UNKNOWN)],
+        );
+    };
+    let mut kept = BatchParents::new();
+    pin(&mut kept);
+    let mut later = BatchParents::new();
+    pin(&mut later);
+    later.set_spent_range_only(Fk(1), (2000, 8));
+    kept.extend_from(later);
+    assert!(kept.has_abs_layout(Fk(1)));
+    assert_eq!(kept.get_spender_abs(Fk(1), 0), Some(2000));
 }
