@@ -232,15 +232,45 @@ pub enum ConfirmQuiesce {
     Refund,
 }
 
+/// Folds every 8-byte word of a key with a rotate and a multiply: a few
+/// operations per block hash instead of SipHash over 32 bytes on the
+/// per-second hygiene and assign walks. Every word counts, so hashes that
+/// share a prefix (test fixtures, partial collisions) still spread.
+#[derive(Default, Clone, Copy)]
+pub struct BlockHashHasher(u64);
+
+impl std::hash::Hasher for BlockHashHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0 ^ u64::from_le_bytes(word))
+                .rotate_left(29)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Block-hash keyed map with [`BlockHashHasher`].
+pub type BlockHashMap<V> = HashMap<BlockHash, V, std::hash::BuildHasherDefault<BlockHashHasher>>;
+/// Block-hash keyed set with [`BlockHashHasher`].
+pub type BlockHashSet = HashSet<BlockHash, std::hash::BuildHasherDefault<BlockHashHasher>>;
+
 /// Core mutable state for the IBD event loop.
 pub struct IbdWorkState {
     pub slots: Vec<PeerSlot>,
     /// Unique hashes with outstanding getdata (1 peer normally; tip-hole races ≤4).
-    pub inflight: HashMap<BlockHash, InflightReq>,
+    pub inflight: BlockHashMap<InflightReq>,
     /// Chain-order download path after local tip (front ≈ next to confirm).
     pub ordered: VecDeque<BlockHash>,
-    pub ordered_set: HashSet<BlockHash>,
-    pub hash_height: HashMap<BlockHash, u32>,
+    pub ordered_set: BlockHashSet,
+    pub hash_height: BlockHashMap<u32>,
     /// Inverse of [`Self::hash_height`] for O(1) tip+1‥ confirm offers.
     ///
     /// Dense from the lowest occupant to the highest. Per-second hygiene
@@ -249,11 +279,11 @@ pub struct IbdWorkState {
     pub height_to_hash: HeightIndex,
     /// Parent hash recorded when the header was admitted. The orchestration
     /// loop uses this instead of reading the header store.
-    pub path_prev: HashMap<BlockHash, BlockHash>,
-    pub known_headers: HashSet<BlockHash>,
+    pub path_prev: BlockHashMap<BlockHash>,
+    pub known_headers: BlockHashSet,
     pub body: BodyPresence,
     /// header hash → Class A header fk (from getheaders; Block path skips store).
-    pub header_fks: HashMap<BlockHash, Fk>,
+    pub header_fks: BlockHashMap<Fk>,
     /// Best peer-advertised tip (version.start_height + learned header heights).
     pub max_peer_height: u32,
     /// Highest claim-ready / offered body height on the work path (body queue
@@ -359,8 +389,8 @@ impl IbdWorkState {
     }
 
     pub fn new(slots: Vec<PeerSlot>, tip_hash: Option<BlockHash>, tip_height: Option<u32>) -> Self {
-        let mut known_headers = HashSet::new();
-        let mut hash_height = HashMap::new();
+        let mut known_headers = BlockHashSet::default();
+        let mut hash_height = BlockHashMap::default();
         let mut max_peer_height = tip_height.unwrap_or(0);
         if let Some(h) = tip_hash {
             known_headers.insert(h);
@@ -374,11 +404,11 @@ impl IbdWorkState {
         let start_tip = tip_height.unwrap_or(0);
         Self {
             slots,
-            inflight: HashMap::new(),
+            inflight: BlockHashMap::default(),
             ordered: VecDeque::new(),
-            ordered_set: HashSet::new(),
+            ordered_set: BlockHashSet::default(),
             hash_height,
-            path_prev: HashMap::new(),
+            path_prev: BlockHashMap::default(),
             height_to_hash: {
                 let mut m = HeightIndex::default();
                 if let (Some(h), Some(th)) = (tip_hash, tip_height) {
@@ -388,7 +418,7 @@ impl IbdWorkState {
             },
             known_headers,
             body: BodyPresence::new(),
-            header_fks: HashMap::new(),
+            header_fks: BlockHashMap::default(),
             max_peer_height,
             max_ready_height: start_tip,
             max_ordered_height: start_tip,

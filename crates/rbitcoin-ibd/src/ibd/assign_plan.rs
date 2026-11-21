@@ -1,7 +1,7 @@
 //! Pure ordered-path helpers (no peer IO).
 
 use bitcoin::BlockHash;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 /// Mark `h` done in the ordered set. Prefer O(1) front pop; otherwise leave a
 /// stale ordered entry. Ghosts (removed from set but still in the deque) are
@@ -10,9 +10,9 @@ use std::collections::{HashSet, VecDeque};
 /// **Ghosts:** middle removes only update `ordered_set`. Entries may remain in
 /// the deque until front-trim or [`compact_ordered`]. Scans that walk `ordered`
 /// should skip hashes not in `ordered_set` (or use set membership).
-pub fn remove_from_ordered(
+pub fn remove_from_ordered<S: std::hash::BuildHasher>(
     ordered: &mut VecDeque<BlockHash>,
-    ordered_set: &mut HashSet<BlockHash>,
+    ordered_set: &mut std::collections::HashSet<BlockHash, S>,
     h: BlockHash,
 ) {
     ordered_set.remove(&h);
@@ -30,7 +30,10 @@ pub fn remove_from_ordered(
 /// Rebuild `ordered` to match `ordered_set` (drop middle ghosts).
 ///
 /// Cheap no-op when the deque is not much larger than the live set.
-pub fn compact_ordered(ordered: &mut VecDeque<BlockHash>, ordered_set: &HashSet<BlockHash>) {
+pub fn compact_ordered<S: std::hash::BuildHasher>(
+    ordered: &mut VecDeque<BlockHash>,
+    ordered_set: &std::collections::HashSet<BlockHash, S>,
+) {
     let len = ordered.len();
     if len <= 64 {
         return;

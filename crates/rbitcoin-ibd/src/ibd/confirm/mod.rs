@@ -3378,10 +3378,10 @@ pub fn spawn_confirm_engine(
 ///
 /// Uses `height_to_hash` for **O(OFFER_AHEAD)** work — never scans the full
 /// ordered path (that pegged a core at ~130k headers with tip frozen).
-pub fn offer_confirm_ready(
+pub fn offer_confirm_ready<S: std::hash::BuildHasher>(
     feed: &ConfirmFeed,
     height_to_hash: &impl HeightOccupants,
-    prev_of: &HashMap<BlockHash, BlockHash>,
+    prev_of: &std::collections::HashMap<BlockHash, BlockHash, S>,
     body: &mut BodyPresence,
     hub: &ChainHub,
     max_ready_height: &mut u32,

@@ -23,7 +23,6 @@ use rbitcoin_net::chain::ChainHub;
 use rbitcoin_net::codec::MAX_HEADERS_RESULTS;
 use rbitcoin_net::error::NetError;
 use rbitcoin_net::seeds::AddrMan;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -1917,8 +1916,8 @@ pub fn try_apply_exploration(st: &mut IbdWorkState, hub: &rbitcoin_net::chain::C
     }
 }
 
-pub fn parent_height(
-    hash_height: &HashMap<BlockHash, u32>,
+pub fn parent_height<S: std::hash::BuildHasher>(
+    hash_height: &std::collections::HashMap<BlockHash, u32, S>,
     hub: &ChainHub,
     prev: BlockHash,
 ) -> Option<u32> {

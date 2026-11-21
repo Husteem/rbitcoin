@@ -2,7 +2,6 @@
 
 use bitcoin::BlockHash;
 use rbitcoin_net::chain::ChainHub;
-use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// O(1) occupancy of each [`BodyPresence`] set (for `ibd: sizes` logs).
@@ -52,9 +51,9 @@ impl Slot {
 ///
 /// `rejected` covers Class C permanent failures: never re-offer or re-download.
 pub struct BodyPresence {
-    slots: HashMap<BlockHash, Slot>,
+    slots: crate::ibd::state::BlockHashMap<Slot>,
     /// Pending hashes only, so a stale check does not walk archived rows.
-    pending_keys: HashSet<BlockHash>,
+    pending_keys: crate::ibd::state::BlockHashSet,
     known: usize,
     pending: usize,
     missing: usize,
@@ -70,8 +69,8 @@ impl Default for BodyPresence {
 impl BodyPresence {
     pub fn new() -> Self {
         Self {
-            slots: HashMap::new(),
-            pending_keys: HashSet::new(),
+            slots: Default::default(),
+            pending_keys: Default::default(),
             known: 0,
             pending: 0,
             missing: 0,

@@ -516,9 +516,9 @@ pub fn ibd_header_locator(
 /// Mark `peer` dead and drop it from every hash it holds. Returns the hashes
 /// no other peer still holds: they are no longer requested and need
 /// [`super::state::IbdWorkState::reopen_for_densify`].
-pub fn release_peer_block_work(
+pub fn release_peer_block_work<S: std::hash::BuildHasher>(
     slots: &mut [PeerSlot],
-    inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    inflight: &mut std::collections::HashMap<bitcoin::BlockHash, super::state::InflightReq, S>,
     body: &mut super::body::BodyPresence,
     peer: usize,
 ) -> Vec<bitcoin::BlockHash> {
@@ -532,8 +532,8 @@ pub fn release_peer_block_work(
 
 /// Drop `peer` from each of `owed`. A disconnect and a manual-peer pause
 /// both release through here.
-fn release_block_requests(
-    inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+fn release_block_requests<S: std::hash::BuildHasher>(
+    inflight: &mut std::collections::HashMap<bitcoin::BlockHash, super::state::InflightReq, S>,
     body: &mut super::body::BodyPresence,
     peer: usize,
     owed: Vec<bitcoin::BlockHash>,
@@ -751,9 +751,9 @@ pub fn note_misbehavior_dead(
 /// This lock-holding form is what the stall tests drive.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-pub fn disconnect_stalled_block_peers(
+pub fn disconnect_stalled_block_peers<S: std::hash::BuildHasher>(
     slots: &mut [PeerSlot],
-    inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    inflight: &mut std::collections::HashMap<bitcoin::BlockHash, super::state::InflightReq, S>,
     body: &mut super::body::BodyPresence,
     addr_cooldown: &mut HashMap<NetAddr, Instant>,
     addr_strikes: &mut HashMap<NetAddr, u8>,
@@ -776,9 +776,9 @@ pub fn disconnect_stalled_block_peers(
 
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-pub fn disconnect_stalled_block_peers_at(
+pub fn disconnect_stalled_block_peers_at<S: std::hash::BuildHasher>(
     slots: &mut [PeerSlot],
-    inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    inflight: &mut std::collections::HashMap<bitcoin::BlockHash, super::state::InflightReq, S>,
     body: &mut super::body::BodyPresence,
     addr_cooldown: &mut HashMap<NetAddr, Instant>,
     addr_strikes: &mut HashMap<NetAddr, u8>,
@@ -884,9 +884,9 @@ pub fn withholding_blocks(slot: &PeerSlot, now_ms: u64, stall_ms: u64) -> bool {
 /// floor; this only cuts peers that keep making slow progress while the bulk
 /// is dramatically faster.
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-pub fn disconnect_relative_slow_block_peers(
+pub fn disconnect_relative_slow_block_peers<S: std::hash::BuildHasher>(
     slots: &mut [PeerSlot],
-    inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    inflight: &mut std::collections::HashMap<bitcoin::BlockHash, super::state::InflightReq, S>,
     body: &mut super::body::BodyPresence,
     addr_cooldown: &mut HashMap<NetAddr, Instant>,
     addr_strikes: &mut HashMap<NetAddr, u8>,
@@ -912,9 +912,9 @@ pub fn disconnect_relative_slow_block_peers(
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-pub fn disconnect_relative_slow_block_peers_at(
+pub fn disconnect_relative_slow_block_peers_at<S: std::hash::BuildHasher>(
     slots: &mut [PeerSlot],
-    inflight: &mut HashMap<bitcoin::BlockHash, super::state::InflightReq>,
+    inflight: &mut std::collections::HashMap<bitcoin::BlockHash, super::state::InflightReq, S>,
     body: &mut super::body::BodyPresence,
     addr_cooldown: &mut HashMap<NetAddr, Instant>,
     addr_strikes: &mut HashMap<NetAddr, u8>,
