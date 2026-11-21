@@ -264,10 +264,10 @@ pub fn is_uring_unavailable(err: &StoreError) -> bool {
 }
 
 #[doc(hidden)]
-pub fn add_wave_cands(n_cands: &mut [usize], cands: &[Vec<Fk>]) -> u64 {
+pub fn add_wave_cands(n_cands: &mut [usize], cands: &[(usize, Vec<Fk>)]) -> u64 {
     let mut n = 0u64;
-    for (i, c) in cands.iter().enumerate() {
-        n_cands[i] = n_cands[i].saturating_add(c.len());
+    for (i, c) in cands {
+        n_cands[*i] = n_cands[*i].saturating_add(c.len());
         n = n.saturating_add(c.len() as u64);
     }
     n
@@ -311,6 +311,11 @@ pub fn resolve_identity_core(
             .head
             .probe_candidates_batch_wave(&mixed, HeadProbeWave::Open, None, &mut ctx)?;
     probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+    let open: Vec<(usize, Vec<Fk>)> = open
+        .into_iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_empty())
+        .collect();
     cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &open));
     id_idx_wave(
         txids,
@@ -330,22 +335,24 @@ pub fn resolve_identity_core(
         cancelled,
     )?;
 
-    if any_unfinished(&picked, &connected, heights) {
+    let mut active: Vec<usize> = (0..txids.len())
+        .filter(|&i| !key_finished(i, &picked, &connected, heights))
+        .collect();
+    if !active.is_empty() {
         let n_segs = table.head.segment_count();
-        let mut active = unfinished_mask(&picked, &connected, heights);
         for si in (0..n_segs).rev() {
             if cancelled() {
                 return Err(StoreError::Cancelled("txid batch"));
             }
-            if !active.iter().any(|on| *on) {
+            if active.is_empty() {
                 break;
             }
             let t_probe = Instant::now();
             let cands = table
                 .head
-                .probe_sealed_segment(&mixed, si, Some(&active), &mut ctx)?;
+                .probe_sealed_segment(&mixed, si, &active, &mut ctx)?;
             probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-            if cands.iter().all(|c| c.is_empty()) {
+            if cands.is_empty() {
                 continue;
             }
             cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &cands));
@@ -366,9 +373,7 @@ pub fn resolve_identity_core(
                 &mut had_id,
                 cancelled,
             )?;
-            for (i, on) in active.iter_mut().enumerate() {
-                *on = !key_finished(i, &picked, &connected, heights);
-            }
+            active.retain(|&i| !key_finished(i, &picked, &connected, heights));
         }
     }
 
@@ -458,26 +463,6 @@ pub fn key_finished(
     }
 }
 
-#[doc(hidden)]
-pub fn any_unfinished(
-    picked: &[Option<Fk>],
-    connected: &[bool],
-    heights: Option<&HeightFence>,
-) -> bool {
-    (0..picked.len()).any(|i| !key_finished(i, picked, connected, heights))
-}
-
-#[doc(hidden)]
-pub fn unfinished_mask(
-    picked: &[Option<Fk>],
-    connected: &[bool],
-    heights: Option<&HeightFence>,
-) -> Vec<bool> {
-    (0..picked.len())
-        .map(|i| !key_finished(i, picked, connected, heights))
-        .collect()
-}
-
 #[allow(clippy::too_many_arguments)] // IO/session args stay unbundled
 /// Sidefile ID (at most two page-grouped shots) then BIP30 match.
 ///
@@ -491,7 +476,7 @@ pub fn unfinished_mask(
 #[doc(hidden)]
 pub fn id_idx_wave(
     txids: &[[u8; 32]],
-    cands_by_key: &[Vec<Fk>],
+    cands_by_key: &[(usize, Vec<Fk>)],
     side: &TxidBody,
     picked: &mut [Option<Fk>],
     connected: &mut [bool],
@@ -514,10 +499,10 @@ pub fn id_idx_wave(
     let mut skip = vec![false; n];
     let mut started = vec![false; n];
     let mut key_miss = vec![0u64; n];
-    for ki in 0..n {
-        let done = key_finished(ki, picked, connected, heights);
-        skip[ki] = done;
-        started[ki] = !done;
+    for (j, (ki, _)) in cands_by_key.iter().enumerate() {
+        let done = key_finished(*ki, picked, connected, heights);
+        skip[j] = done;
+        started[j] = !done;
     }
     let mut id_map: U64Map<[u8; 32]> = U64Map::default();
 
@@ -525,7 +510,7 @@ pub fn id_idx_wave(
         if cancelled() {
             return Err(StoreError::Cancelled("txid batch"));
         }
-        let shot = next_id_shot(cands_by_key, &filled, &skip, take);
+        let shot = next_id_shot(cands_by_key.iter().map(|(_, c)| c), &filled, &skip, take);
         let mut need: Vec<Fk> = Vec::new();
         {
             let mut seen = U64Set::default();
@@ -548,18 +533,18 @@ pub fn id_idx_wave(
             *body_lookups = body_lookups.saturating_add(more.len() as u64);
             id_map.extend(more);
         }
-        for ki in 0..n {
-            if skip[ki] {
+        for (j, (_, cands)) in cands_by_key.iter().enumerate() {
+            if skip[j] {
                 continue;
             }
-            filled[ki] = filled[ki].saturating_add(take).min(cands_by_key[ki].len());
+            filled[j] = filled[j].saturating_add(take).min(cands.len());
         }
-        for ki in 0..n {
-            if skip[ki] {
+        for (j, (ki, cands)) in cands_by_key.iter().enumerate() {
+            let ki = *ki;
+            if skip[j] {
                 continue;
             }
-            let cands = &cands_by_key[ki];
-            let nfill = filled[ki];
+            let nfill = filled[j];
             // A prior segment may already hold an unconnected body. Do not
             // replace it unless this prefix connects, or this is the last
             // cand and nothing is picked yet.
@@ -568,20 +553,20 @@ pub fn id_idx_wave(
             if walked.had_body {
                 had_id[ki] = true;
             }
-            key_miss[ki] = walked.miss;
+            key_miss[j] = walked.miss;
             if let Some((fk, rank)) = walked.winner {
                 hit_ranks.note(rank);
                 note_identity_pick(ki, fk, picked, connected, heights, first_fks, local_age);
-                skip[ki] = true;
+                skip[j] = true;
             }
         }
     }
 
-    for ki in 0..n {
-        if !started[ki] {
+    for j in 0..n {
+        if !started[j] {
             continue;
         }
-        *miss_peeks = miss_peeks.saturating_add(key_miss[ki]);
+        *miss_peeks = miss_peeks.saturating_add(key_miss[j]);
     }
     Ok(())
 }

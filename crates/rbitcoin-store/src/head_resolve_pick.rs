@@ -14,21 +14,22 @@ use rbitcoin_primitives::Fk;
 /// still unfinished (no connected win; unconnected body match is not enough).
 pub const ID_FILL_CHUNK: usize = 4;
 
-/// Unread prefix of `take` cands for keys that are not `skip`.
-pub fn next_id_shot(
-    cands_by_key: &[Vec<Fk>],
+/// Unread prefix of `take` cands for keys that are not `skip`. `filled` and
+/// `skip` index the same positions as `cands_by_key`.
+pub fn next_id_shot<C: AsRef<[Fk]>>(
+    cands_by_key: impl IntoIterator<Item = C>,
     filled: &[usize],
     skip: &[bool],
     take: usize,
 ) -> Vec<Fk> {
     let mut need = Vec::new();
     let mut seen = U64Set::default();
-    for (ki, cands) in cands_by_key.iter().enumerate() {
+    for (ki, cands) in cands_by_key.into_iter().enumerate() {
         if skip.get(ki).copied().unwrap_or(false) {
             continue;
         }
         let start = filled.get(ki).copied().unwrap_or(0);
-        for &fk in cands.iter().skip(start).take(take) {
+        for &fk in cands.as_ref().iter().skip(start).take(take) {
             let Some(id) = fk.get() else {
                 continue;
             };
