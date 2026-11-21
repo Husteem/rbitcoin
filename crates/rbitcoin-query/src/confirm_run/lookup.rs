@@ -126,6 +126,9 @@ pub fn archived_create_pairs(
 
 /// IBD **load** stage: structure + stamp create_fk + parent body ranges.
 ///
+/// Parent create_fk: same-batch → in-flight → skeleton → one `tx.head` read
+/// for the keys in neither ([`crate::stamp_external_parents`]).
+///
 /// May read `tx.head`, `tx.idx`, `txid.body`. **Never** denserels-decode `tx.body`.
 /// Parent create_fk: in-flight → skeleton (carried BQ keys) → leftover TipOnly
 /// (plan=None). Wire blocks are `Arc` so IBD resolve can decode once and hand
@@ -226,10 +229,11 @@ fn lookup_stamp_work(
 
 /// Warn once for each input that spends a parent load read from `tx.head`.
 ///
-/// Lookup left that parent out of its read and nothing in the pipeline
-/// created it: a txid tag the undrained-creates table shares with another
-/// create. With the table's random key that is an accident or a block
-/// built to collide, so it is logged and not treated as invalid.
+/// Neither in-flight nor lookup's read held that parent. A txid tag the
+/// undrained-creates table shares with another create does that, and so
+/// would a race between in-flight's prune and the `tx.head` drain. The read
+/// is TipOnly, so the bind is right either way; the warning keeps the case
+/// visible without rejecting the block.
 fn warn_parents_from_head(metas: &[BodyMeta], wire_blocks: &[Arc<Block>], from_head: &[[u8; 32]]) {
     for (meta, block) in metas.iter().zip(wire_blocks) {
         for tx in &block.txdata {
@@ -238,7 +242,7 @@ fn warn_parents_from_head(metas: &[BodyMeta], wire_blocks: &[Arc<Block>], from_h
                     continue;
                 }
                 rbitcoin_log::warn!(
-                    "ibd: lookup left out a parent load read from tx.head: block {} height {} prev {}",
+                    "ibd: load read a parent from tx.head that in-flight and lookup did not hold: block {} height {} prev {}",
                     bitcoin::BlockHash::from_byte_array(meta.hash),
                     meta.height.0,
                     inp.previous_output.txid,

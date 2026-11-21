@@ -2058,7 +2058,8 @@ pub enum ParentCheck {
 }
 
 /// The stamp reads the pipeline's own view (in-flight and load-batch
-/// skeleton), and a miss there has blacklisted valid blocks before. A
+/// skeleton, then `tx.head` for a key in neither), and a miss there has
+/// blacklisted valid blocks before. A
 /// verdict needs the tip path's read: the block extends the tip, `tx.head`
 /// holds every connected create, a fresh TipOnly read still misses, and no
 /// disconnect ran from the wait through the read.

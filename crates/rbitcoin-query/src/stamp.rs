@@ -304,8 +304,9 @@ pub fn stamp_external_parents(
 ///
 /// Lookup leaves out of its read a prev its undrained-creates table holds.
 /// A tag that table shares with another create can hold a parent that is
-/// already on disk, which in-flight never has. A parent `tx.head` does not
-/// hold either is `parent create_fk unresolved`, as before.
+/// already on disk, which in-flight never has. The caller warns for each
+/// key bound here. A parent `tx.head` does not hold either is
+/// `parent create_fk unresolved`, as before.
 fn bind_left_out_from_head(
     store: &Store,
     stamp: &mut ExternalParentStamp,

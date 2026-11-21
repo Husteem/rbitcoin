@@ -1624,8 +1624,10 @@ impl Query {
         let index_tx = self.tx_index_enabled();
 
         let t_collect = Instant::now();
-        // With a skeleton, a key the wave did not resolve is Corrupt, so ask
-        // only for what in-flight or the skeleton holds.
+        // A prev this batch also creates later is a forward spend that
+        // structural rejects. With a skeleton, ask for it only when in-flight
+        // or the skeleton holds an earlier create of it; the stamp would read
+        // any other key from `tx.head` and call a miss unresolved.
         let need_vec =
             collect_plan_need_external(&work, &batch_map, &batch_repeats, carried_need, |t| {
                 skeleton.is_none_or(|s| s.get(t).is_some()) || in_flight.get_create_fk(t).is_some()

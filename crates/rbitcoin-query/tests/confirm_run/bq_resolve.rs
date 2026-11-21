@@ -548,6 +548,10 @@ fn a_skipped_parent_binds_from_in_flight_or_not_at_all() {
         Some(planned_fk),
         "the skipped parent is the create load planned for block 1"
     );
+    assert!(
+        bound.from_head.is_empty(),
+        "in-flight bound it, so no warning"
+    );
 
     match stamp_external_parents(
         q.store(),
@@ -588,8 +592,10 @@ impl std::hash::Hasher for OneSlot {
 /// although nothing in the pipeline creates it. Here every txid shares one
 /// slot, so block 2's own creates hide block 1's coinbase, which is
 /// connected and in `tx.head`. Load finds the parent in neither in-flight
-/// nor the skeleton, reads that one key from `tx.head`, binds it there, and
-/// warns with the block, its height, and the prev.
+/// nor the skeleton, reads that one key from `tx.head`, binds it with the
+/// ranges `tx.head` gives, and warns with the block, its height, and the
+/// prev. It does so for a new body (the plan) and again once that body is
+/// archived (the archived stamp).
 #[test]
 fn a_forced_tag_collision_reads_the_parent_from_tx_head_and_warns() {
     use rbitcoin_query::{confirm_wire_lookup_stamp, InFlight, WireLoadPipeline};
@@ -610,13 +616,13 @@ fn a_forced_tag_collision_reads_the_parent_from_tx_head_and_warns() {
     );
     q.block_queue_enqueue(2, b2.block_hash().to_byte_array(), 2, &serialize(&b2))
         .unwrap();
-    let on_disk = q
+    let (on_disk, pair) = q
         .store()
         .get_fk_by_txid_batch(&[parent.to_byte_array()])
         .unwrap()[0]
         .1
-        .map(|(fk, _)| fk)
         .expect("block 1's coinbase is in tx.head");
+    let on_disk_id = on_disk.get().expect("a real fk");
 
     let mut undrained = UndrainedCreates::with_hasher(OneSlot);
     let wave = confirm_bq_resolve_wave_capped(
@@ -652,15 +658,40 @@ fn a_forced_tag_collision_reads_the_parent_from_tx_head_and_warns() {
         carried_header_hashes: Vec::new(),
     };
     let items = [(Height(2), Arc::new(b2.clone()), None)];
-    rbitcoin_log::capture_logs(true);
-    let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe));
-    let logs = rbitcoin_log::take_logs();
-    rbitcoin_log::capture_logs(false);
+    let stamp = || {
+        rbitcoin_log::capture_logs(true);
+        let stamped = confirm_wire_lookup_stamp(&q, &params, Milestone::NONE, &items, Some(&pipe));
+        let logs = rbitcoin_log::take_logs();
+        rbitcoin_log::capture_logs(false);
+        let stamped = stamped.expect("the parent binds from tx.head");
+        assert_eq!(stamped.parent_pin.from_head, vec![parent.to_byte_array()]);
+        let ident = stamped
+            .parent_pin
+            .idents
+            .get(&on_disk_id)
+            .expect("the parent's identity");
+        assert_eq!(
+            (ident.body, ident.spent, ident.n_out),
+            (Some(pair.txout), Some(pair.spent), Some(pair.n_out)),
+            "the ranges tx.head gives"
+        );
+        let warns: Vec<&String> = logs
+            .iter()
+            .filter(|(level, _)| *level == rbitcoin_log::Level::Warn)
+            .map(|(_, line)| line)
+            .collect();
+        assert_eq!(warns.len(), 1, "{logs:?}");
+        for part in [
+            b2.block_hash().to_string(),
+            "height 2".to_string(),
+            parent.to_string(),
+        ] {
+            assert!(warns[0].contains(&part), "{part} not in {}", warns[0]);
+        }
+        stamped
+    };
 
-    let plan = stamped
-        .expect("the parent binds from tx.head")
-        .plan
-        .expect("block 2 is a new body");
+    let mut plan = stamp().plan.expect("block 2 is a new body");
     let spend = plan
         .edges
         .values()
@@ -668,19 +699,10 @@ fn a_forced_tag_collision_reads_the_parent_from_tx_head_and_warns() {
         .find(|e| e.vout != u32::MAX)
         .expect("block 2 spends block 1's coinbase");
     assert_eq!(spend.create_fk, on_disk);
-    let warns: Vec<&String> = logs
-        .iter()
-        .filter(|(level, _)| *level == rbitcoin_log::Level::Warn)
-        .map(|(_, line)| line)
-        .collect();
-    assert_eq!(warns.len(), 1, "{logs:?}");
-    for part in [
-        b2.block_hash().to_string(),
-        "height 2".to_string(),
-        parent.to_string(),
-    ] {
-        assert!(warns[0].contains(&part), "{part} not in {}", warns[0]);
-    }
+
+    rbitcoin_query::archive::stamp_wire_plan_txstat(&q, &mut plan).unwrap();
+    q.archive_commit_plan(plan).unwrap();
+    assert!(stamp().plan.is_none(), "block 2's body is archived");
     let _ = std::fs::remove_dir_all(&path);
 }
 
