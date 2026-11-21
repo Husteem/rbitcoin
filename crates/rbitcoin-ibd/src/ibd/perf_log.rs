@@ -264,6 +264,10 @@ pub struct IbdPerfSample {
     /// Structural meta bulk read wall ms / peek count.
     pub meta_ms: u64,
     pub meta_n: u64,
+    /// KiB the `spent.body` peeks asked for: a merged group's whole span.
+    pub meta_read_kb: u64,
+    /// KiB of 8-byte slots those peeks wanted.
+    pub meta_kept_kb: u64,
     pub load_ms: u64,
     /// Wire load residual (inside load/pre_asm, outside pin): Arc clone.
     pub prep_wire_arc_ms: u64,
@@ -319,6 +323,10 @@ pub struct IbdPerfSample {
     pub load_cold_range_body_sqe_n: u64,
     /// First-wave Outs jobs that pread the full idx span (spill guess).
     pub load_cold_range_guess_full_n: u64,
+    /// KiB the body preads asked for: a merged group's whole page span.
+    pub load_cold_range_read_kb: u64,
+    /// KiB of those reads handed to jobs. `read - kept` is the copied hole.
+    pub load_cold_range_kept_kb: u64,
     pub load_body_tx_reads: u64,
     pub conf_ready: usize,
     pub conf_script_q: usize,
@@ -516,6 +524,8 @@ impl Default for IbdPerfSample {
             spend: SpendWindow::default(),
             meta_ms: 0,
             meta_n: 0,
+            meta_read_kb: 0,
+            meta_kept_kb: 0,
             load_ms: 0,
             prep_wire_arc_ms: 0,
             prep_struct_ms: 0,
@@ -552,6 +562,8 @@ impl Default for IbdPerfSample {
             load_cold_range_extend_n: 0,
             load_cold_range_body_sqe_n: 0,
             load_cold_range_guess_full_n: 0,
+            load_cold_range_read_kb: 0,
+            load_cold_range_kept_kb: 0,
             load_body_tx_reads: 0,
             conf_ready: 0,
             conf_script_q: 0,
@@ -1044,6 +1056,8 @@ pub fn sample(
         },
         meta_ms: ns_ms(meta_ns),
         meta_n,
+        meta_read_kb: w.spend_meta_read_bytes / 1024,
+        meta_kept_kb: w.spend_meta_kept_bytes / 1024,
         load_ms: ns_ms(load_ns),
         prep_wire_arc_ms: ns_ms(prep_wire_arc_ns),
         prep_struct_ms: ns_ms(prep_struct_ns),
@@ -1080,6 +1094,8 @@ pub fn sample(
         load_cold_range_extend_n: w.cold_range_extend_n,
         load_cold_range_body_sqe_n: w.cold_range_body_sqe_n,
         load_cold_range_guess_full_n: w.cold_range_guess_full_n,
+        load_cold_range_read_kb: w.cold_range_read_bytes / 1024,
+        load_cold_range_kept_kb: w.cold_range_kept_bytes / 1024,
         load_body_tx_reads: w.body_tx_reads,
         conf_ready,
         conf_script_q,

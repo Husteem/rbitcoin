@@ -244,7 +244,7 @@ fn range_outs_leave_n_in_unstamped() {
     let fk = t.put_full_batch_indexed(&[(tx, ins, outs)], true).unwrap()[0];
     assert_eq!(t.input.n_in(fk).unwrap(), Some(2));
     let range = t.body_range(fk).unwrap();
-    let (rows, _, _, _, _, _) = t
+    let (rows, _, _, _) = t
         .get_outs_by_range_batch(&[(fk, range, txid, 1, vec![0])])
         .unwrap();
     let (got, _, _) = rows[0].as_ref().expect("range outs");
@@ -1817,7 +1817,7 @@ fn get_fk_by_txid_batch_multi_cand_then_outs() {
     let multi = batch.iter().find(|(id, _)| *id == txid).unwrap();
     let (fk, range) = multi.1.expect("multi-cand hit");
     assert_eq!(fk, fk_new);
-    let (outs_rows, _, _, _, _, _) = t
+    let (outs_rows, _, _, _) = t
         .get_outs_by_range_batch(&[(fk, range.txout, txid, range.n_out, vec![0])])
         .unwrap();
     let (tx, outs, dens) = outs_rows[0].as_ref().expect("outs for winner");
@@ -1829,7 +1829,7 @@ fn get_fk_by_txid_batch_multi_cand_then_outs() {
     let single = batch.iter().find(|(id, _)| *id == solo).unwrap();
     let (fk_s, range_s) = single.1.expect("single-cand hit");
     assert_eq!(fk_s, fk_solo);
-    let (solo_rows, _, _, _, _, _) = t
+    let (solo_rows, _, _, _) = t
         .get_outs_by_range_batch(&[(fk_s, range_s.txout, solo, range_s.n_out, vec![0])])
         .unwrap();
     let (tx_s, outs_s, _) = solo_rows[0].as_ref().expect("single outs");
@@ -2079,7 +2079,7 @@ fn get_outs_denserels_by_range_sparse_need() {
         .unwrap()[0];
     let range = t.body_range(fk).unwrap();
     // Only need vout 1 — skip allocating big scripts on 0 and 2.
-    let (rows, _, _, _, _, _) = t
+    let (rows, _, _, _) = t
         .get_outs_by_range_batch(&[(fk, range, want_txid, 3, vec![1])])
         .unwrap();
     let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
@@ -2127,11 +2127,11 @@ fn get_outs_by_range_batch_skips_extend_when_need_in_first_page() {
         .unwrap()[0];
     let range = t.body_range(fk).unwrap();
     assert!(range.1 > 4096);
-    let (rows, _, _, extend_n, _, guess_full_n) = t
+    let (rows, _, _, io) = t
         .get_outs_by_range_batch(&[(fk, range, txid, 80, vec![0])])
         .unwrap();
-    assert_eq!(extend_n, 0);
-    assert_eq!(guess_full_n, 0);
+    assert_eq!(io.extend_n, 0);
+    assert_eq!(io.guess_full_n, 0);
     let (got, live, sparse) = rows[0].as_ref().expect("range denserels");
     assert_eq!(got.txid, txid);
     assert_eq!(got.input_count, 0, "range pin does not read input.loc");
@@ -2139,11 +2139,11 @@ fn get_outs_by_range_batch_skips_extend_when_need_in_first_page() {
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].0, 0);
     assert_eq!(sparse.len(), 1);
-    let (_, _, _, extend_all, _, guess_all) = t
+    let (_, _, _, all) = t
         .get_outs_by_range_batch(&[(fk, range, txid, 80, vec![])])
         .unwrap();
-    assert_eq!(extend_all, 0);
-    assert_eq!(guess_all, 1);
+    assert_eq!(all.extend_n, 0);
+    assert_eq!(all.guess_full_n, 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2369,13 +2369,15 @@ fn get_output_spender_metas_at_one_walk() {
             &abs,
             rbitcoin_store::io_backend::ReadIoBackend::Pread,
         )
-        .unwrap();
+        .unwrap()
+        .0;
     let uring = t
         .get_spender_meta_at_abs_batch_backend(
             &abs,
             rbitcoin_store::io_backend::ReadIoBackend::Uring,
         )
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(mmap, bulk);
     assert_eq!(uring, bulk);
     let _ = std::fs::remove_dir_all(&dir);
@@ -4963,7 +4965,8 @@ fn spend_meta_batch_reads_merged_slots_past_one_ring() {
             &offs,
             rbitcoin_store::io_backend::ReadIoBackend::Pread,
         )
-        .unwrap();
+        .unwrap()
+        .0;
     assert_eq!(pread, got);
     let _ = std::fs::remove_dir_all(&dir);
 }

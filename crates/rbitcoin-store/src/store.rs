@@ -1457,7 +1457,7 @@ impl Store {
         &self,
         abs_offs: &[u64],
         backend: crate::io_backend::ReadIoBackend,
-    ) -> Result<Vec<Option<crate::tx_table::SpenderSlot>>, StoreError> {
+    ) -> Result<crate::tx_table::SpendMetaRead, StoreError> {
         self.txs
             .get_spender_meta_at_abs_batch_backend(abs_offs, backend)
     }
