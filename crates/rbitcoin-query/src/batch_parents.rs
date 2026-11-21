@@ -856,8 +856,9 @@ impl BatchParents {
         }
         let snap = e.load_outs();
         let (value, script) = snap.get_parts(vout)?;
-        *self.sticky_outs.borrow_mut() = Some((id, Arc::clone(&snap)));
-        Some(f(value, script, txid))
+        let out = f(value, script, txid);
+        *self.sticky_outs.borrow_mut() = Some((id, snap));
+        Some(out)
     }
 
     pub fn get_parent_tx(&self, fk: Fk) -> Option<TxRecord> {

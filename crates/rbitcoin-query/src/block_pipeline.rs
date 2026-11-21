@@ -1472,6 +1472,33 @@ pub struct ResolvedPrevout {
     pub create_fk: rbitcoin_primitives::Fk,
 }
 
+/// A batch-pinned parent output: its identity matches the wire prevout and it
+/// is spendable. Returns the value and the input's sigops. `txout.script_pubkey`
+/// stays empty; `script` is the archived bytes, including when scripts are
+/// not executed.
+fn check_pinned_prevout(
+    value: u64,
+    script: &[u8],
+    parent_txid: [u8; 32],
+    prev_txid: [u8; 32],
+    inp: &bitcoin::TxIn,
+    sigop_rules: rbitcoin_consensus::block::SpendSigopRules,
+    acc: &mut AsmPrevoutAcc,
+) -> Result<(u64, rbitcoin_consensus::block::SpendSigops), ConfirmError> {
+    if parent_txid != prev_txid {
+        acc.cold_txid_mismatch_n = acc.cold_txid_mismatch_n.saturating_add(1);
+        #[cfg(debug_assertions)]
+        crate::block_pipeline::test_phase::tl_note_cold_why_txid_mismatch();
+        return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: pin parent create identity mismatch wire prev_txid",
+        )));
+    }
+    rbitcoin_consensus::block::reject_unspendable_prevout(
+        rbitcoin_consensus::policy::is_unspendable(script),
+    )?;
+    Ok((value, sigop_rules.count(inp, script)))
+}
+
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub fn resolve_prevout(
     block: &Block,
@@ -1523,29 +1550,37 @@ pub fn resolve_prevout(
 
     // Batch pin first (no TxRecord clone — A3). Pin identity/vout misses are
     // hard invariants (load must fill schema-13 identity + denserels).
+    // Without script jobs the parts are borrowed under the batch's sticky
+    // outs `Arc`; only a script job needs its own handle on the pin.
     if let Some(prev_fk) = prev_fk_hint {
-        if let Some((pinned, parent_txid)) = batch_parents.share_parent_prevout(prev_fk, op.vout) {
-            if parent_txid != prev_txid {
-                acc.cold_txid_mismatch_n = acc.cold_txid_mismatch_n.saturating_add(1);
-                #[cfg(debug_assertions)]
-                crate::block_pipeline::test_phase::tl_note_cold_why_txid_mismatch();
-                return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
-                    "invariant: pin parent create identity mismatch wire prev_txid",
-                )));
-            }
-            let (value, script) =
-                pinned
-                    .parts()
-                    .ok_or(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
-                        "invariant: pin incomplete outs for spent parent vout",
-                    )))?;
-            // Same rule as the same-block arm. `txout.script_pubkey` below is
-            // empty; `script` is the archived bytes, including when scripts
-            // are not executed.
-            rbitcoin_consensus::block::reject_unspendable_prevout(
-                rbitcoin_consensus::policy::is_unspendable(script),
-            )?;
-            let sigops = sigop_rules.count(inp, script);
+        let pinned = if need_script_buf {
+            batch_parents
+                .share_parent_prevout(prev_fk, op.vout)
+                .map(|(pinned, parent_txid)| {
+                    let (value, script) = pinned.parts().ok_or(ConfirmError::Store(
+                        rbitcoin_store::StoreError::Corrupt(
+                            "invariant: pin incomplete outs for spent parent vout",
+                        ),
+                    ))?;
+                    let checked = check_pinned_prevout(
+                        value,
+                        script,
+                        parent_txid,
+                        prev_txid,
+                        inp,
+                        sigop_rules,
+                        acc,
+                    )?;
+                    Ok((checked, Some(pinned.into_shared_prevout())))
+                })
+        } else {
+            batch_parents.get_parent_txout_parts(prev_fk, op.vout, |value, script, parent_txid| {
+                check_pinned_prevout(value, script, parent_txid, prev_txid, inp, sigop_rules, acc)
+                    .map(|checked| (checked, None))
+            })
+        };
+        if let Some(pinned) = pinned {
+            let ((value, sigops), shared) = pinned?;
             acc.in_n = acc.in_n.saturating_add(1);
             acc.batch_n = acc.batch_n.saturating_add(1);
             #[cfg(debug_assertions)]
@@ -1555,7 +1590,7 @@ pub fn resolve_prevout(
                     value: Amount::from_sat(value),
                     script_pubkey: ScriptBuf::new(),
                 },
-                shared: need_script_buf.then(|| pinned.into_shared_prevout()),
+                shared,
                 sigops,
                 create_fk: prev_fk,
             });
