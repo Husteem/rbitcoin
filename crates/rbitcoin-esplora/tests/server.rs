@@ -138,7 +138,10 @@ async fn stalled_response_write_closes_the_esplora_listener() {
     }
     q.connect_block(Height(0), &h0, &txs).unwrap();
 
-    let sock = dir.path().join("esplora-write.sock");
+    let short = std::path::PathBuf::from(format!("/tmp/rbtc-es-write-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&short);
+    std::fs::create_dir_all(&short).unwrap();
+    let sock = short.join("s.sock");
     let mut cfg = EsploraConfig::with_listen(EsploraListen::Unix(sock), Network::Regtest);
     cfg.limits.idle_timeout = Duration::from_secs(1);
     let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
@@ -179,6 +182,7 @@ async fn stalled_response_write_closes_the_esplora_listener() {
         body_len = body.len()
     );
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&short);
 }
 
 /// Esplora caps accepted TCP sockets, not only in-flight requests, and closes
