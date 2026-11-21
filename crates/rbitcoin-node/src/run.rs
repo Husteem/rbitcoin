@@ -5,7 +5,8 @@ use bitcoin::consensus::Encodable;
 use rbitcoin_electrum::{run_electrum, ElectrumConfig, ElectrumHandle, TipNotify};
 use rbitcoin_esplora::{run_esplora, BlockTemplateFn, EsploraConfig, EsploraHandle, EsploraListen};
 use rbitcoin_ibd::{
-    read_platform_rss, tip_perf_json, IbdConfig, Peerless, TipPerfLog, PEERLESS_REDIAL_CAP,
+    read_platform_rss, read_platform_rss_fast, tip_perf_json, IbdConfig, Peerless, RssCadence,
+    TipPerfLog, PEERLESS_REDIAL_CAP,
 };
 use rbitcoin_log::{debug, info, log_enabled, warn, Category, Level};
 use rbitcoin_net::netaddr::ExternalEndpoint;
@@ -1494,6 +1495,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let stale_tip = config.stale_tip;
         let mut tip_rx = node.hub.subscribe_tips();
         let mut perf_tick = tokio::time::interval(Duration::from_secs(TIP_PERF_SECS));
+        let mut rss_cadence = RssCadence::default();
         perf_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         perf_tick.tick().await;
         let mut rpc_stop_tick = tokio::time::interval(Duration::from_millis(50));
@@ -1692,7 +1694,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         .map(|(checks, (n, us, max))| (checks, n, us, max))
                         .unwrap_or((0, 0, 0, 0));
                     let line = tip_perf_json(&TipPerfLog {
-                        rss: read_platform_rss(),
+                        rss: if rss_cadence.deep_due(std::time::Instant::now()) {
+                            read_platform_rss()
+                        } else {
+                            read_platform_rss_fast()
+                        },
                         cache_bodies: node.hub.cache_body_count(),
                         held_bodies: node.hub.held_body_count(),
                         mp_live: live,
