@@ -607,11 +607,15 @@ pub fn package_full_slot(in_rest: bool, slot_err: bool) -> bool {
     in_rest && slot_err
 }
 
-/// Core `package_msg` for a failed package evaluation. Core names
-/// `unspent-dust` bare. Its other package reasons carry detail this layer
-/// does not build, so they stay `transaction failed`.
+/// Core `package_msg` for a failed package evaluation, for the reasons Core
+/// names bare. Its TRUC and package-RBF reasons carry detail this layer does
+/// not build, so they stay `transaction failed`.
 fn package_eval_reason(e: &AcceptError) -> Option<&'static str> {
-    matches!(e, AcceptError::Policy("missing-ephemeral-spends")).then_some("unspent-dust")
+    match e {
+        AcceptError::Policy("missing-ephemeral-spends") => Some("unspent-dust"),
+        AcceptError::ClusterTooLarge { .. } => Some("too-large-cluster"),
+        _ => None,
+    }
 }
 
 /// Progress lines are at most once per ten seconds, including the instant the

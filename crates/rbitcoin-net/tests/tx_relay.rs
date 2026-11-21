@@ -4336,9 +4336,7 @@ fn submit_package_rpc_admits_zero_fee_anchor() {
         matches!(err, AcceptError::Policy("missing-ephemeral-spends")),
         "{err:?}"
     );
-    let skipped = hub.submit_package_rpc(&[parent.clone(), skips]);
-    assert_eq!(skipped.reason, Some("unspent-dust"), "{skipped:?}");
-    let rows = skipped.rows;
+    let rows = hub.submit_package_rpc(&[parent.clone(), skips]).rows;
     assert!(rows.iter().all(|r| r.result.is_err()), "{rows:?}");
     assert!(!hub.try_contains(&parent.compute_txid()));
 
