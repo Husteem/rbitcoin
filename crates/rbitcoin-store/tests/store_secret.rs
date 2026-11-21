@@ -37,9 +37,21 @@ fn xor_is_involution_and_changes_plaintext() {
 
 #[test]
 fn xor_bytes_matches_key_byte_stream() {
-    let s = StoreSecret::from_bytes([0x3c; 32]);
+    let s = StoreSecret::from_bytes(std::array::from_fn(|i| (i as u8).wrapping_mul(37) ^ 0x3c));
     let lens = [0usize, 1, 7, 8, 9, 15, 16, 31, 32, 33, 64, 127, 256, 1000];
-    let starts = [0u64, 1, 7, 8, 31, 32, 33, 100, 1_000_003];
+    let starts = [
+        0u64,
+        1,
+        7,
+        8,
+        31,
+        32,
+        33,
+        100,
+        1_000_003,
+        u64::MAX - 40,
+        u64::MAX,
+    ];
     for &start in &starts {
         for &len in &lens {
             let mut got = vec![0x5a_u8; len];
