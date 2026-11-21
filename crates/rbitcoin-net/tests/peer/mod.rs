@@ -6627,6 +6627,10 @@ fn inbound_netgroup_is_fixed_at_accept() {
     );
 }
 
+// The reconnect refusal after a misbehavior disconnect has no default journey:
+// default harness peers dial from loopback, which `ip_skips_discourage`
+// exempts. These units own it in default CI (TESTING.md witness table,
+// "Inbound discourage").
 #[test]
 fn misbehavior_disconnect_refuses_the_same_address() {
     let peers = rbitcoin_net::peers::PeerHub::new();
