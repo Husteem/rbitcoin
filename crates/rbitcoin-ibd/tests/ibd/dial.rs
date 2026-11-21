@@ -1817,6 +1817,21 @@ fn request_headers_opens_one_reply_exemption() {
     );
 }
 
+/// A getheaders that never reaches the writer does not open an exemption.
+#[test]
+fn a_closed_command_channel_does_not_open_a_reply_exemption() {
+    let mut seq = 0u32;
+    let slot = dummy_slot(1, addr(1), true);
+    assert!(
+        !request_headers_from(std::slice::from_ref(&slot), 1, &mut seq, vec![]).unwrap(),
+        "the slot's command receiver is gone"
+    );
+    assert!(
+        !slot.headers_asks.take_reply(ibd_mono_ms()),
+        "a failed send records no ask"
+    );
+}
+
 /// The protocol maximum drops the lowest heights. A hash named twice counts once.
 #[test]
 fn the_locator_cap_keeps_the_refill_and_the_highest_hashes() {

@@ -178,9 +178,10 @@ pub fn solicit_track() -> (
 /// Asks sent on this peer that a `headers` reply may still answer.
 ///
 /// A solicited reply is a normal part of header sync, so it stays off the
-/// session window once per ask. The count is capped and an ask older than
-/// [`HEADERS_ASK_TTL_MS`] is forgotten, so a peer that never answers cannot
-/// bank exemptions for an unsolicited burst.
+/// session window once per ask. The count is capped, and an ask older than
+/// [`HEADERS_ASK_TTL_MS`] is forgotten when the next ask arrives or a reply
+/// is taken, so a peer that never answers cannot bank exemptions for an
+/// unsolicited burst.
 #[derive(Debug, Default)]
 pub struct HeaderAsks {
     state: Mutex<HeaderAskState>,
@@ -208,9 +209,13 @@ impl HeaderAsks {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Record one `getheaders` sent at `now_ms`.
+    /// Record one `getheaders` sent at `now_ms`. An ask older than the window
+    /// gives up its credit to this one.
     pub fn note_ask(&self, now_ms: u64) {
         let mut state = self.state();
+        if now_ms.saturating_sub(state.newest_ms) > HEADERS_ASK_TTL_MS {
+            state.owed = 0;
+        }
         state.newest_ms = now_ms;
         state.owed = state.owed.saturating_add(1).min(HEADERS_ASKS_MAX);
     }

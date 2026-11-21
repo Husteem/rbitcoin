@@ -449,6 +449,7 @@ fn headers_frame(headers: &[Header]) -> FramedMessage {
         .unwrap();
     for header in headers {
         header.consensus_encode(&mut payload).unwrap();
+        payload.push(0);
     }
     framed(*b"headers\0\0\0\0\0", payload)
 }
@@ -502,17 +503,72 @@ async fn headers_and_notfound_charge_the_session_window() {
 async fn one_solicited_headers_reply_stays_off_the_session_window() {
     use rbitcoin_net::peer_dos::DEFAULT_MAX_BYTES_PER_SEC;
 
-    let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(1);
+    let (mut ctx, _out, mut body_rx, mut ctrl_rx) = test_ctx(1);
     ctx.rate = PeerRateLimiter::new(1, DEFAULT_MAX_BYTES_PER_SEC);
     ctx.headers_asks.note_ask(ibd_mono_ms());
     assert!(!ctx.handle(Ok(headers_frame(&[one_header()]))));
     assert_eq!(ctx.rate.cur_msgs, 0, "the asked reply is exempt");
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(2), ctrl_rx.recv())
+        .await
+        .expect("an exempt reply is still decoded")
+        .expect("ctrl open");
+    match ev {
+        PeerEvent::Headers { headers, .. } => assert_eq!(headers.len(), 1),
+        _ => panic!("the exempt reply must reach ctrl"),
+    }
 
     assert!(!ctx.handle(Ok(headers_frame(&[one_header()]))));
     assert_eq!(ctx.rate.cur_msgs, 1, "a second reply is charged");
     assert!(!ctx.handle(Ok(headers_frame(&[one_header()]))));
     assert_eq!(ctx.ban_score, RATE_LIMIT_BAN_SCORE);
     assert!(body_rx.try_recv().is_err(), "the overflow stays connected");
+}
+
+/// A `notfound` is not a headers reply: it neither spends the ask nor skips
+/// the window.
+#[tokio::test]
+async fn notfound_does_not_spend_a_headers_exemption() {
+    use rbitcoin_net::peer_dos::DEFAULT_MAX_BYTES_PER_SEC;
+
+    let (mut ctx, _out, _body, _ctrl) = test_ctx(1);
+    ctx.rate = PeerRateLimiter::new(1, DEFAULT_MAX_BYTES_PER_SEC);
+    ctx.headers_asks.note_ask(ibd_mono_ms());
+    let hash = BlockHash::from_byte_array([12u8; 32]);
+    assert!(!ctx.handle(Ok(notfound_frame(&[hash]))));
+    assert_eq!(ctx.rate.cur_msgs, 1, "notfound is charged");
+
+    assert!(!ctx.handle(Ok(headers_frame(&[one_header()]))));
+    assert_eq!(
+        ctx.rate.cur_msgs, 1,
+        "the headers reply still uses the outstanding ask"
+    );
+}
+
+#[test]
+fn a_fresh_headers_ask_is_not_stale_against_process_start() {
+    let asks = HeaderAsks::new();
+    let now = HEADERS_ASK_TTL_MS + 1;
+    asks.note_ask(now);
+    assert!(
+        asks.take_reply(now),
+        "the ask's own time is the freshness mark"
+    );
+    assert!(!asks.take_reply(now), "one ask exempts one reply");
+}
+
+#[test]
+fn a_stale_headers_ask_does_not_bank_credit_for_the_next_one() {
+    let asks = HeaderAsks::new();
+    asks.note_ask(0);
+    asks.note_ask(HEADERS_ASK_TTL_MS + 1);
+    assert!(
+        asks.take_reply(HEADERS_ASK_TTL_MS + 2),
+        "the fresh ask exempts its reply"
+    );
+    assert!(
+        !asks.take_reply(HEADERS_ASK_TTL_MS + 2),
+        "the stale ask is forgotten when the next one arrives"
+    );
 }
 
 #[test]
