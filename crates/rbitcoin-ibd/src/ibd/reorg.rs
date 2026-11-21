@@ -735,10 +735,11 @@ pub struct RewindPrep {
 /// Store side of a rewind: parent lookup and the confirmed-tip disconnect.
 /// No `IbdWorkState` borrow, so the coordination lock is not held.
 ///
-/// A rewind whose selection measured `tip_before`. The tip commit is held
-/// while the tip is compared to it and the disconnect runs, so confirm cannot
-/// extend the chain the fork was measured against in between. A moved tip
-/// selects again on a later turn instead.
+/// A rewind whose selection measured `tip_before`. The disconnect takes the
+/// tip commit and compares `tip_before` under it, so confirm cannot extend
+/// the chain the fork was measured against in between. Both callers take the
+/// commit again for their state commit and recheck the tip there, so the
+/// plant branch needs no compare here. A moved tip selects again later.
 #[doc(hidden)]
 pub fn prepare_header_rewind_at(
     hub: &ChainHub,
@@ -754,13 +755,6 @@ pub fn prepare_header_rewind_at(
             return Ok(None);
         };
         if !hub.try_rewind_to_height_at(lca_h, (height, hash))? {
-            return Ok(None);
-        }
-    } else {
-        let Some(_commit) = hub.query.try_lock_tip_commit() else {
-            return Ok(None);
-        };
-        if tip_pair(hub) != tip_before {
             return Ok(None);
         }
     }
@@ -890,13 +884,14 @@ pub fn apply_header_rewind(
         return Ok(false);
     };
     // The prepare dropped the tip commit after its disconnect and read the
-    // path's store rows since. Confirm may have extended from the LCA. Hold
-    // the commit across the recheck and the commit so the path is never
-    // planted on a tip the selection did not measure.
+    // path's store rows since. Confirm may have extended from the LCA. After
+    // a disconnect the state commit cannot be abandoned, so wait for the
+    // commit rather than try it, and hold it across the recheck and commit.
     fire(&AFTER_PREPARE);
-    let Some(_commit) = hub.query.try_lock_tip_commit() else {
-        return Ok(false);
-    };
+    let _commit = hub
+        .query
+        .lock_tip_commit()
+        .map_err(|e| NetError::Store(e.to_string()))?;
     if !rewind_tip_still(hub, &prep, tip_before) {
         return Ok(false);
     }
@@ -1025,6 +1020,15 @@ pub(crate) fn apply_off_lock_rewind(
     // either committed or is waiting on this gate.
     fire(&AFTER_PREPARE);
     let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
+    // The prepare has already disconnected when it was a rewind, so the
+    // state commit cannot be abandoned. Take `shared` before the commit and
+    // then wait for it; confirm does not take `shared`, so this order cannot
+    // cycle. Hold it across the recheck and commit so confirm cannot extend
+    // from the LCA in between.
+    let _commit = hub
+        .query
+        .lock_tip_commit()
+        .map_err(|e| NetError::Store(e.to_string()))?;
     let marked_invalid = path
         .iter()
         .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()));

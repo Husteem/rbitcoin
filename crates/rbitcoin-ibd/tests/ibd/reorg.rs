@@ -767,6 +767,7 @@ fn a_plant_selected_against_an_older_tip_is_skipped() {
 static AFTER_LOCK: Mutex<()> = Mutex::new(());
 static AFTER_HUB: Mutex<Option<Arc<ChainHub>>> = Mutex::new(None);
 static AFTER_BLOCKS: Mutex<Option<Vec<Block>>> = Mutex::new(None);
+static AFTER_HOLD_HUB: Mutex<Option<Arc<ChainHub>>> = Mutex::new(None);
 static AFTER_RAN: AtomicBool = AtomicBool::new(false);
 
 struct ClearAfterRewindHook;
@@ -775,6 +776,7 @@ impl Drop for ClearAfterRewindHook {
         arm_after_header_rewind_prepare_for_test(None);
         *AFTER_HUB.lock().unwrap_or_else(|err| err.into_inner()) = None;
         *AFTER_BLOCKS.lock().unwrap_or_else(|err| err.into_inner()) = None;
+        *AFTER_HOLD_HUB.lock().unwrap_or_else(|err| err.into_inner()) = None;
     }
 }
 
@@ -844,6 +846,66 @@ fn an_under_lock_commit_selected_against_an_older_tip_is_skipped() {
         "the path is not committed against a tip the selection did not measure"
     );
     assert_eq!(st.reorg.deferred, vec![fork[4]]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Stands in for a tip flush or confirm write that owns the commit when the
+/// prepare returns. The holder keeps it just long enough for the caller to
+/// reach its own acquisition.
+fn hold_commit_after_prepare() {
+    let hub = AFTER_HOLD_HUB
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .expect("hub armed")
+        .clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _commit = hub.query.lock_tip_commit().expect("tip commit");
+        ready_tx.send(()).expect("holder ready");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("holder took the commit");
+    AFTER_RAN.store(true, Ordering::Release);
+}
+
+/// The prepare already disconnected to the LCA. A tip flush or confirm write
+/// holds the commit and the tip has not moved. Returning false here leaves
+/// the store tip at the LCA and the work state on the old path; the next pass
+/// plants where it should rewind, so `note_rewind` never runs. The state
+/// commit must wait for the commit and finish.
+#[test]
+fn an_under_lock_commit_survives_a_busy_tip_commit() {
+    let _serial = AFTER_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+    let _clear = ClearAfterRewindHook;
+    AFTER_RAN.store(false, Ordering::Release);
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_980;
+    let chain = confirmed_chain(&hub, 2, t);
+    let fork = side_headers(&hub, &chain, 0, 5, t + 1);
+    let hub = Arc::new(hub);
+    *AFTER_HOLD_HUB.lock().unwrap_or_else(|err| err.into_inner()) = Some(Arc::clone(&hub));
+
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
+    arm_after_header_rewind_prepare_for_test(Some(hold_commit_after_prepare));
+
+    assert!(maybe_rewind_to_best_work(&mut st, &hub).unwrap());
+    assert!(
+        AFTER_RAN.load(Ordering::Acquire),
+        "the commit was busy after the prepare"
+    );
+    assert_eq!(hub.tip_height(), Some(0), "the prepare disconnected");
+    assert_eq!(st.height_to_hash.get(&1), Some(&fork[0]));
+    assert_eq!(
+        hub.query.lookup_taken_hi(),
+        Some(0),
+        "the state commit ran once the commit was free"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
