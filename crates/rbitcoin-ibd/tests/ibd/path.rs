@@ -392,14 +392,7 @@ fn seed_work_path_archives_ahead_of_tip() {
     for h in 1u32..=2 {
         let b = mine(tip, time + h * 600, h);
         hub.ensure_header(&b.header).unwrap();
-        commit_class_a_block(
-            &hub.query,
-            &hub.params,
-            rbitcoin_primitives::Height(h),
-            &b,
-            hub.milestone,
-        )
-        .unwrap();
+        commit_class_a_block(&hub.query, &hub.params, &b).unwrap();
         tip = b.block_hash();
     }
     let b3 = mine(tip, time + 3 * 600, 3);

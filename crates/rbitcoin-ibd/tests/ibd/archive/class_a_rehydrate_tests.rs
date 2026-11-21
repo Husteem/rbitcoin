@@ -87,14 +87,7 @@ fn class_a_rehydrate_makes_tip_plus_one_claim_ready() {
     for h in 1u32..=3 {
         let b = mine(tip, time + h * 600, h);
         hub.ensure_header(&b.header).unwrap();
-        rbitcoin_query::testutil::commit_class_a_block(
-            &hub.query,
-            &hub.params,
-            rbitcoin_primitives::Height(h),
-            &b,
-            hub.milestone,
-        )
-        .unwrap();
+        rbitcoin_query::testutil::commit_class_a_block(&hub.query, &hub.params, &b).unwrap();
         hashes.push(b.block_hash());
         tip = b.block_hash();
     }
@@ -371,14 +364,7 @@ fn class_a_rehydrate_offers_store_without_known_cache() {
     let gen = hub.tip_hash().unwrap();
     let b = mine(gen, 1_300_000_600, 1);
     let hash = b.block_hash();
-    rbitcoin_query::testutil::commit_class_a_block(
-        &hub.query,
-        &hub.params,
-        rbitcoin_primitives::Height(1),
-        &b,
-        hub.milestone,
-    )
-    .unwrap();
+    rbitcoin_query::testutil::commit_class_a_block(&hub.query, &hub.params, &b).unwrap();
     let fk = hub.ensure_header_fk(&b.header).unwrap();
     let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
     st.record_height(hash, 1);
@@ -401,14 +387,7 @@ fn class_a_rehydrate_rejects_a_hash_mismatch() {
     let gen = hub.tip_hash().unwrap();
     let b = mine(gen, 1_300_000_600, 1);
     let hash = b.block_hash();
-    rbitcoin_query::testutil::commit_class_a_block(
-        &hub.query,
-        &hub.params,
-        rbitcoin_primitives::Height(1),
-        &b,
-        hub.milestone,
-    )
-    .unwrap();
+    rbitcoin_query::testutil::commit_class_a_block(&hub.query, &hub.params, &b).unwrap();
     let fk = hub.ensure_header_fk(&b.header).unwrap();
     let mut stored = hub.query.store.headers.get(fk).unwrap();
     stored.nonce = stored.nonce.wrapping_add(1);

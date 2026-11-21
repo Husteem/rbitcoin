@@ -3152,7 +3152,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
     let tx_b = spend_acs(tx_a_id, 0, Amount::from_sat(48_0000_0000));
     let tx_b_id = tx_b.compute_txid();
     let b_s1 = mine_with(tip, tip_time + 600, h_spend, vec![tx_a, tx_b]);
-    commit_class_a_block(&q, &params, Height(h_spend), &b_s1, ms).unwrap();
+    commit_class_a_block(&q, &params, &b_s1).unwrap();
     assert_eq!(q.tip_height().map(|h| h.0), Some(maturity + 2));
     // IBD rehydrate path: stamp → load(Forbid) must not miss denserels stage
     // when plan=None (consensus forces Allow cold + body_txid identity).

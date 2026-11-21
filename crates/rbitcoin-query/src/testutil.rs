@@ -10,7 +10,7 @@ use crate::convert::header_to_record;
 use crate::{ConfirmError, Query, QueryError, ShJoinSlot, TxApply, WirePlanNeed};
 use bitcoin::hashes::Hash;
 use rbitcoin_consensus::block::{validate_block_structure_hashed, ValidationContext};
-use rbitcoin_consensus::{ChainParams, Milestone};
+use rbitcoin_consensus::ChainParams;
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::HeaderRecord;
 use std::sync::Arc;
@@ -175,11 +175,8 @@ fn class_a_header_and_txids(
 pub fn commit_class_a_block(
     query: &Query,
     params: &ChainParams,
-    height: Height,
     block: &bitcoin::Block,
-    milestone: Milestone,
 ) -> Result<(), ConfirmError> {
-    let _ = (height, milestone);
     let (header, txids) = class_a_header_and_txids(query, params, block)?;
     let fk = query.ensure_header(&header).map_err(ConfirmError::from)?;
     let arc = Arc::new(block.clone());
@@ -193,15 +190,13 @@ pub fn commit_class_a_block(
 ///
 /// Use this instead of N×[`commit_class_a_block`] when later blocks spend
 /// earlier unconfirmed creates.
-pub fn commit_class_a_run(
+pub fn commit_class_a_run<'a>(
     query: &Query,
     params: &ChainParams,
-    blocks: &[(Height, bitcoin::Block)],
-    milestone: Milestone,
+    blocks: impl IntoIterator<Item = &'a bitcoin::Block>,
 ) -> Result<(), ConfirmError> {
-    let _ = milestone;
-    let mut owned = Vec::with_capacity(blocks.len());
-    for (_, block) in blocks {
+    let mut owned = Vec::new();
+    for block in blocks {
         let (header, txids) = class_a_header_and_txids(query, params, block)?;
         let fk = query.ensure_header(&header).map_err(ConfirmError::from)?;
         owned.push((fk, Arc::new(block.clone()), txids));
