@@ -1,3 +1,16 @@
+#[cfg(debug_assertions)]
+static SH_PAGE_SCAN_HELD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(debug_assertions)]
+fn note_sh_page_scan_heavy_held(q: &Query) {
+    let held = matches!(
+        q.heavy_sh_join.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    );
+    SH_PAGE_SCAN_HELD.store(held, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn assert_unspent_newest_page_stops(
     q: &Query,
     quiet_sh: [u8; 32],
@@ -456,12 +469,20 @@ fn newest_page_gap_obeys_create_cap() {
     {
         q.set_heavy_sh_creates(1);
         q.sh_join_probe.arm();
+        SH_PAGE_SCAN_HELD.store(false, std::sync::atomic::Ordering::SeqCst);
+        rbitcoin_query::scripthash::set_sh_page_scan_hook_for_test(Some(
+            note_sh_page_scan_heavy_held,
+        ));
         q.spends_for_newest_page(&sh, &members, &window, 2, &view)
             .expect("an in-window page under the heavy turn");
         assert_eq!(
             q.sh_join_probe.entered(),
             (0, 1),
             "an in-window page above --heavy-sh-creates takes the turn"
+        );
+        assert!(
+            SH_PAGE_SCAN_HELD.load(std::sync::atomic::Ordering::SeqCst),
+            "the heavy turn was dropped before the page scan"
         );
         q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
     }

@@ -42,6 +42,33 @@ fn note_sh_posting_gap(_query: &Query) -> Result<(), QueryError> {
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+type ShPageScanHook = fn(&Query);
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SH_PAGE_SCAN: std::cell::Cell<Option<ShPageScanHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One-shot hook at the start of the spend read of a newest page. Tests use
+/// it to check that the heavy turn is still held after the admit block.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_sh_page_scan_hook_for_test(hook: Option<ShPageScanHook>) {
+    SH_PAGE_SCAN.with(|slot| slot.set(hook));
+}
+
+#[cfg(debug_assertions)]
+fn note_sh_page_scan(query: &Query) {
+    if let Some(hook) = SH_PAGE_SCAN.with(|slot| slot.take()) {
+        hook(query);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn note_sh_page_scan(_query: &Query) {}
+
 /// While held, an unpaged join on this thread skips `--max-sh-creates`.
 /// `--heavy-sh-creates` still applies. The Esplora unix socket's
 /// `/internal/{address,scripthash}` totals hold one for the request: the
@@ -1663,17 +1690,19 @@ impl Query {
         high: u32,
         view: &ChainView,
     ) -> Result<Vec<SpendHit>, QueryError> {
-        if window.bound.is_some() {
+        let admit = if window.bound.is_some() {
             // Both a block scan and a spend-slot read walk every create, so
             // each takes the unpaged cap and keeps the heavy turn for its read.
-            let admit = self.unpaged_join_admit(scripthash)?;
-            // Debug drops the probe before `admit`, so a released heavy turn
-            // is not counted as still running.
-            #[cfg(debug_assertions)]
-            let _probe = self.sh_join_probe.enter(admit.heavy);
-            #[cfg(not(debug_assertions))]
-            let _admit = admit;
-        }
+            Some(self.unpaged_join_admit(scripthash)?)
+        } else {
+            None
+        };
+        // Debug drops the probe before `admit`, so a released heavy turn is
+        // not counted as still running. The turn covers the inner read.
+        #[cfg(debug_assertions)]
+        let _probe = admit.as_ref().map(|a| self.sh_join_probe.enter(a.heavy));
+        #[cfg(not(debug_assertions))]
+        let _admit = admit;
         self.spends_for_newest_page_inner(scripthash, members, window, high, view)
     }
 
@@ -1690,6 +1719,7 @@ impl Query {
         let Some(low) = window.bound else {
             return self.spends_of_retained_creates(scripthash, &window.creates, high, view);
         };
+        note_sh_page_scan(self);
         if high.saturating_sub(low) <= MAX_HISTORY_WINDOW {
             return self.spends_of_members(members, low, high);
         }
