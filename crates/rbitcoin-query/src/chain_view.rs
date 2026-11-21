@@ -672,18 +672,22 @@ impl Query {
                 None => Ok(Vec::new()),
             };
         }
-        let mut start = 0u32;
+        // Core's `FindForkInGlobalIndex` skips hashes it does not know — the
+        // zero hash included — and falls back to genesis when none match.
+        // Either way the reply starts after the fork point, so genesis is
+        // never served for a non-empty locator. Core also maps a known hash
+        // on a stale branch that contains our tip to that tip; this layer
+        // only resolves active-chain heights, so it skips that hash and
+        // keeps walking. A normal locator still has an active-chain
+        // ancestor; only a locator with no active-chain entry falls back
+        // to genesis.
+        let mut start = 1u32;
         'outer: for loc in locator {
-            if loc.to_byte_array() == [0u8; 32] {
-                start = 0;
-                break;
-            }
             if let Some(h) = self.height_of_hash(&loc.to_byte_array())? {
                 start = h.0.saturating_add(1);
                 break 'outer;
             }
         }
-        // If no locator matched, Bitcoin peers typically start from genesis; we start at 0.
         let mut out = Vec::new();
         let mut h = start;
         while h <= tip.0 && out.len() < limit {
