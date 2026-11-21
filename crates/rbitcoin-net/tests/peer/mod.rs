@@ -6648,6 +6648,65 @@ async fn over_budget_session_does_not_read_a_ping() {
     let _ = std::fs::remove_dir_all(&t.dir);
 }
 
+/// A decoded non-block frame held for the send budget is still in
+/// `decode_q`, but it is not a frame waiting to decode behind a permit.
+/// The writer can be stuck forever on a peer that stops reading, so that
+/// hold must not suspend the ping timeout. The heartbeat has to drop the
+/// session even though the queue is non-empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_non_block_frame_does_not_suspend_the_ping_timeout() {
+    use bitcoin::blockdata::constants::genesis_block;
+    use rbitcoin_net::v2::write_v2_msg;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("held-front-timeout");
+    hub.ensure_genesis().unwrap();
+    let hub = hub.into_arc();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let start = 1_700_000_000_u64;
+    peers.set_mock_now(start);
+    let held = hold_decode_permits().await;
+    let mut s = open_decode_session(Arc::clone(&hub), &peers, 18480, hub.tip_hash()).await;
+    drain_startup(&mut s.reader, s.magic).await;
+
+    // A heavy block holds the decode queue, so the ping behind it is queued
+    // instead of applied directly. The budget flips before that front is
+    // polled: the block still applies, then the ping is put back.
+    let before = s.live.decode_enqueued();
+    let block = genesis_block(Network::Regtest);
+    let hash = block.block_hash();
+    write_v2_msg(&mut s.writer, NetworkMessage::Block(block))
+        .await
+        .unwrap();
+    wait_decode_enqueued(&s.live, before + 1).await;
+    let nonce = 0x51a7_0002_u64;
+    write_v2_msg(&mut s.writer, NetworkMessage::Ping(nonce))
+        .await
+        .unwrap();
+    wait_decode_enqueued(&s.live, before + 2).await;
+    s.live
+        .note_send_queued(2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
+    assert!(s.live.send_over_budget());
+    drop(held);
+    wait_block_applied(&s.live, &hash).await;
+    assert_no_pong(&mut s.reader, s.magic, nonce).await;
+    assert!(
+        !s.session.is_finished(),
+        "the held ping ended the session before the timeout"
+    );
+
+    let now = peers.now_secs();
+    peers.set_mock_now(now + PING_TIMEOUT_SECS + POST_BLOCK_PONG_GRACE_SECS + 1);
+    tokio::time::timeout(Duration::from_secs(5), &mut s.session)
+        .await
+        .expect("a held non-block frame must not hold the ping timeout")
+        .expect("session task");
+    assert!(
+        s.live.stop.load(Ordering::SeqCst),
+        "the ping timeout disconnected the stalled writer"
+    );
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
 fn inbound_peer(
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
 ) -> std::sync::Arc<rbitcoin_net::peers::LivePeer> {
