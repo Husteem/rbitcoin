@@ -89,6 +89,7 @@ use crate::file::{
 };
 use crate::tx_table::BODY_PAGE_SIZE;
 use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
@@ -345,6 +346,40 @@ const RING: usize = 8;
 const RING_AT: usize = 80;
 const COMMIT_LEN: usize = RING_AT + RING * 8;
 const ZERO: Slot = [0u8; SLOT];
+
+// Bulk submissions and serial record preads of confirm-style delta lookups
+// on this thread. Checkpoint merge and reclaim do not count. Thread-local
+// so a parallel suite does not mix another test's calls into the count.
+// Always on, so a release test sees the same split a debug test does.
+thread_local! {
+    static DELTA_RECORD_BULK: Cell<u64> = const { Cell::new(0) };
+    static DELTA_RECORD_SERIAL: Cell<u64> = const { Cell::new(0) };
+}
+
+fn note_delta_record_serial() {
+    DELTA_RECORD_SERIAL.with(|n| n.set(n.get() + 1));
+}
+
+fn note_delta_record_bulk() {
+    DELTA_RECORD_BULK.with(|n| n.set(n.get() + 1));
+}
+
+/// Clear [`delta_record_io`] on this thread.
+#[doc(hidden)]
+pub fn reset_delta_record_io() {
+    DELTA_RECORD_BULK.with(|n| n.set(0));
+    DELTA_RECORD_SERIAL.with(|n| n.set(0));
+}
+
+/// `(bulk submissions, serial record preads)` since [`reset_delta_record_io`]
+/// on this thread.
+#[doc(hidden)]
+pub fn delta_record_io() -> (u64, u64) {
+    (
+        DELTA_RECORD_BULK.with(Cell::get),
+        DELTA_RECORD_SERIAL.with(Cell::get),
+    )
+}
 /// [`Placed`] fields: `segment:22 | offset:23 | len:12 | base:7`.
 const SEG_BITS: u32 = 22;
 const OFF_BITS: u32 = 23;
@@ -1485,6 +1520,15 @@ struct Writer {
     dir_unsynced: bool,
 }
 
+/// One directory miss: the segment record, and the slots this lookup wants.
+struct RecordMiss {
+    file: Arc<TableFile>,
+    offset: u64,
+    len: usize,
+    base: Base,
+    wanted: Vec<(u16, usize)>,
+}
+
 pub struct SpendPageLog {
     dir: PathBuf,
     policy: Policy,
@@ -1714,6 +1758,7 @@ impl SpendPageLog {
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>, StoreError> {
+        note_delta_record_serial();
         let mut buf = vec![0u8; len];
         file.pread_all(offset, &mut buf)?;
         Record::check(&buf, page_off)?;
@@ -1820,11 +1865,25 @@ impl SpendPageLog {
         Ok(self.slots_at(&[abs])?[0])
     }
 
-    /// [`Self::slot`] for many slots, one record read per page.
+    /// [`Self::slot`] for many slots.
+    ///
+    /// A RAM note is not read. Pages the directory still names as records are
+    /// one bulk read on the completion session (ring depth 128, or the libc
+    /// pread bulk fallback). A folded page with no record is not part of that
+    /// read.
     pub fn slots_at(&self, abs: &[u64]) -> Result<Vec<Option<Slot>>, StoreError> {
+        self.slots_at_backend(abs, crate::io_backend::read_io_backend())
+    }
+
+    /// [`Self::slots_at`] on `backend`, the one the caller already chose for
+    /// the `spent.body` peeks.
+    pub fn slots_at_backend(
+        &self,
+        abs: &[u64],
+        backend: crate::io_backend::ReadIoBackend,
+    ) -> Result<Vec<Option<Slot>>, StoreError> {
         let mut out = vec![Some(ZERO); abs.len()];
-        type Miss = (Arc<TableFile>, u64, usize, Base, Vec<(u16, usize)>);
-        let mut misses: BTreeMap<u64, Miss> = BTreeMap::new();
+        let mut misses: BTreeMap<u64, RecordMiss> = BTreeMap::new();
         {
             let g = self.lock();
             for (i, &off) in abs.iter().enumerate() {
@@ -1844,33 +1903,157 @@ impl SpendPageLog {
                     } => {
                         misses
                             .entry(page_off)
-                            .or_insert_with(|| {
-                                (
-                                    Arc::clone(&g.segs[&seg].file),
-                                    offset,
-                                    len,
-                                    base,
-                                    Vec::new(),
-                                )
+                            .or_insert_with(|| RecordMiss {
+                                file: Arc::clone(&g.segs[&seg].file),
+                                offset,
+                                len,
+                                base,
+                                wanted: Vec::new(),
                             })
-                            .4
+                            .wanted
                             .push((rel, i));
                     }
                 }
             }
         }
-        for (page_off, (file, offset, len, base, wanted)) in misses {
-            let bytes = Self::read_record(&file, page_off, offset, len)?;
-            let record = Record(&bytes);
-            for (rel, i) in wanted {
-                out[i] = match record.get(rel) {
-                    Some(meta) => Some(meta),
-                    None if base.is_body() => None,
-                    None => Some(ZERO),
-                };
+        if misses.is_empty() {
+            return Ok(out);
+        }
+        Self::read_record_misses(misses, backend, &mut out)?;
+        Ok(out)
+    }
+
+    /// One completion-session read of the record misses, chunked at ring depth.
+    /// Records that touch in a segment share a span, so the dead gap between
+    /// two records is not read. The directory lock is not held.
+    fn read_record_misses(
+        misses: BTreeMap<u64, RecordMiss>,
+        backend: crate::io_backend::ReadIoBackend,
+        out: &mut [Option<Slot>],
+    ) -> Result<(), StoreError> {
+        struct Page {
+            page_off: u64,
+            offset: u64,
+            len: usize,
+            base: Base,
+            wanted: Vec<(u16, usize)>,
+        }
+        struct SpanRec {
+            at: usize,
+            len: usize,
+            page_off: u64,
+            base: Base,
+            wanted: Vec<(u16, usize)>,
+        }
+        struct Span {
+            path: PathBuf,
+            fd: crate::io_handle::IoHandle,
+            offset: u64,
+            buf: Vec<u8>,
+            recs: Vec<SpanRec>,
+        }
+
+        let mut grouped: BTreeMap<usize, (Arc<TableFile>, Vec<Page>)> = BTreeMap::new();
+        for (
+            page_off,
+            RecordMiss {
+                file,
+                offset,
+                len,
+                base,
+                wanted,
+            },
+        ) in misses
+        {
+            let key = Arc::as_ptr(&file) as usize;
+            grouped
+                .entry(key)
+                .or_insert_with(|| (file, Vec::new()))
+                .1
+                .push(Page {
+                    page_off,
+                    offset,
+                    len,
+                    base,
+                    wanted,
+                });
+        }
+        let mut spans = Vec::new();
+        for (_, (file, mut pages)) in grouped {
+            pages.sort_unstable_by_key(|p| p.offset);
+            while !pages.is_empty() {
+                let mut n = 1;
+                while n < pages.len()
+                    && pages[n].offset == pages[n - 1].offset + pages[n - 1].len as u64
+                {
+                    n += 1;
+                }
+                let run: Vec<Page> = pages.drain(..n).collect();
+                let start = run[0].offset;
+                let end = run[n - 1].offset + run[n - 1].len as u64;
+                let recs = run
+                    .into_iter()
+                    .map(|p| SpanRec {
+                        at: (p.offset - start) as usize,
+                        len: p.len,
+                        page_off: p.page_off,
+                        base: p.base,
+                        wanted: p.wanted,
+                    })
+                    .collect();
+                spans.push(Span {
+                    path: file.path.clone(),
+                    fd: file.io_handle(),
+                    offset: start,
+                    buf: vec![0u8; (end - start) as usize],
+                    recs,
+                });
             }
         }
-        Ok(out)
+        let depth = crate::uring_session::DEFAULT_ENTRIES as usize;
+        for chunk in spans.chunks_mut(depth.max(1)) {
+            note_delta_record_bulk();
+            let paths: Vec<PathBuf> = chunk.iter().map(|span| span.path.clone()).collect();
+            let lens: Vec<usize> = chunk.iter().map(|span| span.buf.len()).collect();
+            let mut ops: Vec<crate::bulk_io::ReadOp<'_>> = chunk
+                .iter_mut()
+                .map(|span| crate::bulk_io::ReadOp {
+                    fd: span.fd,
+                    offset: span.offset,
+                    buf: span.buf.as_mut_slice(),
+                    result: i32::MIN,
+                })
+                .collect();
+            crate::bulk_io::pread_batch_backend(&mut ops, backend);
+            for (i, op) in ops.iter().enumerate() {
+                if op.result < 0 {
+                    return Err(StoreError::io(
+                        &paths[i],
+                        std::io::Error::from_raw_os_error(-op.result),
+                    ));
+                }
+                if op.result as usize != lens[i] {
+                    return Err(StoreError::io(
+                        &paths[i],
+                        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pread short"),
+                    ));
+                }
+            }
+            drop(ops);
+            for span in chunk.iter() {
+                for rec in &span.recs {
+                    let record = Record::check(&span.buf[rec.at..rec.at + rec.len], rec.page_off)?;
+                    for &(rel, i) in &rec.wanted {
+                        out[i] = match record.get(rel) {
+                            Some(meta) => Some(meta),
+                            None if rec.base.is_body() => None,
+                            None => Some(ZERO),
+                        };
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn note_slots(&self, slots: &[(u64, Slot)]) -> Result<(), StoreError> {

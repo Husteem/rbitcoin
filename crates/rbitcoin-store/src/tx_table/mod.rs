@@ -2658,7 +2658,7 @@ impl TxTable {
         let body_path = self.spent.body_file_path();
 
         let mut out: Vec<Option<SpenderSlot>> = vec![None; abs_offs.len()];
-        let logged = self.spend_pages.slots_at(abs_offs)?;
+        let logged = self.spend_pages.slots_at_backend(abs_offs, backend)?;
         let mut submitted: Vec<usize> = Vec::with_capacity(abs_offs.len());
         for (i, &off) in abs_offs.iter().enumerate() {
             let end = off.saturating_add(META_LEN as u64);
