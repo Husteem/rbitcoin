@@ -2326,14 +2326,10 @@ pub async fn admit_broadcast(st: AppState, tx: bitcoin::Transaction) -> Response
     let Some(mp) = st.mempool.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "mempool not available").into_response();
     };
+    let txid = tx.compute_txid();
     let budget = st.query.api_read_budget();
-    match rbitcoin_net::with_store_budget(
-        budget,
-        mp.accept_tx_from_async(tx, rbitcoin_net::TxOrigin::Local),
-    )
-    .await
-    {
-        Ok(r) => plain_ok(block_hash_hex(&r.txid.to_byte_array())),
+    match rbitcoin_net::with_store_budget(budget, mp.broadcast_local_async(tx)).await {
+        Ok(_) => plain_ok(block_hash_hex(&txid.to_byte_array())),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }

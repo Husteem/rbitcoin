@@ -1066,9 +1066,11 @@ pub async fn sendrawtransaction_async(
     // The note and the blocksonly rebroadcast sit on the admit task. Dropping
     // this request must not skip them after the tx is already published.
     rbitcoin_net::spawn_with_store_budget(async move {
-        let accepted = mp_done
-            .accept_tx_from_work(tx_done.clone(), rbitcoin_net::TxOrigin::Local)
-            .await;
+        let accepted = rbitcoin_net::LocalBroadcast::of(
+            mp_done
+                .accept_tx_from_work(tx_done.clone(), rbitcoin_net::TxOrigin::Local)
+                .await,
+        );
         // After publish, before the note. A dropped request stays here only
         // when a test armed the latch. The note still runs on this task.
         park_before_unbroadcast_note(&mp_done).await;
@@ -1103,7 +1105,7 @@ async fn park_before_unbroadcast_note(mp: &MempoolHub) {
 fn sendraw_after_accept(
     ctx: &RpcContext,
     tx: &Transaction,
-    accepted: Result<rbitcoin_net::AcceptResult, rbitcoin_net::AcceptError>,
+    accepted: Result<rbitcoin_net::LocalBroadcast, rbitcoin_net::AcceptError>,
 ) -> Result<Value, Value> {
     let mp = ctx
         .mempool
@@ -1112,8 +1114,8 @@ fn sendraw_after_accept(
     // `-blocksonly` leaves P2P relay off but RPC still accepts
     // (`p2p_blocksonly.py` sendrawtransaction).
     match accepted {
-        Ok(r) => {
-            mp.note_unbroadcast(r.txid);
+        Ok(rbitcoin_net::LocalBroadcast::Admitted) => {
+            mp.note_unbroadcast(tx.compute_txid());
             // `-blocksonly`: accept-time announce is skipped (relay off + not
             // yet unbroadcast). Re-announce after noting so inbound peers INV
             // (`p2p_blocksonly.py:48`). When relay is on, leave the 30s inbound
@@ -1131,13 +1133,13 @@ fn sendraw_after_accept(
         }
         // Core sendraw of a live mempool tx is a no-op success (returns txid)
         // and must not re-enter the unbroadcast set (`mempool_unbroadcast.py:93`).
-        Err(rbitcoin_net::AcceptError::Duplicate(_)) => {
+        Ok(rbitcoin_net::LocalBroadcast::InPool) => {
             Ok(json!(hash_hex_display(&tx.compute_txid().to_byte_array())))
         }
         // Same txid, different witness: success + force-INV the live body so a
         // peer that missed the first announce still sees it
         // (`mempool_accept_wtxid.py:82`). Ignores inv_gen_floor / age gate.
-        Err(e) if e.to_string() == "policy: txn-same-nonwitness-data-in-mempool" => {
+        Ok(rbitcoin_net::LocalBroadcast::OtherWitnessInPool) => {
             let tid = tx.compute_txid();
             if let (Some(peers), Some(chain)) = (ctx.peers.as_ref(), ctx.chain.as_ref()) {
                 rbitcoin_net::force_announce_txid(chain, peers, tid);
