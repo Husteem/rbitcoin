@@ -1993,6 +1993,33 @@ async fn tip_restatus_waits_for_a_held_pool() {
     let _ = std::fs::remove_dir_all(&pad.dir);
 }
 
+/// A request split across two reads survives scripthash ticks that win the
+/// session's wait between them, and gets its reply.
+#[tokio::test(start_paused = true)]
+async fn request_split_across_ticks_is_answered() {
+    let mut pad = held_pool_pad().await;
+    let line = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"server.ping\",\"params\":[]}\n";
+    let (head, tail) = line.split_at(line.len() / 2);
+    pad.client
+        .get_mut()
+        .write_all(head.as_bytes())
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(60)).await;
+    }
+    pad.client
+        .get_mut()
+        .write_all(tail.as_bytes())
+        .await
+        .unwrap();
+    let reply = pad.read().await;
+    assert_eq!(reply["id"], 7, "{reply}");
+    assert_eq!(reply["result"], Value::Null, "{reply}");
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
 /// A pool admit announced while a reorg holds the pool restatuses on the
 /// next tick.
 #[tokio::test(start_paused = true)]
@@ -2303,27 +2330,25 @@ async fn chain_view_reorg_notifies_dropped_scripthash() {
 }
 
 #[tokio::test]
-async fn read_line_capped_accepts_under_limit() {
+async fn line_reader_accepts_under_limit() {
     use std::io::Cursor;
-    use tokio::io::BufReader;
-    let mut r = BufReader::new(Cursor::new(b"{\"id\":1}\nnext\n".as_slice()));
-    let line = read_line_capped(&mut r, 1024).await.unwrap().unwrap();
+    let mut r = LineReader::new(Cursor::new(b"{\"id\":1}\nnext\n".as_slice()), 1024);
+    let line = r.read_line().await.unwrap().unwrap();
     assert_eq!(line, "{\"id\":1}");
-    let line2 = read_line_capped(&mut r, 1024).await.unwrap().unwrap();
+    let line2 = r.read_line().await.unwrap().unwrap();
     assert_eq!(line2, "next");
 }
 
 /// A partial line with no newline is the bytes read, including a buffer that
 /// fills the cap exactly. A shorter tail is still that tail.
 #[tokio::test]
-async fn read_line_capped_keeps_a_partial_line_through_the_cap() {
+async fn line_reader_keeps_a_partial_line_through_the_cap() {
     use std::io::Cursor;
-    use tokio::io::BufReader;
-    let mut exact = BufReader::new(Cursor::new(b"AAAA".as_slice()));
-    let line = read_line_capped(&mut exact, 4).await.unwrap().unwrap();
+    let mut exact = LineReader::new(Cursor::new(b"AAAA".as_slice()), 4);
+    let line = exact.read_line().await.unwrap().unwrap();
     assert_eq!(line, "AAAA");
-    let mut short = BufReader::new(Cursor::new(b"AA".as_slice()));
-    let line = read_line_capped(&mut short, 4).await.unwrap().unwrap();
+    let mut short = LineReader::new(Cursor::new(b"AA".as_slice()), 4);
+    let line = short.read_line().await.unwrap().unwrap();
     assert_eq!(line, "AA");
 }
 
@@ -2547,12 +2572,11 @@ async fn elapsed_tweaks_chunk_seals_while_heights_remain() {
     let peer: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
     let limits = rbitcoin_electrum::tweaks::subscribe_serve_limits(false);
     let idle = Duration::from_secs(1);
-    let max_line = DEFAULT_MAX_LINE_BYTES;
     let last = 3_000u32;
 
     let (client, server) = tokio::io::duplex(1024 * 1024);
     let (server_r, server_w) = tokio::io::split(server);
-    let mut server_r = BufReader::new(server_r);
+    let mut server_r = LineReader::new(server_r, DEFAULT_MAX_LINE_BYTES);
     let mut server_w = rbitcoin_electrum::server::ConnWrite::new(server_w, idle);
     let mut next = 0u32;
     tokio::time::timeout(
@@ -2566,7 +2590,6 @@ async fn elapsed_tweaks_chunk_seals_while_heights_remain() {
             last,
             limits,
             0,
-            max_line,
             started,
             &mut next,
         ),
@@ -2593,7 +2616,7 @@ async fn elapsed_tweaks_chunk_seals_while_heights_remain() {
 
     let (client, server) = tokio::io::duplex(1024 * 1024);
     let (server_r, server_w) = tokio::io::split(server);
-    let mut server_r = BufReader::new(server_r);
+    let mut server_r = LineReader::new(server_r, DEFAULT_MAX_LINE_BYTES);
     let mut server_w = rbitcoin_electrum::server::ConnWrite::new(server_w, idle);
     let mut next = 0u32;
     tokio::time::timeout(
@@ -2607,7 +2630,6 @@ async fn elapsed_tweaks_chunk_seals_while_heights_remain() {
             last,
             limits,
             0,
-            max_line,
             started,
             &mut next,
         ),

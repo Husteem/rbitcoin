@@ -420,58 +420,60 @@ pub async fn run_electrum(
     })
 }
 
-/// Read one `\n`-terminated line with a hard byte cap (prevents OOM without newline).
-pub async fn read_line_capped<R>(
-    reader: &mut R,
+/// A connection's request lines, each capped at `max_bytes` (prevents OOM
+/// without a newline). The bytes of a line read so far live here, not in
+/// the [`LineReader::read_line`] future, so a `select!` that drops that
+/// future mid-line loses nothing.
+#[doc(hidden)]
+pub struct LineReader<R> {
+    inner: BufReader<R>,
+    partial: Vec<u8>,
     max_bytes: usize,
-) -> Result<Option<String>, std::io::Error>
-where
-    R: AsyncBufReadExt + Unpin,
-{
-    let max_bytes = max_bytes.max(1);
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            return if buf.is_empty() {
-                Ok(None)
-            } else {
-                if buf.len() > max_bytes {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "electrum request line too long",
-                    ));
-                }
-                Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
-            };
+}
+
+impl<R: AsyncRead + Unpin> LineReader<R> {
+    pub fn new(inner: R, max_bytes: usize) -> Self {
+        Self {
+            inner: BufReader::new(inner),
+            partial: Vec::new(),
+            max_bytes: max_bytes.max(1),
         }
-        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-            let take = pos + 1;
-            if buf.len().saturating_add(take) > max_bytes {
-                reader.consume(take);
+    }
+
+    /// The next `\n`-terminated line without its line ending, or the
+    /// unterminated tail at EOF. Cancel safe.
+    pub async fn read_line(&mut self) -> Result<Option<String>, std::io::Error> {
+        loop {
+            let available = self.inner.fill_buf().await?;
+            if available.is_empty() {
+                if self.partial.is_empty() {
+                    return Ok(None);
+                }
+                let line = std::mem::take(&mut self.partial);
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            let (take, done) = match available.iter().position(|&b| b == b'\n') {
+                Some(pos) => (pos + 1, true),
+                None => (available.len(), false),
+            };
+            if self.partial.len().saturating_add(take) > self.max_bytes {
+                self.inner.consume(take);
+                self.partial.clear();
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "electrum request line too long",
                 ));
             }
-            buf.extend_from_slice(&available[..take]);
-            reader.consume(take);
-            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-                buf.pop();
+            self.partial.extend_from_slice(&available[..take]);
+            self.inner.consume(take);
+            if done {
+                let mut line = std::mem::take(&mut self.partial);
+                while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
             }
-            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
         }
-        if buf.len().saturating_add(available.len()) > max_bytes {
-            let n = available.len();
-            reader.consume(n);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "electrum request line too long",
-            ));
-        }
-        buf.extend_from_slice(available);
-        let n = available.len();
-        reader.consume(n);
     }
 }
 
@@ -520,13 +522,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (reader, writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
+    let mut reader = LineReader::new(reader, config.max_line_bytes());
     let mut conn = ElectrumConn::new();
     let mut last_sent_status: HashMap<[u8; 32], String> = HashMap::new();
     let notify = Arc::new(Notify::new());
     let mut mempool_rx = mempool.as_ref().map(|m| m.subscribe_announces());
     let mut writer = ConnWrite::new(writer, config.idle_timeout());
-    let max_line = config.max_line_bytes();
     let mut sh_seen = query.sh_indexed_through_height();
     // A status read overlapped a held pool, so the tick reads every sub again.
     let mut sh_rescan = false;
@@ -695,7 +696,7 @@ where
                     }
                 }
             }
-            line = tokio::time::timeout(writer.idle(), read_line_capped(&mut reader, max_line)) => {
+            line = tokio::time::timeout(writer.idle(), reader.read_line()) => {
                 let line = match line {
                     Ok(Ok(Some(l))) => l,
                     Ok(Ok(None)) => {
@@ -772,7 +773,6 @@ where
                                         &peer,
                                         id,
                                         &params_v,
-                                        max_line,
                                         config.tweaks_min_dust,
                                     )
                                     .await?
@@ -1955,18 +1955,17 @@ fn sp_scan_error_note(sub: &crate::silent_scan::SpSub, message: String) -> Value
 
 #[allow(clippy::too_many_arguments)] // matches handle_client call-site
 pub async fn serve_tweaks_subscribe<R, W>(
-    reader: &mut R,
+    reader: &mut LineReader<R>,
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     chain: &Arc<ChainParams>,
     peer: &SocketAddr,
     id: Value,
     params_v: &Value,
-    max_line: usize,
     min_dust: u64,
 ) -> Result<(), std::io::Error>
 where
-    R: AsyncBufReadExt + Unpin,
+    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let req = match crate::tweaks::parse_req(params_v) {
@@ -2017,7 +2016,7 @@ where
     let mut next = req.start.saturating_add(wave.consumed.max(1));
     let limits = crate::tweaks::subscribe_serve_limits(req.historical);
     serve_tweaks_rest(
-        reader, writer, query, chain, peer, last, limits, min_dust, max_line, t0, &mut next,
+        reader, writer, query, chain, peer, last, limits, min_dust, t0, &mut next,
     )
     .await
 }
@@ -2025,7 +2024,7 @@ where
 /// After wave 0: more waves while the chunk is open, then Cake `done`.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_tweaks_rest<R, W>(
-    reader: &mut R,
+    reader: &mut LineReader<R>,
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     chain: &Arc<ChainParams>,
@@ -2033,18 +2032,17 @@ pub async fn serve_tweaks_rest<R, W>(
     last: u32,
     limits: rbitcoin_query::ThinTweakRangeLimits,
     min_dust: u64,
-    max_line: usize,
     t0: Instant,
     next: &mut u32,
 ) -> Result<(), std::io::Error>
 where
-    R: AsyncBufReadExt + Unpin,
+    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let more = *next <= last;
     if crate::tweaks::chunk_still_open(t0.elapsed(), more) {
         serve_tweaks_follow_waves(
-            reader, writer, query, chain, peer, last, limits, min_dust, max_line, t0, next,
+            reader, writer, query, chain, peer, last, limits, min_dust, t0, next,
         )
         .await?;
     }
@@ -2138,7 +2136,7 @@ pub async fn serve_tweaks_empty_ok<W: AsyncWrite + Unpin>(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_tweaks_follow_waves<R, W>(
-    reader: &mut R,
+    reader: &mut LineReader<R>,
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     chain: &Arc<ChainParams>,
@@ -2146,12 +2144,11 @@ pub async fn serve_tweaks_follow_waves<R, W>(
     last: u32,
     limits: rbitcoin_query::ThinTweakRangeLimits,
     min_dust: u64,
-    max_line: usize,
     t0: Instant,
     next: &mut u32,
 ) -> Result<(), std::io::Error>
 where
-    R: AsyncBufReadExt + Unpin,
+    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let spawn_wave = |batch_start: u32| {
@@ -2181,7 +2178,7 @@ where
     let mut handle = spawn_wave(batch_start);
     loop {
         let batch = loop {
-            match tweaks_wait_wave_or_ping(reader, writer, max_line, &mut handle).await? {
+            match tweaks_wait_wave_or_ping(reader, writer, &mut handle).await? {
                 TweaksWait::Wave(map) => break map,
                 TweaksWait::Continue => continue,
                 TweaksWait::Eof => return Ok(()),
@@ -2225,19 +2222,18 @@ pub enum TweaksWait {
 }
 
 pub async fn tweaks_wait_wave_or_ping<R, W>(
-    reader: &mut R,
+    reader: &mut LineReader<R>,
     writer: &mut ConnWrite<W>,
-    max_line: usize,
     handle: &mut tokio::task::JoinHandle<Result<crate::tweaks::NotifyWave, String>>,
 ) -> Result<TweaksWait, std::io::Error>
 where
-    R: AsyncBufReadExt + Unpin,
+    R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let idle = writer.idle();
     tokio::select! {
         biased;
-        line = tokio::time::timeout(idle, read_line_capped(reader, max_line)) => {
+        line = tokio::time::timeout(idle, reader.read_line()) => {
             match line {
                 Ok(Ok(Some(l))) => {
                     if !l.trim().is_empty() {
