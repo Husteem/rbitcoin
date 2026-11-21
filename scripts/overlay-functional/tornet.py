@@ -267,6 +267,25 @@ def main() -> int:
 
     if not cookie.is_file():
         raise SystemExit("control cookie missing")
+    restart = client / "restart.sh"
+    write(
+        restart,
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+pid="$(cat {client / 'tor.pid'})"
+kill "$pid"
+for _ in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+: >{client / 'notice.log'}
+tor -f {torrc}
+for _ in $(seq 1 300); do
+  grep -q "Bootstrapped 100%" {client / 'notice.log'} && exit 0
+  sleep 0.4
+done
+tail -n 25 {client / 'notice.log'} >&2
+exit 1
+""",
+    )
+    restart.chmod(0o755)
     write(
         env_path,
         "\n".join(
@@ -274,6 +293,7 @@ def main() -> int:
                 f"OVERLAY_TOR_SOCKS=127.0.0.1:{socks}",
                 f"OVERLAY_TOR_CONTROL=127.0.0.1:{control}",
                 f"OVERLAY_TOR_COOKIE={cookie}",
+                f"OVERLAY_TOR_RESTART={restart}",
             ]
         )
         + "\n",

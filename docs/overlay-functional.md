@@ -55,6 +55,9 @@ Timeout **45 minutes** (i2pd tunnel build on a tiny net is the long pole).
 | `OVERLAY_I2P_SAM` | Node A SAM (`127.0.0.1:port`) |
 | `OVERLAY_I2P_SAM_B` | Node B SAM (accept-incoming) |
 | `OVERLAY_CJDNS_A` / `OVERLAY_CJDNS_B` | `fc00::/8` IPv6 on each TUN |
+| `OVERLAY_TOR_RESTART` | Script that restarts the client tor and waits for `Bootstrapped 100%` |
+| `OVERLAY_I2P_RESTART_B` | Script that restarts node B's i2pd router and waits for SAM `HELLO` |
+| `OVERLAY_CJDNS_RESTART_B` | Script that restarts node B's cjdroute and waits until its address binds |
 
 ### Per-journey walls
 
@@ -71,6 +74,9 @@ Timeout **45 minutes** (i2pd tunnel build on a tiny net is the long pole).
 3. **I2P SAM** — A/B `--i2p-sam --only-net i2p`; B `--i2p-accept-incoming`. B's `getnetworkinfo` address is the `.b32.i2p:0` hash of the public Destination in `p2p.priv` (not a private re-encode of the whole key file). A STREAM CONNECTs to that name. `getpeerinfo` is `i2p` / v2 and has received `addrv2`.
 4. **CJDNS TUN** — A/B `--cjdns-reachable` on real `fc00::/8`. `getpeerinfo.network=cjdns` on both sides. `getnetworkinfo.localaddresses` lists each TUN address without `--external-ip`. TUN create failure is a hard fail.
 5. **Ephemeral broadcast** — A `--proxy` (real Tor SOCKS); standing onion peer to B; `sendrawtransaction`; standing session must not INV that tx; a one-shot circuit delivers `tx`.
+6. **Tor restart** — B `--listen-onion --tor-control`; restart the client tor under B. B lists the same onion again, it is reachable over SOCKS, and A then syncs from it. B is not restarted.
+7. **i2pd restart** — B `--i2p-accept-incoming` on SAM B; restart that i2pd router under B. B lists the same `.b32.i2p` again, a SAM stream reaches it, and A then syncs from it.
+8. **cjdroute restart** — B listens on its `fc00::/8` address; restart B's cjdroute. A then connects to B over cjdns and syncs. The listener is kept across the restart.
 
 Out of this harness: seqsigwit prune; public overlays; replacing NixOS
 module dummy `tor`/`i2pd` units ([`nixos-module-runtime`](../nix/tests/nixos-module-runtime.nix)

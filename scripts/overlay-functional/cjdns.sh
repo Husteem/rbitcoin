@@ -2,6 +2,7 @@
 # Two-node cjdns TUN that UDP-peers on 127.0.0.1. Fail if TUN cannot be created.
 set -euo pipefail
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="${1:?dir}"
 mkdir -p "$ROOT"
 
@@ -89,7 +90,6 @@ for name, cfg in (("a", a), ("b", b)):
 PY
 
 CJDNS_BIN="$(command -v cjdroute)"
-HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # cjdroute reads stdin until EOF as JSON conf, then `--nobg` keeps the
 # client in the event loop so the core is not reaped (parent would
@@ -138,100 +138,39 @@ wait_tun rbtc1
 
 IPV6_A="$(cat "$ROOT/a.ipv6")"
 IPV6_B="$(cat "$ROOT/b.ipv6")"
+bash "$HERE/cjdns-ready.sh" "$ROOT"
 
-# Kernel TCP over the TUNs (the product path). ICMP through cjdns is not
-# reliable on GitHub-hosted runners even when the ifaces are up.
-if ! python3 - "$IPV6_A" "$IPV6_B" <<'PY'
-import socket, sys, time
-a, b = sys.argv[1], sys.argv[2]
-end = time.time() + 60
-last = ""
-while time.time() < end:
-    srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        srv.bind((b, 0))
-        srv.listen(1)
-        srv.settimeout(1)
-        port = srv.getsockname()[1]
-        cli = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        try:
-            cli.bind((a, 0))
-            cli.settimeout(1)
-            cli.connect((b, port))
-            conn, _ = srv.accept()
-            conn.close()
-            sys.exit(0)
-        except OSError as e:
-            last = str(e)
-        finally:
-            cli.close()
-    except OSError as e:
-        last = str(e)
-    finally:
-        srv.close()
-    time.sleep(0.4)
-print(f"cjdns TCP timeout ({a} -> {b}): {last}", file=sys.stderr)
-sys.exit(1)
-PY
-then
-  echo "cjdns TCP timeout ($IPV6_A <-> $IPV6_B)" >&2
-  for name in a b; do
-    echo "--- $name pid ---" >&2
-    if [[ -f "$ROOT/$name.pid" ]] && sudo kill -0 "$(cat "$ROOT/$name.pid")" 2>/dev/null; then
-      echo "alive $(cat "$ROOT/$name.pid")" >&2
-    else
-      echo "dead" >&2
-    fi
-    echo "--- $name.log ---" >&2
-    tail -n 80 "$ROOT/$name.log" >&2 || true
-  done
-  sudo ip -6 addr show rbtc0 >&2 || true
-  sudo ip -6 addr show rbtc1 >&2 || true
-  sudo ip -6 route get "$IPV6_B" >&2 || true
+cat >"$ROOT/restart-b.sh" <<RESTART
+#!/usr/bin/env bash
+set -euo pipefail
+pid="\$(cat "$ROOT/b.pid")"
+# b runs under cjdns-run.sh, which owns the session: the angel's core is a
+# grandchild, so only a group kill takes the TUN down with the pair.
+sudo kill -TERM -- "-\$pid" 2>/dev/null || true
+for _ in \$(seq 1 100); do ip link show rbtc1 >/dev/null 2>&1 || break; sleep 0.2; done
+if ip link show rbtc1 >/dev/null 2>&1; then
+  echo "cjdns: rbtc1 still up after stop" >&2
   exit 1
 fi
-
-for pair in a:rbtc0 b:rbtc1; do
-  name="${pair%%:*}"
-  dev="${pair#*:}"
-  # A supervisor that kept the survivor after an angel crash is fine: the
-  # device and its address are what the journeys bind, so require those.
-  if [[ ! -e "/sys/class/net/$dev" ]]; then
-    echo "cjdns: $dev not up after TCP wait" >&2
-    tail -n 40 "$ROOT/$name.log" >&2 || true
-    exit 1
-  fi
+rm -f "$ROOT/b.pid"
+# The supervisor never exits, and this script runs under a captured pipe
+# (`restart_daemon` uses `Command::output`): its own stdout must not stay
+# open on that pipe or the caller waits for EOF forever. It writes the
+# daemon's output to b.log itself.
+sudo bash -c 'exec setsid bash "\$@"' _ "$HERE/cjdns-run.sh" "$CJDNS_BIN" \
+  "$ROOT/b.conf" "$ROOT/b.log" "$ROOT/b.pid" "$ROOT/b.cjdns.sock" rbtc1 \
+  >/dev/null 2>&1 &
+for _ in \$(seq 1 50); do
+  [[ -s "$ROOT/b.pid" ]] && break
+  sleep 0.1
 done
-# GHA: the core can crash ~1s after the first TCP. The supervisor puts a
-# fresh one back, TUN and address included; wait for both addresses to bind
-# again so the journeys never get a dead TUN. A crash loop never settles
-# and fails here, with the log.
-sleep 2
-python3 - "$IPV6_A" "$IPV6_B" <<'PY'
-import socket, sys, time
-end = time.time() + 15
-last = ""
-while time.time() < end:
-    live = 0
-    for ip in sys.argv[1:]:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        try:
-            s.bind((ip, 0))
-            live += 1
-        except OSError as e:
-            last = f"{ip}: {e}"
-        finally:
-            s.close()
-    if live == len(sys.argv) - 1:
-        sys.exit(0)
-    time.sleep(0.5)
-print(f"cjdns: TUN still dead after supervisor restart: {last}", file=sys.stderr)
-sys.exit(1)
-PY
+bash "$HERE/cjdns-ready.sh" "$ROOT"
+RESTART
+chmod +x "$ROOT/restart-b.sh"
 
 cat >"$ROOT/env" <<EOF
 OVERLAY_CJDNS_A=${IPV6_A}
 OVERLAY_CJDNS_B=${IPV6_B}
+OVERLAY_CJDNS_RESTART_B=$ROOT/restart-b.sh
 EOF
 cat "$ROOT/env"

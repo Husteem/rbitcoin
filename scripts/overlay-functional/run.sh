@@ -13,6 +13,9 @@ LIST_NAMES=(
   i2p_sam_two_node
   cjdns_tun_two_node
   ephemeral_socks_isolated_broadcast
+  tor_onion_comes_back_after_tor_restarts
+  i2p_destination_comes_back_after_i2pd_restarts
+  cjdns_listener_works_after_cjdroute_restarts
 )
 
 if [[ "${1:-}" == "--list" ]]; then
@@ -124,13 +127,22 @@ source "$WORKDIR/i2p/env"
 # shellcheck disable=SC1091
 source "$WORKDIR/cjdns/env"
 
-export OVERLAY_TOR_SOCKS OVERLAY_TOR_CONTROL OVERLAY_TOR_COOKIE
-export OVERLAY_I2P_SAM OVERLAY_I2P_SAM_B
-export OVERLAY_CJDNS_A OVERLAY_CJDNS_B
+export OVERLAY_TOR_SOCKS OVERLAY_TOR_CONTROL OVERLAY_TOR_COOKIE OVERLAY_TOR_RESTART
+export OVERLAY_I2P_SAM OVERLAY_I2P_SAM_B OVERLAY_I2P_RESTART_B
+export OVERLAY_CJDNS_A OVERLAY_CJDNS_B OVERLAY_CJDNS_RESTART_B
 
 echo "overlay-functional: TOR_SOCKS=$OVERLAY_TOR_SOCKS TOR_CONTROL=$OVERLAY_TOR_CONTROL" >&2
 echo "overlay-functional: I2P_SAM=$OVERLAY_I2P_SAM I2P_SAM_B=$OVERLAY_I2P_SAM_B" >&2
 echo "overlay-functional: CJDNS_A=$OVERLAY_CJDNS_A CJDNS_B=$OVERLAY_CJDNS_B" >&2
 
-cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --test-threads=1 "$@"
+if [[ "$#" -gt 0 ]]; then
+  cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --test-threads=1 "$@"
+else
+  skips=()
+  for name in "${LIST_NAMES[@]}"; do
+    cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --exact "$name"
+    skips+=(--skip "$name")
+  done
+  cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --exact "${skips[@]}"
+fi
 echo "overlay-functional: journeys done"

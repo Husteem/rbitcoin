@@ -20,6 +20,9 @@ pub struct OverlayEnv {
     pub i2p_sam_b: SocketAddr,
     pub cjdns_a: std::net::Ipv6Addr,
     pub cjdns_b: std::net::Ipv6Addr,
+    pub tor_restart: PathBuf,
+    pub i2p_restart_b: PathBuf,
+    pub cjdns_restart_b: PathBuf,
 }
 
 pub fn require_env() -> OverlayEnv {
@@ -35,7 +38,26 @@ pub fn require_env() -> OverlayEnv {
         cjdns_b: req("OVERLAY_CJDNS_B")
             .parse()
             .unwrap_or_else(|e| panic!("OVERLAY_CJDNS_B: {e}")),
+        tor_restart: PathBuf::from(req("OVERLAY_TOR_RESTART")),
+        i2p_restart_b: PathBuf::from(req("OVERLAY_I2P_RESTART_B")),
+        cjdns_restart_b: PathBuf::from(req("OVERLAY_CJDNS_RESTART_B")),
     }
+}
+
+pub async fn restart_daemon(script: &Path) {
+    let script = script.to_path_buf();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("bash").arg(&script).output()
+    })
+    .await
+    .unwrap()
+    .unwrap_or_else(|e| panic!("restart script: {e}"));
+    assert!(
+        out.status.success(),
+        "restart script failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn req(name: &str) -> String {
