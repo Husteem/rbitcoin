@@ -42,6 +42,33 @@ fn note_sh_posting_gap(_query: &Query) -> Result<(), QueryError> {
     Ok(())
 }
 
+#[cfg(debug_assertions)]
+type ShPageScanHook = fn(&Query);
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SH_PAGE_SCAN: std::cell::Cell<Option<ShPageScanHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One-shot hook at the start of the spend read of a newest page. Tests use
+/// it to check that the heavy turn is still held after the admit block.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_sh_page_scan_hook_for_test(hook: Option<ShPageScanHook>) {
+    SH_PAGE_SCAN.with(|slot| slot.set(hook));
+}
+
+#[cfg(debug_assertions)]
+fn note_sh_page_scan(query: &Query) {
+    if let Some(hook) = SH_PAGE_SCAN.with(|slot| slot.take()) {
+        hook(query);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn note_sh_page_scan(_query: &Query) {}
+
 /// While held, an unpaged join on this thread skips `--max-sh-creates`.
 /// `--heavy-sh-creates` still applies. The Esplora unix socket's
 /// `/internal/{address,scripthash}` totals hold one for the request: the
@@ -839,8 +866,9 @@ impl Query {
 
     /// A `from_height` above 0 scans that window and never fills the join.
     /// Any `to_height` also skips the stored join. A limited newest-first
-    /// page never fills it, at every cap. A height-ascending page skips it
-    /// only when the unpaged join would hit `--max-sh-creates`.
+    /// page never fills it. A height-ascending page skips it only when the
+    /// unpaged join would hit `--max-sh-creates`. The limited paths still
+    /// take that cap and the heavy turn when they read every create.
     #[doc(hidden)]
     pub fn page_without_full_slot(
         &self,
@@ -856,7 +884,8 @@ impl Query {
             return Ok(false);
         }
         // A catch-up from a later height scans that window. It must not
-        // fill the join or trip `--max-sh-creates`.
+        // fill the join. `height_window_history` takes the same cap and
+        // heavy turn as an unpaged join because it reads every create.
         if filter.from_height > 0 {
             return Ok(true);
         }
@@ -1406,17 +1435,21 @@ impl Query {
         view: &ChainView,
     ) -> Result<Vec<Fk>, QueryError> {
         let genesis = self.genesis_coinbase_fk()?;
-        let (durable, pending) = self.stable_sh_postings(scripthash)?;
         let mut fks = Vec::new();
-        for fk in durable {
-            if Some(fk) != genesis && self.confirmed_strong_in(fk, view)? {
-                fks.push(fk);
-            }
-        }
-        for fk in pending {
+        for fk in self.stable_sh_create_fks(scripthash)? {
             if Some(fk) == genesis || !self.confirmed_strong_in(fk, view)? {
                 continue;
             }
+            fks.push(fk);
+        }
+        Ok(fks)
+    }
+
+    /// Durable and pending creates, oldest fk first, before the chain check.
+    fn stable_sh_create_fks(&self, scripthash: &[u8; 32]) -> Result<Vec<Fk>, QueryError> {
+        let (durable, pending) = self.stable_sh_postings(scripthash)?;
+        let mut fks = durable;
+        for fk in pending {
             if let Err(at) = fks.binary_search_by_key(&fk.0, |f| f.0) {
                 fks.insert(at, fk);
             }
@@ -1439,7 +1472,8 @@ impl Query {
         Ok(Some(*self.genesis_coinbase_fk.get_or_init(|| fk)))
     }
 
-    /// See [`NewestWindow`].
+    /// See [`NewestWindow`]. `fks` is the whole posting list before the
+    /// strong-chain check; the walk checks only the tail it needs.
     #[doc(hidden)]
     pub fn newest_create_window(
         &self,
@@ -1447,7 +1481,9 @@ impl Query {
         k: usize,
         high: u32,
         strict: bool,
+        view: &ChainView,
     ) -> Result<NewestWindow, QueryError> {
+        let genesis = self.genesis_coinbase_fk()?;
         let mut rev = Vec::new();
         let mut idx = fks.len();
         let mut counted = 0usize;
@@ -1462,8 +1498,11 @@ impl Query {
                 ));
             }
             for (fk, h) in chunk.iter().zip(heights).rev() {
+                if Some(*fk) == genesis {
+                    continue;
+                }
                 let h = h.unwrap_or(0);
-                if h > high {
+                if h > high || !self.confirmed_strong_in(*fk, view)? {
                     continue;
                 }
                 rev.push((h, *fk));
@@ -1637,12 +1676,39 @@ impl Query {
 
     /// Spends that can land on a newest-first page.
     ///
-    /// A gap inside [`MAX_HISTORY_WINDOW`] still scans those blocks. A wider
-    /// gap reads spend slots of the page's creates and of creates below the
-    /// page bound, and that read is refused above `--max-sh-creates`.
-    /// A spender counts only at a height inside `[low, high]`.
+    /// A gap inside [`MAX_HISTORY_WINDOW`] scans those blocks. A wider gap
+    /// reads spend slots of the page's creates and of creates below the page
+    /// bound. Both read every create, so both are refused above
+    /// `--max-sh-creates` and hold the heavy turn. A spender counts only at a
+    /// height inside `[low, high]`.
     #[doc(hidden)]
     pub fn spends_for_newest_page(
+        &self,
+        scripthash: &[u8; 32],
+        members: &[Fk],
+        window: &NewestWindow,
+        high: u32,
+        view: &ChainView,
+    ) -> Result<Vec<SpendHit>, QueryError> {
+        let admit = if window.bound.is_some() {
+            // Both a block scan and a spend-slot read walk every create, so
+            // each takes the unpaged cap and keeps the heavy turn for its read.
+            Some(self.unpaged_join_admit(scripthash)?)
+        } else {
+            None
+        };
+        // Debug drops the probe before `admit`, so a released heavy turn is
+        // not counted as still running. The turn covers the inner read.
+        #[cfg(debug_assertions)]
+        let _probe = admit.as_ref().map(|a| self.sh_join_probe.enter(a.heavy));
+        #[cfg(not(debug_assertions))]
+        let _admit = admit;
+        self.spends_for_newest_page_inner(scripthash, members, window, high, view)
+    }
+
+    /// [`Self::spends_for_newest_page`] for a caller that already holds the
+    /// admit a full page needs.
+    fn spends_for_newest_page_inner(
         &self,
         scripthash: &[u8; 32],
         members: &[Fk],
@@ -1653,11 +1719,10 @@ impl Query {
         let Some(low) = window.bound else {
             return self.spends_of_retained_creates(scripthash, &window.creates, high, view);
         };
+        note_sh_page_scan(self);
         if high.saturating_sub(low) <= MAX_HISTORY_WINDOW {
             return self.spends_of_members(members, low, high);
         }
-        // Held across the spend-slot read so a heavy script keeps the turn.
-        let _admit = self.unpaged_join_admit(scripthash)?;
         let mut creates = window.creates.clone();
         let mut kept: Vec<u64> = window.creates.iter().map(|(_, fk)| fk.0).collect();
         kept.sort_unstable();
@@ -1709,9 +1774,29 @@ impl Query {
                 cursor_missing: true,
             });
         };
-        let members = self.strong_sh_creates(scripthash, view)?;
-        let window = self.newest_create_window(&members, k, scan.high, scan.strict)?;
-        let hits = self.spends_for_newest_page(scripthash, &members, &window, scan.high, view)?;
+        // Walk the posting tail before the full strong list: a full page over
+        // the cap is refused after reading only the page, not every create.
+        let postings = self.stable_sh_create_fks(scripthash)?;
+        let window = self.newest_create_window(&postings, k, scan.high, scan.strict, view)?;
+        let full = window.bound.is_some();
+        let admit = if full {
+            Some(self.unpaged_join_admit(scripthash)?)
+        } else {
+            None
+        };
+        // Debug drops the probe before `admit`, so a released heavy turn is
+        // not counted as still running. The turn covers the body load below.
+        #[cfg(debug_assertions)]
+        let _probe = admit.as_ref().map(|a| self.sh_join_probe.enter(a.heavy));
+        #[cfg(not(debug_assertions))]
+        let _admit = admit;
+        let members = if full {
+            self.strong_sh_creates(scripthash, view)?
+        } else {
+            Vec::new()
+        };
+        let hits =
+            self.spends_for_newest_page_inner(scripthash, &members, &window, scan.high, view)?;
         let mut decode = window.creates.iter().map(|(_, fk)| *fk).collect::<Vec<_>>();
         for hit in &hits {
             decode.push(hit.parent);
@@ -1821,7 +1906,8 @@ impl Query {
     /// Creates below `from_height` stay as foreign keys. Spends of those
     /// coins come from [`Self::spends_of_members`] on the window's blocks
     /// (`input.body`), not from their spend slots, and not from [`Self::sh_join`].
-    /// A hit counts only when that input's output pays this script.
+    /// A hit counts only when that input's output pays this script. The scan
+    /// reads every create, so it takes the unpaged cap and heavy turn.
     #[doc(hidden)]
     pub fn height_window_history(
         &self,
@@ -1843,6 +1929,13 @@ impl Query {
         if span > MAX_HISTORY_WINDOW {
             return Err(StoreError::Rejected("history window too wide"));
         }
+        // The window needs every create to decide whether a spend in it
+        // pays the script. Take the unpaged cap and heavy turn for that read.
+        let admit = self.unpaged_join_admit(scripthash)?;
+        #[cfg(debug_assertions)]
+        let _probe = self.sh_join_probe.enter(admit.heavy);
+        #[cfg(not(debug_assertions))]
+        let _admit = admit;
         let members = self.strong_sh_creates(scripthash, view)?;
         let heights = self.store.tx_height_get_batch(&members)?;
         if heights.len() != members.len() {

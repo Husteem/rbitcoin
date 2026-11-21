@@ -1,3 +1,16 @@
+#[cfg(debug_assertions)]
+static SH_PAGE_SCAN_HELD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(debug_assertions)]
+fn note_sh_page_scan_heavy_held(q: &Query) {
+    let held = matches!(
+        q.heavy_sh_join.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    );
+    SH_PAGE_SCAN_HELD.store(held, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn assert_unspent_newest_page_stops(
     q: &Query,
     quiet_sh: [u8; 32],
@@ -5,11 +18,18 @@ fn assert_unspent_newest_page_stops(
 ) {
     use rbitcoin_query::scripthash::HistoryOrder::NewestFirst;
 
+    let err = sh_page(q, &quiet_sh, NewestFirst, None).unwrap_err();
+    assert!(
+        matches!(err, rbitcoin_store::StoreError::ShCreatesCap { .. }),
+        "a full newest page over the cap must refuse: {err}"
+    );
+    q.set_max_sh_creates(0);
     assert_eq!(
         sh_page(q, &quiet_sh, NewestFirst, None).unwrap(),
         [tip_cb_txid],
         "newest-first page is the tip create"
     );
+    q.set_max_sh_creates(2);
 }
 
 fn short_newest_summary(
@@ -61,10 +81,49 @@ fn sh_page(
         .collect())
 }
 
+fn height_window_obeys_create_cap(
+    q: &Query,
+    sh: &[u8; 32],
+    tip_cb_txid: [u8; 32],
+    spend_txid: [u8; 32],
+) {
+    let filter = rbitcoin_query::scripthash::HistoryFilter::height_window(5, Some(6));
+    let err = q.scripthash_history_filtered(sh, &filter).unwrap_err();
+    assert!(
+        err.to_string() == "scripthash join exceeds --max-sh-creates (7 creates, cap 2)",
+        "a height window over the cap must refuse: {err}"
+    );
+    q.set_max_sh_creates(0);
+    let txids: Vec<[u8; 32]> = q
+        .scripthash_history_filtered(sh, &filter)
+        .expect("cap 0 serves the height window")
+        .rows
+        .iter()
+        .map(|row| row.txid)
+        .collect();
+    assert!(txids.contains(&tip_cb_txid), "{txids:?}");
+    assert!(txids.contains(&spend_txid), "{txids:?}");
+    #[cfg(debug_assertions)]
+    {
+        q.set_heavy_sh_creates(1);
+        q.sh_join_probe.arm();
+        q.scripthash_history_filtered(sh, &filter)
+            .expect("cap 0 serves the height window under the heavy turn");
+        assert_eq!(
+            q.sh_join_probe.entered(),
+            (0, 1),
+            "a height window above --heavy-sh-creates takes the turn"
+        );
+        q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
+    }
+    q.set_max_sh_creates(2);
+}
+
 /// One scripthash with more creates than `--max-sh-creates`: the full join
-/// refuses, a page that closes before the cap is still served in either
-/// order and past a cursor, and the create count includes the write-behind
-/// that has not reached the durable index yet.
+/// refuses; height-ascending and cursor pages that close before the cap are
+/// still served; a full newest-first page refuses above the cap; and the
+/// create count includes the write-behind that has not reached the durable
+/// index yet.
 #[test]
 fn sh_history_caps() {
     use rbitcoin_query::scripthash::HistoryOrder::{HeightAsc, NewestFirst};
@@ -170,11 +229,20 @@ fn sh_history_caps() {
         "a cursor deeper than the cap still returns its next row"
     );
 
+    height_window_obeys_create_cap(&q, &sh, tip_cb_txid, spend_txid);
+
+    let err = sh_page(&q, &sh, NewestFirst, None).unwrap_err();
+    assert!(
+        err.to_string() == "scripthash join exceeds --max-sh-creates (7 creates, cap 2)",
+        "a full newest page over the cap must refuse: {err}"
+    );
+    q.set_max_sh_creates(0);
     assert_eq!(
         sh_page(&q, &sh, NewestFirst, None).unwrap(),
         [spend_txid],
         "the newest row spends the oldest create"
     );
+    q.set_max_sh_creates(2);
     assert_unspent_newest_page_stops(&q, quiet_sh, tip_cb_txid);
 
     let view = q.pin_sh_chain_view().unwrap().expect("sh view");
@@ -320,13 +388,13 @@ fn history_walk_fails_once_its_view_leaves_the_chain() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A newest-first page whose gap is wider than the 8064-block history window joins
-/// spend slots of every older create. That join is the unpaged cap: over
-/// `--max-sh-creates` it refuses, and with the cap off it still returns the
-/// spend of the create below the page bound. A gap inside the window still
-/// scans blocks and still serves the same spend above the cap.
+/// A newest-first page that reaches a create below the page bound reads every
+/// create, whether it scans blocks inside the 8064-block window or joins spend
+/// slots across a wider gap. Both take the unpaged cap: over
+/// `--max-sh-creates` each refuses, and with the cap off each still returns
+/// the spend of the create below the page bound.
 #[test]
-fn wide_gap_newest_page_obeys_create_cap() {
+fn newest_page_gap_obeys_create_cap() {
     let (dir, q) = temp_query("sh-wide-gap-cap");
     let sh = script_hash(&[0x51]);
     let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
@@ -377,29 +445,47 @@ fn wide_gap_newest_page_obeys_create_cap() {
     };
 
     q.set_max_sh_creates(2);
-    match q.spends_for_newest_page(&sh, &members, &window, 8_066, &view) {
-        Err(err) => assert!(
-            err.to_string() == "scripthash join exceeds --max-sh-creates (3 creates, cap 2)",
-            "{err}"
-        ),
-        Ok(_) => panic!("a wide gap over the cap must refuse the join"),
+    for (gap, high) in [("in-window", 2), ("wide", 8_066)] {
+        match q.spends_for_newest_page(&sh, &members, &window, high, &view) {
+            Err(err) => assert!(
+                err.to_string() == "scripthash join exceeds --max-sh-creates (3 creates, cap 2)",
+                "{gap}: {err}"
+            ),
+            Ok(_) => panic!("a {gap} gap over the cap must refuse the join"),
+        }
     }
-    let short = q
-        .spends_for_newest_page(&sh, &members, &window, 2, &view)
-        .expect("a gap inside the history window still scans");
-    assert!(
-        spend_of_oldest(short),
-        "the in-window scan still returns the spend above the cap"
-    );
 
     q.set_max_sh_creates(0);
-    let open = q
-        .spends_for_newest_page(&sh, &members, &window, 8_066, &view)
-        .expect("cap 0 still joins the wide gap");
-    assert!(
-        spend_of_oldest(open),
-        "the wide gap returns the spend of the create below the page bound"
-    );
+    for (gap, high) in [("in-window", 2), ("wide", 8_066)] {
+        let open = q
+            .spends_for_newest_page(&sh, &members, &window, high, &view)
+            .unwrap_or_else(|e| panic!("cap 0 still joins the {gap} gap: {e}"));
+        assert!(
+            spend_of_oldest(open),
+            "the {gap} gap returns the spend of the create below the page bound"
+        );
+    }
+    #[cfg(debug_assertions)]
+    {
+        q.set_heavy_sh_creates(1);
+        q.sh_join_probe.arm();
+        SH_PAGE_SCAN_HELD.store(false, std::sync::atomic::Ordering::SeqCst);
+        rbitcoin_query::scripthash::set_sh_page_scan_hook_for_test(Some(
+            note_sh_page_scan_heavy_held,
+        ));
+        q.spends_for_newest_page(&sh, &members, &window, 2, &view)
+            .expect("an in-window page under the heavy turn");
+        assert_eq!(
+            q.sh_join_probe.entered(),
+            (0, 1),
+            "an in-window page above --heavy-sh-creates takes the turn"
+        );
+        assert!(
+            SH_PAGE_SCAN_HELD.load(std::sync::atomic::Ordering::SeqCst),
+            "the heavy turn was dropped before the page scan"
+        );
+        q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -510,6 +596,12 @@ fn newest_page_ignores_cap_and_sibling_spends() {
         err.to_string() == "scripthash join exceeds --max-sh-creates (4 creates, cap 1)",
         "{err}"
     );
+    let err = sh_page(&q, &sh, NewestFirst, Some(lo)).unwrap_err();
+    assert!(
+        err.to_string() == "scripthash join exceeds --max-sh-creates (4 creates, cap 1)",
+        "a full newest page over the cap must refuse: {err}"
+    );
+    q.set_max_sh_creates(0);
     assert_eq!(page(Some(lo)), vec![spend_txid]);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -576,6 +668,13 @@ fn newest_page_is_tip_events_not_creates_between() {
     );
 
     q.set_max_sh_creates(1);
+    let err = q.scripthash_history_filtered(&sh, &filter).unwrap_err();
+    assert!(
+        err.to_string() == "scripthash join exceeds --max-sh-creates (3 creates, cap 1)",
+        "a full newest page over the cap must refuse: {err}"
+    );
+    assert_newest_page_leaves_slot_empty(&q, &sh);
+    q.set_max_sh_creates(0);
     assert_eq!(
         q.scripthash_history_filtered(&sh, &filter)
             .unwrap()
@@ -585,7 +684,6 @@ fn newest_page_is_tip_events_not_creates_between() {
             .collect::<Vec<_>>(),
         vec![spend_txid, tip_txid]
     );
-    assert_newest_page_leaves_slot_empty(&q, &sh);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
