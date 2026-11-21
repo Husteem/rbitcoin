@@ -57,7 +57,7 @@ pub fn render(status: &NodeStatus) -> String {
             .map_or(0, |d| d.as_secs()),
     );
     progress_gauges(&mut out, &rbitcoin_log::progress::snapshots());
-    let rss_kb = rbitcoin_ibd::read_platform_rss().rss_kb;
+    let rss_kb = rbitcoin_ibd::read_platform_rss_fast().rss_kb;
     if rss_kb > 0 {
         out.gauge(
             "process_resident_memory_bytes",
