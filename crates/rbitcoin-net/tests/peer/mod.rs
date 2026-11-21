@@ -1294,6 +1294,7 @@ async fn heartbeat_once(
         &mut None,
         &mut None,
         false,
+        false,
     )
     .await
     .unwrap();
@@ -1324,6 +1325,7 @@ async fn queued_decode_holds_block_requests_across_heartbeat() {
         &mut None,
         &mut None,
         true,
+        true,
     )
     .await
     .unwrap();
@@ -1350,6 +1352,7 @@ async fn queued_decode_holds_block_requests_across_heartbeat() {
         &mut None,
         &mut None,
         false,
+        false,
     )
     .await
     .unwrap();
@@ -1358,6 +1361,86 @@ async fn queued_decode_holds_block_requests_across_heartbeat() {
         "once the decode queue is empty the stall clock still expires"
     );
     assert!(!hub.already_have_or_asked_block(&hash));
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// A `blocktxn` queued behind a front held for the send budget is already
+/// off the socket. The front no longer waits to decode, so the timeout
+/// gates run, but the 10s request expiry must not forget the pending
+/// compact before that `blocktxn` is applied.
+#[tokio::test]
+async fn held_front_keeps_a_queued_blocktxn_pending() {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::blockdata::constants::genesis_block;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("held-front-blocktxn");
+    hub.ensure_genesis().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = outbound_test_peer(&peers, 18481);
+    let block = genesis_block(Network::Regtest);
+    let hash = block.block_hash();
+    let mut follow = PeerFollowState::new();
+    follow.pending_cmpct.insert(
+        hash,
+        PendingCmpct {
+            hsi: HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[]).unwrap(),
+            partial: rbitcoin_net::compact::CmpctPartial {
+                slots: Vec::new(),
+                txids: Vec::new(),
+                missing: vec![1],
+            },
+            fill: None,
+            since: std::time::Instant::now() - BLOCK_GETDATA_TIMEOUT - Duration::from_secs(1),
+        },
+    );
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let mut since = None;
+    on_heartbeat(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &mut since,
+        &mut None,
+        &mut None,
+        false,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(
+        follow.pending_cmpct.contains_key(&hash),
+        "a blocktxn behind the held front must stay pending"
+    );
+    assert!(
+        sent(&mut out_rx)
+            .iter()
+            .all(|m| !matches!(m, NetworkMessage::GetData(_))),
+        "the held first frame must not expire the compact into a full getdata"
+    );
+    on_heartbeat(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &mut since,
+        &mut None,
+        &mut None,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !follow.pending_cmpct.contains_key(&hash),
+        "an empty decode queue still expires the compact"
+    );
+    assert!(
+        sent(&mut out_rx)
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::GetData(_))),
+        "the expired compact asks for the full body"
+    );
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
@@ -1390,6 +1473,7 @@ async fn getdata_stall_keeps_a_hash_the_download_timer_owns() {
             &mut None,
             &mut None,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -1416,6 +1500,7 @@ async fn getdata_stall_keeps_a_hash_the_download_timer_owns() {
         &mut since,
         &mut None,
         &mut None,
+        false,
         false,
     )
     .await
@@ -1455,6 +1540,7 @@ async fn queued_decode_holds_the_block_download_window() {
         &mut None,
         &mut None,
         true,
+        true,
     )
     .await
     .unwrap();
@@ -1474,6 +1560,7 @@ async fn queued_decode_holds_the_block_download_window() {
         &mut since,
         &mut None,
         &mut None,
+        false,
         false,
     )
     .await
@@ -1512,6 +1599,7 @@ async fn queued_decode_holds_the_ping_timeout() {
         &mut None,
         &mut None,
         true,
+        true,
     )
     .await
     .unwrap();
@@ -1527,6 +1615,7 @@ async fn queued_decode_holds_the_ping_timeout() {
         &mut since,
         &mut None,
         &mut None,
+        false,
         false,
     )
     .await
@@ -1773,6 +1862,55 @@ async fn assert_no_pong(reader: &mut rbitcoin_net::v2::V2Reader, magic: Magic, n
                 !frame_is_pong(&frame, nonce),
                 "pong went out while the earlier block was still queued"
             ),
+            _ => break,
+        }
+    }
+}
+
+async fn wait_getblocktxn(
+    reader: &mut rbitcoin_net::v2::V2Reader,
+    magic: Magic,
+    hash: BlockHash,
+) -> Vec<u64> {
+    use rbitcoin_net::v2::read_v2_frame;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(left, read_v2_frame(reader, magic)).await {
+            Ok(Ok(frame)) => {
+                if let NetworkMessage::GetBlockTxn(g) = frame.decode().into_payload() {
+                    if g.txs_request.block_hash == hash {
+                        return g.txs_request.indexes;
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    panic!("no getblocktxn for {hash}");
+}
+
+async fn assert_no_getdata_for(
+    reader: &mut rbitcoin_net::v2::V2Reader,
+    magic: Magic,
+    hash: BlockHash,
+    wait: Duration,
+) {
+    use rbitcoin_net::v2::read_v2_frame;
+    let deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match tokio::time::timeout(left, read_v2_frame(reader, magic)).await {
+            Ok(Ok(frame)) => {
+                if let NetworkMessage::GetData(inv) = frame.decode().into_payload() {
+                    assert!(
+                        !inv.iter().any(|i| {
+                            matches!(i, Inventory::WitnessBlock(h) | Inventory::CompactBlock(h) if *h == hash)
+                        }),
+                        "a queued blocktxn was expired into a full getdata"
+                    );
+                }
+            }
             _ => break,
         }
     }
@@ -6646,6 +6784,168 @@ async fn over_budget_session_does_not_read_a_ping() {
     .expect("draining the send budget lets the session read the ping");
     t.node.shutdown().await;
     let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// A decoded non-block frame held for the send budget is still in
+/// `decode_q`, but it is not a frame waiting to decode behind a permit.
+/// The writer can be stuck forever on a peer that stops reading, so that
+/// hold must not suspend the ping timeout. The heartbeat has to drop the
+/// session even though the queue is non-empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_non_block_frame_does_not_suspend_the_ping_timeout() {
+    use bitcoin::blockdata::constants::genesis_block;
+    use rbitcoin_net::v2::write_v2_msg;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("held-front-timeout");
+    hub.ensure_genesis().unwrap();
+    let hub = hub.into_arc();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let start = 1_700_000_000_u64;
+    peers.set_mock_now(start);
+    let held = hold_decode_permits().await;
+    let mut s = open_decode_session(Arc::clone(&hub), &peers, 18480, hub.tip_hash()).await;
+    drain_startup(&mut s.reader, s.magic).await;
+
+    // A heavy block holds the decode queue, so the ping behind it is queued
+    // instead of applied directly. The budget flips before that front is
+    // polled: the block still applies, then the ping is put back.
+    let before = s.live.decode_enqueued();
+    let block = genesis_block(Network::Regtest);
+    let hash = block.block_hash();
+    write_v2_msg(&mut s.writer, NetworkMessage::Block(block))
+        .await
+        .unwrap();
+    wait_decode_enqueued(&s.live, before + 1).await;
+    let nonce = 0x51a7_0002_u64;
+    write_v2_msg(&mut s.writer, NetworkMessage::Ping(nonce))
+        .await
+        .unwrap();
+    wait_decode_enqueued(&s.live, before + 2).await;
+    s.live
+        .note_send_queued(2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
+    assert!(s.live.send_over_budget());
+    drop(held);
+    wait_block_applied(&s.live, &hash).await;
+    assert_no_pong(&mut s.reader, s.magic, nonce).await;
+    assert!(
+        !s.session.is_finished(),
+        "the held ping ended the session before the timeout"
+    );
+
+    let now = peers.now_secs();
+    peers.set_mock_now(now + PING_TIMEOUT_SECS + POST_BLOCK_PONG_GRACE_SECS + 1);
+    tokio::time::timeout(Duration::from_secs(5), &mut s.session)
+        .await
+        .expect("a held non-block frame must not hold the ping timeout")
+        .expect("session task");
+    assert!(
+        s.live.stop.load(Ordering::SeqCst),
+        "the ping timeout disconnected the stalled writer"
+    );
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// The held frame can be a ping with a `blocktxn` still behind it. The
+/// timeout gates run, but the 10s request expiry must leave that pending
+/// compact alone until the disconnect drain applies the `blocktxn`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_front_keeps_a_queued_blocktxn_until_the_drain() {
+    use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
+    use bitcoin::blockdata::constants::genesis_block;
+    use rbitcoin_net::v2::write_v2_msg;
+
+    let (dir, hub, [a, _]) = compact_spend_pair("held-front-cmpct");
+    let hub = hub.into_arc();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let start = 1_700_000_000_u64;
+    peers.set_mock_now(start);
+    let mut s = open_decode_session(Arc::clone(&hub), &peers, 18482, hub.tip_hash()).await;
+    drain_startup(&mut s.reader, s.magic).await;
+    write_v2_msg(
+        &mut s.writer,
+        NetworkMessage::SendCmpct(SendCmpct {
+            send_compact: true,
+            version: 2,
+        }),
+    )
+    .await
+    .unwrap();
+    let hsi = HeaderAndShortIds::from_block(&a, 0xbeef, 2, &[]).unwrap();
+    write_v2_msg(
+        &mut s.writer,
+        NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi }),
+    )
+    .await
+    .unwrap();
+    let indexes = wait_getblocktxn(&mut s.reader, s.magic, a.block_hash()).await;
+
+    // Hold decodes, then queue a heavy filler, the ping, and the blocktxn
+    // in wire order. Once the budget flips the filler applies, the ping is
+    // held, and the blocktxn stays behind it.
+    let held = hold_decode_permits().await;
+    let before = s.live.decode_enqueued();
+    let filler = genesis_block(Network::Regtest);
+    let filler_hash = filler.block_hash();
+    write_v2_msg(&mut s.writer, NetworkMessage::Block(filler))
+        .await
+        .unwrap();
+    wait_decode_enqueued(&s.live, before + 1).await;
+    let nonce = 0x51a7_0003_u64;
+    write_v2_msg(&mut s.writer, NetworkMessage::Ping(nonce))
+        .await
+        .unwrap();
+    wait_decode_enqueued(&s.live, before + 2).await;
+    let blocktxn = BlockTransactions {
+        block_hash: a.block_hash(),
+        transactions: indexes
+            .iter()
+            .map(|i| a.txdata[*i as usize].clone())
+            .collect(),
+    };
+    write_v2_msg(
+        &mut s.writer,
+        NetworkMessage::BlockTxn(BlockTxn {
+            transactions: blocktxn,
+        }),
+    )
+    .await
+    .unwrap();
+    wait_decode_enqueued(&s.live, before + 3).await;
+    s.live
+        .note_send_queued(2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
+    drop(held);
+    wait_block_applied(&s.live, &filler_hash).await;
+    assert_no_pong(&mut s.reader, s.magic, nonce).await;
+    assert!(
+        !s.session.is_finished(),
+        "the held ping ended the session before the expiry"
+    );
+    // Request expiry runs on the real clock. Let the pending compact age
+    // while the held front keeps the blocktxn queued.
+    tokio::time::sleep(BLOCK_GETDATA_TIMEOUT + Duration::from_secs(1)).await;
+
+    let now = peers.now_secs();
+    peers.set_mock_now(now + BLOCK_GETDATA_TIMEOUT.as_secs() + 1);
+    assert_no_getdata_for(
+        &mut s.reader,
+        s.magic,
+        a.block_hash(),
+        Duration::from_millis(250),
+    )
+    .await;
+
+    let now = peers.now_secs();
+    peers.set_mock_now(now + PING_TIMEOUT_SECS + POST_BLOCK_PONG_GRACE_SECS + 1);
+    tokio::time::timeout(Duration::from_secs(5), &mut s.session)
+        .await
+        .expect("the held ping must still time the writer out")
+        .expect("session task");
+    assert_eq!(
+        hub.tip_hash(),
+        Some(a.block_hash()),
+        "the drain applies the queued blocktxn"
+    );
+    let _ = std::fs::remove_dir_all(dir.path());
 }
 
 fn inbound_peer(

@@ -2450,6 +2450,7 @@ mod peer_session_pins {
             &mut announces,
             &mut flushes,
             false,
+            false,
         ))
         .unwrap();
         assert!(follow.requested_blocks.is_empty());
@@ -3816,6 +3817,7 @@ pub async fn on_heartbeat(
     requested_since: &mut Option<std::time::Instant>,
     tx_announce_rx: &mut Option<broadcast::Receiver<crate::tx_relay::MempoolAnnounce>>,
     inv_flush_rx: &mut Option<broadcast::Receiver<()>>,
+    decode_waiting: bool,
     decode_queued: bool,
 ) -> Result<(), NetError> {
     if tx_announce_rx.is_none() {
@@ -3834,17 +3836,21 @@ pub async fn on_heartbeat(
     }
     let now = s.clock_now();
     s.sync_block_download(now, |h| follow.block_in_flight(h));
-    // Blocks in flight, or a frame already read and waiting to decode,
+    // Blocks in flight, or a frame already read and still waiting to decode,
     // suspend the ping timeout. A due ping still sends. The next TCP read
-    // stays armed, so this is the heartbeat side of that same wait.
-    let ping_elapsed = if decode_queued || follow.has_blocks_in_flight() {
+    // stays armed, so this is the heartbeat side of that same wait. A frame
+    // held for the send budget is not waiting on a decode permit: the writer
+    // may never drain, so its hold must not suppress the timeout.
+    let ping_elapsed = if decode_waiting || follow.has_blocks_in_flight() {
         None
     } else {
         s.ping_timeout(now)
     };
-    // A body already in `decode_q` is still the oldest block in flight.
-    // Timing that window out would drop the frame before it is applied.
-    let download_timed_out = if decode_queued {
+    // A block or compact frame still waiting to decode is the oldest block
+    // in flight, so timing that window out would race its decode. A frame
+    // held for the send budget does not suspend this window: the disconnect
+    // drain still applies block bodies already off the socket.
+    let download_timed_out = if decode_waiting {
         None
     } else {
         s.block_download_timed_out(now, hub.params.btc.pow_target_spacing)
@@ -3863,8 +3869,9 @@ pub async fn on_heartbeat(
         ph.note_heartbeat_lap();
         ph.on_session_heartbeat();
     }
-    // A block or compact frame already sits in `decode_q`. Expiring the
-    // ask here forgets it before that frame is applied.
+    // A block or compact frame already sits in `decode_q`, even when it is
+    // behind a front held for the send budget. Expiring the ask here forgets
+    // it before that frame is applied.
     if !decode_queued {
         if maybe_expire_block_requests(
             hub,
@@ -4368,7 +4375,9 @@ pub async fn peer_session_with(
     let mut tip_deadline: Option<tokio::time::Instant> = None;
     // The decode arm consumes a ready oneshot. A non-block frame at the
     // front waits here until the send budget clears, so a later frame
-    // cannot pass it and the request is not dropped.
+    // cannot pass it and the request is not dropped. It is not waiting on
+    // a decode permit, so the heartbeat still times out a writer that never
+    // drains.
     let mut hold_front = false;
     let result = async {
         // Drop tips already sitting in the receiver so catch-up and the
@@ -4416,6 +4425,12 @@ pub async fn peer_session_with(
             if !over_budget {
                 hold_front = false;
             }
+            // The decode arm and the heartbeat must agree on whether the
+            // front is waiting to decode (suspend timeouts) or held for the
+            // send budget (do not). Any queued frame still blocks request
+            // expiry, including one sitting behind a held front.
+            let decode_queued = !decode_q.is_empty();
+            let front_waiting = decode_queued && !hold_front;
             let tail_pending =
                 !follow.getdata_tail.is_empty() || !follow.getblocktxn_tail.is_empty();
             let reading = !over_budget && !tail_pending;
@@ -4430,7 +4445,7 @@ pub async fn peer_session_with(
                         return Poll::Pending;
                     };
                     std::pin::Pin::new(rx).poll(cx)
-                }), if !decode_q.is_empty() && !hold_front => {
+                }), if front_waiting => {
                     let n = decode_q.front_len();
                     let heavy = decode_q.front_heavy();
                     let _ = decode_q.pop_front();
@@ -4829,7 +4844,8 @@ pub async fn peer_session_with(
                         &mut requested_since,
                         &mut tx_announce_rx,
                         &mut inv_flush_rx,
-                        !decode_q.is_empty(),
+                        front_waiting,
+                        decode_queued,
                     )
                     .await?;
                     last_hb = std::time::Instant::now();
