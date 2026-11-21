@@ -67,6 +67,15 @@ impl std::ops::Deref for CreatePinArc {
     }
 }
 
+/// `per_header_ranges` rows ascend by first tx fk: the order
+/// [`ArchiveWritePlan::create_in_header_ranges`] searches.
+fn debug_assert_header_ranges_ascend(ranges: &[(Fk, Fk, u32)]) {
+    debug_assert!(
+        ranges.windows(2).all(|w| w[0].1 .0 < w[1].1 .0),
+        "invariant: per-header ranges out of order"
+    );
+}
+
 /// Outputs of one block, shared by that block's pins after Class A commit.
 ///
 /// One allocation for every output script. A `Vec<OutputRecord>` per tx would
@@ -665,6 +674,9 @@ impl ArchiveWritePlan {
 
     /// Same-header create: assemble uses the wire `TxOut` (do not pin).
     ///
+    /// The search needs the order [`debug_assert_header_ranges_ascend`]
+    /// checks where the rows are built, rebased, and appended.
+    ///
     /// `per_header` is one `(header, first tx fk, n)` row per block in
     /// height order, so first fks ascend and a binary search finds the
     /// spend's block.
@@ -827,6 +839,7 @@ impl ArchiveWritePlan {
         self.batch_pin = new_pin;
         self.tx_fees = new_fees;
         self.tx_sizes = new_sizes;
+        debug_assert_header_ranges_ascend(&new_ranges);
         self.per_header_ranges = new_ranges;
         self.edges.retain(|id, _| keep_fks.contains(id));
         self.batch_creates
@@ -866,6 +879,7 @@ impl ArchiveWritePlan {
         }
         self.planned_fks.append(&mut other.planned_fks);
         self.per_header_ranges.append(&mut other.per_header_ranges);
+        debug_assert_header_ranges_ascend(&self.per_header_ranges);
         self.edges.extend(other.edges);
         self.batch_creates.append(&mut other.batch_creates);
         self.batch_pin.append(&mut other.batch_pin);
@@ -1593,6 +1607,7 @@ impl Query {
             }
             per_header_ranges.push((*header_fk, first_tx_fk, n_txs));
         }
+        debug_assert_header_ranges_ascend(&per_header_ranges);
         let assign_ns = t_assign.elapsed().as_nanos() as u64;
         let plan = self.finish_archive_plan(
             work,
