@@ -738,11 +738,57 @@ pub fn prepare_header_rewind(
     path: &[BlockHash],
     max_depth: u32,
 ) -> Result<Option<RewindPrep>, NetError> {
+    let Some((lca, lca_h, tip_h)) = rewind_target(hub, path, max_depth)? else {
+        return Ok(None);
+    };
+    if tip_h > lca_h && !hub.try_rewind_to_height(lca_h)? {
+        return Ok(None);
+    }
+    Ok(Some(finish_header_rewind(hub, path, lca, lca_h, tip_h)))
+}
+
+/// [`prepare_header_rewind`] for the off-lock pass. `tip_before` is the
+/// confirmed tip the selection measured. The tip commit is held while the
+/// tip is compared to it and the disconnect runs, so confirm cannot extend
+/// the chain the fork was measured against in between. A moved tip selects
+/// again on a later turn instead.
+fn prepare_header_rewind_at(
+    hub: &ChainHub,
+    path: &[BlockHash],
+    max_depth: u32,
+    tip_before: (Option<u32>, Option<BlockHash>),
+) -> Result<Option<RewindPrep>, NetError> {
+    let Some((lca, lca_h, tip_h)) = rewind_target(hub, path, max_depth)? else {
+        return Ok(None);
+    };
+    if tip_h > lca_h {
+        let (Some(height), Some(hash)) = tip_before else {
+            return Ok(None);
+        };
+        if !hub.try_rewind_to_height_at(lca_h, (height, hash))? {
+            return Ok(None);
+        }
+    } else {
+        let Some(_commit) = hub.query.try_lock_tip_commit() else {
+            return Ok(None);
+        };
+        if tip_pair(hub) != tip_before {
+            return Ok(None);
+        }
+    }
+    Ok(Some(finish_header_rewind(hub, path, lca, lca_h, tip_h)))
+}
+
+/// The path's LCA, its height, and the tip `max_depth` is measured from.
+fn rewind_target(
+    hub: &ChainHub,
+    path: &[BlockHash],
+    max_depth: u32,
+) -> Result<Option<(BlockHash, u32, u32)>, NetError> {
     let Some((lca, lca_h)) = path_lca(hub, path)? else {
         return Ok(None);
     };
     let tip_h = hub.tip_height().unwrap_or(0);
-    let rewound = tip_h > lca_h;
     if tip_h.saturating_sub(lca_h) > max_depth {
         warn!(
             "ibd: heavier fork rewind depth {} exceeds cap {max_depth} (lca={lca_h} tip={tip_h})",
@@ -750,10 +796,18 @@ pub fn prepare_header_rewind(
         );
         return Ok(None);
     }
+    Ok(Some((lca, lca_h, tip_h)))
+}
+
+fn finish_header_rewind(
+    hub: &ChainHub,
+    path: &[BlockHash],
+    lca: BlockHash,
+    lca_h: u32,
+    tip_h: u32,
+) -> RewindPrep {
+    let rewound = tip_h > lca_h;
     if rewound {
-        if !hub.try_rewind_to_height(lca_h)? {
-            return Ok(None);
-        }
         info!(
             "ibd: most-work header rewind tip {tip_h} → {lca_h} (winning path {} header(s))",
             path.len()
@@ -783,14 +837,14 @@ pub fn prepare_header_rewind(
                 .map(|(fk, _)| fk)
         })
         .collect();
-    Ok(Some(RewindPrep {
+    RewindPrep {
         lca,
         lca_h,
         archived,
         connected,
         fks,
         rewound,
-    }))
+    }
 }
 
 #[doc(hidden)]
@@ -948,14 +1002,14 @@ pub(crate) fn apply_off_lock_rewind(
     };
     let cap = super::header_walk::rewind_depth_cap_of(origin, proven, hub);
     let walk_max = ancestor_walk_max(cap);
+    let tip_before = tip_pair(hub);
     let Some((path, cap)) =
         select_heavier_path(hub, cands, invalid, walk_max, &mut || cap, Pick::MostWork)?
     else {
         return Ok(false);
     };
     fire(&BEFORE_PREPARE);
-    let tip_before = tip_pair(hub);
-    let Some(prep) = prepare_header_rewind(hub, &path, cap)? else {
+    let Some(prep) = prepare_header_rewind_at(hub, &path, cap, tip_before)? else {
         shared
             .lock()
             .unwrap_or_else(|err| err.into_inner())
