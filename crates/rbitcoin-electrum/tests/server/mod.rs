@@ -1,3 +1,4 @@
+use crate::Admit;
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_electrum::server::*;
 use rbitcoin_net::MempoolHub;
@@ -4485,7 +4486,7 @@ async fn stalled_scripthash_push_ends_the_connection() {
             script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    hub.accept_tx(&tx)
+    hub.admit(&tx)
         .expect("mempool spend of the subscribed script");
     let joined = tokio::time::timeout(std::time::Duration::from_secs(2), task)
         .await

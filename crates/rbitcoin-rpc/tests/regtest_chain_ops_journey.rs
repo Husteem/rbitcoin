@@ -3977,7 +3977,7 @@ fn chain_ops_maxfeerate(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     ctx.mempool
         .as_ref()
         .unwrap()
-        .accept_tx(&spend)
+        .admit(&spend)
         .expect("P2P/admit path is not capped by RPC maxfeerate");
     let ok = dispatch(ctx, "sendrawtransaction", vec![json!(hex.clone()), json!(0)]).unwrap();
     assert!(ok.as_str().is_some(), "{ok}");

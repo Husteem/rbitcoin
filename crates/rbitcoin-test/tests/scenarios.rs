@@ -3,6 +3,7 @@
 //! Prefer fewer tests at the highest layer that still hit production paths.
 //! Mature regtest chains are built once per test that needs them (not thrice).
 
+use crate::Admit;
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Block, BlockHash};
@@ -3116,7 +3117,7 @@ fn block_cache_and_mempool_hub_surface() {
 
     let spend = spend_anyone_can_spend(cb1_txid, 0, Amount::from_sat(49_0000_0000));
     let r = hub
-        .accept_tx(&spend)
+        .admit(&spend)
         .expect("mempool accept mature coinbase spend");
     assert!(hub.contains(&r.txid));
     assert!(hub.get_tx(&r.txid).is_some());

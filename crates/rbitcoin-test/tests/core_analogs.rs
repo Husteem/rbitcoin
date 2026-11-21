@@ -12,6 +12,7 @@
 //!    including below a seqsigwit prune (`rpc_getblockfilter.py`,
 //!    `feature_blockfilterindex_prune.py`)
 
+use crate::Admit;
 use bitcoin::hashes::Hash;
 use bitcoin::{
     Amount, BlockHash, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
@@ -84,7 +85,7 @@ fn analog_milestone_and_mempool_persist() {
         let hub = MempoolHub::open_with_weight(&mp_dir, Arc::clone(&q_arc), 50_000_000).unwrap();
         hub.set_relay_enabled(true);
         let r = hub
-            .accept_tx(&unconf)
+            .admit(&unconf)
             .expect("accept unconfirmed spend of confirmed anyone-can-spend");
         assert_eq!(r.txid, want);
         hub.flush().expect("SIGTERM-equivalent flush");
@@ -220,12 +221,12 @@ fn pin_restart_catchup_then_tip_purge(
     {
         let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000).unwrap();
         hub.set_relay_enabled(true);
-        hub.accept_tx(&same).expect("accept same-txid leftover");
-        hub.accept_tx(&loser).expect("accept conflict loser");
-        hub.accept_tx(&parent).expect("accept parent");
-        hub.accept_tx(&child).expect("accept child of parent");
+        hub.admit(&same).expect("accept same-txid leftover");
+        hub.admit(&loser).expect("accept conflict loser");
+        hub.admit(&parent).expect("accept parent");
+        hub.admit(&child).expect("accept child of parent");
         for tx in &extras {
-            hub.accept_tx(tx).expect("accept ballast leftover");
+            hub.admit(tx).expect("accept ballast leftover");
         }
         hub.flush().expect("persist leftover pool");
         hub.set_relay_enabled(false);
@@ -361,7 +362,7 @@ fn flush_prefix_then_tail(
     let slots_prefix = std::fs::read(mp_dir.join("slots")).unwrap();
     let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000).unwrap();
     hub.set_relay_enabled(true);
-    hub.accept_tx(tail).expect("accept tail spend");
+    hub.admit(tail).expect("accept tail spend");
     hub.flush().expect("flush prefix plus tail");
     assert!(hub.contains(want) && hub.contains(tail_id));
     drop(hub);
@@ -459,7 +460,7 @@ fn pin_unreadable_sidecar_then_accept(
     assert_fee_history(mp_dir);
     hub.set_relay_enabled(true);
     let accepted = hub
-        .accept_tx(tail)
+        .admit(tail)
         .expect("empty mempool after quarantine still accepts");
     assert_eq!(accepted.txid, *tail_id);
     assert!(hub.contains(tail_id));

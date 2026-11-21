@@ -1,4 +1,5 @@
 use crate::test_chain::{padded_chain_with, shared_regtest, test_tp_config, TestChain};
+use crate::Admit;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::{
@@ -177,7 +178,7 @@ async fn template_budget_fees_coinbase_and_merkle_path() {
         ScriptBuf::from_bytes(vec![OP_CHECKSIG; 4_000]),
     );
     for tx in [&a, &b, &heavy] {
-        tc.mempool.accept_tx(tx).expect("mempool accept");
+        tc.mempool.admit(tx).expect("mempool accept");
     }
 
     let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
@@ -266,7 +267,7 @@ async fn constraints_cooldown_publishes_the_next_budget() {
         20_000,
         ScriptBuf::from_bytes(vec![OP_CHECKSIG; 4_000]),
     );
-    tc.mempool.accept_tx(&heavy).expect("mempool accept");
+    tc.mempool.admit(&heavy).expect("mempool accept");
     let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
         .await
         .expect("listen");
@@ -301,7 +302,7 @@ async fn template_resent_constraints_do_not_rebuild() {
         20_000,
         ScriptBuf::from_bytes(vec![OP_CHECKSIG; 4_000]),
     );
-    tc.mempool.accept_tx(&heavy).expect("mempool accept");
+    tc.mempool.admit(&heavy).expect("mempool accept");
     let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
         .await
         .expect("listen");
@@ -333,7 +334,7 @@ async fn template_constraint_rebuilds_are_rate_limited() {
         20_000,
         ScriptBuf::from_bytes(vec![OP_CHECKSIG; 4_000]),
     );
-    tc.mempool.accept_tx(&heavy).expect("mempool accept");
+    tc.mempool.admit(&heavy).expect("mempool accept");
     let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
         .await
         .expect("listen");
@@ -404,7 +405,7 @@ async fn constraints_while_ibd_keep_the_last_budget() {
         20_000,
         ScriptBuf::from_bytes(vec![OP_CHECKSIG; 4_000]),
     );
-    tc.mempool.accept_tx(&heavy).expect("mempool accept");
+    tc.mempool.admit(&heavy).expect("mempool accept");
     let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
         .await
         .expect("listen");
@@ -770,7 +771,7 @@ async fn tip_event_rebuilds_a_template_built_on_its_prev_hash() {
         10_000,
         ScriptBuf::from_bytes(vec![OP_TRUE]),
     );
-    tc.mempool.accept_tx(&paid).expect("mempool accept");
+    tc.mempool.admit(&paid).expect("mempool accept");
     let tp = run_sv2_tp(test_tp_config(Arc::clone(&tc.chain), [7; 32]))
         .await
         .expect("listen");
@@ -921,7 +922,7 @@ async fn fee_push_after_the_interval_past_the_delta() {
 
     let cheap = ScriptBuf::from_bytes(vec![OP_TRUE]);
     let a = spend(tc.coinbases[0], 1_000, cheap.clone());
-    tc.mempool.accept_tx(&a).expect("mempool accept");
+    tc.mempool.admit(&a).expect("mempool accept");
     // `future: false` also asserts no SetNewPrevHash follows.
     let id = expect_template(&mut c, &tc, &[&a], false).await;
     assert!(
@@ -931,7 +932,7 @@ async fn fee_push_after_the_interval_past_the_delta() {
     assert!(id > first, "template_id must increase");
 
     let b = spend(tc.coinbases[1], 600, cheap.clone());
-    tc.mempool.accept_tx(&b).expect("mempool accept");
+    tc.mempool.admit(&b).expect("mempool accept");
     let d = spend(tc.coinbases[2], 400, cheap.clone());
     // One recv future throughout: dropping it mid-frame breaks the Noise decoder.
     let pushed = {
@@ -943,7 +944,7 @@ async fn fee_push_after_the_interval_past_the_delta() {
             "600 sat over the last sent is below the delta"
         );
         // 600 + 400 since the last sent template reaches the delta.
-        tc.mempool.accept_tx(&d).expect("mempool accept");
+        tc.mempool.admit(&d).expect("mempool accept");
         tokio::time::timeout(Duration::from_secs(10), recv)
             .await
             .expect("fee push at the delta")
@@ -970,7 +971,7 @@ async fn fee_push_after_the_interval_past_the_delta() {
     };
     // Budget first: it queues the rebuild before `e` moves the counter.
     c.coinbase_output_constraints(0, 1).await.unwrap();
-    tc.mempool.accept_tx(&e).expect("mempool accept");
+    tc.mempool.admit(&e).expect("mempool accept");
     let mut f = recv_in_time(&mut c).await;
     assert_eq!(f.msg_type, MESSAGE_TYPE_NEW_TEMPLATE);
     let t: NewTemplate = binary_sv2::from_bytes(&mut f.payload).expect("decode");
@@ -1025,7 +1026,7 @@ async fn fee_pushes_keep_older_same_tip_templates_solvable() {
     // More fee pushes than a three-template ring would keep.
     let mut last = template_id;
     for tx in &txs {
-        tc.mempool.accept_tx(tx).expect("mempool accept");
+        tc.mempool.admit(tx).expect("mempool accept");
         let mut f = recv_in_time(&mut c).await;
         assert_eq!(f.msg_type, MESSAGE_TYPE_NEW_TEMPLATE);
         let t: NewTemplate = binary_sv2::from_bytes(&mut f.payload).expect("decode");
@@ -1110,7 +1111,7 @@ async fn fee_pushes_stay_an_interval_apart_under_steady_admission() {
             }],
             ..fanout.clone()
         };
-        tc.mempool.accept_tx(&tx).expect("mempool accept");
+        tc.mempool.admit(&tx).expect("mempool accept");
         let mut recv = std::pin::pin!(c.recv());
         tokio::task::yield_now().await;
         assert!(

@@ -432,8 +432,9 @@ async fn ephemeral_broadcast() {
     let locals: Vec<Transaction> = (0..BURST + 10)
         .map(|vout| spend(OutPoint { txid: fan_id, vout }, 89_990_000))
         .collect();
-    let submit = |tx: &Transaction| {
-        mp.accept_tx_from(tx, rbitcoin_net::TxOrigin::Local)
+    let submit = async |tx: &Transaction| {
+        mp.accept_tx_from_async(tx.clone(), rbitcoin_net::TxOrigin::Local)
+            .await
             .expect("local");
     };
 
@@ -452,13 +453,13 @@ async fn ephemeral_broadcast() {
         Magic::REGTEST,
         ISOLATED_RESEND_SWEEP,
     );
-    submit(&locals[0]);
+    submit(&locals[0]).await;
     tokio::time::timeout(Duration::from_secs(30), busy_rx)
         .await
         .expect("the first send reaches the recipient")
         .unwrap();
     for tx in &locals[1..=BURST as usize] {
-        submit(tx);
+        submit(tx).await;
     }
     let mined = locals[5].compute_txid();
     hub.generate_to_script(
@@ -469,7 +470,7 @@ async fn ephemeral_broadcast() {
     .expect("mine a queued local tx");
     assert!(!mp.contains(&mined), "the block took it from the mempool");
     let last = &locals[BURST as usize + 1];
-    submit(last);
+    submit(last).await;
     gate_tx.send(()).unwrap();
 
     let want: Vec<Txid> = locals[..=BURST as usize + 1]
@@ -486,7 +487,7 @@ async fn ephemeral_broadcast() {
         "every queued local tx still in the mempool goes out once, in submit order"
     );
     let late = locals[BURST as usize + 2].compute_txid();
-    submit(&locals[BURST as usize + 2]);
+    submit(&locals[BURST as usize + 2]).await;
     assert_eq!(
         next_sent(&mut got_rx).await,
         late,
@@ -515,7 +516,7 @@ async fn ephemeral_broadcast() {
     );
     let gone = &locals[BURST as usize + 3];
     let kept = &locals[BURST as usize + 4];
-    submit(gone);
+    submit(gone).await;
     tokio::time::timeout(Duration::from_secs(30), busy_rx)
         .await
         .expect("the first send reaches the recipient")
@@ -528,7 +529,7 @@ async fn ephemeral_broadcast() {
         gone.compute_txid(),
         "the send already dialed completes"
     );
-    submit(kept);
+    submit(kept).await;
     assert_eq!(
         [next_sent(&mut got_rx).await, next_sent(&mut got_rx).await],
         [kept.compute_txid(); 2],
@@ -564,14 +565,14 @@ async fn ephemeral_broadcast() {
         1,
     )
     .compute_txid();
-    submit(first);
+    submit(first).await;
     tokio::time::timeout(Duration::from_secs(30), busy_rx)
         .await
         .expect("the first send reaches the recipient")
         .unwrap();
     mp.queue_isolated(never_admitted);
-    submit(held);
-    submit(after);
+    submit(held).await;
+    submit(after).await;
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn({
@@ -602,7 +603,7 @@ async fn ephemeral_broadcast() {
         [held.compute_txid(), after.compute_txid()],
         "a busy mempool write delays the next local txs; it does not drop them"
     );
-    submit(idle);
+    submit(idle).await;
     assert_eq!(
         next_sent(&mut got_rx).await,
         idle.compute_txid(),
@@ -651,7 +652,8 @@ async fn ephemeral_broadcast() {
         }],
     };
     let no_targets = mp.isolated_laps().no_targets;
-    mp.accept_tx_from(&local, rbitcoin_net::TxOrigin::Local)
+    mp.accept_tx_from_async(local.clone(), rbitcoin_net::TxOrigin::Local)
+        .await
         .expect("local");
     wait_isolated_lap(
         &mp,
@@ -724,7 +726,7 @@ async fn ephemeral_broadcast() {
     let txid = retried.compute_txid();
     let start = mp.relay_now_secs();
     mp.note_mock_now(start);
-    submit(retried);
+    submit(retried).await;
     tokio::time::timeout(Duration::from_secs(30), busy_rx)
         .await
         .expect("the first send reaches the recipient")

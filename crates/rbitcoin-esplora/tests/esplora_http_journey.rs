@@ -1452,7 +1452,7 @@ async fn reorged_out_tx_in_the_mempool_serves_the_mempool_copy() {
     assert!(stored_json["weight"].as_u64().unwrap() > tx.weight().to_wu());
 
     pad.q.disconnect_tip().unwrap();
-    pad.hub.accept_tx(&tx).expect("back in the mempool");
+    pad.hub.admit(&tx).expect("back in the mempool");
 
     let (st, hex) = http_get(pad.addr, &format!("/tx/{id}/hex")).await;
     assert_eq!((st, hex), (200, serialize_hex(&tx)));
@@ -1566,7 +1566,7 @@ async fn status_of_a_tx_dropped_mid_request_is_never_200_unconfirmed() {
     let resp = rbitcoin_esplora::server::tx_status_reply(&st, &id(&third), None, || {
         ran.set(ran.get() + 1);
         q.disconnect_tip().unwrap();
-        hub.accept_tx(&third).expect("back in the mempool");
+        hub.admit(&third).expect("back in the mempool");
     });
     assert_eq!(resp.status(), 200);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)

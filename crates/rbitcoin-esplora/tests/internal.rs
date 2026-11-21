@@ -1,3 +1,4 @@
+use crate::Admit;
 use bitcoin::absolute::LockTime;
 use bitcoin::Txid;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -970,7 +971,7 @@ async fn bulk_routes_skip_a_reorged_out_tx_until_the_mempool_holds_it() {
             .unwrap();
         deserialize::<Transaction>(&pad.q.tx_wire_bytes(fk).unwrap()).unwrap()
     };
-    pad.hub.accept_tx(&fan_tx).expect("back in the mempool");
+    pad.hub.admit(&fan_tx).expect("back in the mempool");
     assert_eq!(rows(&sock).await, (1, 3, 3), "in the mempool");
 
     handle.shutdown().await;

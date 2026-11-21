@@ -1,3 +1,4 @@
+use crate::Admit;
 use bitcoin::consensus::{deserialize, encode::serialize_hex};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, ScriptBuf, Transaction};
@@ -615,7 +616,13 @@ fn getorphantxs_is_hidden_and_lists_parked() {
         }],
     };
     let err = mp
-        .accept_tx_from(&tx, rbitcoin_net::TxOrigin::Relay(Some(3)))
+        .accept_with_utxo(
+            &tx,
+            &mp.utxo_provider(),
+            rbitcoin_net::TxOrigin::Relay(Some(3)),
+            rbitcoin_net::tx_relay::AcceptPath::Relay,
+            &[],
+        )
         .unwrap_err();
     assert!(
         matches!(err, rbitcoin_net::AcceptError::Orphaned { .. }),
@@ -1621,7 +1628,7 @@ fn mempool_txid_lookups_do_not_list_live() {
                 script_pubkey: spk.clone(),
             }],
         };
-        mp.accept_tx(&tx).expect("accept");
+        mp.admit(&tx).expect("accept");
         live.push(tx);
     }
     let want = live[1].compute_txid();
@@ -1692,9 +1699,9 @@ fn cluster_entries_beat(ctx: &RpcContext, mp: &MempoolHub, coinbase: Txid) -> (T
         Sequence::ENABLE_RBF_NO_LOCKTIME,
         50_0000_0000 - 1_000,
     );
-    mp.accept_tx(&parent).expect("parent");
+    mp.admit(&parent).expect("parent");
     let child = op_true_spend(parent.compute_txid(), Sequence::MAX, 50_0000_0000 - 3_000);
-    mp.accept_tx(&child).expect("child");
+    mp.admit(&child).expect("child");
 
     let parent_hex = hash_hex_display(&parent.compute_txid().to_byte_array());
     let child_hex = hash_hex_display(&child.compute_txid().to_byte_array());
@@ -1833,7 +1840,7 @@ fn getmempoolentry_vsize_ceils_weight() {
             script_pubkey: p2wsh,
         }],
     };
-    mp.accept_tx(&fund).expect("fund");
+    mp.admit(&fund).expect("fund");
     let spend = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -1851,7 +1858,7 @@ fn getmempoolentry_vsize_ceils_weight() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    mp.accept_tx(&spend).expect("p2wsh spend");
+    mp.admit(&spend).expect("p2wsh spend");
     let weight = spend.weight().to_wu();
     assert_ne!(
         weight % 4,
@@ -2962,7 +2969,7 @@ fn invalidate_evicting_a_mempool_tx_returns_the_replacement_fork() {
     hub.hold_body(Arc::new(b1), false);
     hub.hold_body(Arc::new(b2), false);
     let spend = mature_coinbase_spend(&ctx, 49_9999_0000, spk).1;
-    mp.accept_tx(&spend).expect("mature coinbase spend");
+    mp.admit(&spend).expect("mature coinbase spend");
     let cut = hub.block_at_height(100).unwrap().unwrap().block_hash();
     let invalidator = Arc::clone(&hub);
     let got = http_wait_woken_by(ctx, "waitfornewblock", json!([60_000]), move || {
@@ -4101,7 +4108,7 @@ fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
     ctx.mempool
         .as_ref()
         .unwrap()
-        .accept_tx(&spend)
+        .admit(&spend)
         .expect("P2P/admit path is not capped by RPC maxburnamount");
     let ok = dispatch(
         &ctx,
@@ -5315,7 +5322,7 @@ fn pressure_admit_then_cluster(ctx: &RpcContext, spk: &ScriptBuf) {
     let mp = ctx.mempool.as_ref().unwrap();
     mp.set_cluster_limits(Some(2), None);
     let (_, cluster_parent) = spend_generated_coinbase(ctx, 1, 50_0000_0000 - 1_000, spk.clone());
-    mp.accept_tx(&cluster_parent).expect("parent");
+    mp.admit(&cluster_parent).expect("parent");
     let cluster_child = child_of(&cluster_parent, 1_000);
     let cluster_grand = child_of(&cluster_child, 1_000);
     let res = dispatch(
@@ -6820,7 +6827,7 @@ fn testmempoolaccept_rbf_does_not_evict_conflict() {
             script_pubkey: spk.clone(),
         }],
     };
-    mp.accept_tx(&low).expect("low");
+    mp.admit(&low).expect("low");
     let high = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -6884,7 +6891,7 @@ fn testmempoolaccept_missing_inputs_is_missing_inputs() {
     assert_eq!(row[0]["reject-reason"], json!("missing-inputs"), "{row}");
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 0);
 
-    ctx.mempool.as_ref().unwrap().accept_tx(&tx).unwrap_err();
+    ctx.mempool.as_ref().unwrap().admit(&tx).unwrap_err();
     assert_eq!(ctx.mempool.as_ref().unwrap().orphan_count(), 1);
     let row = dispatch(&ctx, "testmempoolaccept", vec![json!([hex])]).unwrap();
     assert_eq!(row[0]["allowed"], json!(false), "{row}");

@@ -50,3 +50,38 @@ mod unconfirmed_script;
 mod v1;
 mod v2;
 mod versionbits_warn;
+
+/// Admit through [`rbitcoin_net::MempoolHub::accept_with_utxo`], the sync core
+/// that peer relay and orphan promotion ship. A `Local` admit here does not
+/// wake the isolated broadcast loop; a test that turns that loop on admits
+/// with `accept_tx_from_async`.
+pub(crate) trait Admit {
+    fn admit_from(
+        &self,
+        tx: &bitcoin::Transaction,
+        origin: rbitcoin_net::TxOrigin,
+    ) -> Result<rbitcoin_net::AcceptResult, rbitcoin_net::AcceptError>;
+
+    fn admit(
+        &self,
+        tx: &bitcoin::Transaction,
+    ) -> Result<rbitcoin_net::AcceptResult, rbitcoin_net::AcceptError> {
+        self.admit_from(tx, rbitcoin_net::TxOrigin::Relay(None))
+    }
+}
+
+impl Admit for rbitcoin_net::MempoolHub {
+    fn admit_from(
+        &self,
+        tx: &bitcoin::Transaction,
+        origin: rbitcoin_net::TxOrigin,
+    ) -> Result<rbitcoin_net::AcceptResult, rbitcoin_net::AcceptError> {
+        self.accept_with_utxo(
+            tx,
+            &self.utxo_provider(),
+            origin,
+            rbitcoin_net::tx_relay::AcceptPath::Relay,
+            &[],
+        )
+    }
+}

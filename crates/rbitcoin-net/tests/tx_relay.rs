@@ -1,3 +1,4 @@
+use crate::Admit;
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
@@ -275,7 +276,7 @@ fn expire_stale_drops_old_tx_without_a_new_accept() {
     hub.set_relay_enabled(true);
     let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let tid = tx.compute_txid();
-    hub.accept_tx(&tx).expect("admit");
+    hub.admit(&tx).expect("admit");
     assert_eq!(hub.live_count(), 1);
     hub.set_expiry_hours(1);
     hub.note_mock_now(hub.relay_now_secs() + 3600 + 5);
@@ -296,7 +297,7 @@ fn reopen_keeps_accept_time_and_expiry() {
     hub.note_mock_now(t0);
     let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let tid = tx.compute_txid();
-    hub.accept_tx(&tx).expect("admit");
+    hub.admit(&tx).expect("admit");
     assert_eq!(hub.accept_time_txid(&tid), Some(t0));
     hub.flush().expect("shutdown flush");
     drop(hub);
@@ -337,7 +338,7 @@ fn expire_stale_drops_oldest_accepts_within_one_scan() {
         // Regtest halves every 150 blocks, so later coinbases are under 50 BTC.
         let mut tx = spend_true(*cb, 0, ScriptBuf::from_bytes(vec![0x51]));
         tx.output[0].value = Amount::from_sat(1_000_000);
-        hub.accept_tx(&tx).expect("admit");
+        hub.admit(&tx).expect("admit");
         ids.push(tx.compute_txid());
     }
     assert_eq!(hub.live_count(), N as usize);
@@ -379,7 +380,7 @@ fn expire_stale_reaches_a_live_tx_behind_evicted_ghosts() {
     hub.note_mock_now(10_000);
     let live = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let live_id = live.compute_txid();
-    hub.accept_tx(&live).expect("admit live");
+    hub.admit(&live).expect("admit live");
     {
         let mut ix = hub.relay_index.lock().unwrap();
         for i in 0..GHOSTS {
@@ -470,7 +471,7 @@ fn try_expire_stale_skips_when_the_relay_index_is_held() {
     hub.note_mock_now(1);
     let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let tid = tx.compute_txid();
-    hub.accept_tx(&tx).expect("admit");
+    hub.admit(&tx).expect("admit");
     hub.set_expiry_hours(0);
     hub.note_mock_now(hub.relay_now_secs() + 5);
     let held = hub.relay_index.lock().unwrap();
@@ -697,7 +698,9 @@ async fn unreturned_isolated_tx_is_sent_again_until_the_cap() {
     hub.note_mock_now(1_000);
     let tx = spend_true(cbs[3], 1_000, spk.clone());
     let txid = tx.compute_txid();
-    hub.accept_tx_from(&tx, TxOrigin::Local).expect("accept");
+    hub.accept_tx_from_async(tx.clone(), TxOrigin::Local)
+        .await
+        .expect("accept");
     let (first, behind) = hub.next_isolated().await;
     assert_eq!(first, txid);
     assert_eq!(behind, 0, "one local tx has nobody waiting behind it");
@@ -724,8 +727,12 @@ async fn unreturned_isolated_tx_is_sent_again_until_the_cap() {
     let b = spend_true(cbs[6], 1_000, spk.clone());
     let id_a = a.compute_txid();
     let id_b = b.compute_txid();
-    hub.accept_tx_from(&a, TxOrigin::Local).expect("accept a");
-    hub.accept_tx_from(&b, TxOrigin::Local).expect("accept b");
+    hub.accept_tx_from_async(a.clone(), TxOrigin::Local)
+        .await
+        .expect("accept a");
+    hub.accept_tx_from_async(b.clone(), TxOrigin::Local)
+        .await
+        .expect("accept b");
     let (got, behind) = hub.next_isolated().await;
     assert_eq!(got, id_a, "the first submit is taken first");
     assert_eq!(behind, 1, "the later submit still waits");
@@ -768,7 +775,9 @@ async fn unreturned_isolated_tx_is_sent_again_until_the_cap() {
 
     let back = spend_true(cbs[4], 1_000, spk);
     let txid = back.compute_txid();
-    hub.accept_tx_from(&back, TxOrigin::Local).expect("accept");
+    hub.accept_tx_from_async(back.clone(), TxOrigin::Local)
+        .await
+        .expect("accept");
     assert_eq!(hub.next_isolated().await.0, txid);
     hub.isolated_sent(&txid);
     hub.note_returned(&txid);
@@ -791,7 +800,8 @@ async fn returned_tx_waits_for_in_flight_isolated_sends() {
     hub.note_mock_now(1_000);
     let sending = spend_true(cbs[1], 1_000, spk.clone());
     let txid = sending.compute_txid();
-    hub.accept_tx_from(&sending, TxOrigin::Local)
+    hub.accept_tx_from_async(sending.clone(), TxOrigin::Local)
+        .await
         .expect("accept");
     assert_eq!(hub.accept_time_txid(&txid), Some(1_000));
     assert_eq!(hub.next_isolated().await.0, txid);
@@ -821,7 +831,9 @@ async fn returned_tx_waits_for_in_flight_isolated_sends() {
     hub.note_mock_now(3_000);
     let sent = spend_true(cbs[2], 1_000, spk);
     let txid = sent.compute_txid();
-    hub.accept_tx_from(&sent, TxOrigin::Local).expect("accept");
+    hub.accept_tx_from_async(sent.clone(), TxOrigin::Local)
+        .await
+        .expect("accept");
     assert_eq!(hub.next_isolated().await.0, txid);
     hub.isolated_sent(&txid);
     assert!(hub.is_local_origin(&txid), "sent but not back yet");
@@ -848,7 +860,7 @@ async fn inv_floor_follows_the_oldest_live_accept() {
     let admit = |cb: Txid, at: u64| {
         hub.note_mock_now(at);
         let tx = spend_true(cb, 1_000, spk.clone());
-        hub.accept_tx(&tx).expect("accept");
+        hub.admit(&tx).expect("accept");
         tx.compute_txid()
     };
     let oldest = admit(cbs[1], 1_000);
@@ -874,11 +886,12 @@ async fn inv_floor_follows_the_oldest_live_accept() {
     hub.note_mock_now(1_000);
     let local = spend_true(cbs[4], 1_000, spk.clone());
     let local_id = local.compute_txid();
-    hub.accept_tx_from(&local, TxOrigin::Local).expect("accept");
+    hub.accept_tx_from_async(local.clone(), TxOrigin::Local)
+        .await
+        .expect("accept");
     assert_eq!(hub.next_isolated().await.0, local_id);
     hub.note_mock_now(5_000);
-    hub.accept_tx(&spend_true(cbs[5], 1_000, spk))
-        .expect("accept");
+    hub.admit(&spend_true(cbs[5], 1_000, spk)).expect("accept");
     hub.isolated_sent(&local_id);
     hub.note_mock_now(5_040);
     hub.note_returned(&local_id);
@@ -933,7 +946,8 @@ async fn ending_the_broadcast_keeps_the_row_until_the_age_moves() {
     hub.note_mock_now(1_000);
     let sending = spend_true(cbs[1], 1_000, spk.clone());
     let txid = sending.compute_txid();
-    hub.accept_tx_from(&sending, TxOrigin::Local)
+    hub.accept_tx_from_async(sending.clone(), TxOrigin::Local)
+        .await
         .expect("accept");
     assert_eq!(hub.next_isolated().await.0, txid);
     hub.note_returned(&txid);
@@ -943,7 +957,9 @@ async fn ending_the_broadcast_keeps_the_row_until_the_age_moves() {
     hub.note_mock_now(3_000);
     let sent = spend_true(cbs[2], 1_000, spk);
     let txid = sent.compute_txid();
-    hub.accept_tx_from(&sent, TxOrigin::Local).expect("accept");
+    hub.accept_tx_from_async(sent.clone(), TxOrigin::Local)
+        .await
+        .expect("accept");
     assert_eq!(hub.next_isolated().await.0, txid);
     hub.isolated_sent(&txid);
     hub.note_mock_now(4_000);
@@ -960,7 +976,7 @@ fn unbroadcast_survives_reopen_and_logs_confirm_before_broadcast() {
     let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
     hub.set_relay_enabled(true);
     let tx = spend_true(cbs[1], 1_000, spk.clone());
-    hub.accept_tx_from(&tx, TxOrigin::Local).expect("accept");
+    hub.admit_from(&tx, TxOrigin::Local).expect("accept");
     let extra = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -980,7 +996,7 @@ fn unbroadcast_survives_reopen_and_logs_confirm_before_broadcast() {
         "non-live must fill midstates after connect ids"
     );
     let wire = spend_true(cbs[8], 1_000, spk.clone());
-    hub.accept_tx(&wire).expect("peer tx");
+    hub.admit(&wire).expect("peer tx");
     hub.note_unbroadcast(tx.compute_txid());
     assert_eq!(hub.unbroadcast_count(), 1);
     assert!(hub.is_local_origin(&tx.compute_txid()));
@@ -1117,7 +1133,7 @@ fn scripthash_reopen_drops_parent_then_child() {
     hub.set_relay_enabled(true);
     let mut rx = hub.subscribe_announces();
     let parent = spend_true(cbs[2], 1_000, spk.clone());
-    hub.accept_tx(&parent).expect("accept");
+    hub.admit(&parent).expect("accept");
     let ann = rx.try_recv().expect("announce");
     assert!(ann.scripthashes.contains(&sh));
     let child = Transaction {
@@ -1137,7 +1153,7 @@ fn scripthash_reopen_drops_parent_then_child() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    hub.accept_tx(&child).expect("child");
+    hub.admit(&child).expect("child");
     assert!(hub.scripthash_mempool(&sh).len() >= 2);
     hub.flush().unwrap();
     drop(hub);
@@ -1184,13 +1200,13 @@ fn announce_lists_spent_and_freed_outpoints() {
             script_pubkey: spk.clone(),
         }],
     };
-    hub.accept_tx(&victim).expect("accept victim");
+    hub.admit(&victim).expect("accept victim");
     let ann = rx.try_recv().expect("victim announce");
     let listed: BTreeSet<OutPoint> = ann.outpoints.iter().copied().collect();
     assert_eq!(listed, BTreeSet::from([kept, freed]));
 
     let replacement = spend_true(cbs[4], 20_000, spk);
-    let r = hub.accept_tx(&replacement).expect("accept replacement");
+    let r = hub.admit(&replacement).expect("accept replacement");
     assert_eq!(r.replaced, vec![victim.compute_txid()]);
     let ann = rx.try_recv().expect("replacement announce");
     let listed: BTreeSet<OutPoint> = ann.outpoints.iter().copied().collect();
@@ -1217,7 +1233,7 @@ fn live_pool_recent_accepts_and_1p1c_rollback() {
     assert!(provider.get_txout(&op0).is_some());
     let cheap = spend_true(cbs[9], 1, spk.clone());
     assert!(matches!(
-        hub.accept_tx(&cheap),
+        hub.admit(&cheap),
         Err(AcceptError::Policy("min relay fee"))
     ));
     assert!(
@@ -1238,10 +1254,7 @@ fn live_pool_recent_accepts_and_1p1c_rollback() {
             script_pubkey: spk.clone(),
         }],
     };
-    assert!(matches!(
-        hub.accept_tx(&coinbase),
-        Err(AcceptError::Coinbase)
-    ));
+    assert!(matches!(hub.admit(&coinbase), Err(AcceptError::Coinbase)));
     assert!(hub.try_recent_reject(&coinbase.compute_wtxid()));
     hub.note_recent_confirmed(&[]);
     assert!(
@@ -1250,7 +1263,7 @@ fn live_pool_recent_accepts_and_1p1c_rollback() {
     );
     assert!(hub.recent_accepts().is_empty());
     let parent = spend_true(cbs[3], 1_000, spk.clone());
-    let pr = hub.accept_tx(&parent).expect("accept parent");
+    let pr = hub.admit(&parent).expect("accept parent");
     assert_eq!(pr.txid, parent.compute_txid());
     assert!(ann_rx.try_recv().is_ok());
     let recent = hub.recent_accepts();
@@ -1276,7 +1289,7 @@ fn live_pool_recent_accepts_and_1p1c_rollback() {
     };
     let second = spend_true(cbs[4], 5_000, ScriptBuf::from_bytes(vec![0x52]));
     let second_id = second.compute_txid();
-    hub.accept_tx(&child).expect("child");
+    hub.admit(&child).expect("child");
     let pkg = hub.accept_package(&[second]).expect("package");
     assert_eq!(pkg.len(), 1);
     assert_eq!(hub.live_count(), 3);
@@ -1342,17 +1355,17 @@ fn live_pool_recent_accepts_and_1p1c_rollback() {
     };
     let lpid = lp.compute_txid();
     assert!(matches!(
-        hub.accept_tx(&lp),
+        hub.admit(&lp),
         Err(AcceptError::Policy("min relay fee"))
     ));
     let one_sat = spend_vout(OutPoint::new(lpid, 0), 25_0000_0000 - 1);
     assert!(matches!(
-        hub.accept_tx(&one_sat),
+        hub.admit(&one_sat),
         Err(AcceptError::Orphaned { .. })
     ));
     assert_eq!(hub.orphan_count(), 1);
     let payer = spend_vout(OutPoint::new(lpid, 1), 1_000);
-    hub.accept_tx_from(&payer, TxOrigin::Local)
+    hub.admit_from(&payer, TxOrigin::Local)
         .expect("hub 1p1c must admit parent+child");
     assert!(hub.contains(&lpid));
     assert!(hub.contains(&payer.compute_txid()));
@@ -1368,7 +1381,7 @@ fn live_pool_recent_accepts_and_1p1c_rollback() {
     assert_eq!(hub.orphan_count(), 0);
     let sib = spend_vout(OutPoint::new(lpid, 0), 25_0000_0000 - 10_000);
     let (sib_id, sib_w) = (sib.compute_txid(), sib.compute_wtxid());
-    hub.accept_tx(&sib).expect("paying sibling of live parent");
+    hub.admit(&sib).expect("paying sibling of live parent");
     assert!(hub.relay_seq_of(&sib_w).is_some());
     assert!(hub.accept_time_txid(&sib_id).is_some());
     // A 1p1c rollback keeps a parent that another admit's child spends.
@@ -1396,7 +1409,7 @@ fn live_pool_recent_accepts_and_1p1c_rollback() {
     };
     let lp2_id = lp2.compute_txid();
     assert!(matches!(
-        hub.accept_tx(&lp2),
+        hub.admit(&lp2),
         Err(AcceptError::Policy("min relay fee"))
     ));
     let payer2 = spend_vout(OutPoint::new(lp2_id, 1), 1_000);
@@ -1429,7 +1442,7 @@ fn accept_stage_meters_then_expiry_drops_stale_child() {
         let fee = 1_000u64 + i as u64;
         fee_sum += fee as i64;
         let tx = spend_true(*cbtxid, fee, spk.clone());
-        hub.accept_tx(&tx).expect("accept spend");
+        hub.admit(&tx).expect("accept spend");
         spends.push(tx.compute_txid());
     }
     let n = 3u64;
@@ -1469,12 +1482,12 @@ fn accept_stage_meters_then_expiry_drops_stale_child() {
     // `mempool_expiry.py`: a new tx past -mempoolexpiry drops every
     // older tx with its child, and keeps prioritisetransaction.
     let child = spend_true(spends[0], 2_000, spk.clone());
-    hub.accept_tx(&child).expect("child");
+    hub.admit(&child).expect("child");
     hub.prioritise_tx(spends[0], 50_000);
     hub.set_expiry_hours(1);
     hub.note_mock_now(hub.relay_now_secs() + 3600 + 5);
     let trigger = spend_true(cbs[10], 3_000, spk.clone());
-    hub.accept_tx(&trigger).expect("trigger expires stale");
+    hub.admit(&trigger).expect("trigger expires stale");
     assert_eq!(hub.live_count(), 1);
     assert!(hub.contains(&trigger.compute_txid()));
     assert_eq!(hub.fee_delta(&spends[0]), 50_000);
@@ -1604,7 +1617,7 @@ fn over_standard_sigops_still_fit_a_block() {
             script_pubkey: ScriptBuf::from_bytes(vec![0xac; 4_001]),
         }],
     };
-    hub.accept_tx(&tx).expect("16004 sigop cost fits a block");
+    hub.admit(&tx).expect("16004 sigop cost fits a block");
     let picked = hub.select_block_template(hub.template_budget(0));
     assert_eq!(picked.len(), 1);
     assert_eq!(*picked[0].0, tx);
@@ -1725,7 +1738,7 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
         }],
     };
     let _ = q.store().txs.sample_reset_body_decodes();
-    hub.accept_tx(&child).expect("non-coinbase chain spend");
+    hub.admit(&child).expect("non-coinbase chain spend");
     assert_eq!(
         hub.get_live_meta(&child.compute_txid()).map(|(fee, _)| fee),
         Some(1_000),
@@ -1747,7 +1760,7 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
         "no BIP68 time-lock must not compute create MTP"
     );
     let immature = spend_true(b.txdata[0].compute_txid(), 1_000, spk.clone());
-    let err = hub.accept_tx(&immature).unwrap_err();
+    let err = hub.admit(&immature).unwrap_err();
     assert!(
         matches!(err, AcceptError::ImmatureCoinbase),
         "the tip coinbase is inside the maturity window, got {err}"
@@ -1757,7 +1770,7 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
             .is_empty(),
         "output script must still hit SH overlay"
     );
-    let err = hub.accept_tx(&confirmed).unwrap_err();
+    let err = hub.admit(&confirmed).unwrap_err();
     assert!(
         matches!(err, AcceptError::MissingPrevout(_)),
         "confirmed body must not park as orphan, got {err}"
@@ -1801,7 +1814,7 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
             script_pubkey: spk.clone(),
         }],
     };
-    let err = hub.accept_tx(&oob).unwrap_err();
+    let err = hub.admit(&oob).unwrap_err();
     assert!(
         matches!(err, AcceptError::MissingPrevout(_)),
         "confirmed create missing vout must not park, got {err}"
@@ -1827,7 +1840,7 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
             script_pubkey: spk.clone(),
         }],
     };
-    let err = hub.accept_tx(&ghost).unwrap_err();
+    let err = hub.admit(&ghost).unwrap_err();
     assert!(
         matches!(err, AcceptError::Orphaned { .. }),
         "disconnected create (no height) must park, got {err}"
@@ -1851,7 +1864,7 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
             script_pubkey: spk,
         }],
     };
-    hub.accept_tx(&timed).expect("bip68 time-lock spend");
+    hub.admit(&timed).expect("bip68 time-lock spend");
     let s = hub.sample_reset_perf();
     assert!(
         s.get_coin_create_mtp >= 1,
@@ -1877,7 +1890,7 @@ fn reorg_evict_does_not_template_a_parentless_child() {
     hub.set_relay_enabled(true);
     let parent = spend_true(cbs[0], 1_000, spk.clone());
     let parent_id = parent.compute_txid();
-    hub.accept_tx(&parent).expect("parent");
+    hub.admit(&parent).expect("parent");
     let child = Transaction {
         version: bitcoin::transaction::Version::TWO,
         lock_time: LockTime::ZERO,
@@ -1896,7 +1909,7 @@ fn reorg_evict_does_not_template_a_parentless_child() {
         }],
     };
     let child_id = child.compute_txid();
-    hub.accept_tx(&child).expect("child");
+    hub.admit(&child).expect("child");
     while q.tip_height().map(|h| h.0).unwrap_or(0) > 0 {
         q.disconnect_tip().unwrap();
     }
@@ -2005,7 +2018,7 @@ fn package_rollback_unindexes_slot_eviction_and_keeps_delta() {
     let victim = spend_true(cbs[0], 1_000, spk.clone());
     let victim_id = victim.compute_txid();
     hub.prioritise_tx(victim_id, 11);
-    hub.accept_tx(&victim).expect("victim");
+    hub.admit(&victim).expect("victim");
     rbitcoin_mempool::testutil::pin_full_slot_table(&mut hub.lock_write().store);
     let parent = spend_true(cbs[1], 50_000, spk.clone());
     let parent_id = parent.compute_txid();
@@ -2057,7 +2070,7 @@ fn onep_rollback_unindexes_slot_eviction() {
     hub.note_mock_now(10);
     let victim = spend_true(cbs[0], 1_000, spk.clone());
     let victim_id = victim.compute_txid();
-    hub.accept_tx(&victim).expect("victim");
+    hub.admit(&victim).expect("victim");
     rbitcoin_mempool::testutil::pin_full_slot_table(&mut hub.lock_write().store);
     let parent = spend_true(cbs[1], 50_000, ScriptBuf::from_bytes(vec![0x00]));
     let parent_id = parent.compute_txid();
@@ -2079,7 +2092,7 @@ fn onep_rollback_unindexes_slot_eviction() {
             script_pubkey: spk,
         }],
     };
-    let _ = hub.accept_tx(&child);
+    let _ = hub.admit(&child);
     assert!(!hub.contains(&parent_id));
     assert!(!hub.contains(&victim_id));
     assert!(
@@ -2102,7 +2115,7 @@ fn failed_1p1c_trim_restores_the_conflict() {
         let hub = MempoolHub::open_with_weight(&dir, Arc::clone(&q), victim.weight().to_wu() + 400)
             .unwrap();
         hub.set_relay_enabled(true);
-        hub.accept_tx(&victim).expect("victim");
+        hub.admit(&victim).expect("victim");
         let parent = spend_true(cbs[round], 20_000, spk.clone());
         let parent_id = parent.compute_txid();
         assert!(hub.try_note_extra_compact(&parent));
@@ -2117,7 +2130,7 @@ fn failed_1p1c_trim_restores_the_conflict() {
         let err = if on_async {
             block_on(hub.accept_tx_from_async(child.clone(), TxOrigin::Relay(None)))
         } else {
-            hub.accept_tx(&child)
+            hub.admit(&child)
         };
         assert!(
             err.is_err(),
@@ -2170,12 +2183,12 @@ fn eviction_keeps_priority_and_duplicate_does_not_replay_it() {
     let high_id = high.compute_txid();
     hub.prioritise_tx(low_id, 9);
     hub.prioritise_tx(high_id, 4);
-    hub.accept_tx(&low).expect("low");
-    hub.accept_tx(&high).expect("high evicts low");
+    hub.admit(&low).expect("low");
+    hub.admit(&high).expect("high evicts low");
     assert!(!hub.contains(&low_id));
     assert_eq!(hub.fee_delta(&low_id), 9);
     let updates = hub.template_updates();
-    let err = hub.accept_tx(&high).expect_err("already in the pool");
+    let err = hub.admit(&high).expect_err("already in the pool");
     assert!(matches!(err, AcceptError::Duplicate(_)), "{err}");
     assert_eq!(hub.template_updates(), updates);
     assert_eq!(hub.fee_delta(&low_id), 9);
@@ -2204,10 +2217,9 @@ fn slot_evict_unindexes_evicted_relay_maps() {
     let first = spend_true(cbs[0], 2_000, spk.clone());
     let second = spend_true(cbs[1], 2_000, spk);
     let first_id = first.compute_txid();
-    hub.accept_tx(&first).expect("first admit");
+    hub.admit(&first).expect("first admit");
     rbitcoin_mempool::testutil::pin_full_slot_table(&mut hub.lock_write().store);
-    hub.accept_tx(&second)
-        .expect("second admit evicts for a slot");
+    hub.admit(&second).expect("second admit evicts for a slot");
     assert!(!hub.contains(&first_id));
     assert!(hub.contains(&second.compute_txid()));
     assert!(
@@ -2236,9 +2248,8 @@ fn admission_trim_unindexes_evicted_relay_maps() {
     hub.note_mock_now(10);
     let low_id = low.compute_txid();
     let high_id = high.compute_txid();
-    hub.accept_tx(&low).expect("low feerate fits");
-    hub.accept_tx(&high)
-        .expect("higher feerate evicts the low one");
+    hub.admit(&low).expect("low feerate fits");
+    hub.admit(&high).expect("higher feerate evicts the low one");
     assert!(
         !hub.contains(&low_id),
         "the low feerate tx leaves the graph"
@@ -2270,8 +2281,8 @@ fn unindex_drops_relay_seq_and_accept_at() {
     hub.note_mock_now(10);
     let gone = spend_true(cbs[0], 1_000, spk.clone());
     let stay = spend_true(cbs[1], 2_000, spk);
-    hub.accept_tx(&gone).expect("accept gone");
-    hub.accept_tx(&stay).expect("accept stay");
+    hub.admit(&gone).expect("accept gone");
+    hub.admit(&stay).expect("accept stay");
     let gone_w = gone.compute_wtxid();
     let stay_w = stay.compute_wtxid();
     assert!(hub.relay_seq_of(&gone_w).is_some());
@@ -2302,7 +2313,7 @@ fn unindex_drops_relay_seq_and_accept_at() {
         }],
     };
     assert!(matches!(
-        hub.accept_tx(&orphan),
+        hub.admit(&orphan),
         Err(AcceptError::Orphaned { .. })
     ));
     let orphan_w = orphan.compute_wtxid();
@@ -2354,7 +2365,7 @@ fn tx_inv_due_uses_wall_clock_when_mocktime_unset() {
     hub.set_relay_enabled(true);
     assert_eq!(hub.mock_now.load(Ordering::Relaxed), 0);
     let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
-    hub.accept_tx(&tx).expect("accept");
+    hub.admit(&tx).expect("accept");
     let w = tx.compute_wtxid();
     assert!(
         !hub.tx_inv_due(&w),
@@ -2413,13 +2424,11 @@ fn purge_confirmed_drops_relay_maps() {
         },
         parent.output[0].value.to_sat() - 2_000,
     );
-    hub.accept_tx(&parent).expect("admit parent");
-    hub.accept_tx(&child).expect("admit child");
+    hub.admit(&parent).expect("admit parent");
+    hub.admit(&child).expect("admit child");
     let fee_dir = tmp();
     let fee_hub = MempoolHub::open(&fee_dir, Arc::clone(&q)).unwrap();
-    fee_hub
-        .accept_tx(&parent)
-        .expect("admit parent on the fee hub");
+    fee_hub.admit(&parent).expect("admit parent on the fee hub");
     let parent_id = parent.compute_txid();
     let child_id = child.compute_txid();
     let w = parent.compute_wtxid();
@@ -2526,8 +2535,8 @@ fn purge_fault_unindexes_txs_that_already_left() {
     let confirmed = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let conflict = spend_true(cbs[1], 2_000, ScriptBuf::from_bytes(vec![0x51]));
     let chain_spend = spend_true(cbs[1], 3_000, ScriptBuf::from_bytes(vec![0x51]));
-    hub.accept_tx(&confirmed).expect("admit confirmed");
-    hub.accept_tx(&conflict).expect("admit conflict");
+    hub.admit(&confirmed).expect("admit confirmed");
+    hub.admit(&conflict).expect("admit conflict");
     let confirmed_id = confirmed.compute_txid();
     let conflict_id = conflict.compute_txid();
     assert!(hub.relay_indexed(&confirmed_id));
@@ -2621,7 +2630,7 @@ fn a_cached_create_holding_another_txid_is_not_trusted() {
     );
     let dir = tmp();
     let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
-    hub.accept_tx(&child)
+    hub.admit(&child)
         .expect("admit a child of the confirmed parent");
     let g = hub.lock_write();
     assert_eq!(
@@ -2690,7 +2699,7 @@ fn maintenance_keeps_a_child_whose_confirmed_parent_the_head_lost() {
     {
         let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
         for tx in [&parent, &child, &spent_parent, &spent_child] {
-            hub.accept_tx(tx).expect("admit parents and their children");
+            hub.admit(tx).expect("admit parents and their children");
         }
         // The parents' block strips them from the pool. The children stay.
         let mut g = hub.lock_write();
@@ -2842,7 +2851,7 @@ fn maintenance_drops_reloaded_txs_whose_parent_is_gone() {
             &lost_parent,
             &lost_child,
         ] {
-            hub.accept_tx(tx).expect("admit");
+            hub.admit(tx).expect("admit");
         }
         // The lost admit: the parent leaves the sidecar, its child stays.
         let mut g = hub.lock_write();
@@ -3131,7 +3140,7 @@ fn hub_accept_remove_with_map_utxo_path() {
         "dry-run missing parent: {err}"
     );
     assert_eq!(hub.orphan_count(), 0);
-    let err = hub.accept_tx(&tx).unwrap_err();
+    let err = hub.admit(&tx).unwrap_err();
     assert!(matches!(err, AcceptError::Orphaned { .. }), "{err}");
     assert_eq!(hub.orphan_count(), 1);
     let err = hub.test_accept(&tx).unwrap_err();
@@ -3184,9 +3193,7 @@ fn accept_from_peer_erase_drops_orphan() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let err = hub
-        .accept_tx_from(&tx, TxOrigin::Relay(Some(4)))
-        .unwrap_err();
+    let err = hub.admit_from(&tx, TxOrigin::Relay(Some(4))).unwrap_err();
     assert!(matches!(err, AcceptError::Orphaned { .. }), "{err}");
     assert_eq!(hub.orphan_snapshot()[0].announcers, vec![4]);
     hub.add_orphan_announcer(&tx.compute_wtxid(), 8);
@@ -3225,10 +3232,7 @@ fn compact_fill_uses_parked_orphan() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    assert!(matches!(
-        hub.accept_tx(&tx),
-        Err(AcceptError::Orphaned { .. })
-    ));
+    assert!(matches!(hub.admit(&tx), Err(AcceptError::Orphaned { .. })));
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
     let nonce = 1u64;
     let keys = ShortId::calculate_siphash_keys(&genesis.header, nonce);
@@ -3757,10 +3761,10 @@ fn orphan_witnesses_wait_until_a_resent_parent_finds_their_txid_pooled() {
     let parent_bad = malleate(&parent);
     let child_bad = malleate(&child);
     let peer = TxOrigin::Relay(Some(4));
-    hub.accept_tx_from(&parent_bad, peer)
+    hub.admit_from(&parent_bad, peer)
         .expect_err("a 0-fee parent");
     for tx in [&child, &child_bad] {
-        let err = hub.accept_tx_from(tx, peer).unwrap_err();
+        let err = hub.admit_from(tx, peer).unwrap_err();
         assert!(matches!(err, AcceptError::Orphaned { .. }), "{err:?}");
     }
     let parked = |tx: &Transaction| {
@@ -3784,7 +3788,7 @@ fn orphan_witnesses_wait_until_a_resent_parent_finds_their_txid_pooled() {
         "an RPC package leaves both orphans parked"
     );
 
-    let _ = hub.accept_tx_from(&parent_bad, peer);
+    let _ = hub.admit_from(&parent_bad, peer);
     assert!(
         !parked(&child) && !parked(&child_bad),
         "the resent parent erases the peer's orphans whose txid is pooled"
@@ -3803,14 +3807,14 @@ fn local_submit_admits_a_parked_tx_whose_parent_is_pooled() {
     hub.set_relay_enabled(true);
     let parent = spend_true(cbs[10], 10_000, ScriptBuf::from_bytes(vec![0x51]));
     let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
-    hub.accept_tx_from(&parent, TxOrigin::Local)
+    hub.admit_from(&parent, TxOrigin::Local)
         .expect("the parent pays for itself");
     assert!(hub.lock_write().orphanage.insert_from(
         child.clone(),
         BTreeSet::from([parent.compute_txid()]),
         Some(4),
     ));
-    hub.accept_tx_from(&child, TxOrigin::Local)
+    hub.admit_from(&child, TxOrigin::Local)
         .expect("a local submit ignores the orphanage");
     assert!(hub.try_contains(&child.compute_txid()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -3826,14 +3830,14 @@ fn relay_admit_erases_the_parked_copy() {
     hub.set_relay_enabled(true);
     let parent = spend_true(cbs[9], 10_000, ScriptBuf::from_bytes(vec![0x51]));
     let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
-    hub.accept_tx_from(&parent, TxOrigin::Local)
+    hub.admit_from(&parent, TxOrigin::Local)
         .expect("the parent pays for itself");
     assert!(hub.lock_write().orphanage.insert_from(
         child.clone(),
         BTreeSet::from([parent.compute_txid()]),
         Some(4),
     ));
-    hub.accept_tx_from(&child, TxOrigin::Relay(Some(5)))
+    hub.admit_from(&child, TxOrigin::Relay(Some(5)))
         .expect("its parent is pooled");
     let g = hub.lock_read();
     assert!(
@@ -3856,7 +3860,7 @@ fn test_package_member_leaves_its_parked_copy() {
     hub.set_relay_enabled(true);
     let parent = spend_true(cbs[7], 10_000, ScriptBuf::from_bytes(vec![0x51]));
     let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
-    hub.accept_tx_from(&parent, TxOrigin::Local)
+    hub.admit_from(&parent, TxOrigin::Local)
         .expect("the parent pays for itself");
     assert!(hub.lock_write().orphanage.insert_from(
         child.clone(),
@@ -3954,7 +3958,7 @@ fn hub_package_admits_its_parked_child() {
     let child_id = child.compute_txid();
     let sibling_id = sibling.compute_txid();
     for tx in [&child, &sibling] {
-        let err = hub.accept_tx(tx).unwrap_err();
+        let err = hub.admit(tx).unwrap_err();
         assert!(
             matches!(err, AcceptError::Orphaned { .. }),
             "spend of the missing parent must park, got {err:?}"
@@ -4004,7 +4008,7 @@ fn hub_package_admits_its_parked_child() {
         49_0000_0000,
     );
     let child_id = child.compute_txid();
-    let err = hub.accept_tx(&child).unwrap_err();
+    let err = hub.admit(&child).unwrap_err();
     assert!(matches!(err, AcceptError::Orphaned { .. }), "{err:?}");
     let bad = spend_vout(
         OutPoint {
@@ -4047,7 +4051,7 @@ fn failed_package_leaves_its_parked_child_parked() {
     hub.set_relay_enabled(true);
     let parent = spend_true(cbs[0], 10_000, spk);
     let parent_id = parent.compute_txid();
-    hub.accept_tx(&parent).expect("parent pays for itself");
+    hub.admit(&parent).expect("parent pays for itself");
     let child = spend_vout(
         OutPoint {
             txid: parent_id,
@@ -4097,7 +4101,7 @@ fn failed_package_leaves_its_parked_child_parked() {
     hub.set_relay_enabled(true);
     let parent = spend_true(cbs[1], 10_000, ScriptBuf::from_bytes(vec![0x51]));
     let parent_id = parent.compute_txid();
-    hub.accept_tx(&parent).expect("parent");
+    hub.admit(&parent).expect("parent");
     let absent = Txid::from_byte_array([0xab; 32]);
     let mut child = spend_vout(
         OutPoint {
@@ -4346,7 +4350,7 @@ fn submit_package_rpc_admits_zero_fee_anchor() {
     hub.set_relay_enabled(true);
 
     let parent = zero_fee_anchor(cbs[0]);
-    let err = hub.accept_tx(&parent).expect_err("a lone anchor parent");
+    let err = hub.admit(&parent).expect_err("a lone anchor parent");
     assert!(
         matches!(err, AcceptError::Policy("min relay fee")),
         "{err:?}"
@@ -4437,7 +4441,7 @@ fn from_peer(
 ) -> Result<rbitcoin_mempool::AcceptResult, AcceptError> {
     let origin = TxOrigin::Relay(Some(peer));
     if !on_async {
-        return hub.accept_tx_from(tx, origin);
+        return hub.admit_from(tx, origin);
     }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -4705,7 +4709,7 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
     let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
     assert!(
         matches!(
-            hub.accept_tx(&parent),
+            hub.admit(&parent),
             Err(AcceptError::Policy("min relay fee"))
         ),
         "parent must fail min-relay alone"
@@ -4766,10 +4770,10 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
     // Child also spends a parent already in the mempool. The package
     // remainder is only the under-fee parent plus the child.
     let sponsor = spend_true(cbs[1], 10_000, ScriptBuf::from_bytes(vec![0x51]));
-    assert!(hub.accept_tx(&sponsor).is_ok());
+    assert!(hub.admit(&sponsor).is_ok());
     let poor = spend_true(cbs[2], 1, ScriptBuf::from_bytes(vec![0x51]));
     assert!(matches!(
-        hub.accept_tx(&poor),
+        hub.admit(&poor),
         Err(AcceptError::Policy("min relay fee"))
     ));
     let in_val = (50_0000_0000 - 10_000) + (50_0000_0000 - 1);
@@ -4869,7 +4873,7 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
     let dir3 = tmp();
     let hub3 = MempoolHub::open_with_weight(&dir3, Arc::clone(q), filler.weight().to_wu()).unwrap();
     hub3.set_relay_enabled(true);
-    hub3.accept_tx(&filler).expect("filler");
+    hub3.admit(&filler).expect("filler");
     {
         let mut g = hub3.lock_write();
         g.max_weight = g.graph.total_weight();
@@ -4960,7 +4964,7 @@ fn failed_commit_publishes_raised_fee_floor() {
         fat.push(0x51);
         let parent = spend_true(cbs[0], 100_000, ScriptBuf::from_bytes(fat));
         assert!(
-            hub.accept_tx(&parent).is_ok(),
+            hub.admit(&parent).is_ok(),
             "package={package}: parent must fit"
         );
         let advertised = hub.fee_floor_sat_kvb();
@@ -4984,7 +4988,7 @@ fn failed_commit_publishes_raised_fee_floor() {
         let err = if package {
             hub.accept_package(std::slice::from_ref(&child)).map(|_| ())
         } else {
-            hub.accept_tx(&child).map(|_| ())
+            hub.admit(&child).map(|_| ())
         };
         assert!(
             matches!(err, Err(AcceptError::Policy("mempool full"))),
@@ -5048,8 +5052,8 @@ fn failed_replacement_keeps_the_conflict() {
     let dir = tmp();
     let hub = MempoolHub::open_with_weight(&dir, Arc::clone(q), budget).unwrap();
     hub.set_relay_enabled(true);
-    assert!(hub.accept_tx(&anchor).is_ok(), "anchor fits");
-    assert!(hub.accept_tx(&victim).is_ok(), "victim fits");
+    assert!(hub.admit(&anchor).is_ok(), "anchor fits");
+    assert!(hub.admit(&victim).is_ok(), "victim fits");
     let [replacement, child] = package_evicted_with_anchor(&anchor, cbs[1], 60_000, 50_000, budget);
     let replacement_id = replacement.compute_txid();
     let err = hub.accept_package(&[replacement, child]).map(|_| ());
@@ -5090,8 +5094,8 @@ fn failed_replacement_restore_keeps_accept_time_across_restart() {
     hub.set_relay_enabled(true);
     let t0 = 1_700_000_000u64;
     hub.note_mock_now(t0);
-    hub.accept_tx(&anchor).expect("anchor fits");
-    hub.accept_tx(&victim).expect("victim fits");
+    hub.admit(&anchor).expect("anchor fits");
+    hub.admit(&victim).expect("victim fits");
     hub.note_mock_now(t0 + 600);
     let [replacement, child] = package_evicted_with_anchor(&anchor, cbs[1], 60_000, 50_000, budget);
     let err = hub.accept_package(&[replacement, child]).map(|_| ());
@@ -5147,9 +5151,9 @@ fn failed_replacement_keeps_below_floor_victim() {
     let victim = spend_true(cbs[1], victim_fee, spk.clone());
     let victim_id = victim.compute_txid();
     let victim_rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(victim_fee, victim_wu);
-    assert!(hub.accept_tx(&anchor).is_ok(), "anchor fits");
+    assert!(hub.admit(&anchor).is_ok(), "anchor fits");
     assert!(
-        hub.accept_tx(&victim).is_ok(),
+        hub.admit(&victim).is_ok(),
         "victim at the pre-eviction floor fits, fee {victim_fee} floor {floor}"
     );
     let [replacement, child] = package_evicted_with_anchor(&anchor, cbs[1], 80_000, 50_000, budget);
@@ -5201,7 +5205,7 @@ fn failed_replacement_keeps_cpfp_conflict_set() {
     hub.set_relay_enabled(true);
     let floor = hub.lock_read().mempool_min_fee_sat_kvb();
     let anchor = spend_true(cbs[0], fee_at_least(anchor_wu, floor), anchor_spk);
-    assert!(hub.accept_tx(&anchor).is_ok(), "anchor fits");
+    assert!(hub.admit(&anchor).is_ok(), "anchor fits");
     hub.accept_package(&[parent.clone(), paying.clone()])
         .expect("CPFP package admits a below-min-relay parent");
     assert!(hub.contains(&parent_id));
@@ -5346,11 +5350,11 @@ fn submit_package_rpc_cpf_ps_parent_under_mempool_min_fee() {
     let filler = spend_true(cbs[0], 100_000, heavy.clone());
     let bumper = spend_true(cbs[1], 200_000, heavy);
     assert!(
-        hub.accept_tx(&filler).is_ok(),
+        hub.admit(&filler).is_ok(),
         "filler must enter before the pool is over budget"
     );
     assert!(
-        hub.accept_tx(&bumper).is_ok(),
+        hub.admit(&bumper).is_ok(),
         "higher-fee bumper must evict the filler"
     );
     assert!(
@@ -5365,11 +5369,11 @@ fn submit_package_rpc_cpf_ps_parent_under_mempool_min_fee() {
     let parent = spend_true(cbs[2], 500, ScriptBuf::from_bytes(vec![0x51]));
     assert!(
         matches!(
-            hub.accept_tx(&parent),
+            hub.admit(&parent),
             Err(AcceptError::Policy("mempool min fee"))
         ),
         "parent clears static min relay and fails the dynamic floor, got {:?}",
-        hub.accept_tx(&parent)
+        hub.admit(&parent)
     );
     let child = Transaction {
         version: Version::TWO,
@@ -5449,7 +5453,7 @@ fn package_inside_promote_admits_parent_orphans() {
         50_0000_0000 - 1 - half - 20_000,
     );
     let err = hub
-        .accept_tx_from(&sibling, TxOrigin::Relay(Some(1)))
+        .admit_from(&sibling, TxOrigin::Relay(Some(1)))
         .unwrap_err();
     assert!(
         matches!(err, AcceptError::Orphaned { .. }),
@@ -5485,7 +5489,7 @@ fn package_inside_promote_admits_parent_orphans() {
         }],
     };
     let err = hub
-        .accept_tx_from(&child, TxOrigin::Relay(Some(1)))
+        .admit_from(&child, TxOrigin::Relay(Some(1)))
         .unwrap_err();
     assert!(
         matches!(err, AcceptError::Orphaned { .. }),
@@ -5556,7 +5560,7 @@ fn parked_chain_promotes_in_one_frame() {
         parked.push(child);
     }
     for child in parked.iter().rev() {
-        let err = hub.accept_tx(child).unwrap_err();
+        let err = hub.admit(child).unwrap_err();
         assert!(
             matches!(err, AcceptError::Orphaned { .. }),
             "link must park, got {err:?}"
@@ -5564,7 +5568,7 @@ fn parked_chain_promotes_in_one_frame() {
     }
     assert_eq!(hub.orphan_count(), parked.len());
     rbitcoin_net::tx_relay::reset_promote_depth();
-    hub.accept_tx(&root).expect("root admits the parked chain");
+    hub.admit(&root).expect("root admits the parked chain");
     assert_eq!(hub.orphan_count(), 0);
     assert!(hub.try_contains(&root.compute_txid()));
     for child in &parked {
@@ -5591,7 +5595,7 @@ fn mempool_under_pressure() {
     hub.set_relay_enabled(true);
     let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
     assert!(matches!(
-        hub.accept_tx(&parent),
+        hub.admit(&parent),
         Err(AcceptError::Policy("min relay fee"))
     ));
     let child = Transaction {
@@ -5611,7 +5615,7 @@ fn mempool_under_pressure() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let err = hub.accept_tx_from(&child, TxOrigin::Relay(Some(7)));
+    let err = hub.admit_from(&child, TxOrigin::Relay(Some(7)));
     assert!(
         matches!(err, Err(AcceptError::Orphaned { .. })),
         "P2P child of min-relay parent must orphan, got {err:?}"
@@ -5622,7 +5626,7 @@ fn mempool_under_pressure() {
 
     let heavy = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x6a; 110_000]));
     assert!(matches!(
-        hub.accept_tx(&heavy),
+        hub.admit(&heavy),
         Err(AcceptError::Policy("tx weight"))
     ));
     assert_eq!(
@@ -5659,7 +5663,7 @@ fn mempool_under_pressure() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let child_err = hub.accept_tx(&rejected_child);
+    let child_err = hub.admit(&rejected_child);
     assert!(
         matches!(child_err, Err(AcceptError::Orphaned { .. })),
         "missing inputs still orphaned, got {child_err:?}"
@@ -5686,7 +5690,7 @@ fn mempool_under_pressure() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let _ = hub.accept_tx(&grandchild);
+    let _ = hub.admit(&grandchild);
     assert_eq!(
         hub.orphan_count(),
         parked,
@@ -5722,7 +5726,7 @@ fn accept_package_child_fail_restores_rbf_victims() {
         }],
     };
     let low_id = low.compute_txid();
-    hub.accept_tx(&low).expect("low fee live");
+    hub.admit(&low).expect("low fee live");
     let high = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -6130,7 +6134,7 @@ fn fee_estimates_follow_the_floor_after_a_package_rollback() {
         record_fee_sample(&hub, height, 150);
     }
     let victim = spend_true(cbs[0], 10_000, ScriptBuf::from_bytes(vec![0x51; 9_000]));
-    hub.accept_tx(&victim).expect("victim");
+    hub.admit(&victim).expect("victim");
     let near_full = hub.lock_read().mempool_min_fee_sat_kvb();
     assert!(near_full > 150, "near-full floor {near_full}");
     let replacement = spend_true(cbs[0], 20_000, ScriptBuf::from_bytes(vec![0x51]));
@@ -6175,7 +6179,7 @@ fn arrivals_above_the_ladder_leave_near_targets_to_history() {
     let dir = tmp();
     let hub = MempoolHub::open(&dir, q).unwrap();
     hub.set_relay_enabled(true);
-    hub.accept_tx(&spend_true(
+    hub.admit(&spend_true(
         cbs[0],
         1_000,
         ScriptBuf::from_bytes(vec![0x51]),
@@ -6210,7 +6214,7 @@ fn fee_snapshot_live_totals_match_list_live_meta() {
     let hub = MempoolHub::open(&mp_dir, Arc::clone(q)).unwrap();
     hub.set_relay_enabled(true);
     let a = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
-    hub.accept_tx(&a).expect("admit");
+    hub.admit(&a).expect("admit");
     let live = hub.list_live_meta();
     let expect_count = live.len();
     let expect_fee: u64 = live.iter().map(|(_, f, _)| *f).sum();
@@ -6459,9 +6463,7 @@ async fn add_orphan_announcer_does_not_panic_on_tokio_worker() {
     let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
     hub.set_relay_enabled(true);
     let tx = parked_orphan_tx();
-    let err = hub
-        .accept_tx_from(&tx, TxOrigin::Relay(Some(4)))
-        .unwrap_err();
+    let err = hub.admit_from(&tx, TxOrigin::Relay(Some(4))).unwrap_err();
     assert!(matches!(err, AcceptError::Orphaned { .. }), "{err}");
     let wtxid = tx.compute_wtxid();
     let join = tokio::spawn(async move {
@@ -6691,8 +6693,8 @@ fn mempool_tx_snapshot_two_live_and_accept_while_held() {
     let spk = ScriptBuf::from_bytes(vec![0x51]);
     let a = spend_true(cbs[0], 1_000, spk.clone());
     let b = spend_true(cbs[1], 2_000, ScriptBuf::from_bytes(vec![0x52]));
-    hub.accept_tx(&a).expect("a");
-    hub.accept_tx(&b).expect("b");
+    hub.admit(&a).expect("a");
+    hub.admit(&b).expect("b");
     let snap = hub.mempool_tx_snapshot();
     assert_eq!(snap.entries().len(), 2);
     for e in snap.entries() {
@@ -6708,7 +6710,7 @@ fn mempool_tx_snapshot_two_live_and_accept_while_held() {
     let cid = c.compute_txid();
     let held = Arc::clone(&snap);
     let h2 = Arc::clone(&hub);
-    let join = thread::spawn(move || h2.accept_tx(&c));
+    let join = thread::spawn(move || h2.admit(&c));
     join.join().expect("accept thread").expect("c");
     assert_eq!(held.entries().len(), 2, "held Arc is the old snapshot");
     let snap2 = hub.mempool_tx_snapshot();
@@ -6758,7 +6760,7 @@ fn mempool_tx_snapshot_refresh_reuses_tx_arc() {
     let hub = MempoolHub::open(&mp_dir, Arc::clone(q)).unwrap();
     hub.set_relay_enabled(true);
     let a = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
-    hub.accept_tx(&a).expect("a");
+    hub.admit(&a).expect("a");
     let snap1 = hub.mempool_tx_snapshot();
     let aid = a.compute_txid();
     let e1 = snap1.get(&aid).expect("a in snap1");
@@ -6772,7 +6774,7 @@ fn mempool_tx_snapshot_refresh_reuses_tx_arc() {
     );
     assert_eq!(e2.json.get().map(|s| s.as_ref()), Some("keep-a"));
     let b = spend_true(cbs[1], 2_000, ScriptBuf::from_bytes(vec![0x52]));
-    hub.accept_tx(&b).expect("b");
+    hub.admit(&b).expect("b");
     let snap3 = hub.mempool_tx_snapshot();
     let bid = b.compute_txid();
     let e3a = snap3.get(&aid).expect("a still live");
@@ -6799,7 +6801,7 @@ fn trust_peer_reorg_evict_keeps_nonfinal() {
     let mut tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
     tx.lock_time = LockTime::from_height(tip + 10).unwrap();
     tx.input[0].sequence = Sequence::from_consensus(0xfffffffe);
-    hub.accept_tx_from(&tx, TxOrigin::Relay(Some(session)))
+    hub.admit_from(&tx, TxOrigin::Relay(Some(session)))
         .expect("non-final from the trusted session");
     let txid = tx.compute_txid();
     assert!(hub.try_contains(&txid));
@@ -6818,7 +6820,7 @@ fn trust_peer_reorg_evict_keeps_nonfinal() {
     let mut local = spend_true(cbs[1], 1_000, ScriptBuf::from_bytes(vec![0x52]));
     local.lock_time = LockTime::from_height(tip + 10).unwrap();
     local.input[0].sequence = Sequence::from_consensus(0xfffffffe);
-    let err = hub.accept_tx(&local).unwrap_err();
+    let err = hub.admit(&local).unwrap_err();
     assert!(
         matches!(err, AcceptError::NotFinal | AcceptError::Policy(_)),
         "{err}"
@@ -6850,7 +6852,7 @@ fn review_trust_flag_off_open_drops_marked_tree() {
     let mut parent = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
     parent.lock_time = LockTime::from_height(tip + 10).unwrap();
     parent.input[0].sequence = Sequence::from_consensus(0xfffffffe);
-    hub.accept_tx_from(&parent, TxOrigin::Relay(Some(session)))
+    hub.admit_from(&parent, TxOrigin::Relay(Some(session)))
         .expect("non-final from the trusted session");
     let parent_id = parent.compute_txid();
     let child = spend_vout(
@@ -6861,8 +6863,7 @@ fn review_trust_flag_off_open_drops_marked_tree() {
         parent.output[0].value.to_sat() - 1_000,
     );
     let child_id = child.compute_txid();
-    hub.accept_tx(&child)
-        .expect("clean child of a marked parent");
+    hub.admit(&child).expect("clean child of a marked parent");
     assert!(hub.lock_read().trust_kept.contains(&parent_id));
     assert!(!hub.lock_read().trust_kept.contains(&child_id));
     hub.flush().unwrap();
@@ -6928,18 +6929,18 @@ fn review_trust_orphan_keeps_session_waiver() {
     other.lock_time = LockTime::from_height(tip + 10).unwrap();
     other.input[0].sequence = Sequence::from_consensus(0xfffffffe);
     let parked = hub
-        .accept_tx_from(&trusted, TxOrigin::Relay(Some(session)))
+        .admit_from(&trusted, TxOrigin::Relay(Some(session)))
         .unwrap_err();
     assert!(matches!(parked, AcceptError::Orphaned { .. }), "{parked}");
     let parked_other = hub
-        .accept_tx_from(&other, TxOrigin::Relay(Some(99)))
+        .admit_from(&other, TxOrigin::Relay(Some(99)))
         .unwrap_err();
     assert!(
         matches!(parked_other, AcceptError::Orphaned { .. }),
         "{parked_other}"
     );
-    hub.accept_tx(&parent).expect("parent");
-    hub.accept_tx(&other_parent).expect("other parent");
+    hub.admit(&parent).expect("parent");
+    hub.admit(&other_parent).expect("other parent");
     let trusted_id = trusted.compute_txid();
     assert!(
         hub.try_contains(&trusted_id),
@@ -6960,13 +6961,13 @@ fn review_trust_orphan_keeps_session_waiver() {
         script_parent.output[0].value.to_sat() - 1_000,
     );
     let parked_bad = hub
-        .accept_tx_from(&bad, TxOrigin::Relay(Some(session)))
+        .admit_from(&bad, TxOrigin::Relay(Some(session)))
         .unwrap_err();
     assert!(
         matches!(parked_bad, AcceptError::Orphaned { .. }),
         "{parked_bad}"
     );
-    hub.accept_tx(&script_parent).expect("p2wpkh parent");
+    hub.admit(&script_parent).expect("p2wpkh parent");
     let bad_id = bad.compute_txid();
     assert!(hub.try_contains(&bad_id), "trusted script orphan dropped");
     assert!(hub.lock_read().trust_kept.contains(&bad_id));
@@ -6987,7 +6988,7 @@ fn trust_peer_admit_from_peer_only() {
     q.set_trust_peer(true);
     let wpkh = WPubkeyHash::from_byte_array([0x44; 20]);
     let parent = spend_true(cbs[0], 1_000, ScriptBuf::new_p2wpkh(&wpkh));
-    hub.accept_tx(&parent).expect("fund p2wpkh");
+    hub.admit(&parent).expect("fund p2wpkh");
     let parent_value = parent.output[0].value.to_sat();
     let child = Transaction {
         version: Version::TWO,
@@ -7006,7 +7007,7 @@ fn trust_peer_admit_from_peer_only() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let err = hub.accept_tx(&child).unwrap_err();
+    let err = hub.admit(&child).unwrap_err();
     assert!(matches!(err, AcceptError::Script(_)), "{err}");
     assert!(!hub.try_contains(&child.compute_txid()));
 
@@ -7015,7 +7016,7 @@ fn trust_peer_admit_from_peer_only() {
     rbitcoin_log::capture_logs(false);
     rbitcoin_log::capture_logs(true);
     let got = hub
-        .accept_tx_from(&child, TxOrigin::Relay(Some(session)))
+        .admit_from(&child, TxOrigin::Relay(Some(session)))
         .expect("trusted session admits the script fault");
     assert_eq!(got.fee_sat, 1_000);
     let txid = child.compute_txid();
@@ -7036,7 +7037,7 @@ fn trust_peer_admit_from_peer_only() {
     );
 
     let parent2 = spend_true(cbs[1], 1_000, ScriptBuf::new_p2wpkh(&wpkh));
-    hub.accept_tx(&parent2).expect("second fund");
+    hub.admit(&parent2).expect("second fund");
     let other = Transaction {
         input: vec![TxIn {
             previous_output: OutPoint {
@@ -7048,7 +7049,7 @@ fn trust_peer_admit_from_peer_only() {
         ..child.clone()
     };
     let other_err = hub
-        .accept_tx_from(&other, TxOrigin::Relay(Some(session + 1)))
+        .admit_from(&other, TxOrigin::Relay(Some(session + 1)))
         .unwrap_err();
     assert!(matches!(other_err, AcceptError::Script(_)), "{other_err}");
     assert!(!hub.try_contains(&other.compute_txid()));
@@ -7182,7 +7183,7 @@ fn review_trust_recent_reject_does_not_drop_session_tx() {
 
     let wpkh = WPubkeyHash::from_byte_array([0x44; 20]);
     let parent = spend_true(cbs[0], 1_000, ScriptBuf::new_p2wpkh(&wpkh));
-    mp.accept_tx(&parent).expect("fund p2wpkh");
+    mp.admit(&parent).expect("fund p2wpkh");
     let parent_value = parent.output[0].value.to_sat();
     let child = Transaction {
         version: Version::TWO,
@@ -7201,7 +7202,7 @@ fn review_trust_recent_reject_does_not_drop_session_tx() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let err = mp.accept_tx(&child).unwrap_err();
+    let err = mp.admit(&child).unwrap_err();
     assert!(matches!(err, AcceptError::Script(_)), "{err}");
     let txid = child.compute_txid();
     assert!(!mp.try_contains(&txid));
@@ -7352,7 +7353,7 @@ fn get_coin_decodes_only_the_spent_output_of_a_wide_parent() {
     let child = spend_wide(&wide, &[500]);
     let _ = q.store().txs.sample_reset_body_decodes();
     let _ = q.store().txs.sample_reset_outputs_decoded();
-    hub.accept_tx(&child).expect("spend of vout 500");
+    hub.admit(&child).expect("spend of vout 500");
     assert_eq!(
         hub.get_live_meta(&child.compute_txid()).map(|(fee, _)| fee),
         Some(1_000)
@@ -7462,7 +7463,7 @@ fn cpfp_package_meters_the_chunk_once() {
     let dir = tmp();
     let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
     hub.set_relay_enabled(true);
-    hub.accept_tx(&parent).expect("parent");
+    hub.admit(&parent).expect("parent");
     let (after_parent, admitted_before_child) = {
         let flow = hub.fee_flow.lock().unwrap();
         (flow.admit_wu_s.clone(), flow.admitted_wu)
@@ -7472,7 +7473,7 @@ fn cpfp_package_meters_the_chunk_once() {
         vec![parent_i],
         "a lone parent is its own chunk"
     );
-    hub.accept_tx(&child).expect("child");
+    hub.admit(&child).expect("child");
     let (after_child, admitted_after_child) = {
         let flow = hub.fee_flow.lock().unwrap();
         (flow.admit_wu_s.clone(), flow.admitted_wu)
@@ -7570,19 +7571,19 @@ fn admit_1p1c_meters_the_chunk_before_orphan_promotion() {
     hub.set_min_relay_sat_kvb(50_000);
     assert!(
         matches!(
-            hub.accept_tx(&parent),
+            hub.admit(&parent),
             Err(AcceptError::Policy("min relay fee"))
         ),
         "the parent stays out of the pool so the sibling can park"
     );
     let parked = hub
-        .accept_tx_from(&sibling, TxOrigin::Relay(Some(1)))
+        .admit_from(&sibling, TxOrigin::Relay(Some(1)))
         .unwrap_err();
     assert!(
         matches!(parked, AcceptError::Orphaned { .. }),
         "the paying sibling waits on the parent, got {parked:?}"
     );
-    hub.accept_tx_from(&child, TxOrigin::Local)
+    hub.admit_from(&child, TxOrigin::Local)
         .expect("local 1p1c admits the parent with the child");
     assert!(hub.contains(&parent_id));
     assert!(hub.contains(&child_id));

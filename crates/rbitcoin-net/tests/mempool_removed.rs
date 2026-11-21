@@ -1,4 +1,5 @@
 use super::tx_relay::{pad_cbs, spend_true, tmp};
+use crate::Admit;
 use bitcoin::{ScriptBuf, Transaction, Txid};
 use rbitcoin_mempool::RemovedRow;
 use rbitcoin_net::tx_relay::MempoolHub;
@@ -23,15 +24,15 @@ fn package_and_one_parent_rollbacks_write_no_row() {
     hub.set_relay_enabled(true);
 
     let lone = spend(cbs[0], 1_000);
-    hub.accept_tx(&lone).expect("lone");
+    hub.admit(&lone).expect("lone");
     let at = sequence(&hub);
     hub.rollback_1p1c_parent(&lone.compute_txid(), &[]);
     assert!(!hub.contains(&lone.compute_txid()));
     assert_eq!(sequence(&hub), at + 1);
 
     let victim = spend(cbs[1], 1_000);
-    hub.accept_tx(&victim).expect("victim");
-    let bump = hub.accept_tx(&spend(cbs[1], 50_000)).expect("replacement");
+    hub.admit(&victim).expect("victim");
+    let bump = hub.admit(&spend(cbs[1], 50_000)).expect("replacement");
     let at = sequence(&hub);
     hub.rollback_package_accepted(std::slice::from_ref(&bump));
     assert!(hub.contains(&victim.compute_txid()), "the victim is back");
@@ -77,7 +78,7 @@ fn a_listing_under_concurrent_admits_matches_its_sequence() {
             let hub = Arc::clone(&hub);
             s.spawn(move || {
                 for cb in chunk {
-                    hub.accept_tx(&spend(*cb, 1_000)).expect("admit");
+                    hub.admit(&spend(*cb, 1_000)).expect("admit");
                 }
             });
         }

@@ -1743,7 +1743,14 @@ mod peer_session_pins {
         let older_tx = spend_height(&hub, 1);
         let older = older_tx.compute_txid();
         let older_w = older_tx.compute_wtxid();
-        mp.accept_tx(&older_tx).expect("older");
+        mp.accept_with_utxo(
+            &older_tx,
+            &mp.utxo_provider(),
+            crate::tx_relay::TxOrigin::Relay(None),
+            crate::tx_relay::AcceptPath::Relay,
+            &[],
+        )
+        .expect("older");
         mp.note_unbroadcast(older);
         let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_peers, local) = peer(PeerConnType::OutboundFullRelay);
@@ -1766,7 +1773,14 @@ mod peer_session_pins {
 
         let newer_tx = spend_height(&hub, 2);
         let newer_w = newer_tx.compute_wtxid();
-        mp.accept_tx(&newer_tx).expect("newer");
+        mp.accept_with_utxo(
+            &newer_tx,
+            &mp.utxo_provider(),
+            crate::tx_relay::TxOrigin::Relay(None),
+            crate::tx_relay::AcceptPath::Relay,
+            &[],
+        )
+        .expect("newer");
         let mut from = crate::peers::CappedSet::new();
         from.insert(older, 8);
         let (_peers, live) = peer(PeerConnType::OutboundFullRelay);
