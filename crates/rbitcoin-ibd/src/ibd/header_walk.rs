@@ -1261,6 +1261,7 @@ pub fn rewind_above(st: &mut IbdWorkState, hub: &ChainHub, height: u32) {
 #[doc(hidden)]
 pub fn rewind_to(st: &mut IbdWorkState, hub: &ChainHub, height: u32, dead: Option<BlockHash>) {
     let dead_height = st.header_walk.tip_height();
+    let tip_before = st.header_walk.tip_hash();
     let marked = dead.filter(|hash| st.header_walk.base_hash != Some(*hash));
     if dead.is_some() {
         if let Some(hash) = marked {
@@ -1302,13 +1303,14 @@ pub fn rewind_to(st: &mut IbdWorkState, hub: &ChainHub, height: u32, dead: Optio
     // `clear_path_above` already dropped path slots above `keep`. An ordered
     // hash with no height stays unless it is the abandoned tip.
     drop_queue_above(st, keep, &keep_hashes);
-    if dead.is_some() {
+    // `emptied` names the tip those peers answered empty at. A rewind that
+    // moves the tip invalidates every entry, whether or not a dead hash was
+    // named.
+    if dead.is_some() || st.header_walk.tip_hash() != tip_before {
         st.header_walk.emptied.clear();
-        if let Some(dead) = marked {
-            rbitcoin_log::warn!(
-                "ibd: headers dead-end hash={dead} height={dead_height} rewind={keep}"
-            );
-        }
+    }
+    if let Some(dead) = marked {
+        rbitcoin_log::warn!("ibd: headers dead-end hash={dead} height={dead_height} rewind={keep}");
     }
     clear_off_path(st);
     recompute_witness(st);
@@ -2566,33 +2568,38 @@ pub fn note_empty(
     if !st.header_walk.origin || !below_floor(hub, &st.header_walk.tip_work()) {
         return false;
     }
-    let counted = asked.is_some() && asked == st.header_walk.tip_hash();
-    let retired = counted && st.header_walk.reserved == Some(peer);
-    if counted {
+    if asked.is_some() && asked == st.header_walk.tip_hash() {
         st.header_walk.emptied.insert(peer);
-        if retired {
-            st.header_walk.reserved = None;
-        }
     }
+    // A quiet peer is retired from the walk, so it cannot answer another ask
+    // at this tip. Waiting on one would keep the rewind from ever firing.
     let tall: Vec<usize> = st
         .slots
         .iter()
-        .filter(|s| s.alive && s.peer_height > st.header_walk.tip_height())
+        .filter(|s| {
+            s.alive
+                && !st.header_walk.walk_quiet.contains(&s.id)
+                && s.peer_height > st.header_walk.tip_height()
+        })
         .map(|s| s.id)
         .collect();
     let alive: Vec<usize> = if tall.is_empty() {
-        st.slots.iter().filter(|s| s.alive).map(|s| s.id).collect()
+        st.slots
+            .iter()
+            .filter(|s| s.alive && !st.header_walk.walk_quiet.contains(&s.id))
+            .map(|s| s.id)
+            .collect()
     } else {
         tall
     };
     let waiting = alive.iter().any(|id| !st.header_walk.emptied.contains(id));
     if alive.is_empty() || waiting {
-        if retired && waiting {
-            st.header_walk.reserved = pick_header_peer(st, st.header_walk.tip_height(), Some(peer));
-        }
         let _ = send_getheaders(st, hub);
         return true;
     }
+    // The whole tip is abandoned. The rewind changes the tip, so the ask
+    // starts from the new one instead of keeping the last empty peer.
+    st.header_walk.reserved = None;
     rewind(st, hub);
     let _ = send_getheaders(st, hub);
     true

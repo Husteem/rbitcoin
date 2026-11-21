@@ -5445,6 +5445,72 @@ fn note_empty_prefers_a_taller_peer_over_one_at_the_tip() {
     );
 }
 
+/// A stored path ahead of the walk tip does not let `ensure_reserved` drop
+/// the taller peer and reserve the peer that just answered empty again.
+#[test]
+fn note_empty_keeps_the_taller_peer_when_the_stored_path_is_ahead() {
+    let (_dir, mut hub) =
+        rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-empty-path-ahead");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    floor_above(&mut hub);
+    let (mut first, _rx0) = slot(0);
+    first.peer_height = 10;
+    let (mut second, _rx1) = slot(1);
+    second.peer_height = 2;
+    let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+    st.header_walk.origin = true;
+    st.header_walk.base_hash = Some(gen);
+    st.header_walk.base_height = 0;
+    st.header_walk.tip.hash = Some(byte_hash(4));
+    st.header_walk.tip.height = 1;
+    st.header_walk.tip.work = Work::from_be_bytes([0; 32]);
+    let ahead = byte_hash(99);
+    st.ordered.push_back(ahead);
+    st.ordered_set.insert(ahead);
+    st.hash_height.insert(ahead, 5);
+    st.header_walk.reserved = Some(0);
+    assert!(note_empty(&mut st, &hub, 0, Some(byte_hash(4))));
+    assert_eq!(
+        st.header_walk.reserved,
+        Some(1),
+        "the ask stays on the taller peer below the stored path"
+    );
+}
+
+/// A taller peer retired from the walk does not keep the all-peers-empty
+/// rewind waiting for an ask it will never receive.
+#[test]
+fn note_empty_rewinds_when_the_only_other_taller_peer_is_quiet() {
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-empty-quiet");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    floor_above(&mut hub);
+    let (mut first, _rx0) = slot(0);
+    first.peer_height = 10;
+    let (mut quiet, _rx1) = slot(1);
+    quiet.peer_height = 10;
+    let mut st = IbdWorkState::new(vec![first, quiet], Some(gen), Some(0));
+    st.header_walk.origin = true;
+    st.header_walk.base_hash = Some(gen);
+    st.header_walk.base_height = 0;
+    st.header_walk.tip.hash = Some(byte_hash(4));
+    st.header_walk.tip.height = 1;
+    st.header_walk.tip.work = Work::from_be_bytes([0; 32]);
+    st.header_walk.reserved = Some(0);
+    st.header_walk.walk_quiet.insert(1);
+    assert!(note_empty(&mut st, &hub, 0, Some(byte_hash(4))));
+    assert_eq!(
+        st.header_walk.tip_hash(),
+        Some(gen),
+        "the empty peer does not wait on the quiet peer"
+    );
+    assert!(
+        st.header_walk.dead_ends.contains(&byte_hash(4)),
+        "the abandoned tip is a dead end"
+    );
+}
+
 /// With no checkpoint the walk tip is its base. Every peer answering empty
 /// there does not mark it dead, so a later batch on it extends the walk.
 #[test]
@@ -5616,6 +5682,33 @@ fn rewind_keeps_a_challenger_forked_at_a_live_checkpoint() {
     assert!(
         st.header_walk.challenger.is_none(),
         "rewinding under the fork drops the challenger"
+    );
+}
+
+/// A rewind to a lower tip invalidates the empty answers given at the old
+/// tip, even when no dead hash is named.
+#[test]
+fn rewind_above_clears_emptied_at_the_old_tip() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-rewind-emptied");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let a1 = mine(gen, 1);
+    let (s0, _rx0) = slot(0);
+    let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+    st.header_walk.origin = true;
+    st.header_walk.base_hash = Some(gen);
+    st.header_walk.base_height = 0;
+    st.header_walk.tip.hash = Some(a1.block_hash());
+    st.header_walk.tip.height = 1;
+    st.header_walk
+        .checkpoints
+        .push(mark_checkpoint(a1.block_hash(), 1));
+    st.header_walk.emptied.insert(0);
+    rewind_above(&mut st, &hub, 0);
+    assert_eq!(st.header_walk.tip_hash(), Some(gen));
+    assert!(
+        st.header_walk.emptied.is_empty(),
+        "an empty answer at the old tip does not follow the walk down"
     );
 }
 
