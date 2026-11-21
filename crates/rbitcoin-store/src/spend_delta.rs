@@ -348,8 +348,9 @@ const COMMIT_LEN: usize = RING_AT + RING * 8;
 const ZERO: Slot = [0u8; SLOT];
 
 // Bulk submissions and serial record preads of confirm-style delta lookups
-// on this thread. Checkpoint merge and reclaim do not count. Thread-local
-// so a parallel suite does not mix another test's calls into the count.
+// on this thread. A checkpoint merge counts one bulk submission per chunk.
+// Reclaim does not count. Thread-local so a parallel suite does not mix
+// another test's calls into the count.
 // Always on, so a release test sees the same split a debug test does.
 thread_local! {
     static DELTA_RECORD_BULK: Cell<u64> = const { Cell::new(0) };
@@ -1799,13 +1800,24 @@ impl SpendPageLog {
     }
 
     /// The committed records of `page_offs` that have one, read into one
-    /// buffer sized from the directory. Records touching in a segment are
-    /// read in one pread.
+    /// buffer sized from the directory. Records touching in a segment share
+    /// one span. Spans go out together on the completion session, at ring
+    /// depth 128, the same batch a confirm lookup uses. The directory lock
+    /// is not held across the reads.
     fn committed_records(
         &self,
         page_offs: &[u64],
         report: &mut CheckpointReport,
     ) -> Result<CommittedRecords, StoreError> {
+        struct Run {
+            file: Arc<TableFile>,
+            offset: u64,
+            pos: usize,
+            len: usize,
+            seg_gen: u32,
+            recs: Vec<LiveRecord>,
+        }
+
         let mut by_seg: HashMap<u32, (Arc<TableFile>, u32, Vec<LiveRecord>)> = HashMap::new();
         {
             let g = self.lock();
@@ -1840,6 +1852,7 @@ impl SpendPageLog {
             rows: Vec::with_capacity(count),
             next: 0,
         };
+        let mut runs = Vec::new();
         let mut pos = 0;
         for (file, seg_gen, mut records) in by_seg.into_values() {
             records.sort_unstable_by_key(|r| r.offset);
@@ -1847,20 +1860,66 @@ impl SpendPageLog {
                 let first = run[0];
                 let last = run[run.len() - 1];
                 let len = (last.offset + last.len as u64 - first.offset) as usize;
-                file.pread_all(first.offset, &mut out.buf[pos..pos + len])?;
+                runs.push(Run {
+                    file: Arc::clone(&file),
+                    offset: first.offset,
+                    pos,
+                    len,
+                    seg_gen,
+                    recs: run.to_vec(),
+                });
+                pos += len;
+            }
+        }
+        let backend = crate::io_backend::read_io_backend();
+        let depth = crate::uring_session::DEFAULT_ENTRIES as usize;
+        for chunk in runs.chunks(depth.max(1)) {
+            note_delta_record_bulk();
+            let paths: Vec<PathBuf> = chunk.iter().map(|run| run.file.path.clone()).collect();
+            let ranges: Vec<(usize, usize)> = chunk.iter().map(|run| (run.pos, run.len)).collect();
+            let slices = disjoint_slices(&mut out.buf, &ranges);
+            let mut ops: Vec<crate::bulk_io::ReadOp<'_>> = slices
+                .into_iter()
+                .zip(chunk.iter())
+                .map(|(buf, run)| {
+                    let fd = run.file.io_handle();
+                    crate::bulk_io::ReadOp {
+                        fd,
+                        offset: run.offset,
+                        buf,
+                        result: i32::MIN,
+                    }
+                })
+                .collect();
+            crate::bulk_io::pread_batch_backend(&mut ops, backend);
+            for (i, op) in ops.iter().enumerate() {
+                if op.result < 0 {
+                    return Err(StoreError::io(
+                        &paths[i],
+                        std::io::Error::from_raw_os_error(-op.result),
+                    ));
+                }
+                if op.result as usize != chunk[i].len {
+                    return Err(StoreError::io(
+                        &paths[i],
+                        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "pread short"),
+                    ));
+                }
+            }
+            drop(ops);
+            for run in chunk {
                 report.merge_reads += 1;
-                report.merge_read_bytes += len as u64;
-                for rec in run {
-                    let at = pos + (rec.offset - first.offset) as usize;
+                report.merge_read_bytes += run.len as u64;
+                for rec in &run.recs {
+                    let at = run.pos + (rec.offset - run.offset) as usize;
                     Record::check(&out.buf[at..at + rec.len], rec.page_off)?;
                     out.rows.push(CommittedRow {
                         page_off: rec.page_off,
                         at: at..at + rec.len,
                         base: rec.base,
-                        seg_gen,
+                        seg_gen: run.seg_gen,
                     });
                 }
-                pos += len;
             }
         }
         out.rows.sort_unstable_by_key(|r| r.page_off);
@@ -3339,10 +3398,26 @@ fn read_run(file: &TableFile, run: &[LiveRecord]) -> Result<Vec<u8>, StoreError>
     Ok(buf)
 }
 
-/// Split offset-ordered records into runs of touching records, one `pread`
+/// Split offset-ordered records into runs of touching records, one span
 /// each. A gap between two records holds dead bytes, which are not read.
 fn coalesce(records: &[LiveRecord]) -> impl Iterator<Item = &[LiveRecord]> + '_ {
     records.chunk_by(|a, b| b.offset == a.offset + a.len as u64)
+}
+
+/// `ranges` are `(start, len)` into `buf`, in order, and do not overlap.
+fn disjoint_slices<'a>(buf: &'a mut [u8], ranges: &[(usize, usize)]) -> Vec<&'a mut [u8]> {
+    let mut out = Vec::with_capacity(ranges.len());
+    let mut rest = buf;
+    let mut consumed = 0usize;
+    for &(start, len) in ranges {
+        let skip = start - consumed;
+        let (_, mid) = rest.split_at_mut(skip);
+        let (mine, tail) = mid.split_at_mut(len);
+        out.push(mine);
+        rest = tail;
+        consumed = start + len;
+    }
+    out
 }
 
 #[derive(Default)]
