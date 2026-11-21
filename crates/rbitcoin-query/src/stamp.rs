@@ -181,7 +181,7 @@ pub fn external_parent_stamp(need_len: usize) -> ExternalParentStamp {
 ///
 /// `skeleton = Some` is the IBD path: the keys in neither in-flight nor the
 /// skeleton are read from `tx.head` once, and one it does not hold either
-/// is `Corrupt` ([`bind_left_out_from_head`]). In-flight identity still takes
+/// is `Corrupt` (`bind_left_out_from_head`). In-flight identity still takes
 /// skeleton loc when TipOnly already has that create (later wave). Creates
 /// above the wave's snapshot are omitted from the skeleton; those holes stay
 /// for write fill.

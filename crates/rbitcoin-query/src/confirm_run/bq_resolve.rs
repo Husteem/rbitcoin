@@ -80,7 +80,7 @@ struct Bucket([u64; BUCKET_SLOTS]);
 ///
 /// The set is one fixed table of [`UNDRAINED_SLOTS`] slots in 64 B buckets
 /// of 8, [`UNDRAINED_TABLE_BYTES`] in all. A slot is a 40-bit tag of the
-/// txid and the 24-bit [`level`] of the height that created it. The bucket
+/// txid and the 24-bit `level` of the height that created it. The bucket
 /// and the tag come from the whole txid hashed with SipHash-1-3 under a
 /// random key of this set's own, so a txid that shares a slot with another
 /// cannot be built offline. Nothing is removed by itself: a slot whose
