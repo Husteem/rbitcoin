@@ -2054,8 +2054,8 @@ async fn silent_compact_peer_holds_the_ping_then_hits_the_download_timeout() {
 }
 
 /// A compact body whose witness commitment does not match is not cached as
-/// an invalid header, and the announcing peer is not the only one asked
-/// for the body.
+/// an invalid header. The announcing peer is asked for the full block, and
+/// it is not the only one asked.
 ///
 /// On the same chain, a `blocktxn` that completes a body failing its
 /// witness commitment is not announced to a high-bandwidth peer. A real
@@ -2110,8 +2110,12 @@ async fn witness_reconstruct_fail_asks_another_peer() {
         "a bad witness reconstruct is not a permanently invalid header"
     );
     assert!(
-        !hub.already_have_or_asked_block(&hash),
-        "the announcing peer's claim is dropped"
+        asked_witness(&ann_msgs, hash),
+        "the announcing peer is asked for the full block"
+    );
+    assert!(
+        hub.already_have_or_asked_block(&hash),
+        "the announcing peer keeps the claim"
     );
 
     let (good_a, bad_a) = witness_committed_pair(&a);
@@ -2284,6 +2288,51 @@ async fn witness_mutated_cmpct_reconstruct_is_not_relayed() {
             assert_ne!(hub.tip_hash(), Some(hash));
         }
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Core `FillBlock` fails a reconstruct that is mutated and net_processing
+/// asks the same peer for the full block, without `Misbehaving`: a short-id
+/// collision is not the sender's fault. A manual peer that is the only
+/// source must be asked, or the node stays one block behind.
+#[tokio::test]
+async fn witness_mutated_cmpct_reconstruct_asks_the_same_peer_for_the_block() {
+    let (dir, hub) = open_genesis_announce("cmpct-wit-ask-again", true);
+    let (good, bad) = witness_committed_pair(&hb_tip_child(&hub));
+    let hash = good.block_hash();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let manual = live_peer_as(&peers, 18487, 87, rbitcoin_net::peers::PeerConnType::Manual);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    manual.attach_out(tx.clone());
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+    // The tip `getdata` to a compact v2 peer asked for a compact block.
+    follow.requested_blocks.insert(hash);
+    hub.note_asked_block(hash);
+    let hsi = HeaderAndShortIds::from_block(&bad, 0xbeef, 2, &[]).unwrap();
+    on_cmpctblock(
+        &hub,
+        &tx,
+        &mut follow,
+        Some(manual.as_ref()),
+        &CmpctBlock { compact_block: hsi },
+    )
+    .await
+    .unwrap();
+    let msgs = sent(&mut rx);
+    assert!(
+        asked_witness(&msgs, hash),
+        "the same peer is asked for the full block, got {msgs:?}"
+    );
+    assert_eq!(follow.ban_score, 0, "a mutated reconstruct is not scored");
+    assert!(!manual.stop.load(Ordering::SeqCst), "kept");
+    assert!(!hub.is_block_invalid(&hash), "not invalid");
+    assert!(follow.requested_blocks.contains(&hash), "still in flight");
+
+    on_block(&hub, &tx, &mut follow, Some(manual.as_ref()), &good)
+        .await
+        .unwrap();
+    assert_eq!(hub.tip_hash(), Some(hash), "the full block connects");
     let _ = std::fs::remove_dir_all(dir);
 }
 
