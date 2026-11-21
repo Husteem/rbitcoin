@@ -2029,7 +2029,8 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
         .unwrap();
     assert!(!stopped.is_empty());
     assert_eq!(stopped.last().unwrap().block_hash(), stop);
-    // Zero locator entry → start from genesis.
+    // A zero locator entry is unknown: fall back to genesis as the fork
+    // point, then start after it.
     let from_zero = q
         .headers_after_locator(
             &[BlockHash::from_byte_array([0u8; 32])],
@@ -2038,6 +2039,11 @@ fn consensus_mature_chain_spend_reconstruct_and_scripthash() {
         )
         .unwrap();
     assert_eq!(from_zero.len(), 5);
+    assert_eq!(
+        from_zero[0].block_hash(),
+        chain.blocks[1].block_hash(),
+        "a zero-only locator is answered from height 1, not genesis"
+    );
 
     let flags = local_service_flags(false, None);
     assert!(flags.has(ServiceFlags::NETWORK));
@@ -3050,6 +3056,24 @@ fn block_cache_and_mempool_hub_surface() {
     let hdrs = cache.headers_after_locator(&[genesis_hash], stop);
     assert!(!hdrs.is_empty());
     assert_ne!(hdrs[0].block_hash(), genesis_hash);
+    // A zero or unknown locator falls back to the genesis fork point, then
+    // starts after it. Keep genesis in the body window so the old start-at-0
+    // answer is distinguishable.
+    let shallow = BlockCache::with_body_depth(8);
+    for (h, b) in (0u32..).zip(&blocks[..4]) {
+        shallow.push_best(h, b.clone());
+    }
+    for locator in [
+        vec![BlockHash::from_byte_array([0u8; 32])],
+        vec![BlockHash::from_byte_array([0xee; 32])],
+    ] {
+        let hdrs = shallow.headers_after_locator(&locator, stop);
+        assert_eq!(
+            hdrs.first().map(|h| h.block_hash()),
+            Some(blocks[1].block_hash()),
+            "a locator with no known hash is answered from height 1, not genesis"
+        );
+    }
     cache.truncate_to_height(2);
     assert_eq!(cache.tip_height(), Some(2));
     let mut bad = blocks.last().unwrap().clone();

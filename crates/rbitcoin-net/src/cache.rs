@@ -186,7 +186,10 @@ impl BlockCache {
         if g.chain.is_empty() {
             return Vec::new();
         }
-        let mut start = 0usize;
+        // Core's `FindForkInGlobalIndex` skips hashes it does not know and
+        // falls back to genesis, then replies from after that fork point.
+        // `base == 0` means `chain[0]` is genesis, which is never served.
+        let mut start = usize::from(g.base == 0);
         'outer: for loc in locator {
             for (i, h) in g.chain.iter().enumerate() {
                 if h == loc {

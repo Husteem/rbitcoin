@@ -314,6 +314,19 @@ async fn getblocks_locator_cap(
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let sess = live_peer(peers, 18602, 602, true);
     let mut follow = PeerFollowState::new();
+    let inv_hashes = |msgs: Vec<NetworkMessage>| -> Vec<BlockHash> {
+        msgs.into_iter()
+            .filter_map(|m| match m {
+                NetworkMessage::Inv(inv) => Some(inv),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|i| match i {
+                Inventory::Block(h) | Inventory::WitnessBlock(h) => Some(h),
+                _ => None,
+            })
+            .collect()
+    };
     push(
         hub,
         &out_tx,
@@ -326,22 +339,59 @@ async fn getblocks_locator_cap(
         follow.ban_score, 0,
         "wire cap: a getblocks locator of 101 hashes is not misbehavior"
     );
-    let served: Vec<BlockHash> = take_msgs(&mut out_rx)
-        .into_iter()
-        .filter_map(|m| match m {
-            NetworkMessage::Inv(inv) => Some(inv),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|i| match i {
-            Inventory::Block(h) | Inventory::WitnessBlock(h) => Some(h),
-            _ => None,
-        })
-        .collect();
+    let served = inv_hashes(take_msgs(&mut out_rx));
     let expected: Vec<BlockHash> = (1..=tip).map(|h| header_at(hub, h).block_hash()).collect();
     assert_eq!(
         served, expected,
         "wire cap: a getblocks locator of 101 hashes gets an inv of every block after genesis"
+    );
+
+    // A zero hash is not a known block. Core's FindForkInGlobalIndex skips
+    // it, so the known hash after it is the fork point.
+    let mid = tip / 2;
+    let mid_hash = header_at(hub, mid).block_hash();
+    push(
+        hub,
+        &out_tx,
+        &mut follow,
+        Some(sess.as_ref()),
+        NetworkMessage::GetBlocks(GetBlocksMessage::new(
+            vec![BlockHash::from_byte_array([0u8; 32]), mid_hash],
+            zero_stop(),
+        )),
+    )
+    .await;
+    let served = inv_hashes(take_msgs(&mut out_rx));
+    let expected: Vec<BlockHash> = (mid + 1..=tip)
+        .map(|h| header_at(hub, h).block_hash())
+        .collect();
+    assert_eq!(
+        served, expected,
+        "a zero locator hash is skipped; the next known hash is the fork point"
+    );
+
+    // No known hash: Core falls back to genesis and serves from after it,
+    // never genesis itself.
+    push(
+        hub,
+        &out_tx,
+        &mut follow,
+        Some(sess.as_ref()),
+        NetworkMessage::GetBlocks(GetBlocksMessage::new(
+            vec![BlockHash::from_byte_array([0xee; 32])],
+            zero_stop(),
+        )),
+    )
+    .await;
+    let served = inv_hashes(take_msgs(&mut out_rx));
+    let expected: Vec<BlockHash> = (1..=tip).map(|h| header_at(hub, h).block_hash()).collect();
+    assert_eq!(
+        served, expected,
+        "an unknown locator is answered from after genesis"
+    );
+    assert!(
+        !served.contains(&genesis),
+        "genesis is never served for a non-empty locator"
     );
     push(
         hub,
