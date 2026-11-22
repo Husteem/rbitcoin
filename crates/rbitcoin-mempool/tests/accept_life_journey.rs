@@ -152,6 +152,7 @@ fn orphan_parks_then_promotes(life: &mut Life) {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .unwrap_err();
@@ -222,6 +223,7 @@ fn full_rbf_and_staged_commit(life: &mut Life) -> (OutPoint, Txid) {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .unwrap_err();
@@ -242,6 +244,7 @@ fn full_rbf_and_staged_commit(life: &mut Life) -> (OutPoint, Txid) {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .expect("prevout free at prepare");
