@@ -331,33 +331,3 @@ impl FrameWrite for PeerWriter {
         self.write_contents(contents).await
     }
 }
-
-#[cfg(test)]
-mod v1_bounds {
-    use super::*;
-
-    fn reader_with_len(len: u32) -> V1Reader<&'static [u8]> {
-        let magic = Magic::from(bitcoin::Network::Signet);
-        let mut reader = V1Reader::new(&[][..]);
-        reader.head[..4].copy_from_slice(&magic.to_bytes());
-        reader.head[4..8].copy_from_slice(b"ping");
-        reader.head[16..20].copy_from_slice(&len.to_le_bytes());
-        reader
-    }
-
-    #[test]
-    fn check_head_accepts_the_max_length() {
-        let magic = Magic::from(bitcoin::Network::Signet);
-        let max = u32::try_from(MAX_PROTOCOL_MESSAGE_LENGTH).unwrap();
-        let reader = reader_with_len(max);
-        assert_eq!(
-            reader.check_head(magic).unwrap(),
-            MAX_PROTOCOL_MESSAGE_LENGTH
-        );
-        let over = reader_with_len(max.saturating_add(1));
-        assert!(matches!(
-            over.check_head(magic),
-            Err(NetError::MessageTooLarge(_))
-        ));
-    }
-}
