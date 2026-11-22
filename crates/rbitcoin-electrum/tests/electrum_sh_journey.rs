@@ -290,6 +290,7 @@ pub async fn heavy_joins_take_turns(q: Arc<Query>) {
         (2, 1),
         "light joins overlap, heavy joins take turns"
     );
+    q.sh_join_probe.disarm();
 
     let creates = q
         .scripthash_create_count(&rbitcoin_primitives::parse_display_hash32(&heavy).unwrap())
@@ -309,6 +310,7 @@ pub async fn heavy_joins_take_turns(q: Arc<Query>) {
         (1, 0),
         "a join at exactly --heavy-sh-creates is light"
     );
+    q.sh_join_probe.disarm();
     q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
     handle.shutdown().await;
 }
@@ -357,6 +359,7 @@ pub async fn batch_reads_time_themselves_and_keep_the_join(q: Arc<Query>) {
         took(1) < SH_JOIN_PROBE_WAIT / 2,
         "the header read reports its own time, not the join ahead of it: {trace:?}"
     );
+    q.sh_join_probe.disarm();
 
     q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
     q.sh_join_probe.arm();
@@ -381,6 +384,7 @@ pub async fn batch_reads_time_themselves_and_keep_the_join(q: Arc<Query>) {
         (1, 0),
         "the later get_history reuses the batch's join"
     );
+    q.sh_join_probe.disarm();
     handle.shutdown().await;
 }
 

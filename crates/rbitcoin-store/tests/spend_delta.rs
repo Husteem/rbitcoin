@@ -3200,11 +3200,12 @@ fn checkpoints_that_keep_failing_stop_the_edge_cap_wait() {
 }
 
 /// A checkpoint that fails after its freeze keeps the notes it sealed. They
-/// still count toward the cap, so the parked confirm stays parked until the
-/// failures stop it, instead of noting another cap's worth each retry.
+/// still count toward the cap, so the parked confirm stays parked instead of
+/// noting another cap's worth each retry, and a later success releases it.
+/// [`checkpoints_that_keep_failing_stop_the_edge_cap_wait`] covers the stop.
 #[test]
 fn notes_a_failed_checkpoint_sealed_still_hold_the_edge_cap() {
-    use rbitcoin_store::spend_delta::{CHECKPOINT_FAILURES_STOP, OPEN_EDGE_CAP};
+    use rbitcoin_store::spend_delta::OPEN_EDGE_CAP;
     use std::sync::{mpsc, Arc, Condvar, Mutex};
     let d = dir();
     let mut body = MemBody::new((PAGES * 4096) as usize);
@@ -3231,19 +3232,23 @@ fn notes_a_failed_checkpoint_sealed_still_hold_the_edge_cap() {
     let (tx, rx) = mpsc::channel();
     let waiter = Arc::clone(&log);
     std::thread::spawn(move || tx.send(waiter.wait_open_edge_room()).unwrap());
-    while failed < CHECKPOINT_FAILURES_STOP {
+    // The first failure seals the cap's notes; the second proves that a
+    // retry does not release the waiter by counting the open map again.
+    for failed in 1..=2 {
+        assert!(folding_commit(&log, tip, |_| Ok(true), &mut body, Some(u32::MAX)).is_err());
         assert!(
             rx.recv_timeout(std::time::Duration::from_millis(50))
                 .is_err(),
             "parked after {failed} failures"
         );
-        assert!(folding_commit(&log, tip, |_| Ok(true), &mut body, Some(u32::MAX)).is_err());
-        failed += 1;
     }
+    // A success publishes the sealed layer, so the parked waiter gets room.
+    body.fail_writes = false;
+    folding_commit(&log, tip, |_| Ok(true), &mut body, Some(u32::MAX)).unwrap();
     let got = rx
         .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("the wait gives up");
-    assert!(got.is_err());
+        .expect("a successful checkpoint releases the waiter");
+    assert!(got.is_ok());
 }
 
 fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
