@@ -480,6 +480,16 @@ impl ChainParams {
         Ok(())
     }
 
+    /// Core `-test=bip94`: enforce BIP94 on regtest. Core refuses `-test` on
+    /// any other network.
+    pub fn apply_test_bip94(&mut self) -> Result<(), &'static str> {
+        if self.network != Network::Regtest {
+            return Err("test=bip94 is regtest only");
+        }
+        self.enforce_bip94 = true;
+        Ok(())
+    }
+
     /// Fix regtest difficulty at `bits` for every block at height >= 1.
     ///
     /// Refuses other networks, a zero, negative or overflowing target, and a
