@@ -1,3 +1,4 @@
+use crate::Mine;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -782,9 +783,10 @@ fn a_short_lighter_fork_does_not_keep_the_walk_asking() {
 #[test]
 fn a_false_peer_height_does_not_hold_ibd_at_the_tip() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-exit");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(2, op_true.clone(), vec![]).unwrap();
+    hub.mine(2, op_true.clone(), vec![]).unwrap();
     let time = hub.tip_header().unwrap().time + 1;
     // The stored tip is stamped at the test clock. The length cap is that
     // age times six headers, so a same-second walk cannot extend it.
@@ -878,9 +880,10 @@ fn a_false_peer_height_does_not_hold_ibd_at_the_tip() {
 #[test]
 fn a_restarted_tip_exits_once_the_false_height_fails() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-restart-tip");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(2, op_true, vec![]).unwrap();
+    hub.mine(2, op_true, vec![]).unwrap();
     let tip = hub.tip_height().unwrap();
     let (mut liar, mut liar_rx) = slot(0);
     liar.peer_height = 100_000;
@@ -912,9 +915,10 @@ fn a_restarted_tip_exits_once_the_false_height_fails() {
 #[test]
 fn known_block_invs_from_false_height_peers_keep_ibd_caught_up() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-known-inv");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(2, op_true.clone(), vec![]).unwrap();
+    hub.mine(2, op_true.clone(), vec![]).unwrap();
     let tip = hub.tip_height().unwrap();
     let tip_hash = hub.tip_hash().unwrap();
     let below_tip = hub.header_of(&tip_hash).unwrap().prev_blockhash;
@@ -999,9 +1003,10 @@ fn known_block_invs_from_false_height_peers_keep_ibd_caught_up() {
 #[test]
 fn block_inv_writes_the_next_header_from_the_stored_tip() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-refill-at-tip");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(2, op_true.clone(), vec![]).unwrap();
+    hub.mine(2, op_true.clone(), vec![]).unwrap();
     let tip = hub.tip_height().unwrap();
     let tip_hash = hub.tip_hash().unwrap();
     let time = hub.tip_header().unwrap().time + 1;
@@ -1124,6 +1129,7 @@ fn a_reserved_peer_block_inv_is_asked_with_a_full_queue() {
 #[test]
 fn a_seeded_header_walk_stores_drains_and_refills() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-seeded");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
     let first = mine(gen, 1);
@@ -1207,9 +1213,9 @@ fn a_seeded_header_walk_stores_drains_and_refills() {
 
 /// Same hub as the seeded walk. Two asks share one confirmed tail. A
 /// same-height hash, then a taller tip, each rebuild it.
-fn confirmed_tail_follows_the_published_tip(hub: &ChainHub) {
+fn confirmed_tail_follows_the_published_tip(hub: &std::sync::Arc<ChainHub>) {
     let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(2, script.clone(), vec![]).unwrap();
+    hub.mine(2, script.clone(), vec![]).unwrap();
     let tip = hub.tip_hash().unwrap();
     let tip_h = hub.tip_height().unwrap();
     let genesis = hub.params.genesis_hash;
@@ -1257,7 +1263,7 @@ fn same_tip_repeats_the_locator(
 
 fn same_height_rebuilds_the_tail(
     st: &mut IbdWorkState,
-    hub: &ChainHub,
+    hub: &std::sync::Arc<ChainHub>,
     rx: &mut mpsc::UnboundedReceiver<PeerCmd>,
     tip: BlockHash,
     tip_h: u32,
@@ -1266,7 +1272,7 @@ fn same_height_rebuilds_the_tail(
     run_on_tip_accept(|| hub.invalidate_block_inner(tip)).unwrap();
     assert_eq!(hub.tip_height(), Some(tip_h - 1));
     let alt_script = bitcoin::ScriptBuf::from_bytes(vec![0x52]);
-    hub.generate_to_script(1, alt_script, vec![]).unwrap();
+    hub.mine(1, alt_script, vec![]).unwrap();
     let same_h_tip = hub.tip_hash().unwrap();
     let published = hub.query.published_tip().expect("published tip");
     assert_eq!(hub.tip_height(), Some(tip_h));
@@ -1297,13 +1303,13 @@ fn same_height_rebuilds_the_tail(
 
 fn taller_tip_rebuilds_the_tail(
     st: &mut IbdWorkState,
-    hub: &ChainHub,
+    hub: &std::sync::Arc<ChainHub>,
     rx: &mut mpsc::UnboundedReceiver<PeerCmd>,
     script: &bitcoin::ScriptBuf,
     same_h_tip: BlockHash,
     ahead: BlockHash,
 ) {
-    hub.generate_to_script(1, script.clone(), vec![]).unwrap();
+    hub.mine(1, script.clone(), vec![]).unwrap();
     let new_tip = hub.tip_hash().unwrap();
     assert_ne!(new_tip, same_h_tip);
     assert_ne!(take_header_ask(st, 0), HeaderAsk::Unsolicited);
@@ -1860,10 +1866,11 @@ fn a_peer_without_the_guess_refills_from_the_anchor_it_shares() {
 #[test]
 fn a_confirmed_tip_on_another_branch_keeps_the_candidate_anchor() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("locator-other-branch");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
     let mined = hub
-        .generate_to_script(
+        .mine(
             LOCATOR_FIXTURE_TIP,
             bitcoin::ScriptBuf::from_bytes(vec![0x51]),
             vec![],
@@ -3220,8 +3227,11 @@ fn a_heavier_header_chain_keeps_its_context() {
         {
             // Rewind onto the confirmed chain this hub just grew past the stale block.
             let have = hub.tip_height().unwrap();
-            hub.generate_to_script(5 - have, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+            let shared = std::sync::Arc::new(hub);
+            shared
+                .mine(5 - have, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
                 .unwrap();
+            hub = std::sync::Arc::into_inner(shared).expect("mine released the hub");
             let base_height = hub.tip_height().unwrap();
             let base_hash = hub.tip_hash().unwrap();
             let base_header = hub.tip_header().unwrap();
@@ -5837,10 +5847,11 @@ fn an_unlinked_divergent_refill_is_not_a_challenger() {
 #[test]
 fn stored_work_uses_the_confirmed_tip_when_the_base_does_not_link() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-walk-stored-tip");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
     let gen_work = hub.chain_work().unwrap();
-    hub.generate_to_script(2, bitcoin::ScriptBuf::from_bytes(vec![0x51]), Vec::new())
+    hub.mine(2, bitcoin::ScriptBuf::from_bytes(vec![0x51]), Vec::new())
         .unwrap();
     let tip = hub.tip_hash().unwrap();
     let tip_h = hub.tip_height().unwrap();
@@ -6364,7 +6375,7 @@ const LOCATOR_FIXTURE_TIP: u32 = 30;
 /// exponential stepping names them. `confirmed` is indexed by height.
 struct WithheldCandidate {
     _dir: rbitcoin_query::testutil::TempDir,
-    hub: ChainHub,
+    hub: std::sync::Arc<ChainHub>,
     st: IbdWorkState,
     rx: mpsc::UnboundedReceiver<PeerCmd>,
     confirmed: Vec<Header>,
@@ -6374,10 +6385,11 @@ struct WithheldCandidate {
 impl WithheldCandidate {
     fn new(label: &str) -> Self {
         let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled(label);
+        let hub = std::sync::Arc::new(hub);
         hub.ensure_genesis().unwrap();
         let gen = hub.tip_hash().unwrap();
         let mined = hub
-            .generate_to_script(
+            .mine(
                 LOCATOR_FIXTURE_TIP,
                 bitcoin::ScriptBuf::from_bytes(vec![0x51]),
                 vec![],
@@ -7415,9 +7427,10 @@ fn a_heavier_fork_past_the_header_rate_does_not_replace_the_tip() {
 #[test]
 fn a_recent_tip_still_extends_inside_the_genesis_header_rate() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("unproven-recent-tip");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(2, op_true.clone(), vec![]).unwrap();
+    hub.mine(2, op_true.clone(), vec![]).unwrap();
     let tip = hub.tip_height().unwrap();
     let tip_hash = hub.tip_hash().unwrap();
     let time = hub.tip_header().unwrap().time + 1;
@@ -7850,8 +7863,9 @@ fn a_promoted_fork_keeps_the_charge_for_a_block_that_stays() {
     use std::time::Instant;
 
     let (_dir, hub, mut st, _gen) = opened("unproven-promote-charge", true);
+    let hub = std::sync::Arc::new(hub);
     let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(11, op_true, vec![]).unwrap();
+    hub.mine(11, op_true, vec![]).unwrap();
     let tip = hub.tip_height().unwrap();
     let hash = hub.tip_hash().unwrap();
     assert!(tip > 10);
@@ -8207,8 +8221,9 @@ fn an_old_unproved_adopt_measures_the_lead_from_the_confirmed_tip() {
 #[test]
 fn an_old_unproved_adopt_below_the_confirmed_tip_measures_from_that_tip() {
     let (dir, hub, mut st, gen) = opened("unproven-legacy-base-below", true);
+    let hub = std::sync::Arc::new(hub);
     let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(3, op_true, vec![]).unwrap();
+    hub.mine(3, op_true, vec![]).unwrap();
     let confirmed = hub.tip_height().unwrap();
     assert_eq!(confirmed, 3);
     st.header_walk.base_height = 0;
@@ -8244,8 +8259,9 @@ fn an_old_unproved_adopt_below_the_confirmed_tip_measures_from_that_tip() {
 #[test]
 fn an_old_adopt_at_or_behind_the_confirmed_tip_is_not_installed() {
     let (dir, hub, mut st, gen) = opened("unproven-legacy-tip-behind", true);
+    let hub = std::sync::Arc::new(hub);
     let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(3, op_true, vec![]).unwrap();
+    hub.mine(3, op_true, vec![]).unwrap();
     let confirmed = hub.tip_height().unwrap();
     assert_eq!(confirmed, 3);
     st.header_walk.base_height = 0;
@@ -8351,8 +8367,9 @@ fn a_rewind_drops_a_match_above_the_new_tip() {
 #[test]
 fn an_empty_rewind_keeps_class_a_on_the_confirmed_tip() {
     let (_dir, hub, mut st, gen) = opened("unproven-empty-rewind-bytes", true);
+    let hub = std::sync::Arc::new(hub);
     let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(4, op_true, vec![]).unwrap();
+    hub.mine(4, op_true, vec![]).unwrap();
     let confirmed = hub.tip_height().unwrap();
     assert!(confirmed >= 4);
     st.header_walk.checkpoints.push(Checkpoint {

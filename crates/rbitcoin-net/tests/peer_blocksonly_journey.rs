@@ -350,7 +350,9 @@ fn relay_on_purges_confirmed(hub: &rbitcoin_net::chain::ChainHub, confirmed: Vec
     let mp = hub.mempool().unwrap();
     let n = confirmed.len();
     assert_eq!(mp.live_count(), n);
-    hub.generate_to_script(1, op_true(), confirmed).unwrap();
+    // A connected block, not `generate`: RPC generate commits its own txids
+    // out of the pool whether or not relay is on.
+    hub.accept_block(mine_child(hub, 1, confirmed)).unwrap();
     assert_eq!(mp.live_count(), n, "relay off defers the per-block remove");
     mp.set_relay_enabled(true);
     assert_eq!(mp.live_count(), 0, "relay on purges what the chain confirmed");
@@ -509,7 +511,8 @@ async fn force_announce_picks_peers(
     assert_eq!(tx_invs(&mut ok_rx), vec![from_p2p.compute_txid()]);
 
     assert!(mp.is_local_origin(&local.compute_txid()));
-    hub.generate_to_script(1, op_true(), vec![relayed, local.clone(), from_p2p])
+    // A connected block, not `generate`: generate commits its own txids.
+    hub.accept_block(mine_child(hub, 1, vec![relayed, local.clone(), from_p2p]))
         .unwrap();
     assert_eq!(mp.live_count(), 0);
     assert!(
@@ -863,7 +866,8 @@ fn relay_on_inbound_age_gate(
         "a relay=false inbound does not walk the mempool"
     );
 
-    hub.generate_to_script(1, op_true(), txs).unwrap();
+    // A connected block, not `generate`: generate commits its own txids.
+    hub.accept_block(mine_child(hub, 1, txs)).unwrap();
     assert_eq!(mp.live_count(), 0);
     for s in [inbound, block_only, late, outbound] {
         peers.unregister(s.id);
@@ -874,7 +878,7 @@ fn relay_on_inbound_age_gate(
 /// a disconnected block put it back. After a +300s jump announces the old
 /// txs, a new sendraw is neither INV'd nor served to inbound.
 async fn getdata_until_announced_or_reorg(
-    hub: &rbitcoin_net::chain::ChainHub,
+    hub: &std::sync::Arc<rbitcoin_net::chain::ChainHub>,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
     now: u64,
     heights: [u32; 4],
@@ -884,9 +888,7 @@ async fn getdata_until_announced_or_reorg(
     let [old_a, old_b, disconnected, fresh] = heights.map(|h| spend_coinbase(hub, h));
     mp.admit(&old_a).expect("old_a");
     mp.admit(&old_b).expect("old_b");
-    let stale = hub
-        .generate_to_script(1, op_true(), vec![disconnected.clone()])
-        .unwrap()[0];
+    let stale = hub.mine(1, op_true(), vec![disconnected.clone()]).unwrap()[0];
     run_on_tip_accept(|| hub.invalidate_block_inner(stale)).unwrap();
     assert!(
         mp.try_contains(&disconnected.compute_txid()),
@@ -931,8 +933,13 @@ async fn getdata_until_announced_or_reorg(
         other => panic!("fresh sendraw must notfound, got {other:?}"),
     }
 
-    hub.generate_to_script(1, op_true(), vec![old_a, old_b, disconnected, fresh])
-        .unwrap();
+    // A connected block, not `generate`: generate commits its own txids.
+    hub.accept_block(mine_child(
+        hub,
+        1,
+        vec![old_a, old_b, disconnected, fresh],
+    ))
+    .unwrap();
     assert_eq!(mp.live_count(), 0);
     peers.unregister(sess.id);
 }

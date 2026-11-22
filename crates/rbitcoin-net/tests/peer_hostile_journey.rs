@@ -534,9 +534,9 @@ async fn script_failures_disconnect_a_relay_peer_and_policy_rejects_do_not() {
     let mut t = paused_serve("script-reject-score", 0, &["/rbitcoin:test(script-reject)/"]).await;
     let hub = Arc::clone(&t.node.hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(10, ScriptBuf::from_bytes(vec![0x00]), vec![])
+    hub.mine(10, ScriptBuf::from_bytes(vec![0x00]), vec![])
         .unwrap();
-    hub.generate_to_script(100, op_true.clone(), vec![]).unwrap();
+    hub.mine(100, op_true.clone(), vec![]).unwrap();
     let mp = rbitcoin_net::tx_relay::MempoolHub::open(t.dir.join("mp"), Arc::clone(&hub.query))
         .unwrap();
     mp.set_relay_enabled(true);
@@ -971,8 +971,9 @@ async fn cap_evicts_only_after_the_store_accepts() {
     use std::cmp::Ordering;
 
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-store");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip = hub
         .query
@@ -1133,8 +1134,9 @@ async fn cap_accepts_the_next_header_when_equal_work_fills_the_map() {
     use std::cmp::Ordering;
 
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-equal");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip = hub
         .query
@@ -1245,8 +1247,9 @@ async fn cap_accepts_the_next_header_when_equal_work_fills_the_map() {
 #[tokio::test]
 async fn cap_accepts_the_next_header_when_failed_pow_fills_the_map() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-pow");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip = hub
         .query
@@ -1350,8 +1353,9 @@ async fn cap_accepts_the_next_header_when_failed_pow_fills_the_map() {
 #[tokio::test]
 async fn cap_counts_one_repeated_header() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-repeat");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
@@ -1445,8 +1449,9 @@ async fn inv_asks_headers(
 #[tokio::test]
 async fn cap_store_kept_headers_skip_a_rejected_tip_child() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-reject");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip = hub
         .query
@@ -1520,8 +1525,9 @@ async fn cap_store_kept_headers_skip_a_rejected_tip_child() {
 #[tokio::test]
 async fn cap_store_kept_headers_skip_an_earlier_hash() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-walk");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip = hub
         .query
@@ -1574,8 +1580,9 @@ async fn cap_store_kept_headers_skip_an_earlier_hash() {
 #[tokio::test]
 async fn cap_already_stored_tip_frees_no_slot() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-stored-tip");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(CAP_TIP, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip = hub
         .query

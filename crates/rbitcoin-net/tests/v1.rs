@@ -1,4 +1,5 @@
 use crate::Admit;
+use crate::Mine;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
@@ -229,7 +230,7 @@ async fn p2p_v1_wallet_sync_listener() {
         // A new block reaches the wallet, and getdata serves its body.
         let hash: BlockHash = node
             .hub
-            .generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .mine(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
             .unwrap()[0];
         let (announce, _) = v1_until(&mut wallet, |m| match m {
             NetworkMessage::Inv(inv) => inv.iter().any(
@@ -418,9 +419,7 @@ async fn p2p_v1_tx_inv_follows_wtxidrelay() {
         assert!(node.hub.attach_mempool(std::sync::Arc::clone(&mp)).is_ok());
         let op_true = ScriptBuf::from_bytes(vec![0x51]);
         let p2wsh = ScriptBuf::new_p2wsh(&op_true.wscript_hash());
-        node.hub
-            .generate_to_script(1, p2wsh.clone(), vec![])
-            .unwrap();
+        node.hub.mine(1, p2wsh.clone(), vec![]).unwrap();
         node.hub.confirm_empty_regtest(100).unwrap();
         let cb = node
             .hub

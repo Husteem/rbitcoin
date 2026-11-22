@@ -1,6 +1,7 @@
 //! Bounds and caps of the header walk: the clock window, the ordered and
 //! refused-tip caps, the length cap, fork suppression under the floor, the
 //! retire of an invalid block, the confirm lead, and the getheaders locator.
+use crate::Mine;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -450,8 +451,9 @@ fn a_match_above_the_base_is_the_confirm_lead() {
 #[test]
 fn the_locator_names_the_confirmed_tip_only_between_the_anchor_and_the_queue() {
     let (_dir, hub, _gen) = bare("confirmed-between");
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(2, op_true, vec![]).unwrap();
+    hub.mine(2, op_true, vec![]).unwrap();
     let tip = hub.tip_hash().unwrap();
     assert_eq!(hub.tip_height(), Some(2));
     let mut st = fresh(&hub);
@@ -528,8 +530,9 @@ fn an_unproved_resume_keeps_the_tip_until_the_next_header_is_indexed() {
 #[test]
 fn the_locator_names_a_challenger_only_when_it_is_taller_than_the_tip() {
     let (_dir, hub, _gen) = bare("locator-challenger");
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(2, op_true, vec![]).unwrap();
+    hub.mine(2, op_true, vec![]).unwrap();
     let mut st = fresh(&hub);
     let low = BlockHash::from_byte_array([0x91; 32]);
     let high = BlockHash::from_byte_array([0x92; 32]);

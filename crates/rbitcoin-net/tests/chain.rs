@@ -1,4 +1,5 @@
 use crate::Admit;
+use crate::Mine;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::{
@@ -636,28 +637,13 @@ fn conflicting_mempool_spend_leaves_with_the_block() {
 }
 
 /// Production cap is 10_000. One past it is refused before genesis is
-/// touched. The inclusive bound uses a stand-in cap of 2: the same `>`
-/// comparison, two blocks mined, one more refused.
+/// touched.
 #[test]
-fn generate_accepts_its_cap_and_refuses_one_more() {
-    let (_dir, hub) = tmp_hub();
-    let mined = hub
-        .generate_to_script_limited(2, ScriptBuf::from_bytes(vec![0x51]), vec![], 2)
-        .expect("the cap itself");
-    assert_eq!(mined.len(), 2);
-    assert_eq!(hub.tip_height(), Some(2));
-    let err = hub
-        .generate_to_script_limited(3, ScriptBuf::from_bytes(vec![0x51]), vec![], 2)
-        .expect_err("one past the stand-in cap");
-    assert!(
-        err.to_string().contains("nblocks too large (max 2)"),
-        "{err}"
-    );
-    assert_eq!(hub.tip_height(), Some(2));
-
+fn generate_refuses_one_past_its_cap() {
     let (_dir, fresh) = tmp_hub();
+    let fresh = Arc::new(fresh);
     let err = fresh
-        .generate_to_script(
+        .mine(
             ChainHub::GENERATE_MAX_BLOCKS + 1,
             ScriptBuf::from_bytes(vec![0x51]),
             vec![],
@@ -670,6 +656,26 @@ fn generate_accepts_its_cap_and_refuses_one_more() {
     assert_eq!(fresh.tip_height(), None, "refusal must not mine");
 }
 
+/// A count equal to the production cap is not refused; one more is. This
+/// runs from `tests/`, where the net suite actually compiles.
+#[test]
+fn generate_cap_is_inclusive() {
+    assert!(ChainHub::refuse_over_cap(
+        ChainHub::GENERATE_MAX_BLOCKS,
+        ChainHub::GENERATE_MAX_BLOCKS
+    )
+    .is_ok());
+    let err = ChainHub::refuse_over_cap(
+        ChainHub::GENERATE_MAX_BLOCKS + 1,
+        ChainHub::GENERATE_MAX_BLOCKS,
+    )
+    .expect_err("one past the production cap");
+    assert!(
+        err.to_string().contains("nblocks too large (max 10000)"),
+        "{err}"
+    );
+}
+
 /// Block 1 on a real clock is still the pow limit (the min-difficulty gap).
 /// Block 2 takes the overlay. `0x1b7fffff` does not fit one nonce span, so
 /// generate returns instead of panicking inside the grind.
@@ -677,8 +683,9 @@ fn generate_accepts_its_cap_and_refuses_one_more() {
 fn generate_returns_when_regtest_pow_does_not_fit_one_nonce_span() {
     let (_dir, mut hub) = tmp_hub();
     hub.params.apply_regtest_pow_bits(0x1b7f_ffff).unwrap();
+    let hub = Arc::new(hub);
     let err = hub
-        .generate_to_script(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .mine(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .expect_err("block 2 cannot be ground");
     assert!(
         err.to_string().contains("regtest pow grind exhausted"),
@@ -808,8 +815,17 @@ async fn confirmed_private_broadcast_is_not_sent_again_before_the_pool_is_mainta
     mp.isolated_sent(&txid);
     mp.note_mock_now(mp.relay_now_secs() + 181);
     assert_eq!(mp.requeue_unreturned(), 1);
-    hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![local])
-        .unwrap();
+    // A connected block, not `generate`: RPC generate commits its own txids
+    // out of the pool whether or not the pool is maintained.
+    let time = hub.tip_header().unwrap().time.saturating_add(1);
+    let height = hub.tip_height().unwrap().saturating_add(1);
+    hub.accept_block(mine_with_extra(
+        hub.tip_hash().unwrap(),
+        time,
+        height,
+        vec![local],
+    ))
+    .unwrap();
     assert!(!mp.pool_maintained());
     assert!(
         mp.is_local_origin(&txid),
@@ -878,6 +894,7 @@ fn chain_hub_prefill_and_version() {
     params.apply_test_activation_height("dersig", 102).unwrap();
     params.apply_test_activation_height("cltv", 111).unwrap();
     let hub = ChainHub::new(q, params, Milestone::NONE);
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let op_true = || ScriptBuf::from_bytes(vec![0x51]);
 
@@ -924,10 +941,7 @@ fn chain_hub_prefill_and_version() {
     let mock = i64::from(tip_time) - 3_000;
     assert!(mock as u32 > mid, "mock must sit above MTP");
     hub.clock.set_mock(mock);
-    assert_eq!(
-        hub.generate_to_script(1, op_true(), vec![]).unwrap().len(),
-        1
-    );
+    assert_eq!(hub.mine(1, op_true(), vec![]).unwrap().len(), 1);
     let t = hub.tip_header().unwrap().time;
     assert!(
         t >= mock as u32 && t < tip_time,
@@ -938,7 +952,7 @@ fn chain_hub_prefill_and_version() {
     // Generate drains the SH write-behind, so its coinbase is indexed.
     let sh_script = ScriptBuf::from_bytes(vec![0x52]);
     let sh = script_hash(sh_script.as_bytes());
-    hub.generate_to_script(1, sh_script, vec![]).unwrap();
+    hub.mine(1, sh_script, vec![]).unwrap();
     let hist = hub.query.scripthash_history(&sh).unwrap();
     assert!(
         hist.iter().any(|row| row.height == 4),
@@ -974,7 +988,7 @@ fn chain_hub_prefill_and_version() {
     let mp = attach_mp(dir.path(), &hub);
     hub.set_prefill_compact(true);
     let hashes = hub
-        .generate_to_script(1, op_true(), vec![mature_spend_tx(&hub, 1)])
+        .mine(1, op_true(), vec![mature_spend_tx(&hub, 1)])
         .unwrap();
     assert_eq!(
         hub.cmpct_prefill_indexes(&hashes[0]),
@@ -983,7 +997,7 @@ fn chain_hub_prefill_and_version() {
     );
     let live = mature_spend_tx(&hub, 2);
     mp.admit(&live).expect("in mempool");
-    let hashes = hub.generate_to_script(1, op_true(), vec![live]).unwrap();
+    let hashes = hub.mine(1, op_true(), vec![live]).unwrap();
     assert_eq!(
         hub.cmpct_prefill_indexes(&hashes[0]),
         Some(vec![0]),
@@ -1004,7 +1018,7 @@ fn chain_hub_prefill_and_version() {
     assert_eq!(hub.cmpct_prefill_indexes(&hash), Some(vec![0, 1]));
 
     // `feature_cltv.py`: from 111 a version-3 block is `bad-version`.
-    hub.generate_to_script(6, op_true(), vec![]).unwrap();
+    hub.mine(6, op_true(), vec![]).unwrap();
     assert_eq!(hub.tip_height(), Some(110));
     bad_version(111, 3);
 
@@ -1264,22 +1278,6 @@ fn core_log_helpers_match_step21_needles() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn generate_to_script_from_tokio_connects_off_worker() {
-    let (dir, hub) = tmp_hub();
-    let task = tokio::task::spawn_blocking(move || {
-        let _g = rbitcoin_net::reactor::BlockingRegion::enter();
-        let hashes = hub
-            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .expect("generate");
-        (hashes, hub.tip_height())
-    });
-    let (hashes, tip) = task.await.expect("join blocking");
-    assert_eq!(hashes.len(), 1);
-    assert_eq!(tip, Some(1));
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn accept_received_block_async_connects_off_worker() {
     let (dir, hub) = tmp_hub();
     let hub = ChainHub::into_arc(hub);
@@ -1317,6 +1315,7 @@ fn linux_thread_comms() -> Vec<String> {
 #[test]
 fn tip_accept_script_jobs_use_steal_pool() {
     let (dir, hub) = tmp_hub();
+    let hub = std::sync::Arc::new(hub);
     hub.confirm_empty_regtest(101).expect("mature coinbases");
     let cb1 = hub.block_at_height(1).unwrap().unwrap().txdata[0].compute_txid();
     let cb2 = hub.block_at_height(2).unwrap().unwrap().txdata[0].compute_txid();
@@ -1334,7 +1333,7 @@ fn tip_accept_script_jobs_use_steal_pool() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    hub.generate_to_script(
+    hub.mine(
         1,
         ScriptBuf::from_bytes(vec![0x51]),
         vec![spend(cb1, 49_9999_0000), spend(cb2, 49_9999_0000)],
@@ -2286,7 +2285,7 @@ fn disconnect_to_with_mempool_still_harvests() {
 /// block and on any later tip, not on the fork point.
 struct ReorgPad {
     dir: rbitcoin_query::testutil::TempDir,
-    hub: ChainHub,
+    hub: Arc<ChainHub>,
     mp: Arc<rbitcoin_net::tx_relay::MempoolHub>,
     fork: u32,
     fork_hash: BlockHash,
@@ -2317,6 +2316,7 @@ fn spend_out0(prev: bitcoin::Txid, sat: u64, lock_time: LockTime) -> Transaction
 
 fn reorg_pad() -> ReorgPad {
     let (dir, hub) = tmp_hub();
+    let hub = Arc::new(hub);
     hub.ensure_genesis().unwrap();
     let mp =
         rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
@@ -2326,7 +2326,7 @@ fn reorg_pad() -> ReorgPad {
         .unwrap();
     // Per-block accept. The fault test truncates `txout.body` by half and
     // relies on Class A appending one height at a time.
-    hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let fork = hub.tip_height().unwrap();
     let fork_hash = hub.tip_hash().unwrap();
@@ -4812,15 +4812,15 @@ fn store_fault_on_block_releases_the_body_ask() {
 /// a resent tip that waits here holds the ping that follows it.
 #[test]
 fn resent_block_returns_while_the_tip_accept_lane_is_busy() {
+    // A live session accepts through `shared_arc`. Without it, `on_block`
+    // blocks the caller thread and a timeout on that same thread never fires.
     let (_dir, hub) = tmp_hub();
+    let hub = hub.into_arc();
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.mine(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let tip = hub.block_at_height(1).unwrap().expect("generated tip");
     assert!(hub.already_have(tip.block_hash()));
-    // A live session accepts through `shared_arc`. Without it, `on_block`
-    // blocks the caller thread and a timeout on that same thread never fires.
-    let hub = hub.into_arc();
 
     let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -5216,8 +5216,9 @@ fn hostile_peer_session() {
 #[test]
 fn coinbase_spend_rejects_cached_height_after_disconnect() {
     let (dir, hub) = tmp_hub();
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, op_true, vec![]).unwrap();
+    hub.mine(1, op_true, vec![]).unwrap();
     let fk = hub.query.block_tx_fks(Height(1)).unwrap()[0];
     let created_h = hub.query.store().tx_height_get(fk).unwrap().unwrap();
     assert_eq!(created_h, 1);
@@ -5273,6 +5274,7 @@ fn coinbase_spend_rejects_cached_height_after_disconnect() {
 #[test]
 fn check_block_proposal_prices_fees_and_rejects_on_one_chain() {
     let (dir, hub) = tmp_hub();
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     hub.confirm_empty_regtest(101).unwrap();
 
@@ -5364,8 +5366,7 @@ fn check_block_proposal_prices_fees_and_rejects_on_one_chain() {
         })
         .collect();
     let parent_txid = parent.compute_txid();
-    hub.generate_to_script(1, op_true.clone(), vec![parent])
-        .unwrap();
+    hub.mine(1, op_true.clone(), vec![parent]).unwrap();
     let child_paying = |vout: u32, value: u64| Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -5397,8 +5398,7 @@ fn check_block_proposal_prices_fees_and_rejects_on_one_chain() {
         "one packed body decode per distinct parent; the spentness probes and the fk resolve decode nothing"
     );
 
-    hub.generate_to_script(1, op_true.clone(), vec![child(0)])
-        .unwrap();
+    hub.mine(1, op_true.clone(), vec![child(0)]).unwrap();
     let respend = child_paying(0, payout - 1_000);
     let block = hub
         .assemble_block_to_script(op_true.clone(), vec![child(1), respend])
@@ -5665,6 +5665,7 @@ fn proposal_spend_of_an_unspendable_output_is_missing() {
     }
 
     let (dir, hub) = tmp_hub();
+    let hub = Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     hub.confirm_empty_regtest(101).unwrap();
     let mut op_return = one_sat(
@@ -5688,12 +5689,11 @@ fn proposal_spend_of_an_unspendable_output_is_missing() {
         spendable_10k(),
     );
     coin.input = mature_spend_tx(&hub, 3).input;
-    hub.generate_to_script(1, op_true.clone(), vec![op_return.clone()])
+    hub.mine(1, op_true.clone(), vec![op_return.clone()])
         .expect("an unspent OP_RETURN output still connects");
-    hub.generate_to_script(1, op_true.clone(), vec![oversize.clone()])
+    hub.mine(1, op_true.clone(), vec![oversize.clone()])
         .unwrap();
-    hub.generate_to_script(1, op_true.clone(), vec![coin.clone()])
-        .unwrap();
+    hub.mine(1, op_true.clone(), vec![coin.clone()]).unwrap();
 
     let missing = |tx: Transaction| {
         let block = hub
@@ -5962,9 +5962,9 @@ fn invalidate_skips_a_fork_that_fails() {
 /// proof of work must not connect and must not add that claimed work.
 #[test]
 fn review_trust_no_pow_block_credits_claimed_work() {
-    fn forged_block(hub: &ChainHub) -> bitcoin::Block {
+    fn forged_block(hub: &Arc<ChainHub>) -> bitcoin::Block {
         let op_true = ScriptBuf::from_bytes(vec![0x51]);
-        hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+        hub.mine(1, op_true.clone(), vec![]).unwrap();
         let mut forged = hub.assemble_block_to_script(op_true, vec![]).unwrap();
         forged.header.bits = bitcoin::CompactTarget::from_consensus(0x1d00_ffff);
         forged.header.merkle_root = forged.compute_merkle_root().unwrap();
@@ -5974,10 +5974,12 @@ fn review_trust_no_pow_block_credits_claimed_work() {
         forged
     }
     let (_d_off, off_hub) = tiny_regtest_hub_labeled("review-pow-off");
+    let off_hub = Arc::new(off_hub);
     let r_off = off_hub.accept_received_block(forged_block(&off_hub));
     assert!(r_off.is_err(), "flag off rejects: {r_off:?}");
 
     let (_d_on, hub) = tiny_regtest_hub_labeled("review-pow-on");
+    let hub = Arc::new(hub);
     let forged = forged_block(&hub);
     let hash = forged.block_hash();
     let before = hub.chain_work().unwrap();
@@ -6004,8 +6006,9 @@ fn review_trust_no_pow_block_credits_claimed_work() {
 #[test]
 fn review_trust_local_side_subsidy_is_not_applied() {
     let (_dir, hub) = tiny_regtest_hub_labeled("review-local-side");
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, op_true, vec![]).unwrap();
+    hub.mine(1, op_true, vec![]).unwrap();
     let tip = hub.tip_hash().unwrap();
     let tip_h = hub.tip_height().unwrap();
     let tip_block = hub.block_at_height(tip_h).unwrap().unwrap();
@@ -6046,8 +6049,9 @@ fn review_trust_local_side_subsidy_is_not_applied() {
 #[test]
 fn review_trust_session_side_subsidy_is_applied() {
     let (_dir, hub) = tiny_regtest_hub_labeled("review-session-side");
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, op_true, vec![]).unwrap();
+    hub.mine(1, op_true, vec![]).unwrap();
     let tip = hub.tip_hash().unwrap();
     let tip_h = hub.tip_height().unwrap();
     let tip_block = hub.block_at_height(tip_h).unwrap().unwrap();
@@ -6088,8 +6092,9 @@ fn review_trust_session_side_subsidy_is_applied() {
 #[test]
 fn review_trust_restore_keeps_a_waived_tip() {
     let (_dir, hub) = tiny_regtest_hub_labeled("review-restore-waive");
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+    hub.mine(1, op_true.clone(), vec![]).unwrap();
     let parent_h = hub.tip_height().unwrap();
     let parent = hub.tip_hash().unwrap();
     let mut bad = hub.assemble_block_to_script(op_true, vec![]).unwrap();
@@ -6136,8 +6141,9 @@ fn review_trust_restore_keeps_a_waived_tip() {
 #[test]
 fn review_trust_local_excess_subsidy_is_not_applied() {
     let (_dir, hub) = tiny_regtest_hub_labeled("review-local-subsidy");
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+    hub.mine(1, op_true.clone(), vec![]).unwrap();
     let mut block = hub.assemble_block_to_script(op_true, vec![]).unwrap();
     let bumped = block.txdata[0].output[0].value.to_sat() + 1;
     block.txdata[0].output[0].value = Amount::from_sat(bumped);
@@ -6170,8 +6176,9 @@ fn excess_on(prev: BlockHash, time: u32, height: u32) -> Block {
 #[test]
 fn review_trust_high_hash_reject_sticks() {
     let (_dir, hub) = tiny_regtest_hub_labeled("review-reject-stick");
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+    hub.mine(1, op_true.clone(), vec![]).unwrap();
     hub.query.set_trust_peer(true);
     let mut forged = hub.assemble_block_to_script(op_true, vec![]).unwrap();
     forged.header.bits = CompactTarget::from_consensus(0x1d00_ffff);
@@ -6195,8 +6202,9 @@ fn review_trust_high_hash_reject_sticks() {
 #[test]
 fn review_trust_session_upgrades_held_waive() {
     let (_dir, hub) = tiny_regtest_hub_labeled("review-hold-upgrade");
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(2, op_true, vec![]).unwrap();
+    hub.mine(2, op_true, vec![]).unwrap();
     let tip = hub.tip_hash().unwrap();
     let tip_h = hub.tip_height().unwrap();
     let genesis = hub.block_at_height(0).unwrap().unwrap();
@@ -6273,10 +6281,9 @@ fn review_trust_reorg_mtp_on_second_block() {
     }
 
     let (_dir, local) = tiny_regtest_hub_labeled("review-reorg-mtp-local");
+    let local = Arc::new(local);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    local
-        .generate_to_script(1, op_true.clone(), vec![])
-        .unwrap();
+    local.mine(1, op_true.clone(), vec![]).unwrap();
     let tip = local.tip_hash().unwrap();
     local.query.set_trust_peer(true);
     rbitcoin_log::capture_logs(false);
@@ -6286,7 +6293,8 @@ fn review_trust_reorg_mtp_on_second_block() {
     assert_eq!(local.tip_hash(), Some(tip));
 
     let (_dir, session) = tiny_regtest_hub_labeled("review-reorg-mtp-session");
-    session.generate_to_script(1, op_true, vec![]).unwrap();
+    let session = Arc::new(session);
+    session.mine(1, op_true, vec![]).unwrap();
     session.query.set_trust_peer(true);
     let session_tip = session.tip_hash().unwrap();
     let session_r = branch(&session, true);
@@ -6305,9 +6313,9 @@ fn review_trust_local_block_rechecks_marked_script() {
 
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     let (dir, hub) = tiny_regtest_hub_labeled("review-marked-block");
+    let hub = std::sync::Arc::new(hub);
     let wpkh = WPubkeyHash::from_byte_array([0x41; 20]);
-    hub.generate_to_script(1, ScriptBuf::new_p2wpkh(&wpkh), vec![])
-        .unwrap();
+    hub.mine(1, ScriptBuf::new_p2wpkh(&wpkh), vec![]).unwrap();
     hub.confirm_empty_regtest(101).unwrap();
     let cb = hub
         .query
@@ -6364,7 +6372,8 @@ fn review_trust_local_block_rechecks_marked_script() {
 fn review_trust_side_header_mtp_is_held() {
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     let (_dir, hub) = tiny_regtest_hub_labeled("review-side-mtp");
-    hub.generate_to_script(1, op_true, vec![]).unwrap();
+    let hub = std::sync::Arc::new(hub);
+    hub.mine(1, op_true, vec![]).unwrap();
     hub.query.set_trust_peer(true);
     let tip = hub.tip_hash().unwrap();
     let genesis = hub.block_at_height(0).unwrap().unwrap();
@@ -6421,8 +6430,9 @@ fn review_trust_side_header_mtp_is_held() {
 #[test]
 fn review_trust_proposal_is_silent() {
     let (dir, hub) = tmp_hub();
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+    hub.mine(1, op_true.clone(), vec![]).unwrap();
     let template = hub
         .assemble_block_to_script(op_true.clone(), vec![])
         .unwrap();
@@ -6502,8 +6512,9 @@ fn assert_proposal_silent() {
 #[test]
 fn review_trust_submitheader_stays_strict() {
     let (_dir, hub) = tiny_regtest_hub_labeled("review-submitheader");
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+    hub.mine(1, op_true.clone(), vec![]).unwrap();
     let mut block = hub.assemble_block_to_script(op_true, vec![]).unwrap();
     block.header.time = block.header.time.saturating_add(3 * 60 * 60);
     rbitcoin_consensus::grind_regtest_pow(&mut block.header);
@@ -6528,9 +6539,9 @@ fn review_trust_submitheader_stays_strict() {
 /// refetchable: it is not marked permanently failed.
 #[test]
 fn review_trust_merkle_mismatch_stays_refetchable() {
-    fn mismatched(hub: &ChainHub) -> bitcoin::Block {
+    fn mismatched(hub: &Arc<ChainHub>) -> bitcoin::Block {
         let op_true = ScriptBuf::from_bytes(vec![0x51]);
-        hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+        hub.mine(1, op_true.clone(), vec![]).unwrap();
         let mut block = hub.assemble_block_to_script(op_true, vec![]).unwrap();
         block.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x11; 32]);
         for _ in 0..10_000 {
@@ -6542,6 +6553,7 @@ fn review_trust_merkle_mismatch_stays_refetchable() {
         panic!("regtest target accepted no nonce");
     }
     let (_d_on, hub) = tiny_regtest_hub_labeled("review-merkle-on");
+    let hub = Arc::new(hub);
     let block = mismatched(&hub);
     let hash = block.block_hash();
     let before = hub.chain_work().unwrap();
@@ -6764,16 +6776,16 @@ fn arcs(blocks: &[bitcoin::Block]) -> Vec<std::sync::Arc<bitcoin::Block>> {
 /// Regtest with BIP94 on and a 4-block difficulty period. Heights 1..=3 are
 /// mined 2000 s apart, so the height-4 period start sits well above the
 /// median and only the timewarp floor decides it.
-fn bip94_pad(label: &str) -> (rbitcoin_query::testutil::TempDir, ChainHub) {
+fn bip94_pad(label: &str) -> (rbitcoin_query::testutil::TempDir, Arc<ChainHub>) {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
     let mut params = ChainParams::regtest();
     params.enforce_bip94 = true;
     params.btc.pow_target_timespan = 4 * params.btc.pow_target_spacing;
-    let hub = ChainHub::new(q, params, Milestone::NONE);
+    let hub = Arc::new(ChainHub::new(q, params, Milestone::NONE));
     hub.ensure_genesis().unwrap();
     for i in 1..=3i64 {
         hub.clock.set_mock(1_700_000_000 + 2000 * i);
-        hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        hub.mine(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
             .unwrap();
     }
     (dir, hub)
@@ -7225,6 +7237,7 @@ fn bip94_off_tip_retarget_scales_the_period_first_bits() {
 #[test]
 fn check_block_proposal_decodes_only_the_spent_outputs_of_a_wide_parent() {
     let (dir, hub) = tmp_hub();
+    let hub = std::sync::Arc::new(hub);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     hub.confirm_empty_regtest(101).unwrap();
     let mut wide = mature_spend_tx(&hub, 1);
@@ -7234,8 +7247,7 @@ fn check_block_proposal_decodes_only_the_spent_outputs_of_a_wide_parent() {
             script_pubkey: op_true.clone(),
         })
         .collect();
-    hub.generate_to_script(1, op_true.clone(), vec![wide.clone()])
-        .unwrap();
+    hub.mine(1, op_true.clone(), vec![wide.clone()]).unwrap();
     let spends: Vec<Transaction> = [2u32, 7, 9]
         .iter()
         .map(|&v| Transaction {
@@ -7527,9 +7539,10 @@ fn chain_pin_a_stuck_disconnect_keeps_the_confirmed_mark() {
 #[test]
 fn generate_stops_before_the_fail_latch() {
     let (_dir, hub) = tmp_hub();
+    let hub = Arc::new(hub);
     hub.generate_fail_before.store(1, Ordering::Relaxed);
     let err = hub
-        .generate_to_script(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .mine(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .expect_err("the latch stops the second block");
     assert!(
         err.to_string()

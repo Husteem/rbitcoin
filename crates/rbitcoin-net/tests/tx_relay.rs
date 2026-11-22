@@ -1,4 +1,5 @@
 use crate::Admit;
+use crate::Mine;
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
@@ -7716,6 +7717,7 @@ async fn inv_bucket_caps_a_burst_and_outbound_drains_faster() {
     use rbitcoin_primitives::Height;
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("inv-bucket-burst");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     hub.confirm_empty_regtest(101).unwrap();
     let coinbase = hub
@@ -7745,7 +7747,7 @@ async fn inv_bucket_caps_a_burst_and_outbound_drains_faster() {
             })
             .collect(),
     };
-    hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![fanout.clone()])
+    hub.mine(1, ScriptBuf::from_bytes(vec![0x51]), vec![fanout.clone()])
         .unwrap();
     let mp = MempoolHub::open(dir.path().join("pool"), hub.query.clone()).unwrap();
     mp.set_relay_enabled(true);

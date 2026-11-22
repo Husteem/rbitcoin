@@ -1,3 +1,4 @@
+use crate::Mine;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::Magic;
 use bitcoin::Transaction;
@@ -380,6 +381,7 @@ async fn ephemeral_broadcast() {
     use tokio::sync::mpsc;
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ephemeral-broadcast");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
     hub.confirm_empty_regtest(102).expect("pad");
     let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
@@ -427,7 +429,7 @@ async fn ephemeral_broadcast() {
     let mut fan = spend(OutPoint { txid: cb2, vout: 0 }, 90_000_000);
     fan.output = vec![fan.output[0].clone(); BURST as usize + 10];
     let fan_id = fan.compute_txid();
-    hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![fan])
+    hub.mine(1, ScriptBuf::from_bytes(vec![0x51]), vec![fan])
         .expect("fan-out block");
     let locals: Vec<Transaction> = (0..BURST + 10)
         .map(|vout| spend(OutPoint { txid: fan_id, vout }, 89_990_000))
@@ -462,7 +464,7 @@ async fn ephemeral_broadcast() {
         submit(tx).await;
     }
     let mined = locals[5].compute_txid();
-    hub.generate_to_script(
+    hub.mine(
         1,
         ScriptBuf::from_bytes(vec![0x51]),
         vec![locals[5].clone()],
@@ -521,7 +523,7 @@ async fn ephemeral_broadcast() {
         .await
         .expect("the first send reaches the recipient")
         .unwrap();
-    hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![gone.clone()])
+    hub.mine(1, ScriptBuf::from_bytes(vec![0x51]), vec![gone.clone()])
         .expect("mine the tx in flight");
     gate_tx.send(()).unwrap();
     assert_eq!(

@@ -2711,6 +2711,21 @@ mod walk_depth_pins {
     use bitcoin::BlockHash;
     use rbitcoin_primitives::Height;
 
+    fn mine(hub: crate::chain::ChainHub, nblocks: u32) -> std::sync::Arc<crate::chain::ChainHub> {
+        let hub = std::sync::Arc::new(hub);
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(hub.generate_to_script_for_rpc_async(
+                nblocks,
+                bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+                vec![],
+                false,
+            ))
+            .unwrap();
+        hub
+    }
+
     /// `pending_walk` and `header_announcement_connects` stop after this many steps.
     #[test]
     fn pending_walk_stops_past_one_headers_batch() {
@@ -2722,8 +2737,7 @@ mod walk_depth_pins {
     fn depth_is_one_block_after_one_spacing() {
         let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("depth-one-spacing");
         hub.clock.set_mock(1_700_000_000);
-        hub.generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .unwrap();
+        let hub = mine(hub, 1);
         let tip = hub.tip_header().expect("tip");
         hub.clock.set_mock(i64::from(tip.time) + 600);
         assert_eq!(approximate_best_block_depth(&hub), 1);
@@ -2733,8 +2747,7 @@ mod walk_depth_pins {
     #[test]
     fn locator_steps_by_one_then_doubles() {
         let (_dir, hub) = crate::chain::tiny_regtest_hub_labeled("locator-double");
-        hub.generate_to_script(40, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .unwrap();
+        let hub = mine(hub, 40);
         let heights = [40u32, 39, 38, 37, 36, 35, 34, 33, 32, 31, 29, 25, 17, 1, 0];
         let expected: Vec<BlockHash> = heights
             .iter()

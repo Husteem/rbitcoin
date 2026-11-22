@@ -1,5 +1,6 @@
 //! End of IBD: tip follow, scripthash history, and restart on a live miner.
 
+use crate::Mine;
 use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::script::ScriptBuf;
@@ -395,7 +396,7 @@ async fn extend_one(
     let before = history_txids(electrum, &[0x51]).await;
     miner
         .hub
-        .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .mine(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let height = miner.tip_height().unwrap();
     let hash = miner.hub.tip_hash().unwrap().to_string();
@@ -581,10 +582,7 @@ async fn crash_with_class_a_above_tip(miner: &P2PNode, synced: &mut Synced) {
     );
     let mut blocks = Vec::new();
     for txs in [vec![parent], vec![child, grandchild]] {
-        miner
-            .hub
-            .generate_to_script(1, op_true.clone(), txs)
-            .unwrap();
+        miner.hub.mine(1, op_true.clone(), txs).unwrap();
         let block = miner
             .query
             .reconstruct_block_at_height(Height(miner.tip_height().unwrap()));
@@ -876,7 +874,7 @@ async fn resume_pass1_and_restart(
 fn mine_one_a(miner: &P2PNode) -> (u32, String, String) {
     miner
         .hub
-        .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .mine(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let height = miner.tip_height().unwrap();
     let hash = miner.hub.tip_hash().unwrap().to_string();

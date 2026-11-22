@@ -2762,7 +2762,8 @@ impl ChainHub {
     #[doc(hidden)]
     pub const GENERATE_MAX_BLOCKS: u32 = 10_000;
 
-    fn refuse_over_cap(nblocks: u32, cap: u32) -> Result<(), NetError> {
+    #[doc(hidden)]
+    pub fn refuse_over_cap(nblocks: u32, cap: u32) -> Result<(), NetError> {
         if nblocks > cap {
             return Err(NetError::Consensus(format!(
                 "nblocks too large (max {cap})"
@@ -2775,27 +2776,10 @@ impl ChainHub {
         stop != 0 && index == stop
     }
 
-    /// Mine `nblocks` paying `script_pubkey` and accept each via [`Self::accept_block`].
-    ///
-    /// Regtest harness only. Extra txs go in the first block. Ensures genesis.
-    /// More than [`Self::GENERATE_MAX_BLOCKS`] is refused before any block is mined.
-    ///
-    /// PoW runs on the caller, not on `tip-accept`, so an `OP_TRUE` signet
-    /// grind can use extra cores. Accept stays on the lane. A peer block that
-    /// wins the tip during the grind is mined again.
-    pub fn generate_to_script(
-        &self,
-        nblocks: u32,
-        script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
-    ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(nblocks, script_pubkey, extra_txs, Self::GENERATE_MAX_BLOCKS)
-    }
-
     /// Confirm `nblocks` empty regtest blocks through [`rbitcoin_query::confirm_wire_run`].
     ///
     /// IBD packs at most 144 blocks into one confirm wave. A long fixture uses
-    /// that wave. [`Self::generate_to_script`] still accepts one block at a time
+    /// that wave. [`Self::generate_to_script_for_rpc_async`] still accepts one block at a time
     /// on `tip-accept` when the test needs chosen txs or the lane.
     #[doc(hidden)]
     pub fn confirm_empty_regtest(&self, nblocks: u32) -> Result<Vec<BlockHash>, NetError> {
@@ -2831,7 +2815,7 @@ impl ChainHub {
             left = left.saturating_sub(n);
         }
         self.ensure_chain_work_prefix()?;
-        // `generate_to_script` seals write-behind indexes before it returns.
+        // `generate_to_script_for_rpc_async` seals write-behind indexes before it returns.
         // A fixture that turned the filter index on needs that same watermark.
         self.drain_generate_indexes();
         Ok(hashes)
@@ -2850,8 +2834,6 @@ impl ChainHub {
             nblocks,
             script_pubkey,
             GenerateFirst::Chosen(extra_txs),
-            Self::GENERATE_MAX_BLOCKS,
-            true,
             record_assembly,
         )
         .await
@@ -2867,15 +2849,8 @@ impl ChainHub {
         nblocks: u32,
         script_pubkey: ScriptBuf,
     ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying_async(
-            nblocks,
-            script_pubkey,
-            GenerateFirst::Pool,
-            Self::GENERATE_MAX_BLOCKS,
-            true,
-            true,
-        )
-        .await
+        self.generate_paying_async(nblocks, script_pubkey, GenerateFirst::Pool, true)
+            .await
     }
 
     async fn generate_paying_async(
@@ -2883,14 +2858,12 @@ impl ChainHub {
         nblocks: u32,
         script_pubkey: ScriptBuf,
         first: GenerateFirst,
-        limit: u32,
-        commit_on_accept: bool,
         record_assembly: bool,
     ) -> Result<Vec<BlockHash>, NetError> {
         if nblocks == 0 {
             return Ok(Vec::new());
         }
-        Self::refuse_over_cap(nblocks, limit)?;
+        Self::refuse_over_cap(nblocks, Self::GENERATE_MAX_BLOCKS)?;
         // Accept and the blocksonly pool removal share this task. Dropping
         // the request must not leave a connected block's txs in the pool.
         let hub = std::sync::Arc::clone(self);
@@ -2921,11 +2894,7 @@ impl ChainHub {
                 } else {
                     Vec::new()
                 };
-                let ids = commit_on_accept.then(|| {
-                    txs.iter()
-                        .map(|tx| tx.compute_txid())
-                        .collect::<Vec<Txid>>()
-                });
+                let ids: Vec<Txid> = txs.iter().map(|tx| tx.compute_txid()).collect();
                 if record_assembly {
                     let weight = txs.iter().map(|tx| tx.weight().to_wu()).sum();
                     hub.note_block_assembled(weight, txs.len());
@@ -2934,7 +2903,7 @@ impl ChainHub {
                     hub.mine_and_accept_paying_async(&script_pubkey, txs)
                         .await?,
                 );
-                if let Some(ids) = ids.filter(|ids| !ids.is_empty()) {
+                if !ids.is_empty() {
                     Self::park_before_generate_commit(&hub).await;
                     if let Some(mp) = hub.mempool().cloned() {
                         crate::reactor::off_pool(move || mp.commit_generated_txids(&ids))
@@ -2965,21 +2934,6 @@ impl ChainHub {
         hub.generate_commit_parked.store(false, Ordering::Release);
     }
 
-    /// Sync generate runs on stack hubs and some
-    /// `#[tokio::test]` tasks. `blocking_lock` panics on a Tokio worker even
-    /// when the lock is free, so a worker only uses `try_lock`.
-    fn lock_generate_sync(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        if tokio::runtime::Handle::try_current().is_err() {
-            return self.generate_lock.blocking_lock();
-        }
-        loop {
-            if let Ok(guard) = self.generate_lock.try_lock() {
-                return guard;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    }
-
     fn drain_generate_indexes(&self) {
         if let Err(e) = self.query.apply_sh_pending() {
             rbitcoin_log::warn!("generate: SH write-behind drain: {e}");
@@ -2987,20 +2941,6 @@ impl ChainHub {
         if let Err(e) = rbitcoin_query::build_indexes_released(&self.query) {
             rbitcoin_log::warn!("generate: index write-behind drain: {e}");
         }
-    }
-
-    /// [`Self::generate_to_script`] with an explicit cap. Production passes
-    /// [`Self::GENERATE_MAX_BLOCKS`]. Tests pass a small cap so the same
-    /// comparison is pinned without mining ten thousand blocks.
-    #[doc(hidden)]
-    pub fn generate_to_script_limited(
-        &self,
-        nblocks: u32,
-        script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
-        limit: u32,
-    ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(nblocks, script_pubkey, extra_txs, limit)
     }
 
     /// Live pool transactions for the first block of `generate`.
@@ -3011,40 +2951,6 @@ impl ChainHub {
         self.mempool()
             .map(|mp| mp.select_generate_txs(self.block_min_tx_fee_sat_kvb()))
             .unwrap_or_default()
-    }
-
-    fn generate_paying(
-        &self,
-        nblocks: u32,
-        script_pubkey: ScriptBuf,
-        mut extras: Vec<Transaction>,
-        limit: u32,
-    ) -> Result<Vec<BlockHash>, NetError> {
-        if nblocks == 0 {
-            return Ok(Vec::new());
-        }
-        Self::refuse_over_cap(nblocks, limit)?;
-        self.ensure_genesis()?;
-        // Serialize tip-read + mine + accept so concurrent generateblock
-        // (rpc_generate.py parallel) cannot race the same tip into AlreadyHave.
-        let _guard = self.lock_generate_sync();
-        let mut hashes = Vec::with_capacity(nblocks as usize);
-        for i in 0..nblocks {
-            let stop = self.generate_fail_before.load(Ordering::Relaxed);
-            if Self::generate_stopped(stop, i) {
-                return Err(NetError::Consensus(
-                    "generate lost the tip during proof-of-work".into(),
-                ));
-            }
-            let txs = if i == 0 {
-                std::mem::take(&mut extras)
-            } else {
-                Vec::new()
-            };
-            hashes.push(self.mine_and_accept_paying(&script_pubkey, txs)?);
-        }
-        self.drain_generate_indexes();
-        Ok(hashes)
     }
 
     fn prepare_mined_block(
@@ -3099,27 +3005,6 @@ impl ChainHub {
                 hub.accept_mined_block(block, prev)
             })
             .await?;
-            if accepted {
-                return Ok(hash);
-            }
-        }
-        Err(NetError::Consensus(
-            "generate lost the tip during proof-of-work".into(),
-        ))
-    }
-
-    /// Mine one block on this thread, then accept it on `tip-accept`.
-    #[doc(hidden)]
-    pub fn mine_and_accept_paying(
-        &self,
-        script_pubkey: &ScriptBuf,
-        txs: Vec<Transaction>,
-    ) -> Result<BlockHash, NetError> {
-        for _attempt in 0..4 {
-            let (block, prev) = self.prepare_mined_block(script_pubkey, txs.clone())?;
-            let hash = block.block_hash();
-            let accepted =
-                crate::tip_accept::run_on_tip_accept(|| self.accept_mined_block(block, prev))?;
             if accepted {
                 return Ok(hash);
             }

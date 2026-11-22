@@ -3603,14 +3603,10 @@ async fn mocktime_generate_keeps_ponging_peer() {
         for i in 1..=10u64 {
             let laps = a.peers.heartbeat_laps();
             a.peers.set_mock_now(t0 + i * 600);
-            let hub = a.hub.clone();
-            let script = script.clone();
-            tokio::task::spawn_blocking(move || {
-                let _g = rbitcoin_net::BlockingRegion::enter();
-                hub.generate_to_script(1, script, vec![]).expect("generate");
-            })
-            .await
-            .expect("join");
+            a.hub
+                .generate_to_script_for_rpc_async(1, script.clone(), vec![], false)
+                .await
+                .expect("generate");
             // Core's `generate` syncs before the next `setmocktime`. Here the
             // ponging peer answers before the clock moves again. Its pong can
             // wait seconds behind other tests' connects on the process-wide

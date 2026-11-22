@@ -1,3 +1,4 @@
+use crate::Mine;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -805,7 +806,7 @@ fn witness_pad_script() -> bitcoin::ScriptBuf {
     bitcoin::ScriptBuf::from_bytes(bytes)
 }
 
-fn over_one_mebibyte_block(hub: &rbitcoin_net::ChainHub) -> bitcoin::Block {
+fn over_one_mebibyte_block(hub: &Arc<rbitcoin_net::ChainHub>) -> bitcoin::Block {
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version};
     use bitcoin::hashes::Hash;
@@ -858,7 +859,7 @@ fn over_one_mebibyte_block(hub: &rbitcoin_net::ChainHub) -> bitcoin::Block {
     grind_regtest_pow(&mut funding.header);
     let txid = funding.txdata[0].compute_txid();
     hub.accept_block(funding).expect("fund the padded spends");
-    hub.generate_to_script(99, ScriptBuf::from_bytes(vec![0x51]), Vec::new())
+    hub.mine(99, ScriptBuf::from_bytes(vec![0x51]), Vec::new())
         .expect("mature the coinbase");
     assert_eq!(
         hub.tip_height(),
@@ -966,11 +967,11 @@ where
 #[tokio::test]
 async fn large_block_submit_and_proposal_clear_http_413() {
     let dir = rbitcoin_store::testutil::TempDir::for_socket().expect("temp dir");
-    let hub = rbitcoin_net::ChainHub::new(
+    let hub = Arc::new(rbitcoin_net::ChainHub::new(
         Query::open_or_create_tiny(dir.join("store")).unwrap(),
         rbitcoin_consensus::ChainParams::regtest(),
         rbitcoin_consensus::Milestone::NONE,
-    );
+    ));
     hub.ensure_genesis().unwrap();
     let block = over_one_mebibyte_block(&hub);
     let want_hash = block.block_hash().to_string();
@@ -1007,7 +1008,7 @@ async fn large_block_submit_and_proposal_clear_http_413() {
     let mut cfg = regtest_rpc(dir.path());
     cfg.socket_path = socket_path.clone();
     cfg.rest = true;
-    let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
+    let handle = run_rpc(cfg, query, None, None, None, Some(hub), None)
         .await
         .unwrap();
     let token = handle.auth.token.clone();
@@ -1357,7 +1358,10 @@ async fn long_poll_deadline_returns_the_tip() {
 }
 
 /// The tip, not the deadline, ends the wait: the deadline is a minute out.
-async fn published_tip_wakes_waitfornewblock(handle: &RpcHandle, hub: &rbitcoin_net::ChainHub) {
+async fn published_tip_wakes_waitfornewblock(
+    handle: &RpcHandle,
+    hub: &Arc<rbitcoin_net::ChainHub>,
+) {
     let addr = tcp_addr(handle);
     let auth = handle.auth.clone();
     let waiter = tokio::spawn(async move {
@@ -1381,7 +1385,7 @@ async fn published_tip_wakes_waitfornewblock(handle: &RpcHandle, hub: &rbitcoin_
     })
     .await
     .expect("waitfornewblock parks before the tip");
-    hub.generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), Vec::new())
+    hub.mine(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), Vec::new())
         .expect("publish a tip");
     let body = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
         .await
@@ -1790,7 +1794,7 @@ async fn batch_waits_to_retake_the_queue_after_a_long_poll() {
     ctx.chain
         .as_ref()
         .expect("chain")
-        .generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), Vec::new())
+        .mine(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), Vec::new())
         .expect("publish a tip");
     wait_for_active_call(&ctx.active, "waitfornewblock", false).await;
     for _ in 0..10 {
@@ -3462,7 +3466,7 @@ async fn earlier_wait_reports_the_tip_from_when_it_finished() {
     let first = wait_for_listing(&watch.active, "waitfornewblock", None).await;
     wait_for_settled_listing(&watch.active, "waitfornewblock", first).await;
     let miner = std::thread::spawn(move || {
-        hub.generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+        hub.mine(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
             .expect("mine");
     });
     miner.join().expect("miner");
