@@ -87,6 +87,12 @@ pub enum Subnet {
 
 impl Subnet {
     pub fn contains(self, ip: IpAddr) -> bool {
+        // Core's `CNetAddr` reads a v4-in-v6 address as IPv4, so a V4 subnet
+        // matches the mapped form too (an outbound `[::ffff:a.b.c.d]` peer).
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            IpAddr::V4(_) => ip,
+        };
         match (self, ip) {
             (Self::V4 { addr, prefix }, IpAddr::V4(v4)) => {
                 let mask = ipv4_mask(prefix);

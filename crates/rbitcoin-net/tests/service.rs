@@ -804,7 +804,19 @@ fn ipv6_unavailable(e: &std::io::Error) -> bool {
     if e.raw_os_error() == Some(libc::EAFNOSUPPORT) {
         return true;
     }
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(10047) {
+        // WSAEAFNOSUPPORT: no IPv6 stack. Rust reports it as Uncategorized.
+        return true;
+    }
     e.kind() == std::io::ErrorKind::AddrNotAvailable
+}
+
+#[cfg(windows)]
+#[test]
+fn ipv6_unavailable_reads_wsa_eafnosupport() {
+    let e = std::io::Error::from_raw_os_error(10047);
+    assert!(ipv6_unavailable(&e));
 }
 
 /// A dual-stack inbound session: the node on `[::]:0`, the client's local

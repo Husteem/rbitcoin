@@ -344,6 +344,14 @@ fn mapped_whitelist_is_the_ipv4_grant() {
     );
     let err = parse_whitelist("noban@::ffff:0:0/96").unwrap_err();
     assert!(err.contains("Invalid netmask specified in"), "{err}");
+    // An outbound peer keeps the mapped address (`NetAddr::from_socket` does
+    // not unmap), so the V4 subnet must match it.
+    assert!(host
+        .subnet
+        .contains(IpAddr::V6("::ffff:127.0.0.1".parse().unwrap())));
+    assert!(net
+        .subnet
+        .contains(IpAddr::V6("::ffff:10.1.2.3".parse().unwrap())));
 }
 
 #[test]

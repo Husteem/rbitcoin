@@ -189,3 +189,22 @@ fn name_key_is_per_host_and_port_and_never_enters_the_book() {
         "a name is dialed, never gossiped or booked"
     );
 }
+
+/// An accepted address is canonicalized for the IPv4 key without rewriting a
+/// real IPv6 address: flow info and zone stay on the kernel address.
+#[test]
+fn canonical_bind_unmaps_v4_in_v6_and_keeps_ipv6_scope() {
+    use std::net::SocketAddrV6;
+    let v6 = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 8333, 7, 9));
+    assert_eq!(rbitcoin_net::peers::canonical_bind(v6), v6);
+    let mapped = SocketAddr::V6(SocketAddrV6::new(
+        "::ffff:127.0.0.1".parse().unwrap(),
+        18444,
+        0,
+        0,
+    ));
+    assert_eq!(
+        rbitcoin_net::peers::canonical_bind(mapped),
+        "127.0.0.1:18444".parse().unwrap()
+    );
+}
