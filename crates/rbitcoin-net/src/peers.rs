@@ -4666,7 +4666,10 @@ impl PeerHub {
         let Some(id) = crate::eviction::select_inbound_eviction(cands) else {
             return false;
         };
-        if let Some(p) = self.get(id) {
+        if let Some(p) = self
+            .get(id)
+            .filter(|p| !p.addr.ip().is_loopback() || self.onion_bind() != Some(p.addrbind))
+        {
             self.note_slot_evict(crate::netgroup::slot_pause_group(p.addr));
         }
         rbitcoin_log::info!("p2p: evict inbound peer={id} ({why})");

@@ -1947,6 +1947,38 @@ fn try_evict_inbound_disconnects_one_peer() {
     );
 }
 
+#[test]
+fn slot_eviction_skips_cooldown_only_for_loopback_on_the_onion_bind() {
+    for (bind, onion_bind, source, paused) in [
+        ("127.0.0.1:8334", "127.0.0.1:8334", "127.0.0.1", false),
+        ("127.0.0.1:8333", "127.0.0.1:8334", "127.0.0.1", true),
+        ("10.0.3.2:8334", "10.0.3.2:8334", "10.0.3.1", true),
+    ] {
+        let hub = PeerHub::new();
+        let bind = bind.parse().unwrap();
+        let source: IpAddr = source.parse().unwrap();
+        hub.set_net_perms(rbitcoin_net::net_permissions::NetPermTable {
+            onion_bind: Some(onion_bind.parse().unwrap()),
+            ..Default::default()
+        });
+        for port in 40000..40030 {
+            hub.register_connecting(
+                SocketAddr::new(source, port),
+                bind,
+                true,
+                PeerConnType::Inbound,
+            );
+        }
+        assert!(hub.try_evict_inbound(), "an inbound session is evicted");
+        assert_eq!(hub.snapshot().len(), 29);
+        assert_eq!(
+            hub.inbound_discouraged(SocketAddr::new(source, 40030)),
+            paused,
+            "unexpected admission decision for {source} on {bind}"
+        );
+    }
+}
+
 /// Thirty CJDNS inbound peers share one four-bit eviction group and sit in
 /// thirty `/32`s. The pause after a slot eviction refuses the evicted
 /// peer's `/32` only, not the sixteenth of CJDNS its group covers.
