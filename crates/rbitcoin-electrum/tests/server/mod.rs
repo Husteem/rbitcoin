@@ -3922,6 +3922,37 @@ async fn sp_catch_up_miss_does_not_go_live() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A live subscription whose new height cannot be read gets the error
+/// note and ends. Left live, it would count height 1 as scanned.
+#[tokio::test]
+async fn sp_tip_miss_ends_the_live_subscription() {
+    let (dir, q) = sp_pruned_chain_missing_height_1();
+    let mut s = sp_session(&q);
+    let reply = s
+        .ask(&[sp_subscribe_line(
+            1,
+            json!([SP_MISS_SCAN, SP_MISS_SPEND, "0-0"]),
+        )])
+        .await;
+    sp_accepted(&reply[0]);
+    // The range ends at 0: no catch-up read. Live at the tip, 1.
+    let (history, progress) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert!(history.is_empty(), "{history:?}");
+    assert_eq!(progress, [1.0]);
+    // A reorg above 0: the live subscription reads height 1.
+    s.tip_tx.send(sp_tip(1, Some(0))).unwrap();
+    let note = sp_next_line(&mut s.client).await;
+    assert_eq!(note["params"]["subscription"], reply[0]["result"], "{note}");
+    let message = note["params"]["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("window miss"), "{note}");
+    // Ended: the same event reads nothing.
+    s.tip_tx.send(sp_tip(1, Some(0))).unwrap();
+    s.assert_quiet(2).await;
+    s.hang_up().await;
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A late event for a lower height rewinds nothing. A reorg to a lower tip
 /// does: the blocks that connect above it again are scanned.
 #[tokio::test]
