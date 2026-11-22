@@ -23,6 +23,8 @@ pub mod fee_history_file;
 #[doc(hidden)]
 pub mod i2p_sam;
 #[doc(hidden)]
+pub mod inv_bucket;
+#[doc(hidden)]
 pub mod listen;
 #[doc(hidden)]
 pub mod most_work;

@@ -120,7 +120,6 @@ fn isolated_submit_reaches_no_standing_peer(
                 ann,
             )
             .unwrap();
-            walked.request_tx_inv();
             rbitcoin_net::peer::queue_due_tx_invs(
                 &chain,
                 walked.as_ref(),
@@ -132,7 +131,6 @@ fn isolated_submit_reaches_no_standing_peer(
         submit.join().unwrap()
     });
     reply.unwrap_or_else(|e| panic!("{method}: {e}"));
-    walked.request_tx_inv();
     rbitcoin_net::peer::queue_due_tx_invs(&chain, walked.as_ref(), &CappedSet::new(), &walk_out);
     for txid in &ours {
         assert!(mp.contains(txid), "{method}: {txid} admitted");

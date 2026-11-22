@@ -187,7 +187,6 @@ async fn blocksonly_sendraw_invs_inbound(
 
     let inbound = relay_peer(peers, [127, 0, 0, 1], rbitcoin_net::peers::PeerConnType::Inbound);
     let block_relay = relay_peer(peers, [127, 0, 0, 1], rbitcoin_net::peers::PeerConnType::BlockRelay);
-    peers.request_all_tx_inv();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &out_tx);
     assert_eq!(tx_invs(&mut out_rx), vec![tx.compute_txid()]);
@@ -464,11 +463,9 @@ async fn force_announce_picks_peers(
     let due_equal = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
     let _due_equal_rx = writer_of(&due_equal);
     due_equal.note_minfeefilter_sat_kvb(rate);
-    due_equal.request_tx_inv();
     let due_above = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
     let _due_above_rx = writer_of(&due_above);
     due_above.note_minfeefilter_sat_kvb(rate.saturating_add(1));
-    due_above.request_tx_inv();
     let (due_eq_tx, mut due_eq_rx) = mpsc::unbounded_channel();
     let (due_hi_tx, mut due_hi_rx) = mpsc::unbounded_channel();
     queue_due_tx_invs(hub, due_equal.as_ref(), &CappedSet::new(), &due_eq_tx);
@@ -479,7 +476,6 @@ async fn force_announce_picks_peers(
         "periodic inv skips a filter above the fee"
     );
     due_above.note_minfeefilter_sat_kvb(0);
-    due_above.request_tx_inv();
     queue_due_tx_invs(hub, due_above.as_ref(), &CappedSet::new(), &due_hi_tx);
     assert!(
         due_hi_rx.try_recv().is_err(),
@@ -538,6 +534,7 @@ async fn force_announce_picks_peers(
     }
 }
 
+#[allow(clippy::cognitive_complexity)] // one journey with pre/post broadcast ticks
 async fn returned_tx_ends_the_private_broadcast(
     hub: &rbitcoin_net::chain::ChainHub,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
@@ -586,6 +583,28 @@ async fn returned_tx_ends_the_private_broadcast(
             mp.is_local_origin(&txid),
             "an inv alone does not end the private broadcast"
         );
+        // A standing session ticks while the private broadcast still holds
+        // `skip_standing_inv`. It advances past the release, so ending the
+        // broadcast must enqueue the tx again.
+        assert!(mp.skip_standing_inv(&txid), "private broadcast still holds the tx");
+        let pre_out = other.writer().expect("other writer");
+        queue_due_tx_invs(hub, other.as_ref(), &CappedSet::new(), &pre_out);
+        assert!(
+            !tx_invs(&mut other_rx).contains(&txid),
+            "no INV of the held tx while the private broadcast is live"
+        );
+        // A peer that handshakes during the private broadcast is above the
+        // original accept generation. The end-of-broadcast requeue must carry
+        // a fresh generation or this peer never hears the tx.
+        let late_after = relay_peer(peers, [127, 0, 0, 4], OutboundFullRelay);
+        late_after.set_inv_gen_floor(mp.next_accept_gen());
+        let mut late_after_rx = writer_of(&late_after);
+        let late_after_out = late_after.writer().expect("late writer");
+        queue_due_tx_invs(hub, late_after.as_ref(), &CappedSet::new(), &late_after_out);
+        assert!(
+            !tx_invs(&mut late_after_rx).contains(&txid),
+            "the accept before the late handshake is hidden"
+        );
 
         let later = notfound_asks_the_next_announcer(hub, peers, &echo, &echo_out, &mut follow, item).await;
         set_relay_clock(hub, peers, submitted.saturating_add(30));
@@ -595,19 +614,27 @@ async fn returned_tx_ends_the_private_broadcast(
             "the tx coming back from a standing peer ends the private broadcast"
         );
         assert!(tx_invs(&mut other_rx).is_empty(), "no announce before the inv timer");
-        other.request_tx_inv();
         let (due_out, mut due_rx) = mpsc::unbounded_channel();
         queue_due_tx_invs(hub, other.as_ref(), &CappedSet::new(), &due_out);
         assert!(tx_invs(&mut due_rx).contains(&txid), "announce on the next inv tick");
-        echo.request_tx_inv();
         let (back_out, mut back_rx) = mpsc::unbounded_channel();
         queue_due_tx_invs(hub, echo.as_ref(), &follow.from_this_peer, &back_out);
         assert!(
             !tx_invs(&mut back_rx).contains(&txid),
             "the peer that sent it does not get it back"
         );
+        queue_due_tx_invs(
+            hub,
+            late_after.as_ref(),
+            &CappedSet::new(),
+            &late_after_out,
+        );
+        assert!(
+            tx_invs(&mut late_after_rx).contains(&txid),
+            "the end-of-broadcast requeue reaches a peer that joined after the accept"
+        );
         let inbound = inbound_waits_thirty_seconds_from_the_echo(hub, peers, txid).await;
-        for s in [block_only, echo, other, later, inbound] {
+        for s in [block_only, echo, other, later, late_after, inbound] {
             peers.unregister(s.id);
         }
     }
@@ -724,19 +751,16 @@ async fn inbound_waits_thirty_seconds_from_the_echo(
     let quiet = |rx: &mut mpsc::UnboundedReceiver<PeerOut>, why: &str| {
         assert!(!tx_invs(rx).contains(&txid), "{why}");
     };
-    inbound.request_tx_inv();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &in_out);
     quiet(&mut in_rx, "an inbound peer stays quiet at the echo");
     let echoed = hub.mempool().unwrap().relay_now_secs();
     set_relay_clock(hub, peers, echoed.saturating_add(29));
-    inbound.request_tx_inv();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &in_out);
     quiet(
         &mut in_rx,
         "an inbound peer stays quiet until 30s after the echo",
     );
     set_relay_clock(hub, peers, echoed.saturating_add(30));
-    inbound.request_tx_inv();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &in_out);
     assert!(
         tx_invs(&mut in_rx).contains(&txid),
@@ -781,9 +805,13 @@ fn relay_on_inbound_age_gate(
         out_rx.try_recv().is_err(),
         "relay-on inbound waits 30s even for unbroadcast"
     );
+    assert_eq!(
+        inbound.snapshot(0).inv_to_send as usize,
+        txs.len(),
+        "every released tx waiting on the 30s gate is counted"
+    );
 
     let outbound = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
-    outbound.request_tx_inv();
     queue_due_tx_invs(hub, outbound.as_ref(), &CappedSet::new(), &out_tx);
     assert_eq!(
         mp.sample_reset_perf().list_live,
@@ -823,7 +851,6 @@ fn relay_on_inbound_age_gate(
         "a relay=false inbound gets only the unbroadcast tx"
     );
     mp.mark_broadcast(&txs[0].compute_txid());
-    block_only.request_tx_inv();
     let _ = mp.sample_reset_perf();
     queue_due_tx_invs(hub, block_only.as_ref(), &CappedSet::new(), &out_tx);
     assert!(
@@ -893,7 +920,6 @@ async fn getdata_until_announced_or_reorg(
 
     mp.admit(&fresh).expect("fresh sendraw");
     mp.note_unbroadcast(fresh.compute_txid());
-    sess.request_tx_inv();
     queue_due_tx_invs(hub, sess.as_ref(), &CappedSet::new(), &out_tx);
     assert!(
         out_rx.try_recv().is_err(),
@@ -1052,4 +1078,165 @@ fn peer_blocksonly_and_orphan_tx() {
 
         let _ = std::fs::remove_dir_all(dir);
     });
+}
+
+/// A peer whose handshake set `inv_gen_floor` after the accept still hears a
+/// rebroadcast: the rebroadcast stamps a fresh accept generation. A peer that
+/// connects after the rebroadcast does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebroadcast_reaches_a_peer_that_joined_after_the_accept() {
+    use rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("repro-rebroadcast-late");
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    hub.confirm_empty_regtest(104).unwrap();
+    let t = hub.tip_header().unwrap().time;
+    hub.clock.set_mock(i64::from(t) + 1);
+    let mp = rbitcoin_net::tx_relay::MempoolHub::open(
+        dir.path().join("mp"),
+        std::sync::Arc::clone(&hub.query),
+    )
+    .unwrap();
+    mp.set_relay_enabled(true);
+    let peers = std::sync::Arc::new(rbitcoin_net::peers::PeerHub::new());
+    peers.attach_mempool(&mp);
+    assert!(hub.attach_mempool(std::sync::Arc::clone(&mp)).is_ok());
+    set_relay_clock(&hub, &peers, 1_700_000_000);
+
+    let tx = spend_coinbase(&hub, 1);
+    mp.admit(&tx).expect("accept");
+    mp.note_unbroadcast(tx.compute_txid());
+
+    let late = relay_peer(&peers, [127, 0, 0, 2], OutboundFullRelay);
+    late.set_inv_gen_floor(mp.next_accept_gen());
+    let (out, mut rx) = mpsc::unbounded_channel();
+    queue_due_tx_invs(&hub, late.as_ref(), &CappedSet::new(), &out);
+    assert!(
+        tx_invs(&mut rx).is_empty(),
+        "the accept before the handshake is not announced"
+    );
+
+    mp.rebroadcast_unbroadcast();
+    queue_due_tx_invs(&hub, late.as_ref(), &CappedSet::new(), &out);
+    let first = tx_invs(&mut rx);
+    assert_eq!(
+        first,
+        vec![tx.compute_txid()],
+        "the rebroadcast reaches a peer that joined after the accept"
+    );
+
+    let after = relay_peer(&peers, [127, 0, 0, 3], OutboundFullRelay);
+    after.set_inv_gen_floor(mp.next_accept_gen());
+    let (after_out, mut after_rx) = mpsc::unbounded_channel();
+    queue_due_tx_invs(&hub, after.as_ref(), &CappedSet::new(), &after_out);
+    assert!(
+        tx_invs(&mut after_rx).is_empty(),
+        "a peer connecting after the rebroadcast does not hear it"
+    );
+    peers.unregister(late.id);
+    peers.unregister(after.id);
+}
+
+/// Relay off: a peer that ticks between accept and `note_unbroadcast` skips
+/// the new local tx. The note itself must enqueue it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn note_unbroadcast_requeues_after_a_relay_off_tick() {
+    use rbitcoin_net::inv_bucket::InvDirection;
+    use rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("rebroadcast-note");
+    hub.ensure_genesis().unwrap();
+    hub.confirm_empty_regtest(104).unwrap();
+    let mp = rbitcoin_net::tx_relay::MempoolHub::open(
+        dir.path().join("mp"),
+        std::sync::Arc::clone(&hub.query),
+    )
+    .unwrap();
+    let peers = std::sync::Arc::new(rbitcoin_net::peers::PeerHub::new());
+    peers.attach_mempool(&mp);
+    assert!(hub.attach_mempool(std::sync::Arc::clone(&mp)).is_ok());
+    set_relay_clock(&hub, &peers, 1_700_000_000);
+
+    let first = spend_coinbase(&hub, 1);
+    mp.admit(&first).expect("first");
+    mp.note_unbroadcast(first.compute_txid());
+    let second = spend_coinbase(&hub, 2);
+    mp.admit(&second).expect("second");
+
+    let peer = peer_with_relay(&peers, [127, 0, 0, 5], OutboundFullRelay, false);
+    let (out, mut rx) = mpsc::unbounded_channel();
+    queue_due_tx_invs(&hub, peer.as_ref(), &CappedSet::new(), &out);
+    let got = tx_invs(&mut rx);
+    assert!(got.contains(&first.compute_txid()), "the noted tx is announced");
+    assert!(
+        !got.contains(&second.compute_txid()),
+        "the not-yet-noted tx is not announced"
+    );
+
+    mp.note_unbroadcast(second.compute_txid());
+    assert_eq!(
+        mp.inv_backlog_len(InvDirection::Inbound),
+        1,
+        "the note queues only the tx just noted, not every unbroadcast tx"
+    );
+    queue_due_tx_invs(&hub, peer.as_ref(), &CappedSet::new(), &out);
+    assert!(
+        tx_invs(&mut rx).contains(&second.compute_txid()),
+        "the note enqueues the tx again"
+    );
+    peers.unregister(peer.id);
+}
+
+/// Core `ReattemptInitialBroadcast`: a still-unbroadcast tx accepted before a
+/// peer connected reaches that peer at the next 10 to 15 minute pass, and not
+/// before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unbroadcast_reattempt_reaches_a_late_peer() {
+    use rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("unbroadcast-reattempt");
+    hub.ensure_genesis().unwrap();
+    hub.confirm_empty_regtest(104).unwrap();
+    let mp = rbitcoin_net::tx_relay::MempoolHub::open(
+        dir.path().join("mp"),
+        std::sync::Arc::clone(&hub.query),
+    )
+    .unwrap();
+    mp.set_relay_enabled(false);
+    let peers = std::sync::Arc::new(rbitcoin_net::peers::PeerHub::new());
+    peers.attach_mempool(&mp);
+    assert!(hub.attach_mempool(std::sync::Arc::clone(&mp)).is_ok());
+    let t0 = 1_700_000_000;
+    set_relay_clock(&hub, &peers, t0);
+
+    let a = spend_coinbase(&hub, 1);
+    mp.admit(&a).expect("accept A");
+    mp.note_unbroadcast(a.compute_txid());
+    mp.reattempt_unbroadcast_due();
+
+    let p = relay_peer(&peers, [127, 0, 0, 1], OutboundFullRelay);
+    p.set_inv_gen_floor(mp.next_accept_gen());
+    let mut p_rx = writer_of(&p);
+    let p_out = p.writer().expect("P writer");
+    let p_follow = PeerFollowState::new();
+    let mut ann_rx = mp.subscribe_announces();
+    let mut tick = || {
+        while let Ok(ann) = ann_rx.try_recv() {
+            on_tx_announce(&hub, &p_out, &p_follow, Some(p.as_ref()), Some(Ok(ann))).unwrap();
+        }
+        queue_due_tx_invs(&hub, p.as_ref(), &CappedSet::new(), &p_out);
+        tx_invs(&mut p_rx)
+    };
+    assert!(tick().is_empty(), "A predates P's handshake");
+
+    set_relay_clock(&hub, &peers, t0 + 599);
+    mp.reattempt_unbroadcast_due();
+    assert!(tick().is_empty(), "no pass before 10 minutes");
+
+    set_relay_clock(&hub, &peers, t0 + 900);
+    mp.reattempt_unbroadcast_due();
+    assert_eq!(
+        tick(),
+        vec![a.compute_txid()],
+        "the pass by 15 minutes reaches the late peer once"
+    );
+    peers.unregister(p.id);
 }

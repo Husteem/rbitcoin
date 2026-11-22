@@ -414,48 +414,46 @@ fn expire_stale_reaches_a_live_tx_behind_evicted_ghosts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// One age-INV walk holds the relay index that every session point lookup
-/// takes. A session starting at `(0, 0)` reads a long log a bounded slice
-/// at a time, and the cursor resumes until the whole log is covered.
-#[test]
-fn age_inv_walk_is_bounded_and_resumes_from_the_cursor() {
-    let (_store, q, _cbs) = pad_cbs(1);
+/// One released-INV read holds the global bucket lock. A session cursor
+/// reads a long log a bounded slice at a time, and the cursor resumes until
+/// the whole log is covered.
+#[tokio::test]
+async fn released_inv_log_is_bounded_and_resumes_from_the_cursor() {
+    let (_store, q, cbs) = pad_cbs(1);
     let dir = tmp();
     let hub = MempoolHub::open(&dir, q).unwrap();
-    let rows = AGE_INV_SCAN_MAX * 2 + 5;
-    let mut want = BTreeSet::new();
-    for i in 0..rows {
-        let mut raw = [0u8; 32];
-        raw[0..4].copy_from_slice(&(i as u32 + 1).to_le_bytes());
-        let txid = Txid::from_byte_array(raw);
-        raw[31] = 1;
-        let wtxid = Wtxid::from_byte_array(raw);
-        hub.insert_relay_maps(txid, wtxid, i as u64 + 1, 1, true);
-        want.insert(wtxid);
+    let rows = RELEASED_INV_SCAN_MAX * 2 + 5;
+    let dirn = rbitcoin_net::inv_bucket::InvDirection::Outbound;
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let live = spend_true(cbs[0], 1_000, spk);
+    hub.accept_tx_async(live.clone()).await.expect("accept");
+    let (txid, wtxid) = (live.compute_txid(), live.compute_wtxid());
+    {
+        let mut g = hub.inv_buckets.lock().unwrap();
+        for _ in 0..rows {
+            g.push_released(dirn, txid, wtxid);
+        }
     }
-    let now = 1_000;
-    let mut seen = (0, 0);
-    let mut got = BTreeSet::new();
+    let mut seen = 0;
+    let mut total = 0;
     let mut calls = 0;
     loop {
-        let (last, due) = hub.try_age_inv_since(seen, now).expect("index free");
+        let (last, released) = hub.take_released_invs(dirn, seen, RELEASED_INV_SCAN_MAX);
         assert!(
-            due.len() <= AGE_INV_SCAN_MAX,
-            "one walk returned {} rows",
-            due.len()
+            released.len() <= RELEASED_INV_SCAN_MAX,
+            "one read returned {} rows",
+            released.len()
         );
-        if due.is_empty() {
-            assert_eq!(last, seen, "an empty walk keeps the cursor");
+        if released.is_empty() {
+            assert_eq!(last, seen, "an empty read keeps the cursor");
             break;
         }
-        for (_, w) in due {
-            assert!(got.insert(w), "a resumed walk repeated a row");
-        }
+        total += released.len();
         seen = last;
         calls += 1;
         assert!(calls <= rows, "the cursor never reached the end");
     }
-    assert_eq!(got, want, "the resumed walks cover the whole log");
+    assert_eq!(total, rows, "the resumed reads cover the whole log");
     assert_eq!(calls, 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2317,13 +2315,7 @@ fn unindex_drops_relay_seq_and_accept_at() {
         Err(AcceptError::Orphaned { .. })
     ));
     let orphan_w = orphan.compute_wtxid();
-    hub.insert_relay_maps(
-        orphan.compute_txid(),
-        orphan_w,
-        1,
-        hub.relay_now_secs(),
-        true,
-    );
+    hub.insert_relay_maps(orphan.compute_txid(), orphan_w, 1, hub.relay_now_secs());
     assert!(hub.relay_seq_of(&orphan_w).is_some());
     hub.unindex_if_absent(&orphan);
     assert!(
@@ -2332,13 +2324,7 @@ fn unindex_drops_relay_seq_and_accept_at() {
     );
     let absent = spend_true(cbs[2], 3_000, ScriptBuf::from_bytes(vec![0x51]));
     let absent_w = absent.compute_wtxid();
-    hub.insert_relay_maps(
-        absent.compute_txid(),
-        absent_w,
-        1,
-        hub.relay_now_secs(),
-        true,
-    );
+    hub.insert_relay_maps(absent.compute_txid(), absent_w, 1, hub.relay_now_secs());
     assert!(hub.relay_seq_of(&absent_w).is_some());
     hub.unindex_if_absent(&absent);
     assert!(
@@ -7664,5 +7650,270 @@ fn admit_1p1c_meters_the_chunk_before_orphan_promotion() {
         !moved.contains(&child_i),
         "1p1c must not meter the child at the rate it has after the sibling moves the chunk, buckets={moved:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A burst larger than the count bucket queues globally and drains as time
+/// advances. A full bucket releases 420 tokens plus the 70 floor. Outbound
+/// refills at 2.5x, so after 7 s inbound releases 98 while outbound drains
+/// the rest.
+#[tokio::test]
+async fn inv_bucket_caps_a_burst_and_outbound_drains_faster() {
+    use bitcoin::transaction::Version as TxVersion;
+    use rbitcoin_net::inv_bucket::InvDirection;
+    use rbitcoin_primitives::Height;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("inv-bucket-burst");
+    hub.ensure_genesis().unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
+    let coinbase = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap()
+        .txdata[0]
+        .clone();
+    let each = coinbase.output[0].value.to_sat() / 2 / 700;
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let fanout = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: coinbase.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: (0..700)
+            .map(|_| TxOut {
+                value: Amount::from_sat(each),
+                script_pubkey: spk.clone(),
+            })
+            .collect(),
+    };
+    hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![fanout.clone()])
+        .unwrap();
+    let mp = MempoolHub::open(dir.path().join("pool"), hub.query.clone()).unwrap();
+    mp.set_relay_enabled(true);
+    mp.note_mock_now(1_000);
+    assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+    let parent = fanout.compute_txid();
+    for vout in 0..700u32 {
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: parent, vout },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(each - 1_000),
+                script_pubkey: spk.clone(),
+            }],
+        };
+        mp.accept_tx_async(child).await.expect("child");
+    }
+    assert_eq!(mp.inv_backlog_len(InvDirection::Inbound), 700);
+    assert_eq!(mp.inv_backlog_len(InvDirection::Outbound), 700);
+
+    mp.drain_inv_backlog(1_000_000);
+    let (in_cursor, inbound) = mp.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
+    let (out_cursor, outbound) = mp.take_released_invs(InvDirection::Outbound, 0, usize::MAX);
+    assert_eq!(inbound.len(), 490, "420 tokens overdrawn to the -70 floor");
+    assert_eq!(outbound.len(), 490, "outbound shares the count floor");
+    assert_eq!(mp.inv_backlog_len(InvDirection::Inbound), 210);
+    assert_eq!(mp.inv_backlog_len(InvDirection::Outbound), 210);
+    assert_eq!(in_cursor, 490, "inbound read the first 490 releases");
+    assert_eq!(out_cursor, 980, "outbound read the next 490 releases");
+
+    mp.drain_inv_backlog(1_007_000);
+    let (_, inbound) = mp.take_released_invs(InvDirection::Inbound, in_cursor, usize::MAX);
+    let (_, outbound) = mp.take_released_invs(InvDirection::Outbound, out_cursor, usize::MAX);
+    assert_eq!(inbound.len(), 98, "14 tx/s * 7 s from the -70 floor");
+    assert_eq!(outbound.len(), 210, "35 tx/s * 7 s drains the rest faster");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A released tx that confirmed before a slow session read it is dropped from
+/// the log, not announced as an unknown hash.
+#[tokio::test]
+async fn released_inv_log_drops_a_tx_that_left_the_pool() {
+    use rbitcoin_net::inv_bucket::InvDirection;
+    let (_store, q, cbs) = pad_cbs(3);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    hub.set_relay_enabled(true);
+    hub.note_mock_now(1_000);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let gone = spend_true(cbs[0], 1_000, spk.clone());
+    let stay = spend_true(cbs[1], 1_000, spk);
+    hub.accept_tx_async(gone.clone()).await.expect("gone");
+    hub.accept_tx_async(stay.clone()).await.expect("stay");
+    hub.drain_inv_backlog(1_000_000);
+    let before = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
+    assert_eq!(before.1.len(), 2);
+
+    hub.remove_for_block(&[gone.compute_txid()], MINED);
+    hub.drain_inv_backlog(1_000_000);
+    assert_eq!(
+        hub.inv_buckets.lock().unwrap().released_inbound.len(),
+        1,
+        "the dead front row is pruned from the log"
+    );
+    let (_, after) = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
+    assert_eq!(
+        after.iter().map(|(_, _, w)| *w).collect::<Vec<_>>(),
+        vec![stay.compute_wtxid()],
+        "the confirmed tx is not replayed from the released log"
+    );
+    let (stay_id, stay_w) = (stay.compute_txid(), stay.compute_wtxid());
+    {
+        let mut g = hub.inv_buckets.lock().unwrap();
+        for _ in 0..(RELEASED_INV_LOG_CAP + 5) {
+            g.push_released(InvDirection::Inbound, stay_id, stay_w);
+        }
+    }
+    hub.drain_inv_backlog(1_000_000);
+    assert_eq!(
+        hub.inv_buckets.lock().unwrap().released_inbound.len(),
+        RELEASED_INV_LOG_CAP,
+        "the released log is capped"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A dead row between two live releases is skipped for both directions, so
+/// an inbound 30 s age check on that row cannot stall every later tx.
+#[tokio::test]
+async fn released_inv_skips_a_dead_middle_row() {
+    use rbitcoin_net::inv_bucket::InvDirection;
+    let (_store, q, cbs) = pad_cbs(4);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    hub.set_relay_enabled(true);
+    hub.note_mock_now(1_000);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let txs: Vec<_> = cbs[..3]
+        .iter()
+        .map(|cb| spend_true(*cb, 1_000, spk.clone()))
+        .collect();
+    for tx in &txs {
+        hub.accept_tx_async(tx.clone()).await.expect("accept");
+    }
+    hub.drain_inv_backlog(1_000_000);
+    hub.remove_for_block(&[txs[1].compute_txid()], MINED);
+    let (last, rows) = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
+    assert_eq!(
+        rows.iter().map(|(_, _, w)| *w).collect::<Vec<_>>(),
+        vec![txs[0].compute_wtxid(), txs[2].compute_wtxid()],
+        "the dead middle row is skipped"
+    );
+    assert_eq!(last, 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A cursor behind a pruned release skips the gap, and a blocked read leaves
+/// the cursor on the row before it instead of jumping the whole log.
+#[test]
+fn released_inv_cursor_advances_over_a_pruned_gap() {
+    use rbitcoin_net::inv_bucket::InvDirection;
+    let (_store, q, _cbs) = pad_cbs(1);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    let out = InvDirection::Outbound;
+    let txid = |b: u8| Txid::from_byte_array([b; 32]);
+    let wtxid = |b: u8| Wtxid::from_byte_array([b; 32]);
+    {
+        let mut g = hub.inv_buckets.lock().unwrap();
+        g.push_released(out, txid(1), wtxid(1));
+        g.push_released(out, txid(2), wtxid(2));
+        g.released_outbound.pop_first();
+    }
+    let (last, rows) = hub.take_released_invs(out, 0, 0);
+    assert!(rows.is_empty());
+    assert_eq!(last, 1, "a pruned front advances the cursor to its gap");
+    {
+        let mut g = hub.inv_buckets.lock().unwrap();
+        g.released_outbound.clear();
+    }
+    let (last, rows) = hub.take_released_invs(out, 0, usize::MAX);
+    assert!(rows.is_empty());
+    assert_eq!(last, 2, "an emptied log advances past the last release");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The size bucket stops a batch one tx past the -50 kB floor. A relay-off
+/// session does not resume at 20 kB/s; an outbound one resumes at 50 kB/s.
+#[tokio::test]
+async fn inv_size_bucket_stops_at_the_floor_and_resumes() {
+    use bitcoin::transaction::Version as TxVersion;
+    use rbitcoin_net::inv_bucket::InvDirection;
+    let (_store, q, cbs) = pad_cbs(4);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    hub.set_relay_enabled(true);
+    hub.note_mock_now(1_000);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    // ~66 kB: one tx crosses the -50 kB floor from a positive balance.
+    let large = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cbs[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: (0..6_000)
+            .map(|_| TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: spk.clone(),
+            })
+            .collect(),
+    };
+    let small: Vec<_> = cbs[1..3]
+        .iter()
+        .map(|cb| spend_true(*cb, 1_000, spk.clone()))
+        .collect();
+    hub.accept_tx_async(large).await.expect("large");
+    for tx in &small {
+        hub.accept_tx_async(tx.clone()).await.expect("small");
+    }
+    assert_eq!(hub.inv_backlog_len(InvDirection::Inbound), 3);
+    assert_eq!(hub.inv_backlog_len(InvDirection::Outbound), 3);
+
+    let now = 1_000_000;
+    hub.set_inv_tokens(InvDirection::Inbound, 100.0, 1.0);
+    hub.set_inv_tokens(InvDirection::Outbound, 100.0, 1.0);
+    hub.drain_inv_backlog(now);
+    let (in_cursor, inbound) = hub.take_released_invs(InvDirection::Inbound, 0, usize::MAX);
+    let (out_cursor, outbound) = hub.take_released_invs(InvDirection::Outbound, 0, usize::MAX);
+    assert_eq!(inbound.len(), 1, "the tx that crosses the floor still goes");
+    assert_eq!(outbound.len(), 1);
+    assert_eq!(hub.inv_backlog_len(InvDirection::Inbound), 2);
+    assert_eq!(hub.inv_backlog_len(InvDirection::Outbound), 2);
+
+    hub.drain_inv_backlog(now + 2_000);
+    let (in_cursor, inbound) = hub.take_released_invs(InvDirection::Inbound, in_cursor, usize::MAX);
+    let (out_cursor, outbound) =
+        hub.take_released_invs(InvDirection::Outbound, out_cursor, usize::MAX);
+    assert!(
+        inbound.is_empty(),
+        "20 kB/s has not cleared the floor in 2 s"
+    );
+    assert_eq!(outbound.len(), 2, "50 kB/s clears it for outbounds");
+
+    hub.drain_inv_backlog(now + 4_000);
+    let (_, inbound) = hub.take_released_invs(InvDirection::Inbound, in_cursor, usize::MAX);
+    assert_eq!(inbound.len(), 2, "inbound resumes after more time");
+    assert_eq!(hub.inv_backlog_len(InvDirection::Outbound), 0);
+    let _ = out_cursor;
     let _ = std::fs::remove_dir_all(&dir);
 }

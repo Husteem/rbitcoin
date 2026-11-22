@@ -1667,6 +1667,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             if matches!(wake, TipFollowWake::Perf) {
                 if let Err(e) = mempool_blocking(&mempool, |mp| {
                     mp.publish_fee_floor();
+                    mp.reattempt_unbroadcast_due();
                     mp.persist_due()
                 })
                 .await?

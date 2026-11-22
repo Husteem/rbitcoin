@@ -383,8 +383,8 @@ fn peerhub_hb_select() {
     assert!(!a.is_sync_started());
     assert!(hub.try_start_headers_sync(&c, now, genesis_time));
 
-    // Announced txs are per peer, by the hash the INV carried, roll the
-    // oldest at the cap, and tx inv is due on a timer or on request.
+    // Announced txs are per peer, by the hash the INV carried, and roll the
+    // oldest at the cap.
     let tx_n = |i: u32| {
         let mut t = [0u8; 32];
         t[..4].copy_from_slice(&i.to_le_bytes());
@@ -402,11 +402,6 @@ fn peerhub_hb_select() {
     );
     assert!(!e.has_announced(&txid_inv(1)));
     assert!(!f.has_announced(&txid_inv(0)));
-    assert!(!e.take_tx_inv_due(1_700_000_000));
-    assert!(!e.take_tx_inv_due(1_700_000_010));
-    assert!(e.take_tx_inv_due(1_700_000_040));
-    e.request_tx_inv();
-    assert!(e.take_tx_inv_due(1_700_000_041));
     for i in 1..=50_000 {
         e.note_announced_tx(tx_n(i).0, tx_n(i).1);
     }
