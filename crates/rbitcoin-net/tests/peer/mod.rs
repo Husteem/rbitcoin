@@ -10852,6 +10852,7 @@ mod walk_depth_pins {
     ) -> std::sync::Arc<rbitcoin_net::chain::ChainHub> {
         let hub = std::sync::Arc::new(hub);
         tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .expect("runtime")
             .block_on(hub.generate_to_script_for_rpc_async(
