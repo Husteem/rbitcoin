@@ -330,7 +330,14 @@ pub fn refusable_addr(
 ) -> Option<(Arc<crate::peers::PeerHub>, crate::peers::DiscourageKey)> {
     let s = session.filter(|s| !misbehavior_exempt(s))?;
     let key = crate::peers::DiscourageKey::from_net(s.net)?;
-    Some((s.peer_hub()?, key))
+    let hub = s.peer_hub()?;
+    if s.inbound
+        && matches!(key, crate::peers::DiscourageKey::Ip(_))
+        && hub.onion_bind() == Some(s.addrbind)
+    {
+        return None;
+    }
+    Some((hub, key))
 }
 
 /// One-day in-memory refusal.

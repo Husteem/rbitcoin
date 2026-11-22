@@ -2492,7 +2492,7 @@ impl PeerHub {
         self.overlay_loopback_forward.store(on, Ordering::Relaxed);
     }
 
-    fn onion_bind(&self) -> Option<SocketAddr> {
+    pub(crate) fn onion_bind(&self) -> Option<SocketAddr> {
         self.net_perms
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3392,14 +3392,18 @@ impl PeerHub {
             .contains_key(&key)
     }
 
-    /// True when this inbound address or its accept-time netgroup is still
-    /// refused. Expired rows are dropped here, which is the only sweep.
-    pub fn inbound_discouraged(&self, addr: SocketAddr) -> bool {
+    /// Refuse an inbound TCP source or its netgroup on an ordinary listener.
+    /// On a marked onion listener the TCP source identifies the forwarder.
+    #[doc(hidden)]
+    pub fn inbound_discouraged(&self, peer_addr: SocketAddr, local_addr: SocketAddr) -> bool {
+        if self.onion_bind() == Some(local_addr) {
+            return false;
+        }
         // `key_refused` drops expired rows.
-        if self.key_refused(DiscourageKey::Ip(addr.ip())) {
+        if self.key_refused(DiscourageKey::Ip(peer_addr.ip())) {
             return true;
         }
-        let group = crate::netgroup::slot_pause_group(addr);
+        let group = crate::netgroup::slot_pause_group(peer_addr);
         self.discouraged_groups
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4668,7 +4672,7 @@ impl PeerHub {
         };
         if let Some(p) = self
             .get(id)
-            .filter(|p| !p.addr.ip().is_loopback() || self.onion_bind() != Some(p.addrbind))
+            .filter(|p| p.net.socket_addr().is_none() || self.onion_bind() != Some(p.addrbind))
         {
             self.note_slot_evict(crate::netgroup::slot_pause_group(p.addr));
         }

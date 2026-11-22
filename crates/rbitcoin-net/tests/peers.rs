@@ -1948,22 +1948,24 @@ fn try_evict_inbound_disconnects_one_peer() {
 }
 
 #[test]
-fn slot_eviction_skips_cooldown_only_for_loopback_on_the_onion_bind() {
-    for (bind, onion_bind, source, paused) in [
-        ("127.0.0.1:8334", "127.0.0.1:8334", "127.0.0.1", false),
-        ("127.0.0.1:8333", "127.0.0.1:8334", "127.0.0.1", true),
-        ("10.0.3.2:8334", "10.0.3.2:8334", "10.0.3.1", true),
+fn onion_bind_eviction_skips_the_forwarder_group() {
+    for (local, source, marked) in [
+        ([127, 0, 0, 1], [127, 0, 0, 1], false),
+        ([127, 0, 0, 1], [127, 0, 0, 1], true),
+        ([10, 0, 3, 2], [10, 0, 3, 1], false),
+        ([10, 0, 3, 2], [10, 0, 3, 1], true),
     ] {
+        let ordinary = SocketAddr::from((local, 8333));
+        let onion = SocketAddr::from((local, 8334));
+        let bind = if marked { onion } else { ordinary };
         let hub = PeerHub::new();
-        let bind = bind.parse().unwrap();
-        let source: IpAddr = source.parse().unwrap();
         hub.set_net_perms(rbitcoin_net::net_permissions::NetPermTable {
-            onion_bind: Some(onion_bind.parse().unwrap()),
+            onion_bind: Some(onion),
             ..Default::default()
         });
         for port in 40000..40030 {
             hub.register_connecting(
-                SocketAddr::new(source, port),
+                SocketAddr::from((source, port)),
                 bind,
                 true,
                 PeerConnType::Inbound,
@@ -1971,12 +1973,49 @@ fn slot_eviction_skips_cooldown_only_for_loopback_on_the_onion_bind() {
         }
         assert!(hub.try_evict_inbound(), "an inbound session is evicted");
         assert_eq!(hub.snapshot().len(), 29);
+        let next = SocketAddr::from((source, 40030));
         assert_eq!(
-            hub.inbound_discouraged(SocketAddr::new(source, 40030)),
-            paused,
-            "unexpected admission decision for {source} on {bind}"
+            hub.inbound_discouraged(next, ordinary),
+            !marked,
+            "unexpected refusal state for eviction on {bind}"
         );
+        assert!(!hub.inbound_discouraged(next, onion));
     }
+}
+
+#[test]
+fn onion_bind_disconnects_are_session_local() {
+    use rbitcoin_net::error::NetError::Protocol;
+    use rbitcoin_net::peer::{punish_disconnect, rate_limit_disconnect, BAN_SCORE_THRESHOLD};
+
+    let hub = PeerHub::new();
+    let ordinary = "10.0.3.2:8333".parse().unwrap();
+    let onion = "10.0.3.2:8334".parse().unwrap();
+    let source = |port| SocketAddr::from(([10, 0, 3, 1], port));
+    hub.set_net_perms(rbitcoin_net::net_permissions::NetPermTable {
+        onion_bind: Some(onion),
+        ..Default::default()
+    });
+    let register =
+        |port, bind| hub.register_connecting(source(port), bind, true, PeerConnType::Inbound);
+    let mut score = 0;
+    punish_disconnect(&mut score, Some(&register(40000, onion)));
+    assert!(score >= BAN_SCORE_THRESHOLD);
+    assert!(hub.snapshot().is_empty());
+    assert!(!hub.inbound_discouraged(source(40001), ordinary));
+
+    for (port, bind) in [(40001, onion), (40002, ordinary), (40003, onion)] {
+        assert!(matches!(
+            rate_limit_disconnect(Some(&register(port, bind))),
+            Protocol("peer rate limit")
+        ));
+    }
+    assert!(matches!(
+        rate_limit_disconnect(Some(&register(40004, ordinary))),
+        Protocol("peer misbehavior threshold")
+    ));
+    assert!(hub.inbound_discouraged(source(40005), ordinary));
+    assert!(!hub.inbound_discouraged(source(40005), onion));
 }
 
 /// Thirty CJDNS inbound peers share one four-bit eviction group and sit in
@@ -1998,10 +2037,10 @@ fn slot_eviction_pauses_a_cjdns_slash32_not_its_group() {
     }
     assert!(hub.try_evict_inbound(), "an inbound peer is evicted");
     let paused = (1..=30u16)
-        .filter(|net| hub.inbound_discouraged(cjdns(*net, 2)))
+        .filter(|net| hub.inbound_discouraged(cjdns(*net, 2), bind))
         .count();
     assert_eq!(paused, 1, "only the evicted peer's /32 waits");
-    assert!(!hub.inbound_discouraged(cjdns(0xffff, 1)));
+    assert!(!hub.inbound_discouraged(cjdns(0xffff, 1), bind));
 }
 
 #[test]
