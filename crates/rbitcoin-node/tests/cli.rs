@@ -909,7 +909,8 @@ fn testnet3_default_milestone_is_anchored() {
 /// on disk while the prune height lags. Startup has to seal the gap
 /// before it advances that height, or the witnesses are deleted and the
 /// index can never be built.
-/// Unit: `enter_tip_mode_indexes` cannot hold the tip flush ahead of the tweak rows.
+/// Stays a unit because `enter_tip_mode_indexes` cannot hold the tip flush
+/// ahead of the tweak rows.
 #[test]
 fn restart_seals_a_pruned_tweak_gap_before_the_prune_height_advances() {
     use rbitcoin_primitives::{Fk, Height};
