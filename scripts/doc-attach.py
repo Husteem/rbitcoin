@@ -37,80 +37,86 @@ def git(root: str, *args: str) -> str:
     return out.stdout
 
 
-def block_lines(lines: list[str]) -> list[bool]:
-    """True for each line that is part of a doc comment or an attribute."""
+STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def classify(lines: list[str]) -> tuple[list[bool], list[bool]]:
+    """Per line: is it a doc comment or attribute, and is it a plain comment."""
     marks = [False] * len(lines)
+    plain = [False] * len(lines)
     depth = 0
+    in_block: str | None = None
     for i, raw in enumerate(lines):
         line = raw.strip()
+        if in_block:
+            (marks if in_block == "doc" else plain)[i] = True
+            if "*/" in line:
+                in_block = None
+            continue
         if depth:
             marks[i] = True
-            depth += line.count("[") - line.count("]")
+            bare = STRING.sub("", line)
+            depth += bare.count("[") - bare.count("]")
             continue
-        if line.startswith("///") or line.startswith("/**"):
+        if line.startswith("///"):
             marks[i] = True
+        elif line.startswith("/*"):
+            doc = line.startswith("/**") and not line.startswith("/***")
+            (marks if doc else plain)[i] = True
+            if "*/" not in line[2:]:
+                in_block = "doc" if doc else "plain"
+        elif line.startswith("//"):
+            plain[i] = True
         elif line.startswith("#["):
             marks[i] = True
-            depth = max(line.count("[") - line.count("]"), 0)
-    return marks
+            bare = STRING.sub("", line)
+            depth = max(bare.count("[") - bare.count("]"), 0)
+    return marks, plain
 
 
-def skipped(lines: list[str], marks: list[bool], i: int) -> bool:
-    line = lines[i].strip()
-    return marks[i] or not line or line.startswith("//")
+class Side:
+    def __init__(self, text: str):
+        self.lines = text.split("\n")
+        self.marks, self.plain = classify(self.lines)
 
+    def skipped(self, i: int) -> bool:
+        return self.marks[i] or self.plain[i] or not self.lines[i].strip()
 
-def target_under(lines: list[str], marks: list[bool], i: int) -> int | None:
-    """Index of the first code line below block line `i`."""
-    for j in range(i + 1, len(lines)):
-        if not skipped(lines, marks, j):
-            return j
-    return None
+    def target_under(self, i: int) -> int | None:
+        """Index of the first code line below block line `i`."""
+        for j in range(i + 1, len(self.lines)):
+            if not self.skipped(j):
+                return j
+        return None
 
+    def block_above(self, i: int) -> list[int]:
+        """Indexes of the doc and attribute lines that attach to code line `i`."""
+        block = []
+        for j in range(i - 1, -1, -1):
+            if not self.skipped(j):
+                break
+            if self.marks[j]:
+                block.append(j)
+        return block[::-1]
 
-def block_above(lines: list[str], marks: list[bool], i: int) -> tuple[str, ...]:
-    """The doc and attribute lines that attach to code line `i`."""
-    block = []
-    for j in range(i - 1, -1, -1):
-        if not skipped(lines, marks, j):
-            break
-        if marks[j]:
-            block.append(lines[j].strip())
-    return tuple(reversed(block))
+    def text(self, i: int) -> str:
+        return self.lines[i].strip()
 
 
 def is_doc(line: str) -> bool:
-    return line.startswith("///") or line.startswith("/**")
+    return line.startswith("///") or line.startswith("/**") or line.startswith("*")
 
 
-def lost(line: str, block: tuple[str, ...]) -> bool:
-    """The item that had `line` above it now has `block`. Did it lose `line`?
-
-    An item whose doc was rewritten still has a doc, so its old lines moving
-    to a new item is a hand-over, not a loss.
-    """
-    if is_doc(line):
-        return not any(is_doc(b) for b in block)
-    return line not in block
-
-
-def stacked(line: str, block: tuple[str, ...]) -> bool:
-    """`line` now sits above an item that had `block`. Is it a leftover?
-
-    An item with no doc of its own may inherit the doc of a deleted wrapper.
-    """
-    if is_doc(line):
-        return any(is_doc(b) for b in block) and line not in block
-    return line not in block
-
-
-def unchanged_map(root: str, base: str, head: str, path: str) -> dict[int, int]:
-    """Map each unchanged HEAD line number to its BASE line number (0-based)."""
-    diff = git(root, "diff", "--no-color", "-U0", base, head, "--", path)
-    post_len = len(git(root, "show", f"{head}:{path}").split("\n"))
+def unchanged_map(root: str, old_blob: str, new_blob: str, new_len: int) -> dict[int, int]:
+    """Map each unchanged new line number to its old line number (0-based)."""
+    out = subprocess.run(
+        ["git", "-C", root, "diff", "--no-color", "-U0", old_blob, new_blob],
+        capture_output=True,
+        text=True,
+    )
     mapping: dict[int, int] = {}
     pre = post = 0
-    for line in diff.split("\n"):
+    for line in out.stdout.split("\n"):
         m = HUNK.match(line)
         if not m:
             continue
@@ -126,44 +132,52 @@ def unchanged_map(root: str, base: str, head: str, path: str) -> dict[int, int]:
             post += 1
         pre = pre_first - 1 + pre_n
         post = post_first - 1 + post_n
-    while post < post_len:
+    while post < new_len:
         mapping[post] = pre
         pre += 1
         post += 1
     return mapping
 
 
-def check_file(root: str, base: str, head: str, path: str) -> list[str]:
-    old = git(root, "show", f"{base}:{path}").split("\n")
-    new = git(root, "show", f"{head}:{path}").split("\n")
-    old_marks, new_marks = block_lines(old), block_lines(new)
-    to_old = unchanged_map(root, base, head, path)
+def check_file(root: str, base: str, head: str, old_path: str, path: str) -> list[str]:
+    old_blob, new_blob = f"{base}:{old_path}", f"{head}:{path}"
+    old, new = Side(git(root, "show", old_blob)), Side(git(root, "show", new_blob))
+    to_old = unchanged_map(root, old_blob, new_blob, len(new.lines))
     to_new = {o: n for n, o in to_old.items()}
     errors = []
     seen = set()
-    for i, marked in enumerate(new_marks):
+    for i, marked in enumerate(new.marks):
         if not marked or i not in to_old:
             continue
-        was = target_under(old, old_marks, to_old[i])
-        now = target_under(new, new_marks, i)
-        if was is None or now is None or old[was].strip() == new[now].strip():
+        was, now = old.target_under(to_old[i]), new.target_under(i)
+        if was is None or now is None or old.text(was) == new.text(now):
             continue
         if (was, now) in seen:
             continue
-        line = new[i].strip()
+        line = new.text(i)
         if was in to_new:
-            if lost(line, block_above(new, new_marks, to_new[was])):
+            # The item the line sat on is still there. It lost the line unless
+            # its doc was rewritten: then every doc line it has is a new one.
+            block = new.block_above(to_new[was])
+            texts = [new.text(j) for j in block]
+            docs = [j for j in block if is_doc(new.text(j))]
+            handed_over = docs and not any(j in to_old for j in docs)
+            if line not in texts and not (is_doc(line) and handed_over):
                 seen.add((was, now))
                 errors.append(
-                    f"{path}:{i + 1}: this block sat on `{old[was].strip()}` and now sits "
-                    f"on `{new[now].strip()}`. Move the new item above the block."
+                    f"{path}:{i + 1}: this block sat on `{old.text(was)}` and now sits "
+                    f"on `{new.text(now)}`. Move the new item above the block."
                 )
         elif now in to_old:
-            if stacked(line, block_above(old, old_marks, to_old[now])):
+            # The line's item is gone. It is a leftover unless the item it
+            # fell on had no doc of its own, as when a wrapper is folded in.
+            texts = [old.text(j) for j in old.block_above(to_old[now])]
+            had_doc = any(is_doc(t) for t in texts)
+            if line not in texts and (had_doc or not is_doc(line)):
                 seen.add((was, now))
                 errors.append(
-                    f"{path}:{i + 1}: this block sat on `{old[was].strip()}`, which is "
-                    f"gone, and now sits on `{new[now].strip()}`. Delete the block with "
+                    f"{path}:{i + 1}: this block sat on `{old.text(was)}`, which is "
+                    f"gone, and now sits on `{new.text(now)}`. Delete the block with "
                     "its item."
                 )
     return errors
@@ -175,12 +189,14 @@ def main() -> int:
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--root", default=".")
     args = parser.parse_args()
-    names = git(
-        args.root, "diff", "--name-only", "--diff-filter=M", args.base, args.head, "--", "*.rs"
+    status = git(
+        args.root, "diff", "--name-status", "-M", "--diff-filter=MR", args.base, args.head,
+        "--", "*.rs",
     )
     errors = []
-    for path in names.split():
-        errors.extend(check_file(args.root, args.base, args.head, path))
+    for row in status.splitlines():
+        fields = row.split("\t")
+        errors.extend(check_file(args.root, args.base, args.head, fields[1], fields[-1]))
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1

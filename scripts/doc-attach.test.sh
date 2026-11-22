@@ -122,6 +122,56 @@ pub fn connecting_n() {}
 EOF2
 assert_ok "an undocumented item may take a deleted wrapper's doc" check wrapper
 
+change split <<'EOF2'
+/// Docs for a.
+/// More about a.
+fn a() {}
+====
+/// Docs for a.
+fn b() {}
+
+/// More about a.
+fn a() {}
+EOF2
+assert_fail_quiet "an item inserted inside a doc block fails" check split
+
+change block-doc <<'EOF2'
+/**
+ * Docs for a.
+ */
+fn a() {}
+====
+/**
+ * Docs for a.
+ */
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "an item inserted under a /** */ doc fails" check block-doc
+
+change bracket-in-string <<'EOF2'
+#[doc = "Array ["]
+fn a() {}
+====
+#[doc = "Array ["]
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "a bracket inside an attribute string does not hide the insert" \
+  check bracket-in-string
+
+change block-comment <<'EOF2'
+/// Docs for a.
+fn a() {}
+====
+/// Docs for a.
+/* Read by the metrics page only. */
+fn a() {}
+EOF2
+assert_ok "a block comment between a block and its item passes" check block-comment
+
 change rename <<'EOF2'
 /// Bits the next header must carry.
 fn next_bits() {}
@@ -192,6 +242,33 @@ fn next_work_bits() {}
 fn next_work_bits() {}
 EOF2
 assert_ok "adding a line to the block passes" check longer-doc
+
+change moved-file <<'EOF2'
+/// Docs for a.
+fn a() {}
+
+fn filler_one() {}
+
+fn filler_two() {}
+
+fn filler_three() {}
+====
+/// Docs for a.
+fn b() {}
+
+fn a() {}
+
+fn filler_one() {}
+
+fn filler_two() {}
+
+fn filler_three() {}
+EOF2
+git -C "$WORK/moved-file" reset -q --hard HEAD^
+git -C "$WORK/moved-file" mv src/lib.rs src/moved.rs
+sed -i 's|^fn a() {}$|fn b() {}\n\nfn a() {}|' "$WORK/moved-file/src/moved.rs"
+git -C "$WORK/moved-file" commit -q -am after
+assert_fail_quiet "an insert in a file the change also renames fails" check moved-file
 
 if [[ "$FAIL" -ne 0 ]]; then
   echo "doc-attach.test.sh: $PASS passed, $FAIL failed"
