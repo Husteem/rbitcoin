@@ -170,6 +170,12 @@ check "short commit id as revision stops" stop "$GHCR:nightly revision is not a 
 fresh; published "$GHCR" master; published "$HUB" "$B"
 check "branch name as revision stops" stop "$GHCR:nightly revision is not a commit: 'master'" "$B" "$GHCR" "$HUB"
 
+fresh; published "$GHCR" "$A~0"; published "$HUB" "$B"
+check "commit id with a suffix git would resolve stops" stop "$GHCR:nightly revision is not a commit: '$A~0'" "$B" "$GHCR" "$HUB"
+
+fresh; published "$GHCR" "x$A"; published "$HUB" "$B"
+check "commit id with a prefix stops" stop "$GHCR:nightly revision is not a commit: 'x$A'" "$B" "$GHCR" "$HUB"
+
 fresh
 answer "$GHCR" 0 '{"org.opencontainers.image.title":"rbitcoin","org.opencontainers.image.version":"nightly-20261111"}'
 published "$HUB" "$B"
