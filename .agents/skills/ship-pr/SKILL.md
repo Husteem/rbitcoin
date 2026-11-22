@@ -63,6 +63,7 @@ cargo deny check
 ./scripts/ast-grep.sh
 ./scripts/unwrap-ratchet.sh
 ./scripts/hex-ratchet.sh
+./scripts/src-test-modules.sh
 cargo test --workspace --quiet
 ./scripts/ci-os-smoke.sh
 ```

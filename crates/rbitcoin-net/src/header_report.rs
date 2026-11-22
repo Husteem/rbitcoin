@@ -487,20 +487,3 @@ impl ChainHub {
         }
     }
 }
-
-#[cfg(test)]
-mod prefix_cover {
-    use super::prefix_point_covers;
-    use bitcoin::hashes::Hash;
-    use bitcoin::BlockHash;
-
-    #[test]
-    fn a_different_hash_at_the_same_height_does_not_cover() {
-        let here = BlockHash::from_byte_array([1; 32]);
-        let other = BlockHash::from_byte_array([2; 32]);
-        assert!(prefix_point_covers((here, 5), here, 5));
-        assert!(!prefix_point_covers((other, 5), here, 5));
-        assert!(prefix_point_covers((other, 4), here, 5));
-        assert!(!prefix_point_covers((other, 6), here, 5));
-    }
-}

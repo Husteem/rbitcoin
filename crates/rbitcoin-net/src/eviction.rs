@@ -140,60 +140,6 @@ fn newest_in_largest_group(cands: NonEmptyCands<'_>) -> u64 {
     best_id
 }
 
-#[cfg(test)]
-fn evict_peer(id: u64, connected_at: u64, netgroup: u64) -> InboundEvictCandidate {
-    InboundEvictCandidate {
-        id,
-        connected_at,
-        min_ping: None,
-        last_block: 0,
-        last_tx: 0,
-        netgroup,
-        noban: false,
-    }
-}
-
-/// Neighborhood of `select_inbound_eviction`: the peer disconnected when
-/// inbound slots are full.
-#[cfg(test)]
-#[test]
-fn tie_keeps_the_higher_id_in_the_smaller_group() {
-    let peer = evict_peer;
-    let higher_first = [
-        peer(203, 100, 10),
-        peer(202, 100, 10),
-        peer(303, 500, 20),
-        peer(302, 400, 20),
-    ];
-    assert_eq!(
-        newest_in_largest_group(NonEmptyCands(&higher_first)),
-        203,
-        "an equal connect time keeps the higher id"
-    );
-    let larger_first = [
-        peer(303, 500, 20),
-        peer(302, 400, 20),
-        peer(203, 100, 10),
-        peer(202, 100, 10),
-    ];
-    assert_eq!(
-        newest_in_largest_group(NonEmptyCands(&larger_first)),
-        203,
-        "a count tie keeps the smaller netgroup"
-    );
-    let older_higher_id = [
-        peer(202, 100, 10),
-        peer(250, 50, 10),
-        peer(303, 500, 20),
-        peer(302, 400, 20),
-    ];
-    assert_eq!(
-        newest_in_largest_group(NonEmptyCands(&older_higher_id)),
-        202,
-        "an older peer does not win on id"
-    );
-}
-
 #[doc(hidden)]
 pub fn ping_key(min_ping: Option<f64>) -> f64 {
     min_ping.unwrap_or(f64::MAX)

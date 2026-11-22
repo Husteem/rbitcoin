@@ -88,3 +88,44 @@ fn verify_pubkey_hash_mismatch() {
     .unwrap_err();
     assert!(format!("{err}").contains("p2pkh"));
 }
+
+mod sighash_script_code_tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use bitcoin::PublicKey;
+
+    #[test]
+    fn keyhash_collision_script_code_is_the_deleted_template() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let pk = PublicKey::new(sk.public_key(&secp));
+        let spk = ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::hash(&pk.to_bytes()));
+        let keyhash = bitcoin::PubkeyHash::hash(&pk.to_bytes());
+        let raw: &[u8; 25] = spk.as_bytes().try_into().unwrap();
+        let code = sighash_script_code(raw, keyhash.as_byte_array());
+        // OP_DUP OP_HASH160 OP_EQUALVERIFY OP_CHECKSIG. The 20-byte push is gone.
+        // Borrowed: the fast path must not allocate a scriptCode for this hit.
+        assert!(matches!(code, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(code.as_ref(), &[0x76, 0xa9, 0x88, 0xac]);
+        assert_ne!(code.as_ref(), spk.as_bytes());
+    }
+
+    #[test]
+    fn other_signatures_hash_the_template_in_place() {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let pk = PublicKey::new(sk.public_key(&secp));
+        let spk = ScriptBuf::new_p2pkh(&bitcoin::PubkeyHash::hash(&pk.to_bytes()));
+        let raw = spk.as_bytes();
+        let typed: &[u8; 25] = raw.try_into().unwrap();
+        let ordinary = [0x30u8; 71];
+        let same = sighash_script_code(typed, &ordinary);
+        assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
+        assert!(std::ptr::eq(same.as_ref(), raw));
+        let mut miss = [0u8; 20];
+        miss[0] = 0x30;
+        let untouched = sighash_script_code(typed, &miss);
+        assert!(std::ptr::eq(untouched.as_ref(), raw));
+    }
+}

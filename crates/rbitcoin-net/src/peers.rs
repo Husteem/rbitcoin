@@ -4774,18 +4774,3 @@ pub fn parse_peer_addr_with_port(
         .or_else(|| addrs.first().copied())
         .ok_or_else(bad)
 }
-
-#[cfg(test)]
-mod addrfetch_notify {
-    use super::PeerHub;
-
-    #[tokio::test]
-    async fn reply_wakes_tip_follow() {
-        let hub = PeerHub::new();
-        let notified = hub.addrfetch_learned().notified();
-        hub.note_addrfetch_reply();
-        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
-            .await
-            .expect("an addr-fetch reply must wake tip-follow");
-    }
-}
