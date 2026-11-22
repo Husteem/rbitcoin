@@ -670,6 +670,16 @@ fn store_create_open_archive_spend_and_meta_errors() {
         check_meta(std::path::Path::new("/no/such")),
         Err(StoreError::Io { .. })
     ));
+    {
+        let bad = tmp();
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("meta"), b"xx").unwrap();
+        match check_meta(&bad) {
+            Err(StoreError::Corrupt(m)) => assert_eq!(m, "meta too short"),
+            other => panic!("short meta: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&bad);
+    }
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
 }
