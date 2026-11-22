@@ -1337,8 +1337,9 @@ async fn invalid_parent_child_is_fetched_after_reconsider(
 }
 
 /// Core `RemoveBlockRequest` on a merkle-mismatch drop: the body is not the
-/// header's, so another peer must be free to serve the real one.
-async fn merkle_mismatch_forgets_the_ask(
+/// header's. Once the punished sender's session ends, the next peer that
+/// announces the header is asked for the real body.
+async fn merkle_mismatch_leaves_the_body_to_the_next_peer(
     hub: &rbitcoin_net::chain::ChainHub,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
 ) {
@@ -1351,7 +1352,7 @@ async fn merkle_mismatch_forgets_the_ask(
     let (out_tx, _rx) = peer_out_channel();
     let sender = live_peer(peers, 18475, 24, true);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.ask(hub, hash);
+    assert!(follow.requested_blocks.claim(hub, hash));
     rbitcoin_log::capture_logs(true);
     on_block(hub, &out_tx, &mut follow, Some(sender.as_ref()), &wrong)
         .await
@@ -1365,11 +1366,17 @@ async fn merkle_mismatch_forgets_the_ask(
         "Core punishes a mutated block"
     );
     assert!(!hub.is_block_invalid(&hash));
-    assert!(
-        !hub.already_have_or_asked_block(&hash),
-        "a mutated drop releases the ask so another peer can serve the real body"
+    drop(follow);
+    let (next_tx, mut next_rx) = peer_out_channel();
+    let mut next = PeerFollowState::new();
+    on_headers(hub, &next_tx, &mut next, None, &[wrong.header])
+        .await
+        .unwrap();
+    assert_eq!(
+        asked_blocks(&mut next_rx),
+        vec![hash],
+        "the next peer to announce the header is asked for the body"
     );
-    assert!(!follow.requested_blocks.contains(&hash));
     assert_eq!(hub.tip_hash(), Some(tip));
 }
 
@@ -2803,7 +2810,7 @@ async fn peer_header_dos_and_self_announce() {
     noban_and_manual_bad_block_is_not_punished(&hub, &peers).await;
     sixty_four_byte_body_is_mutated(&hub, &peers).await;
     empty_body_null_merkle_bans_before_the_header(&hub, &peers).await;
-    merkle_mismatch_forgets_the_ask(&hub, &peers).await;
+    merkle_mismatch_leaves_the_body_to_the_next_peer(&hub, &peers).await;
     manual_peer_is_asked_again_after_a_mutated_copy(&hub, &peers).await;
     sixty_four_byte_kept_peer_and_dropped_session(&hub, &peers).await;
     invalid_parent_child_is_fetched_after_reconsider(&hub, &peers).await;
