@@ -629,6 +629,11 @@ pub struct LivePeer {
     /// the bytes off the socket.
     #[cfg(debug_assertions)]
     pub decode_enqueued: AtomicUsize,
+    /// A heartbeat ran while a frame was still queued behind a front held
+    /// for the send budget. Pins that the held front still feeds
+    /// `decode_queued` to the compact-expiry gate.
+    #[cfg(debug_assertions)]
+    pub held_front_queued: AtomicBool,
 }
 
 #[cfg(target_os = "linux")]
@@ -704,6 +709,16 @@ impl LivePeer {
     #[cfg(debug_assertions)]
     pub(crate) fn note_decode_enqueued(&self) {
         self.decode_enqueued.fetch_add(1, Ordering::Release);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn held_front_queued(&self) -> bool {
+        self.held_front_queued.load(Ordering::Acquire)
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn note_held_front_queued(&self) {
+        self.held_front_queued.store(true, Ordering::Release);
     }
 
     pub fn note_recv(&self, cmd: &str, nbytes: u64) {
@@ -3722,6 +3737,8 @@ impl PeerHub {
             version: ver.version,
             #[cfg(debug_assertions)]
             decode_enqueued: AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            held_front_queued: AtomicBool::new(false),
         })
     }
 

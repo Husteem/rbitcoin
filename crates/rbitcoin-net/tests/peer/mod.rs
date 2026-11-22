@@ -6943,6 +6943,10 @@ async fn held_front_keeps_a_queued_blocktxn_until_the_drain() {
         Duration::from_millis(250),
     )
     .await;
+    assert!(
+        s.live.held_front_queued(),
+        "the held front must still feed decode_queued to the heartbeat"
+    );
 
     let now = peers.now_secs();
     peers.set_mock_now(now + PING_TIMEOUT_SECS + POST_BLOCK_PONG_GRACE_SECS + 1);

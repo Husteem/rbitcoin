@@ -4355,6 +4355,12 @@ pub async fn peer_session_with(
             // expiry, including one sitting behind a held front.
             let decode_queued = !decode_q.is_empty();
             let front_waiting = decode_queued && !hold_front;
+            #[cfg(debug_assertions)]
+            if hold_front && decode_queued {
+                if let Some(s) = session.as_ref() {
+                    s.note_held_front_queued();
+                }
+            }
             let tail_pending =
                 !follow.getdata_tail.is_empty() || !follow.getblocktxn_tail.is_empty();
             let reading = !over_budget && !tail_pending;
