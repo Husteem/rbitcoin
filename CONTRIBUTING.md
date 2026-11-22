@@ -390,6 +390,9 @@ The comment to post:
 - [ ] Experimental / milestone honesty preserved in user-facing docs when relevant
 - [ ] No restating `//` comments. Remaining line comments name an invariant,
       protocol, `SAFETY` requirement, or library quirk the types cannot state.
+- [ ] A doc comment or attribute still sits on the item it was written
+      for. A new item goes above an existing block, and a deleted item takes
+      its block with it. `./scripts/doc-attach.sh` fails `qc` otherwise.
 - [ ] Tests assert shipped behavior, not source/docs text (`include_str!` of
       production `.rs` or markdown is not a pin).
 - [ ] Hot-path algorithm is O(need) at chain scale, or the RAM/CPU trade is

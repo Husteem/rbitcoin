@@ -497,13 +497,6 @@ fn pin_noban_headers_timeout_keep(via_cidr: bool) {
     );
 }
 
-/// Two sessions' heartbeats can time out one noban headers sync at once.
-/// Both read the sync as started under the `live` read guard, then park on
-/// the CIDR table in their noban check, which this test holds. The slot is
-/// released once, so a new sync can start.
-///
-/// Linux only: the test waits until `/proc` shows each heartbeat asleep in
-/// the kernel, which before the table lock it never is.
 /// The session, `flush_tx_invs`, and `force_announce_txid` update one
 /// peer's INV count and sequence from different threads. No count is lost
 /// and the sequence ends at the highest value any of them noted. Parking
@@ -541,6 +534,13 @@ fn concurrent_tx_inv_updates_keep_every_count_and_the_max_sequence() {
     );
 }
 
+/// Two sessions' heartbeats can time out one noban headers sync at once.
+/// Both read the sync as started under the `live` read guard, then park on
+/// the CIDR table in their noban check, which this test holds. The slot is
+/// released once, so a new sync can start.
+///
+/// Linux only: the test waits until `/proc` shows each heartbeat asleep in
+/// the kernel, which before the table lock it never is.
 #[cfg(target_os = "linux")]
 #[test]
 fn concurrent_noban_headers_timeouts_release_the_slot_once() {

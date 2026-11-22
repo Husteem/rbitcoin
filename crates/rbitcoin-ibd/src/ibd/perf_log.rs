@@ -365,12 +365,12 @@ pub struct IbdPerfSample {
     pub thr_script_send_wait_ms: u64,
     pub thr_write_recv_wait_ms: u64,
     pub thr_write_work_ms: u64,
-    /// Lookup-wave `consensus_decode` (`decode=`).
     pub lookup_blocks: u64,
     pub lookup_ms: u64,
     pub lookup_collect_ms: u64,
     pub lookup_head_ms: u64,
     pub lookup_cold_io_ms: u64,
+    /// Lookup-wave `consensus_decode` (`decode=`).
     pub lookup_decode_ms: u64,
     /// Lookup-wave `from_tx_wire` on payload slices (`precompute=`).
     pub lookup_precompute_ms: u64,
