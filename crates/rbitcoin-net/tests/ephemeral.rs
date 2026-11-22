@@ -693,7 +693,6 @@ async fn ephemeral_broadcast() {
         start_height: 0,
         relay: true,
     };
-    let (tx, mut rx) = mpsc::unbounded_channel();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let sess = peers.register(
         addr,
@@ -702,7 +701,7 @@ async fn ephemeral_broadcast() {
         false,
         rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
     );
-    sess.attach_out(tx);
+    let (_, mut rx) = sess.open_out();
     rbitcoin_net::force_announce_txid(&hub, &peers, local.compute_txid());
     assert!(
         rx.try_recv().is_err(),

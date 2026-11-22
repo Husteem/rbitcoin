@@ -6075,7 +6075,7 @@ async fn getpeerinfo_last_block_announcement_tracks_new_heavier_headers() {
         relay: true,
     };
     let peer = peers.register(addr, bind, &ver, true, PeerConnType::Inbound);
-    let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = rbitcoin_net::send_queue::peer_out_channel();
     let mut follow = rbitcoin_net::peer::PeerFollowState::new();
     let genesis = hub
         .query

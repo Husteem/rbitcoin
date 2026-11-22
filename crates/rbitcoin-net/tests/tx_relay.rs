@@ -8,6 +8,7 @@ use rbitcoin_mempool::{
 };
 use rbitcoin_net::fee_history::HistoricalFeeBlock;
 use rbitcoin_net::fee_history_file;
+use rbitcoin_net::send_queue::peer_out_channel;
 use rbitcoin_net::tx_relay::parent_req::ParentNote;
 use rbitcoin_net::tx_relay::*;
 use rbitcoin_primitives::Height;
@@ -7296,7 +7297,7 @@ fn review_trust_recent_reject_does_not_drop_session_tx() {
         false,
         PeerConnType::OutboundFullRelay,
     );
-    let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = peer_out_channel();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

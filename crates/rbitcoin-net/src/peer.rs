@@ -13,6 +13,7 @@ use crate::error::NetError;
 use crate::msg_decode::decode_framed_offload;
 use crate::peer_dos::{PeerRateLimiter, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE};
 use crate::peers::{CappedSet, PeerOut};
+use crate::send_queue::{PeerOutRx, PeerOutTx, Queued};
 use crate::v1::{open_inbound_with_wire, FrameRead, FrameWrite, PeerReader, PeerWriter};
 use crate::v2::{
     open_v2, open_v2_with_wire, read_v2_contents, read_v2_frame, write_v2_contents, write_v2_msg,
@@ -37,8 +38,8 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
+use tokio::sync::broadcast;
 use tokio::sync::watch;
-use tokio::sync::{broadcast, mpsc};
 
 /// Protocol version we advertise (BIP339 wtxidrelay needs ≥70016; rust-bitcoin's
 /// `PROTOCOL_VERSION` is still 70001).
@@ -925,7 +926,7 @@ pub fn advertising_address_log(addr_port: impl std::fmt::Display, peer: u64) -> 
 #[doc(hidden)]
 pub fn queue_addr_list(
     session: Option<&crate::peers::LivePeer>,
-    out: &mpsc::UnboundedSender<PeerOut>,
+    out: &PeerOutTx,
     addrs: Vec<(u32, crate::NetAddr)>,
     v2: bool,
 ) -> Result<(), NetError> {
@@ -943,7 +944,7 @@ pub fn queue_addr_list(
                 port: a.port(),
             })
             .collect();
-        queue_accounted(session, out, NetworkMessage::AddrV2(list))
+        out.send(NetworkMessage::AddrV2(list))
     } else {
         let list: Vec<(u32, Address)> = addrs
             .into_iter()
@@ -955,7 +956,7 @@ pub fn queue_addr_list(
                 | crate::NetAddr::Name { .. } => None,
             })
             .collect();
-        queue_accounted(session, out, NetworkMessage::Addr(list))
+        out.send(NetworkMessage::Addr(list))
     }
 }
 
@@ -963,10 +964,10 @@ pub fn queue_addr_list(
 pub fn maybe_queue_local_addr(
     _hub: &ChainHub,
     session: &crate::peers::LivePeer,
-    out: &mpsc::UnboundedSender<PeerOut>,
+    out: &PeerOutTx,
 ) -> Result<(), NetError> {
     if let Some(msg) = session.take_self_announce_msg() {
-        queue_out(out, msg)?;
+        out.send(msg)?;
     }
     Ok(())
 }
@@ -1735,10 +1736,7 @@ pub fn outbound_write_rank(out: &PeerOut) -> u8 {
 }
 
 #[doc(hidden)]
-pub fn take_outbound_write_batch(
-    first: PeerOut,
-    rx: &mut mpsc::UnboundedReceiver<PeerOut>,
-) -> Vec<PeerOut> {
+pub fn take_outbound_write_batch(first: Queued, rx: &mut PeerOutRx) -> Vec<Queued> {
     let mut batch = Vec::with_capacity(32);
     batch.push(first);
     while batch.len() < 64 {
@@ -1747,7 +1745,7 @@ pub fn take_outbound_write_batch(
             Err(_) => break,
         }
     }
-    batch.sort_by_key(outbound_write_rank);
+    batch.sort_by_key(|q| outbound_write_rank(q.out()));
     batch
 }
 
@@ -1796,15 +1794,14 @@ async fn write_msg_counted(
 
 pub async fn run_writer_task(
     mut writer: PeerWriter,
-    mut out_rx: mpsc::UnboundedReceiver<PeerOut>,
+    mut out_rx: PeerOutRx,
     writer_session: Option<Arc<crate::peers::LivePeer>>,
 ) {
     while let Some(first) = out_rx.recv().await {
         // Write the nonce that was queued. A newer ping is queued again
         // after this write, so it stays behind replies still on the channel.
-        for out in take_outbound_write_batch(first, &mut out_rx) {
-            let n = crate::peers::outbound_queued_bytes(&out);
-            let serve_slot = out.holds_serve_slot();
+        for queued in take_outbound_write_batch(first, &mut out_rx) {
+            let (out, charge) = queued.into_parts();
             let pong_written = match &out {
                 PeerOut::Msg(NetworkMessage::Pong(queued)) => Some(*queued),
                 _ => None,
@@ -1820,9 +1817,9 @@ pub async fn run_writer_task(
                     .is_err(),
                 Err(_) => true,
             };
-            if let Some(s) = &writer_session {
-                s.note_out_written(serve_slot, n);
-            }
+            // Core `SocketSendData`: the bytes leave `nSendSize` once the
+            // socket took them, not when the writer picked them up.
+            drop(charge);
             if err {
                 return;
             }
@@ -1836,7 +1833,7 @@ pub async fn run_writer_task(
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub async fn on_heartbeat(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     requested_since: &mut Option<std::time::Instant>,
@@ -1887,7 +1884,7 @@ pub async fn on_heartbeat(
         rbitcoin_log::info!("{}", ping_timeout_log(elapsed_secs));
         s.request_disconnect();
     } else if let Some(nonce) = s.take_ping_send(now) {
-        let _ = queue_out(out_tx, NetworkMessage::Ping(nonce));
+        let _ = out_tx.send(NetworkMessage::Ping(nonce));
     }
     if let Some(ph) = s.peer_hub() {
         #[cfg(debug_assertions)]
@@ -1927,22 +1924,16 @@ pub async fn on_heartbeat(
     let _ = maybe_queue_initial_getheaders(out_tx, hub, s);
     match crate::peers::PendingSendCmpct::from_u8(s.pending_sendcmpct.swap(0, Ordering::Relaxed)) {
         crate::peers::PendingSendCmpct::Lb => {
-            let _ = queue_out(
-                out_tx,
-                NetworkMessage::SendCmpct(SendCmpct {
-                    send_compact: false,
-                    version: 2,
-                }),
-            );
+            let _ = out_tx.send(NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: false,
+                version: 2,
+            }));
         }
         crate::peers::PendingSendCmpct::Hb => {
-            let _ = queue_out(
-                out_tx,
-                NetworkMessage::SendCmpct(SendCmpct {
-                    send_compact: true,
-                    version: 2,
-                }),
-            );
+            let _ = out_tx.send(NetworkMessage::SendCmpct(SendCmpct {
+                send_compact: true,
+                version: 2,
+            }));
         }
         crate::peers::PendingSendCmpct::None => {}
     }
@@ -1958,7 +1949,7 @@ pub async fn on_heartbeat(
 /// `Ok(true)` means the broadcast is closed and the session should exit.
 pub async fn announce_unsent_tip(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     tip_at_handshake: Option<BlockHash>,
@@ -1993,7 +1984,7 @@ pub async fn announce_unsent_tip(
 /// `true` means the tip broadcast closed; the session should exit.
 pub async fn on_tip_event(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     tip: Result<crate::chain::TipEvent, broadcast::error::RecvError>,
@@ -2019,7 +2010,7 @@ pub async fn on_tip_event(
                 && !peer_has_header(hub, sent, known, ev.hash)))
     {
         if let Some(msg) = cmpct_tip_announce(hub, &ev.hash, follow.cmpct_version).await? {
-            queue_cmpct_tip_announce(out_tx, msg)?;
+            out_tx.send(msg)?;
             if let Some(s) = session {
                 s.note_best_header_sent(ev.hash);
                 s.note_last_tip_offered(ev.hash);
@@ -2038,7 +2029,7 @@ pub async fn on_tip_event(
             if let Some(s) = session {
                 s.note_last_tip_offered(h);
             }
-            queue_out(out_tx, NetworkMessage::Inv(vec![Inventory::Block(h)]))?;
+            out_tx.send(NetworkMessage::Inv(vec![Inventory::Block(h)]))?;
         }
         TipAnnounce::Headers(hs) => {
             if let Some(last) = hs.last() {
@@ -2048,7 +2039,7 @@ pub async fn on_tip_event(
                     s.note_last_tip_offered(hash);
                 }
             }
-            queue_out(out_tx, NetworkMessage::Headers(hs))?;
+            out_tx.send(NetworkMessage::Headers(hs))?;
         }
     }
     Ok(false)
@@ -2057,7 +2048,7 @@ pub async fn on_tip_event(
 #[doc(hidden)]
 pub fn on_headers_poll(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
 ) {
     let skip = session.is_some_and(|s| {
@@ -2075,7 +2066,7 @@ pub fn on_headers_poll(
 #[doc(hidden)]
 pub fn on_tx_announce(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     ann: Option<Result<crate::tx_relay::MempoolAnnounce, broadcast::error::RecvError>>,
@@ -2093,13 +2084,13 @@ pub fn on_tx_announce(
 #[doc(hidden)]
 pub fn on_tx_announce_ok(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     ann: crate::tx_relay::MempoolAnnounce,
 ) -> Result<(), NetError> {
     match announce_ready_txid(hub, &follow.from_this_peer, session, ann.txid, false) {
-        ReadyInv::Queued(inv) => queue_accounted(session, out_tx, NetworkMessage::Inv(vec![inv])),
+        ReadyInv::Queued(inv) => out_tx.send(NetworkMessage::Inv(vec![inv])),
         ReadyInv::Skipped | ReadyInv::Retry => Ok(()),
     }
 }
@@ -2249,7 +2240,7 @@ fn tx_announce_peer_ok_at(
 #[doc(hidden)]
 pub fn on_inv_flush(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     flush: Option<Result<(), broadcast::error::RecvError>>,
@@ -2265,7 +2256,7 @@ pub fn on_inv_flush(
 
 struct OpenedPeerWriter {
     peer_s: String,
-    out_tx: mpsc::UnboundedSender<PeerOut>,
+    out_tx: PeerOutTx,
     writer_task: tokio::task::JoinHandle<()>,
 }
 
@@ -2314,9 +2305,11 @@ async fn open_peer_writer(
         }
     }
 
-    let (out_tx, out_rx) = mpsc::unbounded_channel::<PeerOut>();
+    let (out_tx, out_rx) = match meta.session.as_ref() {
+        Some(s) => s.open_out(),
+        None => crate::send_queue::peer_out_channel(),
+    };
     if let Some(s) = meta.session.as_ref() {
-        s.attach_out(out_tx.clone());
         let _ = maybe_queue_local_addr(hub, s, &out_tx);
     }
 
@@ -3075,7 +3068,7 @@ pub fn should_poll_peer_headers(hub: &ChainHub, best_known: Option<BlockHash>) -
 /// until the tip is caught up.
 #[doc(hidden)]
 pub fn maybe_queue_initial_getheaders(
-    out: &mpsc::UnboundedSender<PeerOut>,
+    out: &PeerOutTx,
     hub: &ChainHub,
     session: &crate::peers::LivePeer,
 ) -> bool {
@@ -3099,15 +3092,12 @@ pub fn maybe_queue_initial_getheaders(
 }
 
 #[doc(hidden)]
-pub fn maybe_queue_addrfetch_getaddr(
-    out: &mpsc::UnboundedSender<PeerOut>,
-    session: &crate::peers::LivePeer,
-) -> bool {
+pub fn maybe_queue_addrfetch_getaddr(out: &PeerOutTx, session: &crate::peers::LivePeer) -> bool {
     if session.conn_type != crate::peers::PeerConnType::AddrFetch {
         return false;
     }
     session.credit_getaddr_reply();
-    let _ = queue_out(out, NetworkMessage::GetAddr);
+    let _ = out.send(NetworkMessage::GetAddr);
     true
 }
 
@@ -3119,7 +3109,7 @@ pub fn addrfetch_timed_out(session: &crate::peers::LivePeer) -> bool {
 
 #[doc(hidden)]
 pub fn queue_getheaders(
-    out: &mpsc::UnboundedSender<PeerOut>,
+    out: &PeerOutTx,
     hub: &ChainHub,
     session: Option<&crate::peers::LivePeer>,
     mark_awaiting: bool,
@@ -3137,7 +3127,7 @@ pub fn queue_getheaders(
     }
     let locator = headers_sync_locator(hub, from);
     let gh = GetHeadersMessage::new(locator, BlockHash::from_byte_array([0u8; 32]));
-    queue_out(out, NetworkMessage::GetHeaders(gh))
+    out.send(NetworkMessage::GetHeaders(gh))
 }
 
 /// BIP152: request `MSG_CMPCT_BLOCK` when the peer speaks compact v2 and
@@ -3193,7 +3183,7 @@ pub fn maybe_expire_pending_cmpct(
     hub: &ChainHub,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
-    out: &mpsc::UnboundedSender<PeerOut>,
+    out: &PeerOutTx,
     now: std::time::Instant,
 ) -> Result<bool, NetError> {
     let stale: Vec<BlockHash> = follow
@@ -3222,7 +3212,7 @@ pub fn maybe_expire_pending_cmpct(
 #[doc(hidden)]
 pub fn queue_block_getdata(
     hub: &ChainHub,
-    out: &mpsc::UnboundedSender<PeerOut>,
+    out: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
     requested_blocks: &mut HashSet<BlockHash>,
     want: &[BlockHash],
@@ -3249,7 +3239,7 @@ pub fn queue_block_getdata(
         s.note_blocks_requested(want);
     }
     for chunk in inv.chunks(MAX_INV_SIZE.min(500)) {
-        queue_accounted(session, out, NetworkMessage::GetData(chunk.to_vec()))?;
+        out.send(NetworkMessage::GetData(chunk.to_vec()))?;
     }
     Ok(())
 }
@@ -3419,7 +3409,7 @@ pub fn force_announce_txid(hub: &ChainHub, peers: &crate::peers::PeerHub, txid: 
         let Some(inv) = s.claim_announced_tx(txid, w) else {
             continue;
         };
-        queue_tx_inv_batches(&s, &out, vec![inv]);
+        queue_tx_inv_batches(&out, vec![inv]);
         if let Some(seq) = mp.relay_seq_of(&w) {
             s.note_tx_inv_seq_at_least(seq.saturating_add(1));
         }
@@ -3475,7 +3465,7 @@ pub fn queue_due_tx_invs(
     hub: &ChainHub,
     session: &crate::peers::LivePeer,
     from_this_peer: &CappedSet<bitcoin::Txid>,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
 ) {
     let Some(mp) = hub.mempool() else {
         return;
@@ -3539,7 +3529,7 @@ pub fn queue_due_tx_invs(
     }
     session.note_inv_released_seen(cursor);
     if !due.is_empty() {
-        queue_tx_inv_batches(session, out_tx, due);
+        queue_tx_inv_batches(out_tx, due);
     }
     if had_released {
         // The releases are queued or skipped by now. The per-tx note raised
@@ -3653,7 +3643,7 @@ impl PeerFollowState {
 #[doc(hidden)]
 pub fn serve_mempool_getdata(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
     item: &Inventory,
     tx: Option<bitcoin::Transaction>,
@@ -3670,7 +3660,7 @@ pub fn serve_mempool_getdata(
     let last_inv = session.map(|s| s.last_inv_sequence()).unwrap_or(1);
     if announced || mp.is_relay_servable(&wtxid, last_inv) {
         mp.mark_broadcast(&txid);
-        queue_accounted(session, out_tx, NetworkMessage::Tx(getdata_tx(item, tx)))?;
+        out_tx.send(NetworkMessage::Tx(getdata_tx(item, tx)))?;
         return Ok(true);
     }
     Ok(false)
@@ -3697,7 +3687,7 @@ struct ReadyDecode<'a> {
 
 struct DecodeDrain<'a> {
     hub: &'a ChainHub,
-    out_tx: &'a mpsc::UnboundedSender<PeerOut>,
+    out_tx: &'a PeerOutTx,
     follow: &'a mut PeerFollowState,
     session: Option<&'a crate::peers::LivePeer>,
     requested_since: &'a mut Option<std::time::Instant>,
@@ -3729,7 +3719,7 @@ async fn push_decode_frame(
 async fn finish_decode_queue_full(
     decode_q: &mut DecodeQueue,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     requested_since: &mut Option<std::time::Instant>,
@@ -3756,7 +3746,7 @@ async fn apply_ready_decode(
     decoded: Result<Result<RawNetworkMessage, NetError>, tokio::sync::oneshot::error::RecvError>,
     slot: &mut ReadyDecode<'_>,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -3818,7 +3808,7 @@ async fn apply_ready_decode(
 async fn apply_queued_decodes(
     decode_q: &mut DecodeQueue,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     requested_since: &mut Option<std::time::Instant>,
@@ -3865,7 +3855,7 @@ async fn apply_queued_decodes(
 async fn apply_decoded_peer_msg(
     decoded: Result<RawNetworkMessage, NetError>,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -3883,7 +3873,7 @@ async fn apply_decoded_peer_msg(
 pub async fn handle_peer_frame(
     frame: FramedMessage,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -3901,7 +3891,7 @@ pub async fn handle_peer_frame(
 pub async fn handle_decoded_peer_msg(
     msg: RawNetworkMessage,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -3943,7 +3933,7 @@ pub async fn handle_decoded_peer_msg(
 pub fn handle_peer_sync_msg(
     payload: &NetworkMessage,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -3957,7 +3947,7 @@ pub fn handle_peer_sync_msg(
 pub fn handle_peer_control_msg(
     payload: &NetworkMessage,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<bool, NetError> {
@@ -4021,13 +4011,13 @@ pub fn filter_q<T>(r: Result<T, rbitcoin_store::StoreError>) -> Result<T, NetErr
 pub fn on_compact_filters(
     payload: &NetworkMessage,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
     match payload {
         NetworkMessage::GetCFilters(m) => on_getcfilters(hub, out_tx, session, m),
-        NetworkMessage::GetCFHeaders(m) => on_getcfheaders(hub, out_tx, session, m),
-        NetworkMessage::GetCFCheckpt(m) => on_getcfcheckpt(hub, out_tx, session, m),
+        NetworkMessage::GetCFHeaders(m) => on_getcfheaders(hub, out_tx, m),
+        NetworkMessage::GetCFCheckpt(m) => on_getcfcheckpt(hub, out_tx, m),
         _ => Ok(()),
     }
 }
@@ -4074,7 +4064,7 @@ pub fn within_filter_watermark(hub: &ChainHub, stop: u32) -> Result<bool, NetErr
 #[doc(hidden)]
 pub fn on_getcfilters(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
     m: &bitcoin::p2p::message_filter::GetCFilters,
 ) -> Result<(), NetError> {
@@ -4097,15 +4087,13 @@ pub fn on_getcfilters(
         else {
             return Ok(());
         };
-        queue_accounted(
-            session,
-            out_tx,
-            NetworkMessage::CFilter(bitcoin::p2p::message_filter::CFilter {
+        out_tx.send(NetworkMessage::CFilter(
+            bitcoin::p2p::message_filter::CFilter {
                 filter_type: 0,
                 block_hash: bitcoin::BlockHash::from_byte_array(rec.hash),
                 filter: body,
-            }),
-        )?;
+            },
+        ))?;
     }
     Ok(())
 }
@@ -4113,8 +4101,7 @@ pub fn on_getcfilters(
 #[doc(hidden)]
 pub fn on_getcfheaders(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
-    session: Option<&crate::peers::LivePeer>,
+    out_tx: &PeerOutTx,
     m: &bitcoin::p2p::message_filter::GetCFHeaders,
 ) -> Result<(), NetError> {
     use bitcoin::bip158::FilterHeader;
@@ -4136,24 +4123,21 @@ pub fn on_getcfheaders(
     } else {
         (rows[0].1, &rows[1..])
     };
-    queue_accounted(
-        session,
-        out_tx,
-        NetworkMessage::CFHeaders(bitcoin::p2p::message_filter::CFHeaders {
+    out_tx.send(NetworkMessage::CFHeaders(
+        bitcoin::p2p::message_filter::CFHeaders {
             filter_type: 0,
             stop_hash: m.stop_hash,
             previous_filter_header: previous,
             filter_hashes: hashes.iter().map(|(hash, _)| *hash).collect(),
-        }),
-    )?;
+        },
+    ))?;
     Ok(())
 }
 
 #[doc(hidden)]
 pub fn on_getcfcheckpt(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
-    session: Option<&crate::peers::LivePeer>,
+    out_tx: &PeerOutTx,
     m: &bitcoin::p2p::message_filter::GetCFCheckpt,
 ) -> Result<(), NetError> {
     use bitcoin::hashes::Hash;
@@ -4170,15 +4154,13 @@ pub fn on_getcfcheckpt(
         };
         filter_headers = headers;
     }
-    queue_accounted(
-        session,
-        out_tx,
-        NetworkMessage::CFCheckpt(bitcoin::p2p::message_filter::CFCheckpt {
+    out_tx.send(NetworkMessage::CFCheckpt(
+        bitcoin::p2p::message_filter::CFCheckpt {
             filter_type: 0,
             stop_hash: m.stop_hash,
             filter_headers,
-        }),
-    )?;
+        },
+    ))?;
     Ok(())
 }
 
@@ -4186,7 +4168,7 @@ pub fn on_getcfcheckpt(
 pub fn handle_peer_inventory_msg(
     payload: &NetworkMessage,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -4241,7 +4223,7 @@ pub fn on_redundant_verack(session: Option<&crate::peers::LivePeer>) {
 #[doc(hidden)]
 pub fn on_ping(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     n: u64,
@@ -4270,7 +4252,7 @@ fn serve_tail_pending(follow: &PeerFollowState) -> bool {
 
 /// Queue a pong parked by [`on_ping`] once both serve tails are empty.
 fn flush_parked_pong(
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -4464,7 +4446,7 @@ pub fn on_addrv2(
                     let msg = NetworkMessage::AddrV2(batch);
                     let sent = bitcoin::consensus::encode::serialize(&msg).len();
                     rbitcoin_log::info!("{}", sending_addrv2_log(sent, other.id));
-                    queue_out(&tx, msg)?;
+                    tx.send(msg)?;
                 }
             }
         }
@@ -4503,7 +4485,7 @@ where
 
 pub async fn on_getheaders(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     gh: &GetHeadersMessage,
@@ -4537,7 +4519,7 @@ pub async fn on_getheaders(
                 s.note_best_header_sent(tip);
             }
         }
-        queue_accounted(session, out_tx, NetworkMessage::Headers(headers))?;
+        out_tx.send(NetworkMessage::Headers(headers))?;
     }
     Ok(())
 }
@@ -4566,7 +4548,7 @@ const GETBLOCKS_PAGE: usize = 500;
 #[doc(hidden)]
 pub async fn on_getblocks(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     gb: &GetBlocksMessage,
@@ -4599,14 +4581,14 @@ pub async fn on_getblocks(
         }
     }
     if !inv.is_empty() {
-        queue_accounted(session, out_tx, NetworkMessage::Inv(inv))?;
+        out_tx.send(NetworkMessage::Inv(inv))?;
     }
     Ok(())
 }
 
 pub async fn serve_getdata(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     inv: Vec<Inventory>,
@@ -4625,7 +4607,7 @@ pub async fn serve_getdata(
 /// collected so far is sent either way.
 pub async fn serve_getdata_tail(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -4654,7 +4636,7 @@ pub async fn serve_getdata_tail(
             // blocking pool. A missing header or body is `NotFound`.
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                 let witness = matches!(item, Inventory::WitnessBlock(_));
-                match serve_getdata_full_block(hub, out_tx, session, h, witness).await? {
+                match serve_getdata_full_block(hub, out_tx, h, witness).await? {
                     FullBlockReply::NotFound => notfound.push(item),
                     // Core returns before the continuation when it sends nothing.
                     FullBlockReply::Withheld => {}
@@ -4662,18 +4644,14 @@ pub async fn serve_getdata_tail(
                         // Core sends this right after the block, even when redundant.
                         follow.continuation_block = None;
                         if let Some(tip) = hub.tip_hash() {
-                            queue_accounted(
-                                session,
-                                out_tx,
-                                NetworkMessage::Inv(vec![Inventory::Block(tip)]),
-                            )?;
+                            out_tx.send(NetworkMessage::Inv(vec![Inventory::Block(tip)]))?;
                         }
                     }
                     FullBlockReply::Queued => {}
                 }
             }
             Inventory::CompactBlock(h) => {
-                serve_getdata_compact(hub, out_tx, follow, session, h).await?;
+                serve_getdata_compact(hub, out_tx, follow, h).await?;
             }
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                 let tx = hub.mempool().and_then(|mp| mp.try_get_tx(txid));
@@ -4690,15 +4668,14 @@ pub async fn serve_getdata_tail(
         }
     }
     if !notfound.is_empty() {
-        queue_accounted(session, out_tx, NetworkMessage::NotFound(notfound))?;
+        out_tx.send(NetworkMessage::NotFound(notfound))?;
     }
     flush_parked_pong(out_tx, follow, session)
 }
 
 pub async fn serve_getdata_full_block(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
-    session: Option<&crate::peers::LivePeer>,
+    out_tx: &PeerOutTx,
     h: &bitcoin::BlockHash,
     witness: bool,
 ) -> Result<FullBlockReply, NetError> {
@@ -4735,7 +4712,7 @@ pub async fn serve_getdata_full_block(
             if !hub.stale_relay_allowed(h) {
                 return Ok(FullBlockReply::Withheld);
             }
-            queue_served(session, out_tx, PeerOut::Encoded(bytes))?;
+            out_tx.send(PeerOut::Encoded(bytes))?;
             Ok(FullBlockReply::Queued)
         }
     }
@@ -4814,9 +4791,8 @@ async fn block_reconstruct_permit() -> Result<tokio::sync::OwnedSemaphorePermit,
 #[doc(hidden)]
 pub async fn serve_getdata_compact(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
-    session: Option<&crate::peers::LivePeer>,
     h: &bitcoin::BlockHash,
 ) -> Result<(), NetError> {
     let permit = block_reconstruct_permit().await?;
@@ -4835,25 +4811,19 @@ pub async fn serve_getdata_compact(
     .map_err(|_| NetError::Protocol("compact serve join failed"))??;
     match outcome {
         CompactServe::Missing => Ok(()),
-        CompactServe::Full(block) => queue_served(
-            session,
-            out_tx,
-            PeerOut::Served(NetworkMessage::Block(block)),
-        ),
-        CompactServe::Cmpct(hsi) => queue_served(
-            session,
-            out_tx,
-            PeerOut::Served(NetworkMessage::CmpctBlock(CmpctBlock {
+        CompactServe::Full(block) => out_tx.send(PeerOut::Served(NetworkMessage::Block(block))),
+        CompactServe::Cmpct(hsi) => {
+            out_tx.send(PeerOut::Served(NetworkMessage::CmpctBlock(CmpctBlock {
                 compact_block: hsi,
-            })),
-        ),
+            })))
+        }
     }
 }
 
 #[doc(hidden)]
 pub async fn serve_getdata_wtx(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
     item: Inventory,
     wtxid: &bitcoin::Wtxid,
@@ -4877,7 +4847,7 @@ pub async fn serve_getdata_wtx(
 /// announced. `true` = queued.
 async fn serve_announced_tip_tx(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
     item: &Inventory,
 ) -> Result<bool, NetError> {
@@ -4890,7 +4860,7 @@ async fn serve_announced_tip_tx(
     let Some(tx) = tx_from_tip_index(hub, hash, item).await? else {
         return Ok(false);
     };
-    queue_accounted(session, out_tx, NetworkMessage::Tx(getdata_tx(item, tx)))?;
+    out_tx.send(NetworkMessage::Tx(getdata_tx(item, tx)))?;
     Ok(true)
 }
 
@@ -5028,7 +4998,7 @@ pub enum GetBlockTxnServe {
 /// empty request disconnects before the block is read, as in Core.
 pub async fn serve_getblocktxn(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     txs_request: BlockTransactionsRequest,
@@ -5047,7 +5017,7 @@ pub async fn serve_getblocktxn(
 
 pub async fn serve_getblocktxn_tail(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -5062,7 +5032,7 @@ pub async fn serve_getblocktxn_tail(
 
 pub async fn serve_one_getblocktxn(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     txs_request: BlockTransactionsRequest,
@@ -5088,16 +5058,14 @@ pub async fn serve_one_getblocktxn(
             misbehaving(&mut follow.ban_score, session);
             Ok(())
         }
-        Some(GetBlockTxnServe::Block(block)) => queue_served(
-            session,
-            out_tx,
-            PeerOut::Served(NetworkMessage::Block(block)),
-        ),
-        Some(GetBlockTxnServe::Txns(transactions)) => queue_served(
-            session,
-            out_tx,
-            PeerOut::Served(NetworkMessage::BlockTxn(BlockTxn { transactions })),
-        ),
+        Some(GetBlockTxnServe::Block(block)) => {
+            out_tx.send(PeerOut::Served(NetworkMessage::Block(block)))
+        }
+        Some(GetBlockTxnServe::Txns(transactions)) => {
+            out_tx.send(PeerOut::Served(NetworkMessage::BlockTxn(BlockTxn {
+                transactions,
+            })))
+        }
     }
 }
 
@@ -5147,7 +5115,7 @@ pub fn getblocktxn_reply(
 #[doc(hidden)]
 pub fn on_inv(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     items: &[Inventory],
@@ -5244,7 +5212,7 @@ pub fn on_inv(
         let _ = queue_getheaders(out_tx, hub, session, true, None);
     }
     if !want.is_empty() {
-        queue_accounted(session, out_tx, NetworkMessage::GetData(want))?;
+        out_tx.send(NetworkMessage::GetData(want))?;
     }
     Ok(())
 }
@@ -6042,7 +6010,7 @@ fn note_advanced_best_known(
 fn apply_headers(
     apply: HeadersApply,
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -6134,7 +6102,7 @@ fn apply_headers(
 /// releases every claim it took, so the next announcement can ask.
 fn queue_claimed_block_getdata(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
     requested_blocks: &mut HashSet<BlockHash>,
     want: &[BlockHash],
@@ -6202,18 +6170,14 @@ fn ask_other_hb_for_block(session: Option<&crate::peers::LivePeer>, hash: BlockH
         let Some(out) = peer.writer() else {
             continue;
         };
-        let _ = queue_accounted(
-            Some(peer.as_ref()),
-            &out,
-            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-        );
+        let _ = out.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]));
     }
 }
 
 /// Send a locator the header job already built. Same in-flight gate as
 /// [`queue_getheaders`].
 fn queue_headers_locator(
-    out: &mpsc::UnboundedSender<PeerOut>,
+    out: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
     locator: Vec<BlockHash>,
 ) -> Result<(), NetError> {
@@ -6224,13 +6188,13 @@ fn queue_headers_locator(
         s.note_awaiting_headers();
     }
     let gh = GetHeadersMessage::new(locator, BlockHash::from_byte_array([0u8; 32]));
-    queue_out(out, NetworkMessage::GetHeaders(gh))
+    out.send(NetworkMessage::GetHeaders(gh))
 }
 
 #[doc(hidden)]
 pub async fn on_headers(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     headers: &[bitcoin::block::Header],
@@ -6262,7 +6226,7 @@ pub async fn on_headers(
 /// the block to the other sessions, as the forgotten ask allows.
 async fn on_mutated_block(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
@@ -6288,7 +6252,7 @@ async fn on_mutated_block(
 
 pub async fn on_block(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     block: &Block,
@@ -6432,7 +6396,7 @@ fn note_store_fault_keep_session(hub: &ChainHub, hash: BlockHash, e: &NetError) 
 
 pub async fn on_block_accept(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     block: &Block,
@@ -6460,7 +6424,7 @@ fn accept_mutated_log_reason(e: &NetError) -> &'static str {
 /// match in this function.
 async fn finish_block_accept(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     block: &Block,
@@ -6546,7 +6510,7 @@ pub fn drop_connected_pending_cmpct(
 
 pub async fn on_cmpctblock(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     cb: &CmpctBlock,
@@ -6617,7 +6581,7 @@ pub async fn on_cmpctblock(
 /// budget asks nothing, and each body is one hub claim.
 async fn on_cmpctblock_header_announce(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
@@ -6706,7 +6670,7 @@ pub fn on_cmpctblock_reject_early(
 #[doc(hidden)]
 pub fn on_cmpctblock_queue_ancestors(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
@@ -6734,7 +6698,7 @@ pub fn on_cmpctblock_queue_ancestors(
 
 pub async fn on_cmpctblock_reconstruct(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hsi: &HeaderAndShortIds,
@@ -6762,10 +6726,7 @@ pub async fn on_cmpctblock_reconstruct(
         }
         None => {
             log_cmpct_getdata(hash, 0);
-            queue_out(
-                out_tx,
-                NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-            )
+            out_tx.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
         }
     }
 }
@@ -6773,7 +6734,7 @@ pub async fn on_cmpctblock_reconstruct(
 #[allow(clippy::too_many_arguments)] // one compact-block fill; call site stays unbundled
 pub async fn on_cmpct_got_block(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hsi: &HeaderAndShortIds,
@@ -6805,7 +6766,7 @@ pub async fn on_cmpct_got_block(
 #[allow(clippy::too_many_arguments)] // one compact fill; the match stays one function
 fn apply_cmpct_accept(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hsi: &HeaderAndShortIds,
@@ -6856,7 +6817,7 @@ fn apply_cmpct_accept(
 
 #[doc(hidden)]
 pub fn on_cmpct_need_getdata(
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
 ) -> Result<(), NetError> {
@@ -6864,17 +6825,14 @@ pub fn on_cmpct_need_getdata(
     if let Some(s) = session {
         s.note_failed_cmpct(hash);
     }
-    queue_out(
-        out_tx,
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-    )
+    out_tx.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
 }
 
 #[allow(clippy::too_many_arguments)] // one getblocktxn ask; call site stays unbundled
 #[doc(hidden)]
 pub fn on_cmpct_need_txn(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hsi: &HeaderAndShortIds,
@@ -6889,10 +6847,7 @@ pub fn on_cmpct_need_txn(
     drop_connected_pending_cmpct(hub, follow, session);
     if follow.pending_cmpct.len() >= MAX_PENDING_CMPCT {
         log_cmpct_getdata(hash, missing_n);
-        return queue_out(
-            out_tx,
-            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-        );
+        return out_tx.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]));
     }
     let may_fill = session.is_none_or(|s| s.try_cmpct_fill(hash));
     if !may_fill {
@@ -6919,12 +6874,9 @@ pub fn on_cmpct_need_txn(
         s.note_block_inflight(h);
         s.note_blocks_requested(&[hash]);
     }
-    queue_out(
-        out_tx,
-        NetworkMessage::GetBlockTxn(GetBlockTxn {
-            txs_request: crate::compact::missing_request(hash, &missing),
-        }),
-    )?;
+    out_tx.send(NetworkMessage::GetBlockTxn(GetBlockTxn {
+        txs_request: crate::compact::missing_request(hash, &missing),
+    }))?;
     ask_other_hb_for_block(session, hash);
     rbitcoin_log::debug!(
         P2p,
@@ -6935,7 +6887,7 @@ pub fn on_cmpct_need_txn(
 
 pub async fn on_blocktxn(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     bt: &BlockTransactions,
@@ -6964,7 +6916,7 @@ pub async fn on_blocktxn(
 #[allow(clippy::too_many_arguments)] // one blocktxn fill; call site stays unbundled
 pub async fn on_blocktxn_got_block(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     pc: &PendingCmpct,
@@ -7037,7 +6989,7 @@ pub async fn on_blocktxn_got_block(
 #[doc(hidden)]
 pub fn on_blocktxn_apply_fail(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     pc: &PendingCmpct,
@@ -7052,16 +7004,13 @@ pub fn on_blocktxn_apply_fail(
     hub.forget_asked_block(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
     ask_other_hb_for_block(session, hash);
-    queue_out(
-        out_tx,
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-    )
+    out_tx.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_unconnectable(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
@@ -7074,10 +7023,7 @@ pub fn on_blocktxn_unconnectable(
     hub.forget_asked_block(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
     ask_other_hb_for_block(session, hash);
-    queue_out(
-        out_tx,
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-    )
+    out_tx.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7145,7 +7091,7 @@ pub fn schedule_orphan_parent_getdata(
 pub fn queue_due_parent_getdata(
     hub: &ChainHub,
     session: &crate::peers::LivePeer,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
 ) {
     let Some(mp) = hub.mempool() else {
         return;
@@ -7165,7 +7111,7 @@ pub fn queue_due_parent_getdata(
             }
         })
         .collect();
-    let _ = queue_accounted(Some(session), out_tx, NetworkMessage::GetData(inv));
+    let _ = out_tx.send(NetworkMessage::GetData(inv));
 }
 
 /// Flush walks every writer with an empty from-this-peer set. The sender
@@ -7217,7 +7163,7 @@ fn already_had_unvalidated(
 
 pub async fn on_tx(
     hub: &ChainHub,
-    _out_tx: &mpsc::UnboundedSender<PeerOut>,
+    _out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     tx: &Transaction,
@@ -7347,7 +7293,7 @@ pub fn on_bloom_forbidden(
 #[doc(hidden)]
 pub fn on_getaddr(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
     if let Some(s) = session {
@@ -7370,7 +7316,7 @@ pub fn on_getaddr(
 
 pub async fn drain_after_accept(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
@@ -7791,7 +7737,7 @@ pub async fn relay_new_pow_valid_block(
         let Some(out) = s.writer() else {
             continue;
         };
-        if queue_cmpct_tip_announce(&out, msg.clone()).is_ok() {
+        if out.send(msg.clone()).is_ok() {
             s.note_best_header_sent(hash);
             s.note_last_tip_offered(hash);
         }
@@ -8565,18 +8511,14 @@ pub fn compact_claimed_height(hub: &ChainHub, header: &bitcoin::block::Header) -
 
 /// Resend BIP133 feefilter when the published floor moved since the last send.
 #[doc(hidden)]
-pub fn maybe_queue_feefilter(
-    hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
-    session: &crate::peers::LivePeer,
-) {
+pub fn maybe_queue_feefilter(hub: &ChainHub, out_tx: &PeerOutTx, session: &crate::peers::LivePeer) {
     let Some(fee) = outbound_feefilter_sats(hub, Some(session)) else {
         return;
     };
     if session.sent_feefilter_sat_kvb() == fee {
         return;
     }
-    if queue_out(out_tx, NetworkMessage::FeeFilter(fee)).is_ok() {
+    if out_tx.send(NetworkMessage::FeeFilter(fee)).is_ok() {
         session.note_sent_feefilter(fee);
     }
 }
@@ -8601,30 +8543,22 @@ pub fn outbound_feefilter_sats(
     Some(hub.feefilter_sat_kvb() as i64)
 }
 
-#[doc(hidden)]
-pub fn queue_out(
-    out: &mpsc::UnboundedSender<PeerOut>,
-    msg: NetworkMessage,
-) -> Result<(), NetError> {
-    queue_accounted(None, out, msg)
-}
-
-/// One charged pong per session. A later ping replaces the nonce and does
-/// not queue another message. No session still queues every pong.
+/// One pong per session on the queue. A later ping replaces the nonce and
+/// does not queue another message. No session queues every pong.
 #[doc(hidden)]
 pub fn queue_pong(
     session: Option<&crate::peers::LivePeer>,
-    out: &mpsc::UnboundedSender<PeerOut>,
+    out: &PeerOutTx,
     nonce: u64,
 ) -> Result<(), NetError> {
     let Some(session) = session else {
-        return queue_out(out, NetworkMessage::Pong(nonce));
+        return out.send(NetworkMessage::Pong(nonce));
     };
     session.store_pong_nonce(nonce);
     if !session.claim_pong_send() {
         return Ok(());
     }
-    queue_accounted(Some(session), out, NetworkMessage::Pong(nonce))
+    out.send(NetworkMessage::Pong(nonce))
 }
 
 /// Send filtered tx announcements in [`TX_INV_BATCH`] chunks.
@@ -8632,64 +8566,10 @@ pub fn queue_pong(
 /// The caller already owns the filtered inventories. Chunking does not clone
 /// the live wtxid set and does not hold the mempool lock across the send.
 #[doc(hidden)]
-pub fn queue_tx_inv_batches(
-    session: &crate::peers::LivePeer,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
-    inv: Vec<Inventory>,
-) {
+pub fn queue_tx_inv_batches(out_tx: &PeerOutTx, inv: Vec<Inventory>) {
     for chunk in inv.chunks(TX_INV_BATCH) {
-        let _ = queue_accounted(Some(session), out_tx, NetworkMessage::Inv(chunk.to_vec()));
+        let _ = out_tx.send(NetworkMessage::Inv(chunk.to_vec()));
     }
-}
-
-#[doc(hidden)]
-pub fn queue_accounted(
-    session: Option<&crate::peers::LivePeer>,
-    out: &mpsc::UnboundedSender<PeerOut>,
-    msg: NetworkMessage,
-) -> Result<(), NetError> {
-    queue_charged(session, out, PeerOut::Msg(msg))
-}
-
-#[doc(hidden)]
-pub fn queue_charged(
-    session: Option<&crate::peers::LivePeer>,
-    out: &mpsc::UnboundedSender<PeerOut>,
-    item: PeerOut,
-) -> Result<(), NetError> {
-    let n = crate::peers::outbound_queued_bytes(&item);
-    out.send(item)
-        .map_err(|_| NetError::Protocol("peer write half closed"))?;
-    if let Some(s) = session {
-        s.note_send_queued(n);
-    }
-    Ok(())
-}
-
-/// Queue a getdata body ([`PeerOut::holds_serve_slot`]) and count it on
-/// `serve_inflight`. [`crate::peers::LivePeer::has_serve_room`] already
-/// held the getdata until the cap had room.
-#[doc(hidden)]
-pub fn queue_served(
-    session: Option<&crate::peers::LivePeer>,
-    out: &mpsc::UnboundedSender<PeerOut>,
-    item: PeerOut,
-) -> Result<(), NetError> {
-    let Some(s) = session else {
-        return queue_charged(None, out, item);
-    };
-    s.serve_inflight.fetch_add(1, Ordering::SeqCst);
-    queue_charged(session, out, item).inspect_err(|_| s.free_serve_slot())
-}
-
-/// BIP152 high-bandwidth tip announce. Takes no `serve_inflight` slot
-/// (that cap is reconstruct getdata), and the writer frees none for it.
-#[doc(hidden)]
-pub fn queue_cmpct_tip_announce(
-    out: &mpsc::UnboundedSender<PeerOut>,
-    msg: NetworkMessage,
-) -> Result<(), NetError> {
-    queue_out(out, msg)
 }
 
 #[doc(hidden)]
@@ -8734,7 +8614,7 @@ pub fn release_asks_off_path(
 /// Try to accept pending blocks that connect to tip or form a better branch.
 pub async fn drain_pending(
     hub: &ChainHub,
-    out: &mpsc::UnboundedSender<PeerOut>,
+    out: &PeerOutTx,
     pending_blocks: &mut PendingBlocks,
     pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
     requested_blocks: &mut HashSet<BlockHash>,
@@ -8781,7 +8661,7 @@ pub async fn drain_pending(
 
 pub fn drain_pending_now(
     hub: &ChainHub,
-    out: &mpsc::UnboundedSender<PeerOut>,
+    out: &PeerOutTx,
     pending_blocks: &mut PendingBlocks,
     pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
     requested_blocks: &mut HashSet<BlockHash>,

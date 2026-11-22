@@ -9,6 +9,7 @@ use rbitcoin_consensus::{genesis_block, mine_regtest_paying, ChainParams, Milest
 use rbitcoin_net::chain::*;
 use rbitcoin_net::error::NetError;
 use rbitcoin_net::most_work::work_better;
+use rbitcoin_net::send_queue::peer_out_channel;
 use rbitcoin_net::tip_accept::run_on_tip_accept;
 use rbitcoin_primitives::{Fk, Height};
 use std::collections::{HashMap, HashSet};
@@ -2104,7 +2105,7 @@ fn reorg_back_reaches_a3(label: &str, prune: bool, restart: bool) -> bool {
         let mut follow = rbitcoin_net::peer::PeerFollowState::new();
         follow.requested_blocks.insert(a1h);
         hub.note_asked_block(a1h);
-        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = peer_out_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4775,7 +4776,7 @@ fn store_fault_on_block_releases_the_body_ask() {
         .build()
         .expect("on_block runtime");
     rt.block_on(async {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = peer_out_channel();
         let mut follow = rbitcoin_net::peer::PeerFollowState::new();
         follow.requested_blocks.insert(hash);
         rbitcoin_net::peer::on_block(&hub, &tx, &mut follow, None, &b3)
@@ -4843,7 +4844,7 @@ fn resent_block_returns_while_the_tip_accept_lane_is_busy() {
             .build()
             .expect("on_block runtime");
         let result = rt.block_on(async {
-            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, _rx) = peer_out_channel();
             let mut follow = rbitcoin_net::peer::PeerFollowState::new();
             rbitcoin_net::peer::on_block(&hub_for_block, &tx, &mut follow, None, &block).await
         });
@@ -5040,7 +5041,7 @@ fn store_fault_on_cmpct_releases_the_body_ask() {
         .build()
         .expect("cmpct runtime");
     rt.block_on(async {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = peer_out_channel();
         let mut follow = rbitcoin_net::peer::PeerFollowState::new();
         follow.requested_blocks.insert(hash);
         rbitcoin_net::peer::on_cmpct_got_block(&hub, &tx, &mut follow, None, &hsi, hash, b3, None)

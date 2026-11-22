@@ -6,6 +6,7 @@ use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::{BlockHash, Txid, Wtxid};
 pub use rbitcoin_net::peers::*;
+use rbitcoin_net::send_queue::PeerOutRx;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -263,11 +264,7 @@ fn peerhub_hb_select() {
     };
     let hb = |p: &LivePeer| p.hb_to.load(Ordering::Relaxed);
     let pending = |p: &LivePeer| p.pending_sendcmpct.load(Ordering::Relaxed);
-    let sendcmpct = |rx: &mut mpsc::UnboundedReceiver<PeerOut>| match rx
-        .try_recv()
-        .expect("sendcmpct")
-        .expect_msg()
-    {
+    let sendcmpct = |rx: &mut PeerOutRx| match rx.try_recv().expect("sendcmpct").expect_msg() {
         NetworkMessage::SendCmpct(sc) => {
             assert_eq!(sc.version, 2);
             sc.send_compact
@@ -289,8 +286,7 @@ fn peerhub_hb_select() {
     assert!(hb(&a));
     assert_eq!(pending(&a), PendingSendCmpct::Hb as u8);
     let b = join(18446, true);
-    let (b_tx, mut b_rx) = mpsc::unbounded_channel();
-    b.attach_out(b_tx);
+    let (_, mut b_rx) = b.open_out();
     hub.maybe_select_hb(b.id);
     assert!(hb(&b) && sendcmpct(&mut b_rx));
     assert_eq!(pending(&b), 0);
@@ -970,8 +966,7 @@ async fn leaving_ibd_starts_tx_relay_and_high_bandwidth_in_tip_mode() {
         false,
         PeerConnType::OutboundFullRelay,
     );
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    peer.attach_out(out_tx);
+    let (_, mut out_rx) = peer.open_out();
     let now = chain.clock.now_secs() as u32;
     let block = rbitcoin_consensus::mine_empty_regtest(chain.tip_hash().unwrap(), now, 1);
     let got = accept_received_from_peer(&chain, block, Some(&peer))

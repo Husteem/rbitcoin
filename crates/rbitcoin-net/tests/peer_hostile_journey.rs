@@ -39,8 +39,7 @@ async fn addrv2_gossip_drops_unroutable_clearnet() {
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
     dst.set_wants_addrv2();
-    let (_dst_tx, mut dst_rx) = mpsc::unbounded_channel();
-    dst.attach_out(_dst_tx);
+    let (_dst_tx, mut dst_rx) = dst.open_out();
     peers.set_mock_now(peer.connected_at_secs() + 10_000);
 
     let public = AddrV2Message {
@@ -181,8 +180,7 @@ async fn addrv2_relay_drops_own_addresses() {
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
     clear.set_wants_addrv2();
-    let (clear_tx, mut clear_rx) = mpsc::unbounded_channel();
-    clear.attach_out(clear_tx);
+    let (_, mut clear_rx) = clear.open_out();
     let onion_net: rbitcoin_net::NetAddr =
         "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333"
             .parse()
@@ -197,8 +195,7 @@ async fn addrv2_relay_drops_own_addresses() {
         rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
     );
     onion_peer.set_wants_addrv2();
-    let (onion_tx, mut onion_rx) = mpsc::unbounded_channel();
-    onion_peer.attach_out(onion_tx);
+    let (_, mut onion_rx) = onion_peer.open_out();
     peers.set_mock_now(src.connected_at_secs() + 10_000);
 
     let row = |addr: AddrV2, port: u16| AddrV2Message {
@@ -277,7 +274,7 @@ async fn hostile_peer_session() {
         true,
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer.open_out();
     let mut follow = PeerFollowState::new();
 
     let hdr = Header {
@@ -360,7 +357,7 @@ async fn hostile_peer_session() {
         panic!("one getheaders under the budget must be answered");
     };
     assert_eq!(first.len(), 200, "locator after genesis walks the tip");
-    let mut queued = 1usize;
+    let mut unread = Vec::new();
     for _ in 0..400 {
         handle_decoded_peer_msg(
             RawNetworkMessage::new(
@@ -378,10 +375,11 @@ async fn hostile_peer_session() {
         .await
         .unwrap();
         match out_rx.try_recv() {
-            Ok(_) => queued += 1,
+            Ok(reply) => unread.push(reply),
             Err(_) => break,
         }
     }
+    let queued = 1 + unread.len();
     let batch = first.len().saturating_mul(81);
     let room = rbitcoin_net::peers::PEER_SEND_BUDGET / batch;
     assert!(
@@ -390,20 +388,12 @@ async fn hostile_peer_session() {
     );
     assert!(queued > 1, "a getheaders under the budget produced no further reply");
 
-    peer.note_send_written(peer.send_queued());
+    drop(unread);
     assert!(!peer.send_over_budget());
     let before = peer.send_queued();
-    queue_accounted(
-        Some(&peer),
-        &out_tx,
-        NetworkMessage::Inv(vec![Inventory::Block(genesis)]),
-    )
+    out_tx.send(NetworkMessage::Inv(vec![Inventory::Block(genesis)]))
     .unwrap();
-    queue_accounted(
-        Some(&peer),
-        &out_tx,
-        NetworkMessage::NotFound(vec![Inventory::Block(genesis)]),
-    )
+    out_tx.send(NetworkMessage::NotFound(vec![Inventory::Block(genesis)]))
     .unwrap();
     let tx = bitcoin::Transaction {
         version: bitcoin::transaction::Version::ONE,
@@ -412,12 +402,8 @@ async fn hostile_peer_session() {
         output: vec![],
     };
     let tx_n = tx.total_size();
-    queue_accounted(Some(&peer), &out_tx, NetworkMessage::Tx(tx)).unwrap();
-    queue_accounted(
-        Some(&peer),
-        &out_tx,
-        NetworkMessage::Addr(vec![(0, Address::new(&bind, ServiceFlags::NONE))]),
-    )
+    out_tx.send(NetworkMessage::Tx(tx)).unwrap();
+    out_tx.send(NetworkMessage::Addr(vec![(0, Address::new(&bind, ServiceFlags::NONE))]))
     .unwrap();
     assert_eq!(
         peer.send_queued() - before,
@@ -460,16 +446,16 @@ async fn hostile_peer_session() {
         blocktxn_n
     );
     assert_eq!(rbitcoin_net::peers::PEER_SEND_BUDGET, 4 * 1024 * 1024);
-    peer.note_send_written(peer.send_queued());
-    peer.note_send_queued(rbitcoin_net::peers::PEER_SEND_BUDGET);
+    while out_rx.try_recv().is_ok() {}
+    assert_eq!(peer.send_queued(), 0, "every reply taken off the queue is released");
+    let at_cap = hold_send_bytes(&peer, rbitcoin_net::peers::PEER_SEND_BUDGET);
     assert!(
         !peer.send_over_budget(),
         "the cap itself is still inside the budget"
     );
-    peer.note_send_queued(1);
+    out_tx.send(PeerOut::Encoded(vec![0])).unwrap();
     assert!(peer.send_over_budget());
-    peer.note_send_written(peer.send_queued());
-
+    drop(at_cap);
     while out_rx.try_recv().is_ok() {}
     handle_peer_inventory_msg(
         &NetworkMessage::GetAddr,
@@ -594,14 +580,12 @@ async fn hostile_addr_relay(
     follow: &mut PeerFollowState,
 ) {
         peer.set_wants_addrv2();
-        let (src_tx, mut src_rx) = mpsc::unbounded_channel();
-        peer.attach_out(src_tx);
+        let (_, mut src_rx) = peer.open_out();
         let mut neigh = Vec::new();
         let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22000);
         let dst = peers.register(a, a, ver, true, rbitcoin_net::peers::PeerConnType::Inbound);
         dst.set_wants_addrv2();
-        let (tx, rx) = mpsc::unbounded_channel();
-        dst.attach_out(tx);
+        let (_, rx) = dst.open_out();
         neigh.push((dst.id, rx));
         let quiet_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 23000);
         let quiet = peers.register(
@@ -611,8 +595,7 @@ async fn hostile_addr_relay(
             true,
             rbitcoin_net::peers::PeerConnType::Inbound,
         );
-        let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel();
-        quiet.attach_out(quiet_tx);
+        let (_, mut quiet_rx) = quiet.open_out();
 
         let mut fresh = AddrTokenBucket::new(1_000);
         assert_eq!(fresh.take(5, 1_000), 1, "a new bucket holds one token");
@@ -666,8 +649,7 @@ async fn hostile_addr_relay(
             let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22000 + i);
             let p = peers.register(a, a, ver, true, rbitcoin_net::peers::PeerConnType::Inbound);
             p.set_wants_addrv2();
-            let (tx, rx) = mpsc::unbounded_channel();
-            p.attach_out(tx);
+            let (_, rx) = p.open_out();
             neigh.push((p.id, rx));
         }
 
@@ -949,7 +931,7 @@ fn nonconnecting_header(nonce: u32) -> bitcoin::block::Header {
 /// pending map holds [`MAX_PENDING_HEADERS`].
 async fn fill_nonconnecting_to_cap(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     peer: &rbitcoin_net::peers::LivePeer,
 ) {
@@ -982,7 +964,7 @@ async fn cap_evicts_only_after_the_store_accepts() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let ver = hostile_ver(bind);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
 
     let mut above_limit = tip;
     above_limit.prev_blockhash = tip.block_hash();
@@ -1149,7 +1131,7 @@ async fn cap_accepts_the_next_header_when_equal_work_fills_the_map() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let ver = hostile_ver(bind);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let peer = peers.register(
         bind,
         bind,
@@ -1262,7 +1244,7 @@ async fn cap_accepts_the_next_header_when_failed_pow_fills_the_map() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let ver = hostile_ver(bind);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let peer = peers.register(
         bind,
         bind,
@@ -1360,7 +1342,7 @@ async fn cap_counts_one_repeated_header() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let ver = hostile_ver(bind);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let peer = peers.register(
         bind,
         bind,
@@ -1422,8 +1404,8 @@ fn bad_diffbits_child(tip: &bitcoin::block::Header) -> bitcoin::block::Header {
 /// follow it.
 async fn inv_asks_headers(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
-    out_rx: &mut mpsc::UnboundedReceiver<PeerOut>,
+    out_tx: &PeerOutTx,
+    out_rx: &mut PeerOutRx,
     follow: &mut PeerFollowState,
     peer: &rbitcoin_net::peers::LivePeer,
     hash: BlockHash,
@@ -1460,7 +1442,7 @@ async fn cap_store_kept_headers_skip_a_rejected_tip_child() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let ver = hostile_ver(bind);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let peer = peers.register(
         bind,
         bind,
@@ -1536,7 +1518,7 @@ async fn cap_store_kept_headers_skip_an_earlier_hash() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let ver = hostile_ver(bind);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let peer = peers.register(
         bind,
         bind,
@@ -1591,7 +1573,7 @@ async fn cap_already_stored_tip_frees_no_slot() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
     let ver = hostile_ver(bind);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let peer = peers.register(
         bind,
         bind,

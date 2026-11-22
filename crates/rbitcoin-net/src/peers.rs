@@ -2,6 +2,7 @@
 
 use crate::error::NetError;
 use crate::netaddr::ExternalEndpoint;
+use crate::send_queue::{PeerOutRx, PeerOutTx, SendQueue};
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::address::{AddrV2Message, Address};
 use bitcoin::p2p::message::NetworkMessage;
@@ -88,6 +89,12 @@ pub enum PeerOut {
     Encoded(Vec<u8>),
     /// A getdata `block` or `cmpctblock`. Holds one serve slot.
     Served(NetworkMessage),
+}
+
+impl From<NetworkMessage> for PeerOut {
+    fn from(msg: NetworkMessage) -> Self {
+        PeerOut::Msg(msg)
+    }
 }
 
 impl PeerOut {
@@ -502,12 +509,9 @@ pub struct LivePeer {
     /// Their `version.relay`. False or `block-relay-only` → `relaytxes=false`.
     pub relay: bool,
     pub stop: AtomicBool,
-    /// Full `Block`/`CmpctBlock` messages queued to this session's writer.
-    pub serve_inflight: AtomicUsize,
-    /// Bytes sitting in this session's outbound queue (estimate).
-    pub send_queued: AtomicUsize,
-    /// Wakes the reader after the writer drains under [`PEER_SEND_BUDGET`].
-    pub send_resume: tokio::sync::Notify,
+    /// This session's writer channel accounting. Every channel
+    /// [`Self::open_out`] hands out charges it.
+    send_queue: Arc<SendQueue>,
     /// Times [`Self::wait_send_budget`] armed that wait. The wait, not the contract.
     #[cfg(debug_assertions)]
     send_budget_parks: AtomicUsize,
@@ -581,7 +585,7 @@ pub struct LivePeer {
     pub inflight: Mutex<Vec<u32>>,
     pub block_download: Mutex<BlockDownload>,
     /// Session writer. RPC/accept flushes tx INVs onto this (`p2p_blocksonly`).
-    pub out_tx: Mutex<Option<mpsc::UnboundedSender<PeerOut>>>,
+    pub out_tx: Mutex<Option<PeerOutTx>>,
     /// Addresses this peer may still send us (Core `m_addr_token_bucket`).
     pub addr_bucket: Mutex<crate::peer::AddrTokenBucket>,
     /// `getpeerinfo.addr_processed` / `addr_rate_limited`.
@@ -756,7 +760,7 @@ impl LivePeer {
 
     pub fn request_disconnect(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.send_resume.notify_waiters();
+        self.send_queue.wake();
     }
 
     /// Wake a session that is blocked in a read or a send pause. The session
@@ -1028,7 +1032,7 @@ impl LivePeer {
         };
         let g = self.out_tx.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(tx) = g.as_ref() {
-            let _ = tx.send(PeerOut::Msg(msg));
+            let _ = tx.send(msg);
         }
     }
 
@@ -1353,61 +1357,21 @@ impl LivePeer {
     }
 
     pub fn queue_msg(&self, msg: NetworkMessage) -> bool {
-        let n = outbound_msg_bytes(&msg);
-        let ok = self
-            .writer()
-            .is_some_and(|tx| tx.send(PeerOut::Msg(msg)).is_ok());
-        if ok {
-            self.note_send_queued(n);
-        }
-        ok
+        self.writer().is_some_and(|tx| tx.send(msg).is_ok())
     }
 
     pub fn send_queued(&self) -> usize {
-        self.send_queued.load(Ordering::Relaxed)
+        self.send_queue.bytes()
+    }
+
+    /// Queued items that hold a serve slot ([`PeerOut::holds_serve_slot`]).
+    pub fn serve_inflight(&self) -> usize {
+        self.send_queue.served()
     }
 
     /// True after a reply has already pushed this peer past [`PEER_SEND_BUDGET`].
     pub fn send_over_budget(&self) -> bool {
         self.send_queued() > PEER_SEND_BUDGET
-    }
-
-    pub fn note_send_queued(&self, n: usize) {
-        if n > 0 {
-            self.send_queued.fetch_add(n, Ordering::Relaxed);
-        }
-    }
-
-    /// Writer finished (or dropped) `n` queued bytes. Wakes a paused reader.
-    pub fn note_send_written(&self, n: usize) {
-        let prev = self
-            .send_queued
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(n))
-            })
-            .unwrap_or(0);
-        if prev.saturating_sub(n) <= PEER_SEND_BUDGET {
-            self.send_resume.notify_waiters();
-        }
-    }
-
-    /// The writer is done with one queued message of `bytes`. The serve slot
-    /// is freed before the bytes: [`Self::note_send_written`] wakes a paused
-    /// getdata tail, which must see the slot.
-    pub fn note_out_written(&self, serve_slot: bool, bytes: usize) {
-        if serve_slot {
-            self.free_serve_slot();
-        }
-        self.note_send_written(bytes);
-    }
-
-    /// Saturating, so a double free cannot wrap to `usize::MAX`.
-    pub fn free_serve_slot(&self) {
-        let _ = self
-            .serve_inflight
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                Some(v.saturating_sub(1))
-            });
     }
 
     /// Times this peer has armed [`Self::wait_send_budget`]. The wait, not the contract.
@@ -1420,7 +1384,7 @@ impl LivePeer {
     /// Reader pause. Registers the waiter before the budget check.
     pub async fn wait_send_budget(&self) {
         loop {
-            let notified = self.send_resume.notified();
+            let notified = self.send_queue.resume().notified();
             if self.stop.load(Ordering::SeqCst) || !self.send_over_budget() {
                 return;
             }
@@ -1435,16 +1399,15 @@ impl LivePeer {
     /// served bodies. The session reader is the only task that queues
     /// served bodies, so room seen here still holds when it queues.
     pub fn has_serve_room(&self) -> bool {
-        !self.send_over_budget()
-            && self.serve_inflight.load(Ordering::SeqCst) < crate::MAX_SERVE_BLOCKS
+        !self.send_over_budget() && self.serve_inflight() < crate::MAX_SERVE_BLOCKS
     }
 
     /// Getdata pause, Core `fPauseSend`: a paused getdata tail resumes once
     /// [`Self::has_serve_room`]. `false` once the session is told to
     /// disconnect or its writer (`out`'s receiver) is gone.
-    pub async fn wait_serve_room(&self, out: &mpsc::UnboundedSender<PeerOut>) -> bool {
+    pub async fn wait_serve_room(&self, out: &PeerOutTx) -> bool {
         loop {
-            let notified = self.send_resume.notified();
+            let notified = self.send_queue.resume().notified();
             if self.stop.load(Ordering::SeqCst) {
                 return false;
             }
@@ -1463,8 +1426,16 @@ impl LivePeer {
         !self.getaddr_answered.swap(true, Ordering::Relaxed)
     }
 
-    pub fn attach_out(&self, tx: mpsc::UnboundedSender<PeerOut>) {
-        *self.out_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    #[doc(hidden)]
+    pub fn send_queue(&self) -> &Arc<SendQueue> {
+        &self.send_queue
+    }
+
+    /// The session's writer channel. [`Self::writer`] hands out the sender.
+    pub fn open_out(&self) -> (PeerOutTx, PeerOutRx) {
+        let (tx, rx) = self.send_queue.channel();
+        *self.out_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
+        (tx, rx)
     }
 
     /// Core `m_addr_token_bucket += MAX_ADDR_TO_SEND` on `getaddr`: the
@@ -1500,7 +1471,7 @@ impl LivePeer {
         allow
     }
 
-    pub fn writer(&self) -> Option<mpsc::UnboundedSender<PeerOut>> {
+    pub fn writer(&self) -> Option<PeerOutTx> {
         self.out_tx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3672,9 +3643,7 @@ impl PeerHub {
             conn_type,
             relay: ver.relay,
             stop: AtomicBool::new(false),
-            serve_inflight: AtomicUsize::new(0),
-            send_queued: AtomicUsize::new(0),
-            send_resume: tokio::sync::Notify::new(),
+            send_queue: Arc::default(),
             #[cfg(debug_assertions)]
             send_budget_parks: AtomicUsize::new(0),
             getaddr_answered: AtomicBool::new(false),
@@ -3790,10 +3759,7 @@ impl PeerHub {
                 continue;
             }
             if let Some(tx) = s.writer() {
-                if tx
-                    .send(PeerOut::Msg(NetworkMessage::FeeFilter(sat_kvb)))
-                    .is_ok()
-                {
+                if tx.send(NetworkMessage::FeeFilter(sat_kvb)).is_ok() {
                     s.note_sent_feefilter(sat_kvb);
                 }
             }
@@ -4433,12 +4399,12 @@ impl PeerHub {
                 if let Some(p) = self.get(evicted) {
                     p.set_hb_to(false);
                     if let Some(out) = p.writer() {
-                        let _ = out.send(PeerOut::Msg(NetworkMessage::SendCmpct(
+                        let _ = out.send(NetworkMessage::SendCmpct(
                             bitcoin::p2p::message_compact_blocks::SendCmpct {
                                 send_compact: false,
                                 version: 2,
                             },
-                        )));
+                        ));
                         p.pending_sendcmpct.store(0, Ordering::Relaxed);
                     } else {
                         p.pending_sendcmpct
@@ -4450,12 +4416,12 @@ impl PeerHub {
         sel.push(id);
         peer.set_hb_to(true);
         if let Some(out) = peer.writer() {
-            let _ = out.send(PeerOut::Msg(NetworkMessage::SendCmpct(
+            let _ = out.send(NetworkMessage::SendCmpct(
                 bitcoin::p2p::message_compact_blocks::SendCmpct {
                     send_compact: true,
                     version: 2,
                 },
-            )));
+            ));
             peer.pending_sendcmpct.store(0, Ordering::Relaxed);
         } else {
             peer.pending_sendcmpct

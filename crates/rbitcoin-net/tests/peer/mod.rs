@@ -19,6 +19,7 @@ use rbitcoin_net::error::NetError;
 use rbitcoin_net::peer::*;
 use rbitcoin_net::peers::{CappedSet, PeerOut};
 use rbitcoin_net::seeds::AddrMan;
+use rbitcoin_net::send_queue::{peer_out_channel, PeerOutRx, PeerOutTx, Queued};
 use rbitcoin_net::tip_accept::run_on_tip_accept;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
@@ -32,8 +33,41 @@ use tokio::sync::{broadcast, mpsc};
 
 use rbitcoin_consensus::{ChainParams, Milestone};
 
-fn served_block(p: PeerOut) -> bitcoin::Block {
-    match p {
+/// A message charged exactly `n` bytes, `n` at least 64 KiB.
+fn charged_msg(n: usize) -> NetworkMessage {
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            script_sig: ScriptBuf::from_bytes(vec![0; n - 55]),
+            ..Default::default()
+        }],
+        output: vec![],
+    };
+    let msg = NetworkMessage::Tx(tx);
+    assert_eq!(rbitcoin_net::peers::outbound_msg_bytes(&msg), n);
+    msg
+}
+
+/// `n` bytes on `peer`'s send queue that no writer drains. Dropping the
+/// receiver is the writer finishing them.
+fn hold_send_bytes(peer: &rbitcoin_net::peers::LivePeer, n: usize) -> PeerOutRx {
+    let (tx, rx) = peer.send_queue().channel();
+    tx.send(charged_msg(n)).unwrap();
+    rx
+}
+
+/// `n` served bodies on `peer`'s send queue that no writer drains.
+fn hold_serve_slots(peer: &rbitcoin_net::peers::LivePeer, n: usize) -> PeerOutRx {
+    let (tx, rx) = peer.send_queue().channel();
+    for _ in 0..n {
+        tx.send(PeerOut::Encoded(Vec::new())).unwrap();
+    }
+    rx
+}
+
+fn served_block(q: Queued) -> bitcoin::Block {
+    match q.into_out() {
         PeerOut::Encoded(bytes) => {
             assert_eq!(bytes.first().copied(), Some(2), "v2 block short id");
             bitcoin::consensus::encode::deserialize(&bytes[1..]).expect("served block payload")
@@ -219,7 +253,7 @@ fn ibd_connect_does_not_start_headers_sync() {
         true,
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     assert!(
         maybe_queue_initial_getheaders(&tx, &hub, &session),
         "IBD still asks the one headers peer for the stored tip"
@@ -243,7 +277,7 @@ fn ibd_connect_does_not_start_headers_sync() {
         true,
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    let (tx2, mut rx2) = peer_out_channel();
     assert!(
         !maybe_queue_initial_getheaders(&tx2, &hub, &session2),
         "a second connecting peer does not start another headers sync"
@@ -268,7 +302,7 @@ fn ibd_connect_does_not_start_headers_sync() {
         true,
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
-    let (tx3, mut rx3) = mpsc::unbounded_channel();
+    let (tx3, mut rx3) = peer_out_channel();
     assert!(
         maybe_queue_initial_getheaders(&tx3, &hub, &session3),
         "after IBD a connecting peer still starts headers sync"
@@ -303,7 +337,7 @@ fn ignored_full_header_batch_does_not_page() {
         prev = hdr.block_hash();
         headers.push(hdr);
     }
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -325,7 +359,7 @@ fn ibd_unknown_block_inv_does_not_getheaders() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-no-inv");
     hub.ensure_genesis().unwrap();
     assert!(hub.in_ibd());
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let unknown = BlockHash::from_byte_array([0x44; 32]);
     on_inv(&hub, &tx, &mut follow, None, &[Inventory::Block(unknown)]).unwrap();
@@ -471,7 +505,7 @@ async fn session_start_announces_a_tip_mined_during_handshake() {
         "an inv does not count as a header the peer has"
     );
     assert_eq!(sess.live.last_tip_offered(), Some(tip));
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let closed = announce_unsent_tip(
         hub.as_ref(),
@@ -523,7 +557,7 @@ async fn queued_tip_before_session_start_is_one_inv() {
         None,
         "an inv does not count as a header the peer has"
     );
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let closed = announce_unsent_tip(
         hub.as_ref(),
@@ -769,7 +803,7 @@ async fn getheaders_parent_of_the_tip_is_the_offer() {
     );
     let stale = BlockHash::from_byte_array([0x11; 32]);
     session.note_last_tip_offered(stale);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     on_getheaders(
         &hub,
@@ -835,7 +869,7 @@ async fn getheaders_keeps_a_newer_offer() {
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
     session.note_last_tip_offered(child);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     on_getheaders(
         &hub,
@@ -1021,9 +1055,9 @@ fn cmpct_helpers_without_mempool_and_queue_out_closed() {
     assert!(hub.mempool().is_none());
 
     // Closed channel → Protocol error.
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = peer_out_channel();
     drop(rx);
-    assert!(queue_out(&tx, NetworkMessage::Verack).is_err());
+    assert!(tx.send(NetworkMessage::Verack).is_err());
     assert!(queue_getheaders(&tx, &hub, None, false, None).is_err());
 
     // headers_for_peer empty store after genesis still returns (tip exists).
@@ -1039,7 +1073,7 @@ fn cmpct_helpers_without_mempool_and_queue_out_closed() {
     // drain_pending empty is a no-op.
     let mut pb = PendingBlocks::new();
     let mut ph = HashMap::new();
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = peer_out_channel();
     drain_pending_now(&hub, &tx, &mut pb, &mut ph, &mut HashSet::new(), false).unwrap();
 
     // Invalid tip-extending body must not kill the session (001).
@@ -1107,7 +1141,7 @@ fn cmpct_helpers_without_mempool_and_queue_out_closed() {
     }
     let bh = bad.block_hash();
     pb.insert(bh, bad.clone());
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = peer_out_channel();
     drain_pending_now(&hub, &tx, &mut pb, &mut ph, &mut HashSet::new(), false)
         .expect("invalid block must not end session");
     assert!(
@@ -1223,7 +1257,7 @@ async fn partial_for_a_block_connected_elsewhere_frees_the_slot() {
         true,
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     stalling.hb_to.store(true, Ordering::Relaxed);
@@ -1287,7 +1321,7 @@ async fn partial_for_a_block_connected_elsewhere_frees_the_slot() {
 
 async fn heartbeat_once(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     peer: &rbitcoin_net::peers::LivePeer,
 ) {
@@ -1315,7 +1349,7 @@ async fn queued_decode_holds_block_requests_across_heartbeat() {
     hub.ensure_genesis().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = outbound_test_peer(&peers, 18449);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let hash = BlockHash::from_byte_array([0x44; 32]);
     hub.note_asked_block(hash);
     let mut follow = PeerFollowState::new();
@@ -1399,7 +1433,7 @@ async fn held_front_keeps_a_queued_blocktxn_pending() {
             since: std::time::Instant::now() - BLOCK_GETDATA_TIMEOUT - Duration::from_secs(1),
         },
     );
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut since = None;
     on_heartbeat(
         &hub,
@@ -1466,7 +1500,7 @@ async fn getdata_stall_keeps_a_hash_the_download_timer_owns() {
     peer.note_blocks_requested(&[hash]);
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = peer_out_channel();
     let mut since =
         Some(std::time::Instant::now() - BLOCK_GETDATA_TIMEOUT - Duration::from_secs(1));
     for _ in 0..2 {
@@ -1533,7 +1567,7 @@ async fn queued_decode_holds_the_block_download_window() {
     peer.note_blocks_requested(&[hash]);
     let interval = hub.params.btc.pow_target_spacing;
     peers.set_mock_now(start + interval + 1);
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
     let mut since = None;
@@ -1593,7 +1627,7 @@ async fn queued_decode_holds_the_ping_timeout() {
     // Past `-peertimeout`, the post-block minute, and the twenty-minute
     // ping, with nothing in the block-download window.
     peers.set_mock_now(start + 20 * 60 + 61);
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let mut since = None;
     on_heartbeat(
@@ -2075,7 +2109,7 @@ fn outbound_test_peer(
     peer
 }
 
-fn sent(out_rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<NetworkMessage> {
+fn sent(out_rx: &mut PeerOutRx) -> Vec<NetworkMessage> {
     let mut msgs = Vec::new();
     while let Ok(m) = out_rx.try_recv() {
         msgs.push(m.expect_msg());
@@ -2107,9 +2141,8 @@ async fn silent_compact_peer_holds_the_ping_then_hits_the_download_timeout() {
     peers.set_mock_now(start);
     let silent = outbound_test_peer(&peers, 18448);
     let other = outbound_test_peer(&peers, 18450);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    let (other_tx, mut other_rx) = mpsc::unbounded_channel();
-    other.attach_out(other_tx.clone());
+    let (out_tx, mut out_rx) = peer_out_channel();
+    let (other_tx, mut other_rx) = other.open_out();
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     heartbeat_once(&hub, &out_tx, &mut follow, &silent).await;
@@ -2228,10 +2261,8 @@ async fn witness_reconstruct_fail_asks_another_peer() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let announcer = inbound_test_peer(&peers, 18451);
     let other = outbound_test_peer(&peers, 18452);
-    let (ann_tx, mut ann_rx) = mpsc::unbounded_channel();
-    let (other_tx, mut other_rx) = mpsc::unbounded_channel();
-    announcer.attach_out(ann_tx.clone());
-    other.attach_out(other_tx);
+    let (ann_tx, mut ann_rx) = announcer.open_out();
+    let (_, mut other_rx) = other.open_out();
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     on_cmpctblock(
@@ -2277,8 +2308,7 @@ async fn witness_reconstruct_fail_asks_another_peer() {
     assert_ne!(hub.tip_hash(), Some(hash_a));
 
     let peer = inbound_test_peer(&peers, 18499);
-    let (tx, _rx) = mpsc::unbounded_channel();
-    peer.attach_out(tx.clone());
+    let (tx, _rx) = peer.open_out();
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     let hsi = HeaderAndShortIds::from_block(&good_a, 0xbeef, 2, &[]).unwrap();
@@ -2322,16 +2352,12 @@ fn hb_relay_target(
     peers: &Arc<rbitcoin_net::peers::PeerHub>,
     hub: &ChainHub,
     port: u16,
-) -> (
-    Arc<rbitcoin_net::peers::LivePeer>,
-    mpsc::UnboundedReceiver<PeerOut>,
-) {
+) -> (Arc<rbitcoin_net::peers::LivePeer>, PeerOutRx) {
     hub.mempool().unwrap().set_relay_enabled(true);
     let target = live_peer(peers, port, u64::from(port), false);
     target.set_hb_from(true);
     target.note_best_known(hub.tip_hash().unwrap());
-    let (tx, rx) = mpsc::unbounded_channel();
-    target.attach_out(tx);
+    let (_, rx) = target.open_out();
     (target, rx)
 }
 
@@ -2364,8 +2390,7 @@ async fn witness_mutated_block_is_not_relayed() {
     let (_target, mut target_rx) = hb_relay_target(&peers, &hub, 18491);
 
     let liar = outbound_test_peer(&peers, 18492);
-    let (liar_tx, _liar_rx) = mpsc::unbounded_channel();
-    liar.attach_out(liar_tx.clone());
+    let (liar_tx, _liar_rx) = liar.open_out();
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
     on_block(&hub, &liar_tx, &mut follow, Some(liar.as_ref()), &bad)
@@ -2378,8 +2403,7 @@ async fn witness_mutated_block_is_not_relayed() {
     assert_ne!(hub.tip_hash(), Some(hash));
 
     let honest = outbound_test_peer(&peers, 18493);
-    let (honest_tx, _honest_rx) = mpsc::unbounded_channel();
-    honest.attach_out(honest_tx.clone());
+    let (honest_tx, _honest_rx) = honest.open_out();
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
     on_block(&hub, &honest_tx, &mut follow, Some(honest.as_ref()), &good)
@@ -2405,8 +2429,7 @@ async fn witness_mutated_cmpct_reconstruct_is_not_relayed() {
 
     for (port, block, real) in [(18495, &bad, false), (18496, &good, true)] {
         let peer = inbound_test_peer(&peers, port);
-        let (tx, _rx) = mpsc::unbounded_channel();
-        peer.attach_out(tx.clone());
+        let (tx, _rx) = peer.open_out();
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
         let hsi = HeaderAndShortIds::from_block(block, 0xbeef, 2, &[]).unwrap();
@@ -2446,8 +2469,7 @@ async fn witness_mutated_cmpct_reconstruct_asks_the_same_peer_for_the_block() {
     let hash = good.block_hash();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let manual = live_peer_as(&peers, 18487, 87, rbitcoin_net::peers::PeerConnType::Manual);
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    manual.attach_out(tx.clone());
+    let (tx, mut rx) = manual.open_out();
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     // The tip `getdata` to a compact v2 peer asked for a compact block.
@@ -2519,8 +2541,7 @@ async fn cmpct_then_blocktxn(
     block: &bitcoin::Block,
 ) {
     let peer = inbound_test_peer(peers, port);
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    peer.attach_out(tx.clone());
+    let (tx, mut rx) = peer.open_out();
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     let hsi = HeaderAndShortIds::from_block(block, 0xbeef, 2, &[]).unwrap();
@@ -2567,10 +2588,8 @@ async fn header_download_does_not_fan_out_to_high_bandwidth_peers() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let announcer = inbound_test_peer(&peers, 18461);
     let other = outbound_test_peer(&peers, 18462);
-    let (ann_tx, mut ann_rx) = mpsc::unbounded_channel();
-    let (other_tx, mut other_rx) = mpsc::unbounded_channel();
-    announcer.attach_out(ann_tx.clone());
-    other.attach_out(other_tx);
+    let (ann_tx, mut ann_rx) = announcer.open_out();
+    let (_, mut other_rx) = other.open_out();
     let mut follow = PeerFollowState::new();
     on_headers(
         &hub,
@@ -2600,10 +2619,8 @@ async fn compact_body_is_asked_of_another_peer_once() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let announcer = inbound_test_peer(&peers, 18471);
     let other = outbound_test_peer(&peers, 18472);
-    let (ann_tx, mut ann_rx) = mpsc::unbounded_channel();
-    let (other_tx, mut other_rx) = mpsc::unbounded_channel();
-    announcer.attach_out(ann_tx.clone());
-    other.attach_out(other_tx);
+    let (ann_tx, mut ann_rx) = announcer.open_out();
+    let (_, mut other_rx) = other.open_out();
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     let hash = a.block_hash();
@@ -2726,7 +2743,7 @@ fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
             true,
             rbitcoin_net::peers::PeerConnType::Inbound,
         );
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
         session.hb_to.store(true, Ordering::Relaxed);
@@ -2770,7 +2787,7 @@ fn wtxidrelay_after_verack_disconnects() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     peers.set_noban(true);
     let session = live_peer(&peers, 18572, 92, true);
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2806,7 +2823,7 @@ fn handle_peer_frame_control_and_inv_paths() {
         let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("handle-frame");
         let hub = std::sync::Arc::new(hub);
         hub.ensure_genesis().unwrap();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
 
@@ -2835,7 +2852,7 @@ fn handle_peer_frame_control_and_inv_paths() {
         // Drain outbound: Pong(42) + empty Addr at least.
         let mut saw_pong = false;
         let mut saw_addr = false;
-        while let Ok(m) = out_rx.try_recv().map(PeerOut::expect_msg) {
+        while let Ok(m) = out_rx.try_recv().map(Queued::expect_msg) {
             match m {
                 NetworkMessage::Pong(n) => {
                     assert_eq!(n, 42);
@@ -3298,7 +3315,7 @@ fn handle_peer_frame_mempool_tx_and_inv_paths() {
         mp.set_relay_enabled(true);
         assert!(hub.attach_mempool(mp).is_ok());
 
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
 
@@ -3564,7 +3581,7 @@ fn recent_reject_skips_atmp_on_second_send(via_cidr: bool) {
             assert!(sess.session_forcerelay());
         }
 
-        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
 
@@ -3728,7 +3745,7 @@ fn resent_parked_tx_is_not_validated_again() {
         .unwrap();
     let send = |tx: &Transaction, peer: &rbitcoin_net::peers::LivePeer| {
         rt.block_on(async {
-            let (out_tx, _out_rx) = mpsc::unbounded_channel();
+            let (out_tx, _out_rx) = peer_out_channel();
             let mut follow = PeerFollowState::new();
             handle_peer_frame(
                 frame_for(NetworkMessage::Tx(tx.clone())),
@@ -3857,7 +3874,7 @@ fn inv_of_a_pooled_tx_that_is_also_parked_is_not_requested() {
         true,
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
-    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let (out_tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let unknown = bitcoin::Txid::from_byte_array([7; 32]);
     on_inv(
@@ -3979,7 +3996,7 @@ fn recent_reject_is_not_requested_from_other_peers() {
             peer: &rbitcoin_net::peers::LivePeer,
             item: Inventory,
         ) -> Vec<Inventory> {
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let (out_tx, mut out_rx) = peer_out_channel();
             let mut follow = PeerFollowState::new();
             handle_peer_frame(
                 frame_for(NetworkMessage::Inv(vec![item])),
@@ -4029,7 +4046,7 @@ fn recent_reject_is_not_requested_from_other_peers() {
             child.compute_wtxid().to_byte_array()
         );
 
-        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         for tx in [parent, child] {
             handle_peer_frame(
@@ -4152,7 +4169,7 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
     let spend_ok = spend.clone();
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
         handle_peer_frame(
@@ -4216,7 +4233,7 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
         );
     });
     rt.block_on(async {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
         handle_peer_frame(
@@ -4360,9 +4377,9 @@ fn inv_of_already_asked_block_does_not_getdata() {
     use rbitcoin_primitives::Height;
     use tokio::runtime::Builder;
 
-    fn drain_block_getdata(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<BlockHash> {
+    fn drain_block_getdata(rx: &mut PeerOutRx) -> Vec<BlockHash> {
         let mut hashes = Vec::new();
-        while let Ok(m) = rx.try_recv().map(PeerOut::expect_msg) {
+        while let Ok(m) = rx.try_recv().map(Queued::expect_msg) {
             if let NetworkMessage::GetData(inv) = m {
                 for i in inv {
                     if let Inventory::Block(h)
@@ -4390,7 +4407,7 @@ fn inv_of_already_asked_block_does_not_getdata() {
         let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("inv-asked-dst");
         hub.ensure_genesis().unwrap();
 
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
 
@@ -4408,7 +4425,7 @@ fn inv_of_already_asked_block_does_not_getdata() {
         assert!(hub.already_have_or_asked_block(&hash));
 
         // Second peer: empty local requested set, same hub (asked_blocks).
-        let (out_tx2, mut out_rx2) = mpsc::unbounded_channel();
+        let (out_tx2, mut out_rx2) = peer_out_channel();
         let mut follow2 = PeerFollowState::new();
         handle_peer_frame(
             frame_for(NetworkMessage::Inv(vec![Inventory::WitnessBlock(hash)])),
@@ -4437,7 +4454,7 @@ fn bloom_disabled_messages_request_disconnect() {
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("bloom-off");
     hub.ensure_genesis().unwrap();
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -4472,7 +4489,7 @@ fn oversize_locator_request_disconnect() {
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("locator-oversize");
     hub.ensure_genesis().unwrap();
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -4725,31 +4742,22 @@ fn getdata_frame(hashes: &[BlockHash]) -> FramedMessage {
     }
 }
 
-/// Stand-in for the session writer: everything queued so far, with the
-/// `notfound` rows split from the served bodies.
-fn take_queued(
-    out_rx: &mut mpsc::UnboundedReceiver<PeerOut>,
-) -> (Vec<PeerOut>, Vec<Vec<Inventory>>) {
+/// Stand-in for the session writer mid-batch: everything queued so far,
+/// still charged, with the `notfound` rows split from the served bodies.
+fn take_queued(out_rx: &mut PeerOutRx) -> (Vec<Queued>, Vec<Vec<Inventory>>) {
     let mut bodies = Vec::new();
     let mut notfound = Vec::new();
     while let Ok(out) = out_rx.try_recv() {
-        match out {
-            PeerOut::Msg(NetworkMessage::NotFound(inv)) => notfound.push(inv),
-            body => bodies.push(body),
+        match out.out() {
+            PeerOut::Msg(NetworkMessage::NotFound(inv)) => notfound.push(inv.clone()),
+            _ => bodies.push(out),
         }
     }
     (bodies, notfound)
 }
 
-/// What the session writer records after it wrote `out`.
-fn wrote(sess: &rbitcoin_net::peers::LivePeer, out: &PeerOut) {
-    sess.note_out_written(
-        out.holds_serve_slot(),
-        rbitcoin_net::peers::outbound_queued_bytes(out),
-    );
-}
-
-fn served_hashes(queued: Vec<PeerOut>) -> Vec<BlockHash> {
+/// The writer finishes `queued`, releasing each charge.
+fn served_hashes(queued: Vec<Queued>) -> Vec<BlockHash> {
     queued
         .into_iter()
         .map(|out| served_block(out).block_hash())
@@ -4771,7 +4779,7 @@ fn getdata_past_serve_cap_waits_for_writer() {
         .unwrap();
     rt.block_on(async {
         let s = serve_session("serve-cap-waits", 20);
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = s.sess.open_out();
         let mut follow = PeerFollowState::new();
         let unknown = BlockHash::from_byte_array([7u8; 32]);
         let ask: Vec<BlockHash> = std::iter::once(unknown).chain(s.hashes.clone()).collect();
@@ -4795,23 +4803,17 @@ fn getdata_past_serve_cap_waits_for_writer() {
             vec![vec![Inventory::WitnessBlock(unknown)]],
             "the notfound collected before the pause is sent"
         );
-        assert_eq!(
-            s.sess.serve_inflight.load(Ordering::SeqCst),
-            MAX_SERVE_BLOCKS
-        );
+        assert_eq!(s.sess.serve_inflight(), MAX_SERVE_BLOCKS);
 
-        for out in &first {
-            wrote(&s.sess, out);
-        }
+        let mut served = served_hashes(first);
         serve_getdata_tail(&s.hub, &out_tx, &mut follow, Some(s.sess.as_ref()))
             .await
             .unwrap();
         let (rest, notfound) = take_queued(&mut out_rx);
         assert!(notfound.is_empty(), "no notfound for blocks we hold");
-        let served = first.into_iter().chain(rest).collect();
+        served.extend(served_hashes(rest));
         assert_eq!(
-            served_hashes(served),
-            s.hashes,
+            served, s.hashes,
             "every requested block is served once, in order"
         );
     });
@@ -4850,10 +4852,10 @@ fn getblocktxn_over_send_budget_waits_for_writer() {
         let s = serve_session("gbtxn-budget-waits", 12);
         let tip = *s.hashes.last().unwrap();
         let deep = s.hashes[0];
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = s.sess.open_out();
         let mut follow = PeerFollowState::new();
         let earlier = rbitcoin_net::peers::PEER_SEND_BUDGET + 1;
-        s.sess.note_send_queued(earlier);
+        let held = hold_send_bytes(&s.sess, earlier);
         tokio::time::timeout(
             Duration::from_secs(10),
             handle_peer_frame(
@@ -4881,7 +4883,7 @@ fn getblocktxn_over_send_budget_waits_for_writer() {
             "the request stays until the writer drains"
         );
 
-        s.sess.note_send_written(earlier);
+        drop(held);
         serve_getblocktxn_tail(&s.hub, &out_tx, &mut follow, Some(s.sess.as_ref()))
             .await
             .unwrap();
@@ -4889,11 +4891,11 @@ fn getblocktxn_over_send_budget_waits_for_writer() {
             .try_recv()
             .expect("drain serves the parked getblocktxn");
         assert!(
-            served.holds_serve_slot(),
+            served.out().holds_serve_slot(),
             "a getblocktxn reply holds a serve slot"
         );
-        let charged = rbitcoin_net::peers::outbound_queued_bytes(&served);
-        let msg = match &served {
+        let charged = rbitcoin_net::peers::outbound_queued_bytes(served.out());
+        let msg = match served.out() {
             PeerOut::Msg(m) | PeerOut::Served(m) => m,
             PeerOut::Encoded(_) => panic!("getblocktxn reply is not a pre-encoded getdata body"),
         };
@@ -4910,9 +4912,9 @@ fn getblocktxn_over_send_budget_waits_for_writer() {
             other => panic!("expected blocktxn or block, got {other:?}"),
         }
         assert_eq!(s.sess.send_queued(), charged);
-        assert_eq!(s.sess.serve_inflight.load(Ordering::SeqCst), 1);
+        assert_eq!(s.sess.serve_inflight(), 1);
         assert!(follow.getblocktxn_tail.is_empty());
-        wrote(&s.sess, &served);
+        drop(served);
 
         // Depth > 10 is the full block, on the same slot and byte charge.
         handle_peer_frame(
@@ -4925,9 +4927,9 @@ fn getblocktxn_over_send_budget_waits_for_writer() {
         .await
         .unwrap();
         let deep_out = out_rx.try_recv().expect("deep getblocktxn");
-        assert!(deep_out.holds_serve_slot());
-        match deep_out.expect_msg() {
-            NetworkMessage::Block(b) => assert_eq!(b.block_hash(), deep),
+        assert!(deep_out.out().holds_serve_slot());
+        match deep_out.out() {
+            PeerOut::Served(NetworkMessage::Block(b)) => assert_eq!(b.block_hash(), deep),
             other => panic!("depth past 10 is a full block, got {other:?}"),
         }
 
@@ -4955,7 +4957,7 @@ fn getblocktxn_over_send_budget_waits_for_writer() {
         // The peer never reads. Further requests stop at the serve cap
         // instead of reconstructing without bound.
         let queued_before = s.sess.send_queued();
-        let mut extra = 0usize;
+        let mut unread = Vec::new();
         for _ in 0..MAX_SERVE_BLOCKS + 4 {
             handle_peer_frame(
                 getblocktxn_frame(tip, vec![0]),
@@ -4966,16 +4968,17 @@ fn getblocktxn_over_send_budget_waits_for_writer() {
             )
             .await
             .unwrap();
-            if out_rx.try_recv().is_err() {
+            let Ok(reply) = out_rx.try_recv() else {
                 break;
-            }
-            extra += 1;
+            };
+            unread.push(reply);
         }
-        assert_eq!(extra, MAX_SERVE_BLOCKS - 1, "the 17th getblocktxn waits");
         assert_eq!(
-            s.sess.serve_inflight.load(Ordering::SeqCst),
-            MAX_SERVE_BLOCKS
+            unread.len(),
+            MAX_SERVE_BLOCKS - 1,
+            "the 17th getblocktxn waits"
         );
+        assert_eq!(s.sess.serve_inflight(), MAX_SERVE_BLOCKS);
         assert_eq!(follow.getblocktxn_tail.len(), 1);
         assert!(s.sess.send_queued() > queued_before);
         assert!(
@@ -4998,7 +5001,7 @@ fn getblocktxn_reconstruct_is_off_the_connection_task() {
     rt.block_on(async {
         let s = serve_session("gbtxn-reactor", 1);
         let tip = *s.hashes.last().unwrap();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         handle_peer_frame(
             getblocktxn_frame(tip, vec![0]),
@@ -5048,9 +5051,8 @@ fn getdata_over_send_budget_waits_for_writer() {
         .unwrap();
     rt.block_on(async {
         let s = serve_session("serve-budget-waits", 3);
-        let earlier = rbitcoin_net::peers::PEER_SEND_BUDGET + 1;
-        s.sess.note_send_queued(earlier);
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let held = hold_send_bytes(&s.sess, rbitcoin_net::peers::PEER_SEND_BUDGET + 1);
+        let (out_tx, mut out_rx) = s.sess.open_out();
         let mut follow = PeerFollowState::new();
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -5066,7 +5068,7 @@ fn getdata_over_send_budget_waits_for_writer() {
         .expect("a getdata past the send budget returns to the session loop")
         .unwrap();
         assert!(out_rx.try_recv().is_err(), "served past the send budget");
-        s.sess.note_send_written(earlier);
+        drop(held);
         serve_getdata_tail(&s.hub, &out_tx, &mut follow, Some(s.sess.as_ref()))
             .await
             .unwrap();
@@ -5088,12 +5090,12 @@ fn uncounted_bodies_do_not_open_serve_slots() {
         .unwrap();
     rt.block_on(async {
         let s = serve_session("serve-slot-uncounted", 20);
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = s.sess.open_out();
         let mut follow = PeerFollowState::new();
         let tip = *s.hashes.last().unwrap();
         for _ in 0..3 {
             let announce = cmpct_announce_msg(&s.hub, &tip, 2).expect("cmpct announce");
-            queue_cmpct_tip_announce(&out_tx, announce).unwrap();
+            out_tx.send(announce).unwrap();
         }
         handle_peer_frame(
             getblocktxn_frame(s.hashes[0], vec![0]),
@@ -5115,8 +5117,9 @@ fn uncounted_bodies_do_not_open_serve_slots() {
         .unwrap();
 
         let (queued, _) = take_queued(&mut out_rx);
-        let (slots, uncounted): (Vec<_>, Vec<_>) =
-            queued.into_iter().partition(|out| out.holds_serve_slot());
+        let (slots, uncounted): (Vec<_>, Vec<_>) = queued
+            .into_iter()
+            .partition(|out| out.out().holds_serve_slot());
         assert_eq!(uncounted.len(), 3, "three announces hold no serve slot");
         assert_eq!(
             slots.len(),
@@ -5125,14 +5128,12 @@ fn uncounted_bodies_do_not_open_serve_slots() {
         );
         assert!(
             matches!(
-                slots.first(),
+                slots.first().map(Queued::out),
                 Some(PeerOut::Served(NetworkMessage::Block(_)))
             ),
             "the deep getblocktxn block is the first served body"
         );
-        for out in &uncounted {
-            wrote(&s.sess, out);
-        }
+        drop(uncounted);
         serve_getdata_tail(&s.hub, &out_tx, &mut follow, Some(s.sess.as_ref()))
             .await
             .unwrap();
@@ -5150,10 +5151,8 @@ fn uncounted_bodies_do_not_open_serve_slots() {
 async fn paused_getdata_ends_on_disconnect_or_dead_writer() {
     use std::time::Duration;
     let s = serve_session("serve-pause-ends", 0);
-    s.sess
-        .serve_inflight
-        .store(MAX_SERVE_BLOCKS, Ordering::SeqCst);
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let _slots = hold_serve_slots(&s.sess, MAX_SERVE_BLOCKS);
+    let (out_tx, _out_rx) = s.sess.open_out();
     let stop = async {
         tokio::task::yield_now().await;
         s.sess.request_disconnect();
@@ -5166,10 +5165,8 @@ async fn paused_getdata_ends_on_disconnect_or_dead_writer() {
     assert!(!room);
 
     let s = serve_session("serve-pause-dead-writer", 0);
-    s.sess
-        .serve_inflight
-        .store(MAX_SERVE_BLOCKS, Ordering::SeqCst);
-    let (out_tx, out_rx) = mpsc::unbounded_channel();
+    let _slots = hold_serve_slots(&s.sess, MAX_SERVE_BLOCKS);
+    let (out_tx, out_rx) = s.sess.open_out();
     let gone = async move {
         tokio::task::yield_now().await;
         drop(out_rx);
@@ -5539,13 +5536,11 @@ async fn paused_session_still_times_out_a_silent_peer() {
     )
     .await;
     let (slots_raw, slots) = &mut t.clients[0];
-    slots
-        .serve_inflight
-        .store(MAX_SERVE_BLOCKS, Ordering::SeqCst);
+    let _slots = hold_serve_slots(slots, MAX_SERVE_BLOCKS);
     write_peer_msg(slots_raw, getdata_msg(&t.hashes)).await;
     wait_session_read(&t.node, slots, "getdata").await;
     let (_, budget) = &t.clients[1];
-    budget.note_send_queued(2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
+    let _budget = hold_send_bytes(budget, 2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
     wait_heartbeat_lap(&t.node.peers, "paused session did not heartbeat").await;
 
     let now = t.node.peers.now_secs();
@@ -6048,8 +6043,7 @@ async fn paused_getdata_tail_is_served_before_the_next_getdata() {
     write_peer_msg(raw, NetworkMessage::Pong(first_ping)).await;
     wait_session_read(&t.node, sess, "pong").await;
 
-    sess.serve_inflight
-        .store(MAX_SERVE_BLOCKS, Ordering::SeqCst);
+    let slots = hold_serve_slots(sess, MAX_SERVE_BLOCKS);
     let (a, b) = t.hashes.split_at(20);
     write_peer_msg(raw, getdata_msg(a)).await;
     write_peer_msg(raw, getdata_msg(b)).await;
@@ -6074,8 +6068,7 @@ async fn paused_getdata_tail_is_served_before_the_next_getdata() {
         "the heartbeat pings while the getdata is paused"
     );
 
-    sess.serve_inflight.store(0, Ordering::SeqCst);
-    sess.note_send_written(0);
+    drop(slots);
     let served = tokio::time::timeout(Duration::from_secs(10), async {
         let mut got = Vec::new();
         while got.len() < t.hashes.len() {
@@ -6206,7 +6199,7 @@ async fn handshake_timeout_after_silence() {
 /// GetData witness bytes must leave the writer before a queued header flood.
 #[test]
 fn outbound_write_batch_sends_getdata_before_headers() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     tx.send(PeerOut::Msg(NetworkMessage::Headers(vec![])))
         .unwrap();
     tx.send(PeerOut::Encoded(vec![2, 0xaa])).unwrap();
@@ -6216,11 +6209,11 @@ fn outbound_write_batch_sends_getdata_before_headers() {
     let first = rx.try_recv().expect("first");
     let batch = take_outbound_write_batch(first, &mut rx);
     assert!(
-        matches!(batch[0], PeerOut::Msg(NetworkMessage::Ping(7))),
+        matches!(batch[0].out(), PeerOut::Msg(NetworkMessage::Ping(7))),
         "ping before serve and announces"
     );
     assert!(
-        matches!(batch[1], PeerOut::Encoded(_)),
+        matches!(batch[1].out(), PeerOut::Encoded(_)),
         "getdata body before headers"
     );
     assert_eq!(batch.len(), 4);
@@ -6578,7 +6571,7 @@ async fn disconnect_after_tip_sync_clears_far_side_within_5s() {
 #[test]
 fn on_tx_announce_none_lagged_closed_are_ok() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("tx-ann-empty");
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     assert!(on_tx_announce(&hub, &out_tx, &follow, None, None).is_ok());
     assert!(on_tx_announce(
@@ -6687,7 +6680,7 @@ async fn inv_and_getdata_at_cap_stay_one_past_disconnects() {
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("inv-cap");
     hub.ensure_genesis().unwrap();
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let block = Inventory::CompactBlock(hub.tip_hash().unwrap());
     let at_cap = vec![block; MAX_INV_SIZE];
     let mut follow = PeerFollowState::new();
@@ -6749,7 +6742,9 @@ async fn over_budget_reader_waits_until_one_byte_is_written() {
         true,
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
-    peer.note_send_queued(rbitcoin_net::peers::PEER_SEND_BUDGET + 1);
+    let _at_cap = hold_send_bytes(&peer, rbitcoin_net::peers::PEER_SEND_BUDGET);
+    let (one_more, mut past_cap) = peer.send_queue().channel();
+    one_more.send(PeerOut::Encoded(vec![0])).unwrap();
     let waiting = std::sync::Arc::clone(&peer);
     let wait = tokio::spawn(async move { waiting.wait_send_budget().await });
     wait_send_parked(&peer, "an over-budget reader never parked").await;
@@ -6757,7 +6752,7 @@ async fn over_budget_reader_waits_until_one_byte_is_written() {
         !wait.is_finished(),
         "an over-budget reader must be parked before the writer drains"
     );
-    peer.note_send_written(1);
+    drop(past_cap.try_recv());
     tokio::time::timeout(std::time::Duration::from_secs(1), wait)
         .await
         .expect("writing back to the cap wakes the reader")
@@ -6771,7 +6766,7 @@ async fn over_budget_session_does_not_read_a_ping() {
     use std::time::Duration;
     let mut t = paused_serve("serve-pause-read", 1, &["/rbitcoin:test(budget-read)/"]).await;
     let (raw, sess) = &mut t.clients[0];
-    sess.note_send_queued(2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
+    let held = hold_send_bytes(sess, 2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
     wait_send_parked(sess, "over-budget session never paused").await;
     write_peer_msg(raw, NetworkMessage::Ping(7)).await;
     let peers = sess.peer_hub().expect("session hub");
@@ -6783,7 +6778,7 @@ async fn over_budget_session_does_not_read_a_ping() {
         .copied()
         .unwrap_or(0);
     assert_eq!(ping, 0, "over-budget session must not read the ping");
-    sess.note_send_written(2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
+    drop(held);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let NetworkMessage::Pong(7) = next_peer_msg(raw).await.unwrap() {
@@ -6832,8 +6827,7 @@ async fn held_non_block_frame_does_not_suspend_the_ping_timeout() {
         .await
         .unwrap();
     wait_decode_enqueued(&s.live, before + 2).await;
-    s.live
-        .note_send_queued(2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
+    let _budget = hold_send_bytes(&s.live, 2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
     assert!(s.live.send_over_budget());
     drop(held);
     wait_block_applied(&s.live, &hash).await;
@@ -6922,8 +6916,7 @@ async fn held_front_keeps_a_queued_blocktxn_until_the_drain() {
     .await
     .unwrap();
     wait_decode_enqueued(&s.live, before + 3).await;
-    s.live
-        .note_send_queued(2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
+    let _budget = hold_send_bytes(&s.live, 2 * rbitcoin_net::peers::PEER_SEND_BUDGET);
     drop(held);
     wait_block_applied(&s.live, &filler_hash).await;
     assert_no_pong(&mut s.reader, s.magic, nonce).await;
@@ -7524,7 +7517,7 @@ async fn inv_getdata_charges_send_budget() {
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = inbound_peer(&peers);
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer.open_out();
     let mut follow = PeerFollowState::new();
     let tx = Inventory::WitnessTransaction(Txid::from_byte_array([0x42; 32]));
     on_inv(&hub, &out_tx, &mut follow, Some(&peer), &[tx]).unwrap();
@@ -7547,7 +7540,7 @@ fn relay_hub(label: &str) -> (rbitcoin_query::testutil::TempDir, ChainHub) {
     (dir, hub)
 }
 
-fn sole_getdata(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<Inventory> {
+fn sole_getdata(rx: &mut PeerOutRx) -> Vec<Inventory> {
     let NetworkMessage::GetData(items) = rx.try_recv().expect("one getdata").expect_msg() else {
         panic!("expected getdata");
     };
@@ -7566,7 +7559,7 @@ async fn inv_drops_repeated_tx_ids_within_one_message() {
     let t = Txid::from_byte_array([0x61; 32]);
     let w = Wtxid::from_byte_array([0x77; 32]);
     let w_same_bytes = Wtxid::from_byte_array([0x61; 32]);
-    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let (out_tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let _ = hub.mempool().unwrap().sample_reset_perf();
     on_inv(
@@ -7607,7 +7600,7 @@ async fn inv_repeat_filter_resets_per_message() {
 
     let (dir, hub) = relay_hub("inv-dedupe-scope");
     let w = Wtxid::from_byte_array([0x78; 32]);
-    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let (out_tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     for round in 0..2 {
         on_inv(&hub, &out_tx, &mut follow, None, &[Inventory::WTx(w)]).unwrap();
@@ -7640,8 +7633,8 @@ async fn notfound_makes_the_waiting_wtxid_peer_due() {
     let wtxid = bitcoin::Wtxid::from_byte_array([0xef; 32]);
     let inv = [Inventory::WTx(wtxid)];
     let noted = peer1.clock_now();
-    let (tx1, mut rx1) = mpsc::unbounded_channel();
-    let (tx2, _rx2) = mpsc::unbounded_channel();
+    let (tx1, mut rx1) = peer_out_channel();
+    let (tx2, _rx2) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     on_inv(&hub, &tx1, &mut follow, Some(&peer1), &inv).unwrap();
     on_inv(&hub, &tx2, &mut follow, Some(&peer2), &inv).unwrap();
@@ -7694,8 +7687,8 @@ async fn notfound_for_txid_inventory_wakes_the_waiter() {
             Inventory::Transaction(txid)
         };
         let noted = peer1.clock_now();
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
-        let (tx2, _rx2) = mpsc::unbounded_channel();
+        let (tx1, mut rx1) = peer_out_channel();
+        let (tx2, _rx2) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         on_inv(&hub, &tx1, &mut follow, Some(&peer1), &[item]).unwrap();
         on_inv(&hub, &tx2, &mut follow, Some(&peer2), &[item]).unwrap();
@@ -7744,8 +7737,8 @@ async fn second_wtxid_inv_waits_while_first_request_is_inflight() {
     let wtxid = bitcoin::Wtxid::from_byte_array([0xee; 32]);
     let inv = [Inventory::WTx(wtxid)];
     let noted = peer1.clock_now();
-    let (tx1, mut rx1) = mpsc::unbounded_channel();
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    let (tx1, mut rx1) = peer_out_channel();
+    let (tx2, mut rx2) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     on_inv(&hub, &tx1, &mut follow, Some(&peer1), &inv).unwrap();
     on_inv(&hub, &tx2, &mut follow, Some(&peer2), &inv).unwrap();
@@ -7811,7 +7804,7 @@ async fn other_peers_rows_do_not_skip_a_fresh_announcement() {
             n += 1;
         }
     }
-    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let (out_tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let block = Inventory::Block(BlockHash::from_byte_array([0x91; 32]));
     let kept = Inventory::WitnessTransaction(Txid::from_byte_array(keep));
@@ -7989,8 +7982,9 @@ async fn tx_inv_drains_one_thousand_under_the_count_cap() {
         false,
         rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
     );
-    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let (out_tx, mut rx) = peer.open_out();
     let before = peer.send_queued();
+    let mut unread = Vec::new();
     let mut total = 0usize;
     for step in 0..40 {
         if step > 0 {
@@ -7999,18 +7993,17 @@ async fn tx_inv_drains_one_thousand_under_the_count_cap() {
             mempool.note_mock_now(now);
         }
         queue_due_tx_invs(&hub, peer.as_ref(), &CappedSet::new(), &out_tx);
-        while let Ok(msg) = rx.try_recv() {
-            match msg.expect_msg() {
-                NetworkMessage::Inv(v) => {
-                    assert!(
-                        v.len() <= 490,
-                        "a full count bucket releases 490, got {}",
-                        v.len()
-                    );
-                    total += v.len();
-                }
-                other => panic!("expected inv, got {other:?}"),
-            }
+        while let Ok(q) = rx.try_recv() {
+            let PeerOut::Msg(NetworkMessage::Inv(v)) = q.out() else {
+                panic!("expected inv, got {:?}", q.out());
+            };
+            assert!(
+                v.len() <= 490,
+                "a full count bucket releases 490, got {}",
+                v.len()
+            );
+            total += v.len();
+            unread.push(q);
         }
         if total == 1001 {
             break;
@@ -8088,7 +8081,7 @@ fn headers_store_runs_off_the_reactor() {
         .unwrap();
     rt.block_on(async move {
         tokio::spawn(async move {
-            let (out_tx, _rx) = mpsc::unbounded_channel();
+            let (out_tx, _rx) = peer_out_channel();
             let mut follow = PeerFollowState::new();
             let gh = GetHeadersMessage::new(vec![], BlockHash::from_byte_array([0u8; 32]));
             on_getheaders(&hub, &out_tx, &mut follow, None, &gh)
@@ -8124,7 +8117,7 @@ fn inbound_cmpct_reconstruct_runs_off_the_reactor() {
         .unwrap();
     rt.block_on(async move {
         tokio::spawn(async move {
-            let (out_tx, _rx) = mpsc::unbounded_channel();
+            let (out_tx, _rx) = peer_out_channel();
             let mut follow = PeerFollowState::new();
             follow.requested_blocks.insert(hash);
             on_cmpctblock_reconstruct(&hub, &out_tx, &mut follow, None, &hsi, hash)
@@ -8173,7 +8166,7 @@ async fn over_budget_headers_are_stored_without_a_follow_up() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18510, 31, false);
     peer.note_awaiting_headers();
-    peer.note_send_queued(rbitcoin_net::peers::PEER_SEND_BUDGET + 1);
+    let _budget = hold_send_bytes(&peer, rbitcoin_net::peers::PEER_SEND_BUDGET + 1);
     assert!(peer.send_over_budget());
     let header = rbitcoin_consensus::mine_regtest_paying(
         hub.tip_hash().unwrap(),
@@ -8184,7 +8177,7 @@ async fn over_budget_headers_are_stored_without_a_follow_up() {
     )
     .header;
     let hash = header.block_hash();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     handle_decoded_peer_msg(
         RawNetworkMessage::new(
@@ -8228,7 +8221,7 @@ async fn failed_body_queue_releases_the_ask() {
     )
     .header;
     let hash = header.block_hash();
-    let (out_tx, out_rx) = mpsc::unbounded_channel();
+    let (out_tx, out_rx) = peer_out_channel();
     drop(out_rx);
     let mut follow = PeerFollowState::new();
     let err = on_headers(&hub, &out_tx, &mut follow, Some(peer.as_ref()), &[header])
@@ -8299,8 +8292,7 @@ async fn compact_push_follows_tx_relay() {
     let target = live_peer(&peers, 18531, 52, false);
     target.set_hb_from(true);
     target.note_best_known(genesis);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
+    let (_, mut out_rx) = target.open_out();
     relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())).await;
     assert!(
         out_rx.try_recv().is_err(),
@@ -8319,7 +8311,7 @@ async fn compact_push_follows_tx_relay() {
     relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())).await;
     assert!(
         matches!(
-            out_rx.try_recv().map(PeerOut::expect_msg),
+            out_rx.try_recv().map(Queued::expect_msg),
             Ok(NetworkMessage::CmpctBlock(_))
         ),
         "tx relay pushes a compact block"
@@ -8349,8 +8341,7 @@ async fn compact_push_follows_tx_relay() {
     let bo_target = live_peer(&bo_peers, 18533, 54, false);
     bo_target.set_hb_from(true);
     bo_target.note_best_known(bo_tip);
-    let (bo_tx, mut bo_rx) = mpsc::unbounded_channel();
-    bo_target.attach_out(bo_tx);
+    let (_, mut bo_rx) = bo_target.open_out();
     relay_new_pow_valid_block(&bo, &bo_block, Some(bo_from.as_ref())).await;
     assert!(
         bo_rx.try_recv().is_err(),
@@ -8430,10 +8421,8 @@ fn hb_compact_announce_serves_the_missing_tx() {
     target.note_best_known(tip);
     let quiet = live_peer(&peers, 18542, 63, false);
     quiet.note_best_known(tip);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
-    let (quiet_tx, mut quiet_rx) = mpsc::unbounded_channel();
-    quiet.attach_out(quiet_tx);
+    let (_, mut out_rx) = target.open_out();
+    let (_, mut quiet_rx) = quiet.open_out();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -8441,7 +8430,7 @@ fn hb_compact_announce_serves_the_missing_tx() {
     rt.block_on(relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())));
     assert!(
         matches!(
-            out_rx.try_recv().map(PeerOut::expect_msg),
+            out_rx.try_recv().map(Queued::expect_msg),
             Ok(NetworkMessage::CmpctBlock(_))
         ),
         "the high-bandwidth peer is announced the compact block"
@@ -8518,8 +8507,7 @@ fn hb_announce_stays_servable_when_a_sibling_wins() {
     let target = live_peer(&peers, 18544, 65, false);
     target.set_hb_from(true);
     target.note_best_known(tip);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
+    let (_, mut out_rx) = target.open_out();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -8527,7 +8515,7 @@ fn hb_announce_stays_servable_when_a_sibling_wins() {
     rt.block_on(relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())));
     assert!(
         matches!(
-            out_rx.try_recv().map(PeerOut::expect_msg),
+            out_rx.try_recv().map(Queued::expect_msg),
             Ok(NetworkMessage::CmpctBlock(_))
         ),
         "the high-bandwidth peer is announced the compact block"
@@ -8657,8 +8645,7 @@ fn hb_announce_stays_servable_when_another_held_branch_connects() {
     let target = live_peer(&peers, 18546, 67, false);
     target.set_hb_from(true);
     target.note_best_known(tip);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
+    let (_, mut out_rx) = target.open_out();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -8666,7 +8653,7 @@ fn hb_announce_stays_servable_when_another_held_branch_connects() {
     rt.block_on(relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())));
     assert!(
         matches!(
-            out_rx.try_recv().map(PeerOut::expect_msg),
+            out_rx.try_recv().map(Queued::expect_msg),
             Ok(NetworkMessage::CmpctBlock(_))
         ),
         "the high-bandwidth peer is announced the compact block"
@@ -8741,8 +8728,7 @@ fn hb_announce_stays_servable_when_the_block_is_too_new() {
     let target = live_peer(&peers, 18548, 69, false);
     target.set_hb_from(true);
     target.note_best_known(tip);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
+    let (_, mut out_rx) = target.open_out();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -8750,7 +8736,7 @@ fn hb_announce_stays_servable_when_the_block_is_too_new() {
     rt.block_on(relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())));
     assert!(
         matches!(
-            out_rx.try_recv().map(PeerOut::expect_msg),
+            out_rx.try_recv().map(Queued::expect_msg),
             Ok(NetworkMessage::CmpctBlock(_))
         ),
         "the high-bandwidth peer is announced the compact block"
@@ -8810,8 +8796,7 @@ fn hb_announce_stays_servable_when_the_parent_is_invalid() {
     let target = live_peer(&peers, 18550, 71, false);
     target.set_hb_from(true);
     target.note_best_known(tip);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
+    let (_, mut out_rx) = target.open_out();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -8819,7 +8804,7 @@ fn hb_announce_stays_servable_when_the_parent_is_invalid() {
     rt.block_on(relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())));
     assert!(
         matches!(
-            out_rx.try_recv().map(PeerOut::expect_msg),
+            out_rx.try_recv().map(Queued::expect_msg),
             Ok(NetworkMessage::CmpctBlock(_))
         ),
         "the high-bandwidth peer is announced the compact block"
@@ -8899,15 +8884,14 @@ fn hb_announce_ages_out_of_the_compact_window() {
     let target = live_peer(&peers, 18552, 73, false);
     target.set_hb_from(true);
     target.note_best_known(tip);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
+    let (_, mut out_rx) = target.open_out();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())));
     assert!(matches!(
-        out_rx.try_recv().map(PeerOut::expect_msg),
+        out_rx.try_recv().map(Queued::expect_msg),
         Ok(NetworkMessage::CmpctBlock(_))
     ));
     let sibling = rbitcoin_consensus::mine_regtest_paying(
@@ -9035,15 +9019,14 @@ fn hb_announce_ages_after_its_parent_is_disconnected() {
     let target = live_peer(&peers, 18558, 79, false);
     target.set_hb_from(true);
     target.note_best_known(parent);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
+    let (_, mut out_rx) = target.open_out();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())));
     assert!(matches!(
-        out_rx.try_recv().map(PeerOut::expect_msg),
+        out_rx.try_recv().map(Queued::expect_msg),
         Ok(NetworkMessage::CmpctBlock(_))
     ));
     let genesis = hub.block_at_height(0).unwrap().expect("genesis");
@@ -9177,15 +9160,14 @@ fn hb_announce_month_old_side_body_is_not_served() {
     let target = live_peer(&peers, 18554, 75, false);
     target.set_hb_from(true);
     target.note_best_known(tip);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
+    let (_, mut out_rx) = target.open_out();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())));
     assert!(matches!(
-        out_rx.try_recv().map(PeerOut::expect_msg),
+        out_rx.try_recv().map(Queued::expect_msg),
         Ok(NetworkMessage::CmpctBlock(_))
     ));
     let sibling = rbitcoin_consensus::mine_regtest_paying(
@@ -9253,15 +9235,14 @@ fn hb_announce_drops_servable_once_connected() {
     let target = live_peer(&peers, 18556, 77, false);
     target.set_hb_from(true);
     target.note_best_known(tip);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
+    let (_, mut out_rx) = target.open_out();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())));
     assert!(matches!(
-        out_rx.try_recv().map(PeerOut::expect_msg),
+        out_rx.try_recv().map(Queued::expect_msg),
         Ok(NetworkMessage::CmpctBlock(_))
     ));
     assert!(hub.cache.servable(&hash).is_some());
@@ -9303,8 +9284,7 @@ fn hb_relay_offered_build_runs_off_the_reactor() {
     let target = live_peer(&peers, 18523, 44, false);
     target.set_hb_from(true);
     target.note_best_known(genesis);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    target.attach_out(out_tx);
+    let (_, mut out_rx) = target.open_out();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("tokio-rt-worker")
@@ -9316,7 +9296,7 @@ fn hb_relay_offered_build_runs_off_the_reactor() {
             relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())).await;
             assert!(
                 matches!(
-                    out_rx.try_recv().map(PeerOut::expect_msg),
+                    out_rx.try_recv().map(Queued::expect_msg),
                     Ok(NetworkMessage::CmpctBlock(_))
                 ),
                 "the offered peer receives the compact block"
@@ -9342,7 +9322,7 @@ fn cmpct_tip_announce_shortids_run_off_the_reactor() {
         .unwrap();
     rt.block_on(async move {
         tokio::spawn(async move {
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let (out_tx, mut out_rx) = peer_out_channel();
             let mut follow = PeerFollowState::new();
             follow.send_cmpct = true;
             follow.cmpct_version = 2;
@@ -9357,7 +9337,7 @@ fn cmpct_tip_announce_shortids_run_off_the_reactor() {
                 .expect("tip");
             assert!(
                 matches!(
-                    out_rx.try_recv().map(PeerOut::expect_msg),
+                    out_rx.try_recv().map(Queued::expect_msg),
                     Ok(NetworkMessage::CmpctBlock(_))
                 ),
                 "genesis tip is a compact announcement"
@@ -9464,7 +9444,7 @@ fn compact_and_wtxid_serve_run_off_the_reactor() {
     rt.block_on(async move {
         let hub = hub;
         tokio::spawn(async move {
-            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let (out_tx, mut out_rx) = peer_out_channel();
             let mut follow = PeerFollowState::new();
             follow.cmpct_version = 2;
             serve_getdata(
@@ -9478,7 +9458,7 @@ fn compact_and_wtxid_serve_run_off_the_reactor() {
             .expect("compact serve");
             assert!(
                 matches!(
-                    out_rx.try_recv().map(PeerOut::expect_msg),
+                    out_rx.try_recv().map(Queued::expect_msg),
                     Ok(NetworkMessage::CmpctBlock(_))
                 ),
                 "genesis getdata is a compact block"
@@ -9495,7 +9475,7 @@ fn compact_and_wtxid_serve_run_off_the_reactor() {
             .expect("wtxid serve");
             assert!(
                 matches!(
-                    out_rx.try_recv().map(PeerOut::expect_msg),
+                    out_rx.try_recv().map(Queued::expect_msg),
                     Ok(NetworkMessage::Tx(_))
                 ),
                 "announced wtxid comes from the tip block"
@@ -9551,7 +9531,7 @@ fn announced_wtxid_getdata_scans_the_tip_once() {
         );
     }
     let _ = hub.take_tip_wtx_scans();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -9589,7 +9569,7 @@ fn announced_wtxid_getdata_scans_the_tip_once() {
     let mut saw_tx = false;
     let mut notfound = Vec::new();
     while let Ok(msg) = out_rx.try_recv() {
-        match PeerOut::expect_msg(msg) {
+        match Queued::expect_msg(msg) {
             NetworkMessage::Tx(tx) => {
                 assert_eq!(tx.compute_wtxid(), real);
                 saw_tx = true;
@@ -9658,7 +9638,7 @@ fn announced_txid_getdata_serves_the_tip_tx() {
     );
     hub.mine(1, op_true, vec![spend.clone()]).unwrap();
     let _ = hub.take_tip_wtx_scans();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -9676,7 +9656,7 @@ fn announced_txid_getdata_serves_the_tip_tx() {
     .expect("getdata");
     let mut served = Vec::new();
     while let Ok(msg) = out_rx.try_recv() {
-        served.push(PeerOut::expect_msg(msg));
+        served.push(Queued::expect_msg(msg));
     }
     let mut bare = spend.clone();
     bare.input[0].witness.clear();
@@ -9715,13 +9695,13 @@ fn month_old_side_block_is_not_rebuilt_for_getdata() {
     assert!(hub.header_of(&side_hash).is_some());
     let _ = hub.cache.take_body_loads();
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(async {
-        let served = serve_getdata_full_block(&hub, &out_tx, None, &side_hash, true)
+        let served = serve_getdata_full_block(&hub, &out_tx, &side_hash, true)
             .await
             .unwrap();
         assert_eq!(
@@ -9774,7 +9754,7 @@ fn month_old_side_block_is_not_rebuilt_for_getdata() {
     );
 
     rt.block_on(async {
-        let served = serve_getdata_full_block(&hub, &out_tx, None, &tip_hash, true)
+        let served = serve_getdata_full_block(&hub, &out_tx, &tip_hash, true)
             .await
             .unwrap();
         assert_eq!(
@@ -9851,7 +9831,7 @@ fn headers_poll_expires_a_stale_tx_off_the_tokio_worker() {
         .unwrap();
     rt.block_on(async move {
         tokio::spawn(async move {
-            let (out_tx, _rx) = mpsc::unbounded_channel();
+            let (out_tx, _rx) = peer_out_channel();
             on_headers_poll(&hub, &out_tx, None);
         })
         .await
@@ -9889,14 +9869,14 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
         "genesis basic filter must be sealed before a peer can read it"
     );
     let tip = hub.tip_hash().unwrap();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     let headers = bitcoin::p2p::message_filter::GetCFHeaders {
         filter_type: 0,
         start_height: 0,
         stop_hash: tip,
     };
-    on_getcfheaders(&hub, &tx, None, &headers).unwrap();
-    match rx.try_recv().expect("cfheaders") {
+    on_getcfheaders(&hub, &tx, &headers).unwrap();
+    match rx.try_recv().expect("cfheaders").into_out() {
         rbitcoin_net::peers::PeerOut::Msg(NetworkMessage::CFHeaders(m)) => {
             assert_eq!(m.previous_filter_header.as_byte_array(), &[0u8; 32]);
             assert_eq!(m.filter_hashes.len(), 1, "{m:?}");
@@ -9962,27 +9942,27 @@ fn getcfilters_stops_after_the_filter_that_crosses_the_send_budget() {
         "generate seals a basic filter through the tip"
     );
     let peer = outbound_peer();
-    peer.note_send_queued(rbitcoin_net::peers::PEER_SEND_BUDGET);
+    let _at_cap = hold_send_bytes(&peer, rbitcoin_net::peers::PEER_SEND_BUDGET);
     assert!(
         !peer.send_over_budget(),
         "the cap itself is still inside the budget"
     );
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer.open_out();
     let req = bitcoin::p2p::message_filter::GetCFilters {
         filter_type: 0,
         start_height: 0,
         stop_hash: hub.tip_hash().unwrap(),
     };
     on_getcfilters(&hub, &tx, Some(peer.as_ref()), &req).unwrap();
+    assert!(peer.send_over_budget());
     let mut n = 0usize;
-    while let Ok(msg) = rx.try_recv() {
+    while let Ok(msg) = rx.try_recv().map(Queued::into_out) {
         match msg {
             PeerOut::Msg(NetworkMessage::CFilter(_)) => n += 1,
             other => panic!("expected cfilter, got {other:?}"),
         }
     }
     assert_eq!(n, 1, "only the filter that crosses the budget is queued");
-    assert!(peer.send_over_budget());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -9997,13 +9977,13 @@ fn getcfcheckpt_returns_a_header_every_thousand_heights() {
     hub.ensure_genesis().unwrap();
     hub.confirm_empty_regtest(999).unwrap();
     assert_eq!(hub.tip_height().unwrap(), 999);
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     let below = bitcoin::p2p::message_filter::GetCFCheckpt {
         filter_type: 0,
         stop_hash: hub.tip_hash().unwrap(),
     };
-    on_getcfcheckpt(&hub, &tx, None, &below).unwrap();
-    match rx.try_recv().expect("cfcheckpt below 1000") {
+    on_getcfcheckpt(&hub, &tx, &below).unwrap();
+    match rx.try_recv().expect("cfcheckpt below 1000").into_out() {
         PeerOut::Msg(NetworkMessage::CFCheckpt(m)) => {
             assert!(
                 m.filter_headers.is_empty(),
@@ -10020,13 +10000,13 @@ fn getcfcheckpt_returns_a_header_every_thousand_heights() {
         .basic_filter_hashes_and_headers(1_000, 1_000)
         .unwrap()
         .expect("sealed range");
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     let req = bitcoin::p2p::message_filter::GetCFCheckpt {
         filter_type: 0,
         stop_hash: hub.tip_hash().unwrap(),
     };
-    on_getcfcheckpt(&hub, &tx, None, &req).unwrap();
-    match rx.try_recv().expect("cfcheckpt") {
+    on_getcfcheckpt(&hub, &tx, &req).unwrap();
+    match rx.try_recv().expect("cfcheckpt").into_out() {
         PeerOut::Msg(NetworkMessage::CFCheckpt(m)) => {
             assert_eq!(m.filter_headers, vec![rows[0].1]);
         }
@@ -10068,7 +10048,7 @@ fn one_charged_pong_keeps_the_queued_nonce() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-one");
     hub.ensure_genesis().unwrap();
     let peer = addrfetch_peer();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer.open_out();
     let mut follow = PeerFollowState::new();
     let before = peer.send_queued();
     on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 1).unwrap();
@@ -10076,12 +10056,14 @@ fn one_charged_pong_keeps_the_queued_nonce() {
     for n in 2..100_000u64 {
         on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), n).unwrap();
     }
+    let mut queued = Vec::new();
     let mut pongs = Vec::new();
-    while let Ok(msg) = rx.try_recv() {
-        match msg {
-            PeerOut::Msg(NetworkMessage::Pong(n)) => pongs.push(n),
+    while let Ok(q) = rx.try_recv() {
+        match q.out() {
+            PeerOut::Msg(NetworkMessage::Pong(n)) => pongs.push(*n),
             other => panic!("a ping queues only a pong, got {other:?}"),
         }
+        queued.push(q);
     }
     assert_eq!(pongs.len(), 1, "pings coalesce to one pong");
     assert_eq!(
@@ -10100,7 +10082,7 @@ fn one_charged_pong_keeps_the_queued_nonce() {
         Some(99_999),
         "the writer sends 1, then queues this nonce"
     );
-    peer.note_out_written(false, charge);
+    drop(queued);
     assert_eq!(
         peer.send_queued(),
         before,
@@ -10125,29 +10107,30 @@ fn one_charged_pong_keeps_the_queued_nonce() {
     );
 
     let fast = addrfetch_peer();
+    let (fast_tx, mut fast_rx) = fast.open_out();
     let fast_before = fast.send_queued();
-    queue_pong(Some(fast.as_ref()), &tx, 4).unwrap();
-    queue_pong(Some(fast.as_ref()), &tx, 0).unwrap();
-    match rx.try_recv() {
+    queue_pong(Some(fast.as_ref()), &fast_tx, 4).unwrap();
+    queue_pong(Some(fast.as_ref()), &fast_tx, 0).unwrap();
+    assert_eq!(
+        fast.send_queued() - fast_before,
+        charge,
+        "the fast path charges one pong"
+    );
+    match fast_rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::Pong(4))) => {}
         other => panic!("the queued pong keeps nonce 4, got {other:?}"),
     }
     assert_eq!(fast.pong_nonce(), 0, "the later ping stored nonce 0");
-    assert_eq!(
-        fast.send_queued().saturating_sub(fast_before),
-        charge,
-        "the fast path charges one pong"
-    );
 
-    let (bare_tx, mut bare_rx) = mpsc::unbounded_channel();
+    let (bare_tx, mut bare_rx) = peer_out_channel();
     on_ping(&hub, &bare_tx, &mut follow, None, 1).unwrap();
     on_ping(&hub, &bare_tx, &mut follow, None, 2).unwrap();
     assert!(matches!(
-        bare_rx.try_recv(),
+        bare_rx.try_recv().map(Queued::into_out),
         Ok(PeerOut::Msg(NetworkMessage::Pong(1)))
     ));
     assert!(matches!(
-        bare_rx.try_recv(),
+        bare_rx.try_recv().map(Queued::into_out),
         Ok(PeerOut::Msg(NetworkMessage::Pong(2)))
     ));
     let _ = std::fs::remove_dir_all(dir);
@@ -10157,7 +10140,7 @@ fn one_charged_pong_keeps_the_queued_nonce() {
 /// requeues a later pong onto, through the same channel it is draining.
 async fn messages_from_writer(
     peer: &Arc<rbitcoin_net::peers::LivePeer>,
-    prepare: impl FnOnce(&mpsc::UnboundedSender<PeerOut>),
+    prepare: impl FnOnce(&PeerOutTx),
     want: usize,
 ) -> Vec<NetworkMessage> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -10173,8 +10156,7 @@ async fn messages_from_writer(
         wire.count_write(write),
         magic,
     ));
-    let (tx, rx) = mpsc::unbounded_channel();
-    peer.attach_out(tx.clone());
+    let (tx, rx) = peer.open_out();
     prepare(&tx);
     let task = tokio::spawn(run_writer_task(writer, rx, Some(Arc::clone(peer))));
     let mut reader = rbitcoin_net::v1::V1Reader::new(client);
@@ -10188,7 +10170,7 @@ async fn messages_from_writer(
             Err(_) => break,
         }
     }
-    // `attach_out` keeps a sender, and the writer task holds this peer, so
+    // `open_out` keeps a sender on the peer, and the writer task holds this peer, so
     // dropping only the local sender leaves `recv` waiting out the timeout.
     peer.clear_out_tx();
     drop(tx);
@@ -10261,7 +10243,7 @@ async fn writer_does_not_count_a_failed_write() {
         wire.count_write(write),
         magic,
     ));
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = peer_out_channel();
     let task = tokio::spawn(run_writer_task(writer, rx, Some(Arc::clone(&peer))));
     tx.send(PeerOut::Msg(NetworkMessage::Ping(7))).unwrap();
     let mut reader = rbitcoin_net::v1::V1Reader::new(&mut client);
@@ -10296,6 +10278,74 @@ async fn writer_does_not_count_a_failed_write() {
         None,
         "a failed write is not counted: {sent:?}"
     );
+}
+
+/// Core `nSendSize` counts every queued message and subtracts what the
+/// socket took. A getheaders written ahead of a reply still on the socket
+/// does not lift the send budget: the reader stays paused until the reply
+/// drains.
+#[tokio::test(flavor = "current_thread")]
+async fn getheaders_written_ahead_keeps_a_queued_reply_charged() {
+    use tokio::io::AsyncReadExt;
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("sendq-ahead");
+    hub.ensure_genesis().unwrap();
+    let peer = addrfetch_peer();
+    // Small socket buffers hold the reply mid-write until this side reads.
+    let listener = tokio::net::TcpSocket::new_v4().unwrap();
+    listener.set_send_buffer_size(4096).unwrap();
+    listener.bind((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    let listener = listener.listen(1).unwrap();
+    let client = tokio::net::TcpSocket::new_v4().unwrap();
+    client.set_recv_buffer_size(4096).unwrap();
+    let mut client = client
+        .connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let (_read, write) = server.into_split();
+    let magic = Magic::from(Network::Regtest);
+    let writer = rbitcoin_net::v1::PeerWriter::V1(rbitcoin_net::v1::V1Writer::new(
+        rbitcoin_net::WireBytes::new().count_write(write),
+        magic,
+    ));
+    let (tx, rx) = peer.open_out();
+
+    queue_getheaders(&tx, &hub, Some(peer.as_ref()), true, None).unwrap();
+    let before = peer.send_queued();
+    let rows = rbitcoin_net::peers::PEER_SEND_BUDGET / 36 + 1;
+    let inv = vec![Inventory::WTx(bitcoin::Wtxid::all_zeros()); rows];
+    for chunk in inv.chunks(MAX_INV_SIZE) {
+        tx.send(NetworkMessage::Inv(chunk.to_vec())).unwrap();
+    }
+    let reply = peer.send_queued() - before;
+    assert!(peer.send_over_budget(), "the reply crosses the budget");
+
+    let task = tokio::spawn(run_writer_task(writer, rx, Some(Arc::clone(&peer))));
+    let mut head = [0u8; 24];
+    let read = async {
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head[4..14], b"getheaders", "getheaders is written first");
+        let len = u32::from_le_bytes(head[16..20].try_into().unwrap()) as usize;
+        client.read_exact(&mut vec![0u8; len]).await.unwrap();
+        // The writer settles one message before it starts the next frame.
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head[4..7], b"inv", "the reply is on the socket");
+    };
+    tokio::time::timeout(Duration::from_secs(2), read)
+        .await
+        .expect("writer frames");
+    assert!(
+        peer.send_queued() >= reply,
+        "the reply is still queued: {} of {reply} bytes charged",
+        peer.send_queued()
+    );
+    assert!(
+        peer.send_over_budget(),
+        "the reader stays paused while the reply is queued"
+    );
+    task.abort();
+    peer.clear_out_tx();
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The session start writes `sendheaders`, `sendcmpct`, the first `ping`
@@ -10403,10 +10453,11 @@ async fn writer_sends_the_queued_pong_then_a_later_nonce_behind_the_replies() {
         "pong 2 must follow every reply, pong_2={pong_2:?} last_reply={last_reply:?}"
     );
 
-    // A raw send from a zero budget hides a missing charge: the subtract
-    // saturates at 0. Queue through `queue_pong` on top of a baseline.
+    // Bytes already queued ahead of the pongs stay charged after both
+    // pongs are written.
     let peer = addrfetch_peer();
-    peer.note_send_queued(1000);
+    let baseline = 1 << 20;
+    let _queued = hold_send_bytes(&peer, baseline);
     let charged = messages_from_writer(
         &peer,
         |tx| {
@@ -10423,7 +10474,7 @@ async fn writer_sends_the_queued_pong_then_a_later_nonce_behind_the_replies() {
     );
     assert_eq!(
         peer.send_queued(),
-        1000,
+        baseline,
         "both pongs are charged and then subtracted, so the baseline remains"
     );
 }
@@ -10436,7 +10487,7 @@ async fn ping_pong_waits_until_both_serve_tails_are_empty() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-tail");
     hub.ensure_genesis().unwrap();
     let peer = addrfetch_peer();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.getdata_tail.push_back(Inventory::Error);
     follow.getblocktxn_tail.push_back(BlockTransactionsRequest {
@@ -10463,7 +10514,7 @@ async fn ping_pong_waits_until_both_serve_tails_are_empty() {
     serve_getblocktxn_tail(&hub, &tx, &mut follow, Some(peer.as_ref()))
         .await
         .unwrap();
-    match rx.try_recv() {
+    match rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::Pong(12))) => {}
         other => panic!("the later parked ping is the one pong, got {other:?}"),
     }
@@ -10482,7 +10533,7 @@ async fn ping_pong_waits_until_both_serve_tails_are_empty() {
     );
     assert_eq!(peer.finish_pong_write(13), None);
     on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 14).unwrap();
-    match rx.try_recv() {
+    match rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::Pong(14))) => {}
         other => panic!("a ping with both tails empty queues its pong, got {other:?}"),
     }
@@ -10496,7 +10547,7 @@ async fn ping_pong_follows_a_getdata_tail_alone() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-getdata");
     hub.ensure_genesis().unwrap();
     let peer = addrfetch_peer();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow
         .getdata_tail
@@ -10515,11 +10566,11 @@ async fn ping_pong_follows_a_getdata_tail_alone() {
         follow.getdata_tail.is_empty(),
         "the getdata item was served"
     );
-    match rx.try_recv() {
+    match rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::NotFound(_))) => {}
         other => panic!("the missing block is a notfound before the pong, got {other:?}"),
     }
-    match rx.try_recv() {
+    match rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::Pong(21))) => {}
         other => panic!("the parked ping is queued after that notfound, got {other:?}"),
     }
@@ -10534,7 +10585,7 @@ async fn ping_pong_follows_a_getblocktxn_reply() {
     let s = serve_session("pong-gbtxn", 1);
     let hash = *s.hashes.last().expect("mined block");
     let peer = addrfetch_peer();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.getblocktxn_tail.push_back(BlockTransactionsRequest {
         block_hash: hash,
@@ -10554,7 +10605,8 @@ async fn ping_pong_follows_a_getblocktxn_reply() {
     );
     let reply = rx
         .try_recv()
-        .expect("the getblocktxn reply is queued before the pong");
+        .expect("the getblocktxn reply is queued before the pong")
+        .into_out();
     match &reply {
         PeerOut::Served(NetworkMessage::BlockTxn(bt)) => {
             assert_eq!(bt.transactions.block_hash, hash);
@@ -10564,7 +10616,7 @@ async fn ping_pong_follows_a_getblocktxn_reply() {
         }
         other => panic!("expected the served getblocktxn reply before the pong, got {other:?}"),
     }
-    match rx.try_recv() {
+    match rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::Pong(31))) => {}
         other => panic!("the parked pong follows that reply, got {other:?}"),
     }
@@ -10577,7 +10629,7 @@ fn ping_with_bytes_after_the_nonce_still_gets_a_pong() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-extra");
     hub.ensure_genesis().unwrap();
     let peer = addrfetch_peer();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let nonce = 0x1122_3344_5566_7788u64;
     let mut payload = nonce.to_le_bytes().to_vec();
@@ -10590,7 +10642,7 @@ fn ping_with_bytes_after_the_nonce_still_gets_a_pong() {
         handle_peer_control_msg(&msg, &hub, &tx, &mut follow, Some(peer.as_ref())).unwrap(),
         "a ping with extra bytes is still a ping"
     );
-    match rx.try_recv() {
+    match rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::Pong(n))) => {
             assert_eq!(n, nonce, "the pong uses the first eight bytes");
         }
@@ -10617,7 +10669,7 @@ fn pong_with_extra_or_short_bytes_still_updates_the_ping() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-unknown");
     hub.ensure_genesis().unwrap();
     let peer = addrfetch_peer();
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let nonce = 0x99u64;
     peer.ping_nonce_sent.store(nonce, Ordering::Relaxed);
@@ -10660,11 +10712,10 @@ fn later_ping_pong_waits_behind_a_reply_already_queued() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-later");
     hub.ensure_genesis().unwrap();
     let peer = addrfetch_peer();
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    peer.attach_out(tx.clone());
+    let (tx, mut rx) = peer.open_out();
     let mut follow = PeerFollowState::new();
     on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 1).unwrap();
-    let queued = match rx.try_recv() {
+    let queued = match rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::Pong(n))) => n,
         other => panic!("the first ping queues one pong, got {other:?}"),
     };
@@ -10673,13 +10724,13 @@ fn later_ping_pong_waits_behind_a_reply_already_queued() {
         .unwrap();
     peer.store_pong_nonce(2);
     requeue_later_pong(peer.as_ref(), queued);
-    match rx.try_recv() {
+    match rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::GetData(_))) => {}
         other => {
             panic!("the reply already queued must stay ahead of the later pong, got {other:?}")
         }
     }
-    match rx.try_recv() {
+    match rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::Pong(2))) => {}
         other => panic!("the later ping must still be answered, got {other:?}"),
     }
@@ -10721,13 +10772,12 @@ async fn addrfetch_learns_the_getaddr_reply_then_disconnects() {
     };
     let neighbor = register(18459, rbitcoin_net::peers::PeerConnType::OutboundFullRelay);
     neighbor.set_wants_addrv2();
-    let (relay_tx, mut relayed) = mpsc::unbounded_channel();
-    neighbor.attach_out(relay_tx);
+    let (_, mut relayed) = neighbor.open_out();
     let book_len = || book.lock().unwrap().len();
     let routable = |i: u32| AddrV2::Ipv4(std::net::Ipv4Addr::from(0x0b00_0001 + (i << 16)));
 
     let seed = register(18460, rbitcoin_net::peers::PeerConnType::AddrFetch);
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = peer_out_channel();
     assert!(maybe_queue_addrfetch_getaddr(&out_tx, &seed));
     let time = seed.clock_now() as u32;
     let mut follow = PeerFollowState::new();
@@ -10954,7 +11004,7 @@ mod peer_queue_pins {
     /// One drain takes at most 64 queued messages.
     #[test]
     fn peer_queue_batch_stops_at_sixty_four() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = peer_out_channel();
         for i in 0..80u64 {
             tx.send(PeerOut::Msg(NetworkMessage::Pong(i))).unwrap();
         }
@@ -11093,10 +11143,11 @@ mod peer_session_pins {
         hub: &rbitcoin_net::chain::ChainHub,
         session: Option<&rbitcoin_net::peers::LivePeer>,
     ) -> bool {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = peer_out_channel();
         on_headers_poll(hub, &tx, session);
         matches!(
-            rx.try_recv(),
+            rx.try_recv()
+                .map(rbitcoin_net::send_queue::Queued::into_out),
             Ok(PeerOut::Msg(NetworkMessage::GetHeaders(_)))
         )
     }
@@ -11165,7 +11216,7 @@ mod peer_session_pins {
             .store(9, std::sync::atomic::Ordering::Relaxed);
         live.ping_start_secs
             .store(1, std::sync::atomic::Ordering::Relaxed);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         assert!(handle_peer_control_msg(
             &NetworkMessage::Pong(9),
@@ -11191,9 +11242,12 @@ mod peer_session_pins {
         assert_eq!(tip_follow_locator(&hub), vec![tip]);
     }
 
-    fn saw_getdata(rx: &mut tokio::sync::mpsc::UnboundedReceiver<PeerOut>) -> bool {
+    fn saw_getdata(rx: &mut PeerOutRx) -> bool {
         loop {
-            match rx.try_recv() {
+            match rx
+                .try_recv()
+                .map(rbitcoin_net::send_queue::Queued::into_out)
+            {
                 Ok(PeerOut::Msg(NetworkMessage::GetData(_))) => return true,
                 Ok(_) => {}
                 Err(_) => return false,
@@ -11220,7 +11274,7 @@ mod peer_session_pins {
             panic!("attach");
         }
         let (_peers, live) = peer(PeerConnType::OutboundFullRelay);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         on_inv(
             &hub,
@@ -11295,9 +11349,12 @@ mod peer_session_pins {
         assert!(skipped, "height 1 is low work once the tip is far ahead");
     }
 
-    fn saw_inv(rx: &mut tokio::sync::mpsc::UnboundedReceiver<PeerOut>) -> bool {
+    fn saw_inv(rx: &mut PeerOutRx) -> bool {
         loop {
-            match rx.try_recv() {
+            match rx
+                .try_recv()
+                .map(rbitcoin_net::send_queue::Queued::into_out)
+            {
                 Ok(PeerOut::Msg(NetworkMessage::Inv(_))) => return true,
                 Ok(_) => {}
                 Err(_) => return false,
@@ -11321,7 +11378,7 @@ mod peer_session_pins {
         let mut follow = PeerFollowState::new();
         follow.send_cmpct = true;
         follow.cmpct_version = 2;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = peer_out_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -11342,7 +11399,7 @@ mod peer_session_pins {
         let tip = hub.tip_hash().expect("tip");
         let (_peers, live) = peer(PeerConnType::OutboundFullRelay);
         live.note_block_from_peer(tip);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -11447,13 +11504,13 @@ mod peer_session_pins {
                 >= rbitcoin_net::chain::STALE_RELAY_AGE_LIMIT_SECS,
             "tip {tip_time} side {side_time}"
         );
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = peer_out_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let served = rt
-            .block_on(serve_getdata_full_block(&hub, &tx, None, &hash, false))
+            .block_on(serve_getdata_full_block(&hub, &tx, &hash, false))
             .expect("serve");
         assert_eq!(served, FullBlockReply::Withheld);
     }
@@ -11478,9 +11535,12 @@ mod peer_session_pins {
         (dir, hub, mp)
     }
 
-    fn wtx_invs(rx: &mut tokio::sync::mpsc::UnboundedReceiver<PeerOut>) -> Vec<bitcoin::Wtxid> {
+    fn wtx_invs(rx: &mut PeerOutRx) -> Vec<bitcoin::Wtxid> {
         let mut out = Vec::new();
-        while let Ok(msg) = rx.try_recv() {
+        while let Ok(msg) = rx
+            .try_recv()
+            .map(rbitcoin_net::send_queue::Queued::into_out)
+        {
             let PeerOut::Msg(NetworkMessage::Inv(items)) = msg else {
                 continue;
             };
@@ -11558,7 +11618,7 @@ mod peer_session_pins {
         )
         .expect("older");
         mp.note_unbroadcast(older);
-        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = peer_out_channel();
         let (_peers, local) = peer(PeerConnType::OutboundFullRelay);
         local.set_wtxid_relay();
         queue_due_tx_invs(
@@ -11604,7 +11664,7 @@ mod peer_session_pins {
             vec![newer_w],
             "the tx this peer sent is not inv'd back"
         );
-        let (serve_tx, mut serve_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (serve_tx, mut serve_rx) = peer_out_channel();
         let served = serve_mempool_getdata(
             &hub,
             &serve_tx,
@@ -11617,7 +11677,10 @@ mod peer_session_pins {
             served,
             "an older tx becomes servable once a later one is inv'd"
         );
-        match serve_rx.try_recv() {
+        match serve_rx
+            .try_recv()
+            .map(rbitcoin_net::send_queue::Queued::into_out)
+        {
             Ok(PeerOut::Msg(NetworkMessage::Tx(tx))) => assert_eq!(tx.compute_txid(), older),
             other => panic!("served the older tx, got {other:?}"),
         }
@@ -11637,7 +11700,7 @@ mod peer_session_pins {
     ) -> Vec<NetworkMessage> {
         let mut follow = PeerFollowState::new();
         follow.cmpct_version = 2;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = peer_out_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -11651,7 +11714,10 @@ mod peer_session_pins {
         ))
         .expect("compact");
         let mut msgs = Vec::new();
-        while let Ok(item) = rx.try_recv() {
+        while let Ok(item) = rx
+            .try_recv()
+            .map(rbitcoin_net::send_queue::Queued::into_out)
+        {
             if let PeerOut::Msg(msg) = item {
                 msgs.push(msg);
             }
@@ -11998,7 +12064,7 @@ mod peer_session_pins {
     fn peer_hb_last_ask_clears_the_window() {
         let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hb-window");
         let (_peers, live) = peer(PeerConnType::OutboundFullRelay);
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         follow
             .requested_blocks

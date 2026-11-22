@@ -4,13 +4,14 @@ use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::Inventory;
 use bitcoin::{Transaction, Txid};
 use rbitcoin_net::peers::{CappedSet, LivePeer, PeerConnType, PeerHub, PeerOut};
+use rbitcoin_net::send_queue::{PeerOutRx, Queued};
 use rbitcoin_net::tx_relay::MempoolAnnounce;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_rpc::methods::RpcContext;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 fn standing_outbound(peers: &Arc<PeerHub>, last_octet: u8) -> Arc<LivePeer> {
     use bitcoin::p2p::address::Address;
@@ -45,9 +46,9 @@ fn recv_announce(rx: &mut broadcast::Receiver<MempoolAnnounce>) -> MempoolAnnoun
     }
 }
 
-fn tx_invs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<Inventory> {
+fn tx_invs(rx: &mut PeerOutRx) -> Vec<Inventory> {
     let mut out = Vec::new();
-    while let Ok(msg) = rx.try_recv() {
+    while let Ok(msg) = rx.try_recv().map(Queued::into_out) {
         if let PeerOut::Msg(NetworkMessage::Inv(v)) = msg {
             out.extend(v);
         }
@@ -91,11 +92,9 @@ fn isolated_submit_reaches_no_standing_peer(
     mp.set_isolated_broadcast(true);
     let peers = PeerHub::new();
     let announced_to = standing_outbound(&peers, 1);
-    let (announce_out, mut announce_rx) = mpsc::unbounded_channel();
-    announced_to.attach_out(announce_out.clone());
+    let (announce_out, mut announce_rx) = announced_to.open_out();
     let walked = standing_outbound(&peers, 2);
-    let (walk_out, mut walk_rx) = mpsc::unbounded_channel();
-    walked.attach_out(walk_out.clone());
+    let (walk_out, mut walk_rx) = walked.open_out();
     ctx.peers = Some(Arc::clone(&peers));
     let mut ann_rx = mp.subscribe_announces();
     let follow = rbitcoin_net::peer::PeerFollowState::new();
