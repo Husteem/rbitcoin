@@ -969,6 +969,10 @@ impl ActiveMempool {
         ingested
             .graph
             .set_block_reserved_sigops(self.graph.block_reserved_sigops());
+        // A rollback puts a dead victim's mark back, then restores victims one
+        // at a time. A compact between two restores cannot see that DEAD slot,
+        // so keep the pending marks beside the ones rebuilt from LIVE rows.
+        ingested.trust_kept.extend(self.trust_kept.iter().copied());
         self.graph = ingested.graph;
         self.bodies = ingested.bodies;
         self.vin_aux = ingested.vin_aux;
@@ -1024,8 +1028,12 @@ impl ActiveMempool {
         }
     }
 
-    /// Compact when DEAD slots are a large fraction of capacity (file growth bound).
+    /// Compact when DEAD slots are a large fraction of capacity, or when dead
+    /// payload bytes are a large fraction of the body (file growth bound).
     pub fn maybe_compact(&mut self) -> Result<Option<(u32, usize)>, MempoolError> {
+        if self.store.body_compaction_due()? {
+            return Ok(Some(self.compact()?));
+        }
         let (_free, live, dead) = self.store.slot_stats();
         if dead == 0 {
             return Ok(None);
@@ -1461,6 +1469,12 @@ impl ActiveMempool {
         prep: PreparedAdmit,
         trim: bool,
     ) -> Result<AcceptResult, AcceptError> {
+        // A full pool reuses the slot its eviction freed but still appends the
+        // new payload. Reclaim the dead bytes before this admit appends, while
+        // no slot from this commit is live yet.
+        if self.store.body_compaction_due()? {
+            let _ = self.maybe_compact()?;
+        }
         let began = self.sequence.next();
         // The sequence the candidate's insert took, once it is in the graph.
         let mut admitted = None;

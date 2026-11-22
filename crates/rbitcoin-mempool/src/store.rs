@@ -10,8 +10,10 @@
 //! Schema **4** packed live records (`fee‖weight‖sigops‖accept_secs‖…`); schema 1–3
 //! recode on open. Body is append-only (`body_persisted_len`);
 //! `persist_due` syncs the dirty tail, then syncs new LIVE slots, then writes meta.
-//! Compact copies packed payload ranges. DEAD of a durable slot is a one-byte
-//! `pwrite`. A batch syncs `slots` once, then `meta`.
+//! Compact copies packed payload ranges. An admit compacts first when dead
+//! payloads reach the live payload bytes, so a full pool that reuses the slot
+//! each eviction frees does not grow `tx.body` until a block. DEAD of a durable slot
+//! is a one-byte `pwrite`. A batch syncs `slots` once, then `meta`.
 //! Open keeps LIVE rows inside the logical body and returns [`MempoolError::Corrupt`]
 //! for an in-range payload that does not decode. The hub moves that image aside.
 //!
@@ -125,6 +127,8 @@ pub struct Mempool {
     pub generation: u64,
     pub slot_cap: u32,
     pub live_count: u32,
+    /// Sum of the LIVE payload lengths named by the slot table.
+    pub live_body_bytes: u64,
     /// True when `tx.body` grew since last persist (admits).
     pub body_dirty: bool,
     /// On-disk body length that slots may legally index (header + durable payloads).
@@ -168,6 +172,7 @@ impl Mempool {
             generation,
             slot_cap,
             live_count,
+            live_body_bytes: 0,
             body_dirty: false,
             body_persisted_len,
             opened: Instant::now(),
@@ -196,6 +201,7 @@ impl Mempool {
         // can still be moved aside with those tmps.
         mp.load_live_txs()?;
         mp.drop_slots_past_body()?;
+        mp.live_body_bytes = mp.scan_live_body_bytes();
         discard_abandoned_tmps(&mp.dir)?;
         Ok(mp)
     }
@@ -384,6 +390,7 @@ impl Mempool {
         let slot = self.alloc_slot()?;
         self.write_slot(slot, SLOT_LIVE, body_off, payload_len as u32, txid)?;
         self.live_count = self.live_count.saturating_add(1);
+        self.live_body_bytes = self.live_body_bytes.saturating_add(payload_len as u64);
         self.body_dirty = true;
         Ok(slot)
     }
@@ -400,6 +407,7 @@ impl Mempool {
         }
         if n > 0 {
             self.live_count = 0;
+            self.live_body_bytes = 0;
             self.flush()?;
         }
         Ok(n)
@@ -424,6 +432,7 @@ impl Mempool {
         let body_len = le_u32!(rec, 12) as u64;
         self.slots[off] = SLOT_DEAD;
         self.live_count = self.live_count.saturating_sub(1);
+        self.live_body_bytes = self.live_body_bytes.saturating_sub(body_len);
         if body_off.saturating_add(body_len) <= self.body_persisted_len {
             self.pwrite_slot_status(slot, SLOT_DEAD)?;
             self.deaths_unsynced = true;
@@ -442,6 +451,20 @@ impl Mempool {
             .write_all(&[status])
             .map_err(|e| MempoolError::io(&path, e))?;
         Ok(())
+    }
+
+    /// Sum the payload lengths of every LIVE row.
+    fn scan_live_body_bytes(&self) -> u64 {
+        let mut n = 0u64;
+        for slot in 0..self.slot_cap {
+            let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
+            if self.slots[off] != SLOT_LIVE {
+                continue;
+            }
+            let rec = slot_rec(&self.slots, off);
+            n = n.saturating_add(u64::from(le_u32!(rec, 12)));
+        }
+        n
     }
 
     /// Count FREE / LIVE / DEAD slots (for compaction triggers).
@@ -463,6 +486,26 @@ impl Mempool {
     /// Logical body length in bytes (includes header).
     pub fn body_logical_len(&self) -> Result<usize, MempoolError> {
         body_logical_len(&self.body)
+    }
+
+    /// Payload bytes in the logical body (header excluded).
+    pub fn body_payload_len(&self) -> Result<usize, MempoolError> {
+        Ok(self.body_logical_len()? - BODY_HEADER)
+    }
+
+    /// Dead payload bytes still held by the logical body.
+    pub fn orphaned_body_bytes(&self) -> Result<u64, MempoolError> {
+        Ok((self.body_payload_len()? as u64).saturating_sub(self.live_body_bytes))
+    }
+
+    /// True when dead payloads are at least the live payload bytes.
+    ///
+    /// A full pool reuses the slot its eviction freed but appends the new
+    /// payload, so DEAD slot counts stay near zero while the body grows. This
+    /// is the trigger that bounds those bytes between block compactions.
+    pub fn body_compaction_due(&self) -> Result<bool, MempoolError> {
+        let dead = self.orphaned_body_bytes()?;
+        Ok(dead > 0 && dead >= self.live_body_bytes)
     }
 
     /// Rewrite body/slots to contain only LIVE payloads packed from the header.
@@ -509,6 +552,7 @@ impl Mempool {
         self.body = new_body;
         self.slots = new_slots;
         self.live_count = next_slot;
+        self.live_body_bytes = packed_len.saturating_sub(BODY_HEADER) as u64;
         self.install_packed_images()?;
         self.clear_dirty();
         Ok((self.live_count, packed_len))
@@ -596,6 +640,7 @@ impl Mempool {
         self.body = new_body;
         self.slots = new_slots;
         self.live_count = next_slot;
+        self.live_body_bytes = packed_len.saturating_sub(BODY_HEADER) as u64;
         self.install_packed_images()?;
         self.clear_dirty();
         rbitcoin_log::info!(
@@ -709,6 +754,7 @@ impl Mempool {
             }
             self.slots[off] = SLOT_FREE;
             self.live_count = self.live_count.saturating_sub(1);
+            self.live_body_bytes = self.live_body_bytes.saturating_sub(body_len);
             changed = true;
         }
         if changed {
