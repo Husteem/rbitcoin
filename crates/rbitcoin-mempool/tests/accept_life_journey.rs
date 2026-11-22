@@ -225,7 +225,7 @@ fn full_rbf_and_staged_commit(life: &mut Life) -> (OutPoint, Txid) {
         )
         .expect("prevout free at prepare");
     life.accept(&first).unwrap();
-    let err = life.mp.commit_after_script(&second, prep).unwrap_err();
+    let err = life.mp.commit_after_script(std::sync::Arc::new(second.clone()), prep).unwrap_err();
     assert!(matches!(err, AcceptError::RbfInsufficient), "{err}");
     assert!(life.live(&first));
     assert!(!life.live(&second));

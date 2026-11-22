@@ -9,7 +9,7 @@
 use crate::fee_history::{FeeHistory, HistoricalFeeBlock};
 use crate::fee_history_file;
 use crate::inv_bucket::{InvBuckets, InvDirection};
-use crate::perf_meter::{PerfCounter, PerfMax};
+use crate::perf_meter::PerfCounter;
 use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
@@ -437,7 +437,8 @@ pub fn tx_has_bip68_time_lock(tx: &Transaction) -> bool {
 /// exists (finding 010 — mirror Core coins-view spentness).
 pub struct QueryUtxoProvider<'a> {
     pub query: &'a Query,
-    pub need_create_mtp: AtomicBool,
+    /// Per-call and single-threaded: set by `note_spender`, read by `get_coin`.
+    pub need_create_mtp: std::cell::Cell<bool>,
     pub meter_get_coin: Option<&'a AtomicU64>,
     pub meter_create_mtp: Option<&'a AtomicU64>,
     /// Test seam for the Class C coinbase read. `0` uses the store.
@@ -450,7 +451,7 @@ impl<'a> QueryUtxoProvider<'a> {
     pub fn new(query: &'a Query) -> Self {
         Self {
             query,
-            need_create_mtp: AtomicBool::new(false),
+            need_create_mtp: std::cell::Cell::new(false),
             meter_get_coin: None,
             meter_create_mtp: None,
             #[cfg(debug_assertions)]
@@ -481,8 +482,7 @@ impl<'a> QueryUtxoProvider<'a> {
 
 impl UtxoProvider for QueryUtxoProvider<'_> {
     fn note_spender(&self, tx: &Transaction) {
-        self.need_create_mtp
-            .store(tx_has_bip68_time_lock(tx), Ordering::Relaxed);
+        self.need_create_mtp.set(tx_has_bip68_time_lock(tx));
     }
 
     fn utxo_view_stamp(&self) -> Option<u64> {
@@ -545,7 +545,7 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
         {
             return ChainPrevout::KnownUnavailable;
         }
-        let create_mtp = if !self.need_create_mtp.load(Ordering::Relaxed) {
+        let create_mtp = if !self.need_create_mtp.get() {
             0
         } else {
             if let Some(m) = self.meter_create_mtp {
@@ -1142,6 +1142,29 @@ pub struct RelayInvView {
     pub weight: u64,
 }
 
+/// Accept wall and per-stage time (µs) since the last perf sample. One lock
+/// per accept, and the sampler takes every field in one consistent read.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AcceptMeter {
+    pub wall_us: u64,
+    pub max_us: u64,
+    pub lock_us: u64,
+    pub utxo_us: u64,
+    pub script_us: u64,
+    pub durable_us: u64,
+}
+
+/// Local txs no peer has fetched yet, and getdatas that beat their note.
+/// One lock covers both, so a note and a served getdata cannot interleave.
+#[derive(Debug, Default)]
+pub struct Unbroadcast {
+    /// Locally submitted txids not yet requested by a peer
+    /// (`getmempoolinfo.unbroadcastcount`). Persisted to the sidecar file.
+    pub live: HashSet<Txid>,
+    /// Getdata arrived before [`MempoolHub::note_unbroadcast`].
+    early: HashSet<Txid>,
+}
+
 /// Shared mempool + relay gate used by peer sessions and tip confirm.
 pub struct MempoolHub {
     pub inner: RwLock<ActiveMempool>,
@@ -1186,12 +1209,7 @@ pub struct MempoolHub {
     pub tx_snap_refreshing: AtomicBool,
     pub meter_accepts: PerfCounter,
     pub meter_rejects: PerfCounter,
-    pub meter_accept_us: AtomicU64,
-    pub meter_accept_max_us: PerfMax,
-    pub meter_accept_lock_us: AtomicU64,
-    pub meter_accept_utxo_us: AtomicU64,
-    pub meter_accept_script_us: AtomicU64,
-    pub meter_accept_durable_us: AtomicU64,
+    pub meter_accept: Mutex<AcceptMeter>,
     pub meter_inv_tx: AtomicU64,
     pub meter_getdata_tx: AtomicU64,
     pub meter_announce: AtomicU64,
@@ -1210,13 +1228,11 @@ pub struct MempoolHub {
     pub sh_index: Mutex<MempoolShIndex>,
     /// `{datadir}/mempool` — sidecar `unbroadcast` lives here.
     pub dir: PathBuf,
-    /// Locally submitted txids not yet requested by a peer (`getmempoolinfo.unbroadcastcount`).
-    pub unbroadcast: Mutex<HashSet<Txid>>,
+    /// Local txs not yet requested by a peer, plus getdatas that beat the note.
+    pub unbroadcast: Mutex<Unbroadcast>,
     /// Core `ReattemptInitialBroadcast`: node second of the next pass. `0`
     /// schedules the first one.
     unbroadcast_reattempt_at: AtomicU64,
-    /// Getdata arrived before [`Self::note_unbroadcast`]. Lock `unbroadcast` first.
-    broadcast_before_note: Mutex<HashSet<Txid>>,
     /// Test latch. Async admits park before `note_unbroadcast` while this is set.
     /// Production leaves it clear. Each hub has its own latch.
     #[doc(hidden)]
@@ -1557,12 +1573,7 @@ impl MempoolHub {
             tx_snap_refreshing: AtomicBool::new(false),
             meter_accepts: PerfCounter::new(),
             meter_rejects: PerfCounter::new(),
-            meter_accept_us: AtomicU64::new(0),
-            meter_accept_max_us: PerfMax::new(),
-            meter_accept_lock_us: AtomicU64::new(0),
-            meter_accept_utxo_us: AtomicU64::new(0),
-            meter_accept_script_us: AtomicU64::new(0),
-            meter_accept_durable_us: AtomicU64::new(0),
+            meter_accept: Mutex::new(AcceptMeter::default()),
             meter_inv_tx: AtomicU64::new(0),
             meter_getdata_tx: AtomicU64::new(0),
             meter_announce: AtomicU64::new(0),
@@ -1575,9 +1586,11 @@ impl MempoolHub {
             meter_get_coin: AtomicU64::new(0),
             meter_get_coin_create_mtp: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
-            unbroadcast: Mutex::new(unbroadcast),
+            unbroadcast: Mutex::new(Unbroadcast {
+                live: unbroadcast,
+                early: HashSet::new(),
+            }),
             unbroadcast_reattempt_at: AtomicU64::new(0),
-            broadcast_before_note: Mutex::new(HashSet::new()),
             pause_before_unbroadcast_note: AtomicBool::new(false),
             unbroadcast_note_parked: AtomicBool::new(false),
             local_origin: Mutex::new(LocalOrigin::default()),
@@ -1635,7 +1648,7 @@ impl MempoolHub {
         }
         {
             let mut u = hub.unbroadcast.lock().unwrap();
-            u.retain(|t| hub.contains(t));
+            u.live.retain(|t| hub.contains(t));
         }
         hub.reindex_live_scripthashes();
         hub.publish_fee_floor();
@@ -1777,11 +1790,11 @@ impl MempoolHub {
         self.remove_relay_maps(txid);
         self.local_origin.lock().unwrap().txs.remove(txid);
         let mut u = self.unbroadcast.lock().unwrap();
-        if u.remove(txid) {
-            persist_unbroadcast_file(&self.dir, &u);
+        if u.live.remove(txid) {
+            persist_unbroadcast_file(&self.dir, &u.live);
             rbitcoin_log::info!("{}", Self::unbroadcast_removed_log(txid));
         }
-        self.broadcast_before_note.lock().unwrap().remove(txid);
+        u.early.remove(txid);
     }
 
     pub fn relay_now_secs(&self) -> u64 {
@@ -1880,20 +1893,18 @@ impl MempoolHub {
         } else {
             self.meter_rejects.add(1);
         }
-        self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
-        self.meter_accept_max_us.note(us);
+        let mut m = self.meter_accept.lock().unwrap_or_else(|p| p.into_inner());
+        m.wall_us = m.wall_us.saturating_add(us);
+        m.max_us = m.max_us.max(us);
     }
 
     #[doc(hidden)]
     pub fn meter_accept_stages(&self, lock_us: u64, stages: rbitcoin_mempool::AcceptStageUs) {
-        self.meter_accept_lock_us
-            .fetch_add(lock_us, Ordering::Relaxed);
-        self.meter_accept_utxo_us
-            .fetch_add(stages.utxo_us, Ordering::Relaxed);
-        self.meter_accept_script_us
-            .fetch_add(stages.script_us, Ordering::Relaxed);
-        self.meter_accept_durable_us
-            .fetch_add(stages.durable_us, Ordering::Relaxed);
+        let mut m = self.meter_accept.lock().unwrap_or_else(|p| p.into_inner());
+        m.lock_us = m.lock_us.saturating_add(lock_us);
+        m.utxo_us = m.utxo_us.saturating_add(stages.utxo_us);
+        m.script_us = m.script_us.saturating_add(stages.script_us);
+        m.durable_us = m.durable_us.saturating_add(stages.durable_us);
     }
 
     /// Running mempool accepts and rejects for `/metrics`. A
@@ -1905,15 +1916,17 @@ impl MempoolHub {
     /// Mempool/relay counters since the previous sample, for the tip-follow
     /// 5s DEBUG line.
     pub fn sample_reset_perf(&self) -> MempoolPerfSample {
+        let accept =
+            std::mem::take(&mut *self.meter_accept.lock().unwrap_or_else(|p| p.into_inner()));
         MempoolPerfSample {
             accepts: self.meter_accepts.take_window(),
             rejects: self.meter_rejects.take_window(),
-            accept_us: self.meter_accept_us.swap(0, Ordering::Relaxed),
-            accept_max_us: self.meter_accept_max_us.take(),
-            accept_lock_us: self.meter_accept_lock_us.swap(0, Ordering::Relaxed),
-            accept_utxo_us: self.meter_accept_utxo_us.swap(0, Ordering::Relaxed),
-            accept_script_us: self.meter_accept_script_us.swap(0, Ordering::Relaxed),
-            accept_durable_us: self.meter_accept_durable_us.swap(0, Ordering::Relaxed),
+            accept_us: accept.wall_us,
+            accept_max_us: accept.max_us,
+            accept_lock_us: accept.lock_us,
+            accept_utxo_us: accept.utxo_us,
+            accept_script_us: accept.script_us,
+            accept_durable_us: accept.durable_us,
             inv_tx: self.meter_inv_tx.swap(0, Ordering::Relaxed),
             getdata_tx: self.meter_getdata_tx.swap(0, Ordering::Relaxed),
             announce: self.meter_announce.swap(0, Ordering::Relaxed),
@@ -3239,15 +3252,19 @@ impl MempoolHub {
 
     /// Recheck, then commit. A miss does not take the previous admit's
     /// eviction list: that admit already published it.
+    ///
+    /// `body` is the copy the pool keeps. Callers build it before taking
+    /// the write lock `g` comes from.
     #[doc(hidden)]
     pub fn commit_rechecked(
         g: &mut ActiveMempool,
-        tx: &Transaction,
+        body: Arc<Transaction>,
         mut prep: rbitcoin_mempool::PreparedAdmit,
         utxo: &impl UtxoProvider,
         defer_trim: bool,
         sample: &SampledCoins,
     ) -> CommitOutcome {
+        let tx: &Transaction = &body;
         let rechecked = if Self::sampled_coins_fresh(g, tx, utxo, sample) {
             Self::apply_sampled_coins(tx, &mut prep, sample)
         } else {
@@ -3263,9 +3280,9 @@ impl MempoolHub {
         }
         let prevouts = prep.prevouts.clone();
         let result = if defer_trim {
-            g.commit_after_script_defer_trim(tx, prep)
+            g.commit_after_script_defer_trim(body, prep)
         } else {
-            g.commit_after_script(tx, prep)
+            g.commit_after_script(body, prep)
         };
         let (failed_evict, undone) = if result.is_err() {
             (g.take_failed_evictions(), g.take_undone_replacements())
@@ -3418,11 +3435,12 @@ impl MempoolHub {
         t0: Instant,
     ) -> (CommitOutcome, u64) {
         let sample = self.sample_chain_coins(tx, utxo);
+        let body = Arc::new(tx.clone());
         let committed = {
             let t_lock = Instant::now();
             let mut g = self.lock_write();
             g.last_accept_stages = stages;
-            let committed = Self::commit_rechecked(&mut g, tx, prep, utxo, defer_trim, &sample);
+            let committed = Self::commit_rechecked(&mut g, body, prep, utxo, defer_trim, &sample);
             self.note_committed(&mut g, tx, origin, &committed.result);
             stages = g.last_accept_stages;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
@@ -3655,9 +3673,10 @@ impl MempoolHub {
         // concurrent spender of the parent that lands in this window keeps
         // the parent in if the child then fails.
         let sample_p = self.sample_chain_coins(parent, utxo);
+        let body_p = Arc::new(parent.clone());
         let parent_commit = {
             let mut g = self.lock_write();
-            let committed = Self::commit_rechecked(&mut g, parent, prep_p, utxo, true, &sample_p);
+            let committed = Self::commit_rechecked(&mut g, body_p, prep_p, utxo, true, &sample_p);
             self.note_committed(&mut g, parent, origin.pair_parent(), &committed.result);
             committed
         };
@@ -3689,9 +3708,10 @@ impl MempoolHub {
             }
         };
         let sample_c = self.sample_chain_coins(child, utxo);
+        let body_c = Arc::new(child.clone());
         let child_commit = {
             let mut g = self.lock_write();
-            let committed = Self::commit_rechecked(&mut g, child, prep_c, utxo, true, &sample_c);
+            let committed = Self::commit_rechecked(&mut g, body_c, prep_c, utxo, true, &sample_c);
             self.note_committed(&mut g, child, origin, &committed.result);
             committed
         };
@@ -3907,13 +3927,13 @@ impl MempoolHub {
         prep.keep_mark = waive;
         prep.keep_accept_secs = keep_secs;
         let hub = Arc::clone(self);
-        let tx_c = tx.clone();
+        let tx_c = Arc::new(tx.clone());
         let committed = crate::reactor::off_pool_budgeted(move || {
             let utxo = hub.utxo_provider();
             utxo.note_spender(&tx_c);
             let sample = hub.sample_chain_coins(&tx_c, &utxo);
             let mut g = hub.lock_write();
-            Self::commit_rechecked(&mut g, &tx_c, prep, &utxo, false, &sample)
+            Self::commit_rechecked(&mut g, tx_c, prep, &utxo, false, &sample)
         })
         .await;
         match committed.result {
@@ -3955,9 +3975,10 @@ impl MempoolHub {
         // Keep the time the hub already holds, so disk and RAM agree.
         prep.keep_accept_secs = self.accept_time_txid(&prep.txid);
         let sample = self.sample_chain_coins(tx, utxo);
+        let body = Arc::new(tx.clone());
         let committed = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, tx, prep, utxo, false, &sample)
+            Self::commit_rechecked(&mut g, body, prep, utxo, false, &sample)
         };
         match committed.result {
             Ok(r) => Ok((r, committed.prevouts)),
@@ -4674,14 +4695,15 @@ impl MempoolHub {
             }
         };
         let hub = Arc::clone(self);
-        let parent_c = parent.clone();
+        let parent_c = Arc::new(parent.clone());
         let child_note = child.clone();
         let parent_commit = crate::reactor::off_pool_budgeted(move || {
             let utxo = hub.utxo_provider();
             utxo.note_spender(&child_note);
             let sample = hub.sample_chain_coins(&parent_c, &utxo);
             let mut g = hub.lock_write();
-            let committed = Self::commit_rechecked(&mut g, &parent_c, prep_p, &utxo, true, &sample);
+            let committed =
+                Self::commit_rechecked(&mut g, Arc::clone(&parent_c), prep_p, &utxo, true, &sample);
             hub.note_committed(&mut g, &parent_c, origin.pair_parent(), &committed.result);
             committed
         })
@@ -4737,13 +4759,14 @@ impl MempoolHub {
             }
         };
         let hub = Arc::clone(self);
-        let child_c = child.clone();
+        let child_c = Arc::new(child.clone());
         let child_commit = crate::reactor::off_pool_budgeted(move || {
             let utxo = hub.utxo_provider();
             utxo.note_spender(&child_c);
             let sample = hub.sample_chain_coins(&child_c, &utxo);
             let mut g = hub.lock_write();
-            let committed = Self::commit_rechecked(&mut g, &child_c, prep_c, &utxo, true, &sample);
+            let committed =
+                Self::commit_rechecked(&mut g, Arc::clone(&child_c), prep_c, &utxo, true, &sample);
             hub.note_committed(&mut g, &child_c, origin, &committed.result);
             committed
         })
@@ -4861,7 +4884,7 @@ impl MempoolHub {
                 }
             };
             let hub = Arc::clone(self);
-            let tx_c = tx.clone();
+            let tx_c = Arc::new(tx.clone());
             let committed = crate::reactor::off_pool_budgeted(move || {
                 let utxo = hub.utxo_provider();
                 utxo.note_spender(&tx_c);
@@ -4869,7 +4892,8 @@ impl MempoolHub {
                 let t_lock = Instant::now();
                 let mut g = hub.lock_write();
                 g.last_accept_stages = stages;
-                let committed = Self::commit_rechecked(&mut g, &tx_c, prep, &utxo, true, &sample);
+                let committed =
+                    Self::commit_rechecked(&mut g, Arc::clone(&tx_c), prep, &utxo, true, &sample);
                 hub.note_committed(&mut g, &tx_c, TxOrigin::Local, &committed.result);
                 let stages = g.last_accept_stages;
                 (committed, stages, t_lock.elapsed().as_micros() as u64)
@@ -5139,7 +5163,8 @@ impl MempoolHub {
         let t0 = Instant::now();
         let (chunks, chunk_raw_vsize, count, vsize, total_fee) = {
             let g = self.lock_read();
-            let chunks = g.graph.mining_chunks_best_first();
+            // The snapshot outlives the guard, so it keeps its own copy.
+            let chunks = g.graph.mining_chunks_best_first().to_vec();
             let chunk_raw_vsize = chunks
                 .iter()
                 .map(|c| {
@@ -5286,7 +5311,8 @@ impl MempoolHub {
         if hard {
             self.meter_accept_wall(us, false);
         } else {
-            self.meter_accept_us.fetch_add(us, Ordering::Relaxed);
+            let mut m = self.meter_accept.lock().unwrap_or_else(|p| p.into_inner());
+            m.wall_us = m.wall_us.saturating_add(us);
         }
         e
     }
@@ -5364,11 +5390,12 @@ impl MempoolHub {
                 }
             };
             let sample = self.sample_chain_coins(tx, &utxo);
+            let body = Arc::new(tx.clone());
             let t_lock = Instant::now();
             let committed = {
                 let mut g = self.lock_write();
                 g.last_accept_stages = stages;
-                let committed = Self::commit_rechecked(&mut g, tx, prep, &utxo, true, &sample);
+                let committed = Self::commit_rechecked(&mut g, body, prep, &utxo, true, &sample);
                 self.note_committed(&mut g, tx, TxOrigin::Local, &committed.result);
                 stages = g.last_accept_stages;
                 committed
@@ -5917,9 +5944,10 @@ impl MempoolHub {
         };
         let prep = self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us)?;
         let sample = self.sample_chain_coins(tx, utxo);
+        let body = Arc::new(tx.clone());
         let committed = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, tx, prep, utxo, false, &sample)
+            Self::commit_rechecked(&mut g, body, prep, utxo, false, &sample)
         };
         let prevouts = match committed.result {
             Ok(r) => {
@@ -6940,7 +6968,14 @@ impl MempoolHub {
                 fee_delta: deltas.remove(&txid).unwrap_or(0),
             })
             .collect();
-        let unbroadcast = self.unbroadcast.lock().unwrap().iter().copied().collect();
+        let unbroadcast = self
+            .unbroadcast
+            .lock()
+            .unwrap()
+            .live
+            .iter()
+            .copied()
+            .collect();
         rbitcoin_mempool::CoreMempoolDat {
             txs,
             deltas,
@@ -6951,15 +6986,13 @@ impl MempoolHub {
     /// `sendrawtransaction` origin: rebroadcast until a peer getdata's it.
     /// A getdata that already won the publish-to-note race is not put back.
     pub fn note_unbroadcast(&self, txid: Txid) {
-        let mut live = self.unbroadcast.lock().unwrap();
-        let mut early = self.broadcast_before_note.lock().unwrap();
-        if early.remove(&txid) {
+        let mut u = self.unbroadcast.lock().unwrap();
+        if u.early.remove(&txid) {
             return;
         }
-        drop(early);
-        live.insert(txid);
-        persist_unbroadcast_file(&self.dir, &live);
-        drop(live);
+        u.live.insert(txid);
+        persist_unbroadcast_file(&self.dir, &u.live);
+        drop(u);
         // A peer whose own relay flag is off may have read the accept-time
         // release before this note and skipped it. The note itself queues the
         // tx again; the backlog dedupe drops a duplicate still pending.
@@ -7185,17 +7218,24 @@ impl MempoolHub {
     /// If the note has not run yet, remember the getdata so the note does not
     /// put the tx back.
     pub fn mark_broadcast(&self, txid: &Txid) {
-        let mut live = self.unbroadcast.lock().unwrap();
-        if live.remove(txid) {
-            persist_unbroadcast_file(&self.dir, &live);
+        let mut u = self.unbroadcast.lock().unwrap();
+        if u.live.remove(txid) {
+            persist_unbroadcast_file(&self.dir, &u.live);
             return;
         }
-        self.broadcast_before_note.lock().unwrap().insert(*txid);
+        u.early.insert(*txid);
     }
 
     /// Re-INV still-unbroadcast local txs (15m due-now).
     pub fn rebroadcast_unbroadcast(&self) {
-        let ids: Vec<Txid> = self.unbroadcast.lock().unwrap().iter().copied().collect();
+        let ids: Vec<Txid> = self
+            .unbroadcast
+            .lock()
+            .unwrap()
+            .live
+            .iter()
+            .copied()
+            .collect();
         for txid in ids {
             if !self.requeue_inv(&txid) {
                 continue;
@@ -7233,12 +7273,12 @@ impl MempoolHub {
 
     /// How many locally submitted txs have not been requested by a peer.
     pub fn unbroadcast_count(&self) -> u64 {
-        self.unbroadcast.lock().unwrap().len() as u64
+        self.unbroadcast.lock().unwrap().live.len() as u64
     }
 
     /// Whether this live tx was submitted locally and is still unbroadcast.
     pub fn is_unbroadcast(&self, txid: &Txid) -> bool {
-        self.unbroadcast.lock().unwrap().contains(txid)
+        self.unbroadcast.lock().unwrap().live.contains(txid)
     }
 
     /// True if a live mempool tx spends `op` (RBF conflict map; no body load).

@@ -1120,7 +1120,7 @@ impl ActiveMempool {
                 }
             }
         }
-        self.commit_after_script(tx, prep)
+        self.commit_after_script(Arc::new(tx.clone()), prep)
     }
 
     #[doc(hidden)]
@@ -1445,9 +1445,12 @@ impl ActiveMempool {
     ///
     /// Fail closed on race (duplicate, conflict set changed, parent gone).
     /// Chain coins come from `prep` (resolved under read); no UTXO provider.
+    ///
+    /// `tx` is the body the pool keeps. Build the `Arc` before taking the
+    /// write lock so the copy does not run under it.
     pub fn commit_after_script(
         &mut self,
-        tx: &Transaction,
+        tx: Arc<Transaction>,
         prep: PreparedAdmit,
     ) -> Result<AcceptResult, AcceptError> {
         self.finish_commit(tx, prep, true)
@@ -1457,7 +1460,7 @@ impl ActiveMempool {
     /// is in, so a parent is not dropped before its child can pay for it.
     pub fn commit_after_script_defer_trim(
         &mut self,
-        tx: &Transaction,
+        tx: Arc<Transaction>,
         prep: PreparedAdmit,
     ) -> Result<AcceptResult, AcceptError> {
         self.finish_commit(tx, prep, false)
@@ -1466,10 +1469,11 @@ impl ActiveMempool {
     #[doc(hidden)]
     pub fn finish_commit(
         &mut self,
-        tx: &Transaction,
+        body: Arc<Transaction>,
         prep: PreparedAdmit,
         trim: bool,
     ) -> Result<AcceptResult, AcceptError> {
+        let tx: &Transaction = &body;
         // A full pool reuses the slot its eviction freed but still appends the
         // new payload. Reclaim the dead bytes before this admit appends, while
         // no slot from this commit is live yet.
@@ -1571,11 +1575,10 @@ impl ActiveMempool {
             parents: BTreeSet::new(),
             children: BTreeSet::new(),
         };
-        let body = Arc::new(tx.clone());
         self.graph.insert(entry, tx);
         let seq = self.sequence.advance();
         admitted = Some(seq);
-        self.bodies.insert(txid, Arc::clone(&body));
+        self.bodies.insert(txid, body);
         self.vin_aux.insert(txid, aux);
 
         if trim {
@@ -2388,7 +2391,7 @@ impl ActiveMempool {
                 None => return Err(e),
             }
         }
-        self.commit_after_script(tx, prep)
+        self.commit_after_script(Arc::new(tx.clone()), prep)
     }
 
     #[doc(hidden)]

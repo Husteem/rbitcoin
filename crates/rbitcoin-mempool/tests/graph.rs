@@ -179,14 +179,14 @@ fn frontier_prefers_high_rate_chunks_and_depth() {
     assert!(g.weight_above_feerate(0) >= wa);
     let ch = g.mining_chunks_best_first();
     assert_eq!(
-        frontier_feerate_from_chunks(&ch, 1),
+        frontier_feerate_from_chunks(ch, 1),
         g.frontier_feerate_sat_per_kvb(1)
     );
     assert!(
-        frontier_feerate_from_chunks(&ch, wa + wb + 1).is_none(),
+        frontier_feerate_from_chunks(ch, wa + wb + 1).is_none(),
         "under-full target must not use last_chunk as a far-horizon rate"
     );
-    assert_eq!(weight_above_from_chunks(&ch, 0), g.weight_above_feerate(0));
+    assert_eq!(weight_above_from_chunks(ch, 0), g.weight_above_feerate(0));
     let a2 = g.mining_chunks_best_first();
     let b2 = g.mining_chunks_best_first();
     assert_eq!(a2, b2, "a second walk reuses the cached chunks");
