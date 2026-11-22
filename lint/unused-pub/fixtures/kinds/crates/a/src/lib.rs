@@ -8,3 +8,5 @@ pub enum AnEnum {}
 pub union AUnion {
     x: u8,
 }
+pub extern "C" fn an_extern_fn() {}
+pub fn r#a_raw_name() {}

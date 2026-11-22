@@ -1488,8 +1488,8 @@ impl Query {
         self.disconnect_tip_body(true)
     }
 
-    /// [`Self::disconnect_tip_keep_pending`] for a caller that already holds
-    /// [`Self::lock_tip_commit`].
+    /// Class C disconnect without dropping RAM SH pending (reorg reaccept
+    /// first), for a caller that already holds [`Self::lock_tip_commit`].
     pub fn disconnect_tip_keep_pending_in_commit(&self) -> Result<(), QueryError> {
         self.disconnect_tip_body(false)
     }

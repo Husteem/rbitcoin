@@ -140,8 +140,8 @@ pub const CHECKPOINT_FAILURES_STOP: u32 = 60;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Policy {
     /// Record bytes a segment holds past its first block; a record that
-    /// would end past them rolls to a new segment. At most
-    /// [`SEGMENT_CAP_MAX`].
+    /// would end past them rolls to a new segment. At most `2 << OFF_BITS`,
+    /// the largest offset a record can name.
     pub segment_cap: u64,
     /// Below this many segments the threshold is [`Policy::sparse_permille`]
     /// alone.

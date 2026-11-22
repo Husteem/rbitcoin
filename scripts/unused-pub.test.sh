@@ -32,6 +32,10 @@ assert_fail_quiet "a comment, a doc link, and a string are not uses" \
   python3 "$PY" --root "$FIX/comment"
 assert_ok "a name captured by a format string is a use" \
   python3 "$PY" --root "$FIX/format-capture"
+assert_ok "a width or precision a format string names is a use" \
+  python3 "$PY" --root "$FIX/format-width"
+assert_ok "a path an attribute names as a raw string is a use" \
+  python3 "$PY" --root "$FIX/attribute-raw-path"
 assert_ok "a path an attribute names as a string is a use" \
   python3 "$PY" --root "$FIX/attribute-path"
 assert_ok "pub(crate) is left to rustc" \
@@ -40,7 +44,8 @@ assert_fail_quiet "two unused items that share a name both fail" \
   python3 "$PY" --root "$FIX/shared-name"
 assert_ok "one use of a shared name keeps both (name match, not resolution)" \
   python3 "$PY" --root "$FIX/shared-name-live"
-for kind in 'fn a_const_fn' 'fn an_async_fn' 'fn an_unsafe_fn' 'static A_STATIC' \
+for kind in 'fn a_const_fn' 'fn an_async_fn' 'fn an_unsafe_fn' 'fn an_extern_fn' \
+  'fn a_raw_name' 'static A_STATIC' \
   'type AType' 'trait ATrait' 'enum AnEnum' 'union AUnion'; do
   assert_ok "pub $kind is scanned" names kinds "\`pub $kind\`"
 done

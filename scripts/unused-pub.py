@@ -8,10 +8,13 @@ in the Rust files under `crates/`, `fuzz/`, and `script-oracle/`. A `pub`
 fn, const, static, struct, enum, trait, type, or union whose name appears
 only where it is declared has no caller in production or in a test.
 
-Comments and strings do not count as a use, with two exceptions: a name a
-format string captures (`"{NAME}"`), and a path assigned as a string, as in
-`#[serde(serialize_with = "path")]`. The match is by name, with no name
-resolution: an item that shares its name with a live one is not reported.
+Comments and strings do not count as a use, with two exceptions read from
+the raw text: a name inside format braces (`"{NAME}"`, `"{:NAME$}"`), and a
+path assigned as a string, as in `#[serde(serialize_with = "path")]`.
+
+What this cannot see. The match is by name, with no name resolution, so an
+item that shares its name with a live one is not reported, and neither is
+one that only a test, a re-export, or a brace in a comment still names.
 `pub(crate)` and narrower are rustc's to report.
 
 Usage: unused-pub.py [--root DIR]
@@ -26,14 +29,18 @@ import sys
 
 SCAN_DIRS = ("crates", "fuzz", "script-oracle")
 PUB_ITEM = re.compile(
-    r"^[ \t]*pub[ \t]+(?:(?:const|async|unsafe)[ \t]+)*"
+    r"^[ \t]*pub[ \t]+(?:(?:const|async|unsafe|extern)[ \t]+)*"
     r"(fn|struct|enum|trait|type|const|static|union)[ \t]+(?:mut[ \t]+)?"
-    r"([A-Za-z_][A-Za-z0-9_]*)",
+    r"(?:r#)?([A-Za-z_][A-Za-z0-9_]*)",
     re.M,
 )
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-FORMAT_CAPTURE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)[:}]")
-STRING_PATH = re.compile(r"=\s*\"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Za-z_][A-Za-z0-9_]*)\"")
+FORMAT_CAPTURE = re.compile(
+    r"\{([A-Za-z_][A-Za-z0-9_]*)[:}]|[:.]([A-Za-z_][A-Za-z0-9_]*)\$"
+)
+STRING_PATH = re.compile(
+    r"=\s*r?#*\"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Za-z_][A-Za-z0-9_]*)\""
+)
 
 
 def load_unwrap():
@@ -62,7 +69,8 @@ def unused(root: str) -> list[str]:
             src = f.read()
         code = blank_non_code(src)
         uses.update(IDENT.findall(code))
-        uses.update(FORMAT_CAPTURE.findall(src))
+        for braced, sized in FORMAT_CAPTURE.findall(src):
+            uses[braced or sized] += 1
         uses.update(STRING_PATH.findall(src))
         rel = os.path.relpath(path, root).replace(os.sep, "/")
         parts = rel.split("/")
