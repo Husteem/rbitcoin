@@ -30,6 +30,8 @@ pub const HEADERS_RESPONSE_TIME_SECS: u64 = 120;
 /// Queued-byte estimate. Headers are 81 wire bytes, inv-like rows are 36,
 /// legacy addr rows are 30. Filter replies and compact blocks are counted
 /// from the fields they already hold. Encoded block bodies use their buffer.
+/// A kind whose payload never changes size is charged 64.
+#[deny(clippy::wildcard_enum_match_arm)]
 pub fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
     match msg {
         NetworkMessage::Headers(h) => h.len().saturating_mul(81),
@@ -49,8 +51,36 @@ pub fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
         NetworkMessage::CFHeaders(m) => 1 + 32 + 32 + hash_vec_len(m.filter_hashes.len()),
         NetworkMessage::CFCheckpt(m) => 1 + 32 + hash_vec_len(m.filter_headers.len()),
         NetworkMessage::CmpctBlock(m) => compact_block_len(&m.compact_block),
-        _ => 64,
+        NetworkMessage::Version(m) => encoded_len(m),
+        NetworkMessage::GetBlocks(m) => encoded_len(m),
+        NetworkMessage::GetHeaders(m) => encoded_len(m),
+        NetworkMessage::GetBlockTxn(m) => encoded_len(m),
+        NetworkMessage::MerkleBlock(m) => encoded_len(m),
+        NetworkMessage::FilterLoad(m) => encoded_len(m),
+        NetworkMessage::FilterAdd(m) => encoded_len(m),
+        NetworkMessage::Reject(m) => encoded_len(m),
+        NetworkMessage::Alert(bytes) => varint_len(bytes.len()) + bytes.len(),
+        NetworkMessage::Unknown { payload, .. } => payload.len(),
+        NetworkMessage::Verack
+        | NetworkMessage::MemPool
+        | NetworkMessage::SendHeaders
+        | NetworkMessage::GetAddr
+        | NetworkMessage::Ping(_)
+        | NetworkMessage::Pong(_)
+        | NetworkMessage::FilterClear
+        | NetworkMessage::GetCFilters(_)
+        | NetworkMessage::GetCFHeaders(_)
+        | NetworkMessage::GetCFCheckpt(_)
+        | NetworkMessage::SendCmpct(_)
+        | NetworkMessage::FeeFilter(_)
+        | NetworkMessage::WtxidRelay
+        | NetworkMessage::SendAddrV2 => 64,
     }
+}
+
+fn encoded_len(msg: &impl bitcoin::consensus::Encodable) -> usize {
+    msg.consensus_encode(&mut bitcoin::io::sink())
+        .unwrap_or(usize::MAX)
 }
 
 fn varint_len(n: usize) -> usize {
