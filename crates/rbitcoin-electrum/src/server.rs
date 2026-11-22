@@ -485,10 +485,10 @@ pub struct ElectrumConn {
     pub sh_join: Option<Arc<ShJoinSlot>>,
     pub outpoint_subs: HashSet<([u8; 32], u32)>,
     /// Silent-payment subscriptions whose history has been sent.
-    pub sp_subs: Vec<SpLive>,
+    sp_subs: Vec<SpLive>,
     /// History scans of subscribes that have not reached the tip. An address
     /// is in one of the two lists, once.
-    pub sp_scans: Vec<SpScanRun>,
+    sp_scans: Vec<SpScanRun>,
 }
 
 impl ElectrumConn {
@@ -1372,7 +1372,7 @@ fn finish_reply(
 /// scans again. `config` caps the addresses of the connection and the scans
 /// of the process.
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-pub async fn serve_sp_subscribe<W>(
+async fn serve_sp_subscribe<W>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     chain: &Arc<ChainParams>,
@@ -1519,8 +1519,7 @@ async fn parse_sp_sub(
         .unwrap_or_else(|e| Err(e.to_string()))
 }
 
-#[doc(hidden)]
-pub fn silentpayments_unsubscribe(
+fn silentpayments_unsubscribe(
     conn: &mut ElectrumConn,
     query: &Query,
     chain: &ChainParams,
@@ -1534,8 +1533,7 @@ pub fn silentpayments_unsubscribe(
 /// A tip event for every live silent-payment subscription: each scans the
 /// heights it has not seen. One whose heights cannot be read gets the error
 /// note and ends. Left live, it would count those heights as scanned.
-#[doc(hidden)]
-pub async fn emit_sp_tips<W: AsyncWrite + Unpin>(
+async fn emit_sp_tips<W: AsyncWrite + Unpin>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     chain: &ChainParams,
@@ -1565,7 +1563,7 @@ pub async fn emit_sp_tips<W: AsyncWrite + Unpin>(
 /// Heights `from..=to` connected after the history: one note when any of
 /// them pays the subscription. `false` when a height could not be read; the
 /// error note is written.
-pub async fn emit_sp_tip<W: AsyncWrite + Unpin>(
+async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     chain: &ChainParams,
@@ -1647,9 +1645,9 @@ pub fn sp_chunk_end(from: u32, last: u32, chunk: u32) -> u32 {
 }
 
 /// A subscription whose history is sent, and the last height scanned for it.
-pub struct SpLive {
-    pub sub: crate::silent_scan::SpSub,
-    pub through: u32,
+struct SpLive {
+    sub: crate::silent_scan::SpSub,
+    through: u32,
 }
 
 impl SpLive {
@@ -1666,17 +1664,16 @@ impl SpLive {
 }
 
 /// One scanned chunk of a history scan.
-#[doc(hidden)]
-pub struct SpScanStep {
-    pub hits: Vec<Value>,
+struct SpScanStep {
+    hits: Vec<Value>,
     /// Last height scanned so far.
-    pub through: u32,
+    through: u32,
     /// Share of the heights scanned. 1.0 only once `through` is the tip.
-    pub progress: f64,
+    progress: f64,
 }
 
 /// A scan task that is aborted when its owner drops it.
-struct SpScanTask(JoinHandle<usize>);
+struct SpScanTask(JoinHandle<()>);
 
 impl Drop for SpScanTask {
     fn drop(&mut self) {
@@ -1686,14 +1683,13 @@ impl Drop for SpScanTask {
 
 /// A history scan running beside the session. Dropping it stops the scan
 /// before its next chunk and frees its slot.
-pub struct SpScanRun {
-    pub sub: crate::silent_scan::SpSub,
+struct SpScanRun {
+    sub: crate::silent_scan::SpSub,
     steps: tokio::sync::mpsc::Receiver<Result<SpScanStep, String>>,
     /// When the client last got a note of this scan.
     noted: Instant,
     /// First height whose step the session has not taken.
-    #[doc(hidden)]
-    pub next: u32,
+    next: u32,
     chunk: u32,
     task: SpScanTask,
     /// This scan's share of [`ElectrumConfig::sp_scan_slots`].
@@ -1763,8 +1759,7 @@ impl SpScanRun {
 /// The address of the first scan with a step ready, and that step: a chunk,
 /// the scan error, or `None` when the scan task died. Pending while no scan
 /// has one. Cancel safe: a step stays queued until this returns it.
-#[doc(hidden)]
-pub async fn next_sp_scan_step(
+async fn next_sp_scan_step(
     scans: &mut [SpScanRun],
 ) -> (String, Option<Result<SpScanStep, String>>) {
     std::future::poll_fn(|cx| {
@@ -1782,8 +1777,7 @@ pub async fn next_sp_scan_step(
 /// read them. Each scan starts again at the first replaced height, or at
 /// the first height it has not sent when that is lower: a step still in
 /// flight is dropped with the old task.
-#[doc(hidden)]
-pub fn restart_sp_scans_after_reorg(
+fn restart_sp_scans_after_reorg(
     scans: &mut [SpScanRun],
     query: &Arc<Query>,
     chain: &Arc<ChainParams>,
@@ -1807,9 +1801,7 @@ pub fn restart_sp_scans_after_reorg(
 
 /// Scan `from..=last`, `chunk` heights a step. A start with no end goes on
 /// to the tip while it keeps moving. Stops when the receiver is gone.
-/// Returns the chunks scanned.
-#[doc(hidden)]
-pub async fn run_sp_scan(
+async fn run_sp_scan(
     query: Arc<Query>,
     chain: Arc<ChainParams>,
     sub: crate::silent_scan::SpSub,
@@ -1817,18 +1809,17 @@ pub async fn run_sp_scan(
     mut last: u32,
     chunk: u32,
     steps: tokio::sync::mpsc::Sender<Result<SpScanStep, String>>,
-) -> usize {
+) {
     use crate::silent_scan::SP_SCAN_PERMITS;
     static PERMITS: Semaphore = Semaphore::const_new(SP_SCAN_PERMITS);
-    let mut chunks = 0usize;
     loop {
         let end = sp_chunk_end(from, last, chunk);
         let permit = tokio::select! {
             permit = PERMITS.acquire() => permit,
-            _ = steps.closed() => return chunks,
+            _ = steps.closed() => return,
         };
         let Ok(permit) = permit else {
-            return chunks;
+            return;
         };
         let (q, c, piece) = (Arc::clone(&query), Arc::clone(&chain), sub.clone());
         let outcome = budgeted_blocking(&query, move || {
@@ -1841,10 +1832,9 @@ pub async fn run_sp_scan(
             Ok(hits) => hits,
             Err(message) => {
                 let _ = steps.send(Err(message)).await;
-                return chunks;
+                return;
             }
         };
-        chunks += 1;
         if end == last && sub.end.is_none() {
             // Blocks connected since `last` was read are history too.
             last = query.tip_height().map_or(last, |tip| tip.0.max(last));
@@ -1860,7 +1850,7 @@ pub async fn run_sp_scan(
             progress,
         };
         if steps.send(Ok(step)).await.is_err() || end == last {
-            return chunks;
+            return;
         }
         from = end + 1;
     }
@@ -1871,8 +1861,7 @@ const SP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Write one step of the history scan for `address`. The step at the tip
 /// makes the subscription live.
-#[doc(hidden)]
-pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
+async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     chain: &ChainParams,
