@@ -1,9 +1,57 @@
 use bitcoin::consensus::Encodable;
 use bitcoin::hashes::Hash;
-use bitcoin::secp256k1::{Scalar, Secp256k1, SecretKey};
+use bitcoin::secp256k1::{Parity, Scalar, Secp256k1, SecretKey};
 use bitcoin::taproot::{TapLeafHash, TapNodeHash, TapTweakHash};
 use rbitcoin_consensus::error::ConsensusError;
-use rbitcoin_consensus::script::p2tr::verify_control_commitment;
+use rbitcoin_consensus::script::p2tr::{output_key_matches_tweak, verify_control_commitment};
+
+/// secp256k1 order n.
+const ORDER: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+    0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+];
+
+fn sub32(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let v = i16::from(a[i]) - i16::from(b[i]) - borrow;
+        if v < 0 {
+            out[i] = (v + 256) as u8;
+            borrow = 1;
+        } else {
+            out[i] = v as u8;
+            borrow = 0;
+        }
+    }
+    assert_eq!(borrow, 0, "underflow");
+    out
+}
+
+#[test]
+fn tweak_at_or_above_order_is_not_a_commitment() {
+    let secp = Secp256k1::new();
+    let sk = SecretKey::from_slice(&[3u8; 32]).unwrap();
+    let (internal, _) = sk.x_only_public_key(&secp);
+    // n reduced to 0 is P + 0*G = P. That must still fail.
+    assert!(!output_key_matches_tweak(
+        &internal,
+        &internal,
+        Parity::Even,
+        &ORDER
+    ));
+    // 2^256-1 reduced mod n is a non-zero residue. Q = P + rG must still fail.
+    let above = [0xffu8; 32];
+    let residue = sub32(above, ORDER);
+    let scalar = Scalar::from_be_bytes(residue).unwrap();
+    let (q, parity) = internal.add_tweak(&secp, &scalar).unwrap();
+    assert!(!output_key_matches_tweak(&internal, &q, parity, &above));
+    let mut max = ORDER;
+    max[31] = 0x40;
+    let scalar = Scalar::from_be_bytes(max).unwrap();
+    let (output, parity) = internal.add_tweak(&secp, &scalar).unwrap();
+    assert!(output_key_matches_tweak(&internal, &output, parity, &max));
+}
 
 #[test]
 fn control_commitment_uses_the_same_tweak_check() {

@@ -177,7 +177,8 @@ impl SendStorePtr {
 
 /// Park `batch` in `slot` before `insert`. Clear the slot only after `Ok`.
 /// A panic drops the guard and leaves the batch parked.
-fn insert_parked(
+#[doc(hidden)]
+pub fn insert_parked(
     slot: &Mutex<Option<Vec<HeadInsert>>>,
     batch: Vec<HeadInsert>,
     insert: impl FnOnce(&[HeadInsert]) -> Result<u64, StoreError>,

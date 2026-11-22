@@ -179,7 +179,8 @@ pub fn verify_control_commitment(
 /// A value at or above the curve order is not a scalar. Core's
 /// `secp256k1_ec_pubkey_tweak_add_helper` returns 0, and `CheckTapTweak`
 /// is then false. `TapTweakHash::to_scalar` panics on those bytes.
-fn output_key_matches_tweak(
+#[doc(hidden)]
+pub fn output_key_matches_tweak(
     internal: &XOnlyPublicKey,
     output_key: &XOnlyPublicKey,
     parity: Parity,

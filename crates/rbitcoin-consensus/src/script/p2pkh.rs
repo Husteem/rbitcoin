@@ -93,7 +93,8 @@ pub fn parse_two_pushes(script: &Script) -> Result<(Vec<u8>, Vec<u8>), Consensus
 /// The signature push matches an instruction boundary only when it is those
 /// 20 keyhash bytes. The template has no bare `OP_CODESEPARATOR`. Any other
 /// signature hashes `spk` unchanged, with no script walk and no allocation.
-fn sighash_script_code<'a>(spk: &'a [u8; 25], sig: &[u8]) -> Cow<'a, [u8]> {
+#[doc(hidden)]
+pub fn sighash_script_code<'a>(spk: &'a [u8; 25], sig: &[u8]) -> Cow<'a, [u8]> {
     if sig.len() == 20 && sig == &spk[3..23] {
         Cow::Borrowed(&P2PKH_SCRIPT_CODE_KEYHASH_REMOVED)
     } else {

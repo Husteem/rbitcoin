@@ -9,29 +9,30 @@ fn one_batch() -> Vec<HeadInsert> {
 
 #[test]
 fn join_restore_returns_the_batch_unless_insert_returns_ok() {
-    // A panicking insert leaves the parked batch for the write thread.
-    let restore = Arc::new(Mutex::new(Some(one_batch())));
-    let mut handle = submit_head_drain(|| panic!("insert"));
-    handle.restore = Some(Arc::clone(&restore));
+    let restore = Arc::new(Mutex::new(None));
+    let restore_job = Arc::clone(&restore);
+    let mut handle =
+        submit_head_drain(move || insert_parked(&restore_job, one_batch(), |_| panic!("insert")));
+    handle.restore = Some(restore);
     let (result, queued) = handle.join_restore();
     assert!(result.is_err(), "{result:?}");
     assert_eq!(queued, one_batch());
 
-    // An Err insert also leaves it parked.
-    let restore = Arc::new(Mutex::new(Some(one_batch())));
-    let mut handle = submit_head_drain(|| Err(StoreError::Corrupt("insert failed")));
-    handle.restore = Some(Arc::clone(&restore));
-    let (result, queued) = handle.join_restore();
-    assert!(result.is_err(), "{result:?}");
-    assert_eq!(queued, one_batch());
-
-    // Ok clears the parked batch.
-    let restore = Arc::new(Mutex::new(Some(one_batch())));
+    let restore = Arc::new(Mutex::new(None));
     let restore_job = Arc::clone(&restore);
     let mut handle = submit_head_drain(move || {
-        restore_job.lock().unwrap_or_else(|p| p.into_inner()).take();
-        Ok(1)
+        insert_parked(&restore_job, one_batch(), |_| {
+            Err(StoreError::Corrupt("insert failed"))
+        })
     });
+    handle.restore = Some(restore);
+    let (result, queued) = handle.join_restore();
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(queued, one_batch());
+
+    let restore = Arc::new(Mutex::new(None));
+    let restore_job = Arc::clone(&restore);
+    let mut handle = submit_head_drain(move || insert_parked(&restore_job, one_batch(), |_| Ok(1)));
     handle.restore = Some(restore);
     let (result, queued) = handle.join_restore();
     assert_eq!(result.unwrap(), 1);
