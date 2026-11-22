@@ -1,4 +1,6 @@
-//! One session's outbound queue and its byte count (Core `nSendSize`).
+//! One session's outbound queue and its byte count, the role Core's
+//! `nSendSize` plays. The count is the per-message estimate
+//! [`outbound_queued_bytes`], not Core's serialized size.
 //!
 //! [`PeerOutTx::send`] charges every message it queues, and the charge rides
 //! on the [`Queued`] item. Dropping the item, or its [`Charge`] once the
@@ -76,6 +78,10 @@ impl PeerOutTx {
     /// The writer task dropped its [`PeerOutRx`].
     pub async fn closed(&self) {
         self.tx.closed().await;
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
     }
 }
 

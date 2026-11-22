@@ -1411,8 +1411,10 @@ impl LivePeer {
             if self.stop.load(Ordering::SeqCst) {
                 return false;
             }
+            // A dying writer closes its channel before it frees what it
+            // held, so room seen on a closed channel is not room.
             if self.has_serve_room() {
-                return true;
+                return !out.is_closed();
             }
             tokio::select! {
                 () = notified => {}

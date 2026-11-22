@@ -5177,6 +5177,25 @@ async fn paused_getdata_ends_on_disconnect_or_dead_writer() {
     .await
     .expect("a dead writer must end a paused getdata");
     assert!(!room);
+
+    // The dying writer frees the bodies it still held. That is not room.
+    for round in 0..16 {
+        let s = serve_session(&format!("serve-pause-dead-full-writer-{round}"), 0);
+        let (out_tx, out_rx) = s.sess.open_out();
+        for _ in 0..MAX_SERVE_BLOCKS {
+            out_tx.send(PeerOut::Encoded(Vec::new())).unwrap();
+        }
+        let gone = async move {
+            tokio::task::yield_now().await;
+            drop(out_rx);
+        };
+        let (room, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(s.sess.wait_serve_room(&out_tx), gone)
+        })
+        .await
+        .expect("a dead writer must end a paused getdata");
+        assert!(!room, "round {round}: a closed writer has no serve room");
+    }
 }
 
 /// A node with `blocks` mined and a raw BIP324 client for each `agents`
