@@ -321,7 +321,9 @@ are omitted from `LH`/`LF`. Those tests still run. A journey that executes
 a production line already counts that line, so a second in-crate `#[test]`
 is not required to make LCOV see it. Library tests live in each crate's
 `tests/suite` and link the normal rlib, so a `#[cfg(test)]` arm in `src/`
-is no longer how those tests compile. `#[cfg(debug_assertions)]` hooks in
+is no longer how those tests compile. `./scripts/src-test-modules.sh`
+fails `qc` when one returns there; `rbitcoin-bench` keeps its `--lib`
+tests. `#[cfg(debug_assertions)]` hooks in
 production files still count. Those hooks also mean the suites link only in
 the `dev` / `test` profiles: `cargo test --release` does not build. The
 release profile is compiled on every PR by `cargo check --release` in `qc`
