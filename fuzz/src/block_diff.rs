@@ -14,7 +14,7 @@ use rbitcoin_consensus::{
 };
 use rbitcoin_net::send_queue::peer_out_channel;
 use rbitcoin_net::{drain_pending_now, AcceptOutcome, ChainHub, NetError, PendingBlocks};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1668,10 +1668,10 @@ pub fn compare_cmpct_reorg_one(
     );
     let (tx, _rx) = peer_out_channel();
     let mut pending = PendingBlocks::new();
-    pending.insert(child.block_hash(), child.clone());
-    pending.insert(side.block_hash(), side);
+    pending.insert(child.block_hash(), child.clone(), None);
+    pending.insert(side.block_hash(), side, None);
     let mut headers = HashMap::new();
-    let mut requested = HashSet::new();
+    let mut requested = rbitcoin_net::peer::RequestedBlocks::default();
     if drain_pending_now(hub, &tx, &mut pending, &mut headers, &mut requested, true).is_err() {
         return CompareOne::Harness("drain");
     }

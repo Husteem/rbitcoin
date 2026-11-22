@@ -873,7 +873,7 @@ async fn tip_announce_depth_and_fill_slot() {
     let session = live_peer(&peers, 18446, 3, true);
     assert!(session.try_cmpct_fill(hash));
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
+    follow.requested_blocks.ask(hub, hash);
     handle_peer_frame(
         frame_for(NetworkMessage::Block(block)),
         hub,
@@ -1560,7 +1560,7 @@ async fn send_cmpct_raw_first_prefill(
     let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = hb_follow();
     if requested {
-        follow.requested_blocks.insert(hsi.header.block_hash());
+        follow.requested_blocks.ask(hub, hsi.header.block_hash());
     }
     handle_peer_frame(
         FramedMessage {
@@ -1588,7 +1588,7 @@ async fn send_cmpct_once(
     let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = hb_follow();
     if requested {
-        follow.requested_blocks.insert(hsi.header.block_hash());
+        follow.requested_blocks.ask(hub, hsi.header.block_hash());
     }
     handle_peer_frame(
         frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
@@ -1845,7 +1845,7 @@ async fn cmpct_from_peer(
     use bitcoin::bip152::HeaderAndShortIds;
     let hsi = HeaderAndShortIds::from_block(block, 0xbeef, 2, &[0]).unwrap();
     if requested {
-        follow.requested_blocks.insert(block.block_hash());
+        follow.requested_blocks.ask(hub, block.block_hash());
     }
     let (out_tx, mut out_rx) = peer_out_channel();
     handle_peer_frame(

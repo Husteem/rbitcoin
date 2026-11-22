@@ -2516,7 +2516,6 @@ fn badprev_orphan_does_not_blacklist_then_reorg_reconstructs() {
     let mut mutated = honest.clone();
     mutated.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x52]);
     assert_eq!(mutated.block_hash(), honest.block_hash());
-    hub.note_asked_block(honest.block_hash());
     let err = hub
         .accept_received_block(mutated)
         .expect_err("mutated merkle must reject");
@@ -2529,9 +2528,14 @@ fn badprev_orphan_does_not_blacklist_then_reorg_reconstructs() {
         !hub.is_block_invalid(&honest.block_hash()),
         "BLOCK_MUTATED must not cache the header hash as BLOCK_FAILED"
     );
+    hub.settle_rejected_ask(
+        hub.claim_block_ask(&honest.block_hash()),
+        honest.block_hash(),
+        &err,
+    );
     assert!(
         !hub.already_have_or_asked_block(&honest.block_hash()),
-        "a mutated reject forgets the ask so the honest body can be fetched"
+        "a mutated reject releases the ask so the honest body can be fetched"
     );
     assert_eq!(hub.tip_hash().unwrap(), w3.block_hash());
     assert!(matches!(

@@ -1255,7 +1255,15 @@ fn cmpct_helpers_without_mempool_and_queue_out_closed() {
     let mut pb = PendingBlocks::new();
     let mut ph = HashMap::new();
     let (tx, _rx) = peer_out_channel();
-    drain_pending_now(&hub, &tx, &mut pb, &mut ph, &mut HashSet::new(), false).unwrap();
+    drain_pending_now(
+        &hub,
+        &tx,
+        &mut pb,
+        &mut ph,
+        &mut RequestedBlocks::default(),
+        false,
+    )
+    .unwrap();
 
     // Invalid tip-extending body must not kill the session (001).
     use bitcoin::absolute::LockTime;
@@ -1321,10 +1329,17 @@ fn cmpct_helpers_without_mempool_and_queue_out_closed() {
         }
     }
     let bh = bad.block_hash();
-    pb.insert(bh, bad.clone());
+    pb.insert(bh, bad.clone(), None);
     let (tx, _rx) = peer_out_channel();
-    drain_pending_now(&hub, &tx, &mut pb, &mut ph, &mut HashSet::new(), false)
-        .expect("invalid block must not end session");
+    drain_pending_now(
+        &hub,
+        &tx,
+        &mut pb,
+        &mut ph,
+        &mut RequestedBlocks::default(),
+        false,
+    )
+    .expect("invalid block must not end session");
     assert!(
         hub.is_block_invalid(&bh),
         "consensus-invalid body must be cached as failed"
@@ -1532,9 +1547,8 @@ async fn queued_decode_holds_block_requests_across_heartbeat() {
     let peer = outbound_test_peer(&peers, 18449);
     let (out_tx, mut out_rx) = peer_out_channel();
     let hash = BlockHash::from_byte_array([0x44; 32]);
-    hub.note_asked_block(hash);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
+    follow.requested_blocks.ask(&hub, hash);
     let mut since =
         Some(std::time::Instant::now() - BLOCK_GETDATA_TIMEOUT - Duration::from_secs(1));
     on_heartbeat(
@@ -1677,10 +1691,9 @@ async fn getdata_stall_keeps_a_hash_the_download_timer_owns() {
     peers.set_mock_now(asked);
     let peer = outbound_test_peer(&peers, 18451);
     let hash = BlockHash::from_byte_array([0x46; 32]);
-    hub.note_asked_block(hash);
     peer.note_blocks_requested(&[hash]);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
+    follow.requested_blocks.ask(&hub, hash);
     let (out_tx, _out_rx) = peer_out_channel();
     let mut since =
         Some(std::time::Instant::now() - BLOCK_GETDATA_TIMEOUT - Duration::from_secs(1));
@@ -1744,13 +1757,12 @@ async fn queued_decode_holds_the_block_download_window() {
     peers.set_mock_now(start);
     let peer = outbound_test_peer(&peers, 18450);
     let hash = BlockHash::from_byte_array([0x45; 32]);
-    hub.note_asked_block(hash);
     peer.note_blocks_requested(&[hash]);
     let interval = hub.params.btc.pow_target_spacing;
     peers.set_mock_now(start + interval + 1);
     let (out_tx, _out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
+    follow.requested_blocks.ask(&hub, hash);
     let mut since = None;
     on_heartbeat(
         &hub,
@@ -2573,7 +2585,7 @@ async fn witness_mutated_block_is_not_relayed() {
     let liar = outbound_test_peer(&peers, 18492);
     let (liar_tx, _liar_rx) = liar.open_out();
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
+    follow.requested_blocks.ask(&hub, hash);
     on_block(&hub, &liar_tx, &mut follow, Some(liar.as_ref()), &bad)
         .await
         .unwrap();
@@ -2586,7 +2598,7 @@ async fn witness_mutated_block_is_not_relayed() {
     let honest = outbound_test_peer(&peers, 18493);
     let (honest_tx, _honest_rx) = honest.open_out();
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
+    follow.requested_blocks.ask(&hub, hash);
     on_block(&hub, &honest_tx, &mut follow, Some(honest.as_ref()), &good)
         .await
         .unwrap();
@@ -2654,8 +2666,7 @@ async fn witness_mutated_cmpct_reconstruct_asks_the_same_peer_for_the_block() {
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     // The tip `getdata` to a compact v2 peer asked for a compact block.
-    follow.requested_blocks.insert(hash);
-    hub.note_asked_block(hash);
+    follow.requested_blocks.ask(&hub, hash);
     let hsi = HeaderAndShortIds::from_block(&bad, 0xbeef, 2, &[]).unwrap();
     on_cmpctblock(
         &hub,
@@ -2821,7 +2832,7 @@ async fn compact_body_is_asked_of_another_peer_once() {
         asked_witness(&sent(&mut other_rx), hash),
         "the first short-id miss asks another high-bandwidth peer"
     );
-    on_blocktxn_unconnectable(&hub, &ann_tx, &mut follow, Some(announcer.as_ref()), hash).unwrap();
+    on_blocktxn_unconnectable(&ann_tx, &mut follow, Some(announcer.as_ref()), hash).unwrap();
     assert!(
         asked_witness(&sent(&mut ann_rx), hash),
         "a failed blocktxn asks the announcing peer for the body"
@@ -4788,7 +4799,7 @@ fn pending_blocks_insert_evicts_at_cap() {
         b.header.bits = bits;
         let h = b.block_hash();
         hashes.push(h);
-        pending.insert(h, b);
+        pending.insert(h, b, None);
     }
     assert_eq!(pending.keys().len(), MAX_PENDING_BLOCKS_FOR_TEST);
     assert!(
@@ -4804,7 +4815,7 @@ fn pending_block_over_four_megabytes_is_not_parked() {
     let mut exact = block_with_wire_len(4_000_000);
     exact.header.nonce = 1;
     let exact_h = exact.block_hash();
-    pending.insert(exact_h, exact);
+    pending.insert(exact_h, exact, None);
     assert!(
         pending.contains_key(&exact_h),
         "a 4_000_000-byte body is parked"
@@ -4813,7 +4824,7 @@ fn pending_block_over_four_megabytes_is_not_parked() {
     over.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![0u8; 4_000_001]);
     over.header.nonce = 2;
     let h = over.block_hash();
-    pending.insert(h, over);
+    pending.insert(h, over, None);
     assert!(!pending.contains_key(&h));
     assert!(pending.contains_key(&exact_h));
 }
@@ -5609,6 +5620,51 @@ async fn aborted_follow_session_releases_its_block_asks() {
     assert!(
         !still_asked,
         "an aborted session must release its body asks for other peers"
+    );
+}
+
+/// A body that arrives while its chain is below `-minimumchainwork` is
+/// parked in the session, still asked. When that session closes, another
+/// peer must be free to fetch the body once the chain meets the floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_session_releases_a_body_parked_below_minimum_chain_work() {
+    let mut t = paused_serve("parked-ask", 1, &["/rbitcoin:test(parked-ask)/"]).await;
+    let tip = t.node.hub.tip_header().unwrap();
+    let height = t.node.hub.tip_height().unwrap() + 1;
+    let block = rbitcoin_consensus::mine_regtest_paying(
+        tip.block_hash(),
+        tip.time + 1,
+        height,
+        ScriptBuf::from_bytes(vec![0x51]),
+        Vec::new(),
+    );
+    let hash = announce_and_wait_for_ask(&mut t, block.header).await;
+    *t.node.hub.minimum_chain_work.write().unwrap() = Some([0xff; 32]);
+    let (raw, _) = &mut t.clients[0];
+    write_peer_msg(raw, NetworkMessage::Block(block)).await;
+    write_peer_msg(raw, NetworkMessage::Ping(9)).await;
+    let ponged = tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(next_peer_msg(raw).await, Ok(NetworkMessage::Pong(9))) {}
+    })
+    .await;
+    assert!(ponged.is_ok(), "the session reads the body before the ping");
+    assert_eq!(t.node.hub.tip_hash(), Some(tip.block_hash()), "parked");
+    assert!(
+        t.node.hub.already_have_or_asked_block(&hash),
+        "a parked body stays asked while its session lives"
+    );
+    raw.close();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !t.node.peers.live_peers().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "closed session");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let still_asked = t.node.hub.already_have_or_asked_block(&hash);
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+    assert!(
+        !still_asked,
+        "a closed session must release the ask of a body it parked"
     );
 }
 
@@ -7568,12 +7624,15 @@ fn requested_block_bodies_stay_off_the_tip_follow_rate_window() {
         }
     };
     let window: Vec<FramedMessage> = (0..MAX_SERVE_BLOCKS as u32).map(body).collect();
-    let asks: HashSet<BlockHash> = window
+    let asks: Vec<BlockHash> = window
         .iter()
         .map(|f| f.block_hash_from_header().unwrap())
         .collect();
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("rate-asks");
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks = asks.clone();
+    for h in &asks {
+        follow.requested_blocks.ask(&hub, *h);
+    }
     let mut rate = PeerRateLimiter::default_limits();
     for (i, f) in window.iter().enumerate() {
         assert!(
@@ -7586,14 +7645,16 @@ fn requested_block_bodies_stay_off_the_tip_follow_rate_window() {
         .all(|f| note_frame_rate(&mut rate, &mut follow, f));
     assert!(!resends_fit, "a resent requested body still counts");
 
-    follow.requested_blocks.clear();
+    follow.requested_blocks = RequestedBlocks::default();
     let mut rate = PeerRateLimiter::default_limits();
     let unsolicited_fits = (0..MAX_SERVE_BLOCKS as u32)
         .map(|i| body(MAX_SERVE_BLOCKS as u32 + i))
         .all(|f| note_frame_rate(&mut rate, &mut follow, &f));
     assert!(!unsolicited_fits, "unsolicited bodies still count");
 
-    follow.requested_blocks = asks;
+    for h in &asks {
+        follow.requested_blocks.ask(&hub, *h);
+    }
     let mut rate = PeerRateLimiter::default_limits();
     let reasked_fits = window
         .iter()
@@ -8319,7 +8380,7 @@ fn inbound_cmpct_reconstruct_runs_off_the_reactor() {
         tokio::spawn(async move {
             let (out_tx, _rx) = peer_out_channel();
             let mut follow = PeerFollowState::new();
-            follow.requested_blocks.insert(hash);
+            follow.requested_blocks.ask(&hub, hash);
             on_cmpctblock_reconstruct(&hub, &out_tx, &mut follow, None, &hsi, hash)
                 .await
                 .expect("reconstruct");
@@ -11185,8 +11246,8 @@ mod peer_queue_pins {
         let second = bare_block(2);
         let a = first.block_hash();
         let b = second.block_hash();
-        pending.insert(a, first);
-        pending.insert(b, second);
+        pending.insert(a, first, None);
+        pending.insert(b, second, None);
         assert_eq!(pending.values().count(), 2);
         pending.remove(&a);
         assert_eq!(pending.fifo.iter().copied().collect::<Vec<_>>(), vec![b]);
@@ -11219,7 +11280,7 @@ mod peer_header_pins {
     use super::*;
     use bitcoin::hashes::Hash;
     use bitcoin::BlockHash;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     /// Bits harder than the regtest pow limit. Claimed proof of work fails.
     fn hdr(prev: BlockHash, n: u32) -> bitcoin::block::Header {
@@ -11276,12 +11337,11 @@ mod peer_header_pins {
     fn peer_header_expire_at_the_timeout() {
         let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hdr-expire");
         let hash = BlockHash::from_byte_array([6; 32]);
-        let mut requested = HashSet::new();
-        requested.insert(hash);
+        let mut requested = RequestedBlocks::default();
+        requested.ask(&hub, hash);
         let start = std::time::Instant::now() - BLOCK_GETDATA_TIMEOUT;
         let mut since = Some(start);
         assert!(maybe_expire_block_requests(
-            &hub,
             &mut requested,
             &mut since,
             start + BLOCK_GETDATA_TIMEOUT,
@@ -12268,7 +12328,7 @@ mod peer_session_pins {
         let mut follow = PeerFollowState::new();
         follow
             .requested_blocks
-            .insert(BlockHash::from_byte_array([7; 32]));
+            .ask(&hub, BlockHash::from_byte_array([7; 32]));
         let mut since = Some(std::time::Instant::now() - BLOCK_GETDATA_TIMEOUT);
         let mut announces = None;
         let mut flushes = None;

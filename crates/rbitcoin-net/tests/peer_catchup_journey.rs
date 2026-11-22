@@ -138,15 +138,15 @@ async fn peer_catchup_compact_reorg() {
     let peer_1 = block_at(&src, 1);
     let peer_2 = block_at(&src, 2);
     let mut pb = PendingBlocks::new();
-    pb.insert(peer_1.block_hash(), peer_1.clone());
-    pb.insert(peer_2.block_hash(), peer_2.clone());
+    pb.insert(peer_1.block_hash(), peer_1.clone(), None);
+    pb.insert(peer_2.block_hash(), peer_2.clone(), None);
     let mut ph = HashMap::new();
     drain_pending(
         &hub,
         &out_tx,
         &mut pb,
         &mut ph,
-        &mut HashSet::new(),
+        &mut RequestedBlocks::default(),
         false,
         None,
     )
@@ -482,15 +482,13 @@ async fn peer_catchup_compact_reorg() {
     assert_eq!(hub.tip_hash(), tip_before_low);
 
     let stale_hash = BlockHash::from_byte_array([0x11; 32]);
-    let mut requested = HashSet::new();
-    requested.insert(stale_hash);
-    hub.note_asked_block(stale_hash);
+    let mut requested = RequestedBlocks::default();
+    requested.ask(&hub, stale_hash);
     assert!(hub.already_have_or_asked_block(&stale_hash));
     let t0 = Instant::now();
     let mut since = Some(t0);
     assert!(
         !maybe_expire_block_requests(
-            &hub,
             &mut requested,
             &mut since,
             t0 + BLOCK_GETDATA_TIMEOUT - Duration::from_secs(1),
@@ -500,7 +498,6 @@ async fn peer_catchup_compact_reorg() {
     );
     assert_eq!(requested.len(), 1);
     assert!(maybe_expire_block_requests(
-        &hub,
         &mut requested,
         &mut since,
         t0 + BLOCK_GETDATA_TIMEOUT + Duration::from_millis(1),
@@ -590,11 +587,10 @@ async fn peer_catchup_compact_reorg() {
     assert!(live.try_cmpct_fill(pending_hash));
     let t1 = Instant::now();
     let mut since = Some(t1);
-    let mut fill_req = HashSet::new();
-    fill_req.insert(pending_hash);
+    let mut fill_req = RequestedBlocks::default();
+    fill_req.ask(&hub, pending_hash);
     assert!(
         maybe_expire_block_requests(
-            &hub,
             &mut fill_req,
             &mut since,
             t1 + BLOCK_GETDATA_TIMEOUT + Duration::from_millis(1),
@@ -675,8 +671,7 @@ async fn catchup_reorg_and_drain(
         .collect();
     assert!(weak_headers.len() as u32 + FORK_PARENT < 160);
     for hash in &stale_asks {
-        follow.requested_blocks.insert(*hash);
-        hub.note_asked_block(*hash);
+        follow.requested_blocks.ask(hub, *hash);
     }
     handle_peer_frame(
         frame_for(NetworkMessage::Headers(weak_headers)),
@@ -693,7 +688,7 @@ async fn catchup_reorg_and_drain(
             .iter()
             .all(|h| !follow.requested_blocks.contains(h)),
         "weaker connecting headers must drop stale-fork asks, still {:?}",
-        follow.requested_blocks
+        follow.requested_blocks.hashes()
     );
     assert_ne!(hub.tip_hash(), Some(src.tip_hash().unwrap()));
 
@@ -717,11 +712,9 @@ async fn catchup_reorg_and_drain(
         let block = block_at(src, h);
         fork_headers.insert(block.block_hash(), block.header);
     }
-    let mut dummy_req = HashSet::new();
+    let mut dummy_req = RequestedBlocks::default();
     for i in 0..MAX_SERVE_BLOCKS {
-        let dummy = BlockHash::from_byte_array([i as u8 + 1; 32]);
-        dummy_req.insert(dummy);
-        hub.note_asked_block(dummy);
+        dummy_req.ask(hub, BlockHash::from_byte_array([i as u8 + 1; 32]));
     }
     let (drain_tx, mut drain_rx) = peer_out_channel();
     let mut drain_blocks = PendingBlocks::new();
@@ -760,7 +753,6 @@ async fn catchup_reorg_and_drain(
     let t2 = Instant::now();
     let mut since = Some(t2);
     assert!(maybe_expire_block_requests(
-        hub,
         &mut dummy_req,
         &mut since,
         t2 + BLOCK_GETDATA_TIMEOUT + Duration::from_millis(1),
@@ -981,14 +973,14 @@ async fn catchup_reorg_and_drain(
     }
     let (miss_tx, mut miss_rx) = peer_out_channel();
     let mut miss_blocks = PendingBlocks::new();
-    miss_blocks.insert(orphan.block_hash(), orphan);
+    miss_blocks.insert(orphan.block_hash(), orphan, None);
     let mut miss_headers = HashMap::new();
     drain_pending(
         hub,
         &miss_tx,
         &mut miss_blocks,
         &mut miss_headers,
-        &mut HashSet::new(),
+        &mut RequestedBlocks::default(),
         false,
         None,
     )

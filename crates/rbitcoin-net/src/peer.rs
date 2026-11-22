@@ -4,7 +4,7 @@ use crate::cache::BlockCache;
 use crate::chain::{
     accept_block_header_nodos_log, accept_prev_not_found_log, ignoring_low_work_chain_log,
     received_getdata_wtx_log, received_tx_log, synchronizing_blockheaders_log, AcceptOutcome,
-    ChainHub,
+    BlockAsk, ChainHub,
 };
 use crate::codec::{
     FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ, TX_INV_BATCH,
@@ -662,11 +662,14 @@ pub const FROM_THIS_PEER_CAP: usize = 50_000;
 pub const MAX_PENDING_BLOCKS_FOR_TEST: usize = MAX_PENDING_BLOCKS;
 
 /// Tip-follow decoded bodies waiting for a connectable parent. Cap 128;
-/// insert evicts the oldest hash (FIFO), not `HashMap::keys().next()`.
+/// insert evicts the oldest hash (FIFO), not `HashMap::keys().next()`. A body
+/// parked while it was still asked keeps its [`BlockAsk`] here, so evicting
+/// or dropping the body releases the ask.
 #[derive(Default)]
 pub struct PendingBlocks {
     pub map: HashMap<BlockHash, bitcoin::Block>,
     pub fifo: VecDeque<BlockHash>,
+    asks: HashMap<BlockHash, BlockAsk>,
 }
 
 impl PendingBlocks {
@@ -686,16 +689,37 @@ impl PendingBlocks {
         self.map.keys()
     }
 
-    pub fn insert(&mut self, hash: BlockHash, block: bitcoin::Block) {
-        stash_pending_block(self, hash, block);
+    pub fn insert(&mut self, hash: BlockHash, block: bitcoin::Block, ask: Option<BlockAsk>) {
+        if stash_pending_block(self, hash, block) {
+            if let Some(ask) = ask {
+                keep_one_ask(&mut self.asks, ask);
+            }
+        }
     }
 
     pub fn remove(&mut self, hash: &BlockHash) -> Option<bitcoin::Block> {
+        self.take(hash).map(|(block, _)| block)
+    }
+
+    /// The body and the ask it was parked with.
+    pub fn take(&mut self, hash: &BlockHash) -> Option<(bitcoin::Block, Option<BlockAsk>)> {
         let b = self.map.remove(hash)?;
         if let Some(i) = self.fifo.iter().position(|h| h == hash) {
             self.fifo.remove(i);
         }
-        Some(b)
+        Some((b, self.asks.remove(hash)))
+    }
+}
+
+/// One ask per hash in `asks`. A second ask for a hash replaces the first,
+/// and the hash stays asked.
+fn keep_one_ask(asks: &mut HashMap<BlockHash, BlockAsk>, ask: BlockAsk) {
+    let hash = ask.hash();
+    if let Some(old) = asks.insert(hash, ask) {
+        drop(old);
+        if let Some(kept) = asks.get(&hash) {
+            kept.renew();
+        }
     }
 }
 
@@ -704,27 +728,107 @@ pub fn block_wire_len(block: &bitcoin::Block) -> usize {
     block.total_size()
 }
 
+/// Park `block`. False when it is too large to park or the cap is full.
 #[doc(hidden)]
-pub fn stash_pending_block(pending: &mut PendingBlocks, hash: BlockHash, block: bitcoin::Block) {
+pub fn stash_pending_block(
+    pending: &mut PendingBlocks,
+    hash: BlockHash,
+    block: bitcoin::Block,
+) -> bool {
     let nbytes = block_wire_len(&block);
     if nbytes > MAX_BLOCK_SERIALIZED {
-        return;
+        return false;
     }
     if let std::collections::hash_map::Entry::Occupied(mut e) = pending.map.entry(hash) {
         e.insert(block);
-        return;
+        return true;
     }
     while pending.map.len() >= MAX_PENDING_BLOCKS {
         let Some(k) = pending.fifo.pop_front() else {
             break;
         };
         pending.map.remove(&k);
+        pending.asks.remove(&k);
     }
     if pending.map.len() >= MAX_PENDING_BLOCKS {
-        return;
+        return false;
     }
     pending.fifo.push_back(hash);
     pending.map.insert(hash, block);
+    true
+}
+
+/// Bodies this session asked its peer for by `getdata` (Core
+/// `vBlocksInFlight`, without compact partials). An entry holds its hub
+/// [`BlockAsk`] until the body is settled: removing the entry, or dropping
+/// the table when the session ends or its task is aborted, releases it.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct RequestedBlocks {
+    hashes: HashSet<BlockHash>,
+    asks: HashMap<BlockHash, BlockAsk>,
+}
+
+impl RequestedBlocks {
+    pub fn hashes(&self) -> &HashSet<BlockHash> {
+        &self.hashes
+    }
+
+    pub fn contains(&self, hash: &BlockHash) -> bool {
+        self.hashes.contains(hash)
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    /// Ask for `hash` unless another session already has: the header path's
+    /// one claim per body.
+    pub fn claim(&mut self, hub: &ChainHub, hash: BlockHash) -> bool {
+        if self.hashes.contains(&hash) {
+            return false;
+        }
+        let Some(ask) = hub.claim_block_ask(&hash) else {
+            return false;
+        };
+        self.hashes.insert(hash);
+        self.asks.insert(hash, ask);
+        true
+    }
+
+    /// Ask for `hash` even when another session already has.
+    pub fn ask(&mut self, hub: &ChainHub, hash: BlockHash) {
+        self.hashes.insert(hash);
+        match self.asks.get(&hash) {
+            Some(ask) => ask.renew(),
+            None => {
+                self.asks.insert(hash, hub.ask_block(hash));
+            }
+        }
+    }
+
+    /// Put back an ask taken out by [`Self::remove`].
+    pub fn restore(&mut self, ask: BlockAsk) {
+        self.hashes.insert(ask.hash());
+        keep_one_ask(&mut self.asks, ask);
+    }
+
+    /// The body is settled here. The caller owns the returned ask; dropping
+    /// it releases the body to other sessions.
+    pub fn remove(&mut self, hash: &BlockHash) -> Option<BlockAsk> {
+        self.hashes.remove(hash);
+        self.asks.remove(hash)
+    }
+
+    /// Release the hub ask while the getdata stays in flight on this
+    /// session, so other sessions may fetch the same body.
+    pub fn release_ask(&mut self, hash: &BlockHash) {
+        self.asks.remove(hash);
+    }
 }
 
 /// Service bits for one node.
@@ -1896,7 +2000,6 @@ pub async fn on_heartbeat(
     // it before that frame is applied.
     if !decode_queued {
         if maybe_expire_block_requests(
-            hub,
             &mut follow.requested_blocks,
             requested_since,
             std::time::Instant::now(),
@@ -2347,11 +2450,8 @@ pub async fn peer_session_with(
     let out_tx = opened.out_tx;
     let mut writer_task = opened.writer_task;
 
-    let mut owned_follow = SessionFollow {
-        hub: hub.clone(),
-        state: PeerFollowState::new(),
-    };
-    let follow = &mut owned_follow.state;
+    let mut owned_follow = PeerFollowState::new();
+    let follow = &mut owned_follow;
     if let Some(s) = meta.session.as_ref() {
         follow.wtxid_relay = s.wtxid_relay();
     }
@@ -2941,7 +3041,7 @@ pub async fn peer_session_with(
     .await;
 
     // A `?` in the tip or tx-announce arm leaves frames that were already
-    // read. Apply them before `SessionFollow` forgets their getdata.
+    // read. Apply them before dropping the follow state releases their asks.
     let drained = apply_queued_decodes(
         &mut decode_q,
         hub.as_ref(),
@@ -3143,8 +3243,7 @@ pub fn getdata_use_compact(hub: &ChainHub, peer_cmpct_version: u32) -> bool {
 /// `sync_blocks` 60s). A hash the download window still lists stays, so the
 /// ping suspend holds until that window times the peer out.
 pub fn maybe_expire_block_requests(
-    hub: &ChainHub,
-    requested: &mut HashSet<BlockHash>,
+    requested: &mut RequestedBlocks,
     since: &mut Option<std::time::Instant>,
     now: std::time::Instant,
     session: Option<&crate::peers::LivePeer>,
@@ -3158,6 +3257,7 @@ pub fn maybe_expire_block_requests(
         return false;
     }
     let stale: Vec<BlockHash> = requested
+        .hashes()
         .iter()
         .copied()
         .filter(|h| session.is_none_or(|s| !s.block_download_owns(h)))
@@ -3167,7 +3267,6 @@ pub fn maybe_expire_block_requests(
     }
     for h in stale {
         requested.remove(&h);
-        hub.forget_asked_block(&h);
         if let Some(s) = session {
             s.release_cmpct_taken(h);
         }
@@ -3214,7 +3313,7 @@ pub fn queue_block_getdata(
     hub: &ChainHub,
     out: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
-    requested_blocks: &mut HashSet<BlockHash>,
+    requested_blocks: &mut RequestedBlocks,
     want: &[BlockHash],
     compact: bool,
 ) -> Result<(), NetError> {
@@ -3232,8 +3331,7 @@ pub fn queue_block_getdata(
         })
         .collect();
     for h in want {
-        requested_blocks.insert(*h);
-        hub.note_asked_block(*h);
+        requested_blocks.ask(hub, *h);
     }
     if let Some(s) = session {
         s.note_blocks_requested(want);
@@ -3242,12 +3340,6 @@ pub fn queue_block_getdata(
         out.send(NetworkMessage::GetData(chunk.to_vec()))?;
     }
     Ok(())
-}
-
-#[doc(hidden)]
-pub fn take_requested_block(hub: &ChainHub, requested: &mut HashSet<BlockHash>, hash: &BlockHash) {
-    requested.remove(hash);
-    hub.forget_asked_block(hash);
 }
 
 #[doc(hidden)]
@@ -3563,7 +3655,7 @@ pub struct PeerFollowState {
     pub pending_blocks: PendingBlocks,
     pub pending_cmpct: HashMap<BlockHash, PendingCmpct>,
     pub from_this_peer: CappedSet<bitcoin::Txid>,
-    pub requested_blocks: HashSet<BlockHash>,
+    pub requested_blocks: RequestedBlocks,
     /// Asks in `requested_blocks` whose one rate-exempt `block` frame has
     /// arrived ([`note_frame_rate`]). Pruned to `requested_blocks` on every
     /// frame, so it never outgrows the open asks, and a later ask for the
@@ -3589,24 +3681,6 @@ pub struct PeerFollowState {
     pub continuation_block: Option<BlockHash>,
 }
 
-/// A live session's follow state. Dropping it, including when the session
-/// task is aborted at shutdown, releases the body asks
-/// the peer never answered: `asked_blocks` is hub-wide, so a held ask would
-/// keep every other peer from fetching that body.
-#[doc(hidden)]
-pub struct SessionFollow {
-    pub hub: Arc<ChainHub>,
-    pub state: PeerFollowState,
-}
-
-impl Drop for SessionFollow {
-    fn drop(&mut self) {
-        for h in self.state.requested_blocks.drain() {
-            self.hub.forget_asked_block(&h);
-        }
-    }
-}
-
 impl PeerFollowState {
     /// Core `vBlocksInFlight`: a body asked by `getdata`, or a compact
     /// block waiting on `blocktxn`.
@@ -3629,7 +3703,7 @@ impl PeerFollowState {
             pending_blocks: PendingBlocks::new(),
             pending_cmpct: HashMap::new(),
             from_this_peer: CappedSet::new(),
-            requested_blocks: HashSet::new(),
+            requested_blocks: RequestedBlocks::default(),
             unmetered_bodies: HashSet::new(),
             ban_score: 0,
             getdata_tail: VecDeque::new(),
@@ -3740,8 +3814,8 @@ async fn finish_decode_queue_full(
 }
 
 /// Apply one frame that already left the socket. A dropped decode task or a
-/// failed apply still drains frames behind it, so `SessionFollow` does not
-/// forget their getdata.
+/// failed apply still drains frames behind it, so dropping the follow state
+/// does not release their asks.
 async fn apply_ready_decode(
     decoded: Result<Result<RawNetworkMessage, NetError>, tokio::sync::oneshot::error::RecvError>,
     slot: &mut ReadyDecode<'_>,
@@ -3803,8 +3877,8 @@ async fn apply_ready_decode(
 }
 
 /// Apply frames already taken off the socket, in order, before a later read
-/// error tears the session down. `SessionFollow`'s drop would otherwise
-/// forget getdata for a block that is still sitting in `decode_q`.
+/// error tears the session down. Dropping the follow state would otherwise
+/// release the ask for a block that is still sitting in `decode_q`.
 async fn apply_queued_decodes(
     decode_q: &mut DecodeQueue,
     hub: &ChainHub,
@@ -5382,7 +5456,7 @@ struct HeadersApply {
     disconnect: Option<(u32, u32)>,
     sync_height: Option<u32>,
     ignore_height: Option<u32>,
-    /// Asks `release_asks_off_path` already forgot on the hub.
+    /// In-flight asks off the stored walk. Applying the batch releases them.
     drop_asks: Vec<BlockHash>,
     want_bodies: Vec<BlockHash>,
     /// Locator for one follow-up `getheaders`, if the batch still wants a page.
@@ -5616,13 +5690,11 @@ fn retarget_stored_header_asks(
     have_bodies: &HashSet<BlockHash>,
 ) {
     let keep = connecting_header_path(hub, pending, last);
+    apply.drop_asks = asks_off_path(requested_before, &keep);
     let mut requested = requested_before.clone();
-    release_asks_off_path(hub, &mut requested, &keep);
-    apply.drop_asks = requested_before
-        .iter()
-        .copied()
-        .filter(|h| !requested.contains(h))
-        .collect();
+    for h in &apply.drop_asks {
+        requested.remove(h);
+    }
     let mut want =
         fetchable_header_path_bodies(hub, pending, last, &PendingBlocks::new(), &requested);
     want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
@@ -6112,20 +6184,19 @@ fn queue_claimed_block_getdata(
     hub: &ChainHub,
     out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
-    requested_blocks: &mut HashSet<BlockHash>,
+    requested_blocks: &mut RequestedBlocks,
     want: &[BlockHash],
     compact: bool,
 ) -> Result<(), NetError> {
     let claimed: Vec<BlockHash> = want
         .iter()
         .copied()
-        .filter(|hash| hub.claim_block_ask(hash))
+        .filter(|hash| requested_blocks.claim(hub, *hash))
         .collect();
     let sent = queue_block_getdata(hub, out_tx, session, requested_blocks, &claimed, compact);
     if sent.is_err() {
         for hash in &claimed {
             requested_blocks.remove(hash);
-            hub.forget_asked_block(hash);
         }
         return sent;
     }
@@ -6209,7 +6280,7 @@ pub async fn on_headers(
 ) -> Result<(), NetError> {
     let noban = session.is_some_and(|s| s.session_noban());
     let pending = follow.pending_headers.clone();
-    let requested = follow.requested_blocks.clone();
+    let requested = follow.requested_blocks.hashes().clone();
     let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
     let headers = headers.to_vec();
     let apply = run_header_job(hub, move |hub| {
@@ -6231,17 +6302,18 @@ pub async fn on_headers(
 /// invalid, and the sender is punished. Core's next `SendMessages` asks for
 /// the block again while it is on the best header chain. A session that
 /// [`misbehaving`] keeps (manual or noban) asks at once; one it drops leaves
-/// the block to the other sessions, as the forgotten ask allows.
+/// the block to the other sessions, as the released ask allows.
 async fn on_mutated_block(
     hub: &ChainHub,
     out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
-    hash: BlockHash,
+    ask: Option<BlockAsk>,
     reason: &str,
 ) -> Result<(), NetError> {
     rbitcoin_log::info!("Block mutated: {reason}");
-    take_requested_block(hub, &mut follow.requested_blocks, &hash);
+    // `drain_pending` skips a body that is still asked.
+    drop(ask);
     misbehaving(&mut follow.ban_score, session);
     if session.is_some_and(misbehavior_exempt) {
         drain_pending(
@@ -6278,7 +6350,8 @@ pub async fn on_block(
         None
     };
     if let Some(reason) = mutated {
-        return on_mutated_block(hub, out_tx, follow, session, hash, reason).await;
+        let ask = follow.requested_blocks.remove(&hash);
+        return on_mutated_block(hub, out_tx, follow, session, ask, reason).await;
     }
     if let Some(s) = session {
         s.note_block_from_peer(hash);
@@ -6294,9 +6367,9 @@ pub async fn on_block(
     // return. A duplicate must not take the process-wide tip-accept lane.
     if hub.already_have(hash) {
         drop_pending_cmpct(follow, session, hash);
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        let ask = follow.requested_blocks.remove(&hash);
         hub.drop_held(hash);
-        return drain_after_accept(hub, out_tx, follow, session, hash, false).await;
+        return drain_after_accept(hub, out_tx, follow, session, hash, ask, false).await;
     }
     let prev = block.header.prev_blockhash;
     if prev.to_byte_array() != [0u8; 32]
@@ -6310,8 +6383,8 @@ pub async fn on_block(
         }
         let _ = queue_getheaders(out_tx, hub, session, true, None);
         admit_pending_header(&mut follow.pending_headers, hash, block.header);
-        follow.pending_blocks.insert(hash, block.clone());
-        hub.forget_asked_block(&hash);
+        follow.pending_blocks.insert(hash, block.clone(), None);
+        follow.requested_blocks.release_ask(&hash);
         return Ok(());
     }
     if on_block_unrequested_skip(hub, follow, session, block, hash)? {
@@ -6320,7 +6393,6 @@ pub async fn on_block(
     if let Err(e) = ensure_peer_header(hub, &block.header) {
         if e.is_local_fault() || crate::chain::accept_err_is_temporary_time(&e) {
             follow.requested_blocks.remove(&hash);
-            hub.forget_asked_block(&hash);
             return Ok(());
         }
         misbehaving(&mut follow.ban_score, session);
@@ -6330,23 +6402,21 @@ pub async fn on_block(
         return Ok(());
     }
     drop_pending_cmpct(follow, session, hash);
-    follow.requested_blocks.remove(&hash);
+    let ask = follow.requested_blocks.remove(&hash);
     admit_pending_header(&mut follow.pending_headers, hash, block.header);
     if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
-        follow.pending_blocks.insert(hash, block.clone());
+        follow.pending_blocks.insert(hash, block.clone(), ask);
         return Ok(());
     }
     // T2: a body already marked invalid costs no lane slot and is not
     // re-announced. Placed after the header/PoW checks so a bad-proof-of-work
     // header still scores the peer. No ban here: the sender may not know.
     if hub.is_block_invalid(&hash) {
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
         hub.drop_held(hash);
-        hub.forget_asked_block(&hash);
         return Ok(());
     }
     relay_new_pow_valid_block(hub, block, session).await;
-    on_block_accept(hub, out_tx, follow, session, block, hash).await
+    on_block_accept(hub, out_tx, follow, session, block, hash, ask).await
 }
 
 #[allow(clippy::unnecessary_get_then_check)]
@@ -6372,8 +6442,6 @@ pub fn on_block_unrequested_skip(
     }
     if let Err(e) = ensure_peer_header(hub, &block.header) {
         if e.is_local_fault() || crate::chain::accept_err_is_temporary_time(&e) {
-            follow.requested_blocks.remove(&hash);
-            hub.forget_asked_block(&hash);
             return Ok(true);
         }
         misbehaving(&mut follow.ban_score, session);
@@ -6395,11 +6463,10 @@ pub fn on_block_unrequested_skip(
     Ok(false)
 }
 
-/// Local IO fault: keep the session, and release the hub body ask so a later
-/// getdata can claim the same hash. The block is not a verdict.
-fn note_store_fault_keep_session(hub: &ChainHub, hash: BlockHash, e: &NetError) {
+/// Local IO fault: keep the session. The block is not a verdict, so its ask
+/// is dropped and a later getdata can claim the same hash.
+fn note_store_fault_keep_session(hash: BlockHash, e: &NetError) {
     rbitcoin_log::warn!("p2p: accept dropped {hash} (local fault — keep session): {e}");
-    hub.forget_asked_block(&hash);
 }
 
 pub async fn on_block_accept(
@@ -6409,9 +6476,10 @@ pub async fn on_block_accept(
     session: Option<&crate::peers::LivePeer>,
     block: &Block,
     hash: BlockHash,
+    ask: Option<BlockAsk>,
 ) -> Result<(), NetError> {
     let outcome = accept_received_from_peer(hub, block.clone(), session).await;
-    finish_block_accept(hub, out_tx, follow, session, block, hash, outcome).await
+    finish_block_accept(hub, out_tx, follow, session, block, hash, ask, outcome).await
 }
 
 fn accept_mutated_log_reason(e: &NetError) -> &'static str {
@@ -6427,9 +6495,11 @@ fn accept_mutated_log_reason(e: &NetError) -> &'static str {
     crate::chain::mutated_copy_log_reason(&reason)
 }
 
-/// What a peer-accept result does to the session. A missing store row keeps
-/// the ask; any other store fault releases it. The neighborhood is the
-/// match in this function.
+/// What a peer-accept result does to the session and to the body's ask. A
+/// reject keeps the ask only on the hub's verdict
+/// ([`ChainHub::settle_rejected_ask`]); every other outcome releases it.
+/// The neighborhood is the match in this function.
+#[allow(clippy::too_many_arguments)] // one accept result; call site stays unbundled
 async fn finish_block_accept(
     hub: &ChainHub,
     out_tx: &PeerOutTx,
@@ -6437,22 +6507,24 @@ async fn finish_block_accept(
     session: Option<&crate::peers::LivePeer>,
     block: &Block,
     hash: BlockHash,
+    ask: Option<BlockAsk>,
     outcome: Result<AcceptOutcome, NetError>,
 ) -> Result<(), NetError> {
     match outcome {
         Ok(AcceptOutcome::Accepted { .. }) => {
-            drain_after_accept(hub, out_tx, follow, session, hash, false).await
+            drain_after_accept(hub, out_tx, follow, session, hash, ask, false).await
         }
         Ok(AcceptOutcome::AlreadyHave) | Ok(AcceptOutcome::IgnoredWeaker) => {
-            drain_after_accept(hub, out_tx, follow, session, hash, false).await
+            drain_after_accept(hub, out_tx, follow, session, hash, ask, false).await
         }
         Err(e) if net_error_is_store_not_found(&e) => {
             rbitcoin_log::warn!("p2p: accept dropped {hash} (store not found — keep session): {e}");
+            hub.settle_rejected_ask(ask, hash, &e);
             Ok(())
         }
         Err(e) if net_error_needs_parent(&e) => {
-            hub.forget_asked_block(&hash);
-            follow.pending_blocks.insert(hash, block.clone());
+            drop(ask);
+            follow.pending_blocks.insert(hash, block.clone(), None);
             drain_pending(
                 hub,
                 out_tx,
@@ -6465,17 +6537,18 @@ async fn finish_block_accept(
             .await
         }
         Err(e @ NetError::Store(_)) => {
-            note_store_fault_keep_session(hub, hash, &e);
+            note_store_fault_keep_session(hash, &e);
             Ok(())
         }
         // Witness bytes the block does not commit to: Core `IsBlockMutated`
         // drops these before validation, as `on_block` drops the others.
         Err(e) if e.is_mutated() => {
             let reason = accept_mutated_log_reason(&e);
-            on_mutated_block(hub, out_tx, follow, session, hash, reason).await
+            on_mutated_block(hub, out_tx, follow, session, ask, reason).await
         }
         Err(e) => {
             rbitcoin_log::warn!("p2p: accept dropped {hash} (invalid — keep session): {e}");
+            hub.settle_rejected_ask(ask, hash, &e);
             Ok(())
         }
     }
@@ -6542,12 +6615,11 @@ pub async fn on_cmpctblock(
         return Ok(());
     }
     let keep = keep_pending_connecting_paths(hub, &follow.pending_headers);
-    release_asks_off_path(hub, &mut follow.requested_blocks, &keep);
+    release_asks_off_path(&mut follow.requested_blocks, &keep);
     on_cmpctblock_queue_ancestors(hub, out_tx, follow, session, hash)?;
     if hub.header_below_anti_dos(&hsi.header) && !follow.requested_blocks.contains(&hash) {
         let id = session.map(|s| s.id).unwrap_or(0);
         rbitcoin_log::info!("p2p: ignore low-work compact block from peer {id}");
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
         return Ok(());
     }
     // Process the compact block's header before trying reconstruction, as Core
@@ -6570,7 +6642,7 @@ pub async fn on_cmpctblock(
         }
     }
     if hub.has_block(&hash) {
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        follow.requested_blocks.remove(&hash);
         return Ok(());
     }
     if !follow.requested_blocks.contains(&hash)
@@ -6602,7 +6674,7 @@ async fn on_cmpctblock_header_announce(
         &follow.pending_headers,
         hash,
         &follow.pending_blocks,
-        &follow.requested_blocks,
+        follow.requested_blocks.hashes(),
     );
     want.truncate(MAX_SERVE_BLOCKS.saturating_sub(follow.requested_blocks.len()));
     queue_claimed_block_getdata(
@@ -6659,7 +6731,7 @@ pub fn on_cmpctblock_reject_early(
     if !hub.header_claimed_pow_ok(&hsi.header) {
         rbitcoin_log::info!("{}", crate::chain::accept_block_header_nodos_log(hash));
         misbehaving(&mut follow.ban_score, session);
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        follow.requested_blocks.remove(&hash);
         return Ok(true);
     }
     if let Some(s) = session {
@@ -6688,7 +6760,7 @@ pub fn on_cmpctblock_queue_ancestors(
         &follow.pending_headers,
         hash,
         &follow.pending_blocks,
-        &follow.requested_blocks,
+        follow.requested_blocks.hashes(),
     )
     .into_iter()
     .filter(|h| *h != hash)
@@ -6751,12 +6823,11 @@ pub async fn on_cmpct_got_block(
     fill: Option<Box<crate::compact::CmpctFillSets>>,
 ) -> Result<(), NetError> {
     log_cmpct_filled(hub, hsi, &block, &[], fill.as_deref());
-    follow.requested_blocks.remove(&hash);
+    let ask = follow.requested_blocks.remove(&hash);
     drop_pending_cmpct(follow, session, hash);
     relay_new_pow_valid_block(hub, &block, session).await;
     let outcome = accept_received_from_peer(hub, block.clone(), session).await;
-    // Accepted released the ask the same way as every other `Ok`. One arm.
-    apply_cmpct_accept(hub, out_tx, follow, session, hsi, hash, block, outcome);
+    apply_cmpct_accept(hub, out_tx, follow, session, hsi, hash, ask, block, outcome);
     drain_pending(
         hub,
         out_tx,
@@ -6769,8 +6840,11 @@ pub async fn on_cmpct_got_block(
     .await
 }
 
-/// Compact accept outcomes. `Ok` releases the body ask. A missing store row
-/// does not. An unknown previous header asks for headers.
+/// Compact accept outcomes for the body and its ask. A reject
+/// keeps the ask only on the hub's verdict
+/// ([`ChainHub::settle_rejected_ask`]); a mutated fill asks the same peer
+/// again; every other outcome releases it. An unknown previous header asks
+/// for headers.
 #[allow(clippy::too_many_arguments)] // one compact fill; the match stays one function
 fn apply_cmpct_accept(
     hub: &ChainHub,
@@ -6779,21 +6853,18 @@ fn apply_cmpct_accept(
     session: Option<&crate::peers::LivePeer>,
     hsi: &HeaderAndShortIds,
     hash: BlockHash,
+    ask: Option<BlockAsk>,
     block: Block,
     outcome: Result<AcceptOutcome, NetError>,
 ) {
     match outcome {
         Err(e) if net_error_needs_parent(&e) => {
-            hub.forget_asked_block(&hash);
-            follow.pending_blocks.insert(hash, block);
+            follow.pending_blocks.insert(hash, block, None);
             maybe_select_hb_if_relay(hub, session);
         }
-        // Accepted, already-have, and a weaker sibling all release the ask.
-        Ok(_) => {
-            hub.forget_asked_block(&hash);
-        }
+        Ok(_) => {}
         Err(e @ NetError::Store(_)) if !net_error_is_store_not_found(&e) => {
-            note_store_fault_keep_session(hub, hash, &e);
+            note_store_fault_keep_session(hash, &e);
         }
         // Core `FillBlock` returns `READ_STATUS_FAILED` and asks the same
         // peer for the full block, without `Misbehaving`: a short-id
@@ -6805,6 +6876,9 @@ fn apply_cmpct_accept(
                 s.note_failed_cmpct(hash);
                 s.release_cmpct_taken(hash);
             }
+            if let Some(ask) = ask {
+                follow.requested_blocks.restore(ask);
+            }
             let _ = queue_block_getdata(
                 hub,
                 out_tx,
@@ -6815,7 +6889,8 @@ fn apply_cmpct_accept(
             );
             ask_other_hb_for_block(session, hash);
         }
-        _ => {
+        Err(e) => {
+            hub.settle_rejected_ask(ask, hash, &e);
             if !hub.knows_header(&hsi.header.prev_blockhash) {
                 let _ = queue_getheaders(out_tx, hub, session, true, None);
             }
@@ -6917,7 +6992,7 @@ pub async fn on_blocktxn(
         Ok((block, fill)) => {
             on_blocktxn_got_block(hub, out_tx, follow, session, &pc, hash, block, fill).await
         }
-        Err(()) => on_blocktxn_apply_fail(hub, out_tx, follow, session, &pc, hash),
+        Err(()) => on_blocktxn_apply_fail(out_tx, follow, session, &pc, hash),
     }
 }
 
@@ -6936,7 +7011,7 @@ pub async fn on_blocktxn_got_block(
     relay_new_pow_valid_block(hub, &block, session).await;
     match accept_received_from_peer(hub, block.clone(), session).await {
         Ok(AcceptOutcome::Accepted { .. }) => {
-            take_requested_block(hub, &mut follow.requested_blocks, &hash);
+            follow.requested_blocks.remove(&hash);
             if let Some(s) = session {
                 if let Some(h) = hub.tip_height() {
                     s.clear_block_inflight(h);
@@ -6957,7 +7032,7 @@ pub async fn on_blocktxn_got_block(
             .await
         }
         Ok(_) => {
-            take_requested_block(hub, &mut follow.requested_blocks, &hash);
+            follow.requested_blocks.remove(&hash);
             if let Some(s) = session {
                 s.release_cmpct_taken(hash);
             }
@@ -6973,8 +7048,8 @@ pub async fn on_blocktxn_got_block(
             .await
         }
         Err(e) if net_error_needs_parent(&e) => {
-            take_requested_block(hub, &mut follow.requested_blocks, &hash);
-            follow.pending_blocks.insert(hash, block);
+            follow.requested_blocks.remove(&hash);
+            follow.pending_blocks.insert(hash, block, None);
             maybe_select_hb_if_relay(hub, session);
             if let Some(s) = session {
                 s.release_cmpct_taken(hash);
@@ -6990,13 +7065,12 @@ pub async fn on_blocktxn_got_block(
             )
             .await
         }
-        Err(_) => on_blocktxn_unconnectable(hub, out_tx, follow, session, hash),
+        Err(_) => on_blocktxn_unconnectable(out_tx, follow, session, hash),
     }
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_apply_fail(
-    hub: &ChainHub,
     out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
@@ -7009,7 +7083,7 @@ pub fn on_blocktxn_apply_fail(
         s.note_failed_cmpct(hash);
         s.release_cmpct_taken(hash);
     }
-    hub.forget_asked_block(&hash);
+    follow.requested_blocks.release_ask(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
     ask_other_hb_for_block(session, hash);
     out_tx.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
@@ -7017,7 +7091,6 @@ pub fn on_blocktxn_apply_fail(
 
 #[doc(hidden)]
 pub fn on_blocktxn_unconnectable(
-    hub: &ChainHub,
     out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
@@ -7028,7 +7101,7 @@ pub fn on_blocktxn_unconnectable(
         s.note_failed_cmpct(hash);
         s.release_cmpct_taken(hash);
     }
-    hub.forget_asked_block(&hash);
+    follow.requested_blocks.release_ask(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
     ask_other_hb_for_block(session, hash);
     out_tx.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
@@ -7328,11 +7401,12 @@ pub async fn drain_after_accept(
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
+    ask: Option<BlockAsk>,
     select_hb: bool,
 ) -> Result<(), NetError> {
     follow.pending_blocks.remove(&hash);
     follow.pending_headers.remove(&hash);
-    hub.forget_asked_block(&hash);
+    drop(ask);
     if select_hb {
         maybe_select_hb_if_relay(hub, session);
     }
@@ -8600,22 +8674,22 @@ pub fn keep_pending_connecting_paths(
     pending_leaf_paths(hub, pending, PathWorkMemo::path_connects)
 }
 
-#[doc(hidden)]
-pub fn release_asks_off_path(
-    hub: &ChainHub,
-    requested: &mut HashSet<BlockHash>,
-    path: &[BlockHash],
-) {
+/// In-flight asks off `path`. An empty path keeps them all.
+fn asks_off_path(requested: &HashSet<BlockHash>, path: &[BlockHash]) -> Vec<BlockHash> {
     if path.is_empty() {
-        return;
+        return Vec::new();
     }
-    let drop: Vec<BlockHash> = requested
+    requested
         .iter()
         .copied()
         .filter(|h| !path.contains(h))
-        .collect();
-    for h in drop {
-        take_requested_block(hub, requested, &h);
+        .collect()
+}
+
+#[doc(hidden)]
+pub fn release_asks_off_path(requested: &mut RequestedBlocks, path: &[BlockHash]) {
+    for h in asks_off_path(requested.hashes(), path) {
+        requested.remove(&h);
     }
 }
 
@@ -8625,7 +8699,7 @@ pub async fn drain_pending(
     out: &PeerOutTx,
     pending_blocks: &mut PendingBlocks,
     pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
-    requested_blocks: &mut HashSet<BlockHash>,
+    requested_blocks: &mut RequestedBlocks,
     compact: bool,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
@@ -8641,8 +8715,8 @@ pub async fn drain_pending(
 
     let keep = keep_pending_connecting_paths(hub, pending_headers);
     let better = pending_leaf_paths(hub, pending_headers, PathWorkMemo::better_path_connects);
-    let mut missing = fetchable_bodies(hub, better, pending_blocks, requested_blocks);
-    release_asks_off_path(hub, requested_blocks, &keep);
+    let mut missing = fetchable_bodies(hub, better, pending_blocks, requested_blocks.hashes());
+    release_asks_off_path(requested_blocks, &keep);
     missing.retain(|h| !requested_blocks.contains(h));
     for h in hub.held_missing_parents() {
         if !missing.contains(&h) {
@@ -8672,7 +8746,7 @@ pub fn drain_pending_now(
     out: &PeerOutTx,
     pending_blocks: &mut PendingBlocks,
     pending_headers: &mut HashMap<BlockHash, bitcoin::block::Header>,
-    requested_blocks: &mut HashSet<BlockHash>,
+    requested_blocks: &mut RequestedBlocks,
     compact: bool,
 ) -> Result<(), NetError> {
     tokio::runtime::Builder::new_current_thread()
@@ -8703,7 +8777,7 @@ pub async fn drain_pending_once(
         progress = false;
         let candidates: Vec<BlockHash> = pending_blocks.keys().copied().collect();
         for h in candidates {
-            let Some(block) = pending_blocks.remove(&h) else {
+            let Some((block, ask)) = pending_blocks.take(&h) else {
                 continue;
             };
             pending_headers.remove(&h);
@@ -8715,7 +8789,7 @@ pub async fn drain_pending_once(
                     progress = true;
                 }
                 Err(e) if net_error_needs_parent(&e) => {
-                    pending_blocks.insert(h, block);
+                    pending_blocks.insert(h, block, ask);
                 }
                 // Invalid body: reject the block, keep the peer. BIP-152
                 // high-bandwidth can deliver PoW-valid-but-invalid blocks
@@ -8726,15 +8800,17 @@ pub async fn drain_pending_once(
                         "p2p: accept dropped {} (store not found — keep session): {e}",
                         h
                     );
+                    hub.settle_rejected_ask(ask, h, &e);
                 }
                 Err(e @ NetError::Store(_)) => {
-                    note_store_fault_keep_session(hub, h, &e);
+                    note_store_fault_keep_session(h, &e);
                 }
                 Err(e) => {
                     rbitcoin_log::warn!(
                         "p2p: accept dropped {} (invalid/unconnectable — keep session): {e}",
                         h
                     );
+                    hub.settle_rejected_ask(ask, h, &e);
                 }
             }
         }
