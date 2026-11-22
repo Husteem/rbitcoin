@@ -3264,19 +3264,6 @@ pub struct PendingCmpct {
     pub since: std::time::Instant,
 }
 
-/// Clone only mempool bodies whose short-ids appear in `hsi` (never `list_live`).
-#[doc(hidden)]
-pub fn mempool_shortid_avail(
-    hub: &ChainHub,
-    hsi: &HeaderAndShortIds,
-    version: u32,
-) -> (
-    HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>,
-    Option<crate::compact::CmpctFillSets>,
-) {
-    shortid_avail(hub.mempool().map(Arc::as_ref), hsi, version)
-}
-
 fn shortid_avail(
     mp: Option<&crate::tx_relay::MempoolHub>,
     hsi: &HeaderAndShortIds,
@@ -8796,17 +8783,6 @@ pub fn announced_wtx_from_reconstruct(
     found: Result<Option<Transaction>, NetError>,
 ) -> Option<Transaction> {
     found.ok().flatten()
-}
-
-#[doc(hidden)]
-pub fn tx_from_tip_block(hub: &ChainHub, wtxid: &bitcoin::Wtxid) -> Option<Transaction> {
-    let hash = hub.tip_hash()?;
-    announced_wtx_from_reconstruct(tx_from_stored_block(
-        hub.cache.as_ref(),
-        hub.query.as_ref(),
-        &hash,
-        wtxid,
-    ))
 }
 
 #[doc(hidden)]

@@ -113,22 +113,6 @@ where
     write_tmp_with(path, TmpSync::FileAndDir, true, write)
 }
 
-#[doc(hidden)]
-pub fn write_tmp_file<F>(path: &Path, sync: bool, write: F) -> Result<(), StoreError>
-where
-    F: FnOnce(&mut File) -> Result<(), StoreError>,
-{
-    write_tmp_synced(
-        path,
-        if sync {
-            TmpSync::FileAndDir
-        } else {
-            TmpSync::None
-        },
-        write,
-    )
-}
-
 fn write_tmp_synced<F>(path: &Path, sync: TmpSync, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
@@ -274,17 +258,6 @@ fn note_write(w: TracedWrite) {
 thread_local! {
     static WRITE_TRACE: std::cell::RefCell<Option<Vec<TracedWrite>>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// Let `skip` directory syncs succeed, then fail the next `times` on this thread.
-///
-/// Debug tests use this for a rename that is already visible when only the
-/// parent-directory sync fails. A release build cannot arm it.
-#[cfg(all(debug_assertions, unix))]
-#[doc(hidden)]
-pub fn arm_fail_dir_sync_after(skip: u32, times: u32) {
-    DIR_SYNC_SKIP.with(|c| c.set(skip));
-    DIR_SYNC_FAIL.with(|c| c.set(times));
 }
 
 #[cfg(all(debug_assertions, unix))]

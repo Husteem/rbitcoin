@@ -2252,13 +2252,6 @@ impl MempoolHub {
         g.graph.iter().map(|(txid, e)| (*txid, e.wtxid)).collect()
     }
 
-    /// Session INV tick: never parks. Busy write → skip this tick.
-    pub fn try_list_live_wtxids(&self) -> Option<Vec<(Txid, Wtxid)>> {
-        self.meter_list_live_wtxids.fetch_add(1, Ordering::Relaxed);
-        let g = self.inner.try_read().ok()?;
-        Some(g.graph.iter().map(|(txid, e)| (*txid, e.wtxid)).collect())
-    }
-
     /// Queue one wtxid for both direction buckets. One accept or rebroadcast
     /// calls this once, so the backlog is global rather than per peer.
     pub fn enqueue_inv(&self, wtxid: Wtxid, size: u32) {
@@ -2452,15 +2445,6 @@ impl MempoolHub {
 
     pub fn inv_backlog_len(&self, dir: InvDirection) -> usize {
         self.inv_buckets.lock().unwrap().backlog_len(dir)
-    }
-
-    pub fn inv_bucket_tokens(&self, dir: InvDirection) -> (f64, f64) {
-        let g = self.inv_buckets.lock().unwrap();
-        let bucket = match dir {
-            InvDirection::Inbound => &g.inbound,
-            InvDirection::Outbound => &g.outbound,
-        };
-        (bucket.count.value(), bucket.size.value())
     }
 
     /// Drop live mempool entries that are confirmed-strong on tip, then live

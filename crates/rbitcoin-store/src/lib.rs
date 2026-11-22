@@ -157,7 +157,7 @@ pub use int_map::{
     FkMap, FkSet, SlotMap, SlotSet, StrideHasher, U32Map, U64IdentityHasher, U64Map, U64Set,
 };
 pub use integrity::VERIFY_TIP_BLOCKS;
-pub use io_backend::{ReadIoBackend, WriteIoBackend};
+pub use io_backend::ReadIoBackend;
 pub use point_table::PointRecord;
 pub use rbitcoin_primitives::{
     merkle_branch, merkle_root_from_branch, merkle_root_from_txids, merkle_root_mutated,

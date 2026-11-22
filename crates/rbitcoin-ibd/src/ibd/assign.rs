@@ -683,12 +683,6 @@ pub fn rewind_densify_scan_lo(st: &mut IbdWorkState, hub: &ChainHub, path_lo: u3
     }
 }
 
-#[doc(hidden)]
-pub fn densify_prefix_filled(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> bool {
-    let mut span = super::progress::QueuedHashSpan::load(hub, ht, ht);
-    densify_prefix_filled_in(st, hub, ht, &mut span)
-}
-
 fn densify_prefix_filled_in(
     st: &mut IbdWorkState,
     hub: &ChainHub,
