@@ -1185,3 +1185,58 @@ async fn note_unbroadcast_requeues_after_a_relay_off_tick() {
     );
     peers.unregister(peer.id);
 }
+
+/// Core `ReattemptInitialBroadcast`: a still-unbroadcast tx accepted before a
+/// peer connected reaches that peer at the next 10 to 15 minute pass, and not
+/// before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unbroadcast_reattempt_reaches_a_late_peer() {
+    use rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("unbroadcast-reattempt");
+    hub.ensure_genesis().unwrap();
+    hub.confirm_empty_regtest(104).unwrap();
+    let mp = rbitcoin_net::tx_relay::MempoolHub::open(
+        dir.path().join("mp"),
+        std::sync::Arc::clone(&hub.query),
+    )
+    .unwrap();
+    mp.set_relay_enabled(false);
+    let peers = std::sync::Arc::new(rbitcoin_net::peers::PeerHub::new());
+    peers.attach_mempool(&mp);
+    assert!(hub.attach_mempool(std::sync::Arc::clone(&mp)).is_ok());
+    let t0 = 1_700_000_000;
+    set_relay_clock(&hub, &peers, t0);
+
+    let a = spend_coinbase(&hub, 1);
+    mp.admit(&a).expect("accept A");
+    mp.note_unbroadcast(a.compute_txid());
+    mp.reattempt_unbroadcast_due();
+
+    let p = relay_peer(&peers, [127, 0, 0, 1], OutboundFullRelay);
+    p.set_inv_gen_floor(mp.next_accept_gen());
+    let mut p_rx = writer_of(&p);
+    let p_out = p.writer().expect("P writer");
+    let p_follow = PeerFollowState::new();
+    let mut ann_rx = mp.subscribe_announces();
+    let mut tick = || {
+        while let Ok(ann) = ann_rx.try_recv() {
+            on_tx_announce(&hub, &p_out, &p_follow, Some(p.as_ref()), Some(Ok(ann))).unwrap();
+        }
+        queue_due_tx_invs(&hub, p.as_ref(), &CappedSet::new(), &p_out);
+        tx_invs(&mut p_rx)
+    };
+    assert!(tick().is_empty(), "A predates P's handshake");
+
+    set_relay_clock(&hub, &peers, t0 + 599);
+    mp.reattempt_unbroadcast_due();
+    assert!(tick().is_empty(), "no pass before 10 minutes");
+
+    set_relay_clock(&hub, &peers, t0 + 900);
+    mp.reattempt_unbroadcast_due();
+    assert_eq!(
+        tick(),
+        vec![a.compute_txid()],
+        "the pass by 15 minutes reaches the late peer once"
+    );
+    peers.unregister(p.id);
+}

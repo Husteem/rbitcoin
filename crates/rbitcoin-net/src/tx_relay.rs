@@ -1212,6 +1212,9 @@ pub struct MempoolHub {
     pub dir: PathBuf,
     /// Locally submitted txids not yet requested by a peer (`getmempoolinfo.unbroadcastcount`).
     pub unbroadcast: Mutex<HashSet<Txid>>,
+    /// Core `ReattemptInitialBroadcast`: node second of the next pass. `0`
+    /// schedules the first one.
+    unbroadcast_reattempt_at: AtomicU64,
     /// Getdata arrived before [`Self::note_unbroadcast`]. Lock `unbroadcast` first.
     broadcast_before_note: Mutex<HashSet<Txid>>,
     /// Test latch. Async admits park before `note_unbroadcast` while this is set.
@@ -1573,6 +1576,7 @@ impl MempoolHub {
             meter_get_coin_create_mtp: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
             unbroadcast: Mutex::new(unbroadcast),
+            unbroadcast_reattempt_at: AtomicU64::new(0),
             broadcast_before_note: Mutex::new(HashSet::new()),
             pause_before_unbroadcast_note: AtomicBool::new(false),
             unbroadcast_note_parked: AtomicBool::new(false),
@@ -7220,6 +7224,26 @@ impl MempoolHub {
                 outpoints: Arc::default(),
             });
             self.meter_announce.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Core `ReattemptInitialBroadcast`: 10 to 15 minutes after the last
+    /// pass, queue every still-unbroadcast tx again so a peer that connected
+    /// after its accept hears it. The first call only schedules the first
+    /// pass.
+    pub fn reattempt_unbroadcast_due(&self) {
+        const BASE_SECS: u64 = 600;
+        const JITTER_SECS: u64 = 300;
+        let now = self.relay_now_secs();
+        let due = self.unbroadcast_reattempt_at.load(Ordering::Relaxed);
+        if due != 0 && now < due {
+            return;
+        }
+        let jitter = crate::peer::rand_nonce() % JITTER_SECS;
+        self.unbroadcast_reattempt_at
+            .store(now.saturating_add(BASE_SECS + jitter), Ordering::Relaxed);
+        if due != 0 {
+            self.rebroadcast_unbroadcast();
         }
     }
 
