@@ -3392,18 +3392,14 @@ impl PeerHub {
             .contains_key(&key)
     }
 
-    /// Refuse an inbound TCP source or its netgroup on an ordinary listener.
-    /// On a marked onion listener the TCP source identifies the forwarder.
-    #[doc(hidden)]
-    pub fn inbound_discouraged(&self, peer_addr: SocketAddr, local_addr: SocketAddr) -> bool {
-        if self.onion_bind() == Some(local_addr) {
-            return false;
-        }
+    /// True when this inbound address or its accept-time netgroup is still
+    /// refused. Expired rows are dropped here, which is the only sweep.
+    pub fn inbound_discouraged(&self, addr: SocketAddr) -> bool {
         // `key_refused` drops expired rows.
-        if self.key_refused(DiscourageKey::Ip(peer_addr.ip())) {
+        if self.key_refused(DiscourageKey::Ip(addr.ip())) {
             return true;
         }
-        let group = crate::netgroup::slot_pause_group(peer_addr);
+        let group = crate::netgroup::slot_pause_group(addr);
         self.discouraged_groups
             .lock()
             .unwrap_or_else(|e| e.into_inner())

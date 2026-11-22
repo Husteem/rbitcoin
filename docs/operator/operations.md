@@ -250,9 +250,12 @@ listening, a portless onion uses the network's default P2P port.
 
 Use a dedicated `listen=127.0.0.1:8334=onion` entry as the local target for
 Tor forwarding. `--listen-onion` uses it automatically when present.
+Restrict access to the marked listener to the Tor forwarder. For a
+non-loopback bind, enforce this restriction with a firewall or network policy.
 Inbound I2P needs a separate primary P2P listener reachable at `127.0.0.1`.
 Source-IP permission rules skip the marked listener. Ordinary listeners
-keep their normal source-IP rules. If an external onion is configured
+keep their normal source-IP rules. Existing IP refusals and eviction
+cooldowns apply on every listener. If an external onion is configured
 without a marked listener, inbound loopback peers skip source-IP grants
 and self-announcements.
 Explicit bind grants still apply.

@@ -1,3 +1,3 @@
 Fixed
 
-- Automatic IP discouragement and eviction cooldowns no longer block unrelated peers on a dedicated `=onion` listener when a Tor forwarder uses a non-loopback source address.
+- Peers on a dedicated `=onion` listener no longer trigger IP discouragement or eviction cooldowns for other peers sharing a non-loopback Tor forwarder.

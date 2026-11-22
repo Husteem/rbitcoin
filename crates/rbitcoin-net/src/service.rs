@@ -526,7 +526,7 @@ pub fn spawn_inbound_accept(
                     // as `::ffff:a.b.c.d`. Every check and row keys it as IPv4.
                     // A real IPv6 address keeps its flow info and scope id.
                     let peer_addr = crate::peers::canonical_bind(peer_addr);
-                    if peers.inbound_discouraged(peer_addr, local_addr) {
+                    if peers.inbound_discouraged(peer_addr) {
                         rbitcoin_log::info!("p2p: reject discouraged inbound {peer_addr}");
                         drop(stream);
                         continue;

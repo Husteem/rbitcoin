@@ -323,6 +323,7 @@ fn store_has_announced_body(hub: &ChainHub, hash: &bitcoin::BlockHash) -> bool {
 /// The hub and key a misbehavior exit may record. Noban and manual peers
 /// are not recorded. A loopback or `0.0.0.0` identity is every local
 /// connection, so Core disconnects that peer and does not discourage it.
+/// A marked onion listener can likewise see one TCP source for many peers.
 /// Onion and I2P use [`crate::peers::LivePeer::net`], not that socket.
 #[doc(hidden)]
 pub fn refusable_addr(

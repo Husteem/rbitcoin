@@ -1975,11 +1975,10 @@ fn onion_bind_eviction_skips_the_forwarder_group() {
         assert_eq!(hub.snapshot().len(), 29);
         let next = SocketAddr::from((source, 40030));
         assert_eq!(
-            hub.inbound_discouraged(next, ordinary),
+            hub.inbound_discouraged(next),
             !marked,
             "unexpected refusal state for eviction on {bind}"
         );
-        assert!(!hub.inbound_discouraged(next, onion));
     }
 }
 
@@ -2002,7 +2001,7 @@ fn onion_bind_disconnects_are_session_local() {
     punish_disconnect(&mut score, Some(&register(40000, onion)));
     assert!(score >= BAN_SCORE_THRESHOLD);
     assert!(hub.snapshot().is_empty());
-    assert!(!hub.inbound_discouraged(source(40001), ordinary));
+    assert!(!hub.inbound_discouraged(source(40001)));
 
     for (port, bind) in [(40001, onion), (40002, ordinary), (40003, onion)] {
         assert!(matches!(
@@ -2014,8 +2013,10 @@ fn onion_bind_disconnects_are_session_local() {
         rate_limit_disconnect(Some(&register(40004, ordinary))),
         Protocol("peer misbehavior threshold")
     ));
-    assert!(hub.inbound_discouraged(source(40005), ordinary));
-    assert!(!hub.inbound_discouraged(source(40005), onion));
+    assert!(
+        hub.inbound_discouraged(source(40005)),
+        "an ordinary session's IP refusal still applies at admission"
+    );
 }
 
 /// Thirty CJDNS inbound peers share one four-bit eviction group and sit in
@@ -2037,10 +2038,10 @@ fn slot_eviction_pauses_a_cjdns_slash32_not_its_group() {
     }
     assert!(hub.try_evict_inbound(), "an inbound peer is evicted");
     let paused = (1..=30u16)
-        .filter(|net| hub.inbound_discouraged(cjdns(*net, 2), bind))
+        .filter(|net| hub.inbound_discouraged(cjdns(*net, 2)))
         .count();
     assert_eq!(paused, 1, "only the evicted peer's /32 waits");
-    assert!(!hub.inbound_discouraged(cjdns(0xffff, 1), bind));
+    assert!(!hub.inbound_discouraged(cjdns(0xffff, 1)));
 }
 
 #[test]
