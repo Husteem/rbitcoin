@@ -400,7 +400,7 @@ fn a_failed_replacement_keeps_its_row_until_the_victim_is_back() {
         )
         .expect("bump prepares");
     mp.store.fail_next_append = true;
-    assert!(mp.commit_after_script(&bump, prep).is_err());
+    assert!(mp.commit_after_script(std::sync::Arc::new(bump.clone()), prep).is_err());
     let out = vec![row(
         2,
         &victim,

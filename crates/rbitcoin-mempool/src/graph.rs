@@ -6,7 +6,7 @@
 use bitcoin::{OutPoint, Transaction, Txid, Wtxid};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
-use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use crate::linearize::{chunk_lengths, DepGraph, FeeFrac};
 
@@ -220,8 +220,10 @@ pub struct TxGraph {
     pub created: HashSet<OutPoint>,
     /// Sum of live weights (WU) for eviction budget.
     pub total_weight: u64,
-    /// Best-first chunks; `None` after mutate until next build.
-    pub chunk_cache: Mutex<Option<Vec<Chunk>>>,
+    /// Best-first chunks, built once on first read. Every mutation runs
+    /// under `&mut self` and `take()`s it, so a filled cache is never stale.
+    /// Concurrent first readers wait in `get_or_init` instead of both building.
+    pub chunk_cache: OnceLock<Vec<Chunk>>,
     /// Lowest-rate chunk per cluster, ordered by (rate, representative txid).
     pub worst_chunks: BTreeMap<(u64, Txid), Chunk>,
     /// Representative → rate key into [`Self::worst_chunks`].
@@ -247,7 +249,7 @@ impl Default for TxGraph {
             conflicts: HashMap::new(),
             created: HashSet::new(),
             total_weight: 0,
-            chunk_cache: Mutex::new(None),
+            chunk_cache: OnceLock::new(),
             worst_chunks: BTreeMap::new(),
             worst_rep_rate: HashMap::new(),
             cluster_count_limit: MAX_CLUSTER_COUNT,
@@ -343,7 +345,7 @@ impl TxGraph {
 
     #[doc(hidden)]
     pub fn invalidate_chunk_cache(&mut self) {
-        *self.chunk_cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.chunk_cache.take();
     }
 
     #[doc(hidden)]
@@ -982,13 +984,13 @@ impl TxGraph {
     ///
     /// Used for fee estimation and future block-template ranking. CPFP packages
     /// appear as single chunks with combined fee/weight.
-    pub fn mining_chunks_best_first(&self) -> Vec<Chunk> {
-        {
-            let g = self.chunk_cache.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(c) = g.as_ref() {
-                return c.clone();
-            }
-        }
+    ///
+    /// Borrowed from the cache: callers that keep the chunks copy them.
+    pub fn mining_chunks_best_first(&self) -> &[Chunk] {
+        self.chunk_cache.get_or_init(|| self.build_chunks_best_first())
+    }
+
+    fn build_chunks_best_first(&self) -> Vec<Chunk> {
         let mut seen = HashSet::new();
         let mut chunks = Vec::new();
         for txid in self.entries.keys() {
@@ -1004,7 +1006,6 @@ impl TxGraph {
             chunks.extend(c.chunks);
         }
         sort_chunks_best_first(&mut chunks);
-        *self.chunk_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(chunks.clone());
         chunks
     }
 
@@ -1022,7 +1023,7 @@ impl TxGraph {
             .filter(|id| delta(*id) != 0)
             .collect();
         if pending.is_empty() {
-            return self.mining_chunks_best_first();
+            return self.mining_chunks_best_first().to_vec();
         }
         let mut touched = HashSet::new();
         let mut clusters = Vec::new();
@@ -1040,8 +1041,9 @@ impl TxGraph {
         }
         let mut chunks: Vec<Chunk> = self
             .mining_chunks_best_first()
-            .into_iter()
+            .iter()
             .filter(|ch| ch.txids.iter().all(|id| !touched.contains(id)))
+            .cloned()
             .collect();
         for (members, total_weight) in clusters {
             let Some(cluster) = self.cluster_from_members(members, total_weight, delta) else {
@@ -1198,12 +1200,12 @@ impl TxGraph {
     /// Feerate (sat/kvB) of the chunk that fills cumulative weight `target_wu`
     /// walking best-first. `None` if the pool is empty or thinner than `target_wu`.
     pub fn frontier_feerate_sat_per_kvb(&self, target_wu: u64) -> Option<u64> {
-        frontier_feerate_from_chunks(&self.mining_chunks_best_first(), target_wu)
+        frontier_feerate_from_chunks(self.mining_chunks_best_first(), target_wu)
     }
 
     /// Weight (WU) of chunks with feerate strictly greater than `rate_sat_per_kvb`.
     pub fn weight_above_feerate(&self, rate_sat_per_kvb: u64) -> u64 {
-        weight_above_from_chunks(&self.mining_chunks_best_first(), rate_sat_per_kvb)
+        weight_above_from_chunks(self.mining_chunks_best_first(), rate_sat_per_kvb)
     }
 
     /// Lowest fee-rate chunk across all clusters (for P5 eviction). `None` if empty.
