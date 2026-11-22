@@ -901,7 +901,8 @@ fn truc_child_limit_holds_across_staged_admits() {
     };
     let prep_a = mp.prepare_admit(&a, &utxos, TIP_OK, opts()).unwrap();
     let prep_b = mp.prepare_admit(&b, &utxos, TIP_OK, opts()).unwrap();
-    mp.commit_after_script(std::sync::Arc::new(a.clone()), prep_a).unwrap();
+    mp.commit_after_script(std::sync::Arc::new(a.clone()), prep_a)
+        .unwrap();
     assert_truc_violation(mp.commit_after_script(std::sync::Arc::new(b.clone()), prep_b));
     assert!(!mp.graph.contains(&b.compute_txid()));
 }
@@ -1294,7 +1295,9 @@ fn commit_after_script_parent_body_missing_is_durable() {
         )
         .unwrap();
     mp.bodies.remove(&pid);
-    let err = mp.commit_after_script(std::sync::Arc::new(child.clone()), prep).unwrap_err();
+    let err = mp
+        .commit_after_script(std::sync::Arc::new(child.clone()), prep)
+        .unwrap_err();
     assert!(
         matches!(err, AcceptError::Durable(ref s) if s == "parent body missing"),
         "got {err}"
@@ -2554,7 +2557,9 @@ fn duplicate_commit_after_prepare_is_duplicate() {
         )
         .unwrap();
     mp.accept_tx(&tx, &utxos, TIP_OK).unwrap();
-    let err = mp.commit_after_script(std::sync::Arc::new(tx.clone()), prep).unwrap_err();
+    let err = mp
+        .commit_after_script(std::sync::Arc::new(tx.clone()), prep)
+        .unwrap_err();
     assert!(matches!(err, AcceptError::Duplicate(_)), "got {err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3130,7 +3135,9 @@ fn review_trust_failed_restore_drops_mark() {
         )
         .expect("replacement prepares");
     mp.store.fail_next_append = true;
-    assert!(mp.commit_after_script(std::sync::Arc::new(replacement.clone()), prep).is_err());
+    assert!(mp
+        .commit_after_script(std::sync::Arc::new(replacement.clone()), prep)
+        .is_err());
     let empty = MapUtxoProvider {
         map: HashMap::new(),
     };
@@ -3451,7 +3458,9 @@ fn review_trust_applied_tx_logs_after_commit() {
     assert!(prep.trust_warn.is_some());
     mp.set_cluster_limits(None, Some(0));
     rbitcoin_log::capture_logs(true);
-    let err = mp.commit_after_script(std::sync::Arc::new(crowded.clone()), prep).unwrap_err();
+    let err = mp
+        .commit_after_script(std::sync::Arc::new(crowded.clone()), prep)
+        .unwrap_err();
     assert!(matches!(err, AcceptError::ClusterTooLarge { .. }), "{err}");
     let crowded_id = crowded.compute_txid();
     assert!(!mp.graph.contains(&crowded_id));

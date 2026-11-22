@@ -987,7 +987,8 @@ impl TxGraph {
     ///
     /// Borrowed from the cache: callers that keep the chunks copy them.
     pub fn mining_chunks_best_first(&self) -> &[Chunk] {
-        self.chunk_cache.get_or_init(|| self.build_chunks_best_first())
+        self.chunk_cache
+            .get_or_init(|| self.build_chunks_best_first())
     }
 
     fn build_chunks_best_first(&self) -> Vec<Chunk> {

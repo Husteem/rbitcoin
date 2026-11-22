@@ -1916,9 +1916,8 @@ impl MempoolHub {
     /// Mempool/relay counters since the previous sample, for the tip-follow
     /// 5s DEBUG line.
     pub fn sample_reset_perf(&self) -> MempoolPerfSample {
-        let accept = std::mem::take(
-            &mut *self.meter_accept.lock().unwrap_or_else(|p| p.into_inner()),
-        );
+        let accept =
+            std::mem::take(&mut *self.meter_accept.lock().unwrap_or_else(|p| p.into_inner()));
         MempoolPerfSample {
             accepts: self.meter_accepts.take_window(),
             rejects: self.meter_rejects.take_window(),
@@ -6969,7 +6968,14 @@ impl MempoolHub {
                 fee_delta: deltas.remove(&txid).unwrap_or(0),
             })
             .collect();
-        let unbroadcast = self.unbroadcast.lock().unwrap().live.iter().copied().collect();
+        let unbroadcast = self
+            .unbroadcast
+            .lock()
+            .unwrap()
+            .live
+            .iter()
+            .copied()
+            .collect();
         rbitcoin_mempool::CoreMempoolDat {
             txs,
             deltas,
@@ -7222,7 +7228,14 @@ impl MempoolHub {
 
     /// Re-INV still-unbroadcast local txs (15m due-now).
     pub fn rebroadcast_unbroadcast(&self) {
-        let ids: Vec<Txid> = self.unbroadcast.lock().unwrap().live.iter().copied().collect();
+        let ids: Vec<Txid> = self
+            .unbroadcast
+            .lock()
+            .unwrap()
+            .live
+            .iter()
+            .copied()
+            .collect();
         for txid in ids {
             if !self.requeue_inv(&txid) {
                 continue;
