@@ -10,6 +10,7 @@ use std::net::TcpListener;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant};
 
 type CapturedParams = Arc<Mutex<Option<serde_json::Value>>>;
 
@@ -196,6 +197,8 @@ fn usage_describes_every_option() {
         "-V, --version",
         "--stdin",
         "--rpcwait",
+        "--rpcclienttimeout N",
+        "--rpcwaittimeout N",
         "--named",
         "--getinfo",
     ] {
@@ -523,8 +526,10 @@ fn stdin_flag_appends_args_from_stdin() {
 #[test]
 fn retry_connect_retries_until_success() {
     let mut calls = 0;
+    let start = Instant::now();
     let out = retry_connect(
-        || {
+        |left: Option<Duration>| {
+            assert_eq!(left, None);
             calls += 1;
             if calls < 3 {
                 Err(ConnectError::transient("connection refused"))
@@ -532,26 +537,41 @@ fn retry_connect_retries_until_success() {
                 Ok(42)
             }
         },
-        3,
-        std::time::Duration::ZERO,
+        None,
+        Duration::from_millis(10),
     );
     assert_eq!(out, Ok(42));
     assert_eq!(calls, 3);
+    assert!(
+        start.elapsed() >= Duration::from_millis(20),
+        "no pause between attempts"
+    );
 }
 
 #[test]
-fn retry_connect_gives_up_after_attempts() {
+fn retry_connect_gives_up_at_the_wait_limit() {
     let mut calls = 0;
+    let mut lefts = Vec::new();
+    let start = Instant::now();
     let out = retry_connect(
-        || {
+        |left: Option<Duration>| {
             calls += 1;
+            lefts.push(left.expect("a wait limit gives each attempt the time left"));
             Err::<i32, ConnectError>(ConnectError::transient("connection refused"))
         },
-        2,
-        std::time::Duration::ZERO,
+        Some(Duration::from_millis(300)),
+        Duration::from_millis(50),
     );
+    let waited = start.elapsed();
     assert_eq!(out, Err("connection refused".to_string()));
-    assert_eq!(calls, 2);
+    assert!(calls >= 2, "a transient error must be retried, got {calls}");
+    assert!(lefts[0] <= Duration::from_millis(300), "{lefts:?}");
+    assert!(lefts.windows(2).all(|w| w[1] < w[0]), "{lefts:?}");
+    assert!(
+        waited >= Duration::from_millis(300),
+        "gave up before the limit: {waited:?}"
+    );
+    assert!(waited < SLOW, "wait not capped: {waited:?}");
 }
 
 /// A bad address or socket path must not be retried: one attempt, then out.
@@ -559,15 +579,610 @@ fn retry_connect_gives_up_after_attempts() {
 fn retry_connect_does_not_retry_a_permanent_error() {
     let mut calls = 0;
     let out = retry_connect(
-        || {
+        |left: Option<Duration>| {
+            assert_eq!(left, None);
             calls += 1;
             Err::<i32, ConnectError>(ConnectError::permanent("bad rpc url"))
         },
-        30,
-        std::time::Duration::ZERO,
+        None,
+        Duration::ZERO,
     );
     assert_eq!(out, Err("bad rpc url".to_string()));
     assert_eq!(calls, 1, "a permanent error must not be retried");
+}
+
+fn call_cfg(args: &[&str]) -> CliConfig {
+    match parse_args(&os_args(args)) {
+        Ok(Action::Call(cfg)) => cfg,
+        Err(e) => panic!("{args:?} must parse, got: {e}"),
+        Ok(_) => panic!("{args:?}: expected Action::Call"),
+    }
+}
+
+#[test]
+fn parse_args_reads_client_and_wait_timeouts() {
+    use TimeoutArg::{After, Omitted, Unlimited};
+    let secs = |n| After(Duration::from_secs(n));
+    let cases: [(&[&str], TimeoutArg, TimeoutArg); 6] = [
+        (&["--rpcclienttimeout=0"], Unlimited, Omitted),
+        (&["-rpcclienttimeout=0"], Unlimited, Omitted),
+        (&["--rpcclienttimeout", "5"], secs(5), Omitted),
+        (&["--rpcwaittimeout=7"], Omitted, secs(7)),
+        (&["-rpcwaittimeout=0", "--rpcwait"], Omitted, Unlimited),
+        (&[], Omitted, Omitted),
+    ];
+    for (flags, client, wait) in cases {
+        let mut args = vec!["rbitcoin-cli"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["importmempool", "mempool.dat"]);
+        let cfg = call_cfg(&args);
+        assert_eq!(cfg.rpcclienttimeout, client, "{flags:?}");
+        assert_eq!(cfg.rpcwaittimeout, wait, "{flags:?}");
+        assert_eq!(cfg.command.as_deref(), Some("importmempool"), "{flags:?}");
+        assert_eq!(cfg.params, vec!["mempool.dat".to_string()], "{flags:?}");
+    }
+}
+
+#[test]
+fn parse_args_refuses_a_bad_timeout() {
+    for (flag, want) in [
+        ("--rpcclienttimeout", "--rpcclienttimeout requires a value"),
+        ("-rpcwaittimeout=", "--rpcwaittimeout requires a value"),
+        ("--rpcwaittimeout=-1", "invalid --rpcwaittimeout"),
+        ("--rpcclienttimeout=1.5", "invalid --rpcclienttimeout"),
+        (
+            "-rpcclienttimeouts=1",
+            "unknown argument `-rpcclienttimeouts=1`",
+        ),
+    ] {
+        let err = match parse_args(&os_args(&["rbitcoin-cli", flag])) {
+            Ok(_) => panic!("{flag} should have been rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains(want), "{flag} -> {err}");
+    }
+}
+
+#[test]
+fn parse_args_takes_core_single_dash_for_any_option() {
+    let cfg = call_cfg(&[
+        "rbitcoin-cli",
+        "-rpcwait",
+        "-named",
+        "-stdin",
+        "-getinfo",
+        "-datadir=/d",
+        "-network",
+        "regtest",
+        "-rpc-url=127.0.0.1:18443",
+        "getnetworkhashps",
+        "-1",
+    ]);
+    assert!(cfg.rpcwait && cfg.named && cfg.stdin && cfg.getinfo);
+    assert_eq!(cfg.datadir, PathBuf::from("/d"));
+    assert_eq!(cfg.network, Network::Regtest);
+    assert_eq!(cfg.rpc_url.as_deref(), Some("127.0.0.1:18443"));
+    assert_eq!(cfg.command.as_deref(), Some("getnetworkhashps"));
+    assert_eq!(cfg.params, vec!["-1".to_string()]);
+    let cfg = call_cfg(&["rbitcoin-cli", "-datadir", "/e", "getblockcount"]);
+    assert_eq!(cfg.datadir, PathBuf::from("/e"));
+    assert_eq!(cfg.command.as_deref(), Some("getblockcount"));
+    for (flag, help) in [
+        ("-h", true),
+        ("-help", true),
+        ("-V", false),
+        ("-version", false),
+    ] {
+        match parse_args(&os_args(&["rbitcoin-cli", flag, "getblockcount"])) {
+            Ok(Action::Help) => assert!(help, "{flag}"),
+            Ok(Action::Version) => assert!(!help, "{flag}"),
+            Ok(Action::Call(_)) => panic!("{flag}: expected Help or Version"),
+            Err(e) => panic!("{flag}: {e}"),
+        }
+    }
+}
+
+/// Every option in the parser's table parses with one dash and with two, and
+/// is listed in `usage()`.
+#[test]
+fn every_long_option_parses_with_either_dash() {
+    let value = |name: &str| match name {
+        "network" => "regtest",
+        "rpcclienttimeout" | "rpcwaittimeout" => "5",
+        _ => "x",
+    };
+    let names: Vec<_> = long_option_names().collect();
+    assert!(names.len() >= 13, "{names:?}");
+    for name in names {
+        assert!(
+            usage().contains(&format!("--{name}")),
+            "--{name} not in usage"
+        );
+        for dash in ["-", "--"] {
+            let bare = format!("{dash}{name}");
+            let alone = parse_args(&os_args(&["rbitcoin-cli", &bare]));
+            let flag = match alone {
+                Err(e) if e == format!("--{name} requires a value") => {
+                    format!("{bare}={}", value(name))
+                }
+                _ => bare.clone(),
+            };
+            let parsed = parse_args(&os_args(&["rbitcoin-cli", &flag, "getblockcount"]));
+            match parsed {
+                Ok(Action::Call(cfg)) => {
+                    assert_eq!(cfg.command.as_deref(), Some("getblockcount"), "{bare}");
+                    assert!(cfg.params.is_empty(), "{bare}: {:?}", cfg.params);
+                }
+                Ok(_) => assert!(name == "help" || name == "version", "{bare}"),
+                Err(e) => panic!("{bare}: {e}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn parse_args_refuses_unknown_or_misspelled_options() {
+    for (flag, want) in [
+        ("-rpcport=8332", "unknown argument `-rpcport=8332`"),
+        ("-rpcuser", "unknown argument `-rpcuser`"),
+        ("-", "unknown argument `-`"),
+        ("-hV", "unknown argument `-hV`"),
+        ("--bogus=1", "unknown argument `--bogus`"),
+        ("-rpcwait=1", "--rpcwait takes no value"),
+        ("--named=0", "--named takes no value"),
+        ("-help=1", "--help takes no value"),
+        ("-datadir", "--datadir requires a value"),
+        ("-network=nonet", "invalid --network"),
+    ] {
+        let err = match parse_args(&os_args(&["rbitcoin-cli", flag])) {
+            Ok(_) => panic!("{flag} should have been rejected"),
+            Err(e) => e,
+        };
+        assert!(err.contains(want), "{flag} -> {err}");
+    }
+}
+
+/// A client timeout short enough that a test never sleeps a whole second.
+const SHORT: Duration = Duration::from_millis(50);
+/// A reply held longer than [`SHORT`] but far under any default.
+const HOLD: Duration = Duration::from_millis(150);
+/// Upper bound for a call that must return on its own timeout.
+const SLOW: Duration = Duration::from_secs(5);
+
+/// Answer one RPC after `hold`. With no `hold` the reply never comes: the
+/// mock reads until the client hangs up (or 30 s pass).
+fn serve_held_rpc(mut s: impl Read + Write, hold: Option<Duration>) {
+    let mut tmp = [0u8; 1024];
+    let Some(hold) = hold else {
+        while matches!(s.read(&mut tmp), Ok(n) if n > 0) {}
+        return;
+    };
+    let mut raw = Vec::new();
+    while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+        match s.read(&mut tmp) {
+            Ok(n) if n > 0 => raw.extend_from_slice(&tmp[..n]),
+            _ => return,
+        }
+    }
+    thread::sleep(hold);
+    let body = "{\"jsonrpc\":\"1.0\",\"id\":\"1\",\"result\":7,\"error\":null}\n";
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = s.write_all(resp.as_bytes());
+}
+
+fn spawn_held_tcp_rpc(hold: Option<Duration>) -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let h = thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        serve_held_rpc(s, hold);
+    });
+    (port, h)
+}
+
+/// Accept one connection and never read it, so a large request cannot
+/// drain. The socket is held until `release` is dropped.
+fn spawn_unread_tcp() -> (u16, std::sync::mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let h = thread::spawn(move || {
+        let (_s, _) = listener.accept().unwrap();
+        let _ = wait.recv_timeout(Duration::from_secs(30));
+    });
+    (port, release, h)
+}
+
+/// Twice the 4 MiB TCP send buffer cap (Linux `tcp_wmem`, macOS
+/// `autosndbufmax`). A peer that never reads takes about 2 MiB on Linux.
+const TCP_STALL: usize = 8 << 20;
+/// A unix socket stalls after a few hundred KiB.
+const UNIX_STALL: usize = 1 << 20;
+
+fn tcp_call_cfg(dir: &std::path::Path, host_port: &str, flags: &[&str]) -> CliConfig {
+    std::fs::write(dir.join("rpc.token"), "s3cret").unwrap();
+    let mut args = vec![
+        "rbitcoin-cli",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "--rpc-url",
+        host_port,
+    ];
+    args.extend_from_slice(flags);
+    args.extend_from_slice(&["importmempool", "mempool.dat"]);
+    call_cfg(&args)
+}
+
+fn local(port: u16) -> String {
+    format!("127.0.0.1:{port}")
+}
+
+/// `dispatch_call` with a deadline, so a call that never returns fails
+/// the test instead of hanging the job.
+fn dispatch_within(cfg: CliConfig, limit: Duration) -> (Result<String, String>, Duration) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let start = Instant::now();
+    thread::spawn(move || {
+        let _ = tx.send(dispatch_call(&cfg));
+    });
+    let out = rx
+        .recv_timeout(limit)
+        .unwrap_or_else(|_| panic!("the call did not return within {limit:?}"));
+    (out, start.elapsed())
+}
+
+fn assert_timed_out(
+    out: Result<String, String>,
+    waited: Duration,
+    op: &str,
+    opt: &str,
+    floor: Duration,
+) {
+    let err = out.unwrap_err();
+    assert!(
+        err.starts_with(op) && err.contains(&format!("{opt} expired")),
+        "want `{op}` naming {opt}, got: {err}"
+    );
+    assert!(waited >= floor, "gave up early: {waited:?}");
+}
+
+#[test]
+fn client_timeout_lifts_or_keeps_the_default() {
+    use TimeoutArg::{After, Omitted, Unlimited};
+    let five = Duration::from_secs(5);
+    assert_eq!(
+        client_timeout(Omitted, true),
+        Some(Duration::from_secs(900))
+    );
+    assert_eq!(client_timeout(Omitted, false), None);
+    assert_eq!(client_timeout(Unlimited, true), None);
+    assert_eq!(client_timeout(Unlimited, false), None);
+    assert_eq!(client_timeout(After(five), true), Some(five));
+    assert_eq!(client_timeout(After(five), false), Some(five));
+}
+
+#[test]
+fn connect_bound_takes_the_shorter_limit() {
+    let s = Duration::from_secs;
+    assert_eq!(connect_bound(None, None), None);
+    assert_eq!(
+        connect_bound(Some(s(9)), None),
+        Some((s(9), "--rpcclienttimeout"))
+    );
+    assert_eq!(
+        connect_bound(None, Some(s(2))),
+        Some((s(2), "--rpcwaittimeout"))
+    );
+    assert_eq!(
+        connect_bound(Some(s(9)), Some(s(2))),
+        Some((s(2), "--rpcwaittimeout"))
+    );
+    assert_eq!(
+        connect_bound(Some(s(2)), Some(s(9))),
+        Some((s(2), "--rpcclienttimeout"))
+    );
+}
+
+/// A lookup past its bound is kept: the next wait takes it over and starts
+/// no second lookup.
+#[test]
+fn host_lookup_keeps_one_lookup_in_flight() {
+    use std::sync::atomic::AtomicUsize;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let mut lookups = HostLookup::default();
+    let c = calls.clone();
+    let start = Instant::now();
+    let first = lookups.wait(Some(SHORT), move || {
+        c.fetch_add(1, Ordering::SeqCst);
+        let _ = held.recv();
+        Ok(vec![addr])
+    });
+    assert_eq!(first.unwrap(), None);
+    assert!(start.elapsed() < SLOW, "{:?}", start.elapsed());
+    let c = calls.clone();
+    let second = lookups.wait(Some(SHORT), move || {
+        c.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![])
+    });
+    assert_eq!(second.unwrap(), None);
+    release.send(()).unwrap();
+    let c = calls.clone();
+    let third = lookups.wait(Some(SLOW), move || {
+        c.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![])
+    });
+    assert_eq!(third.unwrap(), Some(vec![addr]));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "one lookup in flight");
+    let fresh = lookups.wait(None, || Err(std::io::Error::other("no such host")));
+    assert_eq!(fresh.unwrap_err().to_string(), "no such host");
+}
+
+/// `Instant` cannot hold every `u64` of seconds. Such a bound is refused,
+/// not a panic; the socket timeouts clamp it.
+#[test]
+fn a_timeout_past_the_clock_is_refused_on_tcp() {
+    let dir = tmp_datadir();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let cfg = tcp_call_cfg(
+        &dir,
+        &local(port),
+        &["--rpcclienttimeout=18446744073709551615"],
+    );
+    let (out, _) = dispatch_within(cfg, SLOW);
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = out.unwrap_err();
+    assert!(
+        err.contains("--rpcclienttimeout=18446744073709551615 is too large"),
+        "{err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_timeout_past_the_clock_still_calls_over_the_unix_socket() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let (_, served) = serve_one_rpc(UnixListener::bind(dir.join("rpc.sock")).unwrap());
+    let cfg = call_cfg(&[
+        "rbitcoin-cli",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "--rpcclienttimeout=18446744073709551615",
+        "getblockcount",
+    ]);
+    let (out, _) = dispatch_within(cfg, SLOW);
+    let _ = served.join();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out, Ok("7".to_string()));
+}
+
+#[test]
+fn rpcclienttimeout_fails_a_tcp_reply_that_outlasts_it() {
+    let dir = tmp_datadir();
+    let (port, h) = spawn_held_tcp_rpc(None);
+    let mut cfg = tcp_call_cfg(&dir, &local(port), &[]);
+    cfg.rpcclienttimeout = TimeoutArg::After(SHORT);
+    let (out, waited) = dispatch_within(cfg, SLOW);
+    let _ = h.join();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_timed_out(out, waited, "read: ", "--rpcclienttimeout", SHORT);
+}
+
+/// The same held reply passes with `0` and fails with a shorter limit.
+#[test]
+fn rpcclienttimeout_zero_waits_for_a_held_tcp_reply() {
+    for (flag, short) in [
+        ("-rpcclienttimeout=0", false),
+        ("--rpcclienttimeout=0", true),
+    ] {
+        let dir = tmp_datadir();
+        let (port, h) = spawn_held_tcp_rpc(Some(HOLD));
+        let mut cfg = tcp_call_cfg(&dir, &local(port), &[flag]);
+        if short {
+            cfg.rpcclienttimeout = TimeoutArg::After(SHORT);
+        } else {
+            assert_eq!(cfg.rpcclienttimeout, TimeoutArg::Unlimited);
+        }
+        let (out, waited) = dispatch_within(cfg, SLOW);
+        let _ = h.join();
+        let _ = std::fs::remove_dir_all(&dir);
+        if short {
+            assert_timed_out(out, waited, "read: ", "--rpcclienttimeout", SHORT);
+        } else {
+            assert_eq!(out, Ok("7".to_string()));
+            assert!(waited >= HOLD, "{waited:?}");
+        }
+    }
+}
+
+#[test]
+fn rpcclienttimeout_fails_a_tcp_request_that_cannot_drain() {
+    let dir = tmp_datadir();
+    let (port, release, h) = spawn_unread_tcp();
+    let mut cfg = tcp_call_cfg(&dir, &local(port), &[]);
+    cfg.params = vec!["x".repeat(TCP_STALL)];
+    cfg.rpcclienttimeout = TimeoutArg::After(SHORT);
+    let (out, waited) = dispatch_within(cfg, SLOW);
+    drop(release);
+    let _ = h.join();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_timed_out(out, waited, "write: ", "--rpcclienttimeout", SHORT);
+}
+
+/// A name, not an IP: the lookup runs under the connect bound, and with
+/// `0` without one. `localhost` may list `::1` first, which refuses.
+#[test]
+fn rpc_url_host_name_connects_with_and_without_a_bound() {
+    for flags in [&[][..], &["--rpcclienttimeout=0"][..]] {
+        let dir = tmp_datadir();
+        let (port, h) = spawn_held_tcp_rpc(Some(Duration::ZERO));
+        let cfg = tcp_call_cfg(&dir, &format!("localhost:{port}"), flags);
+        let (out, _) = dispatch_within(cfg, SLOW);
+        let _ = h.join();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out, Ok("7".to_string()), "{flags:?}");
+    }
+}
+
+/// A listener with backlog 0 and one queued connection: Linux drops the
+/// next SYN, so a connect hangs like one to a filtered port.
+#[cfg(target_os = "linux")]
+fn full_tcp_listener() -> (socket2::Socket, std::net::TcpStream, u16) {
+    use socket2::{Domain, Socket, Type};
+    let l = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    l.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    l.listen(0).unwrap();
+    let port = l.local_addr().unwrap().as_socket().unwrap().port();
+    let queued = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    (l, queued, port)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rpcclienttimeout_bounds_a_tcp_connect() {
+    let dir = tmp_datadir();
+    let (_l, _queued, port) = full_tcp_listener();
+    let mut cfg = tcp_call_cfg(&dir, &local(port), &[]);
+    cfg.rpcclienttimeout = TimeoutArg::After(SHORT);
+    let (out, waited) = dispatch_within(cfg, SLOW);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_timed_out(out, waited, "connect ", "--rpcclienttimeout", SHORT);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rpcwaittimeout_bounds_a_tcp_connect_under_the_900s_default() {
+    let dir = tmp_datadir();
+    let (_l, _queued, port) = full_tcp_listener();
+    let mut cfg = tcp_call_cfg(&dir, &local(port), &["--rpcwait"]);
+    cfg.rpcwaittimeout = TimeoutArg::After(HOLD);
+    let (out, waited) = dispatch_within(cfg, SLOW);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_timed_out(out, waited, "connect ", "--rpcwaittimeout", HOLD);
+}
+
+/// Backlog 0 and one queued connection: a unix connect waits for room.
+#[cfg(target_os = "linux")]
+#[test]
+fn rpcclienttimeout_bounds_a_unix_connect() {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let l = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    l.bind(&SockAddr::unix(&sock).unwrap()).unwrap();
+    l.listen(0).unwrap();
+    let _queued = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    let mut cfg = call_cfg(&[
+        "rbitcoin-cli",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "getblockcount",
+    ]);
+    cfg.rpcclienttimeout = TimeoutArg::After(SHORT);
+    let (out, waited) = dispatch_within(cfg, SLOW);
+    drop(l);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_timed_out(out, waited, "connect ", "--rpcclienttimeout", SHORT);
+}
+
+#[cfg(unix)]
+fn unix_call_cfg(dir: &std::path::Path, flags: &[&str]) -> CliConfig {
+    let mut args = vec!["rbitcoin-cli", "--datadir", dir.to_str().unwrap()];
+    args.extend_from_slice(flags);
+    args.extend_from_slice(&["importmempool", "mempool.dat"]);
+    call_cfg(&args)
+}
+
+#[cfg(unix)]
+#[test]
+fn rpcclienttimeout_also_bounds_a_unix_reply() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let listener = UnixListener::bind(dir.join("rpc.sock")).unwrap();
+    let h = thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        serve_held_rpc(s, None);
+    });
+    let mut cfg = unix_call_cfg(&dir, &[]);
+    cfg.rpcclienttimeout = TimeoutArg::After(SHORT);
+    let (out, waited) = dispatch_within(cfg, SLOW);
+    let _ = h.join();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_timed_out(out, waited, "read: ", "--rpcclienttimeout", SHORT);
+}
+
+#[cfg(unix)]
+#[test]
+fn rpcclienttimeout_also_bounds_a_unix_request_that_cannot_drain() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let listener = UnixListener::bind(dir.join("rpc.sock")).unwrap();
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let h = thread::spawn(move || {
+        let (_s, _) = listener.accept().unwrap();
+        let _ = wait.recv_timeout(Duration::from_secs(30));
+    });
+    let mut cfg = unix_call_cfg(&dir, &[]);
+    cfg.params = vec!["x".repeat(UNIX_STALL)];
+    cfg.rpcclienttimeout = TimeoutArg::After(SHORT);
+    let (out, waited) = dispatch_within(cfg, SLOW);
+    drop(release);
+    let _ = h.join();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_timed_out(out, waited, "write: ", "--rpcclienttimeout", SHORT);
+}
+
+#[cfg(unix)]
+#[test]
+fn rpcwaittimeout_caps_the_wait_for_a_socket() {
+    let dir = tmp_datadir();
+    let sock = dir.join("absent.sock");
+    let mut cfg = call_cfg(&[
+        "rbitcoin-cli",
+        "--rpc-socket",
+        sock.to_str().unwrap(),
+        "--rpcwait",
+        "getblockcount",
+    ]);
+    cfg.rpcwaittimeout = TimeoutArg::After(HOLD);
+    let (out, waited) = dispatch_within(cfg, SLOW);
+    let _ = std::fs::remove_dir_all(&dir);
+    let err = out.unwrap_err();
+    assert!(err.contains("absent.sock"), "{err}");
+    assert!(waited >= HOLD, "gave up early: {waited:?}");
+}
+
+/// Unlimited retries are `retry_connect_retries_until_success`; this is
+/// the parsed `0` reaching a socket through `--rpcwait`.
+#[cfg(unix)]
+#[test]
+fn rpcwait_with_no_wait_limit_reaches_the_socket() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (_, served) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+    let cfg = call_cfg(&[
+        "rbitcoin-cli",
+        "--rpc-socket",
+        sock.to_str().unwrap(),
+        "--rpcwait",
+        "-rpcwaittimeout=0",
+        "getblockcount",
+    ]);
+    assert_eq!(cfg.rpcwaittimeout, TimeoutArg::Unlimited);
+    let (out, _) = dispatch_within(cfg, SLOW);
+    let _ = served.join();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out, Ok("7".to_string()));
 }
 
 #[test]
@@ -588,7 +1203,6 @@ fn rpcwait_does_not_repeat_the_call() {
     use std::os::unix::net::UnixListener;
     use std::process::Command;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Instant;
 
     let dir = tmp_datadir();
     let sock = dir.join("rpc.sock");
