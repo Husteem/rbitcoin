@@ -114,6 +114,7 @@ fn height_window_obeys_create_cap(
             (0, 1),
             "a height window above --heavy-sh-creates takes the turn"
         );
+        q.sh_join_probe.disarm();
         q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
     }
     q.set_max_sh_creates(2);
@@ -484,6 +485,7 @@ fn newest_page_gap_obeys_create_cap() {
             SH_PAGE_SCAN_HELD.load(std::sync::atomic::Ordering::SeqCst),
             "the heavy turn was dropped before the page scan"
         );
+        q.sh_join_probe.disarm();
         q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
     }
     let _ = std::fs::remove_dir_all(&dir);

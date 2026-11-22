@@ -915,6 +915,7 @@ async fn internal_totals_take_heavy_turns(
         "the totals join and the one history wave are heavy"
     );
     assert_eq!(q.sh_join_probe.peaks().1, 1, "heavy joins take turns");
+    q.sh_join_probe.disarm();
     q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
 }
 

@@ -6931,12 +6931,11 @@ async fn held_front_keeps_a_queued_blocktxn_until_the_drain() {
         !s.session.is_finished(),
         "the held ping ended the session before the expiry"
     );
-    // Request expiry runs on the real clock. Let the pending compact age
-    // while the held front keeps the blocktxn queued.
-    tokio::time::sleep(BLOCK_GETDATA_TIMEOUT + Duration::from_secs(1)).await;
-
-    let now = peers.now_secs();
-    peers.set_mock_now(now + BLOCK_GETDATA_TIMEOUT.as_secs() + 1);
+    // Request expiry reads the real clock, so this cannot age the pending
+    // compact without a 10s sleep. `held_front_keeps_a_queued_blocktxn_pending`
+    // backdates one and pins that a queued frame suspends expiry. What is
+    // left here is the drain: the held blocktxn is not expired into a full
+    // getdata and still applies when the front is released.
     assert_no_getdata_for(
         &mut s.reader,
         s.magic,
@@ -6944,6 +6943,10 @@ async fn held_front_keeps_a_queued_blocktxn_until_the_drain() {
         Duration::from_millis(250),
     )
     .await;
+    assert!(
+        s.live.held_front_queued(),
+        "the held front must still feed decode_queued to the heartbeat"
+    );
 
     let now = peers.now_secs();
     peers.set_mock_now(now + PING_TIMEOUT_SECS + POST_BLOCK_PONG_GRACE_SECS + 1);

@@ -2634,6 +2634,13 @@ impl ShJoinProbe {
         self.armed.store(true, AtomicOrdering::SeqCst);
     }
 
+    /// Stop waiting for a second join of the same kind. A test that arms the
+    /// probe and then keeps reading would otherwise pay [`SH_JOIN_PROBE_WAIT`]
+    /// on every later lone join.
+    pub fn disarm(&self) {
+        self.armed.store(false, AtomicOrdering::SeqCst);
+    }
+
     /// `(light, heavy)` joins started since [`Self::arm`].
     pub fn entered(&self) -> (u32, u32) {
         (
