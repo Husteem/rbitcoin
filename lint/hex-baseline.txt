@@ -10,6 +10,7 @@ crates/rbitcoin-consensus/src/signet.rs	4
 crates/rbitcoin-consensus/src/silent_payments.rs	34
 crates/rbitcoin-electrum/src/tweaks.rs	1
 crates/rbitcoin-esplora/src/tx_json.rs	2
+crates/rbitcoin-ibd/src/ibd/state.rs	1
 crates/rbitcoin-mempool/src/packed.rs	1
 crates/rbitcoin-net/src/asmap.rs	192
 crates/rbitcoin-net/src/chain.rs	5

@@ -198,9 +198,9 @@ pub enum AssignDepth {
 }
 
 /// Drop `hash` from global inflight and every peer's in_flight set.
-pub fn clear_hash_inflight(
+pub fn clear_hash_inflight<S: std::hash::BuildHasher>(
     slots: &mut [PeerSlot],
-    inflight: &mut HashMap<BlockHash, state::InflightReq>,
+    inflight: &mut std::collections::HashMap<BlockHash, state::InflightReq, S>,
     hash: BlockHash,
 ) {
     inflight.remove(&hash);
@@ -210,9 +210,9 @@ pub fn clear_hash_inflight(
 }
 
 /// Free peer/global slots for hashes already on the confirmed tip (RAM set).
-pub fn prune_satisfied_inflight(
+pub fn prune_satisfied_inflight<S: std::hash::BuildHasher>(
     slots: &mut [PeerSlot],
-    inflight: &mut HashMap<BlockHash, state::InflightReq>,
+    inflight: &mut std::collections::HashMap<BlockHash, state::InflightReq, S>,
     hub: &ChainHub,
 ) {
     inflight.retain(|h, _| !hub.has_block(h));
@@ -251,8 +251,8 @@ pub fn prune_off_path_inflight(st: &mut IbdWorkState) {
 }
 
 /// Record `peer` as requesting `hash` (tip-hole / park race may accumulate peers).
-pub fn inflight_add_peer(
-    inflight: &mut HashMap<BlockHash, state::InflightReq>,
+pub fn inflight_add_peer<S: std::hash::BuildHasher>(
+    inflight: &mut std::collections::HashMap<BlockHash, state::InflightReq, S>,
     hash: BlockHash,
     peer: usize,
 ) {

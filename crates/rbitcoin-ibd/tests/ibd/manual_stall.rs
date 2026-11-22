@@ -213,7 +213,8 @@ fn resumed_connect_peer_gets_a_fresh_stall_window() {
 
     hub.clock.set_mock(T0 + COOLDOWN_SECS);
     assign(&mut st, &hub);
-    let asked: HashSet<BlockHash> = drain_wire(&mut wire)[0].0.iter().copied().collect();
+    let asked: rbitcoin_ibd::ibd::state::BlockHashSet =
+        drain_wire(&mut wire)[0].0.iter().copied().collect();
     assert!(!asked.is_empty(), "the resumed peer is asked again");
     assert_eq!(st.slots[0].in_flight, asked);
     assert_eq!(
@@ -537,7 +538,8 @@ fn paused_connect_peer_resumes_when_the_other_peer_leaves() {
     }
     let mut st = IbdWorkState::new(slots, hub.tip_hash(), hub.tip_height());
     let blocks = real_path(&hub, &mut st);
-    let owed: HashSet<BlockHash> = blocks.iter().map(|b| b.block_hash()).collect();
+    let owed: rbitcoin_ibd::ibd::state::BlockHashSet =
+        blocks.iter().map(|b| b.block_hash()).collect();
     for b in &blocks {
         owe_on_wire(&mut st, 0, b.block_hash(), 0);
     }
@@ -556,7 +558,8 @@ fn paused_connect_peer_resumes_when_the_other_peer_leaves() {
         st.slots[0].takes_block_requests(),
         "the pause is lifted once no other peer takes block requests"
     );
-    let asked: HashSet<BlockHash> = drain_wire(&mut wire)[0].0.iter().copied().collect();
+    let asked: rbitcoin_ibd::ibd::state::BlockHashSet =
+        drain_wire(&mut wire)[0].0.iter().copied().collect();
     assert!(
         asked.is_superset(&owed),
         "the resumed peer is asked for the released blocks; got {asked:?}"
@@ -633,7 +636,8 @@ fn sole_manual_peer_that_stalls_keeps_its_requests() {
         slots[0].conn_type = PeerConnType::Manual;
         let mut st = IbdWorkState::new(slots, hub.tip_hash(), hub.tip_height());
         let blocks = real_path(&hub, &mut st);
-        let owed: HashSet<BlockHash> = blocks.iter().map(|b| b.block_hash()).collect();
+        let owed: rbitcoin_ibd::ibd::state::BlockHashSet =
+            blocks.iter().map(|b| b.block_hash()).collect();
         for b in &blocks {
             owe_on_wire(&mut st, 0, b.block_hash(), 0);
         }
