@@ -316,6 +316,17 @@ fn caught_up_empty_path_does_not_ask_again() {
 }
 
 #[test]
+fn an_empty_queue_below_the_walk_asks_and_does_not_latch() {
+    let (dir, hub, mut st, _rx) = fresh("poll-walk-empty", 0);
+    walk_ahead_of_store(&mut st, &hub);
+    st.slots[0].peer_height = 0;
+    st.max_ordered_height = 0;
+    drive_poll(&mut st, &hub, poll_in(0, false, 0, 10, 0));
+    assert!(!st.headers_done, "a walk above the stored path is not caught up");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn soft_cap_with_lag_does_not_open_header_sync() {
     let (dir, hub, mut st, mut rx) = fresh("sync-le", 0);
     walk_ahead_of_store(&mut st, &hub);
