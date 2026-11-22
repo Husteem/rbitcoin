@@ -14,6 +14,8 @@ assert_fail "a cfg(test) module in src fails" \
   python3 "$PY" --root "$FIX/bare"
 assert_fail "cfg(all(test, ...)) in src fails" \
   python3 "$PY" --root "$FIX/cfg-all"
+assert_fail "a wrapped cfg(test) attribute fails" \
+  python3 "$PY" --root "$FIX/cfg-wrapped"
 assert_ok "comments and strings are not test modules" \
   python3 "$PY" --root "$FIX/comment"
 assert_ok "debug_assertions hooks are not test modules" \

@@ -14,7 +14,7 @@ import os
 import re
 import sys
 
-CFG_TEST = re.compile(r"^\s*#\s*\[\s*cfg\s*\(([^\]]*)\)\s*\]")
+CFG_START = re.compile(r"#\s*\[\s*cfg\s*\(")
 
 
 def strip_comments_and_strings(src: str) -> str:
@@ -69,11 +69,15 @@ def scan(root: str):
             continue
         with open(path, encoding="utf-8") as f:
             text = strip_comments_and_strings(f.read())
-        for line_no, line in enumerate(text.splitlines(), 1):
-            m = CFG_TEST.match(line)
-            if m and re.search(r"\btest\b", m.group(1)):
+        for m in CFG_START.finditer(text):
+            end = text.find("]", m.end())
+            if end < 0:
+                continue
+            if re.search(r"\btest\b", text[m.end() : end]):
                 rel = os.path.relpath(path, root)
-                hits.append(f"{rel}:{line_no}: {line.strip()}")
+                line_no = text.count("\n", 0, m.start()) + 1
+                attr = " ".join(text[m.start() : end + 1].split())
+                hits.append(f"{rel}:{line_no}: {attr[:120]}")
     return hits
 
 
