@@ -25,7 +25,7 @@ env:
 # fmt/clippy do not drift with GitHub Actions “stable”. The runner image's
 # rustup auto-installs that toolchain and its components on first cargo.
 #
-# `qc` is one Ubuntu runner: fmt, ast-grep, unwrap-ratchet, hex-ratchet, src-test-modules, doc-attach, deny, scripts, clippy.
+# `qc` is one Ubuntu runner: fmt, ast-grep, unwrap-ratchet, hex-ratchet, src-test-modules, doc-attach, unused-pub, deny, scripts, clippy.
 # test, windows, macos, and macos-test each have their own runner.
 # coverage, pread, rust-forward, and nixos-module-eval wait for qc and test.
 # The module eval runs beside pread and rust-forward. It does not gate coverage.
@@ -86,6 +86,10 @@ jobs:
       - name: doc attach
         if: github.event_name == 'pull_request'
         run: ./scripts/doc-attach.sh --base HEAD^1
+      - name: unused pub self-test
+        run: ./scripts/unused-pub.test.sh
+      - name: unused pub
+        run: ./scripts/unused-pub.sh
       # Prebuilt cargo-deny — do not cargo install. Pin the action commit.
       # 0.18.x cannot parse rustsec CVSS 4.0 advisories (2026).
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4

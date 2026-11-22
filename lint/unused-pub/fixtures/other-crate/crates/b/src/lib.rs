@@ -1,0 +1,3 @@
+fn caller() {
+    a::used();
+}

@@ -1,0 +1,3 @@
+fn target() {
+    a::decode();
+}

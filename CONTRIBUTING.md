@@ -243,7 +243,8 @@ engineering.
     `pub` on **that** surface is intentional. rustc does not report a dead
     hidden item, so a change that removes the last caller removes the
     callee in the same change (code-shape rule 9); `#[allow(dead_code)]`
-    is not a fix, in `src/` or in a suite root. Test hooks in production
+    is not a fix, in `src/` or in a suite root. `./scripts/unused-pub.sh`
+    fails `qc` on a `pub` item that no other code names. Test hooks in production
     files are `#[cfg(debug_assertions)]`, and every debug node runs that
     code, so a hook is either a bounded counter (`Cell` / atomic increment)
     or **opt-in**: off until the test arms it on its thread. Nothing
