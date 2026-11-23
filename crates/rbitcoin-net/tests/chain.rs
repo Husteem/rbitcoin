@@ -95,7 +95,7 @@ fn two_threads_claiming_one_block_produce_one_ask() {
     hub.ensure_genesis().unwrap();
     let tip = hub.tip_hash().unwrap();
     assert!(
-        !hub.claim_block_ask(&tip),
+        hub.claim_block_ask(&tip).is_none(),
         "a connected block is not an ask"
     );
     let hash = BlockHash::from_byte_array([0x41; 32]);
@@ -110,19 +110,64 @@ fn two_threads_claiming_one_block_produce_one_ask() {
             hub.claim_block_ask(&hash)
         }));
     }
-    let wins: usize = threads
+    let wins: Vec<_> = threads
         .into_iter()
-        .map(|t| usize::from(t.join().expect("claim thread")))
-        .sum();
-    assert_eq!(wins, 1, "one claim wins the ask");
+        .filter_map(|t| t.join().expect("claim thread"))
+        .collect();
+    assert_eq!(wins.len(), 1, "one claim wins the ask");
     assert!(hub.already_have_or_asked_block(&hash));
-    assert!(!hub.claim_block_ask(&hash), "the loser stays a loser");
+    assert!(
+        hub.claim_block_ask(&hash).is_none(),
+        "the loser stays a loser"
+    );
     let other = BlockHash::from_byte_array([0x42; 32]);
-    assert!(hub.claim_block_ask(&other), "a second hash is a new ask");
+    let second = hub.claim_block_ask(&other);
+    assert!(second.is_some(), "a second hash is a new ask");
     assert!(
         hub.already_have_or_asked_block(&hash),
         "the first ask stays in flight"
     );
+    drop(wins);
+    assert!(
+        !hub.already_have_or_asked_block(&hash),
+        "dropping the claim releases the ask"
+    );
+    assert!(hub.already_have_or_asked_block(&other));
+}
+
+/// Core drops only the leaving peer's in-flight entry. A body two peers
+/// were asked for stays asked until both asks end, and an ask from before
+/// the set cleared at its cap does not end a later claim.
+#[test]
+fn a_body_stays_asked_until_its_last_ask_ends() {
+    let (_dir, hub) = tmp_hub();
+    let hash = BlockHash::from_byte_array([0x51; 32]);
+    let first = hub.ask_block(hash);
+    let second = hub.ask_block(hash);
+    drop(first);
+    assert!(
+        hub.claim_block_ask(&hash).is_none(),
+        "the second ask is still in flight"
+    );
+    drop(second);
+    let before_clear = hub.claim_block_ask(&hash).expect("the last ask ended");
+    let mut others = Vec::new();
+    let after_clear = loop {
+        if let Some(ask) = hub.claim_block_ask(&hash) {
+            break ask;
+        }
+        assert!(others.len() < 10_000, "the asked set clears at its cap");
+        let mut other = [0xff; 32];
+        other[..8].copy_from_slice(&(others.len() as u64).to_le_bytes());
+        others.push(hub.ask_block(BlockHash::from_byte_array(other)));
+    };
+    drop(before_clear);
+    assert!(
+        hub.already_have_or_asked_block(&hash),
+        "an ask from before the clear does not end the later claim"
+    );
+    drop(after_clear);
+    assert!(!hub.already_have_or_asked_block(&hash));
 }
 
 /// A full `block.invalid` drops its oldest hash for a new failure, so the
@@ -1125,7 +1170,7 @@ fn hold_body_spares_asked_getdata_from_fifo() {
     let gen = hub.tip_hash().unwrap();
     let asked = mine_distinct(gen, 1_400_000_000, 1, &[]);
     let asked_h = asked.block_hash();
-    hub.note_asked_block(asked_h);
+    let _ask = hub.claim_block_ask(&asked_h).expect("unasked body");
     hub.hold_body(Arc::new(asked), false);
     let mut avoid = vec![asked_h];
     for i in 0..HeldBodies::CAP as u32 {
@@ -2103,8 +2148,7 @@ fn reorg_back_reaches_a3(label: &str, prune: bool, restart: bool) -> bool {
         // peer session takes the resent body.
         assert!(prune && hub.held_missing_parents().contains(&a1h));
         let mut follow = rbitcoin_net::peer::PeerFollowState::new();
-        follow.requested_blocks.insert(a1h);
-        hub.note_asked_block(a1h);
+        follow.requested_blocks.ask(&hub, a1h);
         let (out_tx, _out_rx) = peer_out_channel();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4770,7 +4814,6 @@ fn store_fault_on_block_releases_the_body_ask() {
     let (dir, hub, b1, t2) = hub_with_truncated_body();
     let b3 = spend_block(t2.block_hash(), t2.header.time + 600, 3, coinbase_out(&b1));
     let hash = b3.block_hash();
-    assert!(hub.claim_block_ask(&hash));
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -4778,23 +4821,27 @@ fn store_fault_on_block_releases_the_body_ask() {
     rt.block_on(async {
         let (tx, _rx) = peer_out_channel();
         let mut follow = rbitcoin_net::peer::PeerFollowState::new();
-        follow.requested_blocks.insert(hash);
+        assert!(follow.requested_blocks.claim(&hub, hash));
         rbitcoin_net::peer::on_block(&hub, &tx, &mut follow, None, &b3)
             .await
             .expect("store fault keeps the session");
+        assert!(
+            hub.claim_block_ask(&hash).is_some(),
+            "on_block store fault must release the body ask"
+        );
     });
     assert!(
         !hub.is_block_invalid(&hash),
         "store fault is not a block verdict"
     );
     assert_eq!(hub.tip_hash(), Some(t2.block_hash()));
-    assert!(
-        hub.claim_block_ask(&hash),
-        "on_block store fault must release the body ask"
-    );
 
     let mut pending = rbitcoin_net::peer::PendingBlocks::new();
-    pending.insert(hash, b3);
+    pending.insert(hash, b3, hub.claim_block_ask(&hash));
+    assert!(
+        hub.already_have_or_asked_block(&hash),
+        "parked with its ask"
+    );
     let mut headers = HashMap::new();
     rt.block_on(async {
         rbitcoin_net::peer::drain_pending_once(&hub, &mut pending, &mut headers, None)
@@ -4802,7 +4849,7 @@ fn store_fault_on_block_releases_the_body_ask() {
             .expect("drain keeps the session");
     });
     assert!(
-        hub.claim_block_ask(&hash),
+        hub.claim_block_ask(&hash).is_some(),
         "drain_pending store fault must release the body ask"
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -5034,7 +5081,6 @@ fn store_fault_on_cmpct_releases_the_body_ask() {
     let (dir, hub, b1, t2) = hub_with_truncated_body();
     let b3 = spend_block(t2.block_hash(), t2.header.time + 600, 3, coinbase_out(&b1));
     let hash = b3.block_hash();
-    assert!(hub.claim_block_ask(&hash));
     let hsi = HeaderAndShortIds::from_block(&b3, 1, 2, &[0]).expect("compact header");
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -5043,20 +5089,20 @@ fn store_fault_on_cmpct_releases_the_body_ask() {
     rt.block_on(async {
         let (tx, _rx) = peer_out_channel();
         let mut follow = rbitcoin_net::peer::PeerFollowState::new();
-        follow.requested_blocks.insert(hash);
+        assert!(follow.requested_blocks.claim(&hub, hash));
         rbitcoin_net::peer::on_cmpct_got_block(&hub, &tx, &mut follow, None, &hsi, hash, b3, None)
             .await
             .expect("compact store fault keeps the session");
+        assert!(
+            hub.claim_block_ask(&hash).is_some(),
+            "compact store fault must release the body ask"
+        );
     });
     assert!(
         !hub.is_block_invalid(&hash),
         "store fault is not a block verdict"
     );
     assert_eq!(hub.tip_hash(), Some(t2.block_hash()));
-    assert!(
-        hub.claim_block_ask(&hash),
-        "compact store fault must release the body ask"
-    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -5083,7 +5129,6 @@ fn hostile_peer_session() {
     wit.push(vec![0u8; 4_000_000]);
     padded.txdata[0].input[0].witness = wit;
     assert_eq!(padded.block_hash(), honest.block_hash());
-    hub.note_asked_block(honest.block_hash());
     let _err = hub
         .accept_received_block(padded)
         .expect_err("witness padding past the weight limit must reject");
@@ -5109,7 +5154,6 @@ fn hostile_peer_session() {
 
     let inner =
         rbitcoin_net::chain::sixty_four_byte_body(honest.block_hash(), honest.header.time + 1);
-    hub.note_asked_block(inner.block_hash());
     let err = hub
         .accept_received_block(inner.clone())
         .expect_err("a body with no coinbase must reject");
@@ -5119,9 +5163,14 @@ fn hostile_peer_session() {
         "a 64-byte tx without a coinbase may be an inner merkle node: \
          the header's real body must stay acceptable"
     );
+    hub.settle_rejected_ask(
+        hub.claim_block_ask(&inner.block_hash()),
+        inner.block_hash(),
+        &err,
+    );
     assert!(
         !hub.already_have_or_asked_block(&inner.block_hash()),
-        "a mutated reject forgets the ask so the real body can be fetched"
+        "a mutated reject releases the ask so the real body can be fetched"
     );
     assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
 
@@ -5154,7 +5203,6 @@ fn hostile_peer_session() {
         ),
     ] {
         let bad = mine_with_extra(honest.block_hash(), t2, 2, extra);
-        hub.note_asked_block(bad.block_hash());
         let err = hub.accept_received_block(bad.clone()).expect_err(want);
         let reason = err
             .consensus_rules()
@@ -5164,13 +5212,21 @@ fn hostile_peer_session() {
             "{want}: {err:?}"
         );
         assert!(hub.is_block_invalid(&bad.block_hash()), "{want} cached");
+        hub.settle_rejected_ask(
+            hub.claim_block_ask(&bad.block_hash()),
+            bad.block_hash(),
+            &err,
+        );
+        assert!(
+            hub.already_have_or_asked_block(&bad.block_hash()),
+            "{want}: an invalid body stays asked so it is not fetched again"
+        );
     }
 
     let now = honest.header.time;
     hub.clock.set_mock(i64::from(now));
     let far = now + 2 * 3600 + 1;
     let future = mine(honest.block_hash(), far, 2);
-    hub.note_asked_block(future.block_hash());
     let err = hub
         .accept_received_block(future.clone())
         .expect_err("header more than two hours ahead of mock");
@@ -5183,16 +5239,20 @@ fn hostile_peer_session() {
         !hub.is_block_invalid(&future.block_hash()),
         "time-too-new must not cache BLOCK_FAILED"
     );
+    hub.settle_rejected_ask(
+        hub.claim_block_ask(&future.block_hash()),
+        future.block_hash(),
+        &err,
+    );
     assert!(
         !hub.already_have_or_asked_block(&future.block_hash()),
-        "time-too-new must forget asked_blocks so a later getdata can retry"
+        "time-too-new releases the ask so a later getdata can retry"
     );
     assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
 
     // The median of genesis and `honest` is `honest`'s own stamp, so a child
     // at exactly that time fails the `<=` check and can never become valid.
     let old = mine(honest.block_hash(), honest.header.time, 2);
-    hub.note_asked_block(old.block_hash());
     let err = hub
         .accept_received_block(old.clone())
         .expect_err("header at the parent median time past");

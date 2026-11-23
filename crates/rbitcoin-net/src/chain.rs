@@ -260,6 +260,105 @@ impl ForkTips {
     }
 }
 
+/// Block bodies some session asked a peer for, hub-wide. Header-path fetch
+/// and `getdata` skip a hash in here. Every entry is put in by a
+/// [`BlockAsk`]; the set clears at [`Self::CAP`] because a rejected body's
+/// kept ask ([`ChainHub::settle_rejected_ask`]) has no other release.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct AskedBlocks {
+    asks: RwLock<Asks>,
+}
+
+#[derive(Default)]
+struct Asks {
+    /// Live asks per hash, as Core keeps one in-flight entry per peer.
+    live: HashMap<BlockHash, u32>,
+    /// Clears at the cap so far. An ask from an earlier one holds nothing.
+    clears: u64,
+}
+
+impl AskedBlocks {
+    const CAP: usize = 4096;
+
+    fn hold(self: &Arc<Self>, asks: &mut Asks, hash: BlockHash) -> BlockAsk {
+        if asks.live.len() >= Self::CAP && !asks.live.contains_key(&hash) {
+            asks.live.clear();
+            asks.clears += 1;
+        }
+        *asks.live.entry(hash).or_default() += 1;
+        BlockAsk {
+            hash,
+            clear: asks.clears,
+            asked: Some(Arc::clone(self)),
+        }
+    }
+
+    /// A new ask, or `None` when one is already out for `hash`.
+    fn claim(self: &Arc<Self>, hash: BlockHash) -> Option<BlockAsk> {
+        let mut g = self.asks.write().unwrap();
+        if g.live.contains_key(&hash) {
+            return None;
+        }
+        Some(self.hold(&mut g, hash))
+    }
+
+    /// An ask for `hash` whether or not another is already out.
+    fn ask(self: &Arc<Self>, hash: BlockHash) -> BlockAsk {
+        self.hold(&mut self.asks.write().unwrap(), hash)
+    }
+
+    fn contains(&self, hash: &BlockHash) -> bool {
+        self.asks.read().unwrap().live.contains_key(hash)
+    }
+
+    fn snapshot(&self) -> HashSet<BlockHash> {
+        self.asks.read().unwrap().live.keys().copied().collect()
+    }
+}
+
+/// One body ask on [`AskedBlocks`]. Dropping it releases the ask, so a
+/// request that ends any way (the body arrived, a mutated copy, a store
+/// fault, expiry, the session ended or its task was aborted) lets another
+/// peer be asked for the body once no other ask for it is out.
+#[doc(hidden)]
+pub struct BlockAsk {
+    hash: BlockHash,
+    clear: u64,
+    asked: Option<Arc<AskedBlocks>>,
+}
+
+impl BlockAsk {
+    pub fn hash(&self) -> BlockHash {
+        self.hash
+    }
+
+    fn keep_until_wipe(mut self) {
+        self.asked = None;
+    }
+}
+
+impl Drop for BlockAsk {
+    fn drop(&mut self) {
+        let Some(asked) = self.asked.take() else {
+            return;
+        };
+        let mut g = asked
+            .asks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.clears != self.clear {
+            return;
+        }
+        if let std::collections::hash_map::Entry::Occupied(mut live) = g.live.entry(self.hash) {
+            *live.get_mut() -= 1;
+            if *live.get() == 0 {
+                live.remove();
+            }
+        }
+    }
+}
+
 /// Operator-invalidated hashes and best-chain paths (hashes only, height order).
 ///
 /// Uncapped. Forgetting an invalid hash would make that block acceptable again.
@@ -776,7 +875,7 @@ pub struct ChainHub {
     pub rpc_wait_tip_idle: AtomicBool,
     pub prefill_plan: std::sync::Mutex<Option<crate::compact::PrefillPlan>>,
     /// Block hashes we already issued getdata for (any peer).
-    pub asked_blocks: RwLock<HashSet<BlockHash>>,
+    pub asked_blocks: Arc<AskedBlocks>,
     /// `prefix[h] = work through height h` on the best chain. Process cache;
     /// rebuilt from wire headers when short, truncated on disconnect.
     pub chain_work_prefix: RwLock<Vec<Work>>,
@@ -992,7 +1091,7 @@ impl ChainHub {
             rpc_wait_tip_idle: AtomicBool::new(false),
             script_phase: AtomicBool::new(false),
             prefill_plan: std::sync::Mutex::new(None),
-            asked_blocks: RwLock::new(HashSet::new()),
+            asked_blocks: Arc::default(),
             chain_work_prefix: RwLock::new(Vec::new()),
             finished_ibd: AtomicBool::new(false),
             blocks_only: AtomicBool::new(false),
@@ -1017,40 +1116,26 @@ impl ChainHub {
         }
     }
 
-    pub fn note_asked_block(&self, hash: BlockHash) {
-        let mut g = self.asked_blocks.write().unwrap();
-        if g.len() >= 4096 {
-            g.clear();
-        }
-        g.insert(hash);
-    }
-
     /// One in-flight body ask. Connected and held bodies are not claims.
-    /// A hash already asked is not claimed again. The set clears at 4096,
-    /// the same cap as [`Self::note_asked_block`].
+    /// A hash already asked is not claimed again.
     #[doc(hidden)]
-    pub fn claim_block_ask(&self, hash: &BlockHash) -> bool {
+    pub fn claim_block_ask(&self, hash: &BlockHash) -> Option<BlockAsk> {
         if self.is_connected(hash) || self.held_body(hash).is_some() {
-            return false;
+            return None;
         }
-        let mut g = self.asked_blocks.write().unwrap();
-        if g.contains(hash) {
-            return false;
-        }
-        if g.len() >= 4096 {
-            g.clear();
-        }
-        g.insert(*hash)
+        self.asked_blocks.claim(*hash)
     }
 
-    pub fn forget_asked_block(&self, hash: &BlockHash) {
-        self.asked_blocks.write().unwrap().remove(hash);
+    /// An ask for `hash` even when another session already has one out.
+    #[doc(hidden)]
+    pub fn ask_block(&self, hash: BlockHash) -> BlockAsk {
+        self.asked_blocks.ask(hash)
     }
 
     pub fn already_have_or_asked_block(&self, hash: &BlockHash) -> bool {
         self.is_connected(hash)
             || self.held_body(hash).is_some()
-            || self.asked_blocks.read().unwrap().contains(hash)
+            || self.asked_blocks.contains(hash)
     }
 
     /// Core `BlockAssembler::m_last_block_weight` and `m_last_block_num_txs`:
@@ -1844,13 +1929,7 @@ impl ChainHub {
     /// not poison later getdata of that hash.
     #[doc(hidden)]
     pub fn remember_failed_accept(&self, offered: BlockHash, e: &NetError) {
-        if matches!(e, NetError::Consensus(m) if m == BLOCK_IS_INVALIDATED) {
-            return;
-        }
-        // Not kept or marked, so a peer may serve it once the parent is
-        // reconsidered.
-        if matches!(e, NetError::Consensus(m) if m == BAD_PREVBLK) {
-            self.forget_asked_block(&offered);
+        if matches!(e, NetError::Consensus(m) if m == BLOCK_IS_INVALIDATED || m == BAD_PREVBLK) {
             return;
         }
         let hash = e
@@ -1862,7 +1941,6 @@ impl ChainHub {
             || (self.query.trust_peer() && accept_err_is_warn_and_apply(e))
         {
             self.drop_held(hash);
-            self.forget_asked_block(&hash);
             return;
         }
         if e.failing_block_hash().is_some() || matches!(e, NetError::Rules(_)) {
@@ -1876,6 +1954,33 @@ impl ChainHub {
                 self.refresh_header_report();
             }
         }
+    }
+
+    /// A failed accept keeps `offered`'s ask only when this hub holds the
+    /// block, or the ancestor that failed, invalid, or when its store rows
+    /// were missing. The header path walks pending headers without reading
+    /// invalid marks, so that ask is what stops it fetching the same body
+    /// again. Any other reject (a bad parent, a mutated or too-new copy, a
+    /// trusted waive) releases the ask so another copy can be fetched.
+    /// True on that verdict, so the caller does not fetch the body again.
+    #[doc(hidden)]
+    pub fn settle_rejected_ask(
+        &self,
+        ask: Option<BlockAsk>,
+        offered: BlockHash,
+        e: &NetError,
+    ) -> bool {
+        let failed = e
+            .failing_block_hash()
+            .map(BlockHash::from_byte_array)
+            .unwrap_or(offered);
+        let verdict = matches!(e, NetError::Consensus(m) if m == BLOCK_IS_INVALIDATED)
+            || self.invalidated.set.read().unwrap().contains(&failed)
+            || crate::peer::net_error_is_store_not_found(e);
+        if let Some(ask) = ask.filter(|_| verdict) {
+            ask.keep_until_wipe();
+        }
+        verdict
     }
 
     /// True if we have a header row (best chain, header-only tip, or held body).
@@ -4432,7 +4537,7 @@ impl ChainHub {
                 }
             }
         }
-        let keep = self.asked_blocks.read().unwrap().clone();
+        let keep = self.asked_blocks.snapshot();
         self.held_bodies
             .write()
             .unwrap()

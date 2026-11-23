@@ -450,7 +450,7 @@ async fn unknown_parent_bodies(
     let mut follow = PeerFollowState::new();
     let block = orphan_body(BlockHash::from_byte_array([0xab; 32]), 0);
     let hash = block.block_hash();
-    follow.requested_blocks.insert(hash);
+    follow.requested_blocks.ask(hub, hash);
     push(
         hub,
         &out_tx,
@@ -950,7 +950,7 @@ async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub)
     );
     let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(bad_pow.block_hash());
+    follow.requested_blocks.ask(hub, bad_pow.block_hash());
     push(hub, &out_tx, &mut follow, None, NetworkMessage::Block(bad_pow.clone())).await;
     assert!(
         follow.ban_score >= BAN_SCORE_THRESHOLD,
@@ -998,7 +998,7 @@ async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub)
         "a stamp at or below the median time past is not temporary: {old_err}"
     );
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(too_old.block_hash());
+    follow.requested_blocks.ask(hub, too_old.block_hash());
     push(
         hub,
         &out_tx,
@@ -1043,8 +1043,7 @@ async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub)
         "a stamp past the two-hour window is temporary: {time_err}"
     );
     let mut follow = PeerFollowState::new();
-    assert!(hub.claim_block_ask(&future.block_hash()));
-    follow.requested_blocks.insert(future.block_hash());
+    assert!(follow.requested_blocks.claim(hub, future.block_hash()));
     push(
         hub,
         &out_tx,
@@ -1132,7 +1131,7 @@ async fn noban_and_manual_bad_block_is_not_punished(
 
     let plain = live_peer(peers, 18472, 21, true);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(bad_pow.block_hash());
+    follow.requested_blocks.ask(hub, bad_pow.block_hash());
     on_block(
         hub,
         &out_tx,
@@ -1154,7 +1153,7 @@ async fn noban_and_manual_bad_block_is_not_punished(
     peers.set_noban(true);
     let kept = live_peer(peers, 18473, 22, true);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(bad_pow.block_hash());
+    follow.requested_blocks.ask(hub, bad_pow.block_hash());
     on_block(hub, &out_tx, &mut follow, Some(kept.as_ref()), &bad_pow)
         .await
         .unwrap();
@@ -1174,7 +1173,7 @@ async fn noban_and_manual_bad_block_is_not_punished(
     // `--connect` and `addnode` peers are `manual`.
     let manual = live_peer_as(peers, 18477, 26, rbitcoin_net::peers::PeerConnType::Manual);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(bad_pow.block_hash());
+    follow.requested_blocks.ask(hub, bad_pow.block_hash());
     on_block(hub, &out_tx, &mut follow, Some(manual.as_ref()), &bad_pow)
         .await
         .unwrap();
@@ -1209,8 +1208,7 @@ async fn sixty_four_byte_body_is_mutated(
     let (out_tx, _rx) = peer_out_channel();
     let sender = live_peer(peers, 18474, 23, true);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
-    hub.note_asked_block(hash);
+    follow.requested_blocks.ask(hub, hash);
     rbitcoin_log::capture_logs(true);
     on_block(hub, &out_tx, &mut follow, Some(sender.as_ref()), &inner)
         .await
@@ -1262,8 +1260,7 @@ async fn empty_body_null_merkle_bans_before_the_header(
     let (out_tx, _rx) = peer_out_channel();
     let sender = live_peer(peers, 18478, 27, true);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
-    hub.note_asked_block(hash);
+    follow.requested_blocks.ask(hub, hash);
     rbitcoin_log::capture_logs(true);
     on_block(hub, &out_tx, &mut follow, Some(sender.as_ref()), &block)
         .await
@@ -1320,8 +1317,7 @@ async fn invalid_parent_child_is_fetched_after_reconsider(
 
     let sender = live_peer(peers, 18490, 40, true);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
-    hub.note_asked_block(hash);
+    follow.requested_blocks.ask(hub, hash);
     on_block(hub, &out_tx, &mut follow, Some(sender.as_ref()), &child)
         .await
         .unwrap();
@@ -1333,8 +1329,7 @@ async fn invalid_parent_child_is_fetched_after_reconsider(
     run_on_tip_accept(|| hub.reconsider_block_inner(parent)).unwrap();
     assert_eq!(hub.tip_hash(), Some(parent));
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
-    hub.note_asked_block(hash);
+    follow.requested_blocks.ask(hub, hash);
     on_block(hub, &out_tx, &mut follow, Some(sender.as_ref()), &child)
         .await
         .unwrap();
@@ -1342,8 +1337,9 @@ async fn invalid_parent_child_is_fetched_after_reconsider(
 }
 
 /// Core `RemoveBlockRequest` on a merkle-mismatch drop: the body is not the
-/// header's, so another peer must be free to serve the real one.
-async fn merkle_mismatch_forgets_the_ask(
+/// header's. Once the punished sender's session ends, the next peer that
+/// announces the header is asked for the real body.
+async fn merkle_mismatch_leaves_the_body_to_the_next_peer(
     hub: &rbitcoin_net::chain::ChainHub,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
 ) {
@@ -1356,8 +1352,7 @@ async fn merkle_mismatch_forgets_the_ask(
     let (out_tx, _rx) = peer_out_channel();
     let sender = live_peer(peers, 18475, 24, true);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
-    hub.note_asked_block(hash);
+    assert!(follow.requested_blocks.claim(hub, hash));
     rbitcoin_log::capture_logs(true);
     on_block(hub, &out_tx, &mut follow, Some(sender.as_ref()), &wrong)
         .await
@@ -1371,11 +1366,17 @@ async fn merkle_mismatch_forgets_the_ask(
         "Core punishes a mutated block"
     );
     assert!(!hub.is_block_invalid(&hash));
-    assert!(
-        !hub.already_have_or_asked_block(&hash),
-        "a mutated drop forgets the ask so another peer can serve the real body"
+    drop(follow);
+    let (next_tx, mut next_rx) = peer_out_channel();
+    let mut next = PeerFollowState::new();
+    on_headers(hub, &next_tx, &mut next, None, &[wrong.header])
+        .await
+        .unwrap();
+    assert_eq!(
+        asked_blocks(&mut next_rx),
+        vec![hash],
+        "the next peer to announce the header is asked for the body"
     );
-    assert!(!follow.requested_blocks.contains(&hash));
     assert_eq!(hub.tip_hash(), Some(tip));
 }
 
@@ -1458,8 +1459,7 @@ async fn manual_peer_is_asked_again_after_a_mutated_copy(
         );
         let mut follow = PeerFollowState::new();
         admit_pending_header(&mut follow.pending_headers, hash, block.header);
-        follow.requested_blocks.insert(hash);
-        hub.note_asked_block(hash);
+        follow.requested_blocks.ask(hub, hash);
         if n == 2 {
             rbitcoin_log::capture_logs(true);
         }
@@ -1479,7 +1479,7 @@ async fn manual_peer_is_asked_again_after_a_mutated_copy(
         assert!(follow.requested_blocks.contains(&hash), "copy {n}");
         assert_eq!(hub.tip_hash(), Some(tip));
         let mut requested = follow.requested_blocks;
-        take_requested_block(hub, &mut requested, &hash);
+        requested.remove(&hash);
     }
 }
 
@@ -1502,8 +1502,7 @@ async fn sixty_four_byte_kept_peer_and_dropped_session(
     );
     let mut follow = PeerFollowState::new();
     admit_pending_header(&mut follow.pending_headers, short_hash, short.header);
-    follow.requested_blocks.insert(short_hash);
-    hub.note_asked_block(short_hash);
+    follow.requested_blocks.ask(hub, short_hash);
     on_block(hub, &out_tx, &mut follow, Some(manual.as_ref()), &short)
         .await
         .unwrap();
@@ -1516,7 +1515,7 @@ async fn sixty_four_byte_kept_peer_and_dropped_session(
     );
     assert!(follow.requested_blocks.contains(&short_hash));
     let mut requested = follow.requested_blocks;
-    take_requested_block(hub, &mut requested, &short_hash);
+    requested.remove(&short_hash);
 
     let dropped_body = rbitcoin_net::chain::sixty_four_byte_body(tip, time.saturating_add(1));
     let dropped_hash = dropped_body.block_hash();
@@ -1528,8 +1527,7 @@ async fn sixty_four_byte_kept_peer_and_dropped_session(
         dropped_hash,
         dropped_body.header,
     );
-    follow.requested_blocks.insert(dropped_hash);
-    hub.note_asked_block(dropped_hash);
+    follow.requested_blocks.ask(hub, dropped_hash);
     on_block(
         hub,
         &out_tx,
@@ -1556,10 +1554,9 @@ async fn sixty_four_byte_kept_peer_and_dropped_session(
         "the hub ask is clear"
     );
     assert!(
-        hub.claim_block_ask(&dropped_hash),
+        hub.claim_block_ask(&dropped_hash).is_some(),
         "another peer can claim the hash"
     );
-    hub.forget_asked_block(&dropped_hash);
     assert!(!follow.requested_blocks.contains(&dropped_hash));
     assert_eq!(hub.tip_hash(), Some(tip));
 }
@@ -1591,8 +1588,7 @@ async fn signet_block_without_a_witness_commitment_is_invalid() {
     let manual = live_peer_as(&peers, 18496, 90, rbitcoin_net::peers::PeerConnType::Manual);
     let mut follow = PeerFollowState::new();
     admit_pending_header(&mut follow.pending_headers, witnessed_hash, witnessed.header);
-    follow.requested_blocks.insert(witnessed_hash);
-    hub.note_asked_block(witnessed_hash);
+    follow.requested_blocks.ask(&hub, witnessed_hash);
     on_block(
         &hub,
         &out_tx,
@@ -1613,7 +1609,7 @@ async fn signet_block_without_a_witness_commitment_is_invalid() {
         "the kept peer is asked for the real body"
     );
     let mut requested = follow.requested_blocks;
-    take_requested_block(&hub, &mut requested, &witnessed_hash);
+    requested.remove(&witnessed_hash);
 
     let bare = rbitcoin_consensus::mine_empty_regtest(tip, time.saturating_add(1), 1);
     let hash = bare.block_hash();
@@ -1623,8 +1619,7 @@ async fn signet_block_without_a_witness_commitment_is_invalid() {
     let manual = live_peer_as(&peers, 18497, 91, rbitcoin_net::peers::PeerConnType::Manual);
     let mut follow = PeerFollowState::new();
     admit_pending_header(&mut follow.pending_headers, hash, bare.header);
-    follow.requested_blocks.insert(hash);
-    hub.note_asked_block(hash);
+    follow.requested_blocks.ask(&hub, hash);
     on_block(&hub, &out_tx, &mut follow, Some(manual.as_ref()), &bare)
         .await
         .unwrap();
@@ -1686,8 +1681,7 @@ async fn duplicate_pair_disconnects(
     let (out_tx, _rx) = peer_out_channel();
     let sender = live_peer(peers, 18476, 25, true);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(hash);
-    hub.note_asked_block(hash);
+    follow.requested_blocks.ask(hub, hash);
     rbitcoin_log::capture_logs(true);
     on_block(
         hub,
@@ -1736,7 +1730,7 @@ async fn rejected_header_logs_core_reason(hub: &rbitcoin_net::chain::ChainHub) {
     }
     let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(v3.block_hash());
+    follow.requested_blocks.ask(hub, v3.block_hash());
     rbitcoin_log::reset_repeated_info();
     rbitcoin_log::capture_logs(true);
     on_block(hub, &out_tx, &mut follow, None, &v3)
@@ -1759,7 +1753,7 @@ async fn rejected_header_logs_core_reason(hub: &rbitcoin_net::chain::ChainHub) {
     .unwrap();
     let future = rbitcoin_consensus::mine_regtest_paying(prev, now + 3 * 3600, 111, op_true(), vec![]);
     let mut follow = PeerFollowState::new();
-    follow.requested_blocks.insert(future.block_hash());
+    follow.requested_blocks.ask(hub, future.block_hash());
     rbitcoin_log::reset_repeated_info();
     rbitcoin_log::capture_logs(true);
     on_block(hub, &out_tx, &mut follow, None, &future)
@@ -2816,7 +2810,7 @@ async fn peer_header_dos_and_self_announce() {
     noban_and_manual_bad_block_is_not_punished(&hub, &peers).await;
     sixty_four_byte_body_is_mutated(&hub, &peers).await;
     empty_body_null_merkle_bans_before_the_header(&hub, &peers).await;
-    merkle_mismatch_forgets_the_ask(&hub, &peers).await;
+    merkle_mismatch_leaves_the_body_to_the_next_peer(&hub, &peers).await;
     manual_peer_is_asked_again_after_a_mutated_copy(&hub, &peers).await;
     sixty_four_byte_kept_peer_and_dropped_session(&hub, &peers).await;
     invalid_parent_child_is_fetched_after_reconsider(&hub, &peers).await;

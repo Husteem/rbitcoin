@@ -192,9 +192,9 @@ pub fn reconstructed_cmpct_block(case: &CmpctFuzzCase) -> Option<bitcoin::Block>
 fn drain_one(hub: &ChainHub, block: bitcoin::Block) -> Result<(), NetError> {
     let (tx, _rx) = peer_out_channel();
     let mut pending = PendingBlocks::new();
-    pending.insert(block.block_hash(), block);
+    pending.insert(block.block_hash(), block, None);
     let mut headers = HashMap::new();
-    let mut requested = HashSet::new();
+    let mut requested = rbitcoin_net::peer::RequestedBlocks::default();
     drain_pending_now(hub, &tx, &mut pending, &mut headers, &mut requested, true)
 }
 
