@@ -3967,6 +3967,9 @@ pub async fn handle_decoded_peer_msg(
             on_blocktxn(hub, out_tx, follow, session, &bt).await?
         }
         NetworkMessage::Tx(tx) => on_tx(hub, out_tx, follow, session, &tx).await?,
+        msg @ (NetworkMessage::GetCFilters(_)
+        | NetworkMessage::GetCFHeaders(_)
+        | NetworkMessage::GetCFCheckpt(_)) => on_compact_filters(msg, hub, out_tx, session).await?,
         NetworkMessage::GetBlockTxn(GetBlockTxn { txs_request }) => {
             serve_getblocktxn(hub, out_tx, follow, session, txs_request).await?
         }
@@ -4054,17 +4057,41 @@ pub fn filter_q<T>(r: Result<T, rbitcoin_store::StoreError>) -> Result<T, NetErr
 }
 
 #[doc(hidden)]
-pub fn on_compact_filters(
-    payload: &NetworkMessage,
+pub async fn on_compact_filters(
+    payload: NetworkMessage,
     hub: &ChainHub,
     out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
+    // The reply that crossed the budget is already queued.
+    if session.is_some_and(|s| s.send_over_budget()) {
+        return Ok(());
+    }
+    // Up to 1,000 filters are read on the blocking pool under a header
+    // permit, not on the session's worker.
+    let replies = run_header_job(hub, move |hub| compact_filter_replies(hub, &payload)).await??;
+    for reply in replies {
+        if session.is_some_and(|s| s.send_over_budget()) {
+            return Ok(());
+        }
+        out_tx.send(reply)?;
+    }
+    Ok(())
+}
+
+/// The replies to a compact-filter request, read from the store. Runs off
+/// the reactor. An `Err` disconnects the peer.
+#[doc(hidden)]
+pub fn compact_filter_replies(
+    hub: &ChainHub,
+    payload: &NetworkMessage,
+) -> Result<Vec<NetworkMessage>, NetError> {
+    crate::reactor::assert_not_reactor("compact filter read");
     match payload {
-        NetworkMessage::GetCFilters(m) => on_getcfilters(hub, out_tx, session, m),
-        NetworkMessage::GetCFHeaders(m) => on_getcfheaders(hub, out_tx, m),
-        NetworkMessage::GetCFCheckpt(m) => on_getcfcheckpt(hub, out_tx, m),
-        _ => Ok(()),
+        NetworkMessage::GetCFilters(m) => getcfilters_replies(hub, m),
+        NetworkMessage::GetCFHeaders(m) => Ok(getcfheaders_reply(hub, m)?.into_iter().collect()),
+        NetworkMessage::GetCFCheckpt(m) => Ok(getcfcheckpt_reply(hub, m)?.into_iter().collect()),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -4107,107 +4134,96 @@ pub fn within_filter_watermark(hub: &ChainHub, stop: u32) -> Result<bool, NetErr
     Ok(filter_q(hub.query.basic_filter_hwm())?.is_some_and(|hwm| stop <= hwm))
 }
 
-#[doc(hidden)]
-pub fn on_getcfilters(
+fn getcfilters_replies(
     hub: &ChainHub,
-    out_tx: &PeerOutTx,
-    session: Option<&crate::peers::LivePeer>,
     m: &bitcoin::p2p::message_filter::GetCFilters,
-) -> Result<(), NetError> {
+) -> Result<Vec<NetworkMessage>, NetError> {
     use bitcoin::hashes::Hash;
     let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     compact_filter_range(m.start_height, stop, MAX_GETCFILTERS)?;
     if !within_filter_watermark(hub, stop)? {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(filters) = filter_q(hub.query.basic_filters(m.start_height, stop))? else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    let mut out = Vec::with_capacity(filters.len());
     for (h, body) in (m.start_height..).zip(filters) {
-        if session.is_some_and(|s| s.send_over_budget()) {
-            return Ok(());
-        }
         let Some((_, rec)) = filter_q(hub.query.header_at_height(rbitcoin_primitives::Height(h)))?
         else {
-            return Ok(());
+            break;
         };
-        out_tx.send(NetworkMessage::CFilter(
+        out.push(NetworkMessage::CFilter(
             bitcoin::p2p::message_filter::CFilter {
                 filter_type: 0,
                 block_hash: bitcoin::BlockHash::from_byte_array(rec.hash),
                 filter: body,
             },
-        ))?;
+        ));
     }
-    Ok(())
+    Ok(out)
 }
 
-#[doc(hidden)]
-pub fn on_getcfheaders(
+fn getcfheaders_reply(
     hub: &ChainHub,
-    out_tx: &PeerOutTx,
     m: &bitcoin::p2p::message_filter::GetCFHeaders,
-) -> Result<(), NetError> {
+) -> Result<Option<NetworkMessage>, NetError> {
     use bitcoin::bip158::FilterHeader;
     use bitcoin::hashes::Hash;
     let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
-        return Ok(());
+        return Ok(None);
     };
     compact_filter_range(m.start_height, stop, MAX_GETCFHEADERS)?;
     if !within_filter_watermark(hub, stop)? {
-        return Ok(());
+        return Ok(None);
     }
     // One idx read covers the previous header and every hash in range.
     let first = m.start_height.saturating_sub(1);
     let Some(rows) = filter_q(hub.query.basic_filter_hashes_and_headers(first, stop))? else {
-        return Ok(());
+        return Ok(None);
     };
     let (previous, hashes) = if m.start_height == 0 {
         (FilterHeader::from_byte_array([0u8; 32]), &rows[..])
     } else {
         (rows[0].1, &rows[1..])
     };
-    out_tx.send(NetworkMessage::CFHeaders(
+    Ok(Some(NetworkMessage::CFHeaders(
         bitcoin::p2p::message_filter::CFHeaders {
             filter_type: 0,
             stop_hash: m.stop_hash,
             previous_filter_header: previous,
             filter_hashes: hashes.iter().map(|(hash, _)| *hash).collect(),
         },
-    ))?;
-    Ok(())
+    )))
 }
 
-#[doc(hidden)]
-pub fn on_getcfcheckpt(
+fn getcfcheckpt_reply(
     hub: &ChainHub,
-    out_tx: &PeerOutTx,
     m: &bitcoin::p2p::message_filter::GetCFCheckpt,
-) -> Result<(), NetError> {
+) -> Result<Option<NetworkMessage>, NetError> {
     use bitcoin::hashes::Hash;
     let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
-        return Ok(());
+        return Ok(None);
     };
     if !within_filter_watermark(hub, stop)? {
-        return Ok(());
+        return Ok(None);
     }
     let mut filter_headers = Vec::new();
     if stop >= 1000 {
         let Some(headers) = filter_q(hub.query.basic_filter_checkpoint_headers(stop))? else {
-            return Ok(());
+            return Ok(None);
         };
         filter_headers = headers;
     }
-    out_tx.send(NetworkMessage::CFCheckpt(
+    Ok(Some(NetworkMessage::CFCheckpt(
         bitcoin::p2p::message_filter::CFCheckpt {
             filter_type: 0,
             stop_hash: m.stop_hash,
             filter_headers,
         },
-    ))?;
-    Ok(())
+    )))
 }
 
 #[doc(hidden)]
@@ -4233,14 +4249,18 @@ pub fn handle_peer_inventory_msg(
         | NetworkMessage::FilterAdd(_)
         | NetworkMessage::FilterClear => on_bloom_forbidden(follow, session)?,
         NetworkMessage::GetAddr => on_getaddr(hub, out_tx, session)?,
-        NetworkMessage::GetCFilters(_)
-        | NetworkMessage::GetCFHeaders(_)
-        | NetworkMessage::GetCFCheckpt(_) => on_compact_filters(payload, hub, out_tx, session)?,
         NetworkMessage::Headers(_)
         | NetworkMessage::GetHeaders(_)
         | NetworkMessage::GetBlocks(_) => {
             return Err(NetError::Protocol(
                 "header work is not on the sync inventory path",
+            ));
+        }
+        NetworkMessage::GetCFilters(_)
+        | NetworkMessage::GetCFHeaders(_)
+        | NetworkMessage::GetCFCheckpt(_) => {
+            return Err(NetError::Protocol(
+                "compact filter reads are not on the sync inventory path",
             ));
         }
         _ => {}

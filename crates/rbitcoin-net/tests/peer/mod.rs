@@ -10292,6 +10292,66 @@ fn headers_poll_expires_a_stale_tx_off_the_tokio_worker() {
     assert!(!mp.contains(&tid));
 }
 
+/// Compact-filter requests read the store on the blocking pool, not on the
+/// session's `tokio-rt-worker` (`assert_not_reactor` panics there).
+#[test]
+fn compact_filter_requests_read_the_store_off_the_reactor() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cfilter-off-reactor");
+    hub.ensure_genesis().unwrap();
+    let hub = hub.into_arc();
+    let genesis = hub.tip_hash().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        tokio::spawn(async move {
+            let (out_tx, _out_rx) = peer_out_channel();
+            let mut follow = PeerFollowState::new();
+            for msg in [
+                NetworkMessage::GetCFHeaders(bitcoin::p2p::message_filter::GetCFHeaders {
+                    filter_type: 0,
+                    start_height: 0,
+                    stop_hash: genesis,
+                }),
+                NetworkMessage::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
+                    filter_type: 0,
+                    start_height: 0,
+                    stop_hash: genesis,
+                }),
+                NetworkMessage::GetCFCheckpt(bitcoin::p2p::message_filter::GetCFCheckpt {
+                    filter_type: 0,
+                    stop_hash: genesis,
+                }),
+            ] {
+                handle_peer_frame(frame_for(msg), &hub, &out_tx, &mut follow, None)
+                    .await
+                    .expect("filter request");
+            }
+        })
+        .await
+        .expect("reactor task")
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// [`on_compact_filters`] on a one-off runtime. A stack hub runs the
+/// filter read inline.
+fn serve_filters(
+    hub: &ChainHub,
+    tx: &PeerOutTx,
+    session: Option<&rbitcoin_net::peers::LivePeer>,
+    msg: NetworkMessage,
+) -> Result<(), NetError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(on_compact_filters(msg, hub, tx, session))
+}
+
 #[test]
 fn compact_filter_ranges_past_core_limits_disconnect() {
     assert!(compact_filter_range(5, 4, MAX_GETCFILTERS).is_err());
@@ -10320,7 +10380,13 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
         start_height: 0,
         stop_hash: tip,
     };
-    on_getcfheaders(&hub, &tx, &headers).unwrap();
+    serve_filters(
+        &hub,
+        &tx,
+        None,
+        NetworkMessage::GetCFHeaders(headers.clone()),
+    )
+    .unwrap();
     match rx.try_recv().expect("cfheaders").into_out() {
         rbitcoin_net::peers::PeerOut::Msg(NetworkMessage::CFHeaders(m)) => {
             assert_eq!(m.previous_filter_header.as_byte_array(), &[0u8; 32]);
@@ -10333,7 +10399,7 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
         start_height: 0,
         stop_hash: tip,
     };
-    on_getcfilters(&hub, &tx, None, &typed).unwrap();
+    serve_filters(&hub, &tx, None, NetworkMessage::GetCFilters(typed.clone())).unwrap();
     assert!(rx.try_recv().is_err(), "a non-basic filter is silence");
     hub.query.set_block_filter_index(false).unwrap();
     let basic = bitcoin::p2p::message_filter::GetCFilters {
@@ -10341,7 +10407,7 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
         start_height: 0,
         stop_hash: tip,
     };
-    on_getcfilters(&hub, &tx, None, &basic).unwrap();
+    serve_filters(&hub, &tx, None, NetworkMessage::GetCFilters(basic.clone())).unwrap();
     assert!(rx.try_recv().is_err(), "filters off is silence");
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -10398,7 +10464,13 @@ fn getcfilters_stops_after_the_filter_that_crosses_the_send_budget() {
         start_height: 0,
         stop_hash: hub.tip_hash().unwrap(),
     };
-    on_getcfilters(&hub, &tx, Some(peer.as_ref()), &req).unwrap();
+    serve_filters(
+        &hub,
+        &tx,
+        Some(peer.as_ref()),
+        NetworkMessage::GetCFilters(req.clone()),
+    )
+    .unwrap();
     assert!(peer.send_over_budget());
     let mut n = 0usize;
     while let Ok(msg) = rx.try_recv().map(Queued::into_out) {
@@ -10427,7 +10499,7 @@ fn getcfcheckpt_returns_a_header_every_thousand_heights() {
         filter_type: 0,
         stop_hash: hub.tip_hash().unwrap(),
     };
-    on_getcfcheckpt(&hub, &tx, &below).unwrap();
+    serve_filters(&hub, &tx, None, NetworkMessage::GetCFCheckpt(below.clone())).unwrap();
     match rx.try_recv().expect("cfcheckpt below 1000").into_out() {
         PeerOut::Msg(NetworkMessage::CFCheckpt(m)) => {
             assert!(
@@ -10450,7 +10522,7 @@ fn getcfcheckpt_returns_a_header_every_thousand_heights() {
         filter_type: 0,
         stop_hash: hub.tip_hash().unwrap(),
     };
-    on_getcfcheckpt(&hub, &tx, &req).unwrap();
+    serve_filters(&hub, &tx, None, NetworkMessage::GetCFCheckpt(req.clone())).unwrap();
     match rx.try_recv().expect("cfcheckpt").into_out() {
         PeerOut::Msg(NetworkMessage::CFCheckpt(m)) => {
             assert_eq!(m.filter_headers, vec![rows[0].1]);
