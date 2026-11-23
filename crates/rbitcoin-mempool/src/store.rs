@@ -549,11 +549,12 @@ impl Mempool {
         let packed_len = new_body.len();
         new_body[8..16].copy_from_slice(&(packed_len as u64).to_le_bytes());
 
-        self.body = new_body;
-        self.slots = new_slots;
-        self.live_count = next_slot;
-        self.live_body_bytes = packed_len.saturating_sub(BODY_HEADER) as u64;
-        self.install_packed_images()?;
+        self.install_images(
+            new_body,
+            new_slots,
+            next_slot,
+            packed_len.saturating_sub(BODY_HEADER) as u64,
+        )?;
         self.clear_dirty();
         Ok((self.live_count, packed_len))
     }
@@ -637,11 +638,12 @@ impl Mempool {
         }
         let packed_len = new_body.len();
         new_body[8..16].copy_from_slice(&(packed_len as u64).to_le_bytes());
-        self.body = new_body;
-        self.slots = new_slots;
-        self.live_count = next_slot;
-        self.live_body_bytes = packed_len.saturating_sub(BODY_HEADER) as u64;
-        self.install_packed_images()?;
+        self.install_images(
+            new_body,
+            new_slots,
+            next_slot,
+            packed_len.saturating_sub(BODY_HEADER) as u64,
+        )?;
         self.clear_dirty();
         rbitcoin_log::info!(
             "mempool: converted schema {from} sidecar to schema {MEM_SCHEMA} (live={next_slot})"
@@ -881,7 +883,7 @@ impl Mempool {
     ///
     /// Append-safe: a crash after a grown body and before new slots loses admits;
     /// old LIVE ranges stay a prefix of the new body. Packed compact must not
-    /// use this order (see [`Self::install_packed_images`]).
+    /// use this order (see [`Self::install_images`]).
     #[doc(hidden)]
     pub fn persist_body_tail(&mut self) -> Result<(), MempoolError> {
         let body_path = self.dir.join("tx.body");
@@ -1011,23 +1013,39 @@ impl Mempool {
         Ok(())
     }
 
-    /// Packed body+slots: both tmps `sync_all`'d, then rename body then slots.
+    /// Write packed images, then adopt them in RAM.
+    ///
+    /// Both tmps are `sync_all`'d and renamed body-then-slots before any
+    /// in-RAM swap, so a failed write or body rename leaves `self.body`,
+    /// `self.slots` and the live counts as they were. A slots rename that
+    /// fails after the body rename leaves the pair for
+    /// [`finish_pending_compact`] on the next open; the old RAM images stay
+    /// in place and a later compact rewrites both.
     ///
     /// After rename, persist meta only. Rewriting packed body/slots in place
     /// (`set_len` / `write_all`) reopens the crash window tmp+rename closed.
     /// Crash after both renames, before meta: packed images + stale `live_count`
     /// still load (`load_live_txs` scans slots).
-    #[doc(hidden)]
-    pub fn install_packed_images(&mut self) -> Result<(), MempoolError> {
+    fn install_images(
+        &mut self,
+        body: Vec<u8>,
+        slots: Vec<u8>,
+        live_count: u32,
+        live_body_bytes: u64,
+    ) -> Result<(), MempoolError> {
         let body_path = self.dir.join("tx.body");
         let slots_path = self.dir.join("slots");
         let body_tmp = self.dir.join("tx.body.tmp");
         let slots_tmp = self.dir.join("slots.tmp");
-        let logical = body_logical_len(&self.body)?;
-        write_file_synced(&body_tmp, &self.body[..logical])?;
-        write_file_synced(&slots_tmp, &self.slots)?;
+        let logical = body_logical_len(&body)?;
+        write_file_synced(&body_tmp, &body[..logical])?;
+        write_file_synced(&slots_tmp, &slots)?;
         fs::rename(&body_tmp, &body_path).map_err(|e| MempoolError::io(&body_path, e))?;
         fs::rename(&slots_tmp, &slots_path).map_err(|e| MempoolError::io(&slots_path, e))?;
+        self.body = body;
+        self.slots = slots;
+        self.live_count = live_count;
+        self.live_body_bytes = live_body_bytes;
         self.reopen_body_slots()?;
         self.body_persisted_len = logical as u64;
         self.last_persist_ms = self.now_ms();
