@@ -1826,6 +1826,11 @@ impl PoolPad {
 
 /// A one-block store and a pool, served on a connection with no subscription.
 async fn pool_pad() -> PoolPad {
+    pool_pad_with_idle(None).await
+}
+
+/// [`pool_pad`] with an optional idle read timeout.
+async fn pool_pad_with_idle(idle: Option<Duration>) -> PoolPad {
     use rbitcoin_query::TxApply;
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 
@@ -1867,7 +1872,10 @@ async fn pool_pad() -> PoolPad {
     let q = Arc::new(q);
     let mp = MempoolHub::open(dir.join("mempool"), Arc::clone(&q)).unwrap();
     let (tip_tx, tip_rx) = broadcast::channel(4);
-    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    if let Some(idle) = idle {
+        cfg.limits.idle_timeout = idle;
+    }
     let (client, server) = tokio::io::duplex(1 << 16);
     tokio::spawn(handle_client(
         server,
@@ -1898,6 +1906,68 @@ async fn held_pool_pad() -> PoolPad {
         .await;
     assert!(!first["result"].as_str().unwrap().is_empty(), "{first}");
     pad
+}
+
+/// A silent client that holds one scripthash subscription is closed at the
+/// idle timeout. The scripthash tick ends every select pass while the
+/// subscription exists; a fresh timeout per pass would restart the window
+/// forever.
+#[tokio::test]
+async fn silent_subscribed_client_is_closed_at_the_idle_timeout() {
+    let mut pad = pool_pad_with_idle(Some(Duration::from_millis(200))).await;
+    let sh = pad.sh.clone();
+    let first = pad
+        .call(1, "blockchain.scripthash.subscribe", json!([sh]))
+        .await;
+    assert!(first["result"].is_string(), "{first}");
+    let mut line = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(3), pad.client.read_line(&mut line))
+        .await
+        .expect("a subscribed idle session must close within the idle timeout")
+        .unwrap();
+    assert_eq!(n, 0, "unexpected line: {line}");
+}
+
+/// A tip event half-way through the idle window does not restart it.
+#[tokio::test(start_paused = true)]
+async fn tip_event_keeps_the_idle_read_deadline() {
+    let (_dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let peer = "127.0.0.1:1".parse().unwrap();
+    let mut cfg = ElectrumConfig::for_params(peer, &params);
+    cfg.limits.idle_timeout = Duration::from_millis(100);
+    let (_client, server) = tokio::io::duplex(64);
+    let (tip_tx, tip_rx) = broadcast::channel(1);
+    let session = handle_client(
+        server,
+        peer,
+        Arc::new(q),
+        Arc::new(cfg),
+        Arc::new(params),
+        tip_rx,
+        None,
+        ElectrumStop::new(false),
+    );
+    let (result, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_millis(125), session),
+        async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tip_tx
+                .send(TipNotify {
+                    height: 0,
+                    header_hex: "00".repeat(80),
+                    reorg_from_height: None,
+                })
+                .unwrap();
+        },
+    );
+    assert_eq!(
+        result
+            .expect("the session outlived its idle deadline")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut,
+    );
 }
 
 /// Replace block 0 with one paying `0x00`, so the scripthash watermark ends
