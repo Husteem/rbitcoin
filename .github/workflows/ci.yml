@@ -319,7 +319,8 @@ jobs:
           env -u RBITCOIN_IO
           cargo test -p rbitcoin-query -p rbitcoin-net -p rbitcoin-rpc
           -p rbitcoin-ibd -p rbitcoin-test -p rbitcoin-electrum
-          -p rbitcoin-esplora -p rbitcoin-sv2 --features skip-flushes --test suite
+          -p rbitcoin-esplora -p rbitcoin-sv2 -p rbitcoin-node
+          --features skip-flushes --test suite
           -- --quiet flushes_skipped_matches_the_skip_flushes_feature
 
   # Forward rustc. Same wait as pread: a red `test` does not compile it.
