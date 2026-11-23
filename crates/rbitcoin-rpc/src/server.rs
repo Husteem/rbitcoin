@@ -1290,6 +1290,69 @@ async fn exec_blocking_method(
     }
 }
 
+/// Request fields that decide the reply shape. Parsed once per entry point.
+struct Envelope {
+    ver: JsonRpcVer,
+    id: Option<serde_json::Value>,
+    notification: bool,
+}
+
+fn parse_envelope(req: &serde_json::Value) -> Result<Envelope, OneOut> {
+    let ver = match parse_jsonrpc_ver(req) {
+        Ok(v) => v,
+        Err((code, msg)) => {
+            return Err(OneOut::BadVersion {
+                error: serde_json::json!({ "code": code, "message": msg }),
+            });
+        }
+    };
+    let has_id = req.as_object().is_some_and(|m| m.contains_key("id"));
+    Ok(Envelope {
+        ver,
+        notification: ver == JsonRpcVer::V2 && !has_id,
+        id: has_id.then(|| req.get("id").cloned().unwrap_or(serde_json::Value::Null)),
+    })
+}
+
+fn parse_params(req: &serde_json::Value) -> Result<crate::methods::RpcParams, serde_json::Value> {
+    match req.get("params") {
+        None | Some(serde_json::Value::Null) => Ok(crate::methods::RpcParams::empty()),
+        Some(v) => crate::methods::RpcParams::from_json(v).ok_or_else(|| {
+            serde_json::json!({
+                "code": -32602,
+                "message": "params must be array or object",
+            })
+        }),
+    }
+}
+
+/// Error reply in the request's version, or no reply for a notification.
+fn error_reply(env: &Envelope, error: serde_json::Value) -> OneOut {
+    if env.notification {
+        return OneOut::Notification;
+    }
+    let id = env.id.clone();
+    OneOut::Reply(match env.ver {
+        JsonRpcVer::V2 => reply_v2(id.unwrap_or(serde_json::Value::Null), None, Some(error)),
+        JsonRpcVer::V1 => reply_v1(id, None, Some(error)),
+    })
+}
+
+/// Dispatch result in the request's version, or no reply for a notification.
+fn dispatch_reply(env: &Envelope, result: Result<serde_json::Value, serde_json::Value>) -> OneOut {
+    if env.notification {
+        return OneOut::Notification;
+    }
+    let id_v1 = env.id.clone();
+    let id_v2 = env.id.clone().unwrap_or(serde_json::Value::Null);
+    OneOut::Reply(match (env.ver, result) {
+        (JsonRpcVer::V2, Ok(v)) => reply_v2(id_v2, Some(v), None),
+        (JsonRpcVer::V1, Ok(v)) => reply_v1(id_v1, Some(v), None),
+        (JsonRpcVer::V2, Err(e)) => reply_v2(id_v2, None, Some(e)),
+        (JsonRpcVer::V1, Err(e)) => reply_v1(id_v1, None, Some(e)),
+    })
+}
+
 async fn exec_one_async(
     ctx: &Arc<RpcContext>,
     req: &serde_json::Value,
@@ -1300,41 +1363,13 @@ async fn exec_one_async(
     if !crate::methods::request_task_method(method) {
         return exec_blocking_method(ctx, req, method, waited, snap).await;
     }
-    let ver = match parse_jsonrpc_ver(req) {
-        Ok(v) => v,
-        Err((code, msg)) => {
-            return OneOut::BadVersion {
-                error: serde_json::json!({ "code": code, "message": msg }),
-            };
-        }
+    let env = match parse_envelope(req) {
+        Ok(env) => env,
+        Err(out) => return out,
     };
-    let has_id = req.as_object().is_some_and(|m| m.contains_key("id"));
-    let notification = ver == JsonRpcVer::V2 && !has_id;
-    let id = if has_id {
-        Some(req.get("id").cloned().unwrap_or(serde_json::Value::Null))
-    } else {
-        None
-    };
-    let params = match req.get("params") {
-        None | Some(serde_json::Value::Null) => crate::methods::RpcParams::empty(),
-        Some(v) => match crate::methods::RpcParams::from_json(v) {
-            Some(p) => p,
-            None => {
-                let err = serde_json::json!({
-                    "code": -32602,
-                    "message": "params must be array or object",
-                });
-                if notification {
-                    return OneOut::Notification;
-                }
-                return OneOut::Reply(match ver {
-                    JsonRpcVer::V2 => {
-                        reply_v2(id.unwrap_or(serde_json::Value::Null), None, Some(err))
-                    }
-                    JsonRpcVer::V1 => reply_v1(id, None, Some(err)),
-                });
-            }
-        },
+    let params = match parse_params(req) {
+        Ok(p) => p,
+        Err(err) => return error_reply(&env, err),
     };
     let params_s = req
         .get("params")
@@ -1351,21 +1386,7 @@ async fn exec_one_async(
         Ok(_) => None,
     };
     rbitcoin_log::api_call("rpc", "-", method, &params_s, wall_ms, err_s.as_deref());
-    if notification {
-        return OneOut::Notification;
-    }
-    let id_v1 = id.clone();
-    let id_v2 = id.unwrap_or(serde_json::Value::Null);
-    OneOut::Reply(match dispatched {
-        Ok(result) => match ver {
-            JsonRpcVer::V2 => reply_v2(id_v2, Some(result), None),
-            JsonRpcVer::V1 => reply_v1(id_v1, Some(result), None),
-        },
-        Err(error) => match ver {
-            JsonRpcVer::V2 => reply_v2(id_v2, None, Some(error)),
-            JsonRpcVer::V1 => reply_v1(id_v1, None, Some(error)),
-        },
-    })
+    dispatch_reply(&env, dispatched)
 }
 
 #[doc(hidden)]
@@ -1454,54 +1475,22 @@ pub fn exec_one(ctx: &RpcContext, req: &serde_json::Value) -> OneOut {
             Some(serde_json::json!({ "code": -32600, "message": "Invalid Request object" })),
         ));
     }
-    let ver = match parse_jsonrpc_ver(req) {
-        Ok(v) => v,
-        Err((code, msg)) => {
-            return OneOut::BadVersion {
-                error: serde_json::json!({ "code": code, "message": msg }),
-            };
-        }
-    };
-    let has_id = req.as_object().is_some_and(|m| m.contains_key("id"));
-    let notification = ver == JsonRpcVer::V2 && !has_id;
-    let id = if has_id {
-        Some(req.get("id").cloned().unwrap_or(serde_json::Value::Null))
-    } else {
-        None
+    let env = match parse_envelope(req) {
+        Ok(env) => env,
+        Err(out) => return out,
     };
     let method = match req.get("method").and_then(|m| m.as_str()) {
         Some(m) => m,
         None => {
-            let err = serde_json::json!({ "code": -32600, "message": "Missing method" });
-            if notification {
-                return OneOut::Notification;
-            }
-            return OneOut::Reply(match ver {
-                JsonRpcVer::V2 => reply_v2(id.unwrap_or(serde_json::Value::Null), None, Some(err)),
-                JsonRpcVer::V1 => reply_v1(id, None, Some(err)),
-            });
+            return error_reply(
+                &env,
+                serde_json::json!({ "code": -32600, "message": "Missing method" }),
+            );
         }
     };
-    let params = match req.get("params") {
-        None | Some(serde_json::Value::Null) => crate::methods::RpcParams::empty(),
-        Some(v) => match crate::methods::RpcParams::from_json(v) {
-            Some(p) => p,
-            None => {
-                let err = serde_json::json!({
-                    "code": -32602,
-                    "message": "params must be array or object",
-                });
-                if notification {
-                    return OneOut::Notification;
-                }
-                return OneOut::Reply(match ver {
-                    JsonRpcVer::V2 => {
-                        reply_v2(id.unwrap_or(serde_json::Value::Null), None, Some(err))
-                    }
-                    JsonRpcVer::V1 => reply_v1(id, None, Some(err)),
-                });
-            }
-        },
+    let params = match parse_params(req) {
+        Ok(p) => p,
+        Err(err) => return error_reply(&env, err),
     };
     if method == "getblocktemplate" && !crate::methods::http_wait_satisfied() {
         rbitcoin_log::info!("ThreadRPCServer method=getblocktemplate");
@@ -1521,21 +1510,7 @@ pub fn exec_one(ctx: &RpcContext, req: &serde_json::Value) -> OneOut {
         Ok(_) => None,
     };
     rbitcoin_log::api_call("rpc", "-", method, &params_s, wall_ms, err_s.as_deref());
-    if notification {
-        return OneOut::Notification;
-    }
-    let id_v1 = id.clone();
-    let id_v2 = id.clone().unwrap_or(serde_json::Value::Null);
-    OneOut::Reply(match dispatched {
-        Ok(result) => match ver {
-            JsonRpcVer::V2 => reply_v2(id_v2.clone(), Some(result), None),
-            JsonRpcVer::V1 => reply_v1(id_v1.clone(), Some(result), None),
-        },
-        Err(error) => match ver {
-            JsonRpcVer::V2 => reply_v2(id_v2, None, Some(error)),
-            JsonRpcVer::V1 => reply_v1(id_v1, None, Some(error)),
-        },
-    })
+    dispatch_reply(&env, dispatched)
 }
 
 #[doc(hidden)]
