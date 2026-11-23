@@ -174,9 +174,11 @@ tick **nightly**, and leave **ref** empty. The `musl` legs fail at once on
 any other branch or with a ref, so `nightly` only ever names master. A
 second nightly on the same day moves both tags.
 
-Before it pushes, `docker-publish` reads the commit the published
-`nightly` names. When that commit is newer than this build, the job skips
-the push. A re-run or a late nightly never moves `nightly` back.
+Before it pushes, `docker-publish` runs `scripts/nightly-guard.sh`, which
+reads the commit `nightly` names in each registry. When any of them is
+newer than this build, the job skips the push. A re-run or a late nightly
+never moves `nightly` back. A read error other than the tag missing, or a
+revision this clone does not have, fails the job.
 
 `docker-publish` runs one tag (or nightly) at a time across the repo (its own
 concurrency group), and each run reads the tag list at its start. Two tags

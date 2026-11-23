@@ -97,6 +97,8 @@ jobs:
         run: ./scripts/dockerfile.test.sh
       - name: docker-tags self-test
         run: ./scripts/docker-tags.test.sh
+      - name: nightly-guard self-test
+        run: ./scripts/nightly-guard.test.sh
       - name: fuzz-run self-test
         run: ./scripts/fuzz-run.test.sh
       - name: release-pin self-test
