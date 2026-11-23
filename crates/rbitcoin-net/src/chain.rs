@@ -267,72 +267,70 @@ impl ForkTips {
 #[doc(hidden)]
 #[derive(Default)]
 pub struct AskedBlocks {
-    set: RwLock<HashSet<BlockHash>>,
+    asks: RwLock<Asks>,
+}
+
+#[derive(Default)]
+struct Asks {
+    /// Live asks per hash, as Core keeps one in-flight entry per peer.
+    live: HashMap<BlockHash, u32>,
+    /// Clears at the cap so far. An ask from an earlier one holds nothing.
+    clears: u64,
 }
 
 impl AskedBlocks {
     const CAP: usize = 4096;
 
-    fn insert(set: &mut HashSet<BlockHash>, hash: BlockHash) {
-        if set.len() >= Self::CAP {
-            set.clear();
+    fn hold(self: &Arc<Self>, asks: &mut Asks, hash: BlockHash) -> BlockAsk {
+        if asks.live.len() >= Self::CAP && !asks.live.contains_key(&hash) {
+            asks.live.clear();
+            asks.clears += 1;
         }
-        set.insert(hash);
+        *asks.live.entry(hash).or_default() += 1;
+        BlockAsk {
+            hash,
+            clear: asks.clears,
+            asked: Some(Arc::clone(self)),
+        }
     }
 
     /// A new ask, or `None` when one is already out for `hash`.
     fn claim(self: &Arc<Self>, hash: BlockHash) -> Option<BlockAsk> {
-        let mut g = self.set.write().unwrap();
-        if g.contains(&hash) {
+        let mut g = self.asks.write().unwrap();
+        if g.live.contains_key(&hash) {
             return None;
         }
-        Self::insert(&mut g, hash);
-        Some(BlockAsk {
-            hash,
-            asked: Some(Arc::clone(self)),
-        })
+        Some(self.hold(&mut g, hash))
     }
 
     /// An ask for `hash` whether or not another is already out.
     fn ask(self: &Arc<Self>, hash: BlockHash) -> BlockAsk {
-        Self::insert(&mut self.set.write().unwrap(), hash);
-        BlockAsk {
-            hash,
-            asked: Some(Arc::clone(self)),
-        }
+        self.hold(&mut self.asks.write().unwrap(), hash)
     }
 
     fn contains(&self, hash: &BlockHash) -> bool {
-        self.set.read().unwrap().contains(hash)
+        self.asks.read().unwrap().live.contains_key(hash)
     }
 
     fn snapshot(&self) -> HashSet<BlockHash> {
-        self.set.read().unwrap().clone()
+        self.asks.read().unwrap().live.keys().copied().collect()
     }
 }
 
 /// One body ask on [`AskedBlocks`]. Dropping it releases the ask, so a
 /// request that ends any way (the body arrived, a mutated copy, a store
 /// fault, expiry, the session ended or its task was aborted) lets another
-/// peer be asked for the body. Asks for one hash share its one entry: the
-/// first to drop releases it.
+/// peer be asked for the body once no other ask for it is out.
 #[doc(hidden)]
 pub struct BlockAsk {
     hash: BlockHash,
+    clear: u64,
     asked: Option<Arc<AskedBlocks>>,
 }
 
 impl BlockAsk {
     pub fn hash(&self) -> BlockHash {
         self.hash
-    }
-
-    /// Ask again for the same body: the set may have been cleared at its cap
-    /// or released by another ask for this hash.
-    pub fn renew(&self) {
-        if let Some(asked) = &self.asked {
-            AskedBlocks::insert(&mut asked.set.write().unwrap(), self.hash);
-        }
     }
 
     fn keep_until_wipe(mut self) {
@@ -342,12 +340,21 @@ impl BlockAsk {
 
 impl Drop for BlockAsk {
     fn drop(&mut self) {
-        if let Some(asked) = self.asked.take() {
-            asked
-                .set
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&self.hash);
+        let Some(asked) = self.asked.take() else {
+            return;
+        };
+        let mut g = asked
+            .asks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.clears != self.clear {
+            return;
+        }
+        if let std::collections::hash_map::Entry::Occupied(mut live) = g.live.entry(self.hash) {
+            *live.get_mut() -= 1;
+            if *live.get() == 0 {
+                live.remove();
+            }
         }
     }
 }

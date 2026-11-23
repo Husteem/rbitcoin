@@ -135,6 +135,41 @@ fn two_threads_claiming_one_block_produce_one_ask() {
     assert!(hub.already_have_or_asked_block(&other));
 }
 
+/// Core drops only the leaving peer's in-flight entry. A body two peers
+/// were asked for stays asked until both asks end, and an ask from before
+/// the set cleared at its cap does not end a later claim.
+#[test]
+fn a_body_stays_asked_until_its_last_ask_ends() {
+    let (_dir, hub) = tmp_hub();
+    let hash = BlockHash::from_byte_array([0x51; 32]);
+    let first = hub.ask_block(hash);
+    let second = hub.ask_block(hash);
+    drop(first);
+    assert!(
+        hub.claim_block_ask(&hash).is_none(),
+        "the second ask is still in flight"
+    );
+    drop(second);
+    let before_clear = hub.claim_block_ask(&hash).expect("the last ask ended");
+    let mut others = Vec::new();
+    let after_clear = loop {
+        if let Some(ask) = hub.claim_block_ask(&hash) {
+            break ask;
+        }
+        assert!(others.len() < 10_000, "the asked set clears at its cap");
+        let mut other = [0xff; 32];
+        other[..8].copy_from_slice(&(others.len() as u64).to_le_bytes());
+        others.push(hub.ask_block(BlockHash::from_byte_array(other)));
+    };
+    drop(before_clear);
+    assert!(
+        hub.already_have_or_asked_block(&hash),
+        "an ask from before the clear does not end the later claim"
+    );
+    drop(after_clear);
+    assert!(!hub.already_have_or_asked_block(&hash));
+}
+
 /// A full `block.invalid` drops its oldest hash for a new failure, so the
 /// newest one survives restart.
 #[test]

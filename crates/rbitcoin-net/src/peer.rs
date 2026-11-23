@@ -692,7 +692,7 @@ impl PendingBlocks {
     pub fn insert(&mut self, hash: BlockHash, block: bitcoin::Block, ask: Option<BlockAsk>) {
         if stash_pending_block(self, hash, block) {
             if let Some(ask) = ask {
-                keep_one_ask(&mut self.asks, ask);
+                self.asks.insert(hash, ask);
             }
         }
     }
@@ -708,18 +708,6 @@ impl PendingBlocks {
             self.fifo.remove(i);
         }
         Some((b, self.asks.remove(hash)))
-    }
-}
-
-/// One ask per hash in `asks`. A second ask for a hash replaces the first,
-/// and the hash stays asked.
-fn keep_one_ask(asks: &mut HashMap<BlockHash, BlockAsk>, ask: BlockAsk) {
-    let hash = ask.hash();
-    if let Some(old) = asks.insert(hash, ask) {
-        drop(old);
-        if let Some(kept) = asks.get(&hash) {
-            kept.renew();
-        }
     }
 }
 
@@ -800,21 +788,18 @@ impl RequestedBlocks {
         true
     }
 
-    /// Ask for `hash` even when another session already has.
+    /// Ask for `hash` even when another session already has. The new ask
+    /// is held before an earlier one for the hash drops, so the hash stays
+    /// asked even if the set cleared since that earlier ask.
     pub fn ask(&mut self, hub: &ChainHub, hash: BlockHash) {
         self.hashes.insert(hash);
-        match self.asks.get(&hash) {
-            Some(ask) => ask.renew(),
-            None => {
-                self.asks.insert(hash, hub.ask_block(hash));
-            }
-        }
+        self.asks.insert(hash, hub.ask_block(hash));
     }
 
     /// Put back an ask taken out by [`Self::remove`].
     pub fn restore(&mut self, ask: BlockAsk) {
         self.hashes.insert(ask.hash());
-        keep_one_ask(&mut self.asks, ask);
+        self.asks.insert(ask.hash(), ask);
     }
 
     /// The body is settled here. The caller owns the returned ask; dropping
