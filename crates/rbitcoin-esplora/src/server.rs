@@ -676,8 +676,9 @@ async fn admit_connection(
 /// request takes a listener slot, as the RPC server reads its bodies.
 pub const ESPLORA_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Upload permits for [`read_body_first`]. As many as listener slots, so
-/// bodies being read stay under `max_conn * max_body` bytes.
+/// Upload permits for [`read_body_first`], held from the body read until the
+/// request is answered. As many as listener slots, so bodies read or
+/// waiting for a slot stay under `max_conn * max_body` bytes.
 #[derive(Clone)]
 struct BodyGate {
     sem: Arc<Semaphore>,
@@ -703,9 +704,13 @@ async fn read_body_first(State(gate): State<BodyGate>, req: Request, next: Next)
             Ok(Err(status)) => return status.into_response(),
             Ok(Ok(bytes)) => bytes,
         };
+    // Held until the request is answered, so bodies waiting for a slot
+    // stay under `max_conn * max_body`.
+    let resp = next
+        .run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await;
     drop(permit);
-    next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
-        .await
+    resp
 }
 
 /// The whole body, or `413` past `max` bytes, or `400` on a read error.
@@ -1700,9 +1705,10 @@ pub async fn run_esplora(
     } else {
         rest
     };
-    // Outer → inner: timeout → body read → concurrency → body limit → meter
-    // → chain-view stamp → heavy JSON encode. The timeout goes on last,
-    // outside the limit, so the wait for a slot counts against it.
+    // Outer → inner: timeout → body read → (BlindBit permit) → concurrency
+    // → body limit → meter → chain-view stamp → heavy JSON encode. The
+    // timeout goes on last, outside the limit, so the wait for a slot counts
+    // against it.
     let admit = AdmitGate::new(max_conn);
     let body_gate = BodyGate {
         sem: Arc::new(Semaphore::new(max_conn)),
@@ -1722,13 +1728,14 @@ pub async fn run_esplora(
                 Arc::clone(&admit),
                 admit_connection,
             ))
-            .layer(middleware::from_fn_with_state(
-                body_gate.clone(),
-                read_body_first,
-            ))
     };
+    // Outside every other permit, so a slow upload holds only its upload
+    // permit, not a listener slot or a BlindBit permit.
+    let body_first = || middleware::from_fn_with_state(body_gate.clone(), read_body_first);
     let request_timeout = || TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout);
-    let rest = listener_layers(rest.fallback(fallback_404)).layer(request_timeout());
+    let rest = listener_layers(rest.fallback(fallback_404))
+        .layer(body_first())
+        .layer(request_timeout());
     // BlindBit takes its own permit before a listener slot, so a scan queued
     // on it holds no slot. One timeout covers both waits. Merged after the
     // listener layers, so they wrap these routes once.
@@ -1738,6 +1745,7 @@ pub async fn run_esplora(
                 Arc::clone(&blindbit_limit),
                 crate::blindbit::blindbit_permit_mw,
             ))
+            .layer(body_first())
             .layer(request_timeout());
         rest.merge(blindbit)
     } else {

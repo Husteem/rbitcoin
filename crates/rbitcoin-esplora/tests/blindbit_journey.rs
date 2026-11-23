@@ -587,8 +587,44 @@ async fn blindbit_v1_routes_share_one_inflight_limit() {
     handle.shutdown().await;
 }
 
+/// A `forward-tx` whose body has not arrived holds no BlindBit permit: the
+/// body is read before that permit is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_forward_tx_body_holds_no_blindbit_permit() {
+    let (_dir, q) = temp_query("blindbit-stalled-body");
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    let fk0 = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    q.put_sp_tweaks_block(Height(0), fk0, &[None]).unwrap();
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.blindbit_max_inflight = 1;
+    let handle = run_esplora(cfg, Arc::new(q), None)
+        .await
+        .expect("listen");
+    let addr = handle.local_addr;
+    let mut stalled = TcpStream::connect(addr).await.unwrap();
+    stalled
+        .write_all(
+            b"POST /blindbit/v1/forward-tx HTTP/1.1\r\nHost: 127.0.0.1\r\n\
+              Content-Type: application/json\r\nContent-Length: 64\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (st, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        http_get(addr, "/blindbit/v1/tweak-index/0"),
+    )
+    .await
+    .expect("a stalled upload does not hold the only BlindBit permit");
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(handle.blindbit.held(), 0);
+    drop(stalled);
+    handle.shutdown().await;
+}
+
 /// A client that leaves while queued on BlindBit is no longer waiting.
-/// The permit stays with the forward-tx that holds it.
+/// The permit stays with the ask that holds it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_blindbit_waiter_clears_waiting() {
     let (_dir, q) = temp_query("blindbit-drop-waiter");
@@ -599,16 +635,18 @@ async fn dropped_blindbit_waiter_clears_waiting() {
     let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
     cfg.blindbit_max_inflight = 1;
     cfg.limits.max_connections = 2;
-    let handle = run_esplora(cfg, Arc::new(q), None)
+    // The held ask waits on the one store permit the test holds, inside its
+    // handler, so it keeps its BlindBit permit.
+    q.set_api_read_budget(1);
+    let q = Arc::new(q);
+    let _store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
     let addr = handle.local_addr;
 
     let mut held = TcpStream::connect(addr).await.unwrap();
-    held.write_all(
-        b"POST /blindbit/v1/forward-tx HTTP/1.1\r\nHost: 127.0.0.1\r\n\
-          Content-Type: application/json\r\nContent-Length: 64\r\n\r\n",
-    )
+    held.write_all(b"GET /blindbit/v1/tweaks/0 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
     .await
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -618,9 +656,9 @@ async fn dropped_blindbit_waiter_clears_waiting() {
             break;
         }
         let left = deadline.saturating_duration_since(Instant::now());
-        assert!(!left.is_zero(), "forward-tx did not take a BlindBit permit");
+        assert!(!left.is_zero(), "the held ask did not take a BlindBit permit");
         if tokio::time::timeout(left, notified).await.is_err() {
-            panic!("forward-tx did not take a BlindBit permit");
+            panic!("the held ask did not take a BlindBit permit");
         }
     }
     let before = handle.blindbit.waiting();

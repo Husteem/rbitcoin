@@ -972,7 +972,7 @@ async fn esplora_max_connections_spans_every_route() {
         stream.write_all(req.as_bytes()).await.unwrap();
         held.push(stream);
     }
-    // Every held POST has a slot before the GET starts. A late POST must
+    // Every held GET has a slot before the probe starts. A late holder must
     // not be the request that bumps `waiting`.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -981,9 +981,9 @@ async fn esplora_max_connections_spans_every_route() {
             break;
         }
         let left = deadline.saturating_duration_since(Instant::now());
-        assert!(!left.is_zero(), "stalled POSTs did not fill the listener");
+        assert!(!left.is_zero(), "held GETs did not fill the listener");
         if tokio::time::timeout(left, notified).await.is_err() {
-            panic!("stalled POSTs did not fill the listener");
+            panic!("held GETs did not fill the listener");
         }
     }
     let before = handle.admit.waiting();
@@ -1123,9 +1123,9 @@ async fn dropped_admit_waiter_clears_waiting() {
             break;
         }
         let left = deadline.saturating_duration_since(Instant::now());
-        assert!(!left.is_zero(), "stalled POST did not take the listener slot");
+        assert!(!left.is_zero(), "held GET did not take the listener slot");
         if tokio::time::timeout(left, notified).await.is_err() {
-            panic!("stalled POST did not take the listener slot");
+            panic!("held GET did not take the listener slot");
         }
     }
     let before = handle.admit.waiting();

@@ -2439,6 +2439,38 @@ async fn stalled_request_bodies_do_not_hold_listener_slots() {
     handle.shutdown().await;
 }
 
+/// The body read before admission keeps `max_request_bytes`: a body one
+/// byte past it is `413`, and one at it reaches the handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_read_before_admission_keeps_the_size_limit() {
+    const MAX: usize = 64;
+    let (_dir, q) = temp_query("body-limit-wire");
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.max_request_bytes = MAX;
+    let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+    let addr = handle.local_addr;
+    for (len, too_large) in [(MAX + 1, true), (MAX, false)] {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {len}\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.write_all(&vec![b'0'; len]).await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut reply))
+            .await
+            .expect("answered")
+            .unwrap();
+        let reply = String::from_utf8_lossy(&reply);
+        assert_eq!(
+            reply.starts_with("HTTP/1.1 413"),
+            too_large,
+            "{len} bytes: {reply}"
+        );
+    }
+    handle.shutdown().await;
+}
+
 include!("esplora_sh_journey.rs");
 include!("esplora_http_journey.rs");
 include!("blindbit_journey.rs");
