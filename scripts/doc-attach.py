@@ -12,12 +12,12 @@ in both revisions. It fails when that line differs and either
 
 - the item it used to sit on is still there and has lost it (a new item was
   inserted under the block), or
-- the item it now sits on was already there with a doc of its own (the
-  block's item was deleted and the block was left behind).
+- the item it now sits on was already there (the block's item was deleted
+  and the block was left behind).
 
-These pass: renaming the item under a block, rewriting an item's doc while
-its old lines move to a new item, and an undocumented item taking the doc
-of a deleted wrapper.
+These pass: renaming the item under a block, and rewriting an item's doc
+while its old lines move to a new item. An item that takes over a deleted
+item's doc passes once that doc is reworded for it.
 
 Usage: doc-attach.py --base REV [--head REV] [--root DIR]
 """
@@ -28,6 +28,7 @@ import subprocess
 import sys
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+RAW_OPEN = re.compile(r'r(#*)"')
 
 
 def git(root: str, *args: str) -> str:
@@ -37,7 +38,40 @@ def git(root: str, *args: str) -> str:
     return out.stdout
 
 
-STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
+def bracket_delta(line: str, text: str | None) -> tuple[int, str | None]:
+    """Net `[` minus `]` in the code on `line`, and the string left open.
+
+    `text` is the terminator of a string that an earlier line left open:
+    `"` for an ordinary string, `"#`.. for a raw one. Comments and strings
+    hold no brackets that count.
+    """
+    delta = 0
+    i = 0
+    n = len(line)
+    while i < n:
+        if text is not None:
+            if text == '"' and line[i] == "\\":
+                i += 2
+                continue
+            if line.startswith(text, i):
+                i += len(text)
+                text = None
+                continue
+            i += 1
+            continue
+        if line.startswith("//", i):
+            break
+        raw = RAW_OPEN.match(line, i)
+        if raw:
+            text = '"' + raw.group(1)
+            i = raw.end()
+        elif line[i] == '"':
+            text = '"'
+            i += 1
+        else:
+            delta += (line[i] == "[") - (line[i] == "]")
+            i += 1
+    return delta, text
 
 
 def classify(lines: list[str]) -> tuple[list[bool], list[bool]]:
@@ -45,6 +79,7 @@ def classify(lines: list[str]) -> tuple[list[bool], list[bool]]:
     marks = [False] * len(lines)
     plain = [False] * len(lines)
     depth = 0
+    text: str | None = None
     in_block: str | None = None
     for i, raw in enumerate(lines):
         line = raw.strip()
@@ -53,10 +88,10 @@ def classify(lines: list[str]) -> tuple[list[bool], list[bool]]:
             if "*/" in line:
                 in_block = None
             continue
-        if depth:
+        if depth > 0 or text is not None:
             marks[i] = True
-            bare = STRING.sub("", line)
-            depth += bare.count("[") - bare.count("]")
+            delta, text = bracket_delta(line, text)
+            depth = max(depth + delta, 0)
             continue
         if line.startswith("///"):
             marks[i] = True
@@ -69,8 +104,8 @@ def classify(lines: list[str]) -> tuple[list[bool], list[bool]]:
             plain[i] = True
         elif line.startswith("#["):
             marks[i] = True
-            bare = STRING.sub("", line)
-            depth = max(bare.count("[") - bare.count("]"), 0)
+            delta, text = bracket_delta(line, None)
+            depth = max(delta, 0)
     return marks, plain
 
 
@@ -169,11 +204,8 @@ def check_file(root: str, base: str, head: str, old_path: str, path: str) -> lis
                     f"on `{new.text(now)}`. Move the new item above the block."
                 )
         elif now in to_old:
-            # The line's item is gone. It is a leftover unless the item it
-            # fell on had no doc of its own, as when a wrapper is folded in.
-            texts = [old.text(j) for j in old.block_above(to_old[now])]
-            had_doc = any(is_doc(t) for t in texts)
-            if line not in texts and (had_doc or not is_doc(line)):
+            # The line's item is gone and the line fell on the next item.
+            if line not in [old.text(j) for j in old.block_above(to_old[now])]:
                 seen.add((was, now))
                 errors.append(
                     f"{path}:{i + 1}: this block sat on `{old.text(was)}`, which is "

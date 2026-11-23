@@ -120,7 +120,91 @@ pub fn connecting_n() {}
 #[doc(hidden)]
 pub fn connecting_n() {}
 EOF2
-assert_ok "an undocumented item may take a deleted wrapper's doc" check wrapper
+assert_fail_quiet "a deleted item's doc left on an undocumented item fails" check wrapper
+
+change wrapper-reworded <<'EOF2'
+/// Hashes from the fork point to `candidate`.
+pub fn connecting() {}
+
+#[doc(hidden)]
+pub fn connecting_n() {}
+====
+/// Hashes from the fork point to `candidate`, at most `walk_max` back.
+#[doc(hidden)]
+pub fn connecting_n() {}
+EOF2
+assert_ok "an item may take a deleted item's doc once it is reworded" check wrapper-reworded
+
+change comment-bracket <<'EOF2'
+#[cfg_attr(
+    // ] is not the end
+    feature = "x",
+    inline
+)]
+fn a() {}
+====
+#[cfg_attr(
+    // ] is not the end
+    feature = "x",
+    inline
+)]
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "a bracket in a comment inside an attribute does not close it" \
+  check comment-bracket
+
+change negative-depth <<'EOF2'
+#[cfg_attr(
+    // ]] closes nothing
+    feature = "x",
+    inline
+)]
+fn first() {}
+
+/// Docs for a.
+fn a() {}
+====
+#[cfg_attr(
+    // ]] closes nothing
+    feature = "x",
+    inline
+)]
+fn first() {}
+
+/// Docs for a.
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "stray closing brackets do not hide the rest of the file" \
+  check negative-depth
+
+change multiline-string <<'EOF2'
+#[doc = "start [
+ end"]
+fn a() {}
+====
+#[doc = "start [
+ end"]
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "a bracket in a string that crosses lines does not count" \
+  check multiline-string
+
+change raw-string <<'EOF2'
+#[doc = r#"a "quoted" [ bracket"#]
+fn a() {}
+====
+#[doc = r#"a "quoted" [ bracket"#]
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "a bracket in a raw string does not count" check raw-string
 
 change split <<'EOF2'
 /// Docs for a.
