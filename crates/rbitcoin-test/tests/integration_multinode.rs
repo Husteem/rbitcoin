@@ -1277,6 +1277,20 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
         .await;
         wait_ms_until(
             5_000,
+            || peer.hub.mempool().map(|m| m.orphan_count()).unwrap_or(0) == 1,
+            || {
+                format!(
+                    "peer must park the child (peer={:?})",
+                    peer.peers.snapshot()
+                )
+            },
+        )
+        .await;
+        // The parent request waits TXID_RELAY_DELAY_SECS (2 s) on the peer
+        // clock. Move that clock past it rather than wait wall seconds.
+        peer.peers.set_mock_now(peer.peers.now_secs() + 3);
+        wait_ms_until(
+            5_000,
             || {
                 let parked = peer.hub.mempool().map(|m| m.orphan_count()).unwrap_or(0);
                 let getdata = seed
@@ -1298,6 +1312,7 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
             },
         )
         .await;
+        peer.peers.set_mock_now(0);
         wait_ms_until(
             3_000,
             || {
