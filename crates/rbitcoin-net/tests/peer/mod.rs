@@ -10293,11 +10293,19 @@ fn headers_poll_expires_a_stale_tx_off_the_tokio_worker() {
 }
 
 /// Compact-filter requests read the store on the blocking pool, not on the
-/// session's `tokio-rt-worker` (`assert_not_reactor` panics there).
+/// session's `tokio-rt-worker` (`assert_not_reactor` panics there), and the
+/// replies still go out.
 #[test]
 fn compact_filter_requests_read_the_store_off_the_reactor() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cfilter-off-reactor");
+    hub.query.set_block_filter_index(true).unwrap();
     hub.ensure_genesis().unwrap();
+    let heights = hub.query.index_heights(0, 0, None).unwrap();
+    let window = hub.query.read_index_window(&heights).unwrap();
+    let filter = hub.query.basic_filter_from_window(&window, 0).unwrap();
+    hub.query
+        .commit_window_filters(0, &[(filter, heights[0].header_fk)])
+        .unwrap();
     let hub = hub.into_arc();
     let genesis = hub.tip_hash().unwrap();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -10308,7 +10316,7 @@ fn compact_filter_requests_read_the_store_off_the_reactor() {
         .unwrap();
     rt.block_on(async move {
         tokio::spawn(async move {
-            let (out_tx, _out_rx) = peer_out_channel();
+            let (out_tx, mut out_rx) = peer_out_channel();
             let mut follow = PeerFollowState::new();
             for msg in [
                 NetworkMessage::GetCFHeaders(bitcoin::p2p::message_filter::GetCFHeaders {
@@ -10330,6 +10338,21 @@ fn compact_filter_requests_read_the_store_off_the_reactor() {
                     .await
                     .expect("filter request");
             }
+            let mut got = Vec::new();
+            while let Ok(out) = out_rx.try_recv() {
+                got.push(out.expect_msg());
+            }
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [
+                        NetworkMessage::CFHeaders(_),
+                        NetworkMessage::CFilter(_),
+                        NetworkMessage::CFCheckpt(_)
+                    ]
+                ),
+                "{got:?}"
+            );
         })
         .await
         .expect("reactor task")

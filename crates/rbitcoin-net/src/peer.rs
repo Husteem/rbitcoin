@@ -4067,8 +4067,8 @@ pub async fn on_compact_filters(
     if session.is_some_and(|s| s.send_over_budget()) {
         return Ok(());
     }
-    // Up to 1,000 filters are read on the blocking pool under a header
-    // permit, not on the session's worker.
+    // Up to 1,000 filters or 2,000 filter headers are read on the blocking
+    // pool under a header permit, not on the session's worker.
     let replies = run_header_job(hub, move |hub| compact_filter_replies(hub, &payload)).await??;
     for reply in replies {
         if session.is_some_and(|s| s.send_over_budget()) {
