@@ -711,8 +711,12 @@ async fn http_post(addr: SocketAddr, path: &str, body: &[u8]) -> (u16, String) {
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream.write_all(req.as_bytes()).await.unwrap();
-    stream.write_all(body).await.unwrap();
+    // One write: a handler that answers without reading the body closes the
+    // socket, and on macOS a body that arrives after that resets the
+    // connection before the answer is read.
+    let mut msg = req.into_bytes();
+    msg.extend_from_slice(body);
+    stream.write_all(&msg).await.unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf).into_owned();
