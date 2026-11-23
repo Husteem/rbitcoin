@@ -1,3 +1,4 @@
+use rbitcoin_net::send_queue::{PeerOutRx, Queued};
 use rbitcoin_net::{AddrMan, Dialer, PeerConnType, TipEvent};
 use rbitcoin_node::config::{parse_btc_to_sat, NodeConfig, NodeEnv};
 use rbitcoin_node::run::*;
@@ -563,13 +564,12 @@ async fn indexing_finished_sends_feefilter_once_when_the_tip_is_fresh() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
 
     struct Edge {
         node: P2PNode,
         mempool: Arc<MempoolHub>,
         config: NodeConfig,
-        rx: mpsc::UnboundedReceiver<PeerOut>,
+        rx: PeerOutRx,
         floor: i64,
     }
 
@@ -617,8 +617,7 @@ async fn indexing_finished_sends_feefilter_once_when_the_tip_is_fresh() {
         let peer = node
             .peers
             .register(addr, addr, &ver, false, PeerConnType::OutboundFullRelay);
-        let (tx, rx) = mpsc::unbounded_channel();
-        peer.attach_out(tx);
+        let (_, rx) = peer.open_out();
         let floor = node.hub.feefilter_sat_kvb() as i64;
         Edge {
             node,
@@ -641,7 +640,7 @@ async fn indexing_finished_sends_feefilter_once_when_the_tip_is_fresh() {
         "the tip is fresh and relay has not flipped"
     );
     run_edge(&fresh).await;
-    match fresh.rx.try_recv() {
+    match fresh.rx.try_recv().map(Queued::into_out) {
         Ok(PeerOut::Msg(NetworkMessage::FeeFilter(fee))) => {
             assert_eq!(fee, fresh.floor, "the filter is the post-IBD floor");
         }

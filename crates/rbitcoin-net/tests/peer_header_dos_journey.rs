@@ -12,7 +12,7 @@ fn side_tips(hub: &rbitcoin_net::chain::ChainHub) -> usize {
         .count()
 }
 
-fn asked_blocks(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<BlockHash> {
+fn asked_blocks(rx: &mut PeerOutRx) -> Vec<BlockHash> {
     getdata_of(&take_msgs(rx))
         .into_iter()
         .map(|(hash, _)| hash)
@@ -25,7 +25,7 @@ fn zero_stop() -> BlockHash {
 
 async fn push(
     hub: &rbitcoin_net::chain::ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&rbitcoin_net::peers::LivePeer>,
     msg: NetworkMessage,
@@ -136,7 +136,7 @@ async fn handshake_verack_and_addrv2(
         "verack"
     ));
 
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     rbitcoin_log::capture_logs(true);
     push(
@@ -208,7 +208,7 @@ async fn wire_caps_one_past_disconnect(
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
 ) {
     use rbitcoin_net::peers::PeerConnType;
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
 
     let fetch = live_peer_as(peers, 18601, 601, PeerConnType::AddrFetch);
     let sock = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 8333);
@@ -314,7 +314,7 @@ async fn getblocks_locator_cap(
             .chain(std::iter::once(genesis))
             .collect()
     };
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let sess = live_peer(peers, 18602, 602, true);
     let mut follow = PeerFollowState::new();
     let inv_hashes = |msgs: Vec<NetworkMessage>| -> Vec<BlockHash> {
@@ -419,7 +419,7 @@ async fn unknown_parent_bodies(
     use bitcoin::p2p::message_compact_blocks::CmpctBlock;
 
     let peer = live_peer(peers, 18450, 2, false);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let block = orphan_body(BlockHash::from_byte_array([0xab; 32]), 0);
     let hash = block.block_hash();
@@ -446,7 +446,7 @@ async fn unknown_parent_bodies(
 
     let peer = live_peer(peers, 18451, 3, false);
     peer.note_awaiting_headers();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let block = orphan_body(BlockHash::from_byte_array([0xab; 32]), 0);
     let hash = block.block_hash();
@@ -476,7 +476,7 @@ async fn unknown_parent_bodies(
 
     let peer = live_peer(peers, 18452, 4, false);
     peer.note_awaiting_headers();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.send_cmpct = true;
     follow.cmpct_version = 2;
@@ -535,7 +535,7 @@ async fn unknown_parent_bodies(
     assert!(follow.pending_headers.contains_key(&child.block_hash()));
 }
 
-fn getheaders_count(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> usize {
+fn getheaders_count(rx: &mut PeerOutRx) -> usize {
     take_msgs(rx)
         .iter()
         .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
@@ -557,7 +557,7 @@ async fn header_flood_and_pending_walk(
     peers.set_mock_now(start);
     let peer = live_peer(peers, 18453, 5, false);
     peer.note_awaiting_headers();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let unknown = Header {
         version: Version::from_consensus(4),
@@ -617,7 +617,7 @@ async fn header_flood_and_pending_walk(
     let our_tip = hub.tip_hash().unwrap();
     let peer = live_peer(peers, 18454, 6, false);
     let mut follow = PeerFollowState::new();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     push(
         hub,
         &out_tx,
@@ -703,7 +703,7 @@ async fn header_getdata_decisions(
         "claimed nBits without PoW must not outwork the tip"
     );
     let peer = live_peer(peers, 18455, 7, false);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     push(
         hub,
@@ -754,7 +754,7 @@ async fn minchainwork_while_tip_is_short(
     hub.set_minimum_chain_work(Some(work_floor(0x1f)));
     let hdrs14: Vec<_> = (1..=14u32).map(|h| header_at(src, h)).collect();
     let peer = live_peer(peers, 18456, 8, false);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     for hdr in &hdrs14 {
         push(
@@ -839,7 +839,7 @@ async fn shorter_higher_work_rejected_by_the_store_is_not_fetched(
         "one harder header must outwork the short tip"
     );
     let peer = live_peer(peers, 18457, 9, false);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     push(
         hub,
@@ -895,7 +895,7 @@ async fn tall_unknown_parent_skips_reconstruct(
     peer.note_awaiting_headers();
     let block = orphan_body(BlockHash::from_byte_array([0xcd; 32]), 0);
     let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.send_cmpct = true;
     follow.cmpct_version = 2;
@@ -948,7 +948,7 @@ async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub)
         !rbitcoin_net::chain::accept_err_is_temporary_time(&pow_err),
         "bad pow is not a temporary stamp: {pow_err}"
     );
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(bad_pow.block_hash());
     push(hub, &out_tx, &mut follow, None, NetworkMessage::Block(bad_pow.clone())).await;
@@ -1128,7 +1128,7 @@ async fn noban_and_manual_bad_block_is_not_punished(
             break;
         }
     }
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
 
     let plain = live_peer(peers, 18472, 21, true);
     let mut follow = PeerFollowState::new();
@@ -1206,7 +1206,7 @@ async fn sixty_four_byte_body_is_mutated(
     let time = hub.tip_header().unwrap().time.saturating_add(1);
     let inner = rbitcoin_net::chain::sixty_four_byte_body(tip, time);
     let hash = inner.block_hash();
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let sender = live_peer(peers, 18474, 23, true);
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
@@ -1259,7 +1259,7 @@ async fn empty_body_null_merkle_bans_before_the_header(
         "an empty list has no merkle root"
     );
     let hash = block.block_hash();
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let sender = live_peer(peers, 18478, 27, true);
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
@@ -1299,7 +1299,7 @@ async fn invalid_parent_child_is_fetched_after_reconsider(
     run_on_tip_accept(|| hub.invalidate_block_inner(parent)).unwrap();
     let child = rbitcoin_consensus::mine_regtest_paying(parent, time, height, op_true(), vec![]);
     let hash = child.block_hash();
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
 
     // The parent of that header is valid. The header itself is the
     // invalidated block, and that alone disconnects.
@@ -1353,7 +1353,7 @@ async fn merkle_mismatch_forgets_the_ask(
     let hash = wrong.block_hash();
     wrong.txdata[0].output[0].value = bitcoin::Amount::from_sat(1);
     assert!(!wrong.check_merkle_root());
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let sender = live_peer(peers, 18475, 24, true);
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
@@ -1449,7 +1449,7 @@ async fn manual_peer_is_asked_again_after_a_mutated_copy(
     assert_eq!(witnessed.block_hash(), hash);
 
     for (n, copy) in [wrong_root, duplicated, witnessed].into_iter().enumerate() {
-        let (out_tx, mut rx) = mpsc::unbounded_channel();
+        let (out_tx, mut rx) = peer_out_channel();
         let manual = live_peer_as(
             peers,
             18479 + n as u16,
@@ -1493,7 +1493,7 @@ async fn sixty_four_byte_kept_peer_and_dropped_session(
     let time = hub.tip_header().unwrap().time.saturating_add(5);
     let short = rbitcoin_net::chain::sixty_four_byte_body(tip, time);
     let short_hash = short.block_hash();
-    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let (out_tx, mut rx) = peer_out_channel();
     let manual = live_peer_as(
         peers,
         18482,
@@ -1520,7 +1520,7 @@ async fn sixty_four_byte_kept_peer_and_dropped_session(
 
     let dropped_body = rbitcoin_net::chain::sixty_four_byte_body(tip, time.saturating_add(1));
     let dropped_hash = dropped_body.block_hash();
-    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let (out_tx, mut rx) = peer_out_channel();
     let dropped = live_peer(peers, 18483, 32, false);
     let mut follow = PeerFollowState::new();
     admit_pending_header(
@@ -1587,7 +1587,7 @@ async fn signet_block_without_a_witness_commitment_is_invalid() {
     let witnessed_hash = witnessed.block_hash();
     witnessed.txdata[0].input[0].witness = Witness::from_slice(&[[1u8; 3]]);
     assert_eq!(witnessed.block_hash(), witnessed_hash);
-    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let (out_tx, mut rx) = peer_out_channel();
     let manual = live_peer_as(&peers, 18496, 90, rbitcoin_net::peers::PeerConnType::Manual);
     let mut follow = PeerFollowState::new();
     admit_pending_header(&mut follow.pending_headers, witnessed_hash, witnessed.header);
@@ -1619,7 +1619,7 @@ async fn signet_block_without_a_witness_commitment_is_invalid() {
     let hash = bare.block_hash();
     assert_ne!(hash, witnessed_hash);
     assert!(bare.txdata[0].input[0].witness.is_empty());
-    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let (out_tx, mut rx) = peer_out_channel();
     let manual = live_peer_as(&peers, 18497, 91, rbitcoin_net::peers::PeerConnType::Manual);
     let mut follow = PeerFollowState::new();
     admit_pending_header(&mut follow.pending_headers, hash, bare.header);
@@ -1683,7 +1683,7 @@ async fn duplicate_pair_disconnects(
     );
     let hash = block.block_hash();
     let tip = hub.tip_hash().unwrap();
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let sender = live_peer(peers, 18476, 25, true);
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
@@ -1734,7 +1734,7 @@ async fn rejected_header_logs_core_reason(hub: &rbitcoin_net::chain::ChainHub) {
     while v3.header.validate_pow(target).is_err() {
         v3.header.nonce = v3.header.nonce.wrapping_add(1);
     }
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(v3.block_hash());
     rbitcoin_log::reset_repeated_info();
@@ -1796,7 +1796,7 @@ async fn ancient_weaker_fork_disconnects(
     rbitcoin_consensus::grind_regtest_pow(&mut side);
 
     let peer = live_peer(peers, 18470, 11, false);
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     push(
         hub,
@@ -2213,10 +2213,9 @@ fn external_onion_announcement_uses_the_configured_or_listen_port_on_tor() {
     peers.set_listen_port(18445);
     let announce = || {
         let peer = overlay_peer(&peers, tor, Out);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        peer.attach_out(tx);
+        let (_, mut rx) = peer.open_out();
         peer.queue_self_announce_if_due();
-        let PeerOut::Msg(NetworkMessage::AddrV2(addrs)) = rx.try_recv().unwrap() else {
+        let PeerOut::Msg(NetworkMessage::AddrV2(addrs)) = rx.try_recv().unwrap().into_out() else {
             panic!("expected Tor addrv2");
         };
         assert_eq!(addrs.len(), 1);
@@ -2869,7 +2868,7 @@ async fn outbound_low_work_headers_disconnect_during_ibd() {
         headers: &[bitcoin::block::Header],
     ) -> std::sync::Arc<rbitcoin_net::peers::LivePeer> {
         let peer = live_peer_as(peers, port, nonce, conn);
-        let (out_tx, _rx) = mpsc::unbounded_channel();
+        let (out_tx, _rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         push(
             hub,
@@ -3001,7 +3000,7 @@ async fn known_good_chain_survives_a_later_low_work_fork() {
     let peer = live_peer_as(&peers, 18511, 91, PeerConnType::OutboundFullRelay);
     peer.note_best_known(hub.tip_hash().unwrap());
     let fork = regtest_header_chain(header_at(&hub, 0).block_hash(), 1);
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     rbitcoin_log::capture_logs(true);
     push(
@@ -3071,7 +3070,7 @@ async fn earlier_block_does_not_replace_best_known() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer_as(&peers, 18512, 92, PeerConnType::OutboundFullRelay);
     peer.note_best_known(tip);
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let unknown = BlockHash::from_byte_array([0xab; 32]);
     on_inv(
@@ -3204,7 +3203,7 @@ async fn equal_work_fork_keeps_its_work_after_pending_drop() {
     fork_hdr.nonce = 0;
     rbitcoin_consensus::grind_regtest_pow(&mut fork_hdr);
     let fork_hash = fork_hdr.block_hash();
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     push(
         &hub,
@@ -3348,7 +3347,7 @@ async fn bad_pow_cmpct_scores_and_asks_for_nothing() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(std::sync::Arc::clone(&mp)).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
 
     let bad = bad_pow_cmpct_on_tip(&hub);
     assert_eq!(bad.short_ids.len(), 1);
@@ -3534,7 +3533,7 @@ async fn below_floor_headers_are_not_stored_or_fetched() {
     assert!(!hub.meets_minimum_chain_work());
     let hdrs: Vec<_> = (1..=3u32).map(|h| header_at(&src, h)).collect();
     let peer = live_peer(&peers, 18601, 41, false);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     push(
         &hub,
@@ -3597,7 +3596,7 @@ async fn below_floor_header_answers_getheaders_only_on_our_chain() {
     assert!(!hub.meets_minimum_chain_work());
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18621, 61, false);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let orphan = regtest_header_chain(BlockHash::from_byte_array([0x11; 32]), 1);
     peer.note_awaiting_headers();
@@ -3642,7 +3641,7 @@ async fn full_pending_below_floor_batch_answers_getheaders() {
     hub.set_minimum_chain_work(Some([0xff; 32]));
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18622, 62, false);
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let batch = MAX_HEADERS_RESULTS as u32;
     let mut prev = hub.tip_hash().unwrap();
@@ -3714,7 +3713,7 @@ async fn below_floor_full_batch_does_not_page() {
     hub.set_minimum_chain_work(Some(floor));
     let first = chain[..n as usize].to_vec();
     let peer = live_peer(&peers, 18611, 51, false);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     push(
         &hub,
@@ -3821,7 +3820,7 @@ async fn a_later_ask_keeps_the_earlier_block() {
     let a = rbitcoin_consensus::mine_regtest_paying(gen, t, 1, op_true(), vec![]);
     let b = rbitcoin_consensus::mine_regtest_paying(a.block_hash(), t.saturating_add(1), 2, op_true(), vec![]);
     let peer = live_peer(&peers, 18601, 40, false);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     push(
         &hub,
@@ -3838,7 +3837,7 @@ async fn a_later_ask_keeps_the_earlier_block() {
     );
 
     let peer2 = live_peer(&peers, 18602, 41, false);
-    let (out2, mut rx2) = mpsc::unbounded_channel();
+    let (out2, mut rx2) = peer_out_channel();
     let mut follow2 = PeerFollowState::new();
     push(
         &hub,
@@ -3890,7 +3889,7 @@ async fn parked_headers_are_walked_once_per_message() {
     let have = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18621, 61, true);
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let trunk = regtest_header_chain(BlockHash::from_byte_array([0xab; 32]), 150);
     let other = regtest_header_chain(BlockHash::from_byte_array([0xcd; 32]), 50);
@@ -4007,7 +4006,7 @@ async fn parked_chain_that_connects_becomes_best_known() {
     let low = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18622, 62, true);
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let chain = regtest_headers_after(&tip, 40);
     let last = chain[39].block_hash();
@@ -4071,7 +4070,7 @@ async fn path_work_memo_keeps_a_bounded_number_of_stored_headers() {
     let tip = hub.tip_header().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18624, 64, true);
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let mut pending = std::collections::HashMap::new();
     let mut leaves = Vec::new();
@@ -4130,7 +4129,7 @@ async fn failure_walk_does_not_spend_the_work_walk_cache() {
     let tip = hub.tip_header().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18625, 65, true);
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let stored_n = 20u32;
     let stored = regtest_headers_after(&tip, stored_n);
@@ -4192,7 +4191,7 @@ async fn full_pending_map_eviction_walks_each_header_once() {
     let tip = hub.tip_header().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer(&peers, 18623, 63, true);
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let trunk = regtest_headers_after(&tip, 100);
     let trunk_tip = trunk[99];

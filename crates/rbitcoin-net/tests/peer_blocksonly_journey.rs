@@ -31,9 +31,8 @@ fn peer_with_relay(
     peers.register(addr, addr, &ver, inbound, conn)
 }
 
-fn writer_of(sess: &rbitcoin_net::peers::LivePeer) -> mpsc::UnboundedReceiver<PeerOut> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    sess.attach_out(tx);
+fn writer_of(sess: &rbitcoin_net::peers::LivePeer) -> PeerOutRx {
+    let (_, rx) = sess.open_out();
     rx
 }
 
@@ -87,7 +86,7 @@ fn orphan_of(parents: &[bitcoin::OutPoint]) -> bitcoin::Transaction {
 }
 
 /// Txids INV'd to a peer that never sent `wtxidrelay` (BIP339: `MSG_TX`).
-fn tx_invs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<bitcoin::Txid> {
+fn tx_invs(rx: &mut PeerOutRx) -> Vec<bitcoin::Txid> {
     let mut out = Vec::new();
     for msg in take_msgs(rx) {
         match msg {
@@ -105,7 +104,7 @@ fn tx_invs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<bitcoin::Txid> {
     out
 }
 
-fn getdata_txs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<Inventory> {
+fn getdata_txs(rx: &mut PeerOutRx) -> Vec<Inventory> {
     take_msgs(rx)
         .into_iter()
         .filter_map(|m| match m {
@@ -132,7 +131,7 @@ async fn blocksonly_p2p_tx_disconnects(
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
 ) {
     let sess = relay_peer(peers, [127, 0, 0, 1], rbitcoin_net::peers::PeerConnType::Inbound);
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let tx = orphan_of(&[bitcoin::OutPoint::null()]);
     let mut follow = PeerFollowState::new();
     push(hub, &out_tx, &mut follow, Some(sess.as_ref()), NetworkMessage::Tx(tx)).await;
@@ -187,7 +186,7 @@ async fn blocksonly_sendraw_invs_inbound(
 
     let inbound = relay_peer(peers, [127, 0, 0, 1], rbitcoin_net::peers::PeerConnType::Inbound);
     let block_relay = relay_peer(peers, [127, 0, 0, 1], rbitcoin_net::peers::PeerConnType::BlockRelay);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &out_tx);
     assert_eq!(tx_invs(&mut out_rx), vec![tx.compute_txid()]);
     queue_due_tx_invs(hub, block_relay.as_ref(), &CappedSet::new(), &out_tx);
@@ -245,7 +244,7 @@ async fn blocksonly_relay_perm_tx_invs_other_inbound(
     let mut listed_rx = writer_of(&listed);
     let mut other_rx = writer_of(&other);
 
-    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.wtxid_relay = true;
     push(
@@ -321,7 +320,7 @@ async fn getdata_type0_then_tip_block(
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
 ) {
     let sess = relay_peer(peers, [127, 0, 0, 1], rbitcoin_net::peers::PeerConnType::Inbound);
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     let type0 = NetworkMessage::GetData(vec![Inventory::Unknown {
         inv_type: 0,
@@ -423,8 +422,8 @@ async fn force_announce_picks_peers(
     let stand_above = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
     let _stand_above_rx = writer_of(&stand_above);
     stand_above.note_minfeefilter_sat_kvb(rate.saturating_add(1));
-    let (eq_tx, mut eq_ann) = mpsc::unbounded_channel();
-    let (hi_tx, mut hi_ann) = mpsc::unbounded_channel();
+    let (eq_tx, mut eq_ann) = peer_out_channel();
+    let (hi_tx, mut hi_ann) = peer_out_channel();
     on_tx_announce_ok(
         hub,
         &eq_tx,
@@ -468,8 +467,8 @@ async fn force_announce_picks_peers(
     let due_above = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
     let _due_above_rx = writer_of(&due_above);
     due_above.note_minfeefilter_sat_kvb(rate.saturating_add(1));
-    let (due_eq_tx, mut due_eq_rx) = mpsc::unbounded_channel();
-    let (due_hi_tx, mut due_hi_rx) = mpsc::unbounded_channel();
+    let (due_eq_tx, mut due_eq_rx) = peer_out_channel();
+    let (due_hi_tx, mut due_hi_rx) = peer_out_channel();
     queue_due_tx_invs(hub, due_equal.as_ref(), &CappedSet::new(), &due_eq_tx);
     queue_due_tx_invs(hub, due_above.as_ref(), &CappedSet::new(), &due_hi_tx);
     assert_eq!(tx_invs(&mut due_eq_rx), vec![relayed.compute_txid()]);
@@ -563,7 +562,7 @@ async fn returned_tx_ends_the_private_broadcast(
             .expect("local");
         let submitted = mp.relay_now_secs();
 
-        let (block_out, mut block_rx) = mpsc::unbounded_channel();
+        let (block_out, mut block_rx) = peer_out_channel();
         let mut block_follow = PeerFollowState::new();
         push(hub, &block_out, &mut block_follow, Some(block_only.as_ref()), NetworkMessage::Inv(vec![item])).await;
         assert!(getdata_txs(&mut block_rx).is_empty(), "no getdata to a block-relay peer");
@@ -573,7 +572,7 @@ async fn returned_tx_ends_the_private_broadcast(
             wtxid_relay_ignores_txid_inv(hub, peers, item).await;
         }
 
-        let (echo_out, mut echo_rx) = mpsc::unbounded_channel();
+        let (echo_out, mut echo_rx) = peer_out_channel();
         let mut follow = PeerFollowState::new();
         push(hub, &echo_out, &mut follow, Some(echo.as_ref()), NetworkMessage::Inv(vec![item])).await;
         assert_eq!(getdata_txs(&mut echo_rx), vec![item], "ask the peer for our tx");
@@ -617,10 +616,10 @@ async fn returned_tx_ends_the_private_broadcast(
             "the tx coming back from a standing peer ends the private broadcast"
         );
         assert!(tx_invs(&mut other_rx).is_empty(), "no announce before the inv timer");
-        let (due_out, mut due_rx) = mpsc::unbounded_channel();
+        let (due_out, mut due_rx) = peer_out_channel();
         queue_due_tx_invs(hub, other.as_ref(), &CappedSet::new(), &due_out);
         assert!(tx_invs(&mut due_rx).contains(&txid), "announce on the next inv tick");
-        let (back_out, mut back_rx) = mpsc::unbounded_channel();
+        let (back_out, mut back_rx) = peer_out_channel();
         queue_due_tx_invs(hub, echo.as_ref(), &follow.from_this_peer, &back_out);
         assert!(
             !tx_invs(&mut back_rx).contains(&txid),
@@ -652,7 +651,7 @@ async fn wtxid_relay_ignores_txid_inv(
     use rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
     let wtxid_peer = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
     wtxid_peer.set_wtxid_relay();
-    let (w_out, mut w_rx) = mpsc::unbounded_channel();
+    let (w_out, mut w_rx) = peer_out_channel();
     let mut w_follow = PeerFollowState::new();
     push(
         hub,
@@ -681,7 +680,7 @@ async fn wtxid_relay_ignores_txid_inv(
         "a wtxid-relay peer's txid inv is ignored for a tx this node does not have"
     );
     let plain = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
-    let (plain_out, mut plain_rx) = mpsc::unbounded_channel();
+    let (plain_out, mut plain_rx) = peer_out_channel();
     let mut plain_follow = PeerFollowState::new();
     push(
         hub,
@@ -705,13 +704,13 @@ async fn notfound_asks_the_next_announcer(
     hub: &rbitcoin_net::chain::ChainHub,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
     echo: &rbitcoin_net::peers::LivePeer,
-    echo_out: &mpsc::UnboundedSender<PeerOut>,
+    echo_out: &PeerOutTx,
     follow: &mut PeerFollowState,
     item: Inventory,
 ) -> std::sync::Arc<rbitcoin_net::peers::LivePeer> {
     use rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
     let later = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
-    let (later_out, mut later_rx) = mpsc::unbounded_channel();
+    let (later_out, mut later_rx) = peer_out_channel();
     let mut later_follow = PeerFollowState::new();
     push(
         hub,
@@ -750,8 +749,8 @@ async fn inbound_waits_thirty_seconds_from_the_echo(
 ) -> std::sync::Arc<rbitcoin_net::peers::LivePeer> {
     use rbitcoin_net::peers::PeerConnType::Inbound;
     let inbound = relay_peer(peers, [127, 0, 0, 1], Inbound);
-    let (in_out, mut in_rx) = mpsc::unbounded_channel();
-    let quiet = |rx: &mut mpsc::UnboundedReceiver<PeerOut>, why: &str| {
+    let (in_out, mut in_rx) = peer_out_channel();
+    let quiet = |rx: &mut PeerOutRx, why: &str| {
         assert!(!tx_invs(rx).contains(&txid), "{why}");
     };
     queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &in_out);
@@ -796,7 +795,7 @@ fn relay_on_inbound_age_gate(
     let late = relay_peer(peers, [127, 0, 0, 1], Inbound);
     late.set_inv_gen_floor(mp.next_accept_gen());
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let _ = mp.sample_reset_perf();
     for _ in 0..20 {
         queue_due_tx_invs(hub, inbound.as_ref(), &CappedSet::new(), &out_tx);
@@ -897,7 +896,7 @@ async fn getdata_until_announced_or_reorg(
 
     let sess = relay_peer(peers, [127, 0, 0, 1], rbitcoin_net::peers::PeerConnType::Inbound);
     assert!(!sess.session_noban());
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.wtxid_relay = true;
     push(hub, &out_tx, &mut follow, Some(sess.as_ref()), wtx_getdata(&old_a)).await;
@@ -971,7 +970,7 @@ async fn orphan_parks_then_asks_missing_parent(
         },
     ]);
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let worker = {
         let hub = Arc::clone(hub);
         let spy = Arc::clone(&spy);
@@ -1116,7 +1115,7 @@ async fn rebroadcast_reaches_a_peer_that_joined_after_the_accept() {
 
     let late = relay_peer(&peers, [127, 0, 0, 2], OutboundFullRelay);
     late.set_inv_gen_floor(mp.next_accept_gen());
-    let (out, mut rx) = mpsc::unbounded_channel();
+    let (out, mut rx) = peer_out_channel();
     queue_due_tx_invs(&hub, late.as_ref(), &CappedSet::new(), &out);
     assert!(
         tx_invs(&mut rx).is_empty(),
@@ -1134,7 +1133,7 @@ async fn rebroadcast_reaches_a_peer_that_joined_after_the_accept() {
 
     let after = relay_peer(&peers, [127, 0, 0, 3], OutboundFullRelay);
     after.set_inv_gen_floor(mp.next_accept_gen());
-    let (after_out, mut after_rx) = mpsc::unbounded_channel();
+    let (after_out, mut after_rx) = peer_out_channel();
     queue_due_tx_invs(&hub, after.as_ref(), &CappedSet::new(), &after_out);
     assert!(
         tx_invs(&mut after_rx).is_empty(),
@@ -1170,7 +1169,7 @@ async fn note_unbroadcast_requeues_after_a_relay_off_tick() {
     mp.admit(&second).expect("second");
 
     let peer = peer_with_relay(&peers, [127, 0, 0, 5], OutboundFullRelay, false);
-    let (out, mut rx) = mpsc::unbounded_channel();
+    let (out, mut rx) = peer_out_channel();
     queue_due_tx_invs(&hub, peer.as_ref(), &CappedSet::new(), &out);
     let got = tx_invs(&mut rx);
     assert!(got.contains(&first.compute_txid()), "the noted tx is announced");

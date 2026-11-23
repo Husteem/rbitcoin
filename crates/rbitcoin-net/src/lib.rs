@@ -49,6 +49,8 @@ pub mod reactor;
 #[doc(hidden)]
 pub mod seeds;
 #[doc(hidden)]
+pub mod send_queue;
+#[doc(hidden)]
 pub mod serve_perf;
 #[doc(hidden)]
 pub mod service;

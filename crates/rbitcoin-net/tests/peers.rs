@@ -6,6 +6,7 @@ use bitcoin::p2p::message_network::VersionMessage;
 use bitcoin::p2p::ServiceFlags;
 use bitcoin::{BlockHash, Txid, Wtxid};
 pub use rbitcoin_net::peers::*;
+use rbitcoin_net::send_queue::PeerOutRx;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -263,11 +264,7 @@ fn peerhub_hb_select() {
     };
     let hb = |p: &LivePeer| p.hb_to.load(Ordering::Relaxed);
     let pending = |p: &LivePeer| p.pending_sendcmpct.load(Ordering::Relaxed);
-    let sendcmpct = |rx: &mut mpsc::UnboundedReceiver<PeerOut>| match rx
-        .try_recv()
-        .expect("sendcmpct")
-        .expect_msg()
-    {
+    let sendcmpct = |rx: &mut PeerOutRx| match rx.try_recv().expect("sendcmpct").expect_msg() {
         NetworkMessage::SendCmpct(sc) => {
             assert_eq!(sc.version, 2);
             sc.send_compact
@@ -289,8 +286,7 @@ fn peerhub_hb_select() {
     assert!(hb(&a));
     assert_eq!(pending(&a), PendingSendCmpct::Hb as u8);
     let b = join(18446, true);
-    let (b_tx, mut b_rx) = mpsc::unbounded_channel();
-    b.attach_out(b_tx);
+    let (_, mut b_rx) = b.open_out();
     hub.maybe_select_hb(b.id);
     assert!(hb(&b) && sendcmpct(&mut b_rx));
     assert_eq!(pending(&b), 0);
@@ -970,8 +966,7 @@ async fn leaving_ibd_starts_tx_relay_and_high_bandwidth_in_tip_mode() {
         false,
         PeerConnType::OutboundFullRelay,
     );
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    peer.attach_out(out_tx);
+    let (_, mut out_rx) = peer.open_out();
     let now = chain.clock.now_secs() as u32;
     let block = rbitcoin_consensus::mine_empty_regtest(chain.tip_hash().unwrap(), now, 1);
     let got = accept_received_from_peer(&chain, block, Some(&peer))
@@ -2321,6 +2316,164 @@ fn filter_and_compact_block_replies_charge_their_consensus_payload() {
         compact_n,
         "a served compact block uses the same payload charge"
     );
+}
+
+/// No message kind is charged less than its payload on the send budget.
+/// Only a kind counted by its rows leaves out the row count, nine bytes at
+/// most.
+#[test]
+fn every_message_kind_is_charged_its_payload() {
+    use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
+    use bitcoin::bip158::{FilterHash, FilterHeader};
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::message::{CommandString, RawNetworkMessage};
+    use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage};
+    use bitcoin::p2p::message_bloom::{BloomFlags, FilterAdd, FilterLoad};
+    use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn, SendCmpct};
+    use bitcoin::p2p::message_filter::{
+        CFCheckpt, CFHeaders, CFilter, GetCFCheckpt, GetCFHeaders, GetCFilters,
+    };
+    use bitcoin::p2p::message_network::{Reject, RejectReason};
+
+    const ROW_COUNT_MAX: usize = 9;
+    const WIRE_HEADER: usize = 24;
+
+    let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let hash = block.block_hash();
+    let tx = block.txdata[0].clone();
+    let mut fat = block.clone();
+    fat.txdata[0].output[0].script_pubkey = bitcoin::ScriptBuf::from_bytes(vec![0x6a; 1_500]);
+    let locator = vec![hash; 101];
+    let inv = vec![Inventory::Block(hash); 100];
+    let peer_addr = Address::new(
+        &SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+        ServiceFlags::NONE,
+    );
+    let filter_type = 0;
+    let samples = vec![
+        NetworkMessage::Version(ver(&"a".repeat(256))),
+        NetworkMessage::Verack,
+        NetworkMessage::Addr(vec![(1, peer_addr); 100]),
+        NetworkMessage::Inv(inv.clone()),
+        NetworkMessage::GetData(inv.clone()),
+        NetworkMessage::NotFound(inv),
+        NetworkMessage::GetBlocks(GetBlocksMessage::new(locator.clone(), hash)),
+        NetworkMessage::GetHeaders(GetHeadersMessage::new(locator, hash)),
+        NetworkMessage::MemPool,
+        NetworkMessage::Tx(tx.clone()),
+        NetworkMessage::Block(block.clone()),
+        NetworkMessage::Headers(vec![block.header; 2_000]),
+        NetworkMessage::SendHeaders,
+        NetworkMessage::GetAddr,
+        NetworkMessage::Ping(1),
+        NetworkMessage::Pong(1),
+        NetworkMessage::MerkleBlock(bitcoin::MerkleBlock::from_block_with_predicate(
+            &block,
+            |_| true,
+        )),
+        NetworkMessage::FilterLoad(FilterLoad {
+            filter: vec![0; 1_000],
+            hash_funcs: 1,
+            tweak: 0,
+            flags: BloomFlags::None,
+        }),
+        NetworkMessage::FilterAdd(FilterAdd { data: vec![0; 520] }),
+        NetworkMessage::FilterClear,
+        NetworkMessage::GetCFilters(GetCFilters {
+            filter_type,
+            start_height: 0,
+            stop_hash: hash,
+        }),
+        NetworkMessage::CFilter(CFilter {
+            filter_type,
+            block_hash: hash,
+            filter: vec![0; 200],
+        }),
+        NetworkMessage::GetCFHeaders(GetCFHeaders {
+            filter_type,
+            start_height: 0,
+            stop_hash: hash,
+        }),
+        NetworkMessage::CFHeaders(CFHeaders {
+            filter_type,
+            stop_hash: hash,
+            previous_filter_header: FilterHeader::all_zeros(),
+            filter_hashes: vec![FilterHash::all_zeros(); 2_000],
+        }),
+        NetworkMessage::GetCFCheckpt(GetCFCheckpt {
+            filter_type,
+            stop_hash: hash,
+        }),
+        NetworkMessage::CFCheckpt(CFCheckpt {
+            filter_type,
+            stop_hash: hash,
+            filter_headers: vec![FilterHeader::all_zeros(); 3],
+        }),
+        NetworkMessage::SendCmpct(SendCmpct {
+            send_compact: true,
+            version: 2,
+        }),
+        NetworkMessage::CmpctBlock(CmpctBlock {
+            compact_block: HeaderAndShortIds::from_block(&fat, 1, 1, &[0])
+                .expect("prefilled coinbase"),
+        }),
+        NetworkMessage::GetBlockTxn(GetBlockTxn {
+            txs_request: BlockTransactionsRequest {
+                block_hash: hash,
+                indexes: (0..200).map(|i| i * 300).collect(),
+            },
+        }),
+        NetworkMessage::BlockTxn(BlockTxn {
+            transactions: BlockTransactions {
+                block_hash: hash,
+                transactions: vec![tx; 3],
+            },
+        }),
+        NetworkMessage::Alert(vec![0; 300]),
+        NetworkMessage::Reject(Reject {
+            message: "tx".into(),
+            ccode: RejectReason::Invalid,
+            reason: "r".repeat(111).into(),
+            hash: bitcoin::hashes::sha256d::Hash::all_zeros(),
+        }),
+        NetworkMessage::FeeFilter(1_000),
+        NetworkMessage::WtxidRelay,
+        NetworkMessage::AddrV2(vec![
+            AddrV2Message {
+                time: 1,
+                services: ServiceFlags::NONE,
+                addr: bitcoin::p2p::address::AddrV2::Ipv4(Ipv4Addr::LOCALHOST),
+                port: 1,
+            };
+            100
+        ]),
+        NetworkMessage::SendAddrV2,
+        NetworkMessage::Unknown {
+            command: CommandString::try_from_static("sendtxrcncl").expect("command"),
+            payload: vec![0; 500],
+        },
+    ];
+    let undercharged: Vec<String> = samples
+        .into_iter()
+        .filter_map(|msg| {
+            let charged = outbound_msg_bytes(&msg);
+            let cmd = msg.cmd();
+            let row_count = match msg {
+                NetworkMessage::Headers(_)
+                | NetworkMessage::Inv(_)
+                | NetworkMessage::GetData(_)
+                | NetworkMessage::NotFound(_)
+                | NetworkMessage::Addr(_)
+                | NetworkMessage::AddrV2(_) => ROW_COUNT_MAX,
+                _ => 0,
+            };
+            let wire = serialize(&RawNetworkMessage::new(bitcoin::p2p::Magic::REGTEST, msg));
+            let payload = wire.len() - WIRE_HEADER;
+            (charged + row_count < payload)
+                .then(|| format!("{cmd} is charged {charged} for a {payload}-byte payload"))
+        })
+        .collect();
+    assert_eq!(undercharged, Vec::<String>::new());
 }
 
 #[test]

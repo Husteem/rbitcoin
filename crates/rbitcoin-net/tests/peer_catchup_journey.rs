@@ -1,4 +1,4 @@
-fn take_msgs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<NetworkMessage> {
+fn take_msgs(rx: &mut PeerOutRx) -> Vec<NetworkMessage> {
     let mut out = Vec::new();
     while let Ok(item) = rx.try_recv() {
         out.push(item.expect_msg());
@@ -84,7 +84,7 @@ async fn peer_catchup_compact_reorg() {
     );
     live.note_awaiting_headers();
 
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
 
     // Pending child of a better fork connects while we still sit on one private block.
@@ -619,8 +619,8 @@ async fn catchup_reorg_and_drain(
     src: &std::sync::Arc<rbitcoin_net::chain::ChainHub>,
     hub: &rbitcoin_net::chain::ChainHub,
     live: &std::sync::Arc<rbitcoin_net::peers::LivePeer>,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
-    out_rx: &mut mpsc::UnboundedReceiver<PeerOut>,
+    out_tx: &PeerOutTx,
+    out_rx: &mut PeerOutRx,
     follow: &mut PeerFollowState,
 ) {
     use bitcoin::absolute::LockTime;
@@ -723,7 +723,7 @@ async fn catchup_reorg_and_drain(
         dummy_req.insert(dummy);
         hub.note_asked_block(dummy);
     }
-    let (drain_tx, mut drain_rx) = mpsc::unbounded_channel();
+    let (drain_tx, mut drain_rx) = peer_out_channel();
     let mut drain_blocks = PendingBlocks::new();
     drain_pending(
         hub,
@@ -979,7 +979,7 @@ async fn catchup_reorg_and_drain(
             break;
         }
     }
-    let (miss_tx, mut miss_rx) = mpsc::unbounded_channel();
+    let (miss_tx, mut miss_rx) = peer_out_channel();
     let mut miss_blocks = PendingBlocks::new();
     miss_blocks.insert(orphan.block_hash(), orphan);
     let mut miss_headers = HashMap::new();
