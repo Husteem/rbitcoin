@@ -257,7 +257,7 @@ async fn response_budget_restarts_on_each_keep_alive_response() {
         server,
         app,
         Duration::from_secs(30),
-        Duration::from_millis(250),
+        Duration::from_millis(500),
         1 << 30,
     ));
     for _ in 0..3 {
@@ -265,7 +265,7 @@ async fn response_budget_restarts_on_each_keep_alive_response() {
             .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(read_http_response(&mut client, BODY).await, BODY);
     }
     client.shutdown().await.unwrap();

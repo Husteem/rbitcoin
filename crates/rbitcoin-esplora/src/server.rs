@@ -1237,6 +1237,13 @@ impl<S> WriteDeadline<S> {
         }
         self.sleep.as_mut().poll(cx).is_ready()
     }
+
+    /// Mark the socket blocked and report whether the no-progress deadline
+    /// passed. The open interval is charged by the next [`Self::drain`].
+    fn blocked(&mut self, cx: &mut Context<'_>) -> bool {
+        self.open_stall = Some(tokio::time::Instant::now());
+        self.stalled(cx)
+    }
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for WriteDeadline<S> {
@@ -1255,30 +1262,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if let Some(err) = this.drain() {
-            return Poll::Ready(Err(err));
-        }
-        match Pin::new(&mut this.inner).poll_write(cx, buf) {
-            Poll::Ready(result) => {
-                if let Ok(n) = &result {
-                    this.written += *n as u64;
-                }
-                this.progressed();
-                Poll::Ready(result)
-            }
-            Poll::Pending => {
-                this.open_stall = Some(tokio::time::Instant::now());
-                if this.stalled(cx) {
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "esplora: response write stalled",
-                    )))
-                } else {
-                    Poll::Pending
-                }
-            }
-        }
+        AsyncWrite::poll_write_vectored(self, cx, &[io::IoSlice::new(buf)])
     }
 
     fn poll_write_vectored(
@@ -1299,8 +1283,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
                 Poll::Ready(result)
             }
             Poll::Pending => {
-                this.open_stall = Some(tokio::time::Instant::now());
-                if this.stalled(cx) {
+                if this.blocked(cx) {
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "esplora: response write stalled",
@@ -1327,8 +1310,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
                 Poll::Ready(result)
             }
             Poll::Pending => {
-                this.open_stall = Some(tokio::time::Instant::now());
-                if this.stalled(cx) {
+                if this.blocked(cx) {
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "esplora: response flush stalled",
@@ -1351,8 +1333,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
                 Poll::Ready(result)
             }
             Poll::Pending => {
-                this.open_stall = Some(tokio::time::Instant::now());
-                if this.stalled(cx) {
+                if this.blocked(cx) {
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "esplora: response shutdown stalled",
