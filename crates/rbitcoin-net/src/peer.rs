@@ -1505,7 +1505,7 @@ pub async fn run_feeler_inner(
     write_v2_msg(&mut writer, NetworkMessage::Version(version)).await?;
     loop {
         let frame = read_v2_frame(&mut reader, magic).await?;
-        let msg = frame.decode();
+        let msg = frame.try_decode()?;
         if matches!(msg.payload(), NetworkMessage::Version(_)) {
             break;
         }
@@ -1685,7 +1685,7 @@ pub async fn read_peer_version<R: FrameRead>(
     loop {
         let frame = read_handshake_frame(reader, magic, policy).await?;
         let cmd = command_label(&frame.command);
-        let msg = frame.decode();
+        let msg = frame.try_decode()?;
         match msg.payload() {
             NetworkMessage::Version(v) => {
                 if (v.version as i32) < MIN_PEER_PROTO_VERSION {
@@ -1725,7 +1725,7 @@ pub async fn wait_peer_verack<R: FrameRead>(
     loop {
         let frame = read_handshake_frame(reader, magic, policy).await?;
         let cmd = command_label(&frame.command);
-        let msg = frame.decode();
+        let msg = frame.try_decode()?;
         if apply_pre_verack(policy.session, peer_version, msg.payload(), &cmd) {
             return Ok(());
         }
