@@ -947,7 +947,7 @@ async fn getheaders_empty_reply_without_a_peer_block_marks_nothing() {
             rbitcoin_net::peers::PeerConnType::Inbound,
         )
     };
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
 
     let session = register(18482, 82);
     let mut follow = PeerFollowState::new();
@@ -1055,7 +1055,7 @@ async fn getheaders_announces_a_block_connected_during_the_reply() {
         true,
         rbitcoin_net::peers::PeerConnType::Inbound,
     );
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
     follow.wants_headers = true;
 
