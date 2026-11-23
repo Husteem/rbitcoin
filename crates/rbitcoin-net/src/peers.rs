@@ -755,7 +755,7 @@ impl LivePeer {
         self.held_front_queued.store(true, Ordering::Release);
     }
 
-    /// A command outside [`RECV_MSG_TYPES`] counts as `*other*`, so a peer
+    /// A command outside Core's `ALL_NET_MESSAGE_TYPES` counts as `*other*`, so a peer
     /// that sends made-up names adds one key, not one per name.
     pub fn note_recv(&self, cmd: &str, nbytes: u64) {
         self.note_recv_raw(recv_msg_type(cmd), acct_bytes(cmd, nbytes));
