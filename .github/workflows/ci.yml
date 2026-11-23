@@ -60,7 +60,7 @@ jobs:
         run: cargo metadata --locked --format-version 1 > /dev/null
       # Not in taiki-e TOOLS.md; install-action falls back to cargo-binstall
       # (GitHub Release prebuilt). Do not cargo install.
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: ast-grep@0.45.1
       - name: ast-grep fixture self-test
@@ -88,7 +88,7 @@ jobs:
         run: ./scripts/doc-attach.sh --base HEAD^1
       # Prebuilt cargo-deny — do not cargo install. Pin the action commit.
       # 0.18.x cannot parse rustsec CVSS 4.0 advisories (2026).
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-deny@0.20.2
       - name: cargo deny check
@@ -272,7 +272,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32.0.0
         with:
           github_access_token: ${{ github.token }}
           enable_kvm: false
@@ -378,7 +378,7 @@ jobs:
           workspaces: ". -> target/cov"
       # Prebuilt binary — do not `cargo install` (compiles llvm-cov from crates.io).
       # Pin the action commit. Unpinned third-party tags are not immutable.
-      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-llvm-cov@0.6.14,cargo-crap@0.4.3
       - name: coverage (line gate)
