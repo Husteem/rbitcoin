@@ -37,18 +37,31 @@ PUB_ITEM = re.compile(
     re.M,
 )
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-# `impl Name`, `impl<'a> Trait for Name<'a>`: the type's own impl header.
 IMPL_HEADER = re.compile(
-    r"^[ \t]*(?:unsafe[ \t]+)?impl\b(?:<[^>]*>)?[ \t]+(?:[^{;\n]*\bfor[ \t]+)?"
-    r"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Za-z_][A-Za-z0-9_]*)",
-    re.M,
+    r"^[ \t]*(?:unsafe[ \t]+)?impl\b(?:<[^>]*>)?[ \t]+([^{;\n]*)", re.M
 )
+PATH = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Za-z_][A-Za-z0-9_]*)")
 FORMAT_CAPTURE = re.compile(
     r"\{([A-Za-z_][A-Za-z0-9_]*)[:}]|[:.]([A-Za-z_][A-Za-z0-9_]*)\$"
 )
 STRING_PATH = re.compile(
     r"=\s*r?#*\"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Za-z_][A-Za-z0-9_]*)\""
 )
+
+
+def own_impl_types(code: str) -> list[str]:
+    """The type each `impl` header is for, when that type is a path.
+
+    `impl Name` and `impl Trait for Name<'a>` give `Name`. An impl for an
+    array, a reference, or a tuple names no type of its own.
+    """
+    names = []
+    for header in IMPL_HEADER.findall(code):
+        subject = header.rsplit(" for ", 1)[-1].lstrip()
+        path = PATH.match(subject)
+        if path:
+            names.append(path.group(1))
+    return names
 
 
 def load_unwrap():
@@ -77,7 +90,7 @@ def unused(root: str) -> list[str]:
             src = f.read()
         code = blank_non_code(src)
         uses.update(IDENT.findall(code))
-        uses.subtract(IMPL_HEADER.findall(code))
+        uses.subtract(own_impl_types(code))
         for braced, sized in FORMAT_CAPTURE.findall(src):
             uses[braced or sized] += 1
         uses.update(STRING_PATH.findall(src))

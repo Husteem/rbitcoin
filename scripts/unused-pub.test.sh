@@ -42,6 +42,8 @@ assert_fail_quiet "a type only its own impl names fails" \
   python3 "$PY" --root "$FIX/own-impl"
 assert_ok "a type named outside its impl passes" \
   python3 "$PY" --root "$FIX/own-impl-live"
+assert_ok "an impl for an array or a reference still names its trait" \
+  python3 "$PY" --root "$FIX/impl-for-array"
 assert_ok "pub(crate) is left to rustc" \
   python3 "$PY" --root "$FIX/crate-private"
 assert_fail_quiet "two unused items that share a name both fail" \
