@@ -14,12 +14,12 @@ use bitcoin::{
 use rbitcoin_consensus::{
     genesis_block, grind_regtest_pow, mine_regtest_paying, ChainParams, REGTEST_BLOCK_SPACING,
 };
+use rbitcoin_net::send_queue::peer_out_channel;
 use rbitcoin_net::{
     drain_pending_now, encode_v2_contents, shortid_map_from_txs, try_reconstruct, ChainHub,
     NetError, PendingBlocks,
 };
 use std::collections::{HashMap, HashSet};
-use tokio::sync::mpsc;
 
 use crate::block_diff::{
     same_hash_merkle_mutant, verdict_from_core_reply, BlockOracle, BlockStanding, CompareOne,
@@ -190,7 +190,7 @@ pub fn reconstructed_cmpct_block(case: &CmpctFuzzCase) -> Option<bitcoin::Block>
 }
 
 fn drain_one(hub: &ChainHub, block: bitcoin::Block) -> Result<(), NetError> {
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = peer_out_channel();
     let mut pending = PendingBlocks::new();
     pending.insert(block.block_hash(), block);
     let mut headers = HashMap::new();
