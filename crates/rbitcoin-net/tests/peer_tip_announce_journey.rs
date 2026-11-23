@@ -339,7 +339,8 @@ fn getblocks_full_page_continues_with_a_tip_inv() {
     let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getblocks-continue");
     let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    hub.mine(510, op_true(), vec![]).unwrap();
+    // 144-block confirm waves, not 510 single accepts on the tip-accept lane.
+    hub.confirm_empty_regtest(510).unwrap();
     let chain = best_chain_from_1(&hub, 510);
     let genesis = bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash();
     let mut follow = PeerFollowState::new();
