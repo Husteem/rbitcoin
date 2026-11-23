@@ -225,6 +225,28 @@ fn a() {}
 EOF2
 assert_fail_quiet "a backslash does not escape the end of a raw string" check raw-backslash
 
+change raw-c-string <<'EOF2'
+#[doc = cr"foo\"]
+fn a() {}
+====
+#[doc = cr"foo\"]
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "a raw C string ends at its quote, as a raw string does" check raw-c-string
+
+change raw-byte-string <<'EOF2'
+#[doc = br"foo\"]
+fn a() {}
+====
+#[doc = br"foo\"]
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "a raw byte string ends at its quote too" check raw-byte-string
+
 change char-literal <<'EOF2'
 #[custom(']', b']', '"')]
 fn a() {}

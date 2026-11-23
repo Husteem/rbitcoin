@@ -30,7 +30,7 @@ import subprocess
 import sys
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-RAW_OPEN = re.compile(r'(?:br|rb|r)(#*)"')
+RAW_OPEN = re.compile(r'(?:br|cr|r)(#*)"')
 
 
 def git(root: str, *args: str) -> str:
@@ -88,7 +88,7 @@ def code_only(src: str) -> str:
             while j < n and src[j] != '"':
                 j += 2 if src[j] == "\\" else 1
             i = blank(i, j + 1)
-        elif c in "rb" and not (i and (src[i - 1].isalnum() or src[i - 1] == "_")):
+        elif c in "rbc" and not (i and (src[i - 1].isalnum() or src[i - 1] == "_")):
             raw = RAW_OPEN.match(src, i)
             if raw:
                 closer = '"' + raw.group(1)
