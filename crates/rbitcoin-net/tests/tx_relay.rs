@@ -3386,7 +3386,7 @@ fn take_due_parent_getdata_one_flush_covers_max_ancestor_package() {
         missing.insert(Txid::from_byte_array([i + 1; 32]));
     }
     let t0 = 1_000u64;
-    hub.schedule_orphan_parents(&missing, 1, true, t0);
+    hub.schedule_orphan_parents(&missing, 1, false, t0);
     let due = t0 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
     let first = hub.take_due_parent_getdata(1, due);
     assert_eq!(
@@ -3413,7 +3413,7 @@ fn take_due_parent_getdata_caps_per_flush() {
         missing.insert(Txid::from_byte_array(h));
     }
     let t0 = 1_000u64;
-    hub.schedule_orphan_parents(&missing, 1, true, t0);
+    hub.schedule_orphan_parents(&missing, 1, false, t0);
     let due = t0 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
     let first = hub.take_due_parent_getdata(1, due);
     assert_eq!(first.len(), MAX_PARENTS_PER_PARK);
@@ -3571,7 +3571,7 @@ fn wtxid_followup_is_requested_as_wtx() {
         "the wtxid follow-up is its own row and is not a second getdata"
     );
     let missing = BTreeSet::from([Txid::from_byte_array(hash)]);
-    hub.schedule_orphan_parents(&missing, 2, false, 1_000);
+    hub.schedule_orphan_parents(&missing, 2, true, 1_000);
     let expired = 1_000 + GETDATA_TX_INTERVAL_SECS;
     assert!(hub.take_due_parent_getdata(1, expired).is_empty());
     let follow = hub.take_due_parent_getdata(3, expired);
@@ -3602,7 +3602,7 @@ fn same_peer_wtxid_inflight_expires_back_to_txid_parent() {
     let hash = [0xbc; 32];
     let missing = BTreeSet::from([Txid::from_byte_array(hash)]);
     let t0 = 1_000u64;
-    hub.schedule_orphan_parents(&missing, 2, false, t0);
+    hub.schedule_orphan_parents(&missing, 2, true, t0);
     assert_eq!(
         hub.note_inv_tx_requested(2, hash, true, t0, true),
         ParentNote::RequestNow,
@@ -3640,7 +3640,7 @@ fn take_due_parent_getdata_waits_inbound_txid_delay() {
         missing.insert(Txid::from_byte_array([i + 1; 32]));
     }
     let t0 = 1_000u64;
-    hub.schedule_orphan_parents(&missing, 1, true, t0);
+    hub.schedule_orphan_parents(&missing, 1, false, t0);
     assert!(
         hub.take_due_parent_getdata(1, t0 + NONPREF_PEER_TX_DELAY_SECS)
             .is_empty(),
@@ -3658,7 +3658,7 @@ fn take_due_parent_getdata_waits_inbound_txid_delay() {
         hub.take_due_parent_getdata(1, expired).is_empty(),
         "same peer is not retried after interval"
     );
-    hub.schedule_orphan_parents(&missing, 2, true, expired);
+    hub.schedule_orphan_parents(&missing, 2, false, expired);
     let other = hub.take_due_parent_getdata(
         2,
         expired + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS,
@@ -3679,14 +3679,14 @@ fn resolve_tx_request_lets_other_peer_fetch_after_reject() {
     let wtxid = Wtxid::from_byte_array(hash);
     hub.note_inv_tx_requested(1, hash, true, 1_000, false);
     let missing = BTreeSet::from([txid]);
-    hub.schedule_orphan_parents(&missing, 2, true, 1_000);
+    hub.schedule_orphan_parents(&missing, 2, false, 1_000);
     let due = 1_000 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
     assert!(
         hub.take_due_parent_getdata(2, due).is_empty(),
         "in-flight INV GETDATA must block other peer"
     );
     hub.resolve_tx_request(&txid, &wtxid, false);
-    hub.schedule_orphan_parents(&missing, 2, true, due);
+    hub.schedule_orphan_parents(&missing, 2, false, due);
     let got =
         hub.take_due_parent_getdata(2, due + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS);
     assert_eq!(got.len(), 1);

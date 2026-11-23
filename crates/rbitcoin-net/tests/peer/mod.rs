@@ -8148,6 +8148,8 @@ async fn notfound_makes_the_waiting_wtxid_peer_due() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
+    // A fixed clock: `noted` and the note read the same second.
+    peers.set_mock_now(1_000_000);
     let peer1 = preferred_peer(&peers, 2);
     let peer2 = preferred_peer(&peers, 3);
     let wtxid = bitcoin::Wtxid::from_byte_array([0xef; 32]);
@@ -8197,6 +8199,8 @@ async fn notfound_for_txid_inventory_wakes_the_waiter() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
+    // A fixed clock: `noted` and the note read the same second.
+    peers.set_mock_now(1_000_000);
     for (n, witness) in [(0xab_u8, false), (0xcd, true)] {
         let peer1 = preferred_peer(&peers, 2);
         let peer2 = preferred_peer(&peers, 3);
