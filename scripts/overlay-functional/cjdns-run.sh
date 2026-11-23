@@ -24,13 +24,26 @@ dev_up() { [[ -e "${CJDNS_SYSFS:-/sys/class/net}/$DEV" ]]; }
 core_gone() { ! pgrep -f "cjdroute core $SOCK" >/dev/null 2>&1; }
 
 kill_core() {
-  pkill -f "cjdroute core $SOCK" 2>/dev/null || true
-  local i
-  for i in $(seq 1 100); do
-    core_gone && return 0
+  local signalled=0 deadline=$((SECONDS + 10))
+  while (( SECONDS < deadline )); do
+    if ! core_gone; then
+      if [[ "$signalled" -eq 0 ]]; then
+        echo "cjdns: killing the core the angel left behind" >>"$LOG"
+        signalled=1
+      fi
+      pkill -f "cjdroute core $SOCK" 2>/dev/null || true
+    fi
     sleep 0.1
+    core_gone || continue
+    # The angel can fork its core just before it exits. That process does
+    # not match the pgrep until it has exec'd, so require a longer clean
+    # window before calling the pair gone.
+    sleep 0.4
+    core_gone && return 0
   done
-  return 1
+  pkill -KILL -f "cjdroute core $SOCK" 2>/dev/null || true
+  sleep 0.2
+  core_gone
 }
 
 drop_dev() {
@@ -53,7 +66,15 @@ child=0
 stop() {
   if [[ "$child" -ne 0 ]]; then
     kill -TERM "$child" 2>/dev/null || true
+    local i
+    for i in $(seq 1 50); do
+      kill -0 "$child" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
   fi
+  # The angel must be reaped first: a live one can fork after the clean pass.
   kill_core || true
   exit 0
 }
@@ -69,11 +90,12 @@ while :; do
   # brings the TUN back. The angel can die alone and leave its core (and the
   # device) behind. That core is unmanaged: it exits 232 at the 20s security
   # deadline, and the old "keeping it" exit here left a dead TUN behind.
-  # Take the orphan down with the angel, clear the device, start a fresh
-  # pair on the same address.
-  if ! core_gone; then
-    echo "cjdns: killing the core the angel left behind" >>"$LOG"
-    kill_core || true
+  # Always run the kill pass: a core forked just before the angel died may
+  # not have exec'd yet, so a single core_gone check can miss it. Take the
+  # orphan down with the angel, clear the device, start a fresh pair on the
+  # same address.
+  if ! kill_core; then
+    echo "cjdns: could not stop the core the angel left behind" >>"$LOG"
   fi
   if ! drop_dev; then
     echo "cjdns: $DEV still present after the core exited" >>"$LOG"

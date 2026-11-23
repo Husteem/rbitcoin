@@ -90,8 +90,11 @@ echo run >>"$CJDNS_TEST_COUNT"
 # Stand in for the core the angel leaves behind: argv[0] is what the
 # supervisor's pgrep looks for, and TERM simulates the TUN going away.
 # cjdroute is called with only --nobg, so the socket and device come in
-# through the test's environment, not argv.
+# through the test's environment, not argv. The short sleep widens the
+# real fork-to-exec window so a supervisor that checks once before the
+# core execs misses it deterministically.
 (
+  sleep 0.2
   exec -a "cjdroute core $CJDNS_TEST_SOCK" bash -c '
     dev="$1"
     sysfs="$2"
@@ -110,9 +113,9 @@ CJDNS_SYSFS="$tmp2/sysfs" PATH="$tmp2/bin:$PATH" \
   "$tmp2/cjdroute" "$tmp2/conf" "$tmp2/log" "$tmp2/supervisor.pid" \
   "$tmp2/pipe.sock" "$dev" &
 sup2=$!
-# The old supervisor needs its 5s survivor gate before it exits, so give the
-# new one time to notice the orphan and start a second pair.
-for _ in $(seq 1 100); do
+# Wait for the second pair: a supervisor that kept the survivor after the
+# angel-only death exits or stalls here instead.
+for _ in $(seq 1 50); do
   runs=0
   if [[ -f "$tmp2/count" ]]; then runs="$(wc -l <"$tmp2/count")"; fi
   if [[ "$runs" -ge 2 ]]; then break; fi
@@ -125,12 +128,17 @@ alive=no
 kill -0 "$sup2" 2>/dev/null && alive=yes
 kill "$sup2" 2>/dev/null || true
 wait "$sup2" 2>/dev/null || true
-pkill -f "^cjdroute core $tmp2/pipe.sock" 2>/dev/null || true
+# A core forked just before the angel died execs after the supervisor's
+# first pass. Give it that window before asserting the supervisor took it
+# down; a one-shot check leaves it running.
+sleep 0.5
+orphan=no
+if pgrep -f "^cjdroute core $tmp2/pipe.sock" >/dev/null; then orphan=yes; fi
 assert_ok cjdns_supervisor_restarts_after_orphan_core test "$runs" -ge 2
 assert_ok cjdns_supervisor_does_not_exit_on_orphan_core test "$alive" = yes
 assert_ok cjdns_supervisor_logs_orphan_kill grep -q 'killing the core the angel left behind' "$tmp2/log"
-assert_ok cjdns_supervisor_stops_orphan_core \
-  bash -c '! pgrep -f "^cjdroute core $1" >/dev/null' _ "$tmp2/pipe.sock"
+assert_ok cjdns_supervisor_stops_orphan_core test "$orphan" = no
+pkill -f "^cjdroute core $tmp2/pipe.sock" 2>/dev/null || true
 
 # The supervisor's TUN gate is a script the runner calls before every
 # journey, so a dead TUN fails the harness with the daemon logs instead of
