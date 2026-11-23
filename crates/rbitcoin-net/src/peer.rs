@@ -4495,7 +4495,7 @@ pub async fn on_getheaders(
         return Ok(());
     }
     let gh = gh.clone();
-    let (headers, withhold_stale, empty_tip) =
+    let (headers, withhold_stale, met_at) =
         run_header_job(hub, move |hub| getheaders_apply(hub, &gh)).await??;
     if !withhold_stale {
         if let Some(s) = session {
@@ -4515,8 +4515,8 @@ pub async fn on_getheaders(
                 if !newer_offer && tip.is_some_and(|tip| hub.is_header_ancestor(hash, tip)) {
                     s.note_last_tip_offered(hash);
                 }
-            } else if let Some(tip) = empty_tip {
-                s.note_best_header_sent(tip);
+            } else if let Some(hash) = met_at {
+                s.note_best_header_sent(hash);
             }
         }
         out_tx.send(NetworkMessage::Headers(headers))?;
@@ -4534,12 +4534,20 @@ fn getheaders_apply(
         && gh.stop_hash.to_byte_array() != [0u8; 32]
         && hub.header_of(&gh.stop_hash).is_some()
         && !hub.stale_relay_allowed(&gh.stop_hash);
-    let empty_tip = if headers.is_empty() {
-        hub.tip_hash()
+    // An empty reply marks the block the locator met our chain at. The peer
+    // named it, so it has it. Our tip can be a block that connected after
+    // the reply was built, and marking it would skip that block's announce.
+    // Below minimum chain work every reply is empty and, as in Core, marks
+    // nothing.
+    let met_at = if headers.is_empty() && hub.meets_minimum_chain_work() {
+        gh.locator_hashes
+            .iter()
+            .copied()
+            .find(|h| hub.is_connected(h))
     } else {
         None
     };
-    Ok((headers, withhold_stale, empty_tip))
+    Ok((headers, withhold_stale, met_at))
 }
 
 /// Core's `getblocks` page (`nLimit`).
