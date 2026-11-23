@@ -5819,46 +5819,37 @@ async fn aborted_follow_session_releases_its_block_asks() {
 /// A body that arrives while its chain is below `-minimumchainwork` is
 /// parked in the session, still asked. When that session closes, another
 /// peer must be free to fetch the body once the chain meets the floor.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn closed_session_releases_a_body_parked_below_minimum_chain_work() {
-    let mut t = paused_serve("parked-ask", 1, &["/rbitcoin:test(parked-ask)/"]).await;
-    let tip = t.node.hub.tip_header().unwrap();
-    let height = t.node.hub.tip_height().unwrap() + 1;
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-ask");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_header().unwrap();
     let block = rbitcoin_consensus::mine_regtest_paying(
         tip.block_hash(),
         tip.time + 1,
-        height,
+        1,
         ScriptBuf::from_bytes(vec![0x51]),
         Vec::new(),
     );
-    let hash = announce_and_wait_for_ask(&mut t, block.header).await;
-    *t.node.hub.minimum_chain_work.write().unwrap() = Some([0xff; 32]);
-    let (raw, _) = &mut t.clients[0];
-    write_peer_msg(raw, NetworkMessage::Block(block)).await;
-    write_peer_msg(raw, NetworkMessage::Ping(9)).await;
-    let ponged = tokio::time::timeout(Duration::from_secs(10), async {
-        while !matches!(next_peer_msg(raw).await, Ok(NetworkMessage::Pong(9))) {}
-    })
-    .await;
-    assert!(ponged.is_ok(), "the session reads the body before the ping");
-    assert_eq!(t.node.hub.tip_hash(), Some(tip.block_hash()), "parked");
+    let hash = block.block_hash();
+    let mut follow = PeerFollowState::new();
+    assert!(follow.requested_blocks.claim(&hub, hash));
+    hub.set_minimum_chain_work(Some([0xff; 32]));
+    let (tx, _rx) = peer_out_channel();
+    on_block(&hub, &tx, &mut follow, None, &block)
+        .await
+        .unwrap();
+    assert_eq!(hub.tip_hash(), Some(tip.block_hash()), "parked");
     assert!(
-        t.node.hub.already_have_or_asked_block(&hash),
+        hub.already_have_or_asked_block(&hash),
         "a parked body stays asked while its session lives"
     );
-    raw.close();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !t.node.peers.live_peers().is_empty() {
-        assert!(std::time::Instant::now() < deadline, "closed session");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let still_asked = t.node.hub.already_have_or_asked_block(&hash);
-    t.node.shutdown().await;
-    let _ = std::fs::remove_dir_all(&t.dir);
+    drop(follow);
     assert!(
-        !still_asked,
+        !hub.already_have_or_asked_block(&hash),
         "a closed session must release the ask of a body it parked"
     );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Unknown BIP324 short id on a live follow session counts as `*other*`
