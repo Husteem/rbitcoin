@@ -2306,6 +2306,7 @@ async fn start_esplora_applies_max_inflight() {
         Network::Regtest,
         None,
         1,
+        rbitcoin_esplora::DEFAULT_MIN_DRAIN_RATE,
         &shutdown,
         Arc::clone(&hub),
         &mp,

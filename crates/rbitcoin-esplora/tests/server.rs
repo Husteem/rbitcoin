@@ -60,6 +60,7 @@ async fn stalled_response_write_is_cancelled() {
         app,
         Duration::from_secs(30),
         Duration::from_millis(50),
+        1 << 20,
     ));
     let joined = tokio::time::timeout(Duration::from_secs(2), task).await;
     assert!(
@@ -84,6 +85,7 @@ async fn response_write_deadline_resets_after_progress() {
         app,
         Duration::from_secs(30),
         Duration::from_millis(500),
+        16 * 1024,
     ));
     let reader = tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -118,16 +120,179 @@ async fn response_write_deadline_resets_after_progress() {
     );
 }
 
-/// The real listener cancels a stalled response write. A client asks for a
-/// body larger than the socket buffers and never reads; after the request
-/// timeout the connection is closed with only part of the body sent. Without
-/// the deadline the client drains the whole response once it starts reading.
+/// Read one HTTP/1.1 response and return its body length, asserting it is
+/// `body` bytes.
+async fn read_http_response<S: tokio::io::AsyncRead + Unpin>(stream: &mut S, body: usize) -> usize {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let head_end = loop {
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("response headers")
+            .unwrap();
+        assert!(n > 0, "connection closed before the response headers");
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+    let len: usize = header_value(&head, "content-length")
+        .expect("content-length")
+        .parse()
+        .expect("content-length number");
+    assert_eq!(len, body, "unexpected content-length");
+    while buf.len() < head_end + len {
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("response body")
+            .unwrap();
+        assert!(n > 0, "connection closed before the whole body");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(buf.len(), head_end + len, "extra bytes after the body");
+    len
+}
+
+/// A reader that accepts a little before each deadline keeps the no-progress
+/// timer moving but drains far below the minimum rate. The response is
+/// cancelled anyway.
+#[tokio::test]
+async fn trickled_response_write_hits_the_minimum_drain_rate() {
+    const BODY: usize = 16 * 1024;
+    let (server, mut client) = tokio::io::duplex(128);
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let app = Router::new().route("/", get(|| async { vec![0u8; BODY] }));
+    let server_task = tokio::spawn(serve_http_connection(
+        server,
+        app,
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        64 * 1024,
+    ));
+    let reader = tokio::spawn(async move {
+        let mut total = 0usize;
+        let mut buf = [0u8; 64];
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total += n;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+        total
+    });
+    let total = tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("reader")
+        .expect("read task");
+    let joined = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+    assert!(
+        joined.is_ok(),
+        "a response draining below the minimum rate held the connection"
+    );
+    assert!(
+        total < BODY,
+        "the trickled response was not cut: {total} bytes"
+    );
+}
+
+/// The same trickle is served when it meets the configured minimum rate.
+#[tokio::test]
+async fn trickled_response_write_survives_a_lower_minimum_rate() {
+    const BODY: usize = 16 * 1024;
+    let (server, mut client) = tokio::io::duplex(128);
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let app = Router::new().route("/", get(|| async { vec![0u8; BODY] }));
+    let server_task = tokio::spawn(serve_http_connection(
+        server,
+        app,
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        4 * 1024,
+    ));
+    let reader = tokio::spawn(async move {
+        let mut total = 0usize;
+        let mut buf = [0u8; 64];
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total += n;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+        total
+    });
+    let total = tokio::time::timeout(Duration::from_secs(10), reader)
+        .await
+        .expect("reader")
+        .expect("read task");
+    let joined = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+    assert!(
+        joined.is_ok(),
+        "a response that met the minimum rate was cut"
+    );
+    assert!(total > BODY, "the response was cut: {total} bytes");
+}
+
+/// A keep-alive connection starts a new budget at each response. Three
+/// responses that each stall less than the grace are served; a budget that
+/// carried the stalls over would close the second one.
+#[tokio::test]
+async fn response_budget_restarts_on_each_keep_alive_response() {
+    const BODY: usize = 128 * 1024;
+    let (server, mut client) = tokio::io::duplex(64);
+    let app = Router::new().route("/", get(|| async { vec![0u8; BODY] }));
+    let server_task = tokio::spawn(serve_http_connection(
+        server,
+        app,
+        Duration::from_secs(30),
+        Duration::from_millis(250),
+        1 << 30,
+    ));
+    for _ in 0..3 {
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(read_http_response(&mut client, BODY).await, BODY);
+    }
+    client.shutdown().await.unwrap();
+    let joined = tokio::time::timeout(Duration::from_secs(5), server_task).await;
+    assert!(
+        joined.is_ok(),
+        "a keep-alive connection was cut by an earlier response's stall"
+    );
+}
+
+/// One unix-listener block of 50 txs with 4 KB scripts, and a connected
+/// client that has already asked for the block's tx list. The response is
+/// larger than the socket buffers, so a reader decides how fast it drains.
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stalled_response_write_closes_the_esplora_listener() {
+async fn block_txs_listener(
+    label: &str,
+    idle: Duration,
+    min_drain_rate: u64,
+) -> (
+    EsploraHandle,
+    tokio::net::UnixStream,
+    rbitcoin_query::testutil::TempDir,
+    std::path::PathBuf,
+) {
     const TXS: u32 = 50;
     const SCRIPT: usize = 4_000;
-    let (dir, q) = temp_query("esplora-write-stall");
+    let (dir, q) = temp_query(label);
     let (h0, cb0) = coinbase(0, Fk::NULL, None);
     let mut txs = vec![cb0];
     for i in 0..TXS {
@@ -138,12 +303,13 @@ async fn stalled_response_write_closes_the_esplora_listener() {
     }
     q.connect_block(Height(0), &h0, &txs).unwrap();
 
-    let short = std::path::PathBuf::from(format!("/tmp/rbtc-es-write-{}", std::process::id()));
+    let short = std::path::PathBuf::from(format!("/tmp/rbtc-es-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&short);
     std::fs::create_dir_all(&short).unwrap();
     let sock = short.join("s.sock");
     let mut cfg = EsploraConfig::with_listen(EsploraListen::Unix(sock), Network::Regtest);
-    cfg.limits.idle_timeout = Duration::from_secs(1);
+    cfg.limits.idle_timeout = idle;
+    cfg.min_drain_rate = min_drain_rate;
     let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
     let path = handle.socket_path.clone().expect("unix socket");
     let mut stream = tokio::net::UnixStream::connect(&path)
@@ -154,6 +320,25 @@ async fn stalled_response_write_closes_the_esplora_listener() {
         block_hash_hex(&h0.hash)
     );
     stream.write_all(req.as_bytes()).await.unwrap();
+    (handle, stream, dir, short)
+}
+
+/// Split a complete response into its head and body.
+fn response_head_and_body(buf: &[u8]) -> (String, &[u8]) {
+    let text = std::str::from_utf8(buf).expect("utf8 response");
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((text, ""));
+    (head.to_string(), body.as_bytes())
+}
+
+/// The real listener cancels a stalled response write. A client asks for a
+/// body larger than the socket buffers and never reads; after the request
+/// timeout the connection is closed with only part of the body sent. Without
+/// the deadline the client drains the whole response once it starts reading.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_response_write_closes_the_esplora_listener() {
+    let (handle, mut stream, dir, short) =
+        block_txs_listener("write-stall", Duration::from_secs(1), 1 << 20).await;
 
     tokio::time::sleep(Duration::from_millis(2000)).await;
     let mut buf = Vec::new();
@@ -169,16 +354,61 @@ async fn stalled_response_write_closes_the_esplora_listener() {
     .await;
     handle.shutdown().await;
 
-    let text = String::from_utf8_lossy(&buf);
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let (head, body) = response_head_and_body(&buf);
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-    let len: usize = header_value(head, "content-length")
+    let len: usize = header_value(&head, "content-length")
         .expect("content-length")
         .parse()
         .expect("content-length number");
     assert!(
         body.len() < len,
         "stalled response sent {body_len} of {len} bytes",
+        body_len = body.len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&short);
+}
+
+/// The configured minimum drain rate reaches the real listener: a client that
+/// accepts a little before each read hangs up is cut even though every write
+/// makes progress. Without the budget the client drains the whole response.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trickled_response_write_closes_the_esplora_listener() {
+    let (handle, mut stream, dir, short) =
+        block_txs_listener("write-trickle", Duration::from_secs(1), 4 << 20).await;
+
+    // 64 KiB per 100 ms is 640 KiB/s, below the 4 MiB/s floor.
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut closed = false;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(20) {
+        match tokio::time::timeout(Duration::from_secs(3), stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {
+                closed = true;
+                break;
+            }
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    handle.shutdown().await;
+    assert!(
+        closed,
+        "the listener did not close a response draining below the minimum rate"
+    );
+
+    let (head, body) = response_head_and_body(&buf);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let len: usize = header_value(&head, "content-length")
+        .expect("content-length")
+        .parse()
+        .expect("content-length number");
+    assert!(
+        body.len() < len,
+        "trickled response sent {body_len} of {len} bytes",
         body_len = body.len()
     );
     let _ = std::fs::remove_dir_all(&dir);

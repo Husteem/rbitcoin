@@ -383,7 +383,7 @@ pub fn operator_usage() -> String {
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--electrum-onion[=0|1]] [--esplora-onion[=0|1]] [--electrum-i2p[=0|1]] [--esplora-i2p[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
     [--sv2-tp-listen ADDR] [--sv2-tp-authority-sec KEY] [--sv2-tp-authority-sec-file PATH] [--sv2-tp-cert-validity SECS] [--sv2-tp-stale-grace SECS] [--sv2-tp-idle-timeout SECS] [--sv2-tp-fee-delta SATS] [--sv2-tp-template-interval SECS] \\\n\
-    [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--datadir-hdd] [--store-read-budget N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--heavy-sh-creates N] [--electrum-max-subs N] [--electrum-max-sp-subs N] [--esplora-max-inflight N] [--esplora-block-template] \\\n\
+    [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--datadir-hdd] [--store-read-budget N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--heavy-sh-creates N] [--electrum-max-subs N] [--electrum-max-sp-subs N] [--esplora-max-inflight N] [--esplora-min-drain-rate BYTES] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rest] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-cookie-perms owner|group|all] [--rpc-work-queue N] [--rpc-client-version N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
@@ -448,6 +448,7 @@ Block filters: --block-filter-index (default off) builds BIP158 basic filters. I
   --electrum-max-subs N caps blockchain.scripthash.subscribe per Electrum connection (default 10000; >= 1). Wallets subscribe every address up to their gap limit.\n\
   --electrum-max-sp-subs N caps blockchain.silentpayments.subscribe addresses per Electrum connection (default 16; >= 1). Each address scans every new block.\n\
   --esplora-max-inflight N caps Esplora requests in flight across the whole listener (default 256; >= 1). Accepted TCP is 8× that, and a further socket is closed. A socket that sends no headers is closed at the idle timeout. A request that finds the in-flight cap full waits; the wait counts against the request timeout (408).\n\
+  --esplora-min-drain-rate BYTES is the minimum average rate an Esplora response write must sustain, in bytes per second (default 16384; >= 1). A write may stall for the request timeout; after that, its total stalled time may not exceed the timeout plus bytes-written/rate, so a client that accepts a little before each no-progress deadline is still closed. Lower it for slow clients on large histories, raise it on a busy public listener.\n\
   --store-read-budget N caps concurrent API store reads across RPC, REST, Electrum, Esplora, and BlindBit (N >= 1). Omitted or 0 uses the default: 1 when --datadir-hdd is set, otherwise one less than the core count, minimum 1. An explicit N overrides --datadir-hdd. Waiters do not hold a blocking-pool thread.\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
   --electrum-onion (default off) ADD_ONION for --electrum-listen. Needs --tor-control and a TCP listen on 127.0.0.1 or 0.0.0.0.\n\

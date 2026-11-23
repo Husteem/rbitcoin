@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -489,6 +489,12 @@ impl EsploraListen {
     }
 }
 
+/// A response write may stall for the request timeout, and its total stall
+/// time may not exceed that plus `written / DEFAULT_MIN_DRAIN_RATE`. 16 KiB/s
+/// is a 128 kbit/s link, the slowest client a large history is expected to
+/// serve. [`EsploraConfig::min_drain_rate`] replaces it.
+pub const DEFAULT_MIN_DRAIN_RATE: u64 = 16 * 1024;
+
 /// Esplora HTTP server config (listen + shared DoS floor).
 #[derive(Clone, Debug)]
 pub struct EsploraConfig {
@@ -501,6 +507,10 @@ pub struct EsploraConfig {
     pub block_template: Option<BlockTemplateFn>,
     /// Requests in flight across `/blindbit/v1/` (>= 1), when mounted.
     pub blindbit_max_inflight: usize,
+    /// Bytes per second a response write must average after the request-timeout
+    /// grace (>= 1). Below it the connection is closed. Default
+    /// [`DEFAULT_MIN_DRAIN_RATE`].
+    pub min_drain_rate: u64,
 }
 
 impl EsploraConfig {
@@ -520,6 +530,7 @@ impl EsploraConfig {
             network,
             block_template: None,
             blindbit_max_inflight,
+            min_drain_rate: DEFAULT_MIN_DRAIN_RATE,
         }
     }
 }
@@ -1139,24 +1150,50 @@ impl CappedAccept for tokio::net::UnixListener {
     }
 }
 
-/// A pending response write is cancelled after `timeout` without progress.
-/// Reads keep their header/idle deadline; this bounds only the write side, so
-/// a client that stops reading cannot hold the connection and its accept slot
-/// until the process drops it. It is not a total response budget: a reader
-/// that accepts a few bytes before each deadline keeps a large response open.
-/// See #1884.
+/// Per-connection response counter. The response-start middleware bumps it
+/// when a response's headers are ready; the socket wrapper starts that
+/// response's byte and stall totals on the next write. See #1884.
+#[derive(Default)]
+struct ResponseBudget {
+    generation: AtomicU64,
+}
+
+impl ResponseBudget {
+    fn start(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A pending response write is cancelled after `timeout` without progress,
+/// and a response whose writes spend more than `timeout + written / min_rate`
+/// stalled time is cancelled too. Reads keep their header/idle deadline; this
+/// bounds only the write side, so a reader that accepts a few bytes before
+/// each no-progress deadline can no longer hold the connection and its accept
+/// slot. Server compute between writes is not stalled time. See #1884.
 struct WriteDeadline<S> {
     inner: S,
     timeout: Duration,
+    min_rate: u64,
+    budget: Arc<ResponseBudget>,
+    response: u64,
+    written: u64,
+    stalled_for: Duration,
+    open_stall: Option<tokio::time::Instant>,
     armed: bool,
     sleep: Pin<Box<tokio::time::Sleep>>,
 }
 
 impl<S> WriteDeadline<S> {
-    fn new(inner: S, timeout: Duration) -> Self {
+    fn new(inner: S, timeout: Duration, min_rate: u64, budget: Arc<ResponseBudget>) -> Self {
         Self {
             inner,
             timeout,
+            min_rate: min_rate.max(1),
+            response: budget.generation.load(Ordering::Relaxed),
+            budget,
+            written: 0,
+            stalled_for: Duration::ZERO,
+            open_stall: None,
             armed: false,
             sleep: Box::pin(tokio::time::sleep(timeout)),
         }
@@ -1164,6 +1201,31 @@ impl<S> WriteDeadline<S> {
 
     fn progressed(&mut self) {
         self.armed = false;
+    }
+
+    /// Start the totals for a response the middleware began, charge the stall
+    /// interval that just ended, and reject a response that spent more than
+    /// its no-progress grace plus `written / min_rate` stalled.
+    fn drain(&mut self) -> Option<io::Error> {
+        let generation = self.budget.generation.load(Ordering::Relaxed);
+        if generation != self.response {
+            self.response = generation;
+            self.written = 0;
+            self.stalled_for = Duration::ZERO;
+            self.open_stall = None;
+            self.armed = false;
+        }
+        if let Some(start) = self.open_stall.take() {
+            self.stalled_for += start.elapsed();
+        }
+        let allowance =
+            self.timeout + Duration::from_secs_f64(self.written as f64 / self.min_rate as f64);
+        (self.stalled_for > allowance).then(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "esplora: response drained below the minimum rate",
+            )
+        })
     }
 
     fn stalled(&mut self, cx: &mut Context<'_>) -> bool {
@@ -1194,12 +1256,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if let Some(err) = this.drain() {
+            return Poll::Ready(Err(err));
+        }
         match Pin::new(&mut this.inner).poll_write(cx, buf) {
             Poll::Ready(result) => {
+                if let Ok(n) = &result {
+                    this.written += *n as u64;
+                }
                 this.progressed();
                 Poll::Ready(result)
             }
             Poll::Pending => {
+                this.open_stall = Some(tokio::time::Instant::now());
                 if this.stalled(cx) {
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -1218,12 +1287,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if let Some(err) = this.drain() {
+            return Poll::Ready(Err(err));
+        }
         match Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
             Poll::Ready(result) => {
+                if let Ok(n) = &result {
+                    this.written += *n as u64;
+                }
                 this.progressed();
                 Poll::Ready(result)
             }
             Poll::Pending => {
+                this.open_stall = Some(tokio::time::Instant::now());
                 if this.stalled(cx) {
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -1242,12 +1318,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Some(err) = this.drain() {
+            return Poll::Ready(Err(err));
+        }
         match Pin::new(&mut this.inner).poll_flush(cx) {
             Poll::Ready(result) => {
                 this.progressed();
                 Poll::Ready(result)
             }
             Poll::Pending => {
+                this.open_stall = Some(tokio::time::Instant::now());
                 if this.stalled(cx) {
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -1262,12 +1342,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WriteDeadline<S> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Some(err) = this.drain() {
+            return Poll::Ready(Err(err));
+        }
         match Pin::new(&mut this.inner).poll_shutdown(cx) {
             Poll::Ready(result) => {
                 this.progressed();
                 Poll::Ready(result)
             }
             Poll::Pending => {
+                this.open_stall = Some(tokio::time::Instant::now());
                 if this.stalled(cx) {
                     Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -1290,17 +1374,36 @@ pub fn serve_http_connection<S>(
     app: Router,
     header_timeout: Duration,
     write_timeout: Duration,
+    min_drain_rate: u64,
 ) -> impl Future<Output = ()> + Send
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let budget = Arc::new(ResponseBudget::default());
+    let starts = Arc::clone(&budget);
+    let app = app.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let starts = Arc::clone(&starts);
+        async move {
+            let response = next.run(req).await;
+            starts.start();
+            response
+        }
+    }));
     let service = TowerToHyperService::new(app);
     async move {
         let mut http = http1::Builder::new();
         http.timer(TokioTimer::new())
             .header_read_timeout(header_timeout);
         let _ = http
-            .serve_connection(TokioIo::new(WriteDeadline::new(io, write_timeout)), service)
+            .serve_connection(
+                TokioIo::new(WriteDeadline::new(
+                    io,
+                    write_timeout,
+                    min_drain_rate,
+                    budget,
+                )),
+                service,
+            )
             .await;
     }
 }
@@ -1322,6 +1425,7 @@ fn spawn_capped<L: CappedAccept>(
     max_conn: usize,
     header_timeout: Duration,
     write_timeout: Duration,
+    min_drain_rate: u64,
     shutdown: Arc<EsploraStop>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1367,6 +1471,7 @@ fn spawn_capped<L: CappedAccept>(
                                 app.clone(),
                                 header_timeout,
                                 write_timeout,
+                                min_drain_rate,
                             );
                             conns.0.push(tokio::spawn(async move {
                                 let _permit = permit;
@@ -1611,6 +1716,7 @@ pub async fn run_esplora(
                 esplora_accept_cap(max_conn),
                 idle,
                 timeout,
+                config.min_drain_rate,
                 shutdown_c,
             );
             Ok(EsploraHandle {
@@ -1635,6 +1741,7 @@ pub async fn run_esplora(
                 esplora_accept_cap(max_conn),
                 idle,
                 timeout,
+                config.min_drain_rate,
                 shutdown_c,
             );
             Ok(EsploraHandle {

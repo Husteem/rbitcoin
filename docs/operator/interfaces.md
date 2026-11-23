@@ -106,6 +106,7 @@ timeout (`TimeoutLayer`, status 408). `admit_connection` holds the wait.
 |-------|---------|------|
 | Max connections | 256 | Concurrent Electrum TCP clients. Esplora accepts up to 8× `--esplora-max-inflight` sockets; a further socket is closed. A socket that sends no headers is closed at the idle timeout |
 | Max Esplora in flight | 256 (`--esplora-max-inflight`) | Esplora requests in flight across the listener, every route together. Further requests wait for a slot, within the request timeout (408) |
+| Min Esplora drain rate | 16 KiB/s (`--esplora-min-drain-rate`) | A response write may stall for the request timeout; its total stalled time must stay under that plus bytes-written/rate. A reader that accepts a trickle is disconnected |
 | Max request line | 1 MiB | One JSON-RPC line including `\n` |
 | Idle timeout | 120 s | No complete request → disconnect |
 | Max scripthash subs / conn | 10000 (`--electrum-max-subs`) | Notify fan-out cap. A wallet subscribes every address up to its gap limit; each sub is ~170 B (≈0.45 GB worst case at 256 connections) plus one posting check per block against that block's shared touch set; a reorg restatuses every sub |
