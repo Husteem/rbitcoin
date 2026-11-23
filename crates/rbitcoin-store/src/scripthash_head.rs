@@ -16,7 +16,6 @@
 //! A head this process just created is still empty. The ingest file itself is
 //! created on the first insert, not when the store is created.
 
-use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};
@@ -122,27 +121,10 @@ pub fn load_occ_sidecar(head_path: &Path) -> Option<u64> {
 #[doc(hidden)]
 pub fn store_occ_sidecar(head_path: &Path, occupied: u64) -> Result<(), StoreError> {
     let p = occ_sidecar_path(head_path);
-    let tmp = {
-        let mut t = p.as_os_str().to_os_string();
-        t.push(".tmp");
-        PathBuf::from(t)
-    };
     let mut buf = [0u8; 16];
     buf[0..8].copy_from_slice(OCC_MAGIC);
     buf[8..16].copy_from_slice(&occupied.to_le_bytes());
-    if let Some(parent) = p.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(&tmp, buf).map_err(|e| StoreError::io(&tmp, e))?;
-    {
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&tmp)
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
-    }
-    std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
-    Ok(())
+    crate::file::write_synced_tmp_rename(&p, &buf)
 }
 
 #[doc(hidden)]

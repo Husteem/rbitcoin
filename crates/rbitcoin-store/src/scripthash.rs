@@ -65,27 +65,13 @@ impl ColdProgress {
 
     pub fn store(&self, store_dir: &Path) -> Result<(), StoreError> {
         let p = Self::path(store_dir);
-        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tmp = store_dir.join(format!(
-            "{COLD_PROGRESS_NAME}.{}.tmp",
-            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
         let mut buf = Vec::with_capacity(36);
         buf.extend_from_slice(COLD_PROGRESS_MAGIC);
         buf.extend_from_slice(&self.next_shard.to_le_bytes());
         buf.extend_from_slice(&self.body_bump.to_le_bytes());
         buf.extend_from_slice(&self.live_count.to_le_bytes());
         buf.extend_from_slice(&self.keys_written.to_le_bytes());
-        std::fs::write(&tmp, &buf).map_err(|e| StoreError::io(&tmp, e))?;
-        {
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&tmp)
-                .map_err(|e| StoreError::io(&tmp, e))?;
-            f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
-        }
-        std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
-        Ok(())
+        crate::file::write_synced_tmp_rename(&p, &buf)
     }
 
     pub fn clear(store_dir: &Path) {
@@ -141,17 +127,7 @@ pub fn store_include_hwm(store_dir: &Path, max_create_fk: u64) -> Result<(), Sto
         return Ok(());
     }
     let p = store_dir.join(INCLUDE_HWM_NAME);
-    let tmp = store_dir.join(format!("{INCLUDE_HWM_NAME}.tmp"));
-    std::fs::write(&tmp, max_create_fk.to_le_bytes()).map_err(|e| StoreError::io(&tmp, e))?;
-    {
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&tmp)
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
-    }
-    std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
-    Ok(())
+    crate::file::write_synced_tmp_rename(&p, &max_create_fk.to_le_bytes())
 }
 
 /// P2TR scriptPubKey: `OP_1` then a 32-byte x-only key.

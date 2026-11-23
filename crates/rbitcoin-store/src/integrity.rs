@@ -11,7 +11,6 @@
 //! a later Class A truncate left past that count, including when the header
 //! clear landed and the tip shrink did not.
 
-use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::header_table::block_header_hash;
 use crate::store::Store;
@@ -20,7 +19,7 @@ use rbitcoin_primitives::{
     SCHEMA_VERSION, STORE_MAGIC,
 };
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 /// Core `-checkblocks` default: re-read the last N confirmed blocks at open.
@@ -141,22 +140,7 @@ impl TipSeal {
         buf[12..20].copy_from_slice(&self.confirmed_len.to_le_bytes());
         buf[20..28].copy_from_slice(&self.generation.to_le_bytes());
         buf[28..60].copy_from_slice(&self.tip_hash);
-        let tmp = p.with_extension("tip_seal.tmp");
-        {
-            let mut f = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&tmp)
-                .map_err(|e| StoreError::io(&tmp, e))?;
-            f.write_all(&buf).map_err(|e| StoreError::io(&tmp, e))?;
-            f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
-        }
-        std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
-        if let Some(parent) = p.parent() {
-            crate::file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-        }
-        Ok(())
+        crate::file::write_synced_tmp_rename(&p, &buf)
     }
 }
 
