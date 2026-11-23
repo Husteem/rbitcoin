@@ -5830,14 +5830,14 @@ impl MempoolHub {
         &self,
         peer: u64,
         hash: [u8; 32],
-        inbound: bool,
+        preferred: bool,
         now: u64,
         wtxid: bool,
     ) -> ParentNote {
         self.parent_req
             .lock()
             .unwrap()
-            .note_inv(peer, hash, inbound, now, wtxid)
+            .note_inv(peer, hash, preferred, now, wtxid)
     }
 
     pub fn forget_parent_anns_for_peer(&self, peer: u64) {

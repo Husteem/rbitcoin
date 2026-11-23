@@ -5337,8 +5337,13 @@ pub fn on_inv_txid(
         return None;
     }
     if let Some(s) = session {
-        match mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false)
-        {
+        match mp.note_inv_tx_requested(
+            s.id,
+            txid.to_byte_array(),
+            tx_download_preferred(s),
+            s.clock_now(),
+            false,
+        ) {
             crate::tx_relay::ParentNote::RequestNow => {}
             crate::tx_relay::ParentNote::Deferred => return None,
             crate::tx_relay::ParentNote::PeerCapped => {
@@ -5348,6 +5353,12 @@ pub fn on_inv_txid(
         }
     }
     Some(Inventory::WitnessTransaction(*txid))
+}
+
+/// Core `fPreferredDownload` for transaction requests: an outbound peer, or
+/// an inbound one with `noban`.
+fn tx_download_preferred(s: &crate::peers::LivePeer) -> bool {
+    !s.inbound || s.session_noban()
 }
 
 fn asks_back_local_tx(
@@ -5382,7 +5393,7 @@ pub fn on_inv_wtxid(
             match mp.note_inv_tx_requested(
                 s.id,
                 wtxid.to_byte_array(),
-                s.inbound,
+                tx_download_preferred(s),
                 s.clock_now(),
                 true,
             ) {

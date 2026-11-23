@@ -3437,7 +3437,7 @@ fn parent_req_stops_at_per_peer_cap() {
     let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
     let cap = parent_req::MAX_PARENT_ANN_PER_PEER;
     for i in 0..(cap as u32 + 10) {
-        let accepted = hub.note_inv_tx_requested(7, parent_hash(i), false, 1_000, false);
+        let accepted = hub.note_inv_tx_requested(7, parent_hash(i), true, 1_000, false);
         if i < cap as u32 {
             assert_eq!(
                 accepted,
@@ -3466,7 +3466,7 @@ fn second_peer_take_due_does_not_drop_other_peers_keys() {
     let txid = Txid::from_byte_array(hash);
     let wtxid = Wtxid::from_byte_array(hash);
     assert_eq!(
-        hub.note_inv_tx_requested(1, hash, false, 1_000, false),
+        hub.note_inv_tx_requested(1, hash, true, 1_000, false),
         ParentNote::RequestNow
     );
     hub.note_recent_reject(wtxid);
@@ -3562,11 +3562,11 @@ fn wtxid_followup_is_requested_as_wtx() {
     let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
     let hash = [0xab; 32];
     assert_eq!(
-        hub.note_inv_tx_requested(1, hash, false, 1_000, true),
+        hub.note_inv_tx_requested(1, hash, true, 1_000, true),
         ParentNote::RequestNow
     );
     assert_eq!(
-        hub.note_inv_tx_requested(3, hash, false, 1_000, true),
+        hub.note_inv_tx_requested(3, hash, true, 1_000, true),
         ParentNote::Deferred,
         "the wtxid follow-up is its own row and is not a second getdata"
     );
@@ -3604,7 +3604,7 @@ fn same_peer_wtxid_inflight_expires_back_to_txid_parent() {
     let t0 = 1_000u64;
     hub.schedule_orphan_parents(&missing, 2, false, t0);
     assert_eq!(
-        hub.note_inv_tx_requested(2, hash, false, t0, true),
+        hub.note_inv_tx_requested(2, hash, true, t0, true),
         ParentNote::RequestNow,
         "the same peer's wtxid inv is a second announcement"
     );
