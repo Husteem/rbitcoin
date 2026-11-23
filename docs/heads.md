@@ -9,7 +9,7 @@ On-disk bytes: [`SCHEMA.md`](../SCHEMA.md).
 
 ```text
 header.hash ──► header.head          HashHead gen 0 (2²² mainnet; 64 tiny)
-            ──► header.head.gN       overflow gens (same slots; probe newest first)
+            ──► header.head.gN       overflow gens (2x the last; probe newest first)
                     16 B prefix + 8 B fk; .mlt if multi
 
 txid mix    ──► tx.head/             AddressHead inside SegmentedTxHead

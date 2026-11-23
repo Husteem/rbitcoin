@@ -383,7 +383,7 @@ Open-address hash head (see [Hash heads](#hash-heads-headerhead-generic)): key =
 
 **Create:** single file. Mainnet **2²²** slots (~96 MiB sparse, ~3.67 M headers at 7/8). Tiny tests use 64 slots so generation roll is exercised.
 
-**Overflow:** `header.head.g1`, `.g2`, … same slot count as create. Probe newest-first. No schema bump — same 24 B OA slot format.
+**Overflow:** `header.head.g1`, `.g2`, … each twice the slots of the generation before it, so a lookup probes about log₂ generations, not one per 7/8 of the create count. Each file carries its own slot count, so older equal-size generations still open. Probe newest-first. No schema bump — same 24 B OA slot format.
 
 **Open:** leftover `header.head/` directory (old 256-way shards) is **Layout refuse** (wipe `header.head` and `header.body`, reindex). A **single** file smaller than the create target is rewritten on open at the target slot count: write `header.head.grow`, fsync, rename over the live file (`.mlt` kept; no concurrent probes). Crash during rewrite leaves the previous undersized file. A target-sized gen0 with `occupied==0` and a non-empty `header.body` or `.mlt` is **Layout refuse** (wipe `header.head`, `header.head.mlt`, and `header.body`, reindex) — not a silent empty index.
 

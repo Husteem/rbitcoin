@@ -216,7 +216,12 @@ impl HeaderHead {
         }
         let i = gens.len();
         let p = header_gen_path(&self.base, i);
-        gens.push(HashHead::create_with_slots(p, self.target_slots)?);
+        // Twice the last generation: a lookup probes every generation, so
+        // equal sizes would make it linear in the header count.
+        let slots = gens
+            .last()
+            .map_or(self.target_slots, |h| h.slots().saturating_mul(2));
+        gens.push(HashHead::create_with_slots(p, slots)?);
         Ok(())
     }
 
