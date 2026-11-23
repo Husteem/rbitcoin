@@ -254,10 +254,12 @@ Restrict access to the marked listener to the Tor forwarder. For a
 non-loopback bind, enforce this restriction with a firewall or network policy.
 Inbound I2P needs a separate primary P2P listener reachable at `127.0.0.1`.
 Source-IP permission rules skip the marked listener. Ordinary listeners
-keep their normal source-IP rules. Existing IP refusals and eviction
-cooldowns apply on every listener. If an external onion is configured
-without a marked listener, inbound loopback peers skip source-IP grants
-and self-announcements.
+keep their normal source-IP rules. Inbound peers on the marked listener do
+not trigger IP discouragement or eviction group cooldowns. Every listener
+enforces existing refusals for the exact TCP source IP. Only ordinary
+listeners enforce eviction group cooldowns at admission.
+If an external onion is configured without a marked listener, inbound
+loopback peers skip source-IP grants and self-announcements.
 Explicit bind grants still apply.
 
 On NixOS, append the Tor listener alongside the module-managed P2P listener:

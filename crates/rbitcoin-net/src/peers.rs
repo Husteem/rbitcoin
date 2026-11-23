@@ -3392,12 +3392,16 @@ impl PeerHub {
             .contains_key(&key)
     }
 
-    /// True when this inbound address or its accept-time netgroup is still
-    /// refused. Expired rows are dropped here, which is the only sweep.
-    pub fn inbound_discouraged(&self, addr: SocketAddr) -> bool {
+    /// Exact-IP refusals apply to every listener. The marked onion listener
+    /// skips eviction group cooldowns at admission.
+    #[doc(hidden)]
+    pub fn inbound_discouraged(&self, addr: SocketAddr, bind: SocketAddr) -> bool {
         // `key_refused` drops expired rows.
         if self.key_refused(DiscourageKey::Ip(addr.ip())) {
             return true;
+        }
+        if self.onion_bind() == Some(bind) {
+            return false;
         }
         let group = crate::netgroup::slot_pause_group(addr);
         self.discouraged_groups
