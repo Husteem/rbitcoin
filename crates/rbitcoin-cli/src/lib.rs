@@ -9,7 +9,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Mirrors the non-string parameter positions and names the RPC handlers read
 /// in `crates/rbitcoin-rpc/src/methods/`. A handler change that adds, moves,
@@ -126,8 +126,96 @@ const CONVERT_PARAMS: &[(&str, usize, &str, ParamFormat)] = &[
     ("waitfornewblock", 0, "timeout", ParamFormat::Json),
 ];
 
-const RPCWAIT_ATTEMPTS: u32 = 30;
+const RPCWAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const RPCWAIT_DELAY: Duration = Duration::from_secs(1);
+/// Core's `-rpcclienttimeout` default. The unix socket has no default.
+const TCP_CLIENT_TIMEOUT: Duration = Duration::from_secs(900);
+/// The shortest connect attempt: an attempt at the `--rpcwait` limit still
+/// dials once.
+const MIN_DIAL: Duration = Duration::from_millis(1);
+/// Every long option and what it does, in `usage()` order. This table is the
+/// parser: `--name` and Core's `-name` both look the name up here, so a new
+/// option takes the single dash without a second list.
+const LONG_OPTIONS: &[(&str, LongOpt)] = &[
+    (
+        "datadir",
+        LongOpt::Value(|c, v| {
+            c.datadir = PathBuf::from(v);
+            Ok(())
+        }),
+    ),
+    (
+        "rpc-socket",
+        LongOpt::Value(|c, v| {
+            c.socket = Some(PathBuf::from(v));
+            Ok(())
+        }),
+    ),
+    (
+        "network",
+        LongOpt::Value(|c, v| {
+            c.network = Network::parse(v).map_err(|e| format!("invalid --network: {e}"))?;
+            Ok(())
+        }),
+    ),
+    (
+        "rpc-url",
+        LongOpt::Value(|c, v| {
+            c.rpc_url = Some(v.to_string());
+            Ok(())
+        }),
+    ),
+    (
+        "rpc-token-file",
+        LongOpt::Value(|c, v| {
+            c.token_file = Some(PathBuf::from(v));
+            Ok(())
+        }),
+    ),
+    ("help", LongOpt::Help),
+    ("version", LongOpt::Version),
+    ("stdin", LongOpt::Switch(|c| c.stdin = true)),
+    ("rpcwait", LongOpt::Switch(|c| c.rpcwait = true)),
+    (
+        "rpcclienttimeout",
+        LongOpt::Value(|c, v| {
+            c.rpcclienttimeout = TimeoutArg::parse("rpcclienttimeout", v)?;
+            Ok(())
+        }),
+    ),
+    (
+        "rpcwaittimeout",
+        LongOpt::Value(|c, v| {
+            c.rpcwaittimeout = TimeoutArg::parse("rpcwaittimeout", v)?;
+            Ok(())
+        }),
+    ),
+    ("named", LongOpt::Switch(|c| c.named = true)),
+    ("getinfo", LongOpt::Switch(|c| c.getinfo = true)),
+];
+
+/// What one long option does when it parses.
+#[derive(Clone, Copy)]
+enum LongOpt {
+    Help,
+    Version,
+    /// Takes no value.
+    Switch(fn(&mut CliConfig)),
+    /// Takes `=VALUE` or the next argument.
+    Value(fn(&mut CliConfig, &str) -> Result<(), String>),
+}
+
+#[doc(hidden)]
+pub fn long_option_names() -> impl Iterator<Item = &'static str> {
+    LONG_OPTIONS.iter().map(|(name, _)| *name)
+}
+
+fn long_option(name: &str) -> Option<LongOpt> {
+    LONG_OPTIONS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, opt)| *opt)
+}
 
 #[derive(Clone, Copy)]
 enum ParamFormat {
@@ -149,9 +237,17 @@ pub fn usage() -> String {
            -h, --help             this message\n\
            -V, --version          print version\n\
            --stdin                read extra args from stdin, one per line until EOF\n\
-           --rpcwait              retries a refused connection for up to ~30 seconds\n\
+           --rpcwait              retries a refused connection until --rpcwaittimeout\n\
+           --rpcclienttimeout N   seconds an RPC may wait for its reply, 0 for none\n\
+                                  (default 900 on TCP, none on the unix socket)\n\
+           --rpcwaittimeout N     seconds --rpcwait retries, 0 for no limit (default 30)\n\
+                                  (a negative N is refused; Core reads it as no limit)\n\
            --named                pass named (name=value) parameters instead of positional\n\
            --getinfo              print a Core-style chain/network summary\n\
+         \n\
+         Each option also takes Core's single dash (-rpcwait, -datadir=PATH).\n\
+         Options are read anywhere before --, so a parameter spelled like an\n\
+         option (-named) goes after --. A switch takes no =value.\n\
          \n\
          Local: --datadir talks to {{datadir}}/rpc.sock (no token). TCP uses Bearer\n\
          from {{datadir}}/rpc.token. Plain HTTP, same as the node.",
@@ -170,8 +266,109 @@ pub struct CliConfig {
     pub params: Vec<String>,
     pub stdin: bool,
     pub rpcwait: bool,
+    pub rpcclienttimeout: TimeoutArg,
+    pub rpcwaittimeout: TimeoutArg,
     pub named: bool,
     pub getinfo: bool,
+}
+
+/// A seconds option where `0` means no limit, as Core reads it.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TimeoutArg {
+    #[default]
+    Omitted,
+    Unlimited,
+    After(Duration),
+}
+
+impl TimeoutArg {
+    fn parse(flag: &str, raw: &str) -> Result<Self, String> {
+        let secs: u64 = raw
+            .parse()
+            .map_err(|_| format!("invalid --{flag}: `{raw}` (seconds, 0 for no limit)"))?;
+        Ok(match secs {
+            0 => Self::Unlimited,
+            n => Self::After(Duration::from_secs(n)),
+        })
+    }
+
+    fn or(self, default: Option<Duration>) -> Option<Duration> {
+        match self {
+            Self::Omitted => default,
+            Self::Unlimited => None,
+            Self::After(d) => Some(d),
+        }
+    }
+}
+
+/// The read and write timeout of one call: `--rpcclienttimeout`, else 900 s
+/// on TCP and none on the unix socket. `None` is no limit.
+#[doc(hidden)]
+pub fn client_timeout(arg: TimeoutArg, tcp: bool) -> Option<Duration> {
+    arg.or(tcp.then_some(TCP_CLIENT_TIMEOUT))
+}
+
+/// How long a connect may take, and the option that sets it: the client
+/// timeout or what is left of `--rpcwait`, whichever is shorter.
+#[doc(hidden)]
+pub fn connect_bound(
+    client: Option<Duration>,
+    wait_left: Option<Duration>,
+) -> Option<(Duration, &'static str)> {
+    match (client, wait_left) {
+        (Some(c), Some(w)) if w < c => Some((w, "--rpcwaittimeout")),
+        (Some(c), _) => Some((c, "--rpcclienttimeout")),
+        (None, w) => w.map(|w| (w, "--rpcwaittimeout")),
+    }
+}
+
+type Addrs = std::io::Result<Vec<SocketAddr>>;
+
+/// A host name lookup on its own thread. A lookup cannot be cancelled, so
+/// one that outlives an attempt's bound stays here and the next
+/// `--rpcwait` attempt waits on it instead of starting another.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct HostLookup(Option<std::sync::mpsc::Receiver<Addrs>>);
+
+impl HostLookup {
+    /// The addresses, or `None` once `limit` passes. `lookup` runs only
+    /// when no earlier lookup is in flight.
+    pub fn wait(
+        &mut self,
+        limit: Option<Duration>,
+        lookup: impl FnOnce() -> Addrs + Send + 'static,
+    ) -> std::io::Result<Option<Vec<SocketAddr>>> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let rx = match self.0.take() {
+            Some(rx) => rx,
+            None => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                // Not joined: a late lookup finishes on its own.
+                let _detached = std::thread::Builder::new()
+                    .name("rbitcoin-cli-lookup".into())
+                    .spawn(move || {
+                        let _ = tx.send(lookup());
+                    })?;
+                rx
+            }
+        };
+        let got = match limit {
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(limit) => rx.recv_timeout(limit),
+        };
+        match got {
+            Ok(addrs) => addrs.map(Some),
+            Err(RecvTimeoutError::Timeout) => {
+                self.0 = Some(rx);
+                Ok(None)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(std::io::Error::other("the name lookup thread ended"))
+            }
+        }
+    }
 }
 
 impl Default for CliConfig {
@@ -186,6 +383,8 @@ impl Default for CliConfig {
             params: Vec::new(),
             stdin: false,
             rpcwait: false,
+            rpcclienttimeout: TimeoutArg::Omitted,
+            rpcwaittimeout: TimeoutArg::Omitted,
             named: false,
             getinfo: false,
         }
@@ -229,18 +428,59 @@ fn is_negative_number(a: &str) -> bool {
     a.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit())
 }
 
+/// Core's single-dash spelling of a known long option (`-rpcwait`,
+/// `-datadir=PATH`) as its `--` form. Any other single-dash word, `-h`, `-V`
+/// and a negative number are left alone.
+fn core_single_dash(a: &str) -> Option<String> {
+    let rest = a.strip_prefix('-').filter(|r| !r.starts_with('-'))?;
+    let name = rest.split_once('=').map_or(rest, |(name, _)| name);
+    long_option(name).map(|_| format!("-{a}"))
+}
+
+/// Applies one `--name`, `--name=value` or `--name value` option. `i` moves
+/// past a space-separated value. `Some` ends parsing with that action.
+fn apply_long_option(
+    cfg: &mut CliConfig,
+    args: &[OsString],
+    i: &mut usize,
+    name: &str,
+    eq: Option<&str>,
+) -> Result<Option<Action>, String> {
+    let opt = long_option(name).ok_or_else(|| format!("unknown argument `--{name}`"))?;
+    let set = match opt {
+        LongOpt::Value(set) => set,
+        _ if eq.is_some() => return Err(format!("--{name} takes no value")),
+        LongOpt::Help => return Ok(Some(Action::Help)),
+        LongOpt::Version => return Ok(Some(Action::Version)),
+        LongOpt::Switch(set) => {
+            set(cfg);
+            return Ok(None);
+        }
+    };
+    let val = match eq {
+        Some("") => return Err(format!("--{name} requires a value")),
+        Some(v) => v.to_string(),
+        None => take_value(args, i, &format!("--{name}"))?,
+    };
+    set(cfg, &val)?;
+    Ok(None)
+}
+
 #[doc(hidden)]
 pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
     let mut cfg = CliConfig::default();
     let mut positional_only = false;
     let mut i = 1usize;
     while i < args.len() {
-        let a = args[i].to_string_lossy();
+        let mut a = args[i].to_string_lossy();
         if !positional_only {
-            if a == "--help" || a == "-h" {
+            if let Some(long) = core_single_dash(a.as_ref()) {
+                a = long.into();
+            }
+            if a == "-h" {
                 return Ok(Action::Help);
             }
-            if a == "--version" || a == "-V" {
+            if a == "-V" {
                 return Ok(Action::Version);
             }
             if a == "--" {
@@ -248,49 +488,12 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
                 i += 1;
                 continue;
             }
-            if a == "--stdin" {
-                cfg.stdin = true;
-                i += 1;
-                continue;
-            }
-            if a == "--rpcwait" {
-                cfg.rpcwait = true;
-                i += 1;
-                continue;
-            }
-            if a == "--named" {
-                cfg.named = true;
-                i += 1;
-                continue;
-            }
-            if a == "--getinfo" {
-                cfg.getinfo = true;
-                i += 1;
-                continue;
-            }
             if a.starts_with('-') && !a.starts_with("--") && !is_negative_number(a.as_ref()) {
                 return Err(format!("unknown argument `{a}`"));
             }
             if let Some((name, eq)) = flag_name_and_eq(a.as_ref()) {
-                let val = match eq {
-                    Some(v) => {
-                        if v.is_empty() {
-                            return Err(format!("--{name} requires a value"));
-                        }
-                        v.to_string()
-                    }
-                    None => take_value(args, &mut i, &format!("--{name}"))?,
-                };
-                match name {
-                    "datadir" => cfg.datadir = PathBuf::from(val),
-                    "network" => {
-                        cfg.network =
-                            Network::parse(&val).map_err(|e| format!("invalid --network: {e}"))?;
-                    }
-                    "rpc-url" => cfg.rpc_url = Some(val),
-                    "rpc-socket" => cfg.socket = Some(PathBuf::from(val)),
-                    "rpc-token-file" => cfg.token_file = Some(PathBuf::from(val)),
-                    other => return Err(format!("unknown argument `--{other}`")),
+                if let Some(action) = apply_long_option(&mut cfg, args, &mut i, name, eq)? {
+                    return Ok(action);
                 }
                 i += 1;
                 continue;
@@ -424,12 +627,87 @@ impl ConnectError {
     }
 }
 
-fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ConnectError> {
-    let connect = match host.parse::<IpAddr>() {
-        Ok(ip) => TcpStream::connect(SocketAddr::new(ip, port)),
-        Err(_) => TcpStream::connect((host, port)),
+/// `now + d`, or an error for a `d` the clock cannot hold.
+fn deadline_after(d: Duration, opt: &str) -> Result<Instant, ConnectError> {
+    Instant::now().checked_add(d).ok_or_else(|| {
+        ConnectError::permanent(format!(
+            "{opt}={} is too large (0 means no limit)",
+            d.as_secs()
+        ))
+    })
+}
+
+/// What is left before `deadline`, never under [`MIN_DIAL`].
+fn left_until(deadline: Instant) -> Duration {
+    deadline
+        .saturating_duration_since(Instant::now())
+        .max(MIN_DIAL)
+}
+
+/// A connect error that names the option whose time ran out.
+fn dial_error(target: &str, e: &std::io::Error, bound: Option<(Duration, &str)>) -> ConnectError {
+    use std::io::ErrorKind;
+    ConnectError::from_io(
+        || match (e.kind(), bound) {
+            (ErrorKind::TimedOut | ErrorKind::WouldBlock, Some((_, opt))) => {
+                format!("connect {target}: {opt} expired: {e}")
+            }
+            _ => format!("connect {target}: {e}"),
+        },
+        e,
+    )
+}
+
+/// The host name lookup, bounded like the connect.
+fn resolve_tcp(
+    host: &str,
+    port: u16,
+    deadline: Option<(Instant, &'static str)>,
+    lookups: &mut HostLookup,
+) -> Result<Vec<SocketAddr>, ConnectError> {
+    use std::net::ToSocketAddrs;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let target = format!("{host}:{port}");
+    let lookup = {
+        let target = target.clone();
+        move || target.to_socket_addrs().map(Iterator::collect)
     };
-    connect.map_err(|e| ConnectError::from_io(|| format!("connect {host}:{port}: {e}"), &e))
+    let (limit, opt) = deadline.map_or((None, ""), |(at, opt)| (Some(left_until(at)), opt));
+    lookups
+        .wait(limit, lookup)
+        .map_err(|e| dial_error(&target, &e, None))?
+        .ok_or_else(|| {
+            ConnectError::transient(format!(
+                "connect {target}: {opt} expired in the name lookup"
+            ))
+        })
+}
+
+fn connect_tcp(
+    host: &str,
+    port: u16,
+    bound: Option<(Duration, &'static str)>,
+    lookups: &mut HostLookup,
+) -> Result<TcpStream, ConnectError> {
+    let target = format!("{host}:{port}");
+    let deadline = match bound {
+        None => None,
+        Some((d, opt)) => Some((deadline_after(d, opt)?, opt)),
+    };
+    let mut last = None;
+    for addr in resolve_tcp(host, port, deadline, lookups)? {
+        let dial = match deadline {
+            None => TcpStream::connect(addr),
+            Some((at, _)) => TcpStream::connect_timeout(&addr, left_until(at)),
+        };
+        match dial {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = Some(dial_error(&target, &e, bound)),
+        }
+    }
+    Err(last.unwrap_or_else(|| ConnectError::permanent(format!("connect {target}: no address"))))
 }
 
 #[doc(hidden)]
@@ -460,24 +738,31 @@ pub fn read_stdin_args(reader: impl BufRead) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// Retry a transient connect error every `delay` until `limit` has passed
+/// (`None`: forever), as Core's `-rpcwaittimeout` does. The last pause is
+/// cut short so the last attempt lands on the limit. Each attempt gets the
+/// time left, to bound its own connect.
 #[doc(hidden)]
 pub fn retry_connect<T>(
-    mut attempt: impl FnMut() -> Result<T, ConnectError>,
-    attempts: u32,
+    mut attempt: impl FnMut(Option<Duration>) -> Result<T, ConnectError>,
+    limit: Option<Duration>,
     delay: Duration,
 ) -> Result<T, String> {
-    let mut last_err = None;
-    for attempt_num in 0..attempts {
-        match attempt() {
+    let start = Instant::now();
+    let left = || limit.map(|l| l.saturating_sub(start.elapsed()));
+    loop {
+        let e = match attempt(left()) {
             Ok(value) => return Ok(value),
             Err(e) if !e.transient => return Err(e.message),
-            Err(e) => last_err = Some(e.message),
-        }
-        if attempt_num + 1 < attempts {
-            std::thread::sleep(delay);
-        }
+            Err(e) => e,
+        };
+        let pause = match left() {
+            None => delay,
+            Some(Duration::ZERO) => return Err(e.message),
+            Some(left) => delay.min(left),
+        };
+        std::thread::sleep(pause);
     }
-    Err(last_err.unwrap_or_else(|| "rpcwait: zero attempts".to_string()))
 }
 
 fn convert_format(method: &str, index: usize) -> Option<ParamFormat> {
@@ -575,7 +860,7 @@ pub fn rpc_http(
     );
     let mut wire = req.into_bytes();
     wire.extend_from_slice(&body);
-    stream.write_all(&wire).map_err(|e| format!("write: {e}"))?;
+    stream.write_all(&wire).map_err(|e| io_error("write", &e))?;
     let (status, resp_body) = read_http(&mut stream)?;
     if status == 401 {
         return Err("RPC unauthorized (check rpc.token or --rpc-token-file)".into());
@@ -596,14 +881,32 @@ pub fn rpc_http(
 }
 
 #[doc(hidden)]
-pub fn connect_unix(path: &Path) -> Result<socket2::Socket, ConnectError> {
+/// A unix connect waits on a full listen queue for the send timeout, so
+/// `bound` is set as that timeout first.
+pub fn connect_unix(
+    path: &Path,
+    bound: Option<(Duration, &str)>,
+) -> Result<socket2::Socket, ConnectError> {
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
         .map_err(|e| ConnectError::from_io(|| format!("unix socket: {e}"), &e))?;
     let addr = socket2::SockAddr::unix(path)
         .map_err(|e| ConnectError::permanent(format!("unix addr: {e}")))?;
+    sock.set_write_timeout(bound.map(|(d, _)| d.max(MIN_DIAL)))
+        .map_err(|e| ConnectError::permanent(format!("socket timeout: {e}")))?;
     sock.connect(&addr)
-        .map_err(|e| ConnectError::from_io(|| format!("connect {}: {e}", path.display()), &e))?;
+        .map_err(|e| dial_error(&path.display().to_string(), &e, bound))?;
     Ok(sock)
+}
+
+/// A socket timeout reads `EAGAIN` on unix and `TimedOut` on Windows.
+fn io_error(op: &str, e: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+            format!("{op}: --rpcclienttimeout expired: {e}")
+        }
+        _ => format!("{op}: {e}"),
+    }
 }
 
 #[doc(hidden)]
@@ -611,7 +914,7 @@ pub fn read_http(stream: &mut impl Read) -> Result<(u16, String), String> {
     let mut buf = Vec::new();
     stream
         .read_to_end(&mut buf)
-        .map_err(|e| format!("read: {e}"))?;
+        .map_err(|e| io_error("read", &e))?;
     let text = String::from_utf8_lossy(&buf);
     let (head, body) = text
         .split_once("\r\n\r\n")
@@ -634,20 +937,38 @@ pub fn format_result(v: &Value) -> String {
     }
 }
 
-fn connect_stream(cfg: &CliConfig, tcp: Option<&(String, u16)>) -> Result<RpcStream, ConnectError> {
+fn connect_stream(
+    cfg: &CliConfig,
+    tcp: Option<&(String, u16)>,
+    wait_left: Option<Duration>,
+    lookups: &mut HostLookup,
+) -> Result<RpcStream, ConnectError> {
     let sock = socket_path(cfg);
     if cfg.rpc_url.is_none() && (cfg.socket.is_some() || sock.exists()) {
-        Ok(RpcStream::Unix(connect_unix(&sock)?))
+        let timeout = client_timeout(cfg.rpcclienttimeout, false);
+        let stream = connect_unix(&sock, connect_bound(timeout, wait_left))?;
+        set_request_timeout((&stream).into(), timeout)?;
+        Ok(RpcStream::Unix(stream))
     } else {
         let (host, port) = match tcp {
             Some((h, p)) => (h.clone(), *p),
             None => ("127.0.0.1".into(), cfg.network.default_rpc_port()),
         };
-        let stream = connect_tcp(&host, port)?;
-        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-        stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+        let timeout = client_timeout(cfg.rpcclienttimeout, true);
+        let stream = connect_tcp(&host, port, connect_bound(timeout, wait_left), lookups)?;
+        set_request_timeout((&stream).into(), timeout)?;
         Ok(RpcStream::Tcp { stream, host, port })
     }
+}
+
+/// `None` clears the timeout: a zero `Duration` is refused by the socket.
+fn set_request_timeout(
+    sock: socket2::SockRef<'_>,
+    timeout: Option<Duration>,
+) -> Result<(), ConnectError> {
+    sock.set_read_timeout(timeout)
+        .and_then(|()| sock.set_write_timeout(timeout))
+        .map_err(|e| ConnectError::permanent(format!("socket timeout: {e}")))
 }
 
 fn rpc_call(
@@ -707,11 +1028,13 @@ fn print_stdout(text: &str) -> ExitCode {
 
 fn connect(cfg: &CliConfig) -> Result<RpcStream, String> {
     let tcp = cfg.rpc_url.as_deref().map(parse_rpc_addr).transpose()?;
-    let attempt = || connect_stream(cfg, tcp.as_ref());
+    let mut lookups = HostLookup::default();
+    let mut attempt = |wait_left| connect_stream(cfg, tcp.as_ref(), wait_left, &mut lookups);
     if cfg.rpcwait {
-        retry_connect(attempt, RPCWAIT_ATTEMPTS, RPCWAIT_DELAY)
+        let limit = cfg.rpcwaittimeout.or(Some(RPCWAIT_TIMEOUT));
+        retry_connect(attempt, limit, RPCWAIT_DELAY)
     } else {
-        attempt().map_err(|e| e.message)
+        attempt(None).map_err(|e| e.message)
     }
 }
 
