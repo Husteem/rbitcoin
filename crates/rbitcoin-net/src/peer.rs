@@ -6251,14 +6251,21 @@ pub async fn on_headers(
     headers: &[bitcoin::block::Header],
 ) -> Result<(), NetError> {
     let noban = session.is_some_and(|s| s.session_noban());
-    let pending = follow.pending_headers.clone();
-    let requested = follow.requested_blocks.hashes().clone();
-    let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
-    let headers = headers.to_vec();
-    let apply = run_header_job(hub, move |hub| {
-        classify_headers(hub, &headers, &pending, &requested, &have_bodies, noban)
-    })
-    .await?;
+    let apply = if headers.is_empty() {
+        // An empty reply reads neither the store nor the peer's maps, so it
+        // takes no header permit and copies no pending headers.
+        let none = HashSet::new();
+        classify_headers(hub, &[], &HashMap::new(), &none, &none, noban)
+    } else {
+        let pending = follow.pending_headers.clone();
+        let requested = follow.requested_blocks.hashes().clone();
+        let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
+        let headers = headers.to_vec();
+        run_header_job(hub, move |hub| {
+            classify_headers(hub, &headers, &pending, &requested, &have_bodies, noban)
+        })
+        .await?
+    };
     let accepted = !apply.misbehave;
     let stamp_block_announcement = apply.stamp_block_announcement;
     apply_headers(apply, hub, out_tx, follow, session)?;
