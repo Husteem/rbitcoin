@@ -213,6 +213,27 @@ async fn p2p_v1_wallet_sync_listener() {
             row.permissions
         );
 
+        // A made-up v1 command counts as `*other*`, not as its own key.
+        let made_up = NetworkMessage::Unknown {
+            command: bitcoin::p2p::message::CommandString::try_from_static("madeup01")
+                .expect("a 12-byte command"),
+            payload: vec![7, 7],
+        };
+        wallet
+            .write_all(&v1_frame(Magic::REGTEST, made_up))
+            .await
+            .unwrap();
+        v1_ping(&mut wallet, 10).await;
+        let recv = node
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.subver == AGENT)
+            .expect("the wallet is a live peer")
+            .bytesrecv_per_msg;
+        assert!(!recv.contains_key("madeup01"), "{recv:?}");
+        assert_eq!(recv.get("*other*").copied(), Some(24 + 2), "{recv:?}");
+
         // A bad checksum drops that message only. The next one is answered.
         let mut bad = v1_frame(Magic::REGTEST, NetworkMessage::Ping(8));
         bad[20] ^= 0xff;
