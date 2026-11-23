@@ -475,6 +475,7 @@ fn prepare_admit_negative_output_is_check_transaction_not_panic() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .expect_err("overflowing output sum");
@@ -501,6 +502,7 @@ fn prepare_admit_rejects_negative_fee() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .expect_err("outputs exceed inputs");
@@ -857,7 +859,7 @@ fn truc_sibling_eviction_survives_a_floor_rise_before_commit() {
     mp.accept_tx(&first, &utxos, TIP_OK).unwrap();
     // 10,000 sat on ~60 vB: well above min relay, below the raised floor.
     let paying = ver_tx(&[out_of(&parent, 1)], 3, vec![pay(190_000)]);
-    let mut prep = mp
+    let prep = mp
         .prepare_admit(
             &paying,
             &utxos,
@@ -867,10 +869,10 @@ fn truc_sibling_eviction_survives_a_floor_rise_before_commit() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::On,
             },
         )
         .unwrap();
-    prep.sibling_eviction = SiblingEviction::On;
     mp.note_evicted_feerate(1_000_000);
     let r = mp
         .commit_after_script(std::sync::Arc::new(paying.clone()), prep)
@@ -898,6 +900,7 @@ fn truc_child_limit_holds_across_staged_admits() {
         report_orphans: false,
         min_relay: None,
         waive: false,
+        sibling_eviction: SiblingEviction::Off,
     };
     let prep_a = mp.prepare_admit(&a, &utxos, TIP_OK, opts()).unwrap();
     let prep_b = mp.prepare_admit(&b, &utxos, TIP_OK, opts()).unwrap();
@@ -1150,6 +1153,7 @@ fn evaluate_after_script_rbf_leaves_conflict() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .unwrap();
@@ -1161,10 +1165,11 @@ fn evaluate_after_script_rbf_leaves_conflict() {
 }
 
 /// testmempoolaccept preview enforces cluster count and raw-weight vsize
-/// limits itself (only the accept path re-checks after insert): exactly at
-/// each limit previews Ok, one past is ClusterTooLarge with exact totals.
+/// limits at prepare, before scripts (only the accept path re-checks after
+/// insert): exactly at each limit previews Ok, one past is ClusterTooLarge
+/// with exact totals.
 #[test]
-fn evaluate_after_script_enforces_cluster_limits() {
+fn prepare_and_preview_enforce_cluster_limits() {
     let (op, _, utxos) = chain_utxo(100_000);
     let parent = spend_tx(op, 99_000);
     let pw = parent.weight().to_wu();
@@ -1189,20 +1194,20 @@ fn evaluate_after_script_enforces_cluster_limits() {
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         mp.set_cluster_limits(Some(count), Some(1)); // 1 kvB = 4_000 WU
         mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
-        let prep = mp
-            .prepare_admit(
-                child,
-                &utxos,
-                TIP_OK,
-                PrepareOpts {
-                    fee_delta: 0,
-                    report_orphans: true,
-                    min_relay: None,
-                    waive: false,
-                },
-            )
-            .unwrap();
-        mp.evaluate_after_script(child, prep).map(|r| r.txid)
+        mp.prepare_admit(
+            child,
+            &utxos,
+            TIP_OK,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: true,
+                min_relay: None,
+                waive: false,
+                sibling_eviction: SiblingEviction::Off,
+            },
+        )
+        .and_then(|prep| mp.evaluate_after_script(child, prep))
+        .map(|r| r.txid)
     };
     let at = pad_child(4_000);
     assert_eq!(preview(2, &at).unwrap(), at.compute_txid());
@@ -1239,6 +1244,7 @@ fn commit_after_script_does_not_take_utxo_provider() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .unwrap();
@@ -1264,6 +1270,7 @@ fn prepare_admit_stashes_txid() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .unwrap();
@@ -1291,6 +1298,7 @@ fn commit_after_script_parent_body_missing_is_durable() {
                 report_orphans: true,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .unwrap();
@@ -2553,6 +2561,7 @@ fn duplicate_commit_after_prepare_is_duplicate() {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .unwrap();
@@ -2690,6 +2699,7 @@ fn waive_opts() -> PrepareOpts {
         report_orphans: true,
         min_relay: None,
         waive: true,
+        sibling_eviction: SiblingEviction::Off,
     }
 }
 
@@ -3131,6 +3141,7 @@ fn review_trust_failed_restore_drops_mark() {
                 report_orphans: false,
                 min_relay: Some(0),
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .expect("replacement prepares");

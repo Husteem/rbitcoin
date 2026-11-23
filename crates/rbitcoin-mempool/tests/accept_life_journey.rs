@@ -151,6 +151,7 @@ fn orphan_parks_then_promotes(life: &mut Life) {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .unwrap_err();
@@ -206,6 +207,25 @@ fn full_rbf_and_staged_commit(life: &mut Life) -> (OutPoint, Txid) {
     assert!(!life.live(&low));
     let err = life.accept(&low).unwrap_err();
     assert!(matches!(err, AcceptError::RbfInsufficient), "{err}");
+    // The replacement check runs in prepare, before scripts (Core
+    // `ReplacementChecks` in PreChecks), so an underpaying replacement
+    // costs no script verification.
+    let err = life
+        .mp
+        .prepare_admit(
+            &low,
+            &life.chain,
+            life.tip,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: false,
+                min_relay: None,
+                waive: false,
+                sibling_eviction: SiblingEviction::Off,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, AcceptError::RbfInsufficient), "{err}");
 
     let e = life.chain.fund(100_000);
     let first = spend_tx(e, 50_000);
@@ -221,6 +241,7 @@ fn full_rbf_and_staged_commit(life: &mut Life) -> (OutPoint, Txid) {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .expect("prevout free at prepare");

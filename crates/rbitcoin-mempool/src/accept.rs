@@ -501,6 +501,9 @@ pub struct PrepareOpts {
     pub report_orphans: bool,
     pub min_relay: Option<u64>,
     pub waive: bool,
+    /// Carried into [`PreparedAdmit::sibling_eviction`]; the replacement
+    /// and cluster checks in prepare use it.
+    pub sibling_eviction: SiblingEviction,
 }
 
 /// Result of accept prepare (resolve + policy + structural), before script verify.
@@ -1101,9 +1104,9 @@ impl ActiveMempool {
                 report_orphans,
                 min_relay,
                 waive,
+                sibling_eviction,
             },
         )?;
-        prep.sibling_eviction = sibling_eviction;
         self.last_accept_stages.utxo_us = prep.utxo_us;
         let t_script = Instant::now();
         let script_res = verify_tx_scripts(tx, prep.prevouts.clone());
@@ -1202,6 +1205,7 @@ impl ActiveMempool {
             report_orphans,
             min_relay,
             waive,
+            sibling_eviction,
         } = opts;
         let check_tx = |r: Result<(), rbitcoin_consensus::ConsensusError>| {
             r.map_err(|e| {
@@ -1281,7 +1285,7 @@ impl ActiveMempool {
             .as_ref()
             .map(|err| vec![err.mempool_reject_reason()]);
 
-        Ok(PreparedAdmit {
+        let prep = PreparedAdmit {
             txid,
             wtxid,
             fee_sat,
@@ -1294,8 +1298,14 @@ impl ActiveMempool {
             keep_accept_secs: None,
             trust_warn,
             keep_mark: false,
-            sibling_eviction: SiblingEviction::Off,
-        })
+            sibling_eviction,
+        };
+        // Core runs `ReplacementChecks` and the cluster limits in PreChecks,
+        // before scripts. A replacement that underpays, or a tx that would
+        // overfill its cluster, costs no script verification. The commit
+        // runs the same plan again under the write lock.
+        self.plan_after_script(tx, &prep)?;
+        Ok(prep)
     }
 
     fn collect_admit_inputs(
@@ -2381,6 +2391,7 @@ impl ActiveMempool {
                 report_orphans: false,
                 min_relay: Some(0),
                 waive,
+                sibling_eviction: SiblingEviction::Off,
             },
         )?;
         prep.keep_mark = waive;
