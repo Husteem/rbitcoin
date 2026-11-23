@@ -1510,12 +1510,6 @@ impl LivePeer {
             .clone()
     }
 
-    /// Core `m_last_block_time`: stamped only when a block from this peer
-    /// is new to us, not for one we already had.
-    pub fn note_last_block(&self) {
-        self.note_last_block_at(self.clock_now());
-    }
-
     pub fn note_last_block_at(&self, now: u64) {
         self.last_block.store(now, Ordering::Relaxed);
     }
@@ -3852,11 +3846,6 @@ impl PeerHub {
         self.addnode_net(crate::NetAddr::Ip(addr), cmd)
     }
 
-    #[doc(hidden)]
-    pub fn dial_manual_net(&self, addr: &crate::NetAddr) -> Result<(), String> {
-        self.dial_manual_target(DialTarget::from_net(*addr))
-    }
-
     /// Core `AlreadyConnectedToHost` / `AlreadyConnectedToAddressPort`:
     /// `addnode` and the redial pass open no second session to an endpoint
     /// that is connected or still dialling, and the RPC still succeeds.
@@ -4187,12 +4176,6 @@ impl PeerHub {
             return false;
         };
         with_port.eq_ignore_ascii_case(&host)
-    }
-
-    #[doc(hidden)]
-    pub fn dial_resolved(&self, node: &str) -> Result<(), String> {
-        let ready = self.dial_ready()?;
-        self.dial_resolved_ready(&ready.tx, node)
     }
 
     fn dial_resolved_ready(
@@ -4554,14 +4537,6 @@ impl PeerHub {
             })
             .count();
         hub + self.catch_up_full_outbound.load(Ordering::Relaxed)
-    }
-
-    /// Live outbound full-relay addrs (not `noban`-gated) for diversity occupied.
-    pub fn live_outbound_full_relay_addrs(&self) -> Vec<SocketAddr> {
-        self.live_outbound_full_relay_nets()
-            .into_iter()
-            .filter_map(crate::NetAddr::socket_addr)
-            .collect()
     }
 
     /// Nets whose netgroup an automatic outbound dial may not share, as

@@ -65,6 +65,7 @@ cargo deny check
 ./scripts/hex-ratchet.sh
 ./scripts/src-test-modules.sh
 ./scripts/doc-attach.sh --base origin/master
+./scripts/unused-pub.sh
 cargo test --workspace --quiet
 ./scripts/ci-os-smoke.sh
 ```
@@ -83,7 +84,7 @@ Coverage and native `windows` / `macos` stay GitHub Actions;
 ## Push and poll
 
 Required jobs: `qc`, `test`, `windows`, `macos`, `coverage`, `pread`, and
-`rust-forward`. `qc` is fmt, ast-grep, unwrap-ratchet, hex-ratchet, deny, the
+`rust-forward`. `qc` is fmt, ast-grep, unwrap-ratchet, hex-ratchet, unused-pub, deny, the
 script self-tests, then clippy, on one runner. `nixos-module-eval` waits for `qc` and `test` and runs beside `pread` and
 `rust-forward`. It does not gate `coverage`. It is not a Protected status
 check until the ruleset names it. Poll with `--interest nixos-module-eval`.

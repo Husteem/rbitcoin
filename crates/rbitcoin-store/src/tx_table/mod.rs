@@ -811,11 +811,6 @@ pub(crate) fn refuse_below_committed(count: u64, committed: u64) -> Result<(), S
     ))
 }
 
-#[doc(hidden)]
-pub fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::CreateLoc, StoreError> {
-    open_or_create_create_loc_above(dir, 0)
-}
-
 fn open_or_create_create_loc_above(
     dir: &Path,
     floor: u64,
@@ -827,13 +822,6 @@ fn open_or_create_create_loc_above(
     } else {
         crate::create_loc::CreateLoc::create(dir)
     }
-}
-
-#[doc(hidden)]
-pub fn open_or_create_seqsigwit_loc(
-    seqsigwit_dir: &Path,
-) -> Result<crate::delta_loc::DeltaLoc, StoreError> {
-    open_or_create_seqsigwit_loc_above(seqsigwit_dir, 0)
 }
 
 fn open_or_create_seqsigwit_loc_above(
@@ -2659,26 +2647,6 @@ impl TxTable {
                 self.get_spender_meta_at_abs_batch_fd(abs_offs, ReadIoBackend::Pread)
             }
         }
-    }
-
-    /// io_uring pread_batch 9B peeks.
-    #[doc(hidden)]
-    pub fn get_spender_meta_at_abs_batch_uring(
-        &self,
-        abs_offs: &[u64],
-    ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
-        self.get_spender_meta_at_abs_batch_fd(abs_offs, crate::io_backend::ReadIoBackend::Uring)
-            .map(|(slots, _)| slots)
-    }
-
-    /// libc pread_batch 9B peeks (no ring).
-    #[doc(hidden)]
-    pub fn get_spender_meta_at_abs_batch_pread(
-        &self,
-        abs_offs: &[u64],
-    ) -> Result<Vec<Option<SpenderSlot>>, StoreError> {
-        self.get_spender_meta_at_abs_batch_fd(abs_offs, crate::io_backend::ReadIoBackend::Pread)
-            .map(|(slots, _)| slots)
     }
 
     #[doc(hidden)]

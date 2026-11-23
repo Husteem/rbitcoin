@@ -521,13 +521,6 @@ fn no_reply(addr: SocketAddr, timeout: Duration) -> NodeError {
     NodeError::Init(format!("--tor-control {addr}: no reply within {timeout:?}"))
 }
 
-/// One reply: `250-` lines up to a `250 ` line. A line over
-/// [`MAX_REPLY_LINE`] or a reply over [`MAX_REPLY_BYTES`] is refused before
-/// it is held.
-pub async fn read_reply(reader: &mut BufReader<OwnedReadHalf>) -> Result<String, NodeError> {
-    read_reply_or_refusal(reader).await?.map_err(refused)
-}
-
 async fn read_reply_or_refusal(
     reader: &mut BufReader<OwnedReadHalf>,
 ) -> Result<Result<String, String>, NodeError> {

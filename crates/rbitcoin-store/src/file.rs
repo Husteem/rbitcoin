@@ -113,22 +113,6 @@ where
     write_tmp_with(path, TmpSync::FileAndDir, true, write)
 }
 
-#[doc(hidden)]
-pub fn write_tmp_file<F>(path: &Path, sync: bool, write: F) -> Result<(), StoreError>
-where
-    F: FnOnce(&mut File) -> Result<(), StoreError>,
-{
-    write_tmp_synced(
-        path,
-        if sync {
-            TmpSync::FileAndDir
-        } else {
-            TmpSync::None
-        },
-        write,
-    )
-}
-
 fn write_tmp_synced<F>(path: &Path, sync: TmpSync, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
@@ -186,10 +170,6 @@ fn open_tmp(tmp: &Path, private: bool) -> std::io::Result<File> {
 pub fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        #[cfg(debug_assertions)]
-        if fail_dir_sync() {
-            return Err(std::io::Error::other("injected directory sync failure"));
-        }
         let result = std::fs::File::open(dir)?.durable_sync_all();
         #[cfg(debug_assertions)]
         if result.is_ok() {
@@ -274,48 +254,6 @@ fn note_write(w: TracedWrite) {
 thread_local! {
     static WRITE_TRACE: std::cell::RefCell<Option<Vec<TracedWrite>>> =
         const { std::cell::RefCell::new(None) };
-}
-
-/// Let `skip` directory syncs succeed, then fail the next `times` on this thread.
-///
-/// Debug tests use this for a rename that is already visible when only the
-/// parent-directory sync fails. A release build cannot arm it.
-#[cfg(all(debug_assertions, unix))]
-#[doc(hidden)]
-pub fn arm_fail_dir_sync_after(skip: u32, times: u32) {
-    DIR_SYNC_SKIP.with(|c| c.set(skip));
-    DIR_SYNC_FAIL.with(|c| c.set(times));
-}
-
-#[cfg(all(debug_assertions, unix))]
-fn fail_dir_sync() -> bool {
-    let skipping = DIR_SYNC_SKIP.with(|c| {
-        let n = c.get();
-        if n == 0 {
-            false
-        } else {
-            c.set(n - 1);
-            true
-        }
-    });
-    if skipping {
-        return false;
-    }
-    DIR_SYNC_FAIL.with(|c| {
-        let n = c.get();
-        if n == 0 {
-            false
-        } else {
-            c.set(n - 1);
-            true
-        }
-    })
-}
-
-#[cfg(all(debug_assertions, unix))]
-thread_local! {
-    static DIR_SYNC_SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static DIR_SYNC_FAIL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 // Only Unix calls this. Windows `fsync_parent_dir` is a no-op, and a
@@ -1524,25 +1462,6 @@ impl TableFile {
         let mut buf = vec![0u8; len as usize];
         self.pread_at(offset, &mut buf)?;
         Ok(f(&buf))
-    }
-
-    /// `posix_fadvise` for the whole file. Linux best-effort; other OS no-op.
-    /// Whole-file advice. Linux only; other hosts have no `posix_fadvise`.
-    #[cfg(target_os = "linux")]
-    pub fn advise_access(&self, advice: libc::c_int) {
-        use std::os::unix::io::AsRawFd;
-        let file = self.file.lock().unwrap();
-        let fd = file.as_raw_fd();
-        // SAFETY: `fd` is the live file held by `self.file`. Advice is whole-file.
-        let rc = unsafe { libc::posix_fadvise(fd, 0, 0, advice) };
-        if rc != 0 {
-            rbitcoin_log::trace!(
-                Store,
-                "posix_fadvise failed path={}: {}",
-                self.path.display(),
-                std::io::Error::from_raw_os_error(rc)
-            );
-        }
     }
 
     pub fn advise_dont_need(&self, offset: u64, len: u64) {

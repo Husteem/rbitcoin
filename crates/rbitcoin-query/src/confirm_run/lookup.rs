@@ -752,17 +752,6 @@ fn resolve_carried_header_hash(
     })
 }
 
-/// Structure + prepare + plan_batch only (stamp create_fk). Shared by lookup stage.
-pub fn wire_lookup_phase(
-    query: &Query,
-    params: &ChainParams,
-    milestone: Milestone,
-    blocks: &[WireBlockIn],
-    pipeline: Option<&WireLoadPipeline>,
-) -> Result<LookupPhaseOut, ConfirmError> {
-    wire_lookup_phase_impl(query, params, milestone, blocks, pipeline, true)
-}
-
 #[doc(hidden)]
 pub fn wire_lookup_phase_impl(
     query: &Query,
