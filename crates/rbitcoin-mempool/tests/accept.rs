@@ -3475,7 +3475,7 @@ fn review_trust_applied_tx_logs_after_commit() {
 
 /// Core `MAX_REPLACEMENT_CANDIDATES`: a replacement whose direct conflicts
 /// sit in more than 100 distinct clusters is refused before the conflict
-/// set is walked or any script runs. 100 clusters is still allowed.
+/// set is walked. 100 clusters is still allowed.
 #[test]
 fn replacement_of_more_than_100_clusters_is_refused() {
     let coins: Vec<OutPoint> = (0..101u32)
@@ -3527,6 +3527,64 @@ fn replacement_of_more_than_100_clusters_is_refused() {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// The cap counts clusters, not conflicts: 102 direct conflicts that sit in
+/// two clusters (a root and its 50 children each, every one spending its own
+/// chain coin) are replaced. A per-conflict count would refuse this.
+#[test]
+fn replacement_of_many_conflicts_in_few_clusters_is_allowed() {
+    let coin_at = |i: u32| {
+        let mut id = [0xce; 32];
+        id[..4].copy_from_slice(&i.to_le_bytes());
+        OutPoint {
+            txid: Txid::from_byte_array(id),
+            vout: 0,
+        }
+    };
+    let coins: Vec<OutPoint> = (0..102u32).map(coin_at).collect();
+    let txout = TxOut {
+        value: Amount::from_sat(100_000),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    };
+    let utxos = MapUtxoProvider {
+        map: coins.iter().map(|op| (*op, coin(txout.clone()))).collect(),
+    };
+    let input = |op: OutPoint| TxIn {
+        previous_output: op,
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+        witness: Witness::new(),
+    };
+    let dir = tmp_dir();
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    for cluster in coins.chunks(51) {
+        let mut root = spend_tx(cluster[0], 1_000);
+        root.output = vec![
+            TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            };
+            50
+        ];
+        mp.accept_tx(&root, &utxos, TIP_OK).expect("root");
+        for (k, op) in cluster[1..].iter().enumerate() {
+            let mut child = spend_tx(*op, 100_000);
+            child.input.push(input(OutPoint {
+                txid: root.compute_txid(),
+                vout: k as u32,
+            }));
+            mp.accept_tx(&child, &utxos, TIP_OK).expect("child");
+        }
+    }
+    assert_eq!(mp.graph.len(), 102);
+    let mut replacement = spend_tx(coins[0], 102 * 100_000 - 1_000_000);
+    replacement.input = coins.iter().copied().map(input).collect();
+    let r = mp
+        .accept_tx(&replacement, &utxos, TIP_OK)
+        .expect("two clusters");
+    assert_eq!(r.replaced.len(), 102);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 include!("accept_life_journey.rs");
