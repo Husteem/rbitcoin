@@ -1612,8 +1612,7 @@ async fn cap_already_stored_tip_frees_no_slot() {
 }
 
 /// An empty `headers` answers our getheaders without a header job, so with
-/// every ctrl-decode permit held it still finishes. It copies none of the
-/// peer's pending headers.
+/// every ctrl-decode permit held it still finishes.
 #[test]
 fn empty_headers_takes_no_header_permit() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("empty-headers");
