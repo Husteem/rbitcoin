@@ -60,16 +60,16 @@ mod off_pool_lane {
     /// Eight callers blocked inside `off_pool` still share one OS thread, and
     /// no two jobs are inside at once.
     ///
-    /// The jobs name the thread they ran on. A process-wide count of the
-    /// `rbtc-off-pool` comm is not the witness: an unnamed thread that a lane
-    /// job starts inherits that comm, and the other tests in this binary run
-    /// beside this one.
+    /// The jobs record the thread they ran on and its name. A process-wide
+    /// count of the `rbtc-off-pool` comm is not the witness: an unnamed thread
+    /// that a lane job starts inherits that comm, and the other tests in this
+    /// binary run beside this one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_thread_runs_every_off_pool_job() {
         let arrived = Arc::new(AtomicUsize::new(0));
         let inside = Arc::new(AtomicUsize::new(0));
         let most_inside = Arc::new(AtomicUsize::new(0));
-        let ran_on = Arc::new(Mutex::new(Vec::<ThreadId>::new()));
+        let ran_on = Arc::new(Mutex::new(Vec::<(ThreadId, Option<String>)>::new()));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let mut tasks = Vec::new();
         for _ in 0..8 {
@@ -83,10 +83,11 @@ mod off_pool_lane {
                 off_pool(move || {
                     let now_inside = inside.fetch_add(1, Ordering::AcqRel) + 1;
                     most_inside.fetch_max(now_inside, Ordering::AcqRel);
+                    let me = std::thread::current();
                     ran_on
                         .lock()
                         .expect("ran_on")
-                        .push(std::thread::current().id());
+                        .push((me.id(), me.name().map(str::to_owned)));
                     let (lock, cv) = &*gate;
                     let mut go = lock.lock().expect("gate");
                     while !*go {
@@ -115,7 +116,9 @@ mod off_pool_lane {
         }
         let ran_on = ran_on.lock().expect("ran_on").clone();
         assert_eq!(ran_on.len(), 8, "every off-pool job ran");
-        let threads: HashSet<ThreadId> = ran_on.into_iter().collect();
+        let name = ran_on[0].1.as_deref();
+        assert_eq!(name, Some("rbtc-off-pool"), "lane thread name: {name:?}");
+        let threads: HashSet<ThreadId> = ran_on.into_iter().map(|(id, _)| id).collect();
         assert_eq!(
             threads.len(),
             1,
