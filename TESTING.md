@@ -217,9 +217,11 @@ absolute path. Keep default-tier fixtures small: on tmpfs, test bytes are RAM.
 on the whole drive, so suites that run many stores at once queue behind each
 other and miss their wall clocks. `cargo test --workspace --features
 skip-flushes` turns flushes off before any test runs in the query, net, rpc,
-ibd, and `rbitcoin-test` suites (`-p <crate> --features skip-flushes` for
-one). On one Mac those five took 1962 s with 24 failures, and 272 s with one
-failure that does not involve flushes.
+ibd, `rbitcoin-test`, electrum, esplora, and sv2 suites (`-p <crate>
+--features skip-flushes` for one). On one Mac the first five took 1962 s with
+24 failures, and 272 s with one failure that does not involve flushes. In the
+`macos-test` job, electrum, esplora, and sv2 took 17–42 s, 18–37 s, and
+16–18 s with flushes, against about 3 s each on Linux.
 
 A suite opts in with `skip-flushes = []` in its `Cargo.toml` and
 `rbitcoin_store::skip_flushes_before_main!();` at the top of
@@ -234,8 +236,8 @@ still flushes. A test that needs a real flush belongs in a suite that does
 not call the macro, such as `rbitcoin-store`'s. The `skip-flushes-call` and
 `skip-flushes-macro` ast-grep rules refuse the switch anywhere else. CI's
 `pread` job runs each suite's switch test with the flag. The `macos-test`
-job runs the whole workspace with the flag, but only the five suites above
-skip flushes. The rest, such as electrum, esplora, and store, still flush.
+job runs the whole workspace with the flag, but only the eight suites above
+skip flushes. The rest, such as store, mempool, and node, still flush.
 The workspace `cargo test` step in the required `test` job and
 `ci-os-smoke.sh` do not pass the flag, so every suite they run flushes.
 

@@ -1,3 +1,5 @@
+rbitcoin_store::skip_flushes_before_main!();
+
 mod electrum_sh_journey;
 mod json_cpu;
 mod server;

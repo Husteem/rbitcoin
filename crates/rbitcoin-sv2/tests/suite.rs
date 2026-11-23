@@ -1,3 +1,5 @@
+rbitcoin_store::skip_flushes_before_main!();
+
 mod flight_tests;
 mod listener_tests;
 mod session;
