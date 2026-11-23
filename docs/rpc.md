@@ -82,7 +82,9 @@ cannot lock out the local socket. A `401` reply closes its connection. Each
 HTTP header and request body must finish within 30 seconds; waiting for the
 next keep-alive request uses the same header deadline. Expiry closes the
 connection and releases its slot. These read deadlines do not limit
-execution of a complete RPC request, including long-poll calls. The
+execution of a complete RPC request, including long-poll calls. A reply
+write that makes no progress for 30 seconds, or that drains slower than
+16 KiB/s on average past that grace, closes the connection too. The
 deadlines are fixed, with no operator knob.
 Each JSON-RPC body is one JSON value and a trailing newline. Object keys
 are `jsonrpc` (2.0 only), then `result`, then `error`, then `id`, and a

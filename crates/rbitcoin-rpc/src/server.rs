@@ -89,22 +89,69 @@ pub async fn serve_rpc<L>(
                     );
                     continue;
                 };
-                let service = TowerToHyperService::new(app.clone());
-                let mut shutdown_rx = shutdown_tx.subscribe();
+                let connection = serve_rpc_connection(
+                    io,
+                    app.clone(),
+                    RPC_WRITE_TIMEOUT,
+                    RPC_MIN_DRAIN_RATE,
+                    shutdown_tx.subscribe(),
+                );
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let mut http = http1::Builder::new();
-                    http.timer(TokioTimer::new()).header_read_timeout(RPC_READ_TIMEOUT);
-                    let connection = http.serve_connection(TokioIo::new(io), service);
-                    tokio::pin!(connection);
-                    tokio::select! {
-                        _ = &mut connection => {}
-                        _ = shutdown_rx.changed() => {
-                            connection.as_mut().graceful_shutdown();
-                            let _ = connection.await;
-                        }
-                    }
+                    connection.await;
                 });
+            }
+        }
+    }
+}
+
+/// A response write that makes no progress for this long is cancelled, and
+/// so is one whose stalled time passes this plus `written / RPC_MIN_DRAIN_RATE`.
+pub const RPC_WRITE_TIMEOUT: std::time::Duration = RPC_READ_TIMEOUT;
+
+/// Slowest drain rate a response may average, in bytes per second.
+pub const RPC_MIN_DRAIN_RATE: u64 = 16 * 1024;
+
+/// Serve one accepted RPC/REST socket with the header read deadline, until
+/// it closes or `shutdown` fires.
+#[doc(hidden)]
+pub fn serve_rpc_connection<S>(
+    io: S,
+    app: Router,
+    write_timeout: std::time::Duration,
+    min_drain_rate: u64,
+    mut shutdown: tokio::sync::watch::Receiver<()>,
+) -> impl std::future::Future<Output = ()> + Send
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use rbitcoin_net::write_deadline::{ResponseBudget, WriteDeadline};
+    let budget = Arc::new(ResponseBudget::default());
+    let starts = Arc::clone(&budget);
+    // Each response starts its own byte and stall totals.
+    let app = app.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: Next| {
+            let starts = Arc::clone(&starts);
+            async move {
+                let response = next.run(req).await;
+                starts.start();
+                response
+            }
+        },
+    ));
+    let service = TowerToHyperService::new(app);
+    async move {
+        let mut http = http1::Builder::new();
+        http.timer(TokioTimer::new())
+            .header_read_timeout(RPC_READ_TIMEOUT);
+        let io = WriteDeadline::new(io, write_timeout, min_drain_rate, budget);
+        let connection = http.serve_connection(TokioIo::new(io), service);
+        tokio::pin!(connection);
+        tokio::select! {
+            _ = &mut connection => {}
+            _ = shutdown.changed() => {
+                connection.as_mut().graceful_shutdown();
+                let _ = connection.await;
             }
         }
     }
