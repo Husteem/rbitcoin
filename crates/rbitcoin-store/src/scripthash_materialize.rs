@@ -14,7 +14,6 @@
 //! `post/NN/`. Pack folds those spills, then `slot_for_key16` + 2+ bodies;
 //! 1-fk after fold is `fp_singles`. A `post/NN` file refuses.
 
-use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::fuse8_filter::SealedFuse8;
 use crate::scripthash::{sorted_main_shard_path, ColdProgress, ScriptHashTable, ShShardPack};
@@ -26,7 +25,7 @@ use crate::tx_table::TxTable;
 use rbitcoin_primitives::{le_u32, le_u64, read_uleb128, write_uleb128, Fk};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -174,19 +173,19 @@ pub fn unsorted_shard_path(dir: &Path, shard: usize) -> PathBuf {
 }
 
 pub fn unsorted_keys_path(dir: &Path, shard: usize) -> PathBuf {
-    dir.join(KEYS_SUBDIR).join(format!("{shard:02x}"))
+    SpillKind::Keys.shard_dir(dir, shard)
 }
 
 pub fn unsorted_keys_spill_path(dir: &Path, shard: usize, seq: u32) -> PathBuf {
-    unsorted_keys_path(dir, shard).join(format!("{seq:06}"))
+    SpillKind::Keys.spill_path(dir, shard, seq)
 }
 
 pub fn unsorted_post_path(dir: &Path, shard: usize) -> PathBuf {
-    dir.join(POST_SUBDIR).join(format!("{shard:02x}"))
+    SpillKind::Posts.shard_dir(dir, shard)
 }
 
 pub fn unsorted_post_spill_path(dir: &Path, shard: usize, seq: u32) -> PathBuf {
-    unsorted_post_path(dir, shard).join(format!("{seq:06}"))
+    SpillKind::Posts.spill_path(dir, shard, seq)
 }
 
 pub fn unsorted_multi_fuse_path(dir: &Path, shard: usize) -> PathBuf {
@@ -288,18 +287,8 @@ pub fn write_phase_done(
     for c in per_shard {
         buf.extend_from_slice(&c.to_le_bytes());
     }
-    let tmp = dir.join(format!("{name}.tmp"));
     let dst = dir.join(name);
-    fs::write(&tmp, &buf).map_err(|e| StoreError::io(&tmp, e))?;
-    {
-        let f = OpenOptions::new()
-            .write(true)
-            .open(&tmp)
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
-    }
-    fs::rename(&tmp, &dst).map_err(|e| StoreError::io(&dst, e))?;
-    Ok(())
+    crate::file::write_synced_tmp_rename(&dst, &buf)
 }
 
 #[doc(hidden)]
@@ -472,11 +461,6 @@ pub fn keys_map_estimated_bytes(map: &Key16PackMap) -> u64 {
 }
 
 #[doc(hidden)]
-pub fn keys_maps_estimated_bytes(maps: &[Key16PackMap]) -> u64 {
-    maps.iter().map(keys_map_estimated_bytes).sum()
-}
-
-#[doc(hidden)]
 pub fn largest_keys_shard(maps: &[Key16PackMap]) -> Option<usize> {
     maps.iter()
         .enumerate()
@@ -639,11 +623,84 @@ pub fn parse_spill_seq(name: &str) -> Option<u32> {
     }
 }
 
-#[doc(hidden)]
-pub fn list_keys_spill_paths(dir: &Path, shard: usize) -> Result<Vec<PathBuf>, StoreError> {
-    let p = unsorted_keys_path(dir, shard);
+/// Which sequence-numbered spill directory: `keys/NN/` or `post/NN/`.
+#[derive(Clone, Copy)]
+pub(crate) enum SpillKind {
+    Keys,
+    Posts,
+}
+
+impl SpillKind {
+    const fn subdir(self) -> &'static str {
+        match self {
+            Self::Keys => KEYS_SUBDIR,
+            Self::Posts => POST_SUBDIR,
+        }
+    }
+
+    fn shard_dir(self, dir: &Path, shard: usize) -> PathBuf {
+        dir.join(self.subdir()).join(format!("{shard:02x}"))
+    }
+
+    fn spill_path(self, dir: &Path, shard: usize, seq: u32) -> PathBuf {
+        self.shard_dir(dir, shard).join(format!("{seq:06}"))
+    }
+
+    fn refuse(self) -> StoreError {
+        match self {
+            Self::Keys => refuse_keys_leftover(),
+            Self::Posts => refuse_posts_leftover(),
+        }
+    }
+
+    const fn stopped(self) -> &'static str {
+        match self {
+            Self::Keys => "scripthash keys spill writer stopped",
+            Self::Posts => "scripthash post spill writer stopped",
+        }
+    }
+}
+
+/// Per-shard spill map: the two map types share this directory protocol, not
+/// their codec.
+pub(crate) trait SpillMap: Default {
+    fn is_empty(&self) -> bool;
+    fn estimated_bytes(&self) -> u64;
+    fn encode(&self) -> Vec<u8>;
+}
+
+impl SpillMap for Key16PackMap {
+    fn is_empty(&self) -> bool {
+        HashMap::is_empty(self)
+    }
+
+    fn estimated_bytes(&self) -> u64 {
+        keys_map_estimated_bytes(self)
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        encode_keys_spill(self)
+    }
+}
+
+impl SpillMap for PostPackMap {
+    fn is_empty(&self) -> bool {
+        PostPackMap::is_empty(self)
+    }
+
+    fn estimated_bytes(&self) -> u64 {
+        PostPackMap::estimated_bytes(self) as u64
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        encode_posts_spill(self)
+    }
+}
+
+fn list_spill_paths(kind: SpillKind, dir: &Path, shard: usize) -> Result<Vec<PathBuf>, StoreError> {
+    let p = kind.shard_dir(dir, shard);
     if p.is_file() {
-        return Err(refuse_keys_leftover());
+        return Err(kind.refuse());
     }
     if !p.is_dir() {
         return Ok(Vec::new());
@@ -658,12 +715,132 @@ pub fn list_keys_spill_paths(dir: &Path, shard: usize) -> Result<Vec<PathBuf>, S
             continue;
         }
         let Some(seq) = parse_spill_seq(&s) else {
-            return Err(refuse_keys_leftover());
+            return Err(kind.refuse());
         };
         seqs.push((seq, ent.path()));
     }
     seqs.sort_unstable_by_key(|a| a.0);
     Ok(seqs.into_iter().map(|(_, path)| path).collect())
+}
+
+fn next_spill_seq(kind: SpillKind, dir: &Path, shard: usize) -> Result<u32, StoreError> {
+    let mut max_seq = None;
+    for path in list_spill_paths(kind, dir, shard)? {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if let Some(seq) = parse_spill_seq(name) {
+            max_seq = Some(max_seq.map_or(seq, |m: u32| m.max(seq)));
+        }
+    }
+    Ok(max_seq.map(|s| s.saturating_add(1)).unwrap_or(0))
+}
+
+fn write_spill<M: SpillMap>(
+    kind: SpillKind,
+    dir: &Path,
+    shard: usize,
+    seq: u32,
+    map: &M,
+) -> Result<(), StoreError> {
+    let path = kind.spill_path(dir, shard, seq);
+    crate::file::write_tmp_rename(&path, &map.encode())
+}
+
+fn unlink_spill_shard(kind: SpillKind, dir: &Path, shard: usize) {
+    let p = kind.shard_dir(dir, shard);
+    if p.is_dir() {
+        let _ = fs::remove_dir_all(&p);
+    } else if p.is_file() {
+        let _ = fs::remove_file(&p);
+    }
+}
+
+fn total_estimated<M: SpillMap>(maps: &[M]) -> u64 {
+    maps.iter().map(SpillMap::estimated_bytes).sum()
+}
+
+fn spill_largest_while_over<M: SpillMap>(
+    maps: &mut [M],
+    budget: u64,
+    largest: impl Fn(&[M]) -> Option<usize>,
+    mut spill: impl FnMut(usize, M) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    while total_estimated(maps) >= budget {
+        let Some(si) = largest(maps) else {
+            break;
+        };
+        let taken = std::mem::take(&mut maps[si]);
+        spill(si, taken)?;
+    }
+    Ok(())
+}
+
+fn spill_all_maps<M: SpillMap>(
+    maps: &mut [M],
+    mut spill: impl FnMut(usize, M) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    for (si, local) in maps.iter_mut().enumerate() {
+        let taken = std::mem::take(local);
+        spill(si, taken)?;
+    }
+    Ok(())
+}
+
+fn spill_map_from_seq<M: SpillMap>(
+    kind: SpillKind,
+    dir: &Path,
+    shard: usize,
+    seqs: &[AtomicU32],
+    map: M,
+) -> Result<(), StoreError> {
+    if map.is_empty() {
+        return Ok(());
+    }
+    let seq = seqs[shard].fetch_add(1, Ordering::Relaxed);
+    write_spill(kind, dir, shard, seq, &map)
+}
+
+type SpillChannel<M> = (SyncSender<(usize, M)>, Receiver<(usize, M)>);
+
+fn spill_channel<M>() -> SpillChannel<M> {
+    mpsc::sync_channel(1)
+}
+
+fn send_spill<M: SpillMap>(
+    kind: SpillKind,
+    tx: &SyncSender<(usize, M)>,
+    shard: usize,
+    map: M,
+) -> Result<(), StoreError> {
+    if map.is_empty() {
+        return Ok(());
+    }
+    tx.send((shard, map))
+        .map_err(|_| StoreError::Corrupt(kind.stopped()))
+}
+
+fn spill_writer<M: SpillMap + Send>(
+    kind: SpillKind,
+    rx: Receiver<(usize, M)>,
+    dir: &Path,
+    seqs: &[AtomicU32],
+    err: &Mutex<Option<StoreError>>,
+) {
+    while let Ok((si, map)) = rx.recv() {
+        if err.lock().unwrap().is_some() {
+            continue;
+        }
+        if let Err(e) = spill_map_from_seq(kind, dir, si, seqs, map) {
+            let mut g = err.lock().unwrap();
+            if g.is_none() {
+                *g = Some(e);
+            }
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn list_keys_spill_paths(dir: &Path, shard: usize) -> Result<Vec<PathBuf>, StoreError> {
+    list_spill_paths(SpillKind::Keys, dir, shard)
 }
 
 #[doc(hidden)]
@@ -683,21 +860,12 @@ pub fn write_keys_spill(
     seq: u32,
     map: &Key16PackMap,
 ) -> Result<(), StoreError> {
-    let path = unsorted_keys_spill_path(dir, shard, seq);
-    crate::file::write_tmp_rename(&path, &encode_keys_spill(map))
+    write_spill(SpillKind::Keys, dir, shard, seq, map)
 }
 
 #[doc(hidden)]
 pub fn next_keys_spill_seq(dir: &Path, shard: usize) -> Result<u32, StoreError> {
-    let paths = list_keys_spill_paths(dir, shard)?;
-    let mut max_seq = None;
-    for p in &paths {
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if let Some(seq) = parse_spill_seq(name) {
-            max_seq = Some(max_seq.map_or(seq, |m: u32| m.max(seq)));
-        }
-    }
-    Ok(max_seq.map(|s| s.saturating_add(1)).unwrap_or(0))
+    next_spill_seq(SpillKind::Keys, dir, shard)
 }
 
 #[cfg(debug_assertions)]
@@ -719,12 +887,7 @@ pub fn write_keys_spill_entries(
 
 #[doc(hidden)]
 pub fn unlink_keys_shard(dir: &Path, shard: usize) {
-    let p = unsorted_keys_path(dir, shard);
-    if p.is_dir() {
-        let _ = fs::remove_dir_all(&p);
-    } else if p.is_file() {
-        let _ = fs::remove_file(&p);
-    }
+    unlink_spill_shard(SpillKind::Keys, dir, shard)
 }
 
 #[doc(hidden)]
@@ -755,11 +918,6 @@ impl PostPackMap {
 #[doc(hidden)]
 pub fn refuse_posts_leftover() -> StoreError {
     StoreError::Corrupt(INDEX_REFUSE_POST_LEFTOVER)
-}
-
-#[doc(hidden)]
-pub fn posts_maps_estimated_bytes(maps: &[PostPackMap]) -> u64 {
-    maps.iter().map(|m| m.estimated_bytes() as u64).sum()
 }
 
 #[doc(hidden)]
@@ -951,29 +1109,7 @@ pub fn fold_posts_spill_bytes(map: &mut PostPackMap, bytes: &[u8]) -> Result<(),
 
 #[doc(hidden)]
 pub fn list_posts_spill_paths(dir: &Path, shard: usize) -> Result<Vec<PathBuf>, StoreError> {
-    let p = unsorted_post_path(dir, shard);
-    if p.is_file() {
-        return Err(refuse_posts_leftover());
-    }
-    if !p.is_dir() {
-        return Ok(Vec::new());
-    }
-    let rd = fs::read_dir(&p).map_err(|e| StoreError::io(&p, e))?;
-    let mut seqs = Vec::new();
-    for ent in rd {
-        let ent = ent.map_err(|e| StoreError::io(&p, e))?;
-        let name = ent.file_name();
-        let s = name.to_string_lossy();
-        if s.ends_with(".tmp") {
-            continue;
-        }
-        let Some(seq) = parse_spill_seq(&s) else {
-            return Err(refuse_posts_leftover());
-        };
-        seqs.push((seq, ent.path()));
-    }
-    seqs.sort_unstable_by_key(|a| a.0);
-    Ok(seqs.into_iter().map(|(_, path)| path).collect())
+    list_spill_paths(SpillKind::Posts, dir, shard)
 }
 
 #[doc(hidden)]
@@ -993,21 +1129,12 @@ pub fn write_posts_spill(
     seq: u32,
     map: &PostPackMap,
 ) -> Result<(), StoreError> {
-    let path = unsorted_post_spill_path(dir, shard, seq);
-    crate::file::write_tmp_rename(&path, &encode_posts_spill(map))
+    write_spill(SpillKind::Posts, dir, shard, seq, map)
 }
 
 #[doc(hidden)]
 pub fn next_post_spill_seq(dir: &Path, shard: usize) -> Result<u32, StoreError> {
-    let paths = list_posts_spill_paths(dir, shard)?;
-    let mut max_seq = None;
-    for p in &paths {
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if let Some(seq) = parse_spill_seq(name) {
-            max_seq = Some(max_seq.map_or(seq, |m: u32| m.max(seq)));
-        }
-    }
-    Ok(max_seq.map(|s| s.saturating_add(1)).unwrap_or(0))
+    next_spill_seq(SpillKind::Posts, dir, shard)
 }
 
 #[doc(hidden)]
@@ -1017,11 +1144,7 @@ pub fn spill_post_shard_map(
     seqs: &[AtomicU32],
     map: PostPackMap,
 ) -> Result<(), StoreError> {
-    if map.is_empty() {
-        return Ok(());
-    }
-    let seq = seqs[shard].fetch_add(1, Ordering::Relaxed);
-    write_posts_spill(dir, shard, seq, &map)
+    spill_map_from_seq(SpillKind::Posts, dir, shard, seqs, map)
 }
 
 #[doc(hidden)]
@@ -1030,14 +1153,7 @@ pub fn spill_largest_posts_while_over(
     budget: u64,
     mut spill: impl FnMut(usize, PostPackMap) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
-    while posts_maps_estimated_bytes(maps) >= budget {
-        let Some(si) = largest_posts_shard(maps) else {
-            break;
-        };
-        let taken = std::mem::take(&mut maps[si]);
-        spill(si, taken)?;
-    }
-    Ok(())
+    spill_largest_while_over(maps, budget, largest_posts_shard, &mut spill)
 }
 
 #[doc(hidden)]
@@ -1045,11 +1161,7 @@ pub fn spill_all_post_maps(
     maps: &mut [PostPackMap],
     mut spill: impl FnMut(usize, PostPackMap) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
-    for (si, local) in maps.iter_mut().enumerate() {
-        let taken = std::mem::take(local);
-        spill(si, taken)?;
-    }
-    Ok(())
+    spill_all_maps(maps, &mut spill)
 }
 
 #[doc(hidden)]
@@ -1061,7 +1173,7 @@ pub type PostSpillRx = Receiver<PostSpillJob>;
 
 #[doc(hidden)]
 pub fn posts_spill_channel() -> (PostSpillTx, PostSpillRx) {
-    mpsc::sync_channel(1)
+    spill_channel()
 }
 
 #[doc(hidden)]
@@ -1070,11 +1182,7 @@ pub fn send_posts_spill(
     shard: usize,
     map: PostPackMap,
 ) -> Result<(), StoreError> {
-    if map.is_empty() {
-        return Ok(());
-    }
-    tx.send((shard, map))
-        .map_err(|_| StoreError::Corrupt("scripthash post spill writer stopped"))
+    send_spill(SpillKind::Posts, tx, shard, map)
 }
 
 #[doc(hidden)]
@@ -1084,27 +1192,12 @@ pub fn posts_spill_writer(
     seqs: &[AtomicU32],
     err: &Mutex<Option<StoreError>>,
 ) {
-    while let Ok((si, map)) = rx.recv() {
-        if err.lock().unwrap().is_some() {
-            continue;
-        }
-        if let Err(e) = spill_post_shard_map(dir, si, seqs, map) {
-            let mut g = err.lock().unwrap();
-            if g.is_none() {
-                *g = Some(e);
-            }
-        }
-    }
+    spill_writer(SpillKind::Posts, rx, dir, seqs, err)
 }
 
 #[doc(hidden)]
 pub fn unlink_post_shard(dir: &Path, shard: usize) {
-    let p = unsorted_post_path(dir, shard);
-    if p.is_dir() {
-        let _ = fs::remove_dir_all(&p);
-    } else if p.is_file() {
-        let _ = fs::remove_file(&p);
-    }
+    unlink_spill_shard(SpillKind::Posts, dir, shard)
 }
 
 #[cfg(debug_assertions)]
@@ -1152,11 +1245,7 @@ pub fn spill_shard_map(
     seqs: &[AtomicU32],
     map: Key16PackMap,
 ) -> Result<(), StoreError> {
-    if map.is_empty() {
-        return Ok(());
-    }
-    let seq = seqs[shard].fetch_add(1, Ordering::Relaxed);
-    write_keys_spill(dir, shard, seq, &map)
+    spill_map_from_seq(SpillKind::Keys, dir, shard, seqs, map)
 }
 
 #[doc(hidden)]
@@ -1165,14 +1254,7 @@ pub fn spill_largest_keys_while_over(
     budget: u64,
     mut spill: impl FnMut(usize, Key16PackMap) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
-    while keys_maps_estimated_bytes(maps) >= budget {
-        let Some(si) = largest_keys_shard(maps) else {
-            break;
-        };
-        let taken = std::mem::take(&mut maps[si]);
-        spill(si, taken)?;
-    }
-    Ok(())
+    spill_largest_while_over(maps, budget, largest_keys_shard, &mut spill)
 }
 
 #[doc(hidden)]
@@ -1180,17 +1262,13 @@ pub fn spill_all_keys_maps(
     maps: &mut [Key16PackMap],
     mut spill: impl FnMut(usize, Key16PackMap) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
-    for (si, local) in maps.iter_mut().enumerate() {
-        let taken = std::mem::take(local);
-        spill(si, taken)?;
-    }
-    Ok(())
+    spill_all_maps(maps, &mut spill)
 }
 
 /// One in-flight map. The next spill blocks until the writer takes this one.
 #[doc(hidden)]
 pub fn keys_spill_channel() -> (KeysSpillTx, KeysSpillRx) {
-    mpsc::sync_channel(1)
+    spill_channel()
 }
 
 #[doc(hidden)]
@@ -1199,11 +1277,7 @@ pub fn send_keys_spill(
     shard: usize,
     map: Key16PackMap,
 ) -> Result<(), StoreError> {
-    if map.is_empty() {
-        return Ok(());
-    }
-    tx.send((shard, map))
-        .map_err(|_| StoreError::Corrupt("scripthash keys spill writer stopped"))
+    send_spill(SpillKind::Keys, tx, shard, map)
 }
 
 #[doc(hidden)]
@@ -1213,17 +1287,7 @@ pub fn keys_spill_writer(
     seqs: &[AtomicU32],
     err: &Mutex<Option<StoreError>>,
 ) {
-    while let Ok((si, map)) = rx.recv() {
-        if err.lock().unwrap().is_some() {
-            continue;
-        }
-        if let Err(e) = spill_shard_map(dir, si, seqs, map) {
-            let mut g = err.lock().unwrap();
-            if g.is_none() {
-                *g = Some(e);
-            }
-        }
-    }
+    spill_writer(SpillKind::Keys, rx, dir, seqs, err)
 }
 
 #[doc(hidden)]

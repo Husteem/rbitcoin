@@ -211,6 +211,23 @@ pub(crate) struct StagedDelta {
     new_offs: Vec<(u64, u64)>,
 }
 
+impl StagedDelta {
+    fn ref_view(&self) -> crate::loc_table::StagedLocRef<'_, (u64, u32), u64> {
+        crate::loc_table::StagedLocRef {
+            base: self.base,
+            n: self.n,
+            loc_off: self.loc_off,
+            loc_bytes: &self.loc_bytes,
+            ovf_at: self.ovf_at,
+            ovf_bytes: &self.ovf_bytes,
+            new_ovf: &self.new_ovf,
+            off_at: self.off_at,
+            off_bytes: &self.off_bytes,
+            new_offs: &self.new_offs,
+        }
+    }
+}
+
 /// Single-plane u16 delta locator (`seqsigwit.loc`: strides, `0` = overflow).
 pub struct DeltaLoc {
     pub loc: TableFile,
@@ -453,32 +470,23 @@ impl DeltaLoc {
         })
     }
 
+    fn parts(&self) -> crate::loc_table::LocParts<'_, (u64, u32), u64> {
+        crate::loc_table::LocParts {
+            loc: &self.loc,
+            ovf: &self.ovf,
+            off: &self.off,
+            ovf_rows: &self.ovf_rows,
+            checkpoints: &self.checkpoints,
+        }
+    }
+
     pub(crate) fn write_staged(&self, staged: &StagedDelta) -> Result<(), StoreError> {
-        if let Some(&(fk, _)) = staged.new_ovf.first() {
-            let rows = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
-            if let Some(&(last, _)) = rows.last() {
-                if fk <= last {
-                    return Err(StoreError::Corrupt("invariant: loc ovf order"));
-                }
-            }
-        }
-        if let Some(&(w, _)) = staged.new_offs.first() {
-            let cps = self.checkpoints.read().unwrap_or_else(|e| e.into_inner());
-            if w as usize != cps.len() {
-                return Err(StoreError::Corrupt("invariant: loc checkpoint index"));
-            }
-        }
-        self.loc
-            .write_uncommitted(staged.loc_off, &staged.loc_bytes)?;
-        if !staged.ovf_bytes.is_empty() {
-            self.ovf
-                .write_uncommitted(staged.ovf_at, &staged.ovf_bytes)?;
-        }
-        if !staged.off_bytes.is_empty() {
-            self.off
-                .write_uncommitted(staged.off_at, &staged.off_bytes)?;
-        }
-        Ok(())
+        crate::loc_table::write_staged(
+            self.parts(),
+            &staged.ref_view(),
+            "invariant: loc ovf order",
+            "invariant: loc checkpoint index",
+        )
     }
 
     /// Publish RAM for this append. Header pwrites run only while `durable`
@@ -488,29 +496,7 @@ impl DeltaLoc {
     /// rest. RAM still advances.
     #[must_use]
     pub(crate) fn commit_staged(&self, staged: StagedDelta, durable: bool) -> bool {
-        let loc_end = staged.loc_off + staged.loc_bytes.len() as u64;
-        let ovf_end =
-            (!staged.ovf_bytes.is_empty()).then(|| staged.ovf_at + staged.ovf_bytes.len() as u64);
-        let off_end =
-            (!staged.off_bytes.is_empty()).then(|| staged.off_at + staged.off_bytes.len() as u64);
-        let durable = TableFile::commit_locator_file_ends(
-            &self.loc, &self.ovf, &self.off, durable, loc_end, ovf_end, off_end,
-        );
-        if !staged.ovf_bytes.is_empty() {
-            self.ovf_rows
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .extend_from_slice(&staged.new_ovf);
-        }
-        if !staged.off_bytes.is_empty() {
-            let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
-            for &(w, abs) in &staged.new_offs {
-                debug_assert_eq!(w as usize, cps.len());
-                cps.push(abs);
-            }
-        }
-        self.count.store(staged.base + staged.n, Ordering::Release);
-        durable
+        crate::loc_table::commit_staged(self.parts(), &self.count, staged.ref_view(), durable)
     }
 
     pub fn range_batch(&self, fks: &[Fk]) -> Result<Vec<Option<(u64, u64)>>, StoreError> {
@@ -524,23 +510,9 @@ impl DeltaLoc {
     /// Window reads that resolve `fks` (offsets from RAM checkpoints; no IO).
     pub fn plan_range_batch(&self, fks: &[Fk]) -> Result<DeltaLocPlan, StoreError> {
         let count = self.count.load(Ordering::Acquire);
-        let mut jobs: Vec<(usize, u64)> = Vec::new();
-        for (i, fk) in fks.iter().enumerate() {
-            let Some(id) = fk.get() else { continue };
-            if id == 0 || id > count {
-                continue;
-            }
-            jobs.push((i, id));
-        }
-        jobs.sort_unstable_by_key(|(_, id)| *id);
+        let jobs = crate::loc_table::loc_jobs(fks, count);
         let mut windows = Vec::new();
-        let mut w_i = 0usize;
-        while w_i < jobs.len() {
-            let w = loc_window(jobs[w_i].1);
-            let mut w_j = w_i + 1;
-            while w_j < jobs.len() && loc_window(jobs[w_j].1) == w {
-                w_j += 1;
-            }
+        for (w, w_i, w_j) in crate::loc_table::loc_window_groups(&jobs) {
             let win_first = w * LOC_WINDOW + 1;
             let win_last = ((w + 1) * LOC_WINDOW).min(count);
             let n = (win_last - win_first + 1) as usize;
@@ -561,7 +533,6 @@ impl DeltaLoc {
                 win_start,
                 buf: vec![0u8; n * 2],
             });
-            w_i = w_j;
         }
         Ok(DeltaLocPlan {
             out_len: fks.len(),
