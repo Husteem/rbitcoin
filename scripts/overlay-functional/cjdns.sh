@@ -154,9 +154,9 @@ if ip link show rbtc1 >/dev/null 2>&1; then
 fi
 rm -f "$ROOT/b.pid"
 # The supervisor never exits, and this script runs under a captured pipe
-# (`restart_daemon` uses `Command::output`): its own stdout must not stay
-# open on that pipe or the caller waits for EOF forever. It writes the
-# daemon's output to b.log itself.
+# (restart_daemon uses Command::output): its own stdout must not stay open
+# on that pipe or the caller waits for EOF forever. It writes the daemon's
+# output to b.log itself.
 sudo bash -c 'exec setsid bash "\$@"' _ "$HERE/cjdns-run.sh" "$CJDNS_BIN" \
   "$ROOT/b.conf" "$ROOT/b.log" "$ROOT/b.pid" "$ROOT/b.cjdns.sock" rbtc1 \
   >/dev/null 2>&1 &
