@@ -195,6 +195,47 @@ EOF2
 assert_fail_quiet "a bracket in a string that crosses lines does not count" \
   check multiline-string
 
+change nested-comment <<'EOF2'
+#[doc(
+    /* outer /* inner */
+    ] */
+    hidden
+)]
+fn a() {}
+====
+#[doc(
+    /* outer /* inner */
+    ] */
+    hidden
+)]
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "a bracket in a nested block comment does not count" check nested-comment
+
+change raw-backslash <<'EOF2'
+#[doc = r"foo\"]
+fn a() {}
+====
+#[doc = r"foo\"]
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "a backslash does not escape the end of a raw string" check raw-backslash
+
+change char-literal <<'EOF2'
+#[custom(']', b']', '"')]
+fn a() {}
+====
+#[custom(']', b']', '"')]
+fn b() {}
+
+fn a() {}
+EOF2
+assert_fail_quiet "a bracket or quote in a char literal does not count" check char-literal
+
 change raw-string <<'EOF2'
 #[doc = r#"a "quoted" [ bracket"#]
 fn a() {}

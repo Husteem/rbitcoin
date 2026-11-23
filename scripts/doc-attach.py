@@ -23,12 +23,14 @@ Usage: doc-attach.py --base REV [--head REV] [--root DIR]
 """
 
 import argparse
+import importlib.util
+import os
 import re
 import subprocess
 import sys
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-RAW_OPEN = re.compile(r'r(#*)"')
+RAW_OPEN = re.compile(r'(?:br|rb|r)(#*)"')
 
 
 def git(root: str, *args: str) -> str:
@@ -38,84 +40,109 @@ def git(root: str, *args: str) -> str:
     return out.stdout
 
 
-def bracket_delta(line: str, text: str | None) -> tuple[int, str | None]:
-    """Net `[` minus `]` in the code on `line`, and the string left open.
+def load_unwrap():
+    path = os.path.join(os.path.dirname(__file__), "unwrap-ratchet.py")
+    spec = importlib.util.spec_from_file_location("unwrap_ratchet", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
-    `text` is the terminator of a string that an earlier line left open:
-    `"` for an ordinary string, `"#`.. for a raw one. Comments and strings
-    hold no brackets that count.
+
+# Past a char literal that starts at an index, or None for a lifetime.
+char_end = load_unwrap()._char_end
+
+
+def code_only(src: str) -> str:
+    """`src` with comments, strings, and char literals spaced out.
+
+    Newlines stay, so line numbers hold. A string may cross lines, and block
+    comments nest.
     """
-    delta = 0
+    out = list(src)
+    n = len(src)
+
+    def blank(start: int, end: int) -> int:
+        for k in range(start, min(end, n)):
+            if out[k] != "\n":
+                out[k] = " "
+        return end
+
     i = 0
-    n = len(line)
     while i < n:
-        if text is not None:
-            if text == '"' and line[i] == "\\":
-                i += 2
-                continue
-            if line.startswith(text, i):
-                i += len(text)
-                text = None
-                continue
-            i += 1
-            continue
-        if line.startswith("//", i):
-            break
-        raw = RAW_OPEN.match(line, i)
-        if raw:
-            text = '"' + raw.group(1)
-            i = raw.end()
-        elif line[i] == '"':
-            text = '"'
-            i += 1
+        c = src[i]
+        if src.startswith("//", i):
+            end = src.find("\n", i)
+            i = blank(i, n if end < 0 else end)
+        elif src.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if src.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif src.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            i = blank(i, j)
+        elif c == '"':
+            j = i + 1
+            while j < n and src[j] != '"':
+                j += 2 if src[j] == "\\" else 1
+            i = blank(i, j + 1)
+        elif c in "rb" and not (i and (src[i - 1].isalnum() or src[i - 1] == "_")):
+            raw = RAW_OPEN.match(src, i)
+            if raw:
+                closer = '"' + raw.group(1)
+                end = src.find(closer, raw.end())
+                i = blank(i, n if end < 0 else end + len(closer))
+            else:
+                i += 1
+        elif c == "'":
+            end = char_end(src, i)
+            i = blank(i, end) if end is not None else i + 1
         else:
-            delta += (line[i] == "[") - (line[i] == "]")
             i += 1
-    return delta, text
+    return "".join(out)
 
 
-def classify(lines: list[str]) -> tuple[list[bool], list[bool]]:
-    """Per line: is it a doc comment or attribute, and is it a plain comment."""
-    marks = [False] * len(lines)
-    plain = [False] * len(lines)
-    depth = 0
-    text: str | None = None
-    in_block: str | None = None
-    for i, raw in enumerate(lines):
+def classify(text: str) -> list[str | None]:
+    """Per line: "doc", "attr", "comment" (a plain one), or None for code."""
+    raw_lines = text.split("\n")
+    code_lines = code_only(text).split("\n")
+    kinds: list[str | None] = [None] * len(raw_lines)
+    attr_depth = 0
+    doc_depth = 0
+    for i, raw in enumerate(raw_lines):
         line = raw.strip()
-        if in_block:
-            (marks if in_block == "doc" else plain)[i] = True
-            if "*/" in line:
-                in_block = None
-            continue
-        if depth > 0 or text is not None:
-            marks[i] = True
-            delta, text = bracket_delta(line, text)
-            depth = max(depth + delta, 0)
-            continue
-        if line.startswith("///"):
-            marks[i] = True
-        elif line.startswith("/*"):
-            doc = line.startswith("/**") and not line.startswith("/***")
-            (marks if doc else plain)[i] = True
-            if "*/" not in line[2:]:
-                in_block = "doc" if doc else "plain"
-        elif line.startswith("//"):
-            plain[i] = True
-        elif line.startswith("#["):
-            marks[i] = True
-            delta, text = bracket_delta(line, None)
-            depth = max(delta, 0)
-    return marks, plain
+        code = code_lines[i].strip()
+        if doc_depth:
+            kinds[i] = "doc"
+            doc_depth += line.count("/*") - line.count("*/")
+        elif attr_depth:
+            kinds[i] = "attr"
+            attr_depth = max(attr_depth + code.count("[") - code.count("]"), 0)
+        elif line.startswith("///") and not line.startswith("////"):
+            kinds[i] = "doc"
+        elif line.startswith("/**") and not line.startswith(("/***", "/**/")):
+            kinds[i] = "doc"
+            doc_depth = line.count("/*") - line.count("*/")
+        elif line and not code:
+            kinds[i] = "comment"
+        elif code.startswith("#["):
+            kinds[i] = "attr"
+            attr_depth = max(code.count("[") - code.count("]"), 0)
+    return kinds
 
 
 class Side:
     def __init__(self, text: str):
         self.lines = text.split("\n")
-        self.marks, self.plain = classify(self.lines)
+        self.kinds = classify(text)
 
     def skipped(self, i: int) -> bool:
-        return self.marks[i] or self.plain[i] or not self.lines[i].strip()
+        return self.kinds[i] is not None or not self.lines[i].strip()
+
+    def in_block(self, i: int) -> bool:
+        return self.kinds[i] in ("doc", "attr")
 
     def target_under(self, i: int) -> int | None:
         """Index of the first code line below block line `i`."""
@@ -130,16 +157,12 @@ class Side:
         for j in range(i - 1, -1, -1):
             if not self.skipped(j):
                 break
-            if self.marks[j]:
+            if self.in_block(j):
                 block.append(j)
         return block[::-1]
 
     def text(self, i: int) -> str:
         return self.lines[i].strip()
-
-
-def is_doc(line: str) -> bool:
-    return line.startswith("///") or line.startswith("/**") or line.startswith("*")
 
 
 def unchanged_map(root: str, old_blob: str, new_blob: str, new_len: int) -> dict[int, int]:
@@ -181,8 +204,8 @@ def check_file(root: str, base: str, head: str, old_path: str, path: str) -> lis
     to_new = {o: n for n, o in to_old.items()}
     errors = []
     seen = set()
-    for i, marked in enumerate(new.marks):
-        if not marked or i not in to_old:
+    for i in range(len(new.lines)):
+        if not new.in_block(i) or i not in to_old:
             continue
         was, now = old.target_under(to_old[i]), new.target_under(i)
         if was is None or now is None or old.text(was) == new.text(now):
@@ -194,10 +217,10 @@ def check_file(root: str, base: str, head: str, old_path: str, path: str) -> lis
             # The item the line sat on is still there. It lost the line unless
             # its doc was rewritten: then every doc line it has is a new one.
             block = new.block_above(to_new[was])
-            texts = [new.text(j) for j in block]
-            docs = [j for j in block if is_doc(new.text(j))]
+            docs = [j for j in block if new.kinds[j] == "doc"]
             handed_over = docs and not any(j in to_old for j in docs)
-            if line not in texts and not (is_doc(line) and handed_over):
+            kept = line in [new.text(j) for j in block]
+            if not kept and not (new.kinds[i] == "doc" and handed_over):
                 seen.add((was, now))
                 errors.append(
                     f"{path}:{i + 1}: this block sat on `{old.text(was)}` and now sits "
