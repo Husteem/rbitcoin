@@ -71,7 +71,9 @@ async fn stalled_response_write_is_cancelled() {
 
 /// A stall followed by a client that starts reading is not cut off by the
 /// first stall's deadline. The write deadline resets when a write progresses.
-#[tokio::test]
+/// The pipe is in memory and every wait is a tokio timer, so the clock is
+/// paused and advances to each one.
+#[tokio::test(start_paused = true)]
 async fn response_write_deadline_resets_after_progress() {
     const BODY: usize = 64 * 1024;
     let (server, mut client) = tokio::io::duplex(128);
