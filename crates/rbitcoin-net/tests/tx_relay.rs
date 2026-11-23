@@ -2452,7 +2452,7 @@ fn purge_confirmed_drops_relay_maps() {
     assert!(hub.contains(&parent_id), "connect does not strip the pool");
     assert!(!hub.pool_maintained());
     assert_eq!(
-        block_on(hub.remove_for_block_async(vec![parent_id], MINED)),
+        hub.remove_for_block(&[parent_id], MINED),
         0,
         "per-block strip waits for maintenance"
     );
@@ -2512,9 +2512,9 @@ fn purge_confirmed_drops_relay_maps() {
     assert!(reopened.contains(&child_id));
     reopened.set_relay_enabled(true);
     assert_eq!(
-        block_on(reopened.remove_for_block_async(vec![child_id], MINED)),
+        reopened.remove_for_block(&[child_id], MINED),
         1,
-        "once maintained, the armed path strips a live tx"
+        "once maintained, the strip removes a live tx"
     );
     assert!(!reopened.contains(&child_id));
     let _ = std::fs::remove_dir_all(&dir);
@@ -3085,11 +3085,6 @@ fn remove_for_block_skipped_until_relay_then_purge() {
     // Strip stays deferred until maintenance begins. The mined delta still drops.
     assert_eq!(mp.remove_for_block(&[dummy], MINED), 0);
     assert_eq!(
-        block_on(mp.remove_for_block_async(vec![dummy], MINED)),
-        0,
-        "the armed strip is deferred until maintenance too"
-    );
-    assert_eq!(
         mp.fee_delta(&dummy),
         0,
         "a mined delta drops while relay is off"
@@ -3101,7 +3096,6 @@ fn remove_for_block_skipped_until_relay_then_purge() {
     assert_eq!(mp.purge_confirmed_on_chain(), 0);
     // Still no-op for unknown txid, but path is live.
     assert_eq!(mp.remove_for_block(&[dummy], MINED), 0);
-    assert_eq!(block_on(mp.remove_for_block_async(vec![dummy], MINED)), 0);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&store_dir);
 }
@@ -3853,6 +3847,145 @@ fn relay_admit_erases_the_parked_copy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A local replacement that conflicts with a committed package member is a
+/// transient `RbfInsufficient`. It must wait for the package, then replace the
+/// victim the rollback restores.
+#[test]
+fn broadcast_replaces_the_conflict_a_failed_package_restores() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = Arc::new(MempoolHub::open(&dir, Arc::clone(&q)).unwrap());
+    hub.set_relay_enabled(true);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    // A is live at 1,000 sat fee. B replaces it at 5,000. C replaces A at
+    // 3,000: too little for B, enough for A once the rollback restores it.
+    let a = spend_true(cbs[0], 1_000, spk.clone());
+    let b = spend_true(cbs[0], 5_000, spk.clone());
+    let c = spend_true(cbs[0], 3_000, spk.clone());
+    let a_id = a.compute_txid();
+    let b_id = b.compute_txid();
+    let c_id = c.compute_txid();
+    hub.admit(&a).expect("A is live");
+
+    let mut bad_child = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(b_id, 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: spk,
+        }],
+    };
+    bad_child.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
+
+    hub.pause_after_tentative_commit
+        .store(true, Ordering::Release);
+    let hub_pkg = Arc::clone(&hub);
+    let pkg =
+        std::thread::spawn(move || block_on(hub_pkg.accept_package_async(vec![b, bad_child])));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !hub.contains(&b_id) || !hub.tentative_commit_parked.load(Ordering::Acquire) {
+        assert!(Instant::now() < deadline, "the package did not commit B");
+        std::thread::yield_now();
+    }
+
+    let hub_send = Arc::clone(&hub);
+    let send = std::thread::spawn(move || block_on(hub_send.broadcast_local_async(c)));
+    while !send.is_finished() && hub.tentative_waiters() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the broadcast neither answered nor waited"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !send.is_finished(),
+        "the broadcast answered before the package settled"
+    );
+
+    hub.pause_after_tentative_commit
+        .store(false, Ordering::Release);
+    assert!(pkg.join().expect("join the package").is_err());
+    let sent = send.join().expect("join the broadcast");
+    assert_eq!(
+        sent.expect("C replaces A after the rollback"),
+        LocalBroadcast::Admitted
+    );
+    assert!(hub.contains(&c_id));
+    assert!(!hub.contains(&a_id));
+    assert!(!hub.contains(&b_id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A broadcast whose tx a package already removed waits for that admit to
+/// settle. The conflicts are not back yet, so re-admitting in that window
+/// would take their inputs and drop the restore.
+#[test]
+fn broadcast_waits_for_settle_after_its_tx_left() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = Arc::new(MempoolHub::open(&dir, Arc::clone(&q)).unwrap());
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[7], 10_000, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 9_000);
+    let child_id = child.compute_txid();
+
+    // The parent is a package member whose admit has not settled. The child
+    // inherits that mark when relay admits it.
+    let admit = hub.begin_tentative();
+    hub.accept_tx_defer_trim(&parent, admit)
+        .expect("the parent pays for itself");
+    hub.pause_after_broadcast_admit
+        .store(true, Ordering::Release);
+    let hub_send = Arc::clone(&hub);
+    let send = std::thread::spawn(move || block_on(hub_send.broadcast_local_async(child)));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !hub.broadcast_admit_parked.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "the broadcast did not admit the child"
+        );
+        std::thread::yield_now();
+    }
+
+    // The package takes the child back while its mark remains, then the
+    // broadcast resumes. It must wait for the settle, not re-admit immediately.
+    {
+        let mut g = hub.lock_write();
+        g.remove_txid(&child_id, rbitcoin_net::Removal::Undo)
+            .expect("the child is live");
+    }
+    hub.pause_after_broadcast_admit
+        .store(false, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !send.is_finished() && hub.tentative_waiters() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the broadcast neither answered nor waited"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !send.is_finished(),
+        "the broadcast answered before the admit settled"
+    );
+    assert!(hub.tentative_waiters() > 0);
+
+    hub.settle(admit);
+    let sent = send.join().expect("join the broadcast");
+    assert_eq!(
+        sent.expect("the parent is pooled"),
+        LocalBroadcast::Admitted
+    );
+    assert!(hub.contains(&child_id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core's `MempoolAcceptedTx` is peer relay only. A multi-tx
 /// `testmempoolaccept` member commits with no peer, so the parked copy of
 /// it stays parked under its peer.
@@ -3871,7 +4004,10 @@ fn test_package_member_leaves_its_parked_copy() {
         BTreeSet::from([parent.compute_txid()]),
         Some(4),
     ));
-    block_on(hub.accept_test_package_member_async(child.clone())).expect("its parent is pooled");
+    let admit = hub.begin_tentative();
+    hub.accept_test_package_member(&child, admit)
+        .expect("its parent is pooled");
+    hub.settle(admit);
     assert_eq!(
         hub.lock_read()
             .orphanage
@@ -4893,15 +5029,17 @@ fn submit_package_rpc_admits_cpfp_below_minrelay() {
         let mut g = hub3.lock_write();
         g.max_weight = g.graph.total_weight();
     }
-    hub3.accept_tx_defer_trim(&paying_parent)
+    let package = hub3.begin_tentative();
+    hub3.accept_tx_defer_trim(&paying_parent, package)
         .expect("package parent");
     assert!(
         hub3.try_contains(&filler.compute_txid()),
         "a package member must not trim until the child is in"
     );
-    hub3.accept_tx_defer_trim(&paying_child)
+    hub3.accept_tx_defer_trim(&paying_child, package)
         .expect("package child");
     hub3.trim_over_budget();
+    hub3.settle(package);
     assert!(hub3.try_contains(&paying_parent.compute_txid()));
     assert!(hub3.try_contains(&paying_child.compute_txid()));
     assert!(

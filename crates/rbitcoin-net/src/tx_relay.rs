@@ -725,7 +725,7 @@ pub enum LocalBroadcast {
 
 impl LocalBroadcast {
     /// Read a [`TxOrigin::Local`] admit: a txid already pooled is success.
-    pub fn of(accepted: Result<AcceptResult, AcceptError>) -> Result<Self, AcceptError> {
+    fn of(accepted: Result<AcceptResult, AcceptError>) -> Result<Self, AcceptError> {
         match accepted {
             Ok(_) => Ok(Self::Admitted),
             Err(AcceptError::Duplicate(_)) => Ok(Self::InPool),
@@ -985,26 +985,33 @@ pub enum AcceptPath {
     Relay,
     /// A `submitpackage` member. The caller trims afterwards, and an orphan
     /// comes back instead of being paired or parked.
-    PackageMember,
+    PackageMember(Tentative),
     /// A multi-tx `testmempoolaccept` member, removed again afterwards. As a
     /// package member, and any prepare failure comes back unrecorded, so the
     /// dry run leaves no extra-pool body for a later child to pair with. No
     /// TRUC sibling eviction (Core allows no replacement there).
-    TestPackageMember,
+    TestPackageMember(Tentative),
 }
 
 impl AcceptPath {
     fn defer_trim(self) -> bool {
-        matches!(
-            self,
-            AcceptPath::PackageMember | AcceptPath::TestPackageMember
-        )
+        self.tentative().is_some()
+    }
+
+    /// The admit that holds a member this path commits until it settles.
+    fn tentative(self) -> Option<Tentative> {
+        match self {
+            AcceptPath::Relay => None,
+            AcceptPath::PackageMember(admit) | AcceptPath::TestPackageMember(admit) => Some(admit),
+        }
     }
 
     fn sibling_eviction(self) -> rbitcoin_mempool::SiblingEviction {
         match self {
-            AcceptPath::Relay | AcceptPath::PackageMember => rbitcoin_mempool::SiblingEviction::On,
-            AcceptPath::TestPackageMember => rbitcoin_mempool::SiblingEviction::Off,
+            AcceptPath::Relay | AcceptPath::PackageMember(_) => {
+                rbitcoin_mempool::SiblingEviction::On
+            }
+            AcceptPath::TestPackageMember(_) => rbitcoin_mempool::SiblingEviction::Off,
         }
     }
 
@@ -1012,8 +1019,88 @@ impl AcceptPath {
     fn returns_failure(self, e: &AcceptError) -> bool {
         match self {
             AcceptPath::Relay => false,
-            AcceptPath::PackageMember => matches!(e, AcceptError::Orphaned { .. }),
-            AcceptPath::TestPackageMember => true,
+            AcceptPath::PackageMember(_) => matches!(e, AcceptError::Orphaned { .. }),
+            AcceptPath::TestPackageMember(_) => true,
+        }
+    }
+}
+
+/// One admit that commits members it may still take back: a package, a
+/// 1p1c pair, or a multi-tx `testmempoolaccept`. Its members are tentative
+/// until [`MempoolHub::settle`]. Core runs each of these under `cs_main`, so
+/// no other submit sees a member before the admit is done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tentative(u64);
+
+/// Settles an admit when dropped, including when its task unwinds.
+///
+/// A package, 1p1c, or dry-run admit runs on a detached task. Its normal path
+/// settles explicitly; a panic after `hold_committed` would otherwise leave a
+/// mark that keeps every later broadcast waiting.
+#[doc(hidden)]
+pub struct TentativeGuard {
+    hub: Arc<MempoolHub>,
+    admit: Tentative,
+    armed: bool,
+}
+
+impl TentativeGuard {
+    #[doc(hidden)]
+    pub fn admit(&self) -> Tentative {
+        self.admit
+    }
+
+    /// Settle off the reactor and disarm the drop fallback.
+    #[doc(hidden)]
+    pub async fn settle_async(mut self) {
+        self.hub.settle_async(self.admit).await;
+        self.armed = false;
+    }
+}
+
+impl Drop for TentativeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let hub = Arc::clone(&self.hub);
+            let admit = self.admit;
+            // A drop can run on a Tokio worker. `settle` takes the mempool
+            // write lock, which that thread may not hold.
+            crate::reactor::queue_off_pool(move || hub.settle(admit));
+        }
+    }
+}
+
+/// [`TentativeGuard`] for a sync admit, which already runs off the reactor.
+struct TentativeGuardRef<'a> {
+    hub: &'a MempoolHub,
+    admit: Tentative,
+    armed: bool,
+}
+
+impl<'a> TentativeGuardRef<'a> {
+    fn new(hub: &'a MempoolHub) -> Self {
+        Self {
+            hub,
+            admit: hub.begin_tentative(),
+            armed: true,
+        }
+    }
+
+    fn admit(&self) -> Tentative {
+        self.admit
+    }
+
+    /// Settle now and disarm the drop fallback.
+    fn settle(mut self) {
+        self.armed = false;
+        self.hub.settle(self.admit);
+    }
+}
+
+impl Drop for TentativeGuardRef<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.hub.settle(self.admit);
         }
     }
 }
@@ -1240,6 +1327,30 @@ pub struct MempoolHub {
     /// Set while an async admit is parked on [`Self::pause_before_unbroadcast_note`].
     #[doc(hidden)]
     pub unbroadcast_note_parked: AtomicBool,
+    /// Test latch. A package, 1p1c pair, or multi-tx `testmempoolaccept`
+    /// parks right after it commits a member it may still take back.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub pause_after_tentative_commit: AtomicBool,
+    /// Set while an admit is parked on [`Self::pause_after_tentative_commit`].
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub tentative_commit_parked: AtomicBool,
+    /// Test latch. A local broadcast parks after its admit and before it
+    /// checks whether the admit's mark still holds the tx.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub pause_after_broadcast_admit: AtomicBool,
+    /// Set while a broadcast is parked on [`Self::pause_after_broadcast_admit`].
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub broadcast_admit_parked: AtomicBool,
+    /// Local broadcasts waiting for the admit that holds their txid to settle.
+    #[cfg(debug_assertions)]
+    tentative_waiters: AtomicUsize,
+    next_tentative: AtomicU64,
+    /// Wakes local broadcasts when a [`Tentative`] admit settles.
+    tentative_settled: tokio::sync::Notify,
     local_origin: Mutex<LocalOrigin>,
     pub isolated_broadcast: AtomicBool,
     /// Wakes the isolated loop when a local tx is queued for it.
@@ -1372,10 +1483,10 @@ std::thread_local! {
 }
 
 #[cfg(debug_assertions)]
-struct TemplatePrevWait<'a>(&'a AtomicUsize);
+struct LeaveWait<'a>(&'a AtomicUsize);
 
 #[cfg(debug_assertions)]
-impl Drop for TemplatePrevWait<'_> {
+impl Drop for LeaveWait<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
@@ -1593,6 +1704,18 @@ impl MempoolHub {
             unbroadcast_reattempt_at: AtomicU64::new(0),
             pause_before_unbroadcast_note: AtomicBool::new(false),
             unbroadcast_note_parked: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            pause_after_tentative_commit: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            tentative_commit_parked: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            pause_after_broadcast_admit: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            broadcast_admit_parked: AtomicBool::new(false),
+            #[cfg(debug_assertions)]
+            tentative_waiters: AtomicUsize::new(0),
+            next_tentative: AtomicU64::new(0),
+            tentative_settled: tokio::sync::Notify::new(),
             local_origin: Mutex::new(LocalOrigin::default()),
             isolated_broadcast: AtomicBool::new(false),
             isolated_wake: tokio::sync::Notify::new(),
@@ -1974,6 +2097,19 @@ impl MempoolHub {
         self.lock_write()
             .compact()
             .map_err(|e| format!("mempool compact: {e}"))
+    }
+
+    /// Compact when dead slots dominate, as a block strip does. A
+    /// multi-tx `testmempoolaccept` runs this after it takes its members
+    /// back, so repeated dry runs do not grow the body.
+    pub async fn maybe_compact_async(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        crate::reactor::off_pool(move || {
+            let mut g = hub.lock_write();
+            let _ = g.maybe_compact();
+            let _ = g.store.persist_if_dirty();
+        })
+        .await;
     }
 
     /// Enable/disable peer tx inv/accept (false during IBD catch-up).
@@ -2981,18 +3117,40 @@ impl MempoolHub {
         id != u64::MAX && id == self.trusted_session.load(Ordering::Relaxed)
     }
 
+    /// Sync [`Self::accept_test_package_member_async`].
+    #[doc(hidden)]
+    pub fn accept_test_package_member(
+        &self,
+        tx: &Transaction,
+        admit: Tentative,
+    ) -> Result<AcceptResult, AcceptError> {
+        crate::reactor::assert_not_reactor("mempool accept");
+        let utxo = self.utxo_provider();
+        self.accept_with_utxo(
+            tx,
+            &utxo,
+            TxOrigin::Relay(None),
+            AcceptPath::TestPackageMember(admit),
+            &[],
+        )
+    }
+
     /// Admit one `submitpackage` member, local origin, without trimming and
     /// without parking.
     ///
     /// The package trims once at the end. A missing-input child stays a
     /// reconsiderable error so the parent can be retried with it.
     #[doc(hidden)]
-    pub fn accept_tx_defer_trim(&self, tx: &Transaction) -> Result<AcceptResult, AcceptError> {
+    pub fn accept_tx_defer_trim(
+        &self,
+        tx: &Transaction,
+        admit: Tentative,
+    ) -> Result<AcceptResult, AcceptError> {
         self.accept_with_utxo(
             tx,
             &self.utxo_provider(),
             TxOrigin::Local,
-            AcceptPath::PackageMember,
+            AcceptPath::PackageMember(admit),
             &[],
         )
     }
@@ -3290,7 +3448,6 @@ impl MempoolHub {
         path: AcceptPath,
         announcers: &[u64],
     ) -> Result<AcceptResult, AcceptError> {
-        let defer_trim = path.defer_trim();
         utxo.note_spender(tx);
         let from = origin.peer();
         let t0 = Instant::now();
@@ -3359,7 +3516,7 @@ impl MempoolHub {
                 return self.finish_accept_err(us, e);
             }
         };
-        self.commit_admitted(tx, prep, utxo, origin, defer_trim, stages, lock_us, t0)
+        self.commit_admitted(tx, prep, utxo, origin, path, stages, lock_us, t0)
     }
 
     /// Core `LoadMempool` admit of one `mempool.dat` entry: the relay admit,
@@ -3397,7 +3554,7 @@ impl MempoolHub {
             prep,
             &utxo,
             TxOrigin::Relay(None),
-            false,
+            AcceptPath::Relay,
             stages,
             lock_us,
             t0,
@@ -3413,7 +3570,7 @@ impl MempoolHub {
         prep: rbitcoin_mempool::PreparedAdmit,
         utxo: &impl rbitcoin_mempool::UtxoProvider,
         origin: TxOrigin,
-        defer_trim: bool,
+        path: AcceptPath,
         mut stages: rbitcoin_mempool::AcceptStageUs,
         mut lock_us: u64,
         t0: Instant,
@@ -3424,8 +3581,12 @@ impl MempoolHub {
             let t_lock = Instant::now();
             let mut g = self.lock_write();
             g.last_accept_stages = stages;
-            let committed = Self::commit_rechecked(&mut g, body, prep, utxo, defer_trim, &sample);
+            let committed =
+                Self::commit_rechecked(&mut g, body, prep, utxo, path.defer_trim(), &sample);
             self.note_committed(&mut g, tx, origin, &committed.result);
+            if let Some(admit) = path.tentative() {
+                Self::hold_committed(&mut g, admit, &committed.result);
+            }
             stages = g.last_accept_stages;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             committed
@@ -3444,13 +3605,13 @@ impl MempoolHub {
         prep: rbitcoin_mempool::PreparedAdmit,
         utxo: &impl rbitcoin_mempool::UtxoProvider,
         origin: TxOrigin,
-        defer_trim: bool,
+        path: AcceptPath,
         stages: rbitcoin_mempool::AcceptStageUs,
         lock_us: u64,
         t0: Instant,
     ) -> Result<AcceptResult, AcceptError> {
         let (committed, us) =
-            self.commit_sampled(tx, prep, utxo, origin, defer_trim, stages, lock_us, t0);
+            self.commit_sampled(tx, prep, utxo, origin, path, stages, lock_us, t0);
         match committed.result {
             Ok(r) => {
                 self.meter_accept_wall(us, true);
@@ -3636,6 +3797,20 @@ impl MempoolHub {
         utxo: &impl rbitcoin_mempool::UtxoProvider,
         origin: TxOrigin,
     ) -> Option<AcceptResult> {
+        let guard = TentativeGuardRef::new(self);
+        let admitted = self.admit_pair_held(parent, child, utxo, origin, guard.admit());
+        guard.settle();
+        admitted
+    }
+
+    fn admit_pair_held(
+        &self,
+        parent: &Transaction,
+        child: &Transaction,
+        utxo: &impl rbitcoin_mempool::UtxoProvider,
+        origin: TxOrigin,
+        admit: Tentative,
+    ) -> Option<AcceptResult> {
         let mut stages = rbitcoin_mempool::AcceptStageUs::default();
         let mut lock_us = 0u64;
         let spec_p = AdmitSpec {
@@ -3662,6 +3837,7 @@ impl MempoolHub {
             let mut g = self.lock_write();
             let committed = Self::commit_rechecked(&mut g, body_p, prep_p, utxo, true, &sample_p);
             self.note_committed(&mut g, parent, origin.pair_parent(), &committed.result);
+            Self::hold_committed(&mut g, admit, &committed.result);
             committed
         };
         let (parent_res, prevouts_p) = match parent_commit.result {
@@ -3697,6 +3873,7 @@ impl MempoolHub {
             let mut g = self.lock_write();
             let committed = Self::commit_rechecked(&mut g, body_c, prep_c, utxo, true, &sample_c);
             self.note_committed(&mut g, child, origin, &committed.result);
+            Self::hold_committed(&mut g, admit, &committed.result);
             committed
         };
         self.meter_accept_stages(lock_us, stages);
@@ -3754,7 +3931,9 @@ impl MempoolHub {
 
     /// [`Self::abandon_package`] that restores replaced conflicts with
     /// scripts awaited. Each takes a store permit only around its coin read.
-    async fn abandon_package_async(self: &Arc<Self>, accepted: Vec<AcceptResult>) {
+    /// A multi-tx `testmempoolaccept` takes its members back here too, so a
+    /// spender of one leaves with it.
+    pub async fn abandon_package_async(self: &Arc<Self>, accepted: Vec<AcceptResult>) {
         if accepted.is_empty() {
             return;
         }
@@ -4259,11 +4438,12 @@ impl MempoolHub {
         result
     }
 
-    /// One member of a multi-tx `testmempoolaccept`, which removes it again.
-    /// See [`AcceptPath::TestPackageMember`].
+    /// One member of a multi-tx `testmempoolaccept`, which removes it again
+    /// and then settles `admit`. See [`AcceptPath::TestPackageMember`].
     pub async fn accept_test_package_member_async(
         self: &Arc<Self>,
         tx: Transaction,
+        admit: Tentative,
     ) -> Result<AcceptResult, AcceptError> {
         let hub = Arc::clone(self);
         crate::reactor::finish_join(
@@ -4271,7 +4451,7 @@ impl MempoolHub {
                 hub.accept_with_utxo_async(
                     tx,
                     TxOrigin::Relay(None),
-                    AcceptPath::TestPackageMember,
+                    AcceptPath::TestPackageMember(admit),
                     Vec::new(),
                 )
                 .await
@@ -4301,21 +4481,54 @@ impl MempoolHub {
     }
 
     /// Admit `tx` from this node's own client as [`Self::accept_tx_from_async`]
-    /// does, read by [`LocalBroadcast::of`].
+    /// does. A txid already pooled is a [`LocalBroadcast`] success.
+    ///
+    /// A txid an unsettled [`Tentative`] admit holds, as a member or as the
+    /// spender of one, is answered once that admit settles, as Core answers
+    /// after `cs_main`. A txid that has left the pool by then is admitted
+    /// again, so a success always names a tx that was in the pool for good.
     pub async fn broadcast_local_async(
         self: &Arc<Self>,
         tx: Transaction,
     ) -> Result<LocalBroadcast, AcceptError> {
-        LocalBroadcast::of(self.accept_tx_from_async(tx, TxOrigin::Local).await)
+        let txid = tx.compute_txid();
+        loop {
+            let admitted =
+                LocalBroadcast::of(self.accept_tx_from_async(tx.clone(), TxOrigin::Local).await);
+            if let Err(e) = &admitted {
+                // A committed member still holds this tx's conflict or its
+                // parent's output. Wait for the admit to settle, then retry
+                // instead of answering a transient conflict.
+                let transient = matches!(
+                    e,
+                    AcceptError::RbfInsufficient | AcceptError::RbfInsufficientSibling
+                );
+                if transient && self.wait_any_tentative().await {
+                    continue;
+                }
+                return admitted;
+            }
+            #[cfg(debug_assertions)]
+            self.park_after_broadcast_admit().await;
+            if self.settled_in_pool(txid).await {
+                return admitted;
+            }
+        }
     }
 
     /// [`Self::accept_tx_defer_trim`] without a blocking thread across scripts.
     pub async fn accept_tx_defer_trim_async(
         self: &Arc<Self>,
         tx: Transaction,
+        admit: Tentative,
     ) -> Result<AcceptResult, AcceptError> {
-        self.accept_with_utxo_async(tx, TxOrigin::Local, AcceptPath::PackageMember, Vec::new())
-            .await
+        self.accept_with_utxo_async(
+            tx,
+            TxOrigin::Local,
+            AcceptPath::PackageMember(admit),
+            Vec::new(),
+        )
+        .await
     }
 
     async fn accept_with_utxo_async(
@@ -4325,7 +4538,6 @@ impl MempoolHub {
         path: AcceptPath,
         announcers: Vec<u64>,
     ) -> Result<AcceptResult, AcceptError> {
-        let defer_trim = path.defer_trim();
         let from = origin.peer();
         let t0 = Instant::now();
         let hub = Arc::clone(self);
@@ -4366,12 +4578,15 @@ impl MempoolHub {
             let utxo = hub.utxo_provider();
             utxo.note_spender(&tx_c);
             let (committed, us) =
-                hub.commit_sampled(&tx_c, prep, &utxo, origin, defer_trim, stages, lock_us, t0);
+                hub.commit_sampled(&tx_c, prep, &utxo, origin, path, stages, lock_us, t0);
             (committed, us, tx_c)
         })
         .await;
         match committed.result {
             Ok(r) => {
+                if path.tentative().is_some() {
+                    self.park_after_tentative_commit().await;
+                }
                 let prevouts = committed.prevouts;
                 let txid = r.txid;
                 let hub = Arc::clone(self);
@@ -4653,6 +4868,21 @@ impl MempoolHub {
         child: &Transaction,
         origin: TxOrigin,
     ) -> Option<AcceptResult> {
+        let guard = self.begin_tentative_guard();
+        let admitted = self
+            .admit_pair_work_held(parent, child, origin, guard.admit())
+            .await;
+        guard.settle_async().await;
+        admitted
+    }
+
+    async fn admit_pair_work_held(
+        self: &Arc<Self>,
+        parent: Transaction,
+        child: &Transaction,
+        origin: TxOrigin,
+        admit: Tentative,
+    ) -> Option<AcceptResult> {
         let mut stages = rbitcoin_mempool::AcceptStageUs::default();
         let mut lock_us = 0u64;
         let hub = Arc::clone(self);
@@ -4689,6 +4919,7 @@ impl MempoolHub {
             let committed =
                 Self::commit_rechecked(&mut g, Arc::clone(&parent_c), prep_p, &utxo, true, &sample);
             hub.note_committed(&mut g, &parent_c, origin.pair_parent(), &committed.result);
+            Self::hold_committed(&mut g, admit, &committed.result);
             committed
         })
         .await;
@@ -4710,6 +4941,7 @@ impl MempoolHub {
                 return None;
             }
         };
+        self.park_after_tentative_commit().await;
         let hub = Arc::clone(self);
         let child_id = child.compute_txid();
         let spec_c = crate::reactor::off_pool(move || AdmitSpec {
@@ -4752,6 +4984,7 @@ impl MempoolHub {
             let committed =
                 Self::commit_rechecked(&mut g, Arc::clone(&child_c), prep_c, &utxo, true, &sample);
             hub.note_committed(&mut g, &child_c, origin, &committed.result);
+            Self::hold_committed(&mut g, admit, &committed.result);
             committed
         })
         .await;
@@ -4800,7 +5033,10 @@ impl MempoolHub {
     ) -> Result<Vec<AcceptResult>, AcceptError> {
         let hub = Arc::clone(self);
         crate::reactor::spawn_with_store_budget(async move {
-            let accepted = hub.admit_package_work(txs).await?;
+            let guard = hub.begin_tentative_guard();
+            let accepted = hub.admit_package_work(txs, guard.admit()).await;
+            guard.settle_async().await;
+            let accepted = accepted?;
             let ids: Vec<Txid> = accepted.iter().map(|r| r.txid).collect();
             let hub_k = Arc::clone(&hub);
             crate::reactor::off_pool(move || hub_k.kick_isolated_if_live(&ids)).await;
@@ -4815,6 +5051,7 @@ impl MempoolHub {
     async fn admit_package_work(
         self: &Arc<Self>,
         txs: Vec<Transaction>,
+        admit: Tentative,
     ) -> Result<Vec<AcceptResult>, AcceptError> {
         let hub = Arc::clone(self);
         let txs_shape = txs.clone();
@@ -4879,6 +5116,7 @@ impl MempoolHub {
                 let committed =
                     Self::commit_rechecked(&mut g, Arc::clone(&tx_c), prep, &utxo, true, &sample);
                 hub.note_committed(&mut g, &tx_c, TxOrigin::Local, &committed.result);
+                Self::hold_committed(&mut g, admit, &committed.result);
                 let stages = g.last_accept_stages;
                 (committed, stages, t_lock.elapsed().as_micros() as u64)
             })
@@ -4890,6 +5128,7 @@ impl MempoolHub {
                 Ok(r) => {
                     prevouts.push(committed.prevouts);
                     accepted.push(r);
+                    self.park_after_tentative_commit().await;
                 }
                 Err(e) => {
                     let hub = Arc::clone(self);
@@ -5324,7 +5563,10 @@ impl MempoolHub {
     /// Accept an ancestor package. Every member is [`TxOrigin::Local`]: this is
     /// the RPC, Esplora, and Electrum path (BIP331 wire later).
     pub fn accept_package(&self, txs: &[Transaction]) -> Result<Vec<AcceptResult>, AcceptError> {
-        let accepted = self.admit_package(txs)?;
+        let guard = TentativeGuardRef::new(self);
+        let accepted = self.admit_package(txs, guard.admit());
+        guard.settle();
+        let accepted = accepted?;
         let txids: Vec<Txid> = accepted.iter().map(|r| r.txid).collect();
         self.kick_isolated_if_live(&txids);
         Ok(accepted)
@@ -5332,7 +5574,11 @@ impl MempoolHub {
 
     /// [`Self::accept_package`] without the isolated kick, for a caller that
     /// trims again afterwards.
-    fn admit_package(&self, txs: &[Transaction]) -> Result<Vec<AcceptResult>, AcceptError> {
+    fn admit_package(
+        &self,
+        txs: &[Transaction],
+        admit: Tentative,
+    ) -> Result<Vec<AcceptResult>, AcceptError> {
         crate::reactor::assert_not_reactor("mempool accept");
         Self::check_package_shape(txs)?;
         let t0 = Instant::now();
@@ -5381,6 +5627,7 @@ impl MempoolHub {
                 g.last_accept_stages = stages;
                 let committed = Self::commit_rechecked(&mut g, body, prep, &utxo, true, &sample);
                 self.note_committed(&mut g, tx, TxOrigin::Local, &committed.result);
+                Self::hold_committed(&mut g, admit, &committed.result);
                 stages = g.last_accept_stages;
                 committed
             };
@@ -5549,8 +5796,7 @@ impl MempoolHub {
     /// prioritisation deltas still drop, including a tx that already left
     /// the mempool and a block that removes nothing live.
     ///
-    /// `removal` is `Committed(Block)` for a block, and `Undo` for a
-    /// `testmempoolaccept` dry run that takes its admits back.
+    /// `removal` is `Committed(Block)` for a block.
     pub fn remove_for_block(&self, txids: &[Txid], removal: Removal) -> usize {
         if !self.pool_maintained() {
             self.drop_mined_fee_deltas(txids);
@@ -5562,35 +5808,6 @@ impl MempoolHub {
             self.promote_orphans_staged(*tid, &utxo);
         }
         self.finish_block_removal(txids, n);
-        n
-    }
-
-    /// [`Self::remove_for_block`] for an armed task. Orphan promotion takes a
-    /// store permit per coin read and drops it before script verify.
-    pub async fn remove_for_block_async(
-        self: &Arc<Self>,
-        txids: Vec<Txid>,
-        removal: Removal,
-    ) -> usize {
-        let hub = Arc::clone(self);
-        let ids = txids.clone();
-        let n = crate::reactor::off_pool(move || {
-            if !hub.pool_maintained() {
-                hub.drop_mined_fee_deltas(&ids);
-                None
-            } else {
-                Some(hub.unlink_block_txids(&ids, removal))
-            }
-        })
-        .await;
-        let Some(n) = n else {
-            return 0;
-        };
-        for tid in &txids {
-            self.promote_orphans_async(*tid).await;
-        }
-        let hub = Arc::clone(self);
-        crate::reactor::off_pool(move || hub.finish_block_removal(&txids, n)).await;
         n
     }
 
@@ -6165,7 +6382,7 @@ impl MempoolHub {
                 #[cfg(debug_assertions)]
                 self.template_prev_waiters.fetch_add(1, Ordering::SeqCst);
                 #[cfg(debug_assertions)]
-                let _leave = TemplatePrevWait(&self.template_prev_waiters);
+                let _leave = LeaveWait(&self.template_prev_waiters);
                 let guard = self
                     .template_prev
                     .lock()
@@ -6179,6 +6396,127 @@ impl MempoolHub {
     #[cfg(debug_assertions)]
     pub fn template_prev_waiters(&self) -> usize {
         self.template_prev_waiters.load(Ordering::SeqCst)
+    }
+
+    /// Local broadcasts waiting for the admit that holds their txid to settle.
+    #[cfg(debug_assertions)]
+    pub fn tentative_waiters(&self) -> usize {
+        self.tentative_waiters.load(Ordering::SeqCst)
+    }
+
+    /// Start an admit whose members stay tentative until [`Self::settle`].
+    pub fn begin_tentative(&self) -> Tentative {
+        Tentative(self.next_tentative.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// [`Self::begin_tentative`] with a drop guard for an admit on a task.
+    #[doc(hidden)]
+    pub fn begin_tentative_guard(self: &Arc<Self>) -> TentativeGuard {
+        TentativeGuard {
+            hub: Arc::clone(self),
+            admit: self.begin_tentative(),
+            armed: true,
+        }
+    }
+
+    /// `admit` is done: what it left in the pool stays. Wakes the local
+    /// broadcasts waiting on one of its members.
+    pub fn settle(&self, admit: Tentative) {
+        self.lock_write().settle_tentative(admit.0);
+        self.tentative_settled.notify_waiters();
+    }
+
+    /// [`Self::settle`] off the reactor.
+    pub async fn settle_async(self: &Arc<Self>, admit: Tentative) {
+        let hub = Arc::clone(self);
+        crate::reactor::off_pool(move || hub.settle(admit)).await;
+    }
+
+    /// Mark a member `admit` just committed, under that commit's write lock.
+    fn hold_committed(
+        g: &mut ActiveMempool,
+        admit: Tentative,
+        committed: &Result<AcceptResult, AcceptError>,
+    ) {
+        if let Ok(r) = committed {
+            g.hold_tentative(r.txid, admit.0);
+        }
+    }
+
+    /// Wait while an unsettled admit holds `txid`. True when `txid` is then
+    /// in the pool for good, false when it left.
+    async fn settled_in_pool(self: &Arc<Self>, txid: Txid) -> bool {
+        loop {
+            // `notify_waiters` leaves no permit for a future that has not been
+            // polled. Register before the read, or a settle while the read is
+            // in flight is lost and this waits forever.
+            let settled = self.tentative_settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            let hub = Arc::clone(self);
+            let (live, tentative) = crate::reactor::off_pool(move || {
+                let g = hub.lock_read();
+                (g.graph.contains(&txid), g.is_tentative(&txid))
+            })
+            .await;
+            // A tx the admit already removed is still inside that admit's
+            // rollback window: its conflicts are not back yet. Wait for the
+            // settle even though the txid is gone, then decide from the pool.
+            if !tentative {
+                return live;
+            }
+            #[cfg(debug_assertions)]
+            self.tentative_waiters.fetch_add(1, Ordering::SeqCst);
+            #[cfg(debug_assertions)]
+            let _leave = LeaveWait(&self.tentative_waiters);
+            settled.await;
+        }
+    }
+
+    /// Wait for the next admit to settle. True when one was in flight.
+    /// A transient conflict with a committed member is retried after this.
+    async fn wait_any_tentative(self: &Arc<Self>) -> bool {
+        // Register before the read, as in `settled_in_pool`.
+        let settled = self.tentative_settled.notified();
+        tokio::pin!(settled);
+        settled.as_mut().enable();
+        let hub = Arc::clone(self);
+        let held = crate::reactor::off_pool(move || hub.lock_read().tentative_len()).await;
+        if held == 0 {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        self.tentative_waiters.fetch_add(1, Ordering::SeqCst);
+        #[cfg(debug_assertions)]
+        let _leave = LeaveWait(&self.tentative_waiters);
+        settled.await;
+        true
+    }
+
+    /// [`Self::pause_after_tentative_commit`]. Returns at once unless a test
+    /// armed it.
+    async fn park_after_tentative_commit(&self) {
+        #[cfg(debug_assertions)]
+        if self.pause_after_tentative_commit.load(Ordering::Acquire) {
+            self.tentative_commit_parked.store(true, Ordering::Release);
+            while self.pause_after_tentative_commit.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            self.tentative_commit_parked.store(false, Ordering::Release);
+        }
+    }
+
+    /// [`Self::pause_after_broadcast_admit`]. Returns at once unless a test
+    /// armed it.
+    #[cfg(debug_assertions)]
+    async fn park_after_broadcast_admit(&self) {
+        if self.pause_after_broadcast_admit.load(Ordering::Acquire) {
+            self.broadcast_admit_parked.store(true, Ordering::Release);
+            while self.pause_after_broadcast_admit.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            self.broadcast_admit_parked.store(false, Ordering::Release);
+        }
     }
 
     /// `None` when connect holds the tip mutex. An armed thread-local sample
@@ -6645,8 +6983,12 @@ impl MempoolHub {
         txs: &[Transaction],
         package_eval: bool,
     ) -> SubmitPackage {
-        let mut out: Vec<Result<AcceptResult, AcceptError>> =
-            txs.iter().map(|tx| self.accept_tx_defer_trim(tx)).collect();
+        let guard = TentativeGuardRef::new(self);
+        let admit = guard.admit();
+        let mut out: Vec<Result<AcceptResult, AcceptError>> = txs
+            .iter()
+            .map(|tx| self.accept_tx_defer_trim(tx, admit))
+            .collect();
         let rest: Vec<Transaction> = txs
             .iter()
             .zip(out.iter())
@@ -6660,9 +7002,12 @@ impl MempoolHub {
         if package_eval && rest.len() >= 2 {
             // `accept_package` kicks. This path trims once more below, so use
             // the admit that does not kick and kick after that trim.
-            reason = Self::note_package_eval(txs, &rest, &mut out, self.admit_package(&rest));
+            let admitted = self.admit_package(&rest, admit);
+            reason = Self::note_package_eval(txs, &rest, &mut out, admitted);
         }
-        self.package_rows_after_eval(txs, out, rest, reason)
+        let rows = self.package_rows_after_eval(txs, out, rest, reason);
+        guard.settle();
+        rows
     }
 
     /// [`Self::submit_package_rpc_eval`] with scripts awaited on the caller.
@@ -6682,9 +7027,11 @@ impl MempoolHub {
         txs: Vec<Transaction>,
         package_eval: bool,
     ) -> SubmitPackage {
+        let guard = self.begin_tentative_guard();
+        let admit = guard.admit();
         let mut out = Vec::with_capacity(txs.len());
         for tx in &txs {
-            out.push(self.accept_tx_defer_trim_async(tx.clone()).await);
+            out.push(self.accept_tx_defer_trim_async(tx.clone(), admit).await);
         }
         let hub = Arc::clone(self);
         let txs_f = txs.clone();
@@ -6706,11 +7053,15 @@ impl MempoolHub {
         if package_eval && rest.len() >= 2 {
             // `accept_package_async` kicks. This path trims once more below,
             // so use the admit that does not kick and kick after that trim.
-            let admitted = self.admit_package_work(rest.clone()).await;
+            let admitted = self.admit_package_work(rest.clone(), admit).await;
             reason = Self::note_package_eval(&txs, &rest, &mut out, admitted);
         }
         let hub = Arc::clone(self);
-        crate::reactor::off_pool(move || hub.package_rows_after_eval(&txs, out, rest, reason)).await
+        let rows =
+            crate::reactor::off_pool(move || hub.package_rows_after_eval(&txs, out, rest, reason))
+                .await;
+        guard.settle_async().await;
+        rows
     }
 
     /// Stamps a mempool-full package failure on the remainder and returns

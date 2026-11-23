@@ -4674,6 +4674,59 @@ fn testmempoolaccept_package_leaves_no_parent_behind() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A multi-tx `testmempoolaccept` that admits nothing leaves the mempool
+/// files alone, as on master: no compaction of a slot a failed package left
+/// dead below a live one.
+#[test]
+fn testmempoolaccept_admitting_nothing_leaves_the_store_alone() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| {
+        rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(tx))
+    };
+    let spk = || ScriptBuf::from_bytes(vec![0x51]);
+    let (parent_hex, parent) = zero_fee_parent(&ctx);
+    let bad_hex = script_failing_child(&parent, 50_000);
+    let (unrelated_hex, unrelated) = spend_generated_coinbase(&ctx, 2, 50_0000_0000 - 1_000, spk());
+    let v4 = |height: u32| {
+        let (_, mut tx) = spend_generated_coinbase(&ctx, height, 50_0000_0000 - 1_000, spk());
+        tx.version = bitcoin::transaction::Version::non_standard(4);
+        hex(&tx)
+    };
+    let dry_run = vec![json!([v4(3), v4(4)])];
+    let ctx = Arc::new(ctx);
+    let sent = sendraw_while_tentative(
+        &ctx,
+        "submitpackage",
+        vec![json!([parent_hex, bad_hex])],
+        parent.compute_txid(),
+        unrelated_hex,
+    );
+    assert_eq!(
+        sent.expect("unrelated"),
+        json!(unrelated.compute_txid().to_string())
+    );
+    let mp = ctx.mempool.as_ref().unwrap();
+    let stats = || {
+        let (_free, live, dead) = mp.lock_read().store.slot_stats();
+        (live, dead)
+    };
+    let left = stats();
+    assert_eq!(
+        left,
+        (1, 1),
+        "the failed package left its parent's slot dead"
+    );
+    let rows = dispatch(&ctx, "testmempoolaccept", dry_run).unwrap();
+    assert_eq!(rows[0]["reject-reason"], "version", "{rows}");
+    assert_eq!(rows[1]["reject-reason"], "version", "{rows}");
+    assert_eq!(
+        stats(),
+        left,
+        "a dry run that admits nothing compacts nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Multi-tx `testmempoolaccept` admits each member and takes it back. The
 /// pool numbers those changes and keeps no removal row: nothing was mined.
 #[test]
@@ -4701,6 +4754,12 @@ fn testmempoolaccept_package_undo_leaves_no_removed_row() {
         "two in, two out"
     );
     assert_eq!(mp.lock_read().removed_rows().rows, vec![]);
+    let (_free, live, dead) = mp.lock_read().store.slot_stats();
+    assert_eq!(
+        (live, dead),
+        (0, 0),
+        "a dry run on an empty pool leaves no dead slot behind"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -7926,6 +7985,269 @@ fn dropped_submitpackage_still_notes_unbroadcast() {
                 tokio::task::yield_now().await;
             }
         });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Runs `method` until it parks right after committing `held`, a member it
+/// may still take back. Sends `send_hex` over `sendrawtransaction` in that
+/// window, then lets `method` finish. Returns the broadcast's answer.
+fn sendraw_while_tentative(
+    ctx: &Arc<RpcContext>,
+    method: &'static str,
+    params: Vec<Value>,
+    held: Txid,
+    send_hex: String,
+) -> Result<Value, Value> {
+    let mp = Arc::clone(ctx.mempool.as_ref().unwrap());
+    mp.pause_after_tentative_commit
+        .store(true, Ordering::Release);
+    let ctx = Arc::clone(ctx);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let ctx_op = Arc::clone(&ctx);
+            let op = tokio::spawn(async move {
+                dispatch_tip_connect(&ctx_op, method, RpcParams::positional(params)).await
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !mp.contains(&held) || !mp.tentative_commit_parked.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{method} did not park after committing the member"
+                );
+                tokio::task::yield_now().await;
+            }
+            let send = tokio::spawn(async move {
+                let params = RpcParams::positional(vec![json!(send_hex)]);
+                sendrawtransaction_async(&ctx, &params).await
+            });
+            while !send.is_finished() && mp.tentative_waiters() == 0 {
+                assert!(
+                    Instant::now() < deadline,
+                    "sendrawtransaction neither answered nor waited"
+                );
+                tokio::task::yield_now().await;
+            }
+            mp.pause_after_tentative_commit
+                .store(false, Ordering::Release);
+            while !op.is_finished() || !send.is_finished() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{method} or sendrawtransaction did not finish after the release"
+                );
+                tokio::task::yield_now().await;
+            }
+            let _ = op.await.expect("join the parked call");
+            send.await.expect("join sendrawtransaction")
+        })
+}
+
+/// `OP_1 OP_EQUAL`: an output a spender of `2` fails only in its scripts.
+fn one_equal_script() -> ScriptBuf {
+    ScriptBuf::from_bytes(vec![0x51, 0x87])
+}
+
+/// A spend of `parent`'s P2WSH [`one_equal_script`] output that fails its
+/// scripts, so only a parent already in the pool lets it get that far.
+fn script_failing_child(parent: &Transaction, fee_sat: u64) -> String {
+    let mut bad = child_of(parent, fee_sat);
+    bad.input[0].witness =
+        bitcoin::Witness::from_slice(&[vec![0x02], one_equal_script().into_bytes()]);
+    rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&bad))
+}
+
+/// A 0-fee spend of the height-1 coinbase to a P2WSH [`one_equal_script`].
+fn zero_fee_parent(ctx: &RpcContext) -> (String, Transaction) {
+    let spk = ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::hash(one_equal_script().as_bytes()));
+    mature_coinbase_spend(ctx, 50_0000_0000, spk)
+}
+
+/// Core holds `cs_main` across `submitpackage`. A `sendrawtransaction` of
+/// a member sees the pool after the package. Here the child fails, the
+/// package takes the 0-fee parent back, and the parent alone is below the
+/// relay floor.
+#[test]
+fn sendraw_of_a_member_answers_after_the_failed_package() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (parent_hex, parent) = zero_fee_parent(&ctx);
+    let bad_hex = script_failing_child(&parent, 50_000);
+    let ctx = Arc::new(ctx);
+    let sent = sendraw_while_tentative(
+        &ctx,
+        "submitpackage",
+        vec![json!([parent_hex.clone(), bad_hex])],
+        parent.compute_txid(),
+        parent_hex,
+    );
+    let err = sent.expect_err("the package took the parent back");
+    assert_eq!(err["message"], "min relay fee not met", "{err}");
+    assert!(!ctx
+        .mempool
+        .as_ref()
+        .unwrap()
+        .contains(&parent.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A package that fails takes back its parent and every spender of it. A
+/// `sendrawtransaction` of a spender that lands while the parent is held
+/// answers after the package: here the parent comes back from the extra
+/// pool as 1p1c, so both are in the pool.
+#[test]
+fn sendraw_of_a_spender_of_a_held_parent_answers_after_the_package() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (parent_hex, parent) = zero_fee_parent(&ctx);
+    let bad_hex = script_failing_child(&parent, 50_000);
+    let mut spender = child_of(&parent, 50_000);
+    spender.input[0].witness =
+        bitcoin::Witness::from_slice(&[vec![0x01], one_equal_script().into_bytes()]);
+    let spender_hex =
+        rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&spender));
+    let ctx = Arc::new(ctx);
+    let sent = sendraw_while_tentative(
+        &ctx,
+        "submitpackage",
+        vec![json!([parent_hex, bad_hex])],
+        parent.compute_txid(),
+        spender_hex,
+    );
+    assert_eq!(
+        sent.expect("the spender pays for its parent"),
+        json!(spender.compute_txid().to_string())
+    );
+    let mp = ctx.mempool.as_ref().unwrap();
+    assert!(mp.contains(&spender.compute_txid()));
+    assert!(mp.contains(&parent.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A multi-tx `testmempoolaccept` admits each member and removes it again.
+/// A `sendrawtransaction` of a member in that window admits it after the
+/// dry run, so its txid stays in the pool.
+#[test]
+fn sendraw_of_a_test_accept_member_stays_in_the_pool() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let (parent_hex, parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk);
+    let child_hex = rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(
+        &child_of(&parent, 1_000),
+    ));
+    let ctx = Arc::new(ctx);
+    let sent = sendraw_while_tentative(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([parent_hex.clone(), child_hex])],
+        parent.compute_txid(),
+        parent_hex,
+    );
+    assert_eq!(
+        sent.expect("the parent pays for itself"),
+        json!(parent.compute_txid().to_string())
+    );
+    assert!(ctx
+        .mempool
+        .as_ref()
+        .unwrap()
+        .contains(&parent.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A multi-tx `testmempoolaccept` takes its members back with their
+/// spenders, as a failed package does. A `sendrawtransaction` of a spender
+/// of a member in that window answers after the dry run: the parent comes
+/// back from the extra pool as 1p1c, so both are in the pool.
+#[test]
+fn sendraw_of_a_spender_of_a_test_accept_member_keeps_its_parent() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let (parent_hex, parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk);
+    let hex = |tx: &Transaction| {
+        rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(tx))
+    };
+    let member = child_of(&parent, 1_000);
+    let spender = child_of(&parent, 2_000);
+    let ctx = Arc::new(ctx);
+    let sent = sendraw_while_tentative(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([parent_hex, hex(&member)])],
+        parent.compute_txid(),
+        hex(&spender),
+    );
+    assert_eq!(
+        sent.expect("the spender comes back with its parent"),
+        json!(spender.compute_txid().to_string())
+    );
+    let mp = ctx.mempool.as_ref().unwrap();
+    assert!(mp.contains(&parent.compute_txid()));
+    assert!(mp.contains(&spender.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A multi-tx `testmempoolaccept` takes its members back but keeps a
+/// `prioritisetransaction` delta set before the dry run.
+#[test]
+fn testmempoolaccept_package_keeps_a_fee_delta() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| {
+        rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(tx))
+    };
+    let spk = || ScriptBuf::from_bytes(vec![0x51]);
+    let (parent_hex, parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk());
+    let child = child_of(&parent, 1_000);
+    let child_id = child.compute_txid().to_string();
+    dispatch(
+        &ctx,
+        "prioritisetransaction",
+        vec![json!(child_id), json!(0), json!(1_234)],
+    )
+    .unwrap();
+    let rows = dispatch(
+        &ctx,
+        "testmempoolaccept",
+        vec![json!([parent_hex, hex(&child)])],
+    )
+    .unwrap();
+    assert_eq!(rows[1]["allowed"], true, "{rows}");
+    let all = dispatch(&ctx, "getprioritisedtransactions", vec![]).unwrap();
+    assert_eq!(all[&child_id]["fee_delta"], json!(1_234), "{all}");
+    assert_eq!(all[&child_id]["in_mempool"], json!(false), "{all}");
+    assert!(!ctx
+        .mempool
+        .as_ref()
+        .unwrap()
+        .contains(&child.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A local child completes a 0-fee parent from the extra pool as 1p1c. The
+/// parent is committed first and taken back when the child fails. A
+/// `sendrawtransaction` of the parent in that window answers after the pair.
+#[test]
+fn sendraw_of_a_1p1c_parent_answers_after_the_failed_pair() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (parent_hex, parent) = zero_fee_parent(&ctx);
+    let alone = dispatch(&ctx, "sendrawtransaction", vec![json!(parent_hex)]).unwrap_err();
+    assert_eq!(alone["message"], "min relay fee not met", "{alone}");
+    let bad_hex = script_failing_child(&parent, 50_000);
+    let ctx = Arc::new(ctx);
+    let sent = sendraw_while_tentative(
+        &ctx,
+        "sendrawtransaction",
+        vec![json!(bad_hex)],
+        parent.compute_txid(),
+        parent_hex,
+    );
+    let err = sent.expect_err("the pair took the parent back");
+    assert_eq!(err["message"], "min relay fee not met", "{err}");
+    assert!(!ctx
+        .mempool
+        .as_ref()
+        .unwrap()
+        .contains(&parent.compute_txid()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

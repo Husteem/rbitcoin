@@ -649,6 +649,9 @@ pub struct ActiveMempool {
     pub trust_kept: HashSet<Txid>,
     /// The chain enforces BIP 54 ([`Self::set_enforce_bip54`]).
     pub enforce_bip54: bool,
+    /// Live members an admit committed and may still take back, with the
+    /// admits that hold each one. See [`Self::is_tentative`].
+    tentative: std::collections::HashMap<Txid, Vec<u64>>,
     sequence: PoolSequence,
 }
 
@@ -691,6 +694,52 @@ impl ActiveMempool {
     pub fn take_undone_replacements(&mut self) -> Vec<Transaction> {
         self.undone_accept_secs.clear();
         std::mem::take(&mut self.undone_replacements)
+    }
+
+    /// `admit` committed `txid` and may still take it back: a package, a
+    /// 1p1c pair, or a multi-tx `testmempoolaccept`.
+    pub fn hold_tentative(&mut self, txid: Txid, admit: u64) {
+        let held_by = self.tentative.entry(txid).or_default();
+        if !held_by.contains(&admit) {
+            held_by.push(admit);
+        }
+    }
+
+    /// `admit` is done. Its members still in the pool stay.
+    pub fn settle_tentative(&mut self, admit: u64) {
+        self.tentative.retain(|_, held_by| {
+            held_by.retain(|a| *a != admit);
+            !held_by.is_empty()
+        });
+    }
+
+    /// Taking a tentative parent back takes its spenders with it, so a
+    /// spender just committed is held by the parent's admits too.
+    fn inherit_tentative(&mut self, txid: Txid, tx: &Transaction) {
+        if self.tentative.is_empty() {
+            return;
+        }
+        let admits: Vec<u64> = tx
+            .input
+            .iter()
+            .filter_map(|i| self.tentative.get(&i.previous_output.txid))
+            .flatten()
+            .copied()
+            .collect();
+        for admit in admits {
+            self.hold_tentative(txid, admit);
+        }
+    }
+
+    /// `txid` was committed by an admit that has not settled, so it may
+    /// still leave. A mark outlives its removal until that admit settles.
+    pub fn is_tentative(&self, txid: &Txid) -> bool {
+        self.tentative.contains_key(txid)
+    }
+
+    /// Unsettled admits that still hold at least one txid.
+    pub fn tentative_len(&self) -> usize {
+        self.tentative.len()
     }
 }
 
@@ -817,6 +866,7 @@ impl ActiveMempool {
             loaded_accept: ingested.accept_secs,
             trust_kept: ingested.trust_kept,
             enforce_bip54: false,
+            tentative: std::collections::HashMap::new(),
             sequence: PoolSequence::default(),
         })
     }
@@ -1480,6 +1530,20 @@ impl ActiveMempool {
         if self.store.body_compaction_due()? {
             let _ = self.maybe_compact()?;
         }
+        let committed = self.insert_after_script(&body, prep, trim);
+        if let Ok(r) = &committed {
+            self.inherit_tentative(r.txid, tx);
+        }
+        committed
+    }
+
+    fn insert_after_script(
+        &mut self,
+        body: &Arc<Transaction>,
+        prep: PreparedAdmit,
+        trim: bool,
+    ) -> Result<AcceptResult, AcceptError> {
+        let tx: &Transaction = body;
         let began = self.sequence.next();
         // The sequence the candidate's insert took, once it is in the graph.
         let mut admitted = None;
@@ -1578,7 +1642,7 @@ impl ActiveMempool {
         self.graph.insert(entry, tx);
         let seq = self.sequence.advance();
         admitted = Some(seq);
-        self.bodies.insert(txid, body);
+        self.bodies.insert(txid, Arc::clone(body));
         self.vin_aux.insert(txid, aux);
 
         if trim {

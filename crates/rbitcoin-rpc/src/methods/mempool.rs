@@ -2,7 +2,7 @@ use super::*;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
-use rbitcoin_net::{MempoolHub, QueryUtxoProvider, Removal, UtxoProvider};
+use rbitcoin_net::{MempoolHub, QueryUtxoProvider, UtxoProvider};
 use rbitcoin_primitives::Fk;
 use rbitcoin_primitives::Height;
 use serde_json::{json, Value};
@@ -1066,11 +1066,7 @@ pub async fn sendrawtransaction_async(
     // The note and the blocksonly rebroadcast sit on the admit task. Dropping
     // this request must not skip them after the tx is already published.
     rbitcoin_net::spawn_with_store_budget(async move {
-        let accepted = rbitcoin_net::LocalBroadcast::of(
-            mp_done
-                .accept_tx_from_work(tx_done.clone(), rbitcoin_net::TxOrigin::Local)
-                .await,
-        );
+        let accepted = mp_done.broadcast_local_async(tx_done.clone()).await;
         // After publish, before the note. A dropped request stays here only
         // when a test armed the latch. The note still runs on this task.
         park_before_unbroadcast_note(&mp_done).await;
@@ -1394,8 +1390,8 @@ async fn testmempoolaccept_package_rows_async(
     decoded: Vec<Transaction>,
     max_feerate: u64,
 ) -> Value {
-    // Inserts are real until `remove_for_block`. A dropped `testmempoolaccept`
-    // must not leave them in the pool.
+    // Inserts are real until the dry run takes its members back. A dropped
+    // `testmempoolaccept` must not leave them in the pool.
     let mp = Arc::clone(mp);
     rbitcoin_net::spawn_with_store_budget(async move {
         testmempoolaccept_package_rows_work(&mp, decoded, max_feerate).await
@@ -1409,6 +1405,8 @@ async fn testmempoolaccept_package_rows_work(
     decoded: Vec<Transaction>,
     max_feerate: u64,
 ) -> Value {
+    let guard = mp.begin_tentative_guard();
+    let admit = guard.admit();
     let mut added = Vec::new();
     let mut out = Vec::new();
     for tx in decoded {
@@ -1429,9 +1427,8 @@ async fn testmempoolaccept_package_rows_work(
             out.push(tma_bip125(&txid, &wtxid));
             continue;
         }
-        match mp.accept_test_package_member_async(tx.clone()).await {
+        match mp.accept_test_package_member_async(tx.clone(), admit).await {
             Ok(r) => {
-                added.push(r.txid);
                 out.push(tma_from_accept(
                     &tx,
                     &txid,
@@ -1440,13 +1437,16 @@ async fn testmempoolaccept_package_rows_work(
                     r.weight,
                     max_feerate,
                 ));
+                added.push(r);
             }
             Err(e) => out.push(tma_from_err(&tx, &txid, &wtxid, &e)),
         }
     }
     if !added.is_empty() {
-        mp.remove_for_block_async(added, Removal::Undo).await;
+        mp.abandon_package_async(added).await;
+        mp.maybe_compact_async().await;
     }
+    guard.settle_async().await;
     json!(out)
 }
 
