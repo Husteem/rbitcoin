@@ -755,24 +755,21 @@ impl LivePeer {
         self.held_front_queued.store(true, Ordering::Release);
     }
 
+    /// A command outside [`RECV_MSG_TYPES`] counts as `*other*`, so a peer
+    /// that sends made-up names adds one key, not one per name.
     pub fn note_recv(&self, cmd: &str, nbytes: u64) {
-        let n = acct_bytes(cmd, nbytes);
-        *self
-            .recv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(cmd.into())
-            .or_insert(0) += n;
+        self.note_recv_raw(recv_msg_type(cmd), acct_bytes(cmd, nbytes));
     }
 
     /// Store an already-computed wire size (v2 `*other*` = contents + expansion).
-    pub fn note_recv_raw(&self, cmd: &str, nbytes: u64) {
-        *self
-            .recv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(cmd.into())
-            .or_insert(0) += nbytes;
+    pub fn note_recv_raw(&self, cmd: &'static str, nbytes: u64) {
+        let mut recv = self.recv.lock().unwrap_or_else(|e| e.into_inner());
+        match recv.get_mut(cmd) {
+            Some(total) => *total += nbytes,
+            None => {
+                recv.insert(cmd.to_owned(), nbytes);
+            }
+        }
     }
 
     /// The session writer calls this once per frame it wrote. A command
@@ -1943,6 +1940,54 @@ pub fn rand_ping_nonce() -> u64 {
     tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9))
         | 1
+}
+
+/// Core `ALL_NET_MESSAGE_TYPES` (protocol.h): the `bytesrecv_per_msg` keys.
+/// Anything else, `reject` and `alert` included, is `*other*`.
+const RECV_MSG_TYPES: &[&str] = &[
+    "version",
+    "verack",
+    "addr",
+    "addrv2",
+    "sendaddrv2",
+    "inv",
+    "getdata",
+    "merkleblock",
+    "getblocks",
+    "getheaders",
+    "tx",
+    "headers",
+    "block",
+    "getaddr",
+    "mempool",
+    "ping",
+    "pong",
+    "notfound",
+    "filterload",
+    "filteradd",
+    "filterclear",
+    "sendheaders",
+    "feefilter",
+    "sendcmpct",
+    "cmpctblock",
+    "getblocktxn",
+    "blocktxn",
+    "getcfilters",
+    "cfilter",
+    "getcfheaders",
+    "cfheaders",
+    "getcfcheckpt",
+    "cfcheckpt",
+    "wtxidrelay",
+    "sendtxrcncl",
+];
+
+fn recv_msg_type(cmd: &str) -> &'static str {
+    RECV_MSG_TYPES
+        .iter()
+        .copied()
+        .find(|&t| t == cmd)
+        .unwrap_or("*other*")
 }
 
 /// Count at least Core's 24-byte header; `pong` must be ≥29 for `connect_nodes`.
