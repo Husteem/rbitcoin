@@ -1905,7 +1905,6 @@ impl ScriptHashTable {
         Ok(false)
     }
 
-    #[doc(hidden)]
     fn ingest_room(&self) -> u64 {
         let g = self.ingest.lock().unwrap();
         match g.as_ref() {
@@ -1927,6 +1926,7 @@ impl ScriptHashTable {
         Ok(())
     }
 
+    #[doc(hidden)]
     pub fn ingest_insert_many(&self, ups: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
         let mut i = 0usize;
         while i < ups.len() {

@@ -64,6 +64,7 @@ cargo deny check
 ./scripts/unwrap-ratchet.sh
 ./scripts/hex-ratchet.sh
 ./scripts/src-test-modules.sh
+./scripts/doc-attach.sh --base origin/master
 cargo test --workspace --quiet
 ./scripts/ci-os-smoke.sh
 ```
