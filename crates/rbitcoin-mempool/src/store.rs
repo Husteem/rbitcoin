@@ -143,6 +143,9 @@ pub struct Mempool {
     pub fail_next_append: bool,
     /// A durable DEAD `pwrite` is not yet covered by [`Self::sync_deaths`].
     pub deaths_unsynced: bool,
+    /// The live slot table is `slots.tmp`: a compact renamed the body but not
+    /// the slots. Writes stay there until a persist or the next open links it.
+    slots_pending: bool,
 }
 
 impl Mempool {
@@ -182,6 +185,7 @@ impl Mempool {
             #[cfg(debug_assertions)]
             fail_next_append: false,
             deaths_unsynced: false,
+            slots_pending: false,
         };
         let mut body_hdr = [0u8; BODY_HEADER];
         body_hdr.copy_from_slice(&mp.body[..BODY_HEADER]);
@@ -208,6 +212,16 @@ impl Mempool {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The slot-table file this session writes: `slots.tmp` until a failed
+    /// slots rename is linked, then `slots`.
+    fn slots_path(&self) -> PathBuf {
+        if self.slots_pending {
+            self.dir.join("slots.tmp")
+        } else {
+            self.dir.join("slots")
+        }
     }
 
     pub fn meta(&self) -> MempoolMeta {
@@ -314,7 +328,7 @@ impl Mempool {
     /// Adjacent new slots are one write. Does not rewrite the rest of the table.
     #[doc(hidden)]
     pub fn pwrite_live_slots_since(&mut self, old_persisted: u64) -> Result<(), MempoolError> {
-        let path = self.dir.join("slots");
+        let path = self.slots_path();
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for slot in 0..self.slot_cap {
             let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
@@ -442,7 +456,7 @@ impl Mempool {
 
     #[doc(hidden)]
     pub fn pwrite_slot_status(&mut self, slot: u32, status: u8) -> Result<(), MempoolError> {
-        let path = self.dir.join("slots");
+        let path = self.slots_path();
         let off = (SLOTS_HEADER + (slot as usize) * SLOT_REC) as u64;
         self.slots_file
             .seek(SeekFrom::Start(off))
@@ -549,11 +563,12 @@ impl Mempool {
         let packed_len = new_body.len();
         new_body[8..16].copy_from_slice(&(packed_len as u64).to_le_bytes());
 
-        self.body = new_body;
-        self.slots = new_slots;
-        self.live_count = next_slot;
-        self.live_body_bytes = packed_len.saturating_sub(BODY_HEADER) as u64;
-        self.install_packed_images()?;
+        self.install_images(
+            new_body,
+            new_slots,
+            next_slot,
+            packed_len.saturating_sub(BODY_HEADER) as u64,
+        )?;
         self.clear_dirty();
         Ok((self.live_count, packed_len))
     }
@@ -637,11 +652,12 @@ impl Mempool {
         }
         let packed_len = new_body.len();
         new_body[8..16].copy_from_slice(&(packed_len as u64).to_le_bytes());
-        self.body = new_body;
-        self.slots = new_slots;
-        self.live_count = next_slot;
-        self.live_body_bytes = packed_len.saturating_sub(BODY_HEADER) as u64;
-        self.install_packed_images()?;
+        self.install_images(
+            new_body,
+            new_slots,
+            next_slot,
+            packed_len.saturating_sub(BODY_HEADER) as u64,
+        )?;
         self.clear_dirty();
         rbitcoin_log::info!(
             "mempool: converted schema {from} sidecar to schema {MEM_SCHEMA} (live={next_slot})"
@@ -881,7 +897,7 @@ impl Mempool {
     ///
     /// Append-safe: a crash after a grown body and before new slots loses admits;
     /// old LIVE ranges stay a prefix of the new body. Packed compact must not
-    /// use this order (see [`Self::install_packed_images`]).
+    /// use this order (see [`Self::install_images`]).
     #[doc(hidden)]
     pub fn persist_body_tail(&mut self) -> Result<(), MempoolError> {
         let body_path = self.dir.join("tx.body");
@@ -915,7 +931,7 @@ impl Mempool {
     /// as FREE so a slots-ahead-of-body crash cannot load offsets past EOF.
     #[doc(hidden)]
     pub fn persist_slots_and_meta(&mut self) -> Result<(), MempoolError> {
-        let slots_path = self.dir.join("slots");
+        let slots_path = self.slots_path();
         if let Some(disk) = self.demoted_slots_image() {
             self.write_slots_bytes(&slots_path, &disk)?;
         } else {
@@ -924,7 +940,25 @@ impl Mempool {
             self.slots = buf;
             w?;
         }
-        self.persist_meta()
+        self.persist_meta()?;
+        self.promote_pending_slots();
+        Ok(())
+    }
+
+    /// Link a pending `slots.tmp` over `slots` after its bytes are durable.
+    ///
+    /// A failed rename leaves the file in place; the next persist or open
+    /// retries. The open fd keeps the same inode, so no handle change is
+    /// needed.
+    fn promote_pending_slots(&mut self) {
+        if !self.slots_pending {
+            return;
+        }
+        let slots_path = self.dir.join("slots");
+        let slots_tmp = self.dir.join("slots.tmp");
+        if fs::rename(&slots_tmp, &slots_path).is_ok() {
+            self.slots_pending = false;
+        }
     }
 
     #[doc(hidden)]
@@ -1002,7 +1036,7 @@ impl Mempool {
         if !self.deaths_unsynced {
             return Ok(());
         }
-        let path = self.dir.join("slots");
+        let path = self.slots_path();
         self.slots_file
             .durable_sync_data()
             .map_err(|e| MempoolError::io(&path, e))?;
@@ -1011,44 +1045,61 @@ impl Mempool {
         Ok(())
     }
 
-    /// Packed body+slots: both tmps `sync_all`'d, then rename body then slots.
+    /// Write packed images, then adopt them in RAM.
+    ///
+    /// Both tmps are `sync_all`'d and renamed body-then-slots. A failed write,
+    /// or a body rename that fails, leaves `self.body`, `self.slots`, and the
+    /// live counts as they were. If the body rename lands and the slots rename
+    /// fails, the body is already packed, so both RAM images are adopted and
+    /// slot writes stay on `slots.tmp` until a persist or the next open links
+    /// it (see [`finish_pending_compact`]).
     ///
     /// After rename, persist meta only. Rewriting packed body/slots in place
     /// (`set_len` / `write_all`) reopens the crash window tmp+rename closed.
     /// Crash after both renames, before meta: packed images + stale `live_count`
     /// still load (`load_live_txs` scans slots).
-    #[doc(hidden)]
-    pub fn install_packed_images(&mut self) -> Result<(), MempoolError> {
+    fn install_images(
+        &mut self,
+        body: Vec<u8>,
+        slots: Vec<u8>,
+        live_count: u32,
+        live_body_bytes: u64,
+    ) -> Result<(), MempoolError> {
         let body_path = self.dir.join("tx.body");
         let slots_path = self.dir.join("slots");
         let body_tmp = self.dir.join("tx.body.tmp");
         let slots_tmp = self.dir.join("slots.tmp");
-        let logical = body_logical_len(&self.body)?;
-        write_file_synced(&body_tmp, &self.body[..logical])?;
-        write_file_synced(&slots_tmp, &self.slots)?;
+        let logical = body_logical_len(&body)?;
+        if self.slots_pending {
+            // The live table is still here from an earlier install. Link it
+            // before reusing the temp name, or the write would truncate it.
+            fs::rename(&slots_tmp, &slots_path).map_err(|e| MempoolError::io(&slots_path, e))?;
+            self.slots_pending = false;
+        }
+        let body_file = write_file_synced(&body_tmp, &body[..logical])?;
+        let slots_file = write_file_synced(&slots_tmp, &slots)?;
         fs::rename(&body_tmp, &body_path).map_err(|e| MempoolError::io(&body_path, e))?;
-        fs::rename(&slots_tmp, &slots_path).map_err(|e| MempoolError::io(&slots_path, e))?;
-        self.reopen_body_slots()?;
+        self.body = body;
+        self.body_file = body_file;
         self.body_persisted_len = logical as u64;
         self.last_persist_ms = self.now_ms();
+        self.body_dirty = false;
+        if let Err(e) = fs::rename(&slots_tmp, &slots_path) {
+            self.slots = slots;
+            self.slots_file = slots_file;
+            self.live_count = live_count;
+            self.live_body_bytes = live_body_bytes;
+            self.slots_pending = true;
+            // The body is committed. A failed meta leaves a stale live_count,
+            // which open reconciles from the slot table.
+            let _ = self.persist_meta();
+            return Err(MempoolError::io(&slots_path, e));
+        }
+        self.slots = slots;
+        self.slots_file = slots_file;
+        self.live_count = live_count;
+        self.live_body_bytes = live_body_bytes;
         self.persist_meta()
-    }
-
-    #[doc(hidden)]
-    pub fn reopen_body_slots(&mut self) -> Result<(), MempoolError> {
-        let body_path = self.dir.join("tx.body");
-        let slots_path = self.dir.join("slots");
-        self.body_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&body_path)
-            .map_err(|e| MempoolError::io(&body_path, e))?;
-        self.slots_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&slots_path)
-            .map_err(|e| MempoolError::io(&slots_path, e))?;
-        Ok(())
     }
 }
 
@@ -1067,12 +1118,12 @@ pub fn body_logical_len(body: &[u8]) -> Result<usize, MempoolError> {
 }
 
 #[doc(hidden)]
-pub fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<(), MempoolError> {
+pub fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<File, MempoolError> {
     let mut f = File::create(path).map_err(|e| MempoolError::io(path, e))?;
     f.write_all(bytes).map_err(|e| MempoolError::io(path, e))?;
     f.durable_sync_all()
         .map_err(|e| MempoolError::io(path, e))?;
-    Ok(())
+    Ok(f)
 }
 
 /// Finish a compact install interrupted after the body rename.

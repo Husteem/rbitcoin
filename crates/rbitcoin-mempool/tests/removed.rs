@@ -8,6 +8,7 @@ use rbitcoin_mempool::{
     REMOVED_ROWS,
 };
 use std::collections::{BTreeSet, HashMap};
+use std::fs;
 
 const TIP_OK: ChainTipCtx = ChainTipCtx {
     height: 1_000_000,
@@ -89,6 +90,92 @@ fn a_compact_or_a_reopen_is_not_a_change() {
 }
 
 const BLOCK: Removal = Removal::Committed(RemovalReason::Block);
+
+/// A compact that cannot install its packed images has to leave the slot
+/// table and the graph as they were. A swap without the install leaves the
+/// graph naming old slots, so a later removal misses the tx's compacted
+/// slot, and the next successful compact reloads the tx from it.
+#[test]
+fn a_failed_compact_does_not_bring_a_later_removal_back() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(4);
+    let mut mp = ActiveMempool::open_or_create(dir.path()).unwrap();
+    let txs: Vec<_> = ops.iter().map(|op| spend(*op, 99_000)).collect();
+    for tx in &txs {
+        mp.accept_tx(tx, &utxos, TIP_OK).expect("admit");
+    }
+    mp.flush().unwrap();
+
+    // A directory at the body tmp path makes the first image write fail
+    // before either rename, which is the read-only-directory failure.
+    let blocker = dir.path().join("tx.body.tmp");
+    fs::create_dir(&blocker).unwrap();
+    let stripped = mp
+        .remove_live_txids(&[txs[0].compute_txid(), txs[1].compute_txid()], BLOCK)
+        .unwrap();
+    assert_eq!(stripped, 2);
+    assert!(mp.get_tx(&txs[2].compute_txid()).is_some());
+    assert!(mp.get_tx(&txs[3].compute_txid()).is_some());
+
+    // The strip's swallowed `maybe_compact` has already failed. A direct call
+    // still errors with the blocker in place, so the test cannot pass by
+    // skipping the failed install entirely.
+    assert!(mp.compact().is_err());
+
+    // D still sits in its original slot, so this removal marks it DEAD.
+    mp.remove_live_txids(&[txs[3].compute_txid()], BLOCK)
+        .unwrap();
+    assert!(mp.get_tx(&txs[3].compute_txid()).is_none());
+
+    fs::remove_dir(&blocker).unwrap();
+    mp.compact().unwrap();
+    assert!(
+        mp.get_tx(&txs[3].compute_txid()).is_none(),
+        "a DEAD slot in the old table became LIVE in the packed one"
+    );
+    mp.flush().unwrap();
+    drop(mp);
+
+    let mp = ActiveMempool::open_or_create(dir.path()).unwrap();
+    assert_eq!(mp.live_count(), 1);
+    assert!(mp.get_tx(&txs[2].compute_txid()).is_some());
+    assert!(mp.get_tx(&txs[3].compute_txid()).is_none());
+}
+
+/// A compact whose body rename lands but whose slots rename fails has already
+/// committed the packed body. The session must follow that body: later slot
+/// writes go to `slots.tmp`, and the next open links it. Keeping the old slot
+/// file would revert every removal made after the failure.
+#[test]
+fn a_failed_slots_rename_keeps_later_removals() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(4);
+    let mut mp = ActiveMempool::open_or_create(dir.path()).unwrap();
+    let txs: Vec<_> = ops.iter().map(|op| spend(*op, 99_000)).collect();
+    for tx in &txs {
+        mp.accept_tx(tx, &utxos, TIP_OK).expect("admit");
+    }
+    mp.flush().unwrap();
+
+    // A directory at `slots` makes the second rename fail with EISDIR after
+    // the body rename has already replaced `tx.body`.
+    let slots = dir.path().join("slots");
+    fs::remove_file(&slots).unwrap();
+    fs::create_dir(&slots).unwrap();
+    assert!(mp.compact().is_err());
+
+    mp.remove_live_txids(&[txs[3].compute_txid()], BLOCK)
+        .unwrap();
+    assert!(mp.get_tx(&txs[3].compute_txid()).is_none());
+
+    fs::remove_dir(&slots).unwrap();
+    drop(mp);
+
+    let mp = ActiveMempool::open_or_create(dir.path()).unwrap();
+    assert_eq!(mp.live_count(), 3);
+    assert!(mp.get_tx(&txs[1].compute_txid()).is_some());
+    assert!(mp.get_tx(&txs[3].compute_txid()).is_none());
+}
 
 fn out0(tx: &Transaction) -> OutPoint {
     OutPoint {

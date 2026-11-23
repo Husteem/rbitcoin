@@ -956,8 +956,14 @@ impl ActiveMempool {
 
     /// Compact durable storage (drop DEAD holes) and rebuild RAM graph.
     pub fn compact(&mut self) -> Result<(u32, usize), MempoolError> {
-        let (live, body_len) = self.store.compact()?;
+        let compacted = self.store.compact();
+        // The store adopts its packed images before the last fallible steps
+        // (reopen and meta). Rebuild from the slots it now reports on either
+        // outcome; an earlier failure reloads the unchanged image. Returning
+        // with the old graph and packed store is what let a later removal
+        // mark the wrong slot.
         let loaded = self.store.load_live_txs()?;
+        let live = loaded.len() as u32;
         // The same entries in new slots: each keeps the sequence its insert took.
         let live_seq = |txid: &Txid| self.graph.get(txid).map_or(0, |e| e.seq);
         let mut ingested = Self::ingest_loaded(loaded, live_seq);
@@ -979,7 +985,7 @@ impl ActiveMempool {
         self.vin_aux = ingested.vin_aux;
         self.trust_kept = ingested.trust_kept;
         self.store.set_live_count(live);
-        Ok((live, body_len))
+        compacted
     }
 
     #[doc(hidden)]
