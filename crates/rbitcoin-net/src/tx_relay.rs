@@ -848,7 +848,7 @@ pub struct MempoolPerfSample {
     pub list_live: u64,
     /// Calls to [`MempoolHub::list_live_meta`] (full live-set scan).
     pub list_live_meta: u64,
-    /// Calls to [`MempoolHub::list_live_wtxids`] / `try_list_live_wtxids`.
+    /// Calls to [`MempoolHub::list_live_wtxids`].
     pub list_live_wtxids: u64,
     /// `expire_stale` walks of live accept times.
     pub expire_full_scans: u64,

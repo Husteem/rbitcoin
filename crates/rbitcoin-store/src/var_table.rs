@@ -732,18 +732,3 @@ impl VarTable {
         Ok(())
     }
 }
-
-pub struct BodyAccessGuard<'a> {
-    pub body: &'a crate::file::TableFile,
-}
-
-impl Drop for BodyAccessGuard<'_> {
-    fn drop(&mut self) {
-        #[cfg(target_os = "linux")]
-        self.body.advise_access(libc::POSIX_FADV_NORMAL);
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = self.body;
-        }
-    }
-}

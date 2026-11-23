@@ -12,6 +12,8 @@ Comments and strings do not count as a use, with two exceptions read from
 the raw text: a name inside format braces (`"{NAME}"`, `"{:NAME$}"`), and a
 path assigned as a string, as in `#[serde(serialize_with = "path")]`.
 
+A type's own `impl` header does not count as a use of the type.
+
 What this cannot see. The match is by name, with no name resolution, so an
 item that shares its name with a live one is not reported, and neither is
 one that only a test, a re-export, or a brace in a comment still names.
@@ -35,6 +37,12 @@ PUB_ITEM = re.compile(
     re.M,
 )
 IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# `impl Name`, `impl<'a> Trait for Name<'a>`: the type's own impl header.
+IMPL_HEADER = re.compile(
+    r"^[ \t]*(?:unsafe[ \t]+)?impl\b(?:<[^>]*>)?[ \t]+(?:[^{;\n]*\bfor[ \t]+)?"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Za-z_][A-Za-z0-9_]*)",
+    re.M,
+)
 FORMAT_CAPTURE = re.compile(
     r"\{([A-Za-z_][A-Za-z0-9_]*)[:}]|[:.]([A-Za-z_][A-Za-z0-9_]*)\$"
 )
@@ -69,6 +77,7 @@ def unused(root: str) -> list[str]:
             src = f.read()
         code = blank_non_code(src)
         uses.update(IDENT.findall(code))
+        uses.subtract(IMPL_HEADER.findall(code))
         for braced, sized in FORMAT_CAPTURE.findall(src):
             uses[braced or sized] += 1
         uses.update(STRING_PATH.findall(src))
