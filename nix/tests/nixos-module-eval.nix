@@ -116,6 +116,7 @@ let
             hiddenService = true;
             i2p = true;
             maxInflight = 1024;
+            minDrainRate = 8192;
             blockTemplate = true;
           };
           health.enable = true;
@@ -160,6 +161,7 @@ let
           electrum.maxSpSubs = 100;
           heavyShCreates = 0;
           esplora.maxInflight = 1024;
+          esplora.minDrainRate = 8192;
           p2p = {
             listen = false;
             maxInbound = 0;
@@ -608,6 +610,7 @@ assert defaultCfg.storeReadBudget == null;
 assert defaultCfg.esplora.hiddenService == false;
 assert defaultCfg.esplora.i2p == false;
 assert defaultCfg.esplora.maxInflight == null;
+assert defaultCfg.esplora.minDrainRate == null;
 assert defaultCfg.rpc.clientVersion == null;
 assert defaultCfg.i2p.sam == null;
 assert defaultCfg.i2p.acceptIncoming == false;
@@ -737,6 +740,8 @@ assert builtins.match ".*--(electrum|esplora)-(onion|i2p).*" (
 ) == null;
 assert builtins.match ".*--esplora-max-inflight 1024.*" execStart != null;
 assert builtins.match ".*--esplora-max-inflight.*" listenOffExec == null;
+assert builtins.match ".*--esplora-min-drain-rate 8192.*" execStart != null;
+assert builtins.match ".*--esplora-min-drain-rate.*" listenOffExec == null;
 assert builtins.match ".*--sh-index.*" execStart != null;
 assert builtins.match ".*--sp-tweaks.*" execStart == null;
 assert builtins.match ".*--shindex.*" execStart == null;

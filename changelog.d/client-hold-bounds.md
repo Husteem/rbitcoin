@@ -9,5 +9,6 @@ Security
   reset on any accepted write, so a reader that took a few bytes before each
   deadline held its socket and accept slot for as long as it chose. A response
   write may now spend at most the request-timeout grace plus
-  `bytes-written / --esplora-min-drain-rate` (default 16 KiB/s) in stalled
-  time. Server compute between writes is not counted.
+  `bytes-written / --esplora-min-drain-rate` (default 16 KiB/s; NixOS
+  `services.rbitcoin.esplora.minDrainRate`) in stalled time. Server compute
+  between writes is not counted.
