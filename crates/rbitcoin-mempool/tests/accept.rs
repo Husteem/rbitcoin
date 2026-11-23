@@ -3473,6 +3473,62 @@ fn review_trust_applied_tx_logs_after_commit() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core `MAX_REPLACEMENT_CANDIDATES`: a replacement whose direct conflicts
+/// sit in more than 100 distinct clusters is refused before the conflict
+/// set is walked or any script runs. 100 clusters is still allowed.
+#[test]
+fn replacement_of_more_than_100_clusters_is_refused() {
+    let coins: Vec<OutPoint> = (0..101u32)
+        .map(|i| {
+            let mut id = [0xcd; 32];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            OutPoint {
+                txid: Txid::from_byte_array(id),
+                vout: 0,
+            }
+        })
+        .collect();
+    let txout = TxOut {
+        value: Amount::from_sat(100_000),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    };
+    let utxos = MapUtxoProvider {
+        map: coins.iter().map(|op| (*op, coin(txout.clone()))).collect(),
+    };
+    let mut replacement = spend_tx(coins[0], 101 * 100_000 - 500_000);
+    replacement.input = coins
+        .iter()
+        .map(|op| TxIn {
+            previous_output: *op,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        })
+        .collect();
+    for victims in [100usize, 101] {
+        let dir = tmp_dir();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        for op in &coins[..victims] {
+            mp.accept_tx(&spend_tx(*op, 99_000), &utxos, TIP_OK)
+                .expect("one cluster per coin");
+        }
+        let r = mp.accept_tx(&replacement, &utxos, TIP_OK);
+        if victims == 100 {
+            assert_eq!(r.expect("100 clusters").replaced.len(), 100);
+        } else {
+            assert!(
+                matches!(
+                    r,
+                    Err(AcceptError::Policy("too many potential replacements"))
+                ),
+                "{r:?}"
+            );
+            assert_eq!(mp.graph.len(), 101);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 include!("accept_life_journey.rs");
 
 #[test]
