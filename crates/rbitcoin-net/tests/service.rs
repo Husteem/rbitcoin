@@ -725,6 +725,77 @@ async fn listener_cap_silent_inbound_releases_the_slot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn marked_onion_listener_ignores_the_ordinary_source_cap() {
+    use rbitcoin_net::net_permissions::NetPermTable;
+    use rbitcoin_net::peer::V2PlainSession;
+    use rbitcoin_net::peers::MAX_INCOMPLETE_INBOUND_PER_ADDR;
+    use tokio::net::TcpStream;
+
+    let (_dir, query) = rbitcoin_query::testutil::tiny_query_labeled("onion-inbound-limit");
+    let loopback = "127.0.0.1:0".parse().unwrap();
+    let mut node = P2PNode::start_with_agent(
+        loopback,
+        query,
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:test-onion-listener/".into(),
+        2,
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .unwrap();
+    let ordinary = node.local_addr;
+    let onion = node.add_listen(loopback).await.unwrap();
+    node.peers.set_net_perms(NetPermTable {
+        onion_bind: Some(onion),
+        ..Default::default()
+    });
+
+    let _ordinary_reservations: Vec<_> = (0..MAX_INCOMPLETE_INBOUND_PER_ADDR)
+        .map(|_| {
+            node.peers
+                .try_reserve_incomplete(loopback.ip(), ordinary)
+                .unwrap()
+        })
+        .collect();
+    let handshake = |target| async move {
+        let stream = TcpStream::connect(target).await.unwrap();
+        V2PlainSession::outbound_regtest(stream, "/rbitcoin:test-client/", Duration::from_secs(3))
+            .await
+    };
+    let source_capped = handshake(ordinary).await;
+    let marked = handshake(onion).await;
+    node.shutdown().await;
+    assert!(source_capped.is_err(), "ordinary source cap");
+    marked.expect("marked onion listener has room under the shared inbound limit");
+}
+
+#[test]
+fn marked_onion_reservations_leave_the_forwarder_ip_budget_to_ordinary_tcp() {
+    use rbitcoin_net::net_permissions::NetPermTable;
+    use rbitcoin_net::peers::{PeerHub, MAX_INCOMPLETE_INBOUND_PER_ADDR};
+
+    let peers = PeerHub::new();
+    let source = "10.0.3.1".parse().unwrap();
+    let ordinary = "10.0.3.2:8333".parse().unwrap();
+    let onion = "10.0.3.2:8334".parse().unwrap();
+    peers.set_net_perms(NetPermTable {
+        onion_bind: Some(onion),
+        ..Default::default()
+    });
+    let marked = peers.try_reserve_incomplete(source, onion).unwrap();
+    let mut ordinary_reservations: Vec<_> = (0..MAX_INCOMPLETE_INBOUND_PER_ADDR)
+        .map(|_| peers.try_reserve_incomplete(source, ordinary).unwrap())
+        .collect();
+    assert!(peers.try_reserve_incomplete(source, ordinary).is_none());
+    assert!(peers.try_reserve_incomplete(source, onion).is_some());
+    drop(marked);
+    assert!(peers.try_reserve_incomplete(source, ordinary).is_none());
+    drop(ordinary_reservations.pop());
+    assert!(peers.try_reserve_incomplete(source, ordinary).is_some());
+}
+
 #[test]
 fn outbound_connect_timeout_is_eight_seconds() {
     assert_eq!(OUTBOUND_CONNECT_TIMEOUT, Duration::from_secs(8));

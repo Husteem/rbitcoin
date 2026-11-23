@@ -956,8 +956,8 @@ impl NodeConfig {
         self.validate_rpc_cookie()
     }
 
-    /// Tor and I2P inbound arrive from loopback on the P2P, Electrum, and
-    /// Esplora ports, so a v1 listener on one of those ports would serve them v1.
+    /// Keep the wallet's v1 listener separate from node and API listeners
+    /// that can receive traffic from overlay forwarders.
     fn validate_v1_bind(&self) -> Result<(), NodeError> {
         let esplora = match &self.listen.esplora {
             Some(EsploraListen::Tcp(a)) => Some(*a),

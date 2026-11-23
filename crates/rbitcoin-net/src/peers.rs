@@ -2354,30 +2354,32 @@ pub fn ip_is_advertisable(ip: &IpAddr, cjdns_reachable: bool) -> bool {
     !crate::netaddr::clearnet_unroutable(*ip)
 }
 
-/// Unfinished inbound handshakes one address may hold. Localhost and NAT
-/// share an address, so this is not 1.
+/// Unfinished inbound handshakes one source may hold on ordinary TCP listeners.
 pub const MAX_INCOMPLETE_INBOUND_PER_ADDR: usize = 8;
 
-pub(crate) struct IncompleteInbound {
-    ip: IpAddr,
-    hub: Weak<PeerHub>,
+#[doc(hidden)]
+pub struct IncompleteInbound {
+    reservation: Option<(IpAddr, Weak<PeerHub>)>,
 }
 
 impl Drop for IncompleteInbound {
     fn drop(&mut self) {
-        let Some(hub) = self.hub.upgrade() else {
+        let Some((ip, hub)) = &self.reservation else {
+            return;
+        };
+        let Some(hub) = hub.upgrade() else {
             return;
         };
         let mut map = hub
             .incomplete_inbound
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let Some(n) = map.get_mut(&self.ip) else {
+        let Some(n) = map.get_mut(ip) else {
             return;
         };
         *n = n.saturating_sub(1);
         if *n == 0 {
-            map.remove(&self.ip);
+            map.remove(ip);
         }
     }
 }
@@ -2453,14 +2455,18 @@ impl PeerHub {
         })
     }
 
-    /// Count one not-yet-handshaken inbound from `ip`, or `None` at the cap.
-    ///
-    /// The caller drops the guard when the handshake finishes so a live
-    /// session is not counted. Whitelist, noban, and localhost are not exempt.
-    pub(crate) fn try_reserve_incomplete(
+    /// Reserve an unfinished TCP handshake, or return `None` at the source cap.
+    /// The marked onion bind uses the shared inbound slots because Tor peers
+    /// share the forwarder's IP. The guard releases any source reservation.
+    #[doc(hidden)]
+    pub fn try_reserve_incomplete(
         self: &Arc<Self>,
         ip: IpAddr,
+        bind: SocketAddr,
     ) -> Option<IncompleteInbound> {
+        if self.onion_bind() == Some(bind) {
+            return Some(IncompleteInbound { reservation: None });
+        }
         let mut map = self
             .incomplete_inbound
             .lock()
@@ -2471,8 +2477,7 @@ impl PeerHub {
         }
         *n += 1;
         Some(IncompleteInbound {
-            ip,
-            hub: Arc::downgrade(self),
+            reservation: Some((ip, Arc::downgrade(self))),
         })
     }
 
