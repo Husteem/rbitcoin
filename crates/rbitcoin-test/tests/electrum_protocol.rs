@@ -2227,7 +2227,7 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     .await;
     let later_msg = get_later["error"]["message"].as_str().unwrap_or("");
     assert!(
-        later_msg.contains("tx not found"),
+        later_msg.contains("No such mempool or blockchain transaction"),
         "asof create must hide later spend tx: {get_later}"
     );
 

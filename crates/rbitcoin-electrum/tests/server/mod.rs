@@ -4541,3 +4541,29 @@ async fn panicked_electrum_disconnect_logs_at_warn() {
     rbitcoin_log::capture_logs(false);
     assert_eq!(levels, [Level::Debug, Level::Debug, Level::Warn]);
 }
+
+#[tokio::test]
+async fn transaction_get_unknown_txid_reports_core_not_found() {
+    let (dir, q) = tmp_store();
+    let q = Arc::new(q);
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, None).await;
+    let missing = "2222222222222222222222222222222222222222222222222222222222222222";
+    let reply = electrum_tcp_rpc(
+        &mut stream,
+        1,
+        "blockchain.transaction.get",
+        json!([missing, true]),
+    )
+    .await;
+    assert_eq!(reply["jsonrpc"], "2.0");
+    assert_eq!(reply["id"], 1);
+    assert_eq!(reply["error"]["code"], 2);
+    assert_eq!(
+        reply["error"]["message"],
+        "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
+    );
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
