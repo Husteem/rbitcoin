@@ -1523,6 +1523,47 @@ fn regtest_pow_bits_from_argv_and_conf() {
 }
 
 #[test]
+fn test_bip94_from_argv_and_conf() {
+    let bip94 = |cfg: &NodeConfig| cfg.chain_params().map(|p| p.enforce_bip94);
+    assert!(!bip94(&ready_config(["rbitcoin-node", "--network=regtest"])).unwrap());
+    assert!(bip94(&ready_config(["rbitcoin-node", "--network=testnet4"])).unwrap());
+    for argv in [
+        ["rbitcoin-node", "--network=regtest", "--test=bip94"].as_slice(),
+        ["rbitcoin-node", "--network=regtest", "--test", "bip94"].as_slice(),
+    ] {
+        assert!(bip94(&ready_config(argv)).unwrap(), "{argv:?}");
+    }
+
+    let dir = tmp_datadir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("bip94.conf");
+    std::fs::write(&conf, "regtest\ntest=bip94\n").unwrap();
+    let cfg = ready_config(["rbitcoin-node", "--conf", conf.to_str().unwrap()]);
+    assert!(bip94(&cfg).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Core: `-test=<option> can only be used with regtest`.
+    for network in [
+        "--network=signet",
+        "--network=mainnet",
+        "--network=testnet4",
+    ] {
+        let off = ready_config(["rbitcoin-node", network, "--test=bip94"]);
+        let err = off.chain_params().unwrap_err().to_string();
+        assert!(err.contains("regtest only"), "{network}: {err}");
+    }
+    assert!(operator_config_from_args(
+        ["rbitcoin-node", "--network=regtest", "--test=addrman"],
+        &NodeEnv::default()
+    )
+    .is_err());
+    let mut c = NodeConfig::default();
+    let unknown = c.apply_kv("test", "addrman").unwrap_err().to_string();
+    assert!(unknown.contains("bip94"), "{unknown}");
+    assert!(operator_usage().contains("--test bip94"));
+}
+
+#[test]
 fn store_read_budget_formula_and_flag() {
     assert_eq!(store_read_budget(true, 4, None), 1);
     assert_eq!(store_read_budget(true, 4, Some(0)), 1);

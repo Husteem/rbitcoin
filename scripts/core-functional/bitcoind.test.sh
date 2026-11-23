@@ -170,7 +170,7 @@ assert_fail_msg "fakearg still hard-fails" "Error parsing command line arguments
 # Consensus/mempool/peer flags are forwarded; harness-only extras stay ignored.
 OUTX="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -whitelist=noban@127.0.0.1 -txindex -fastprune -limitclustercount=10 \
-  -testactivationheight=csv@102 -permitbaremultisig=0 -maxconnections=8 \
+  -testactivationheight=csv@102 -test=bip94 -permitbaremultisig=0 -maxconnections=8 \
   -minimumchainwork=0x65 -limitancestorcount=5 -blockversion=1337 -mocktime=1296688602 \
   -maxtipage=3600 -blockmintxfee=0.00000001 -externalip=42.42.42.42 \
   -onlynet=ipv4 \
@@ -178,6 +178,7 @@ OUTX="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest \
   -proxy=127.0.0.1:1 -deprecatedrpc=startingheight -par=1 \
   2>/dev/null)" || OUTX=""
 if printf '%s' "$OUTX" | grep -q -- "--test-activation-height=csv@102" \
+  && printf '%s' "$OUTX" | grep -q -- "--test=bip94" \
   && printf '%s' "$OUTX" | grep -q -- "--net-permission=noban@127.0.0.1" \
   && printf '%s' "$OUTX" | grep -q -- "--limit-cluster-count=10" \
   && ! printf '%s' "$OUTX" | grep -q -- "permitbaremultisig" \

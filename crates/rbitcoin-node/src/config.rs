@@ -547,6 +547,8 @@ pub struct NodeConfig {
     pub uacomments: Vec<String>,
     /// `--test-activation-height=name@height` (regtest).
     pub test_activation_heights: Vec<(String, u32)>,
+    /// `--test=bip94` (Core `-test=bip94`): BIP94 on regtest.
+    pub test_bip94: bool,
     /// `--regtest-pow-bits` compact bits fixed for every regtest block >= 1, or
     /// only through the first retarget height when regtest retargeting is on.
     pub regtest_pow_bits: Option<u32>,
@@ -679,6 +681,7 @@ impl Default for NodeConfig {
             asmap: None,
             uacomments: Vec::new(),
             test_activation_heights: Vec::new(),
+            test_bip94: false,
             regtest_pow_bits: None,
             regtest_block_time: None,
             regtest_retarget_interval: None,
@@ -862,6 +865,11 @@ impl NodeConfig {
                 .map_err(|e| {
                     NodeError::Config(format!("test_activation_height {name}@{height}: {e}"))
                 })?;
+        }
+        if self.test_bip94 {
+            params
+                .apply_test_bip94()
+                .map_err(|e| NodeError::Config(e.into()))?;
         }
         if let Some(bits) = self.regtest_pow_bits {
             params
@@ -1824,6 +1832,14 @@ impl NodeConfig {
                 self.test_activation_heights
                     .push((name.to_string(), height));
             }
+            "test" => match val {
+                "bip94" => self.test_bip94 = true,
+                other => {
+                    return Err(NodeError::Config(format!(
+                        "conf test: unknown option `{other}` (only bip94)"
+                    )));
+                }
+            },
             "regtest_pow_bits" => {
                 self.regtest_pow_bits = Some(
                     ChainParams::parse_regtest_pow_bits(val)

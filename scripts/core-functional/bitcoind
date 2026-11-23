@@ -131,6 +131,7 @@ def parse_port(raw: str | None, flag: str) -> str:
 FORWARD_FLAGS = frozenset(
     {
         "testactivationheight",
+        "test",
         "persistmempool",
         "whitelist",
         "whitelistrelay",
