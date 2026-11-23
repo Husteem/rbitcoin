@@ -580,8 +580,11 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
                 .into_iter()
                 .filter(|p| p.inbound && p.subver.is_empty())
                 .count();
-            if connecting >= 1 {
+            if connecting >= 1 && !saw_connecting {
                 saw_connecting = true;
+                // One second on the peer clock: the heartbeat check runs at
+                // once instead of after a wall second.
+                seed.peers.set_mock_now(seed.peers.now_secs() + 1);
             }
             if saw_connecting && connecting == 0 {
                 break;
@@ -594,6 +597,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             }
             tokio::task::yield_now().await;
         }
+        seed.peers.set_mock_now(0);
         drop(raw);
 
         let seed_addr = seed.local_addr;
@@ -665,6 +669,8 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             )
             .await
             .expect("write ping prior to verack");
+        // One second on the peer clock instead of a wall second.
+        seed.peers.set_mock_now(seed.peers.now_secs() + 1);
         wait_v2_eof(
             &mut pre_verack,
             "pre-verack ping must close at peertimeout=1",
@@ -678,6 +684,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             "a completed handshake must outlive peertimeout=1 (seed={:?})",
             seed.peers.snapshot()
         );
+        seed.peers.set_mock_now(0);
 
         for id in peer
             .peers
