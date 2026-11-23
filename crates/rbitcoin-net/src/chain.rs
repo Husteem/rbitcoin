@@ -1962,8 +1962,14 @@ impl ChainHub {
     /// invalid marks, so that ask is what stops it fetching the same body
     /// again. Any other reject (a bad parent, a mutated or too-new copy, a
     /// trusted waive) releases the ask so another copy can be fetched.
+    /// True on that verdict, so the caller does not fetch the body again.
     #[doc(hidden)]
-    pub fn settle_rejected_ask(&self, ask: Option<BlockAsk>, offered: BlockHash, e: &NetError) {
+    pub fn settle_rejected_ask(
+        &self,
+        ask: Option<BlockAsk>,
+        offered: BlockHash,
+        e: &NetError,
+    ) -> bool {
         let failed = e
             .failing_block_hash()
             .map(BlockHash::from_byte_array)
@@ -1974,6 +1980,7 @@ impl ChainHub {
         if let Some(ask) = ask.filter(|_| verdict) {
             ask.keep_until_wipe();
         }
+        verdict
     }
 
     /// True if we have a header row (best chain, header-only tip, or held body).

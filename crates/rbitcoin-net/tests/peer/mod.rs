@@ -2832,7 +2832,7 @@ async fn compact_body_is_asked_of_another_peer_once() {
         asked_witness(&sent(&mut other_rx), hash),
         "the first short-id miss asks another high-bandwidth peer"
     );
-    on_blocktxn_unconnectable(&ann_tx, &mut follow, Some(announcer.as_ref()), hash).unwrap();
+    on_blocktxn_unconnectable(&hub, &ann_tx, &mut follow, Some(announcer.as_ref()), hash).unwrap();
     assert!(
         asked_witness(&sent(&mut ann_rx), hash),
         "a failed blocktxn asks the announcing peer for the body"
@@ -2840,6 +2840,199 @@ async fn compact_body_is_asked_of_another_peer_once() {
     assert!(
         !asked_witness(&sent(&mut other_rx), hash),
         "the same hash is not asked of that peer again"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Core `ProcessCompactBlockTxns` hands a filled body to `ProcessBlock` and
+/// does not ask for it again, so an invalid block is fetched from no peer.
+/// `FillBlock`'s `READ_STATUS_FAILED` asks the same peer for the full block
+/// and keeps it in flight: no other session may claim the body meanwhile.
+#[tokio::test]
+async fn blocktxn_verdict_is_not_fetched_again_and_a_retry_keeps_its_claim() {
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        absolute::LockTime, Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("blocktxn-ask-claim");
+    hub.ensure_genesis().unwrap();
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    assert!(hub.attach_mempool(mp).is_ok());
+    let genesis = hub.tip_header().unwrap();
+    let time = genesis.time + 1;
+    hub.clock.set_mock(i64::from(time) + 1);
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    // A child of genesis whose one spend is not in the mempool, so its
+    // compact block waits on `blocktxn`. The spent output does not exist.
+    let child = |tag: u8| {
+        let spend = Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_byte_array([tag; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: op_true.clone(),
+            }],
+        };
+        rbitcoin_consensus::mine_regtest_paying(
+            genesis.block_hash(),
+            time,
+            1,
+            op_true.clone(),
+            vec![spend],
+        )
+    };
+    let cmpct = |block: &bitcoin::Block| CmpctBlock {
+        compact_block: HeaderAndShortIds::from_block(block, 0xbeef, 2, &[]).unwrap(),
+    };
+    let fill = |block: &bitcoin::Block| BlockTransactions {
+        block_hash: block.block_hash(),
+        transactions: vec![block.txdata[1].clone()],
+    };
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let announcer = inbound_test_peer(&peers, 18475);
+    let (ann_tx, mut ann_rx) = announcer.open_out();
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+
+    let invalid = child(0xab);
+    let bad = invalid.block_hash();
+    // The tip `getdata` to a compact v2 peer asked for a compact block.
+    follow.requested_blocks.ask(&hub, bad);
+    on_cmpctblock(
+        &hub,
+        &ann_tx,
+        &mut follow,
+        Some(announcer.as_ref()),
+        &cmpct(&invalid),
+    )
+    .await
+    .unwrap();
+    assert!(
+        sent(&mut ann_rx)
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::GetBlockTxn(_))),
+        "the spend is asked by getblocktxn"
+    );
+    // A high-bandwidth peer that connects while the blocktxn is owed.
+    let other = outbound_test_peer(&peers, 18476);
+    let (_, mut other_rx) = other.open_out();
+    on_blocktxn(
+        &hub,
+        &ann_tx,
+        &mut follow,
+        Some(announcer.as_ref()),
+        &fill(&invalid),
+    )
+    .await
+    .unwrap();
+    assert!(hub.is_block_invalid(&bad), "the filled body is invalid");
+    assert!(
+        !asked_witness(&sent(&mut ann_rx), bad),
+        "the announcer is not asked for the invalid body again"
+    );
+    assert!(
+        !asked_witness(&sent(&mut other_rx), bad),
+        "another peer is not asked for the invalid body"
+    );
+    assert!(
+        hub.claim_block_ask(&bad).is_none(),
+        "no other session may claim the invalid body"
+    );
+
+    let (_, mutated) = witness_committed_pair(&child(0xac));
+    let mutated_hash = mutated.block_hash();
+    on_cmpctblock(
+        &hub,
+        &ann_tx,
+        &mut follow,
+        Some(announcer.as_ref()),
+        &cmpct(&mutated),
+    )
+    .await
+    .unwrap();
+    let _ = sent(&mut other_rx);
+    on_blocktxn(
+        &hub,
+        &ann_tx,
+        &mut follow,
+        Some(announcer.as_ref()),
+        &fill(&mutated),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !hub.is_block_invalid(&mutated_hash),
+        "a mutated fill is no verdict"
+    );
+    assert!(
+        asked_witness(&sent(&mut ann_rx), mutated_hash),
+        "the announcer is asked for the full block"
+    );
+    assert!(
+        hub.claim_block_ask(&mutated_hash).is_none(),
+        "the full-block ask holds the body while it is in flight"
+    );
+
+    let short = child(0xad);
+    let short_hash = short.block_hash();
+    on_cmpctblock(
+        &hub,
+        &ann_tx,
+        &mut follow,
+        Some(announcer.as_ref()),
+        &cmpct(&short),
+    )
+    .await
+    .unwrap();
+    let _ = sent(&mut other_rx);
+    let none = BlockTransactions {
+        block_hash: short_hash,
+        transactions: Vec::new(),
+    };
+    on_blocktxn(&hub, &ann_tx, &mut follow, Some(announcer.as_ref()), &none)
+        .await
+        .unwrap();
+    assert!(
+        asked_witness(&sent(&mut ann_rx), short_hash),
+        "a blocktxn that cannot fill asks for the full block"
+    );
+    assert!(
+        hub.claim_block_ask(&short_hash).is_none(),
+        "that full-block ask holds the body too"
+    );
+
+    // A sibling connects, so the session walks its header leaves again.
+    let sibling = rbitcoin_consensus::mine_regtest_paying(
+        genesis.block_hash(),
+        time,
+        1,
+        ScriptBuf::from_bytes(vec![0x52]),
+        Vec::new(),
+    );
+    on_block(
+        &hub,
+        &ann_tx,
+        &mut follow,
+        Some(announcer.as_ref()),
+        &sibling,
+    )
+    .await
+    .unwrap();
+    assert_eq!(hub.tip_hash(), Some(sibling.block_hash()));
+    assert!(
+        !asked_witness(&sent(&mut ann_rx), bad),
+        "the header path does not fetch the invalid body"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

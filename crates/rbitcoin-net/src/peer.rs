@@ -6977,7 +6977,7 @@ pub async fn on_blocktxn(
         Ok((block, fill)) => {
             on_blocktxn_got_block(hub, out_tx, follow, session, &pc, hash, block, fill).await
         }
-        Err(()) => on_blocktxn_apply_fail(out_tx, follow, session, &pc, hash),
+        Err(()) => on_blocktxn_apply_fail(hub, out_tx, follow, session, &pc, hash),
     }
 }
 
@@ -7050,12 +7050,22 @@ pub async fn on_blocktxn_got_block(
             )
             .await
         }
-        Err(_) => on_blocktxn_unconnectable(out_tx, follow, session, hash),
+        Err(e) => {
+            // Core asks no peer again for a body it holds invalid.
+            if hub.settle_rejected_ask(follow.requested_blocks.remove(&hash), hash, &e) {
+                if let Some(s) = session {
+                    s.release_cmpct_taken(hash);
+                }
+                return Ok(());
+            }
+            on_blocktxn_unconnectable(hub, out_tx, follow, session, hash)
+        }
     }
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_apply_fail(
+    hub: &ChainHub,
     out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
@@ -7068,14 +7078,21 @@ pub fn on_blocktxn_apply_fail(
         s.note_failed_cmpct(hash);
         s.release_cmpct_taken(hash);
     }
-    follow.requested_blocks.release_ask(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
     ask_other_hb_for_block(session, hash);
-    out_tx.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
+    queue_block_getdata(
+        hub,
+        out_tx,
+        session,
+        &mut follow.requested_blocks,
+        &[hash],
+        false,
+    )
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_unconnectable(
+    hub: &ChainHub,
     out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
@@ -7086,10 +7103,16 @@ pub fn on_blocktxn_unconnectable(
         s.note_failed_cmpct(hash);
         s.release_cmpct_taken(hash);
     }
-    follow.requested_blocks.release_ask(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
     ask_other_hb_for_block(session, hash);
-    out_tx.send(NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]))
+    queue_block_getdata(
+        hub,
+        out_tx,
+        session,
+        &mut follow.requested_blocks,
+        &[hash],
+        false,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
