@@ -306,6 +306,10 @@ let
   ++ optional (cfg.esplora.enable && cfg.esplora.maxInflight != null) (
     toString cfg.esplora.maxInflight
   )
+  ++ optional (cfg.esplora.enable && cfg.esplora.minDrainRate != null) "--esplora-min-drain-rate"
+  ++ optional (cfg.esplora.enable && cfg.esplora.minDrainRate != null) (
+    toString cfg.esplora.minDrainRate
+  )
   ++ optional cfg.health.enable "--health-listen"
   ++ optional cfg.health.enable (socket cfg.health.address cfg.health.port)
   ++ optional cfg.metrics "--metrics"
@@ -1308,6 +1312,20 @@ in
           Esplora requests in flight across the whole listener (--esplora-max-inflight).
           Null keeps the node default (256). Further requests wait for a slot; the
           wait counts against the request timeout (408).
+        '';
+      };
+
+      minDrainRate = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 8192;
+        description = ''
+          Minimum average Esplora response write rate in bytes per second
+          (--esplora-min-drain-rate). Null keeps the node default (16384). A write
+          may stall for the request timeout; its total stalled time must stay under
+          that plus bytes-written/rate, so a client that accepts a trickle is
+          closed. Lower it for slow clients on large histories; raise it on a busy
+          public listener.
         '';
       };
     };

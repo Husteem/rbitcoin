@@ -533,8 +533,15 @@ where
     let mut sh_rescan = false;
     let mut sh_tick = tokio::time::interval(Duration::from_millis(50));
     sh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // One idle window per completed request line, and per silent-payments
+    // scan step. The scripthash tick, a tip push and a mempool announce each
+    // end a pass without serving a request, so a fresh timeout per pass would
+    // let any of them hold the slot forever.
+    let mut read_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        let read_by =
+            *read_deadline.get_or_insert_with(|| tokio::time::Instant::now() + writer.idle());
         let stop_wait = stop.notified();
         if stop.load() {
             break;
@@ -696,7 +703,7 @@ where
                     }
                 }
             }
-            line = tokio::time::timeout(writer.idle(), reader.read_line()) => {
+            line = tokio::time::timeout_at(read_by, reader.read_line()) => {
                 let line = match line {
                     Ok(Ok(Some(l))) => l,
                     Ok(Ok(None)) => {
@@ -723,6 +730,7 @@ where
                 if line.trim().is_empty() {
                     continue;
                 }
+                read_deadline = None;
                 let req: Value = match parse_electrum_request_line(&line) {
                     Some(v) => v,
                     None => {
@@ -790,6 +798,9 @@ where
             (address, step) = next_sp_scan_step(&mut conn.sp_scans) => {
                 write_sp_scan_step(&mut writer, &query, &params, &mut conn, &address, step)
                     .await?;
+                // A scan step is the subscribe's response, so it keeps the idle
+                // window alive while the history is written.
+                read_deadline = None;
             }
         }
     }

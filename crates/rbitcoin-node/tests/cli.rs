@@ -652,6 +652,32 @@ fn esplora_max_inflight_cli_conf_and_bounds() {
 }
 
 #[test]
+fn esplora_min_drain_rate_cli_conf_and_bounds() {
+    assert_eq!(
+        ready_config(["rbitcoin-node"]).esplora_min_drain_rate,
+        rbitcoin_esplora::DEFAULT_MIN_DRAIN_RATE
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--esplora-min-drain-rate", "4096"]).esplora_min_drain_rate,
+        4096
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--esplora-min-drain-rate=65536"]).esplora_min_drain_rate,
+        65536
+    );
+    let mut c = NodeConfig::default();
+    let zero = c.apply_kv("esplora_min_drain_rate", "0").unwrap_err();
+    assert!(format!("{zero}").contains(">= 1"), "{zero}");
+    let bad = c.apply_kv("esplora_min_drain_rate", "nope").unwrap_err();
+    assert!(format!("{bad}").contains("esplora_min_drain_rate"), "{bad}");
+    assert_eq!(
+        c.esplora_min_drain_rate,
+        rbitcoin_esplora::DEFAULT_MIN_DRAIN_RATE,
+        "a refused value leaves the default"
+    );
+}
+
+#[test]
 fn sv2_tp_idle_timeout_argv_default_off() {
     use std::time::Duration;
     assert_eq!(

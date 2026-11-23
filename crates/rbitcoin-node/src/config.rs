@@ -492,6 +492,10 @@ pub struct NodeConfig {
     /// Max Esplora requests in flight across the whole listener (>= 1).
     /// Default [`rbitcoin_electrum::DEFAULT_MAX_CONNECTIONS`].
     pub esplora_max_inflight: usize,
+    /// Esplora response writes must average this many bytes per second after
+    /// the request-timeout grace (>= 1). Default
+    /// [`rbitcoin_esplora::DEFAULT_MIN_DRAIN_RATE`].
+    pub esplora_min_drain_rate: u64,
     /// `--store-read-budget`. `None` is omitted. `Some(0)` uses the formula.
     /// `Some(n)` with `n >= 1` is that many API store reads.
     pub store_read_budget: Option<usize>,
@@ -657,6 +661,7 @@ impl Default for NodeConfig {
             electrum_max_subs: rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS,
             electrum_max_sp_subs: rbitcoin_electrum::DEFAULT_MAX_SP_SUBS,
             esplora_max_inflight: rbitcoin_electrum::DEFAULT_MAX_CONNECTIONS,
+            esplora_min_drain_rate: rbitcoin_esplora::DEFAULT_MIN_DRAIN_RATE,
             store_read_budget: None,
             esplora_block_template: false,
             metrics: false,
@@ -1699,6 +1704,17 @@ impl NodeConfig {
                     )));
                 }
                 self.esplora_max_inflight = n;
+            }
+            "esplora_min_drain_rate" => {
+                let n: u64 = val
+                    .parse()
+                    .map_err(|e| NodeError::Config(format!("conf esplora_min_drain_rate: {e}")))?;
+                if n == 0 {
+                    return Err(NodeError::Config(
+                        "conf esplora_min_drain_rate must be >= 1".into(),
+                    ));
+                }
+                self.esplora_min_drain_rate = n;
             }
             "esplora_block_template" => {
                 self.esplora_block_template = conf_bool("esplora_block_template", val)?

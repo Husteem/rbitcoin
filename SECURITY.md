@@ -80,7 +80,10 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   TCP connection is closed.
   A connection that never sends headers is closed at the idle timeout. A
   response write that makes no progress is cancelled at the request timeout,
-  so a client that stops reading cannot hold its socket. A request that finds
+  and a response whose writes spend more than that timeout plus
+  `bytes-written / --esplora-min-drain-rate` stalled time is cancelled too, so
+  neither a client that stops reading nor one that accepts a trickle can hold
+  its socket. A request that finds
   the in-flight cap full waits. That wait counts against the request timeout
   and the answer is then 408 (`admit_connection`, `TimeoutLayer`). Health,
   Esplora, Electrum, and inbound P2P leave a
