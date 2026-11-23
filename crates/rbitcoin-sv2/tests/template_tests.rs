@@ -427,7 +427,8 @@ async fn constraints_while_ibd_keep_the_last_budget() {
     let first = {
         let recv = c.recv();
         tokio::pin!(recv);
-        let held = tokio::time::timeout(Duration::from_millis(500), &mut recv).await;
+        // The cooldown is the only delayed send; three of them is quiet.
+        let held = tokio::time::timeout(3 * CONSTRAINTS_COOLDOWN_TEST, &mut recv).await;
         assert!(held.is_err(), "no template while the stale tip keeps IBD");
 
         let tip = tc.chain.tip_header().expect("tip header");
@@ -441,7 +442,7 @@ async fn constraints_while_ibd_keep_the_last_budget() {
             .expect("message")
     };
     check_template(&mut c, &tc, first, &[], true).await;
-    let extra = tokio::time::timeout(Duration::from_millis(500), c.recv()).await;
+    let extra = tokio::time::timeout(3 * CONSTRAINTS_COOLDOWN_TEST, c.recv()).await;
     assert!(extra.is_err(), "one template for the last budget");
 
     tp.shutdown().await;
@@ -901,7 +902,7 @@ async fn same_prev_hash_template_keeps_the_sent_bits() {
 async fn fee_push_after_the_interval_past_the_delta() {
     let tc = shared_regtest(3);
     mock_live_tip(&tc);
-    let interval = Duration::from_millis(250);
+    let interval = rbitcoin_sv2::MIN_TEMPLATE_INTERVAL;
     let tp = run_sv2_tp({
         let mut cfg = test_tp_config(Arc::clone(&tc.chain), [7; 32]);
         cfg.fee_delta = 1_000;
@@ -994,7 +995,7 @@ async fn fee_push_after_the_interval_past_the_delta() {
 #[tokio::test(flavor = "multi_thread")]
 async fn fee_pushes_keep_older_same_tip_templates_solvable() {
     let tc = shared_regtest(3);
-    let interval = Duration::from_millis(250);
+    let interval = rbitcoin_sv2::MIN_TEMPLATE_INTERVAL;
     let FirstTemplate {
         tp,
         mut c,
