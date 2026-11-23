@@ -1194,7 +1194,9 @@ fn prepare_and_preview_enforce_cluster_limits() {
         let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
         mp.set_cluster_limits(Some(count), Some(1)); // 1 kvB = 4_000 WU
         mp.accept_tx(&parent, &utxos, TIP_OK).unwrap();
-        mp.prepare_admit(
+        // Prepare alone refuses an over-limit child; one it admits also
+        // passes the same plan after scripts.
+        let prep = mp.prepare_admit(
             child,
             &utxos,
             TIP_OK,
@@ -1205,9 +1207,11 @@ fn prepare_and_preview_enforce_cluster_limits() {
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
             },
-        )
-        .and_then(|prep| mp.evaluate_after_script(child, prep))
-        .map(|r| r.txid)
+        )?;
+        let r = mp
+            .evaluate_after_script(child, prep)
+            .expect("prepare ran the same plan");
+        Ok::<_, AcceptError>(r.txid)
     };
     let at = pad_child(4_000);
     assert_eq!(preview(2, &at).unwrap(), at.compute_txid());

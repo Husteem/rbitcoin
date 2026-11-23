@@ -1300,10 +1300,11 @@ impl ActiveMempool {
             keep_mark: false,
             sibling_eviction,
         };
-        // Core runs `ReplacementChecks` and the cluster limits in PreChecks,
-        // before scripts. A replacement that underpays, or a tx that would
-        // overfill its cluster, costs no script verification. The commit
-        // runs the same plan again under the write lock.
+        // Core checks the cluster limits in PreChecks and runs
+        // `ReplacementChecks` right after it, both before scripts. A
+        // replacement that underpays, or a tx that would overfill its
+        // cluster, costs no script verification. The commit runs the same
+        // plan again under the write lock.
         self.plan_after_script(tx, &prep)?;
         Ok(prep)
     }
