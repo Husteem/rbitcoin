@@ -61,11 +61,19 @@ if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/n
   # Wall-clock cap: a hung instrumented test (P2P/confirm join) otherwise sits
   # until the runner's 6h default. Override: LLVM_COV_TEST_TIMEOUT=20m.
   LLVM_COV_TEST_TIMEOUT="${LLVM_COV_TEST_TIMEOUT:-12m}"
+  # The HTML tree is for a local reader. CI uploads only badge.json and
+  # crap.json, so it sets COVERAGE_HTML=0 and skips that report (about 6 s).
+  # The text and LCOV reports below run either way.
+  if [[ "${COVERAGE_HTML:-1}" == "1" ]]; then
+    REPORT_ARGS=(--html --output-dir "$ROOT/coverage")
+  else
+    REPORT_ARGS=(--no-report)
+  fi
   LLVM_COV_TEST=(
     cargo llvm-cov test --workspace --exclude rbitcoin-bench
     --ignore-filename-regex "$IGNORE"
     "${EXTRA[@]}"
-    --html --output-dir "$ROOT/coverage"
+    "${REPORT_ARGS[@]}"
   )
   echo "coverage: llvm-cov test wall ${LLVM_COV_TEST_TIMEOUT}"
   set +e

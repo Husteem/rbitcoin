@@ -348,7 +348,8 @@ they must sum to the badge `lh`/`lf`. A red PR does not publish.
 `cargo llvm-cov`'s text “Missed Lines” column can count *partial regions within
 a line* (for example match or-patterns) even when the line executed. The gate
 uses LCOV line hit/total (`LH`/`LF`). HTML remains a diagnostic report under
-`coverage/`.
+`coverage/`. CI sets `COVERAGE_HTML=0` and skips it, since it uploads only
+`badge.json` and `crap.json`.
 
 ```bash
 nix-shell
