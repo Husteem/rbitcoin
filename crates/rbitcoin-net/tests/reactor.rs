@@ -48,81 +48,63 @@ mod store_permit_drop {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod off_pool_lane {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
+    use std::thread::ThreadId;
     use std::time::{Duration, Instant};
 
-    fn off_pool_threads() -> usize {
-        let mut n = 0usize;
-        for entry in std::fs::read_dir("/proc/self/task").expect("task dir") {
-            let path = entry.expect("task").path().join("comm");
-            let Ok(comm) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if comm.trim() == "rbtc-off-pool" {
-                n += 1;
-            }
-        }
-        n
-    }
-
-    /// Eight callers blocked inside `off_pool` still share one OS thread.
+    /// Eight callers blocked inside `off_pool` still share one OS thread, and
+    /// no two jobs are inside at once.
+    ///
+    /// The jobs name the thread they ran on. A process-wide count of the
+    /// `rbtc-off-pool` comm is not the witness: an unnamed thread that a lane
+    /// job starts inherits that comm, and the other tests in this binary run
+    /// beside this one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_thread_runs_every_off_pool_job() {
-        off_pool(|| ()).await;
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-        let extra = std::thread::Builder::new()
-            .name("rbtc-off-pool".into())
-            .spawn(move || {
-                let _ = stop_rx.recv();
-            })
-            .expect("extra off-pool thread");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut named = off_pool_threads();
-        while named < 2 {
-            assert!(
-                Instant::now() < deadline,
-                "named rbtc-off-pool threads stayed at {named}"
-            );
-            tokio::task::yield_now().await;
-            named = off_pool_threads();
-        }
-        drop(stop_tx);
-        extra.join().expect("extra off-pool thread");
-        let started = Arc::new(AtomicUsize::new(0));
         let arrived = Arc::new(AtomicUsize::new(0));
+        let inside = Arc::new(AtomicUsize::new(0));
+        let most_inside = Arc::new(AtomicUsize::new(0));
+        let ran_on = Arc::new(Mutex::new(Vec::<ThreadId>::new()));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let mut tasks = Vec::new();
         for _ in 0..8 {
-            let started = Arc::clone(&started);
             let arrived = Arc::clone(&arrived);
+            let inside = Arc::clone(&inside);
+            let most_inside = Arc::clone(&most_inside);
+            let ran_on = Arc::clone(&ran_on);
             let gate = Arc::clone(&gate);
             tasks.push(tokio::spawn(async move {
                 arrived.fetch_add(1, Ordering::Release);
                 off_pool(move || {
-                    started.fetch_add(1, Ordering::Release);
+                    let now_inside = inside.fetch_add(1, Ordering::AcqRel) + 1;
+                    most_inside.fetch_max(now_inside, Ordering::AcqRel);
+                    ran_on
+                        .lock()
+                        .expect("ran_on")
+                        .push(std::thread::current().id());
                     let (lock, cv) = &*gate;
                     let mut go = lock.lock().expect("gate");
                     while !*go {
                         go = cv.wait(go).expect("gate");
                     }
+                    inside.fetch_sub(1, Ordering::AcqRel);
                 })
                 .await;
             }));
         }
         let deadline = Instant::now() + Duration::from_secs(2);
-        while arrived.load(Ordering::Acquire) < 8 {
-            assert!(Instant::now() < deadline, "off-pool callers did not start");
+        while arrived.load(Ordering::Acquire) < 8 || ran_on.lock().expect("ran_on").is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "eight off-pool callers did not reach the lane"
+            );
             tokio::task::yield_now().await;
         }
-        for _ in 0..64 {
-            tokio::task::yield_now().await;
-        }
-        let threads = off_pool_threads();
-        let running = started.load(Ordering::Acquire);
         {
             let (lock, cv) = &*gate;
             *lock.lock().expect("gate") = true;
@@ -131,13 +113,19 @@ mod off_pool_lane {
         for task in tasks {
             task.await.expect("off_pool task");
         }
+        let ran_on = ran_on.lock().expect("ran_on").clone();
+        assert_eq!(ran_on.len(), 8, "every off-pool job ran");
+        let threads: HashSet<ThreadId> = ran_on.into_iter().collect();
         assert_eq!(
-            threads, 1,
-            "rbtc-off-pool threads: {threads}, jobs inside: {running}"
+            threads.len(),
+            1,
+            "off_pool jobs ran on {} OS threads",
+            threads.len()
         );
-        assert!(
-            running < 8,
-            "each job took its own thread ({running} inside at once)"
+        let most_inside = most_inside.load(Ordering::Acquire);
+        assert_eq!(
+            most_inside, 1,
+            "{most_inside} off_pool jobs were inside at once"
         );
     }
 }
