@@ -69,6 +69,8 @@ pub mod io_session_iocp;
 #[doc(hidden)]
 pub mod io_session_pool;
 #[doc(hidden)]
+pub mod loc_table;
+#[doc(hidden)]
 pub mod open_address;
 #[doc(hidden)]
 pub mod point_table;
