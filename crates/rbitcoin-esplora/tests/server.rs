@@ -2399,6 +2399,46 @@ async fn block_template_does_not_lock_the_cache_across_template_prev() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
+/// A POST whose body has not arrived holds an upload permit, not a
+/// listener slot. With every slot's worth of stalled uploads open, a
+/// bodiless request is still served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_request_bodies_do_not_hold_listener_slots() {
+    const SLOTS: usize = 2;
+    let (_dir, q) = temp_query("stalled-bodies");
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.max_connections = SLOTS;
+    let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+    let addr = handle.local_addr;
+    let mut held = Vec::new();
+    for _ in 0..SLOTS {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 64\r\n\r\n")
+            .await
+            .unwrap();
+        held.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut get = TcpStream::connect(addr).await.unwrap();
+    get.write_all(b"GET /no-such-route HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), get.read_to_end(&mut reply))
+        .await
+        .expect("a bodiless request is served while uploads stall")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 404"),
+        "{}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert_eq!(handle.admit.holding(), 0, "stalled uploads hold no slot");
+    drop(held);
+    handle.shutdown().await;
+}
+
 include!("esplora_sh_journey.rs");
 include!("esplora_http_journey.rs");
 include!("blindbit_journey.rs");

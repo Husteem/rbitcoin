@@ -105,7 +105,7 @@ timeout (`TimeoutLayer`, status 408). `admit_connection` holds the wait.
 | Limit | Default | Role |
 |-------|---------|------|
 | Max connections | 256 | Concurrent Electrum TCP clients. Esplora accepts up to 8× `--esplora-max-inflight` sockets; a further socket is closed. A socket that sends no headers is closed at the idle timeout |
-| Max Esplora in flight | 256 (`--esplora-max-inflight`) | Esplora requests in flight across the listener, every route together. Further requests wait for a slot, within the request timeout (408) |
+| Max Esplora in flight | 256 (`--esplora-max-inflight`) | Esplora requests in flight across the listener, every route together. Further requests wait for a slot, within the request timeout (408). A request body is read before the request takes a slot, under its own permit (as many as slots) and a 30 s deadline (408), so a slow upload holds no slot |
 | Min Esplora drain rate | 16 KiB/s (`--esplora-min-drain-rate`) | A response write may stall for the request timeout; its total stalled time must stay under that plus bytes-written/rate. A reader that accepts a trickle is disconnected |
 | Max request line | 1 MiB | One JSON-RPC line including `\n` |
 | Idle timeout | 120 s | No complete request → disconnect |
