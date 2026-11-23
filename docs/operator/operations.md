@@ -214,10 +214,10 @@ onion requires `--proxy` or `--onion`. `--connect foo.onion:8333` is a start
 error when the v3 checksum is invalid. The peers file is `rbitcoin-peers-v2`
 (v1 IPv4/IPv6 still loads).
 
-`--listen=0` / `--no-listen` starts without a P2P TCP bind (no ISP port
-forward). `--listen-onion` still binds **127.0.0.1** (ephemeral port) and
-`ADD_ONION`s the network default P2P port (8333 / signet 38333 / …) to
-that loopback (`{datadir}/onion/p2p.priv`, 0600). Needs `--tor-control`
+`--listen=0` / `--no-listen` disables the regular P2P bind. If both the regular
+and marked binds are absent, `--listen-onion` opens an ephemeral port on `127.0.0.1`.
+Tor's `ADD_ONION` exposes the network default P2P port (8333 / signet 38333 / …).
+The key is saved at `{datadir}/onion/p2p.priv` (0600). This needs `--tor-control`
 and `--max-inbound` > 0. `--no-discover` still gossips that onion via
 `addrv2` and lists it in `getnetworkinfo.localaddresses`; it does not
 gossip `--external-ip`. `--max-inbound 0` refuses `--listen-onion`.
@@ -248,8 +248,10 @@ connections, including inbound peers on the marked listener.
 An external address without a port uses the P2P listen port. With Tor-only
 listening, a portless onion uses the network's default P2P port.
 
-Use a dedicated `listen=127.0.0.1:8334=onion` entry as the local target for
-Tor forwarding. `--listen-onion` uses it automatically when present.
+`=onion` marks the local TCP destination for Tor forwarding.
+`--listen-onion` uses the marked bind when configured. For same-host Tor,
+use `listen=127.0.0.1:8334=onion`. On a container bridge, a forwarder with
+source IP `10.0.3.1` could connect to a node using `listen=10.0.3.2:8334=onion`.
 Restrict access to the marked listener to the Tor forwarder. For a
 non-loopback bind, enforce this restriction with a firewall or network policy.
 Inbound I2P needs a separate primary P2P listener reachable at `127.0.0.1`.

@@ -968,10 +968,9 @@ impl LivePeer {
         }
     }
 
-    /// The network this link carries, which decides the one local address
-    /// it may announce. Tor and I2P inbound both arrive on the loopback
-    /// listener, so with both overlays accepting, a loopback inbound link
-    /// cannot be told apart and announces nothing.
+    /// Choose the network for self-announcements. The local bind identifies
+    /// the marked Tor listener. When Tor and I2P share a loopback listener,
+    /// the source address is ambiguous and neither address is announced.
     fn self_announce_link(&self, hub: &PeerHub) -> SelfAnnounceLink {
         let onion_bind = if self.inbound && self.net.socket_addr().is_some() {
             hub.onion_bind()
