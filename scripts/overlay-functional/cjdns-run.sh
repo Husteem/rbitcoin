@@ -14,19 +14,50 @@ SOCK="${5:?pipe socket}"
 DEV="${6:?tun dev}"
 
 echo $$ >"$PIDFILE"
+
+# CJDNS_SYSFS is a test seam so the supervisor contract can run without a
+# real TUN; production reads the kernel's net class.
+dev_up() { [[ -e "${CJDNS_SYSFS:-/sys/class/net}/$DEV" ]]; }
+# cjdroute is an angel over a core. The angel applies the config and calls
+# Security_setupComplete; `cjdroute is already running` means a core still
+# holds the pipe, so a fresh angel must wait for it.
+core_gone() { ! pgrep -f "cjdroute core $SOCK" >/dev/null 2>&1; }
+
+kill_core() {
+  pkill -f "cjdroute core $SOCK" 2>/dev/null || true
+  local i
+  for i in $(seq 1 100); do
+    core_gone && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+drop_dev() {
+  local i
+  for i in $(seq 1 50); do
+    dev_up || return 0
+    sleep 0.1
+  done
+  # A killed core can leave the device behind; a fresh core would then fail
+  # to create it and hit the 20s security deadline.
+  ip link del "$DEV" 2>/dev/null || true
+  for i in $(seq 1 50); do
+    dev_up || return 0
+    sleep 0.1
+  done
+  return 1
+}
+
 child=0
 stop() {
   if [[ "$child" -ne 0 ]]; then
     kill -TERM "$child" 2>/dev/null || true
   fi
+  kill_core || true
   exit 0
 }
 trap stop TERM INT
-
-dev_up() { [[ -e "/sys/class/net/$DEV" ]]; }
-# cjdroute is an angel over a core. `cjdroute is already running` means a
-# core still holds the pipe, so a fresh angel must wait for it.
-core_gone() { ! pgrep -f "cjdroute core $SOCK" >/dev/null 2>&1; }
 
 while :; do
   "$BIN" --nobg <"$CONF" >>"$LOG" 2>&1 &
@@ -34,32 +65,18 @@ while :; do
   wait "$child"
   status=$?
   echo "cjdns: cjdroute exited $status — restarting" >>"$LOG"
-  # The angel can die alone; its core keeps the device and the pipe. Keep
-  # that survivor: a fresh angel would abort as "already running". A core
-  # left stuck in startup (no device) is killed so the pair comes back.
-  for _ in $(seq 1 50); do
-    core_gone && break
-    dev_up || break
-    sleep 0.1
-  done
-  if ! core_gone && dev_up; then
-    echo "cjdns: core still serves $DEV; keeping it" >>"$LOG"
-    exit 0
-  fi
+  # Never exit while the daemon is down: this loop is the only thing that
+  # brings the TUN back. The angel can die alone and leave its core (and the
+  # device) behind. That core is unmanaged: it exits 232 at the 20s security
+  # deadline, and the old "keeping it" exit here left a dead TUN behind.
+  # Take the orphan down with the angel, clear the device, start a fresh
+  # pair on the same address.
   if ! core_gone; then
-    pkill -f "cjdroute core $SOCK" 2>/dev/null || true
-    for _ in $(seq 1 100); do
-      core_gone && break
-      sleep 0.1
-    done
+    echo "cjdns: killing the core the angel left behind" >>"$LOG"
+    kill_core || true
   fi
-  for _ in $(seq 1 100); do
-    dev_up || break
-    sleep 0.1
-  done
-  if dev_up; then
-    echo "cjdns: $DEV held with no core; keeping it" >>"$LOG"
-    exit 0
+  if ! drop_dev; then
+    echo "cjdns: $DEV still present after the core exited" >>"$LOG"
   fi
   rm -f "$SOCK"
   sleep 0.2

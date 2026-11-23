@@ -69,5 +69,76 @@ assert_ok cjdns_supervisor_restarts_crashed_core test "$runs" -ge 2
 assert_ok cjdns_supervisor_logs_crash grep -q 'cjdroute exited 7' "$tmp/log"
 assert_ok cjdns_supervisor_owns_pidfile test -s "$tmp/supervisor.pid"
 
+# The angel applies the config and calls Security_setupComplete. It can die
+# alone and leave the core (and the TUN) behind; that core then exits 232 at
+# the 20s security deadline. The old supervisor called the survivor healthy,
+# exited, and left the TUN dead with no one to restart it. The supervisor
+# must own the pair: take the orphan core down and start again.
+tmp2="$(mktemp -d /tmp/rbtc-cjdns-orphan.XXXXXX)"
+trap 'rm -rf "$tmp" "$tmp2"' EXIT
+# The name is real so the old supervisor sees "the TUN is up"; the fake
+# sysfs tree and ip make sure neither this test nor a broken supervisor can
+# touch the host's loopback.
+dev="lo"
+mkdir -p "$tmp2/sysfs" "$tmp2/bin"
+: >"$tmp2/sysfs/$dev"
+printf '#!/usr/bin/env bash\necho "unexpected ip $*" >&2\nexit 1\n' >"$tmp2/bin/ip"
+chmod +x "$tmp2/bin/ip"
+cat >"$tmp2/cjdroute" <<'FAKE'
+#!/usr/bin/env bash
+echo run >>"$CJDNS_TEST_COUNT"
+# Stand in for the core the angel leaves behind: argv[0] is what the
+# supervisor's pgrep looks for, and TERM simulates the TUN going away.
+# cjdroute is called with only --nobg, so the socket and device come in
+# through the test's environment, not argv.
+(
+  exec -a "cjdroute core $CJDNS_TEST_SOCK" bash -c '
+    dev="$1"
+    sysfs="$2"
+    trap "rm -f \"$sysfs/$dev\"; exit 0" TERM
+    while :; do sleep 0.2; done
+  ' _ "$CJDNS_TEST_DEV" "$CJDNS_TEST_SYSFS"
+) &
+exit 0
+FAKE
+chmod +x "$tmp2/cjdroute"
+: >"$tmp2/conf"
+CJDNS_TEST_COUNT="$tmp2/count" CJDNS_TEST_SYSFS="$tmp2/sysfs" \
+CJDNS_TEST_SOCK="$tmp2/pipe.sock" CJDNS_TEST_DEV="$dev" \
+CJDNS_SYSFS="$tmp2/sysfs" PATH="$tmp2/bin:$PATH" \
+  "$ROOT/scripts/overlay-functional/cjdns-run.sh" \
+  "$tmp2/cjdroute" "$tmp2/conf" "$tmp2/log" "$tmp2/supervisor.pid" \
+  "$tmp2/pipe.sock" "$dev" &
+sup2=$!
+# The old supervisor needs its 5s survivor gate before it exits, so give the
+# new one time to notice the orphan and start a second pair.
+for _ in $(seq 1 100); do
+  runs=0
+  if [[ -f "$tmp2/count" ]]; then runs="$(wc -l <"$tmp2/count")"; fi
+  if [[ "$runs" -ge 2 ]]; then break; fi
+  if ! kill -0 "$sup2" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+runs=0
+if [[ -f "$tmp2/count" ]]; then runs="$(wc -l <"$tmp2/count")"; fi
+alive=no
+kill -0 "$sup2" 2>/dev/null && alive=yes
+kill "$sup2" 2>/dev/null || true
+wait "$sup2" 2>/dev/null || true
+pkill -f "^cjdroute core $tmp2/pipe.sock" 2>/dev/null || true
+assert_ok cjdns_supervisor_restarts_after_orphan_core test "$runs" -ge 2
+assert_ok cjdns_supervisor_does_not_exit_on_orphan_core test "$alive" = yes
+assert_ok cjdns_supervisor_logs_orphan_kill grep -q 'killing the core the angel left behind' "$tmp2/log"
+assert_ok cjdns_supervisor_stops_orphan_core \
+  bash -c '! pgrep -f "^cjdroute core $1" >/dev/null' _ "$tmp2/pipe.sock"
+
+# The supervisor's TUN gate is a script the runner calls before every
+# journey, so a dead TUN fails the harness with the daemon logs instead of
+# panicking inside a journey that means to bind the address.
+assert_ok tun_up_accepts_live_address \
+  "$ROOT/scripts/overlay-functional/cjdns-tun-up.sh" --timeout 2 ::1
+assert_fail_quiet tun_up_reports_dead_address \
+  "$ROOT/scripts/overlay-functional/cjdns-tun-up.sh" --timeout 1 fd00:dead:beef::1
+
 echo "$PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

@@ -135,11 +135,23 @@ echo "overlay-functional: TOR_SOCKS=$OVERLAY_TOR_SOCKS TOR_CONTROL=$OVERLAY_TOR_
 echo "overlay-functional: I2P_SAM=$OVERLAY_I2P_SAM I2P_SAM_B=$OVERLAY_I2P_SAM_B" >&2
 echo "overlay-functional: CJDNS_A=$OVERLAY_CJDNS_A CJDNS_B=$OVERLAY_CJDNS_B" >&2
 
+# A daemon can die between journeys (the runner's cjdns does). Do not hand a
+# dead TUN to a test that means to bind it: wait for the supervisor to bring
+# the addresses back, then fail the harness here with the daemon logs.
+cjdns_tun_up() {
+  if ! "$HERE/cjdns-tun-up.sh" --timeout 30 "$OVERLAY_CJDNS_A" "$OVERLAY_CJDNS_B"; then
+    echo "overlay-functional: cjdns TUN not ready before a journey" >&2
+    exit 1
+  fi
+}
+
 if [[ "$#" -gt 0 ]]; then
+  cjdns_tun_up
   cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --test-threads=1 "$@"
 else
   skips=()
   for name in "${LIST_NAMES[@]}"; do
+    cjdns_tun_up
     cargo test -p rbitcoin-test --features overlay --test overlay -- --quiet --exact "$name"
     skips+=(--skip "$name")
   done

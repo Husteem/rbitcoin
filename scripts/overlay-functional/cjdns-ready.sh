@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="${1:?dir}"
 IPV6_A="$(cat "$ROOT/a.ipv6")"
 IPV6_B="$(cat "$ROOT/b.ipv6")"
@@ -74,24 +75,7 @@ done
 # again so the journeys never get a dead TUN. A crash loop never settles
 # and fails here, with the log.
 sleep 2
-python3 - "$IPV6_A" "$IPV6_B" <<'PY'
-import socket, sys, time
-end = time.time() + 15
-last = ""
-while time.time() < end:
-    live = 0
-    for ip in sys.argv[1:]:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        try:
-            s.bind((ip, 0))
-            live += 1
-        except OSError as e:
-            last = f"{ip}: {e}"
-        finally:
-            s.close()
-    if live == len(sys.argv) - 1:
-        sys.exit(0)
-    time.sleep(0.5)
-print(f"cjdns: TUN still dead after supervisor restart: {last}", file=sys.stderr)
-sys.exit(1)
-PY
+if ! bash "$HERE/cjdns-tun-up.sh" --timeout 15 "$IPV6_A" "$IPV6_B"; then
+  echo "cjdns: TUN still dead after supervisor restart" >&2
+  exit 1
+fi
