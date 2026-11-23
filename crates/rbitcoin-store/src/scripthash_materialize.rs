@@ -461,11 +461,6 @@ pub fn keys_map_estimated_bytes(map: &Key16PackMap) -> u64 {
 }
 
 #[doc(hidden)]
-pub fn keys_maps_estimated_bytes(maps: &[Key16PackMap]) -> u64 {
-    maps.iter().map(keys_map_estimated_bytes).sum()
-}
-
-#[doc(hidden)]
 pub fn largest_keys_shard(maps: &[Key16PackMap]) -> Option<usize> {
     maps.iter()
         .enumerate()
@@ -923,11 +918,6 @@ impl PostPackMap {
 #[doc(hidden)]
 pub fn refuse_posts_leftover() -> StoreError {
     StoreError::Corrupt(INDEX_REFUSE_POST_LEFTOVER)
-}
-
-#[doc(hidden)]
-pub fn posts_maps_estimated_bytes(maps: &[PostPackMap]) -> u64 {
-    maps.iter().map(|m| m.estimated_bytes() as u64).sum()
 }
 
 #[doc(hidden)]

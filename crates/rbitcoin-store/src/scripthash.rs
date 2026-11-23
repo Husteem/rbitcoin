@@ -4,7 +4,6 @@
 //! paged / extent). Body slabs pack ULEB128 fk deltas; vouts expanded from
 //! Class A at query.
 
-use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
 use crate::fuse8_filter::SealedFuse8;
@@ -65,13 +64,20 @@ impl ColdProgress {
 
     pub fn store(&self, store_dir: &Path) -> Result<(), StoreError> {
         let p = Self::path(store_dir);
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // Pack workers seal shards concurrently, so each write stages under
+        // its own name; a shared `.tmp` would truncate the other writer.
+        let tmp = store_dir.join(format!(
+            "{COLD_PROGRESS_NAME}.{}.tmp",
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         let mut buf = Vec::with_capacity(36);
         buf.extend_from_slice(COLD_PROGRESS_MAGIC);
         buf.extend_from_slice(&self.next_shard.to_le_bytes());
         buf.extend_from_slice(&self.body_bump.to_le_bytes());
         buf.extend_from_slice(&self.live_count.to_le_bytes());
         buf.extend_from_slice(&self.keys_written.to_le_bytes());
-        crate::file::write_synced_tmp_rename(&p, &buf)
+        crate::file::write_synced_tmp_rename_at(&tmp, &p, &buf)
     }
 
     pub fn clear(store_dir: &Path) {
@@ -421,23 +427,7 @@ pub fn shard_pack_mark_path(base: &Path) -> PathBuf {
 
 #[doc(hidden)]
 pub fn write_shard_pack_mark(base: &Path) -> Result<(), StoreError> {
-    let p = shard_pack_mark_path(base);
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
-    }
-    let mut tmp_s = p.as_os_str().to_os_string();
-    tmp_s.push(".tmp");
-    let tmp = PathBuf::from(tmp_s);
-    std::fs::write(&tmp, [1u8]).map_err(|e| StoreError::io(&tmp, e))?;
-    {
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&tmp)
-            .map_err(|e| StoreError::io(&tmp, e))?;
-        f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
-    }
-    std::fs::rename(&tmp, &p).map_err(|e| StoreError::io(&p, e))?;
-    Ok(())
+    crate::file::write_synced_tmp_rename(&shard_pack_mark_path(base), &[1u8])
 }
 
 #[doc(hidden)]

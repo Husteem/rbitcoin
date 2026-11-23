@@ -120,24 +120,47 @@ where
     write_tmp_with(path, sync, false, write)
 }
 
+/// Write `bytes` to `tmp`, `sync_all`, then rename over `path`.
+///
+/// Use when the caller may have several writers for one `path`: each passes
+/// its own `tmp` name, so one writer cannot truncate another's staging file.
+/// `tmp` must be on the same filesystem as `path` for the rename to be atomic.
+pub fn write_synced_tmp_rename_at(tmp: &Path, path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    write_named_tmp(tmp, path, TmpSync::FileAndDir, false, |f| {
+        f.write_all(bytes).map_err(|e| StoreError::io(path, e))
+    })
+}
+
 fn write_tmp_with<F>(path: &Path, sync: TmpSync, private: bool, write: F) -> Result<(), StoreError>
 where
     F: FnOnce(&mut File) -> Result<(), StoreError>,
 {
-    let tmp = tmp_sidecar_path(path);
+    write_named_tmp(&tmp_sidecar_path(path), path, sync, private, write)
+}
+
+fn write_named_tmp<F>(
+    tmp: &Path,
+    path: &Path,
+    sync: TmpSync,
+    private: bool,
+    write: F,
+) -> Result<(), StoreError>
+where
+    F: FnOnce(&mut File) -> Result<(), StoreError>,
+{
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| StoreError::io(parent, e))?;
         }
     }
     {
-        let mut f = open_tmp(&tmp, private).map_err(|e| StoreError::io(&tmp, e))?;
+        let mut f = open_tmp(tmp, private).map_err(|e| StoreError::io(tmp, e))?;
         write(&mut f)?;
         if sync != TmpSync::None {
-            f.durable_sync_all().map_err(|e| StoreError::io(&tmp, e))?;
+            f.durable_sync_all().map_err(|e| StoreError::io(tmp, e))?;
         }
     }
-    std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
+    std::fs::rename(tmp, path).map_err(|e| StoreError::io(path, e))?;
     if sync == TmpSync::FileAndDir {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
