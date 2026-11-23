@@ -1395,25 +1395,29 @@ async fn published_tip_wakes_waitfornewblock(
     assert!(body["result"]["height"].as_u64().unwrap() >= 1, "{body}");
 }
 
-/// Unauthenticated TCP sockets that fill every TCP connection slot do not
-/// lock out the unix socket, and a 401 closes its connection instead of
-/// keeping the slot.
+/// A 401 closes its connection, so an unauthenticated client does not keep
+/// a connection slot with keep-alive.
 #[tokio::test]
-async fn unauthenticated_tcp_cannot_hold_the_unix_socket_slots() {
+async fn unauthorized_reply_closes_the_connection() {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = rbitcoin_store::testutil::TempDir::for_socket().expect("dir");
     let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
-    let socket_path = cfg!(unix).then(|| dir.join("rpc.sock"));
-    let mut cfg = regtest_rpc(dir.path());
-    cfg.socket_path = socket_path.clone();
-    let handle = run_rpc(cfg, Arc::new(q), None, None, None, None, None)
+    let handle = run_rpc(
+        regtest_rpc(dir.path()),
+        Arc::new(q),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let request = br#"{"jsonrpc":"1.0","id":1,"method":"uptime"}"#;
+    let mut denied = tokio::net::TcpStream::connect(tcp_addr(&handle))
         .await
         .unwrap();
-    let addr = tcp_addr(&handle);
-    let request = br#"{"jsonrpc":"1.0","id":1,"method":"uptime"}"#;
-
-    let mut denied = tokio::net::TcpStream::connect(addr).await.unwrap();
     denied
         .write_all(
             format!(
@@ -1432,39 +1436,6 @@ async fn unauthenticated_tcp_cannot_hold_the_unix_socket_slots() {
         .unwrap();
     let reply = String::from_utf8_lossy(&reply);
     assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
-
-    let mut held = Vec::with_capacity(RPC_MAX_CONNECTIONS);
-    for _ in 0..RPC_MAX_CONNECTIONS {
-        held.push(tokio::net::TcpStream::connect(addr).await.unwrap());
-    }
-    let mut extra = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let mut buf = [0u8; 8];
-    let read = tokio::time::timeout(Duration::from_secs(2), extra.read(&mut buf)).await;
-    assert!(
-        matches!(read, Ok(Ok(0)) | Ok(Err(_))),
-        "every TCP slot is held, got {read:?}"
-    );
-    #[cfg(unix)]
-    {
-        let mut socket = tokio::net::UnixStream::connect(socket_path.unwrap())
-            .await
-            .unwrap();
-        socket
-            .write_all(
-                format!(
-                    "POST / HTTP/1.1\r\nHost: rpc\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                    request.len()
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        socket.write_all(request).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), read_keepalive_reply(&mut socket))
-            .await
-            .expect("the unix socket answers while TCP is full");
-    }
-    drop(held);
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1522,6 +1493,27 @@ async fn stalled_rpc_connections_expire_and_free_capacity() {
         "an accept past the cap must be dropped, got {read:?}"
     );
     drop(extra);
+    // Every TCP slot is held. The unix socket has its own and still answers.
+    #[cfg(unix)]
+    {
+        let mut socket = tokio::net::UnixStream::connect(socket_path.as_ref().unwrap())
+            .await
+            .unwrap();
+        socket
+            .write_all(
+                format!(
+                    "POST / HTTP/1.1\r\nHost: rpc\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    request.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(request).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), read_keepalive_reply(&mut socket))
+            .await
+            .expect("the unix socket answers while TCP is full");
+    }
     tokio::time::sleep(Duration::from_millis(50)).await;
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(31)).await;
