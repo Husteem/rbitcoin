@@ -4,6 +4,7 @@ mod frontier_competing;
 mod frontier_replay;
 mod ibd;
 mod ibd_smoke;
+mod peer_header_sync_journey;
 
 /// Mine through [`rbitcoin_net::chain::ChainHub::generate_to_script_for_rpc_async`],
 /// the path RPC `generate*` ships. The task runs on a suite runtime and the

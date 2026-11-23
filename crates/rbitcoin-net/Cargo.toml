@@ -43,7 +43,6 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
-rbitcoin-ibd = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(unix)'.dev-dependencies]

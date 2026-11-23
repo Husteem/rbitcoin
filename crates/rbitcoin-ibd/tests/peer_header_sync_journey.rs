@@ -4,20 +4,23 @@
 
 use rbitcoin_ibd::ibd::{
     apply_confirm_reject, apply_headers_event, assign_work_ordered, candidate_tip, candidate_work,
-    drain_ready_peer_and_body_events, forget_walk_peer, header_poll,
-    header_status_view, install_origin, load_origin, log_progress_tick, need_ready_headroom,
-    note_block_inv, note_reservation, origin_input, read_progress_published,
-    send_getheaders, settle_walk_peer, take_header_ask,
-    solicit_track, spawn_header_thread, AssignDepth, ConfirmRejectClass, GetdataWire, HeaderPoll,
-    HeaderPollIn, IbdWorkState, LoopStats, PeerCmd, PeerEvent, PeerSlot, RejectParent, StatusClock,
-    StatusSnap, ORDERED_HEADERS_SOFT_CAP,
+    drain_ready_peer_and_body_events, forget_walk_peer, header_poll, header_status_view,
+    install_origin, load_origin, log_progress_tick, need_ready_headroom, note_block_inv,
+    note_reservation, origin_input, read_progress_published, send_getheaders, settle_walk_peer,
+    solicit_track, spawn_header_thread, take_header_ask, AssignDepth, ConfirmRejectClass,
+    GetdataWire, HeaderPoll, HeaderPollIn, IbdWorkState, LoopStats, PeerCmd, PeerEvent, PeerSlot,
+    RejectParent, StatusClock, StatusSnap, ORDERED_HEADERS_SOFT_CAP,
 };
 
 use bitcoin::block::Header;
-use bitcoin::{CompactTarget, TxMerkleNode};
-use std::sync::atomic::AtomicU64;
-use std::sync::Mutex;
+use bitcoin::hashes::Hash;
+use bitcoin::{BlockHash, CompactTarget, TxMerkleNode};
+use rbitcoin_net::seeds::AddrMan;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::sync::mpsc;
 
 fn mine(prev: BlockHash, n: u32) -> Header {
     let mut h = Header {
@@ -85,7 +88,12 @@ fn slot(id: usize, height: u32) -> (PeerSlot, mpsc::UnboundedReceiver<PeerCmd>) 
     slot_at(id, Ipv4Addr::new(10, 9, 0, id as u8), height)
 }
 
-fn hub_pair(label: &str) -> (rbitcoin_query::testutil::TempDir, rbitcoin_net::chain::ChainHub) {
+fn hub_pair(
+    label: &str,
+) -> (
+    rbitcoin_query::testutil::TempDir,
+    rbitcoin_net::chain::ChainHub,
+) {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled(label);
     hub.ensure_genesis().unwrap();
     (dir, hub)
@@ -169,7 +177,10 @@ fn status_line(st: &IbdWorkState, hub: &rbitcoin_net::chain::ChainHub) -> String
     );
     let logs = rbitcoin_log::take_logs();
     rbitcoin_log::capture_logs(false);
-    logs.into_iter().map(|(_, msg)| msg).collect::<Vec<_>>().join("\n")
+    logs.into_iter()
+        .map(|(_, msg)| msg)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn plant_origin(st: &mut IbdWorkState, hub: &rbitcoin_net::chain::ChainHub) {
@@ -322,7 +333,10 @@ fn an_empty_queue_below_the_walk_asks_and_does_not_latch() {
     st.slots[0].peer_height = 0;
     st.max_ordered_height = 0;
     drive_poll(&mut st, &hub, poll_in(0, false, 0, 10, 0));
-    assert!(!st.headers_done, "a walk above the stored path is not caught up");
+    assert!(
+        !st.headers_done,
+        "a walk above the stored path is not caught up"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -816,11 +830,7 @@ fn forgetting_a_different_peer_keeps_the_challenge() {
     let (mut other, mut other_rx) = slot(1, 100_000);
     other.first_data_ms = 2;
     other.connected_ms = 1;
-    let mut st = IbdWorkState::new(
-        vec![challenged, other],
-        hub.tip_hash(),
-        hub.tip_height(),
-    );
+    let mut st = IbdWorkState::new(vec![challenged, other], hub.tip_hash(), hub.tip_height());
     plant_origin(&mut st, &hub);
     note_block_inv(&mut st, 0);
     forget_walk_peer(&mut st, 1);
@@ -992,11 +1002,7 @@ fn forgetting_another_peer_keeps_the_reservation() {
 
 /// Judge one answered challenge, then the next getheaders shows who is still
 /// on the walk.
-fn judge_challenge(
-    label: &str,
-    tip_before: Option<BlockHash>,
-    work_before: [u8; 32],
-) {
+fn judge_challenge(label: &str, tip_before: Option<BlockHash>, work_before: [u8; 32]) {
     let (dir, hub) = hub_pair(label);
     let (mut fast, mut fast_rx) = slot(0, 100_000);
     fast.first_data_ms = 2;
@@ -1013,7 +1019,10 @@ fn judge_challenge(
         took_getheaders(&mut slow_rx),
         "a challenge reply that does not beat the candidate asks the other peer"
     );
-    assert!(fast_rx.try_recv().is_err(), "the challenged peer is retired");
+    assert!(
+        fast_rx.try_recv().is_err(),
+        "the challenged peer is retired"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1082,7 +1091,10 @@ fn forgetting_another_peer_keeps_the_open_challenge() {
         took_getheaders(&mut slow_rx),
         "forgetting a different peer keeps the open challenge on its sender"
     );
-    assert!(fast_rx.try_recv().is_err(), "the challenged peer is retired");
+    assert!(
+        fast_rx.try_recv().is_err(),
+        "the challenged peer is retired"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1143,18 +1155,31 @@ fn a_fork_retarget_uses_the_challenger_period() {
     let genesis = hub.header_of(&gen_hash).unwrap();
     plant_origin(&mut st, &hub);
     fill_soft_queue(&mut st);
-    assert_eq!(hub.best_header_height(), 0, "peer height is not a local header");
+    assert_eq!(
+        hub.best_header_height(),
+        0,
+        "peer height is not a local header"
+    );
     let main_a = extend_chain(&hub, &genesis, &[], 20, 1);
     let main_b = extend_chain(&hub, &genesis, &main_a, 10, 1);
     assert!(send_getheaders(&mut st, &hub).unwrap());
-    assert!(took_getheaders(&mut rx), "the look-ahead ask goes to the peer");
+    assert!(
+        took_getheaders(&mut rx),
+        "the look-ahead ask goes to the peer"
+    );
     apply_headers_event(&mut st, &hub, 0, main_a.clone());
     assert!(st.slots[0].alive, "the first look-ahead window is accepted");
     assert_eq!(hub.best_header_height(), 20);
     assert!(send_getheaders(&mut st, &hub).unwrap());
-    assert!(took_getheaders(&mut rx), "the next look-ahead ask goes to the peer");
+    assert!(
+        took_getheaders(&mut rx),
+        "the next look-ahead ask goes to the peer"
+    );
     apply_headers_event(&mut st, &hub, 0, main_b);
-    assert!(st.slots[0].alive, "the second look-ahead window is accepted");
+    assert!(
+        st.slots[0].alive,
+        "the second look-ahead window is accepted"
+    );
     assert_eq!(hub.best_header_height(), 30);
     // The download path names a different header at the period height than the
     // checkpoint that opened that period. The store fallback would retarget
@@ -1232,6 +1257,9 @@ fn a_local_challenge_still_retires_a_short_reply() {
         took_getheaders(&mut slow_rx),
         "a short reply to our own block inv retires that peer"
     );
-    assert!(fast_rx.try_recv().is_err(), "the challenged peer is retired");
+    assert!(
+        fast_rx.try_recv().is_err(),
+        "the challenged peer is retired"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

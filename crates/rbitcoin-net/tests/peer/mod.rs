@@ -1,6 +1,7 @@
 use crate::Admit;
 use crate::Mine;
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
+use bitcoin::block::Header;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
@@ -25,11 +26,11 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use rbitcoin_consensus::{ChainParams, Milestone};
 
@@ -8494,7 +8495,6 @@ include!("../peer_catchup_journey.rs");
 include!("../peer_hostile_journey.rs");
 include!("../peer_tip_announce_journey.rs");
 include!("../peer_header_dos_journey.rs");
-include!("../peer_header_sync_journey.rs");
 include!("../peer_blocksonly_journey.rs");
 
 /// A headers batch and a getheaders reply must not read or write the store
