@@ -796,6 +796,72 @@ fn marked_onion_reservations_leave_the_forwarder_ip_budget_to_ordinary_tcp() {
     assert!(peers.try_reserve_incomplete(source, ordinary).is_some());
 }
 
+#[tokio::test]
+async fn marked_onion_handshake_uses_and_releases_a_shared_inbound_slot() {
+    use rbitcoin_net::chain::{tiny_regtest_hub_labeled, ChainHub};
+    use rbitcoin_net::net_permissions::NetPermTable;
+    use rbitcoin_net::peer::V2PlainSession;
+    use rbitcoin_net::peers::PeerHub;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+    use tokio::net::TcpStream;
+    use tokio::sync::{watch, Semaphore};
+    use tokio::time::timeout;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let onion = listener.local_addr().unwrap();
+    let (dir, hub) = tiny_regtest_hub_labeled("onion-shared-inbound-slot");
+    let peers = PeerHub::new();
+    peers.set_net_perms(NetPermTable {
+        onion_bind: Some(onion),
+        ..Default::default()
+    });
+    peers.set_peer_timeout_secs(10);
+    let inbound_slots = Arc::new(Semaphore::new(1));
+    let occupied = inbound_slots.try_acquire().unwrap();
+    let (stop, stop_rx) = watch::channel(false);
+    let accept = spawn_inbound_accept(
+        listener,
+        onion,
+        ChainHub::into_arc(hub),
+        Arc::clone(&peers),
+        "/rbitcoin:test-onion-slot/".into(),
+        Magic::REGTEST,
+        1,
+        Arc::clone(&inbound_slots),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Mutex::new(Vec::new())),
+        stop_rx,
+    );
+
+    let open_transport = || async {
+        let stream = TcpStream::connect(onion).await.unwrap();
+        timeout(
+            Duration::from_secs(3),
+            V2PlainSession::outbound_bip324(stream),
+        )
+        .await
+        .expect("marked listener answers within the test deadline")
+    };
+    assert!(
+        open_transport().await.is_err(),
+        "the shared slot is occupied"
+    );
+    drop(occupied);
+    let _pending = open_transport().await.expect("the shared slot is free");
+    tokio::time::pause();
+    assert_eq!(inbound_slots.available_permits(), 0, "VERSION is pending");
+    let _released = timeout(Duration::from_secs(11), inbound_slots.acquire())
+        .await
+        .expect("the handshake deadline releases the shared slot")
+        .unwrap();
+    assert!(peers.snapshot().is_empty(), "the timed-out peer is removed");
+
+    stop.send(true).unwrap();
+    accept.await.unwrap();
+    drop(dir);
+}
+
 #[test]
 fn outbound_connect_timeout_is_eight_seconds() {
     assert_eq!(OUTBOUND_CONNECT_TIMEOUT, Duration::from_secs(8));
