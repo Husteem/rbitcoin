@@ -2923,16 +2923,27 @@ fn chain_ops_legacy_sighash_budget(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     chain_ops_mine_pool_empty(ctx);
 
     let fid = fund.compute_txid();
+    // `pad` ten-byte outputs' worth of body. Each thousand past the first
+    // 300 is one 10,000-byte output (a 9,989-byte script): every hash encodes
+    // every output, so the bytes cost the same for a fraction of the work.
+    // The 300 small ones keep the output count's compact size at 3 bytes.
     let wide = |pad: usize, change_len: usize| {
+        let big = pad.saturating_sub(300) / 1_000;
+        let small = pad - 1_000 * big;
         let mut output = vec![
             TxOut {
                 value: Amount::from_sat(1_000),
                 script_pubkey: true_spk(),
             };
-            pad
+            small
         ];
+        output.extend((0..big).map(|_| TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; 9_989]),
+        }));
+        let paid = 1_000 * (small + big) as u64;
         output.push(TxOut {
-            value: Amount::from_sat(INPUTS * coin - 200_000 - 1_000 * pad as u64),
+            value: Amount::from_sat(INPUTS * coin - 200_000 - paid),
             script_pubkey: ScriptBuf::from_bytes(vec![0x51; change_len]),
         });
         Transaction {
