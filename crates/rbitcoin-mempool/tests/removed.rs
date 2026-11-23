@@ -117,6 +117,11 @@ fn a_failed_compact_does_not_bring_a_later_removal_back() {
     assert!(mp.get_tx(&txs[2].compute_txid()).is_some());
     assert!(mp.get_tx(&txs[3].compute_txid()).is_some());
 
+    // The strip's swallowed `maybe_compact` has already failed. A direct call
+    // still errors with the blocker in place, so the test cannot pass by
+    // skipping the failed install entirely.
+    assert!(mp.compact().is_err());
+
     // D still sits in its original slot, so this removal marks it DEAD.
     mp.remove_live_txids(&[txs[3].compute_txid()], BLOCK)
         .unwrap();
@@ -134,6 +139,41 @@ fn a_failed_compact_does_not_bring_a_later_removal_back() {
     let mp = ActiveMempool::open_or_create(dir.path()).unwrap();
     assert_eq!(mp.live_count(), 1);
     assert!(mp.get_tx(&txs[2].compute_txid()).is_some());
+    assert!(mp.get_tx(&txs[3].compute_txid()).is_none());
+}
+
+/// A compact whose body rename lands but whose slots rename fails has already
+/// committed the packed body. The session must follow that body: later slot
+/// writes go to `slots.tmp`, and the next open links it. Keeping the old slot
+/// file would revert every removal made after the failure.
+#[test]
+fn a_failed_slots_rename_keeps_later_removals() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(4);
+    let mut mp = ActiveMempool::open_or_create(dir.path()).unwrap();
+    let txs: Vec<_> = ops.iter().map(|op| spend(*op, 99_000)).collect();
+    for tx in &txs {
+        mp.accept_tx(tx, &utxos, TIP_OK).expect("admit");
+    }
+    mp.flush().unwrap();
+
+    // A directory at `slots` makes the second rename fail with EISDIR after
+    // the body rename has already replaced `tx.body`.
+    let slots = dir.path().join("slots");
+    fs::remove_file(&slots).unwrap();
+    fs::create_dir(&slots).unwrap();
+    assert!(mp.compact().is_err());
+
+    mp.remove_live_txids(&[txs[3].compute_txid()], BLOCK)
+        .unwrap();
+    assert!(mp.get_tx(&txs[3].compute_txid()).is_none());
+
+    fs::remove_dir(&slots).unwrap();
+    drop(mp);
+
+    let mp = ActiveMempool::open_or_create(dir.path()).unwrap();
+    assert_eq!(mp.live_count(), 3);
+    assert!(mp.get_tx(&txs[1].compute_txid()).is_some());
     assert!(mp.get_tx(&txs[3].compute_txid()).is_none());
 }
 
