@@ -32,9 +32,19 @@ pub fn load_resume_entries(
 }
 
 pub fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
-    let exclude: Vec<[u8; 32]> = st.reorg.invalid.iter().collect();
+    let exclude = resume_exclude(st);
     let path = load_resume_entries(hub, &exclude);
     install_resumed_path(st, hub, &path);
+}
+
+/// Headers the resume seed must not plant: consensus-invalid ones, and ones
+/// this session abandoned because every body copy arrived mutated. Without the
+/// second set a stale store header resurrects the abandoned tip on every
+/// reject-path reseed and the re-get loop restarts (#1811).
+pub fn resume_exclude(st: &IbdWorkState) -> Vec<[u8; 32]> {
+    let mut exclude: Vec<[u8; 32]> = st.reorg.invalid.iter().collect();
+    exclude.extend(st.unservable.iter().map(|h| h.to_byte_array()));
+    exclude
 }
 
 pub fn install_resumed_path(
@@ -184,7 +194,10 @@ pub fn plant_find_valid_child(
         tip_h.saturating_add(1)
     };
     if let Some(&cur) = st.height_to_hash.get(&expect) {
-        if !st.reorg.invalid.contains(cur.to_byte_array()) && !st.body.is_rejected(&cur) {
+        if !st.reorg.invalid.contains(cur.to_byte_array())
+            && !st.body.is_rejected(&cur)
+            && !st.unservable.contains(&cur)
+        {
             return None;
         }
     }
@@ -192,7 +205,10 @@ pub fn plant_find_valid_child(
         if ht != expect {
             continue;
         }
-        if st.reorg.invalid.contains(h.to_byte_array()) || st.body.is_rejected(&h) {
+        if st.reorg.invalid.contains(h.to_byte_array())
+            || st.body.is_rejected(&h)
+            || st.unservable.contains(&h)
+        {
             continue;
         }
         let Some(prev) = st.path_prev.get(&h).copied().or_else(|| hub.prev_of(&h)) else {
@@ -238,7 +254,10 @@ pub fn plant_commit_header(
     ht: u32,
     prev: BlockHash,
 ) -> bool {
-    if st.reorg.invalid.contains(cur.to_byte_array()) || st.body.is_rejected(&cur) {
+    if st.reorg.invalid.contains(cur.to_byte_array())
+        || st.body.is_rejected(&cur)
+        || st.unservable.contains(&cur)
+    {
         return false;
     }
     let tip = hub.tip_height().zip(hub.tip_hash());

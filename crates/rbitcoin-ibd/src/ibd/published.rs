@@ -48,7 +48,7 @@ pub fn spawn_header_thread(
                     HeaderCmd::Reseed => {
                         let exclude: Vec<[u8; 32]> = {
                             let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                            st.reorg.invalid.iter().collect()
+                            super::path::resume_exclude(&st)
                         };
                         let path = load_resume_entries(hub.as_ref(), &exclude);
                         {

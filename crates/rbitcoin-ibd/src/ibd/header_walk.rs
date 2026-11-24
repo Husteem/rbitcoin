@@ -1149,21 +1149,83 @@ pub fn refuse_invalid_linked(
     true
 }
 
+/// Forget the tip+1 equal-work siblings. They are not stored headers, so
+/// leaving them in the maps after the walk moved past their height would keep
+/// bodies for an old tip askable.
+fn forget_tip_siblings(st: &mut IbdWorkState) {
+    for h in st.tip_siblings.drain(..) {
+        st.hash_height.remove(&h);
+        st.known_headers.remove(&h);
+        st.header_fks.remove(&h);
+    }
+}
+
+/// Equal-work siblings assign may ask for at one tip. Small: each is at most
+/// one distinct body at tip+1, and a peer can announce them for free.
+pub const TIP_SIBLINGS_CAP: usize = 8;
+
 /// The block at `height` failed consensus. When the download path holds it,
 /// the path above its parent is dropped and every peer may be asked for
 /// headers again. A candidate built on it falls back to that parent.
 pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u32) {
-    let report_epoch = hub.ibd_header_epoch();
-    if !st.is_on_path(&hash, height) {
+    if !cut_walk_to_parent(st, hub, hash, height) {
         return;
     }
-    let Some(parent) = hub.header_of(&hash).map(|h| h.prev_blockhash) else {
+    // A challenger's headers are not stored, and its fork can sit below the
+    // confirmed tip. Peers are asked again from the parent, and a heavier
+    // chain comes back as headers that are stored and can be rewound onto.
+    st.header_walk.challenger = None;
+    rbitcoin_log::warn!(
+        "ibd: header candidate retired at {hash} height={height}; walk back to {:?} height={}",
+        st.header_walk.tip_hash(),
+        st.header_walk.tip_height()
+    );
+    publish_work(st, hub);
+    save_adopt(st, hub);
+}
+
+/// Abandon a header whose body only ever arrived mutated (`reject_is_mutated`)
+/// from peers IBD keeps (`-connect` / noban, so `punish_mutated_sender` cannot
+/// drop them). Without this each copy re-opens the hash, `ordered` never
+/// empties, and IBD never leaves catch-up (#1811).
+///
+/// This is not an invalidity claim: the header breaks no rule, so it is not
+/// marked failed and a later valid copy from another peer can still connect.
+/// It is only taken off the download path, and the path above its parent is
+/// re-seeded so an equal-work sibling at tip+1 can be asked for instead.
+pub fn retire_unservable(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u32) {
+    if !cut_walk_to_parent(st, hub, hash, height) {
         return;
+    }
+    rbitcoin_log::warn!(
+        "ibd: header abandoned at {hash} height={height}: every body copy arrived mutated \
+         and the sender cannot be dropped; walk back to {:?} height={}",
+        st.header_walk.tip_hash(),
+        st.header_walk.tip_height()
+    );
+    publish_work(st, hub);
+    save_adopt(st, hub);
+    // An equal-work sibling recorded at tip+1 stays askable: it keeps its
+    // height and its `tip_siblings` entry across the walk cut.
+    super::path::seed_work_path_from_store(st, hub);
+    super::path::plant_valid_tip_child(st, hub);
+}
+
+/// Drop the walk and the download path above `hash`'s parent. False when the
+/// hash is not on the path or its parent header is unknown, which leaves the
+/// caller nothing safe to cut.
+fn cut_walk_to_parent(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u32) -> bool {
+    let report_epoch = hub.ibd_header_epoch();
+    if !st.is_on_path(&hash, height) {
+        return false;
+    }
+    let Some(parent) = hub.header_of(&hash).map(|h| h.prev_blockhash) else {
+        return false;
     };
     let parent_h = height.saturating_sub(1);
     drop_dead_path(st, Some(hub.query.as_ref()), parent_h);
     if !st.header_walk.origin || st.header_walk.tip_height() < height {
-        return;
+        return false;
     }
     let tip = cut_back_to(st, hub, parent, parent_h);
     if st.header_walk.base_height > parent_h {
@@ -1186,15 +1248,7 @@ pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
     }
     recompute_witness(st);
     drop_lead_past_tip(st, hub);
-    // A challenger's headers are not stored, and its fork can sit below the
-    // confirmed tip. Peers are asked again from the parent, and a heavier
-    // chain comes back as headers that are stored and can be rewound onto.
-    st.header_walk.challenger = None;
-    rbitcoin_log::warn!(
-        "ibd: header candidate retired at {hash} height={height}; walk back to {parent} height={parent_h}"
-    );
-    publish_work(st, hub);
-    save_adopt(st, hub);
+    true
 }
 
 /// Forget the download path above `keep`: queued hashes, bodies waiting in
@@ -1376,6 +1430,24 @@ pub fn offer_alternate(
         return Some(st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP);
     }
     note_challenger(st, hub, prev, fork_height, parent, headers, peer);
+    // The walk stays first-seen, but a sibling that attaches at the walk tip
+    // is a body the announcing peer has and we never ask for. Core moves a
+    // peer's best known block on equal work (`UpdateBlockAvailability`,
+    // `nChainWork >=`), so `FindNextBlocksToDownload` asks for it. Fetch just
+    // that header's body: the announcement itself is still not written.
+    if st.header_walk.tip_height() == fork_height.saturating_add(1) {
+        if let Some(sibling) = headers.first().map(Header::block_hash) {
+            st.hash_height
+                .insert(sibling, fork_height.saturating_add(1));
+            st.known_headers.insert(sibling);
+            if !st.tip_siblings.contains(&sibling) {
+                if st.tip_siblings.len() >= TIP_SIBLINGS_CAP {
+                    st.tip_siblings.remove(0);
+                }
+                st.tip_siblings.push(sibling);
+            }
+        }
+    }
     Some(true)
 }
 
@@ -1653,6 +1725,7 @@ fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
     let Some(mut ch) = st.header_walk.challenger.take() else {
         return;
     };
+    forget_tip_siblings(st);
     if ch
         .checkpoints
         .last()
@@ -1999,6 +2072,7 @@ pub fn adopt_heavier(
     // Capture the fork's period and timestamps before the challenger is dropped.
     let mut tip = cut_back_to(st, hub, prev, fork_height);
     st.header_walk.challenger = None;
+    forget_tip_siblings(st);
     st.header_walk
         .checkpoints
         .retain(|c| c.height <= fork_height);

@@ -421,7 +421,8 @@ pub fn assign_reorg_need(
     cfg: &IbdConfig,
     alive: &[usize],
 ) -> u64 {
-    let reorg_need = st.reorg.need_getdata();
+    let mut reorg_need = st.reorg.need_getdata();
+    reorg_need.extend(st.tip_siblings.iter().copied());
     if reorg_need.is_empty() {
         return 0;
     }

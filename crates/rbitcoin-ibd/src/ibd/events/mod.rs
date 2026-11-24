@@ -549,7 +549,7 @@ pub fn run_header_batch(
         HeaderPlan::Resume => {
             let exclude: Vec<[u8; 32]> = {
                 let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                st.reorg.invalid.iter().collect()
+                super::path::resume_exclude(&st)
             };
             let path = super::path::load_resume_entries(hub, &exclude);
             {
@@ -839,6 +839,21 @@ pub fn apply_block_framed(
     }
     let header_fk = if let Some(&fk) = st.header_fks.get(&hash) {
         fk
+    } else if st.hash_height.contains_key(&hash) {
+        // An equal-work sibling is only asked for; its header was never
+        // written with the announcement. Write the header this body carries:
+        // a peer must deliver a block, not just announce one, to reach the
+        // header store.
+        match store_delivered_header(hub, &payload, hash) {
+            Some(fk) => {
+                st.header_fks.insert(hash, fk);
+                fk
+            }
+            None => {
+                st.body.mark_missing(hash);
+                return;
+            }
+        }
     } else {
         st.body.mark_missing(hash);
         return;
@@ -899,6 +914,21 @@ pub fn apply_block_framed(
     if let Some(feed) = confirm_feed {
         feed.note(height, hash);
     }
+}
+
+/// Store the header a delivered body carries, for a hash that was announced
+/// but not written (an equal-work sibling). The payload's header must hash to
+/// `hash`; the stored row is what gives the body a header fk.
+fn store_delivered_header(
+    hub: &ChainHub,
+    payload: &[u8],
+    hash: BlockHash,
+) -> Option<rbitcoin_primitives::Fk> {
+    let block = bitcoin::consensus::deserialize::<bitcoin::Block>(payload).ok()?;
+    if block.block_hash() != hash {
+        return None;
+    }
+    prepare_header_store(hub, &[block.header]).first().copied()
 }
 
 /// Undecodable wire is the sender's block. Any other store refusal stays a
@@ -1262,6 +1292,11 @@ pub fn take_confirm_events(
                 st.confirm_stuck_since = None;
                 remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                 st.body.mark_archived(hash);
+                // A valid copy arrived after all (another peer, or the same
+                // one on retry): this hash is servable and keeps its path.
+                st.unservable.remove(&hash);
+                st.mutated_copies.remove(&hash);
+                st.tip_siblings.retain(|h| *h != hash);
                 let tip = hub.tip_height().unwrap_or(0);
                 // The write recorded this height. Do not look it up: a fork
                 // promotion can drop `hash_height` first, and a header read
@@ -1467,8 +1502,21 @@ pub(crate) fn finish_deferred_archived_clear(
         // `hash` is the block that failed and `sender` sent that copy. The
         // live pending sender may be a replacement's.
         if !retry_tip_child && rbitcoin_net::chain::reject_is_mutated(err) {
-            if let Some(peer) = sender {
-                punish_mutated_sender(st, peer, hash);
+            // A dropped sender is a different peer next round, so only the
+            // copies from peers we keep count toward the abandon bound.
+            let dropped = sender.is_some_and(|peer| punish_mutated_sender(st, peer, hash));
+            // The sender is still connected (`-connect` / noban), so the hash
+            // re-opens and is asked for again on every copy. Past
+            // `MUTATED_COPIES_BEFORE_ABANDON` copies no peer we keep can serve
+            // it: stop the re-get and take the header off the path, or
+            // `ordered` never empties and IBD never leaves catch-up (#1811).
+            if !dropped && note_mutated_copy(st, hash) {
+                st.unservable.insert(hash);
+                st.body.stop_reget(hash);
+                if let Some(hub) = hub {
+                    super::header_walk::retire_unservable(st, hub, hash, height);
+                }
+                return;
             }
         }
         // A batched soft reject was isolated as a cascade. It landed here on
@@ -1645,24 +1693,51 @@ pub fn bad_prev_parent(
     }
 }
 
+/// Mutated copies of one hash before its header is abandoned. Three matches
+/// `TIP_CHILD_HALT_AFTER`: one can be a fluke, two a peer still resending the
+/// same bad copy, three means no peer IBD keeps can serve the body.
+pub const MUTATED_COPIES_BEFORE_ABANDON: u8 = 3;
+
+/// Tracked hashes with mutated copies. Bounds the map a peer can grow.
+const MUTATED_TRACK_CAP: usize = 256;
+
+/// Count one mutated body copy for `hash`. True once the abandon limit is
+/// reached (see [`MUTATED_COPIES_BEFORE_ABANDON`]).
+///
+/// Dropping a count at [`MUTATED_TRACK_CAP`] only costs retries for that
+/// hash; it can never retire a hash that has not been copied that often.
+pub fn note_mutated_copy(st: &mut IbdWorkState, hash: BlockHash) -> bool {
+    if st.mutated_copies.len() >= MUTATED_TRACK_CAP && !st.mutated_copies.contains_key(&hash) {
+        if let Some(victim) = st.mutated_copies.keys().next().copied() {
+            st.mutated_copies.remove(&victim);
+        }
+    }
+    let copies = st.mutated_copies.entry(hash).or_insert(0);
+    *copies = copies.saturating_add(1);
+    *copies >= MUTATED_COPIES_BEFORE_ABANDON
+}
+
 /// Core `MaybePunishNodeForBlock` (`BLOCK_MUTATED`): drop the sender and
 /// cool down its address so the re-get goes to another peer. Redial falls
 /// back to a cooling address when no other is dialable. A noban peer stays,
 /// and so does a manual one (`--connect`): Core `MaybeDiscourageAndDisconnect`
 /// never drops a manual peer for misbehavior.
+///
+/// False when the peer is kept (`-connect` / noban), which is the case the
+/// re-get bound in [`note_mutated_copy`] exists for.
 #[doc(hidden)]
-pub fn punish_mutated_sender(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
+pub fn punish_mutated_sender(st: &mut IbdWorkState, peer: usize, hash: BlockHash) -> bool {
     let Some((addr, conn_type)) = st
         .slots
         .iter()
         .find(|s| s.id == peer && s.alive)
         .map(|s| (s.addr, s.conn_type))
     else {
-        return;
+        return false;
     };
     if conn_type == rbitcoin_net::peers::PeerConnType::Manual {
         warn!("ibd: peer[{peer}] sent mutated block {hash}; not punishing manually connected peer");
-        return;
+        return false;
     }
     // IBD dials outbound only. A bind address only matters for inbound
     // (`-whitebind`), so the peer address fills that slot.
@@ -1673,10 +1748,11 @@ pub fn punish_mutated_sender(st: &mut IbdWorkState, peer: usize, hash: BlockHash
     });
     if noban {
         warn!("ibd: peer[{peer}] sent mutated block {hash}; not punishing noban peer");
-        return;
+        return false;
     }
     warn!("ibd: peer[{peer}] sent mutated block {hash}; dropping peer");
     disconnect_peer(st, peer);
+    true
 }
 
 fn apply_tip_child_bad_prev(
@@ -1819,6 +1895,7 @@ pub fn apply_consensus_invalid_reject(
     }
     st.body.mark_rejected(hash);
     st.reorg.invalid.mark(hash.to_byte_array());
+    st.tip_siblings.retain(|h| *h != hash);
     if let Some(h) = hub {
         // The failure goes to disk before the retired walk does: a walk saved
         // with its failure lost would resume onto the invalid chain, and

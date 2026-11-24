@@ -5225,3 +5225,35 @@ fn coord_loop_body_and_reject_apply_from_event_facts() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// #1811: re-gets for a hash whose body only arrives mutated are bounded. The
+/// first copies still report "retry", the limit reports "abandon", and the
+/// resume seed skips an abandoned hash so a stale store header cannot
+/// resurrect it on the next reject-path reseed.
+#[test]
+fn mutated_copies_are_bounded_and_abandoned_hashes_are_not_reseeded() {
+    use rbitcoin_ibd::ibd::events::{note_mutated_copy, MUTATED_COPIES_BEFORE_ABANDON};
+    use rbitcoin_ibd::ibd::path::resume_exclude;
+
+    let mut st = IbdWorkState::new(Vec::new(), None, Some(4));
+    let hash = h(0x77);
+    for _ in 1..MUTATED_COPIES_BEFORE_ABANDON {
+        assert!(
+            !note_mutated_copy(&mut st, hash),
+            "a copy below the limit must keep the hash on the retry path"
+        );
+    }
+    assert!(
+        note_mutated_copy(&mut st, hash),
+        "the limit must report the hash as unservable"
+    );
+    assert!(
+        !resume_exclude(&st).contains(&hash.to_byte_array()),
+        "an abandoned hash is not excluded before it is abandoned"
+    );
+    st.unservable.insert(hash);
+    assert!(
+        resume_exclude(&st).contains(&hash.to_byte_array()),
+        "the resume seed must not plant an abandoned header again"
+    );
+}

@@ -315,6 +315,18 @@ pub struct IbdWorkState {
     pub assign_path_lo: u32,
     /// Hashes that already produced one [`super::confirm::ConfirmRejectClass::EngineFault`].
     pub engine_fault_seen: HashSet<BlockHash>,
+    /// Mutated body copies received per hash. Bounds re-getting a hash whose
+    /// sender cannot be punished (`-connect` / noban), which would otherwise
+    /// keep IBD open forever (#1811).
+    pub mutated_copies: BlockHashMap<u8>,
+    /// Headers abandoned because every body copy arrived mutated. Retired from
+    /// the work path and never re-seeded from the store this session. The
+    /// header itself is still valid; another peer may still serve its body.
+    pub unservable: BlockHashSet,
+    /// Equal-work siblings announced at tip+1 that assign still asks for.
+    /// Their header is written when its body is delivered, not on the
+    /// announcement. Bounded like the explore lists.
+    pub tip_siblings: Vec<BlockHash>,
     /// Set when a second engine-fault hits the same hash — IBD must halt.
     pub halt: Option<String>,
     /// First time confirm rejected without tip progress (download gate timer).
@@ -435,6 +447,9 @@ impl IbdWorkState {
             densify_scan_lo: 0,
             assign_path_lo: 0,
             engine_fault_seen: HashSet::new(),
+            mutated_copies: BlockHashMap::default(),
+            unservable: BlockHashSet::default(),
+            tip_siblings: Vec::new(),
             halt: None,
             confirm_stuck_since: None,
             confirm_quiesce: ConfirmQuiesce::Live,
