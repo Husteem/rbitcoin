@@ -1004,6 +1004,116 @@ fn at(trace: &[BatchStep], step: BatchStep) -> usize {
         .unwrap_or_else(|| panic!("{step:?} missing from {trace:?}"))
 }
 
+/// A batch whose client stops reading holds a bounded amount of finished
+/// replies. Four `transaction.get` reads of a transaction whose hex is
+/// larger than `BATCH_HELD_BYTES` run in a window of four while the client
+/// reads nothing: one reply is held, the others run again at their slots,
+/// and every slot still arrives, in order.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn stalled_batch_holds_bounded_reply_bytes() {
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let (dir, q) = tmp_store();
+    let mut hash = [0u8; 32];
+    hash[0] = 0x46;
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: hash,
+        hash,
+        size: 0,
+        weight: 0,
+    };
+    let mut txid = [0u8; 32];
+    txid[31] = 0xbb;
+    let ta = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: [0u8; 32],
+            parent: rbitcoin_store::InputParent::Coinbase,
+            sequence: u32::MAX,
+            script_sig: vec![0],
+            witness: vec![],
+        }],
+        outputs: vec![OutputRecord::unspent(1, vec![0x6a; 600_000])],
+    };
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    let params = ChainParams::regtest();
+    let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    cfg.batch_window = 4;
+    let (_tip_tx, tip_rx) = broadcast::channel(4);
+    let (client, server) = tokio::io::duplex(1 << 16);
+    tokio::spawn(handle_client(
+        server,
+        "127.0.0.1:9".parse().unwrap(),
+        Arc::new(q),
+        Arc::new(cfg),
+        Arc::new(params),
+        tip_rx,
+        None,
+        ElectrumStop::new(false),
+    ));
+    let mut shown = txid;
+    shown.reverse();
+    let txid_hex = rbitcoin_primitives::hex_encode(shown);
+    let items: Vec<Value> = (0..4)
+        .map(|id| {
+            json!({"jsonrpc":"2.0","id":id,"method":"blockchain.transaction.get","params":[txid_hex]})
+        })
+        .collect();
+    let mut line = serde_json::to_string(&items).unwrap();
+    line.push('\n');
+    let mut client = BufReader::new(client);
+    let _ = take_batch_held_peak();
+    batch_trace_arm();
+    client.get_mut().write_all(line.as_bytes()).await.unwrap();
+    // Read nothing while the reads finish: the first slot's write stalls.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut reply = String::new();
+    tokio::time::timeout(Duration::from_secs(10), client.read_line(&mut reply))
+        .await
+        .expect("the batch reply")
+        .unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    let ids: Vec<Value> = reply
+        .as_array()
+        .expect("one array")
+        .iter()
+        .map(|v| v["id"].clone())
+        .collect();
+    assert_eq!(ids, [json!(0), json!(1), json!(2), json!(3)]);
+    for slot in reply.as_array().unwrap() {
+        assert!(
+            slot["result"]
+                .as_str()
+                .is_some_and(|hex| hex.len() > BATCH_HELD_BYTES),
+            "each slot is the transaction"
+        );
+    }
+    let one = reply[0]["result"].as_str().unwrap().len() + 2;
+    let peak = take_batch_held_peak();
+    assert_eq!(peak, one, "one reply held at a time");
+    // The first reply to finish is held alone, so at most three run again.
+    let trace = batch_trace_snapshot();
+    let again = trace
+        .iter()
+        .filter(|s| matches!(s, BatchStep::Again(_)))
+        .count();
+    assert!((1..=3).contains(&again), "{trace:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn batch_window_is_half_the_blocking_pool() {
     assert_eq!(batch_window(1), 1);
