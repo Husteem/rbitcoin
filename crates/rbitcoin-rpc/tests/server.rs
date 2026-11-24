@@ -1467,12 +1467,10 @@ async fn unread_rpc_reply_hits_the_write_deadline() {
     let mut head = [0u8; 12];
     client.read_exact(&mut head).await.unwrap();
     assert_eq!(&head, b"HTTP/1.1 200", "the reply started");
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), served)
-            .await
-            .is_ok(),
-        "an unread reply held the connection"
-    );
+    tokio::time::timeout(Duration::from_secs(5), served)
+        .await
+        .expect("an unread reply held the connection")
+        .expect("the server task did not panic");
     drop(client);
 
     // Reads 64 bytes every 5 ms, far below the minimum rate.
@@ -1506,12 +1504,10 @@ async fn unread_rpc_reply_hits_the_write_deadline() {
         .await
         .expect("reader")
         .expect("read task");
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), served)
-            .await
-            .is_ok(),
-        "a trickled reply held the connection"
-    );
+    tokio::time::timeout(Duration::from_secs(5), served)
+        .await
+        .expect("a trickled reply held the connection")
+        .expect("the server task did not panic");
     assert!(
         total > 0 && total < BODY,
         "the trickled reply was not cut mid-way: {total} bytes"
