@@ -1296,7 +1296,6 @@ impl Store {
             .and_then(|(_, hit)| hit.map(|(fk, _)| fk)))
     }
 
-    /// Confirm / consensus: connected instance only.
     /// Sample-and-reset [`Self::tip_txid_lookups`].
     #[cfg(debug_assertions)]
     pub fn sample_reset_tip_txid_lookups(&self) -> u64 {
@@ -1304,6 +1303,7 @@ impl Store {
             .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Confirm / consensus: connected instance only.
     pub fn get_fk_by_txid_tip(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
         Ok(self.get_fk_by_txid_tip_height(txid)?.map(|(fk, _)| fk))
     }

@@ -868,7 +868,12 @@ pub fn write_outspends(
     nout: u32,
     view: Option<&rbitcoin_query::ChainView>,
 ) -> Result<(), rbitcoin_query::QueryError> {
-    let create = spend_create(query, txid, view)?;
+    // An empty slot list reads nothing.
+    let create = if nout == 0 {
+        None
+    } else {
+        spend_create(query, txid, view)?
+    };
     out.push(b'[');
     for vout in 0..nout {
         if vout > 0 {
@@ -902,6 +907,8 @@ fn spend_create(
     if view.is_none() {
         return Ok(None);
     }
+    // As `Query::spenders_at` resolved it: the connected instance, whether or
+    // not the tx index serves txid lookups.
     query.store().get_fk_by_txid_tip(txid)
 }
 
@@ -915,9 +922,7 @@ fn outspend_slot(
     view: Option<&rbitcoin_query::ChainView>,
 ) -> Result<Value, rbitcoin_query::QueryError> {
     if let (Some(view), Some(create)) = (view, create) {
-        let spenders = query
-            .store()
-            .spenders_at_fk(txid, create, vout, Some(view.height.0))?;
+        let spenders = query.spenders_at_fk(txid, create, vout, Some(view.height.0))?;
         if !spenders.is_empty() {
             let p = &spenders[0];
             let spend_txid = query.store().txs.body_txid(p.spending_tx_fk)?;
