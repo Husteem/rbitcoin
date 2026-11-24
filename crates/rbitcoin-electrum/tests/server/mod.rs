@@ -79,6 +79,18 @@ async fn config_helpers_and_param_parsers() {
         parse_electrum_request_line(&past_cap),
         RequestLine::BatchTooLarge
     ));
+    // Counted before parsing: a past-cap line with a malformed tail is still
+    // too large. A parse-then-count would call it a parse error.
+    let cut = format!("[{},", vec!["0"; MAX_BATCH_ITEMS + 1].join(","));
+    assert!(matches!(
+        parse_electrum_request_line(&cut),
+        RequestLine::BatchTooLarge
+    ));
+    let short_cut = "[0,0,0,";
+    assert!(matches!(
+        parse_electrum_request_line(short_cut),
+        RequestLine::Invalid
+    ));
     assert_eq!(param_i64(&json!([-1]), 0).unwrap(), -1);
     assert_eq!(param_i64(&json!(["10"]), 0).unwrap(), 10);
     assert_eq!(param_str(&json!(["hi"]), 0).unwrap(), "hi");

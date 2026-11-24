@@ -39,11 +39,11 @@ pub const PROTOCOL_ASOF: &str = "1.4.2-asof";
 pub const SERVER_VERSION: &str =
     concat!("rbitcoin-electrs ", env!("CARGO_PKG_VERSION"), " electrumx");
 
-/// One JSON-RPC request line. Junk is `None`; must not panic.
 /// Whether the top-level array in `line` has more than `max` items. Each
 /// item is skipped with [`serde::de::IgnoredAny`], so nothing is built, and
-/// the walk stops at item `max + 1`. A malformed line answers `false` and
-/// fails the full parse instead.
+/// the walk stops at item `max + 1`. Items are counted as they complete, so
+/// a line cut off after item `max + 1` is too large, not a parse error; one
+/// that fails earlier answers `false` and fails the full parse.
 fn batch_exceeds(line: &str, max: usize) -> bool {
     use serde::de::{Deserializer as _, IgnoredAny, SeqAccess, Visitor};
     struct Count<'a> {
@@ -85,6 +85,7 @@ pub enum RequestLine {
     Invalid,
 }
 
+/// One JSON-RPC request line. Must not panic on any input.
 #[doc(hidden)]
 pub fn parse_electrum_request_line(line: &str) -> RequestLine {
     if line.trim_start().starts_with('[') && batch_exceeds(line, MAX_BATCH_ITEMS) {
@@ -1085,11 +1086,6 @@ async fn answer_batch<W: AsyncWrite + Unpin>(
     if items.is_empty() {
         return writer
             .line(invalid_request(Value::Null, "empty batch"))
-            .await;
-    }
-    if items.len() > MAX_BATCH_ITEMS {
-        return writer
-            .line(invalid_request(Value::Null, "batch too large"))
             .await;
     }
     let mut out = BatchOut {
@@ -2293,7 +2289,9 @@ where
             match line {
                 Ok(Ok(Some(l))) => {
                     if !l.trim().is_empty() {
-                        if let Ok(req) = serde_json::from_str::<Value>(&l) {
+                        // The same parse as a request line, so a batch past
+                        // the cap is refused before it is built here too.
+                        if let RequestLine::Value(req) = parse_electrum_request_line(&l) {
                             let ping_id = req.get("id").cloned().unwrap_or(Value::Null);
                             if req.get("method").and_then(|m| m.as_str()) == Some("server.ping") {
                                 writer
