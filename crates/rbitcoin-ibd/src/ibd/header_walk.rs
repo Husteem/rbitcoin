@@ -1149,15 +1149,34 @@ pub fn refuse_invalid_linked(
     true
 }
 
-/// Forget the tip+1 equal-work siblings. They are not stored headers, so
-/// leaving them in the maps after the walk moved past their height would keep
-/// bodies for an old tip askable.
+/// Forget the recorded equal-work siblings the walk has passed: those below
+/// `tip_height`. A sibling at or above it is still a competitor of a header
+/// the walk holds, so it stays the next target if that header is abandoned.
+/// Rows only: a sibling still recorded keeps its height and parent.
 #[doc(hidden)]
-pub fn forget_tip_siblings(st: &mut IbdWorkState) {
+pub fn forget_tip_siblings(st: &mut IbdWorkState, tip_height: u32) {
     let siblings = std::mem::take(&mut st.tip_siblings);
     for h in siblings {
-        forget_sibling_rows(st, h);
+        if st.hash_height.get(&h).is_some_and(|ht| *ht < tip_height) {
+            forget_sibling_rows(st, h);
+        } else {
+            st.tip_siblings.push(h);
+        }
     }
+}
+
+/// Record `sibling` as a tip+1 equal-work target, evicting and forgetting the
+/// oldest when the list is full.
+#[doc(hidden)]
+pub fn record_tip_sibling(st: &mut IbdWorkState, sibling: BlockHash) {
+    if st.tip_siblings.contains(&sibling) {
+        return;
+    }
+    if st.tip_siblings.len() >= TIP_SIBLINGS_CAP {
+        let evicted = st.tip_siblings.remove(0);
+        forget_sibling_rows(st, evicted);
+    }
+    st.tip_siblings.push(sibling);
 }
 
 /// Drop the rows a tip+1 sibling occupies. It is not a stored header, so
@@ -1179,6 +1198,7 @@ pub fn forget_sibling_rows(st: &mut IbdWorkState, hash: BlockHash) {
 
 /// Equal-work siblings kept for planting at one tip. Small: each is at most
 /// one distinct header at tip+1, and a peer can announce them for free.
+#[doc(hidden)]
 pub const TIP_SIBLINGS_CAP: usize = 8;
 
 /// The block at `height` failed consensus. When the download path holds it,
@@ -1471,13 +1491,7 @@ pub fn offer_alternate(
                 .insert(sibling, fork_height.saturating_add(1));
             st.known_headers.insert(sibling);
             st.note_path_prev(sibling, prev);
-            if !st.tip_siblings.contains(&sibling) {
-                if st.tip_siblings.len() >= TIP_SIBLINGS_CAP {
-                    let evicted = st.tip_siblings.remove(0);
-                    forget_sibling_rows(st, evicted);
-                }
-                st.tip_siblings.push(sibling);
-            }
+            record_tip_sibling(st, sibling);
         }
     }
     Some(true)
@@ -1757,7 +1771,7 @@ fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
     let Some(mut ch) = st.header_walk.challenger.take() else {
         return;
     };
-    forget_tip_siblings(st);
+    forget_tip_siblings(st, ch.tip.height);
     if ch
         .checkpoints
         .last()
@@ -2104,7 +2118,6 @@ pub fn adopt_heavier(
     // Capture the fork's period and timestamps before the challenger is dropped.
     let mut tip = cut_back_to(st, hub, prev, fork_height);
     st.header_walk.challenger = None;
-    forget_tip_siblings(st);
     st.header_walk
         .checkpoints
         .retain(|c| c.height <= fork_height);
@@ -2123,6 +2136,7 @@ pub fn adopt_heavier(
         tip.work = work;
     }
     st.header_walk.tip = tip;
+    forget_tip_siblings(st, st.header_walk.tip_height());
     let supplier = peer.and_then(|id| peer_net(st, id));
     st.header_walk
         .checkpoints
@@ -2817,7 +2831,7 @@ fn extend_connected(
     }
     st.header_walk.emptied.clear();
     st.header_walk.restored_unproved = false;
-    forget_tip_siblings(st);
+    forget_tip_siblings(st, st.header_walk.tip_height());
     publish_work(st, hub);
     if adopt_checkpoint_due(
         st.header_walk.proven,

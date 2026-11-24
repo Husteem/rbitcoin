@@ -875,9 +875,7 @@ pub fn apply_block_framed(
                     fk
                 }
                 None => {
-                    let misses = st.header_write_misses.entry(hash).or_insert(0);
-                    *misses = misses.saturating_add(1);
-                    if *misses >= SIBLING_HEADER_WRITE_TRIES {
+                    if note_header_write_miss(st, hash) {
                         st.unservable.insert(hash);
                         st.body.stop_reget(hash);
                         st.tip_siblings.retain(|h| *h != hash);
@@ -1725,17 +1723,45 @@ pub fn bad_prev_parent(
 }
 
 /// Bodies for one hash whose header write produced no fk before the header is
-/// abandoned. The first body is dropped so the header thread can write the
-/// header; this only bounds a store that keeps refusing it.
-const SIBLING_HEADER_WRITE_TRIES: u8 = 4;
+/// abandoned. Bounds a store that keeps refusing the header; the hash is then
+/// dropped from the sibling lane instead of re-asked forever.
+#[doc(hidden)]
+pub const SIBLING_HEADER_WRITE_TRIES: u8 = 4;
+
+/// Tracked hashes with failed sibling header writes. Bounds the map a peer can
+/// grow.
+const HEADER_WRITE_TRACK_CAP: usize = 256;
+
+/// Count one delivered body whose header could not be written (`None` fk).
+/// True once [`SIBLING_HEADER_WRITE_TRIES`] is reached.
+#[doc(hidden)]
+pub fn note_header_write_miss(st: &mut IbdWorkState, hash: BlockHash) -> bool {
+    cap_tracked(&mut st.header_write_misses, hash, HEADER_WRITE_TRACK_CAP);
+    let misses = st.header_write_misses.entry(hash).or_insert(0);
+    *misses = misses.saturating_add(1);
+    *misses >= SIBLING_HEADER_WRITE_TRIES
+}
 
 /// Mutated copies of one hash before its header is abandoned. Three matches
 /// `TIP_CHILD_HALT_AFTER`: one can be a fluke, two a peer still resending the
-/// same bad copy, three means no peer IBD keeps can serve the body.
+/// same bad copy, three means the kept peers that answered cannot serve it
+/// (another kept peer may still have it; see #1992).
+#[doc(hidden)]
 pub const MUTATED_COPIES_BEFORE_ABANDON: u8 = 3;
 
 /// Tracked hashes with mutated copies. Bounds the map a peer can grow.
 const MUTATED_TRACK_CAP: usize = 256;
+
+/// Make room for one more count without growing past `cap`: drop an arbitrary
+/// tracked hash. A dropped count only costs that hash more retries; it can
+/// never retire a hash that has not been copied that often.
+fn cap_tracked(counts: &mut crate::ibd::state::BlockHashMap<u8>, hash: BlockHash, cap: usize) {
+    if counts.len() >= cap && !counts.contains_key(&hash) {
+        if let Some(victim) = counts.keys().next().copied() {
+            counts.remove(&victim);
+        }
+    }
+}
 
 /// Count one mutated body copy for `hash`. True once the abandon limit is
 /// reached (see [`MUTATED_COPIES_BEFORE_ABANDON`]).
@@ -1743,11 +1769,7 @@ const MUTATED_TRACK_CAP: usize = 256;
 /// Dropping a count at the tracking cap only costs retries for that hash; it
 /// can never retire a hash that has not been copied that often.
 pub fn note_mutated_copy(st: &mut IbdWorkState, hash: BlockHash) -> bool {
-    if st.mutated_copies.len() >= MUTATED_TRACK_CAP && !st.mutated_copies.contains_key(&hash) {
-        if let Some(victim) = st.mutated_copies.keys().next().copied() {
-            st.mutated_copies.remove(&victim);
-        }
-    }
+    cap_tracked(&mut st.mutated_copies, hash, MUTATED_TRACK_CAP);
     let copies = st.mutated_copies.entry(hash).or_insert(0);
     *copies = copies.saturating_add(1);
     *copies >= MUTATED_COPIES_BEFORE_ABANDON

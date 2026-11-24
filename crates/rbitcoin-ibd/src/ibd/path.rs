@@ -41,6 +41,7 @@ pub fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
 /// this session abandoned because every body copy arrived mutated. Without the
 /// second set a stale store header resurrects the abandoned tip on every
 /// reject-path reseed and the re-get loop restarts (#1811).
+#[doc(hidden)]
 pub fn resume_exclude(st: &IbdWorkState) -> Vec<[u8; 32]> {
     let mut exclude: Vec<[u8; 32]> = st.reorg.invalid.iter().collect();
     exclude.extend(st.unservable.iter().map(|h| h.to_byte_array()));

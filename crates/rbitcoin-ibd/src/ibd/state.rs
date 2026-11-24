@@ -319,9 +319,9 @@ pub struct IbdWorkState {
     /// sender cannot be punished (`-connect` / noban), which would otherwise
     /// keep IBD open forever (#1811).
     pub mutated_copies: BlockHashMap<u8>,
-    /// Bodies whose serialized header has not produced an fk yet (the header
-    /// thread writes it). Bounded so a store that keeps refusing the header
-    /// cannot re-ask for the same body forever.
+    /// Bodies whose serialized header has not produced an fk yet (the drain
+    /// writes it inline; see #1994). Bounded so a store that keeps refusing
+    /// the header cannot re-ask for the same body forever.
     pub header_write_misses: BlockHashMap<u8>,
     /// Headers abandoned because every body copy arrived mutated. Retired from
     /// the work path and never re-seeded from the store this session. The
@@ -598,6 +598,10 @@ impl IbdWorkState {
             + self.body.heap_bytes()
             + hash_table_bytes::<BlockHash, Fk>(self.header_fks.capacity())
             + hash_table_bytes::<NetAddr, Instant>(self.addr_cooldown.capacity())
+            + hash_table_bytes::<BlockHash, u8>(self.mutated_copies.capacity())
+            + hash_table_bytes::<BlockHash, u8>(self.header_write_misses.capacity())
+            + hash_table_bytes::<BlockHash, ()>(self.unservable.capacity())
+            + (self.tip_siblings.capacity() * std::mem::size_of::<BlockHash>()) as u64
     }
 
     /// True when `ordered` has piled up ghost entries (completed hashes left
@@ -703,6 +707,11 @@ impl IbdWorkState {
             self.header_fks.retain(|h, _| keep(h));
             self.path_prev.retain(|h, _| keep(h));
         }
+        // Sibling header-write misses are one per delivered body. Keep only
+        // hashes the work state still knows; the cap only bounds a burst.
+        let heights = &self.hash_height;
+        self.header_write_misses
+            .retain(|h, _| heights.contains_key(h));
     }
 }
 

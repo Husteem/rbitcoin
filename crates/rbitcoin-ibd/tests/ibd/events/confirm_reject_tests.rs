@@ -5389,32 +5389,94 @@ fn abandoning_a_planted_sibling_plants_the_next_recorded_one() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A forward walk move forgets every recorded sibling. A planted one keeps its
-/// rows (it is the path occupant); an unplanted one loses them so a late body
-/// cannot pass the fk/height gates.
+/// A forward walk move forgets the siblings it passed and keeps the ones at
+/// its new tip height: a recorded sibling at the tip height is still the next
+/// target if that tip is abandoned, while a planted one keeps its rows because
+/// it is the path occupant.
 #[test]
-fn forgetting_tip_siblings_keeps_the_planted_one() {
+fn forgetting_tip_siblings_keeps_a_sibling_at_the_new_tip_height() {
     use rbitcoin_ibd::ibd::header_walk::forget_tip_siblings;
 
     let mut st = IbdWorkState::new(Vec::new(), None, Some(3));
     let planted = h(0xb1);
-    let recorded = h(0xb2);
+    let at_tip = h(0xb2);
+    let passed = h(0xb3);
     st.record_height(planted, 4);
     st.known_headers.insert(planted);
     st.header_fks.insert(planted, rbitcoin_primitives::Fk(11));
-    st.hash_height.insert(recorded, 4);
-    st.known_headers.insert(recorded);
-    st.header_fks.insert(recorded, rbitcoin_primitives::Fk(12));
+    st.hash_height.insert(at_tip, 4);
+    st.known_headers.insert(at_tip);
+    st.header_fks.insert(at_tip, rbitcoin_primitives::Fk(12));
+    st.hash_height.insert(passed, 2);
+    st.known_headers.insert(passed);
+    st.header_fks.insert(passed, rbitcoin_primitives::Fk(13));
     st.tip_siblings.push(planted);
-    st.tip_siblings.push(recorded);
+    st.tip_siblings.push(at_tip);
+    st.tip_siblings.push(passed);
 
-    forget_tip_siblings(&mut st);
-    assert!(st.tip_siblings.is_empty());
+    forget_tip_siblings(&mut st, 4);
+
+    assert_eq!(st.tip_siblings, vec![planted, at_tip]);
     assert_eq!(st.height_to_hash.get(&4), Some(&planted));
     assert_eq!(
         st.header_fks.get(&planted),
         Some(&rbitcoin_primitives::Fk(11))
     );
-    assert!(!st.hash_height.contains_key(&recorded));
-    assert!(!st.header_fks.contains_key(&recorded));
+    assert_eq!(
+        st.header_fks.get(&at_tip),
+        Some(&rbitcoin_primitives::Fk(12)),
+        "a recorded sibling at the new tip height stays the next target"
+    );
+    assert!(!st.hash_height.contains_key(&passed));
+    assert!(!st.header_fks.contains_key(&passed));
+}
+
+/// Recording past the cap evicts the oldest sibling and forgets its rows, so a
+/// late body for it cannot pass the fk/height gates.
+#[test]
+fn recording_past_the_sibling_cap_evicts_and_forgets_the_oldest() {
+    use rbitcoin_ibd::ibd::header_walk::{record_tip_sibling, TIP_SIBLINGS_CAP};
+
+    let mut st = IbdWorkState::new(Vec::new(), None, Some(3));
+    let mut hashes = Vec::new();
+    for n in 0..TIP_SIBLINGS_CAP + 1 {
+        let hash = BlockHash::from_byte_array([n as u8 + 1; 32]);
+        st.hash_height.insert(hash, 4);
+        st.known_headers.insert(hash);
+        st.header_fks
+            .insert(hash, rbitcoin_primitives::Fk(n as u64));
+        record_tip_sibling(&mut st, hash);
+        hashes.push(hash);
+    }
+
+    assert_eq!(st.tip_siblings.len(), TIP_SIBLINGS_CAP);
+    assert!(!st.tip_siblings.contains(&hashes[0]));
+    assert!(!st.hash_height.contains_key(&hashes[0]));
+    assert!(!st.header_fks.contains_key(&hashes[0]));
+    assert!(st.tip_siblings.contains(&hashes[TIP_SIBLINGS_CAP]));
+}
+
+/// A store that keeps refusing a sibling header is bounded: the miss count
+/// stops at the limit, and the tracking map stays capped under a burst.
+#[test]
+fn sibling_header_write_misses_are_capped_and_bounded() {
+    use rbitcoin_ibd::ibd::events::{note_header_write_miss, SIBLING_HEADER_WRITE_TRIES};
+
+    let mut st = IbdWorkState::new(Vec::new(), None, Some(3));
+    let hash = h(0xc1);
+    for _ in 1..SIBLING_HEADER_WRITE_TRIES {
+        assert!(!note_header_write_miss(&mut st, hash));
+    }
+    assert!(note_header_write_miss(&mut st, hash));
+
+    for n in 0..300u32 {
+        let mut raw = [0u8; 32];
+        raw[..4].copy_from_slice(&n.to_le_bytes());
+        note_header_write_miss(&mut st, BlockHash::from_byte_array(raw));
+    }
+    assert!(
+        st.header_write_misses.len() <= 256,
+        "the miss map must stay bounded: {}",
+        st.header_write_misses.len()
+    );
 }
