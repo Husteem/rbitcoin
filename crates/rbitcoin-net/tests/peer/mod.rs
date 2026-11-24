@@ -5953,6 +5953,56 @@ async fn unknown_v2_short_id_counts_other_and_stays() {
     let _ = std::fs::remove_dir_all(&t.dir);
 }
 
+/// Made-up long-form commands all count under one `*other*` key, so a peer
+/// cannot grow `bytesrecv_per_msg` with fresh names (Core
+/// `ALL_NET_MESSAGE_TYPES`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_commands_share_one_other_key() {
+    let mut t = paused_serve("made-up-cmds", 0, &["/rbitcoin:test(madeup)/"]).await;
+    let (raw, sess) = &mut t.clients[0];
+    let id = sess.id;
+    let first_ping = loop {
+        if let NetworkMessage::Ping(n) = next_peer_msg(raw).await.unwrap() {
+            break n;
+        }
+    };
+    write_peer_msg(raw, NetworkMessage::Pong(first_ping)).await;
+    let names: [&[u8; 12]; 3] = [b"madeup000001", b"madeup000002", b"madeup000003"];
+    for name in names {
+        // Long encoding: 0, 12-byte command, then a 2-byte payload.
+        let mut contents = vec![0u8];
+        contents.extend_from_slice(name);
+        contents.extend_from_slice(&[7, 7]);
+        raw.write_contents(&contents).await.unwrap();
+    }
+    write_peer_msg(raw, NetworkMessage::Ping(9)).await;
+    let pong = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let NetworkMessage::Pong(n) = next_peer_msg(raw).await.unwrap() {
+                return n;
+            }
+        }
+    })
+    .await
+    .expect("session stays up after made-up commands");
+    assert_eq!(pong, 9);
+    let snap = t.node.peers.snapshot();
+    let row = snap.iter().find(|p| p.id == id).expect("peer row");
+    for name in ["madeup000001", "madeup000002", "madeup000003"] {
+        assert!(
+            !row.bytesrecv_per_msg.contains_key(name),
+            "{name} got its own key: {:?}",
+            row.bytesrecv_per_msg.keys().collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        row.bytesrecv_per_msg.get("*other*").copied(),
+        Some(3 * (24 + 2))
+    );
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
+
 fn getdata_msg(hashes: &[BlockHash]) -> NetworkMessage {
     NetworkMessage::GetData(hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect())
 }
