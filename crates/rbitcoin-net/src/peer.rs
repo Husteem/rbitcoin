@@ -5633,6 +5633,13 @@ fn queue_stored_header_admits(
     }
 }
 
+/// A header the store refused scores its sender unless the fault is ours or
+/// its time is only too far ahead (Core `BLOCK_TIME_FUTURE`). Callers only
+/// ask for a header path that connects to a known chain.
+fn header_reject_scores(e: &NetError) -> bool {
+    !e.is_local_fault() && !crate::chain::accept_err_is_temporary_time(e)
+}
+
 /// Persist the walk from `last`, then admit only the headers the store kept.
 fn note_stored_header_path(
     hub: &ChainHub,
@@ -5649,10 +5656,8 @@ fn note_stored_header_path(
     // Core `BLOCK_INVALID_HEADER`: a header the store refuses (bad
     // proof of work, bits, or time at or below the median) scores the peer.
     // A local fault or a stamp still in the future is not the peer's.
-    if let Err(e) = &persisted {
-        if !e.is_local_fault() && !crate::chain::accept_err_is_temporary_time(e) {
-            apply.misbehave = true;
-        }
+    if persisted.as_ref().is_err_and(header_reject_scores) {
+        apply.misbehave = true;
     }
     let stored = persisted.is_ok();
     apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
@@ -6612,12 +6617,20 @@ pub async fn on_cmpctblock(
         && work_of_header_path(hub, &follow.pending_headers, hash)
             .zip(hub.chain_work().ok())
             .is_some_and(|(announced, tip)| announced > tip);
+    let connects =
+        header_announcement_connects(hub, &follow.pending_headers, hsi.header.prev_blockhash);
     let pending = follow.pending_headers.clone();
-    // The compact block's own header is checked again on reconstruct.
-    let _ = run_header_job(hub, move |hub| {
+    let persisted = run_header_job(hub, move |hub| {
         persist_pending_header_path(hub, &pending, hash)
     })
     .await?;
+    // Core `invalid header via cmpctblock`: scored like a `headers` message.
+    // A path that does not connect yet only waits for its parent.
+    if connects && persisted.as_ref().is_err_and(header_reject_scores) {
+        follow.pending_headers.remove(&hash);
+        misbehaving(&mut follow.ban_score, session);
+        return Ok(());
+    }
     if should_stamp && header_is_stored(hub, &hash) {
         if let Some(s) = session {
             s.note_last_block_announcement();
@@ -8297,7 +8310,8 @@ fn unstored_header_path(
 /// Store the pending headers from `tip` back to the last stored one. Headers
 /// already stored were checked when they were written.
 ///
-/// `false` when a chunk is rejected. Chunks already written in this call stay.
+/// The store's error when a chunk is rejected. Chunks already written in this
+/// call stay.
 #[doc(hidden)]
 pub fn persist_pending_header_path(
     hub: &ChainHub,
