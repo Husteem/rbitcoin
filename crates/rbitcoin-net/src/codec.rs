@@ -134,9 +134,10 @@ impl FramedMessage {
 
     /// Extra bytes (after anything but a block) or an unknown command →
     /// [`NetworkMessage::Unknown`]. Oversize `headers` (`n > MAX_HEADERS_RESULTS`), oversize inv-like
-    /// messages, and a `tx` / `block` / `cmpctblock` / `blocktxn` whose
-    /// compact-size count cannot fit in the remaining bytes are
-    /// [`NetError::MessageTooLarge`] before `consensus_decode` allocates.
+    /// messages, a `tx` / `block` / `cmpctblock` / `blocktxn` whose
+    /// compact-size count cannot fit in the remaining bytes, and a
+    /// [`count_too_large`] message are [`NetError::MessageTooLarge`] before
+    /// `consensus_decode` allocates.
     pub fn try_decode(self) -> Result<RawNetworkMessage, crate::error::NetError> {
         if self.is_headers() {
             let mut sl = self.payload.as_slice();
@@ -157,6 +158,9 @@ impl FramedMessage {
             }
         }
         if let Some(n) = tx_family_too_large(&self.command, &self.payload) {
+            return Err(crate::error::NetError::MessageTooLarge(n));
+        }
+        if let Some(n) = count_too_large(&self.command, &self.payload) {
             return Err(crate::error::NetError::MessageTooLarge(n));
         }
         Ok(self.decode())
@@ -461,6 +465,37 @@ pub fn walk_cmpctblock(data: &mut &[u8]) -> Bound {
         }
     }
     Bound::Fits
+}
+
+/// Count-prefixed commands outside the tx family: the bytes before the
+/// compact-size count and the fewest bytes one item can take. An `addr`
+/// entry is a time and a 26-byte address. An `addrv2` entry is a time, a
+/// one-byte services and network id and length, no address bytes, and a
+/// port. An inventory entry is a type and a hash. A `getblocktxn` index is
+/// one compact-size byte.
+const COUNTED: [(&[u8; 12], usize, u64); 10] = [
+    (b"addr\0\0\0\0\0\0\0\0", 0, 30),
+    (b"addrv2\0\0\0\0\0\0", 0, 9),
+    (b"inv\0\0\0\0\0\0\0\0\0", 0, 36),
+    (b"getdata\0\0\0\0\0", 0, 36),
+    (b"notfound\0\0\0\0", 0, 36),
+    (b"getheaders\0\0", 4, 32),
+    (b"getblocks\0\0\0", 4, 32),
+    (b"cfheaders\0\0\0", 65, 32),
+    (b"cfcheckpt\0\0\0", 33, 32),
+    (b"getblocktxn\0", 32, 1),
+];
+
+/// `Some(count)` when an `addr`, `addrv2`, inv-like, locator, `cfheaders`,
+/// `cfcheckpt` or `getblocktxn` payload declares more items than its
+/// remaining bytes can hold. `None` lets `decode` run, including for a
+/// payload cut before its count.
+#[doc(hidden)]
+pub fn count_too_large(command: &[u8; 12], payload: &[u8]) -> Option<usize> {
+    let &(_, prefix, min_each) = COUNTED.iter().find(|(c, ..)| *c == command)?;
+    let mut data = payload.get(prefix..)?;
+    let n = read_compact_size(&mut data)?;
+    exceeds(n, min_each, data.len()).then(|| too_large_n(n))
 }
 
 /// `Some(count)` when a transaction-carrying payload declares a compact-size
