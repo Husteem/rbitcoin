@@ -6,6 +6,7 @@ mod body;
 mod cadence;
 mod confirm;
 mod dial;
+mod equal_work_sibling;
 mod events;
 mod exit;
 mod header_walk;
