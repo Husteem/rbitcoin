@@ -587,6 +587,46 @@ fn newest_page_gap_obeys_create_cap() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A block touches the script of each output it spends, not the scripts of
+/// that transaction's other outputs.
+#[test]
+fn block_touch_skips_unspent_siblings() {
+    let (dir, q) = temp_query("touch-siblings");
+    let (h0, mut cb0) = coinbase_block(0, Fk::NULL, None);
+    cb0.tx.output_count = 2;
+    cb0.outputs = vec![
+        OutputRecord::unspent(1, vec![0x56]),
+        OutputRecord::unspent(1, vec![0x55]),
+    ];
+    let parent_txid = cb0.tx.txid;
+    let prev = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let parent = q.block_tx_fks(Height(0)).unwrap()[0];
+    let (h1, cb1) = coinbase_block(1, prev, Some(h0.hash));
+    let mut spend = cb1.clone();
+    spend.tx.txid[31] = 0x5e;
+    spend.outputs = vec![OutputRecord::unspent(1, vec![0x54])];
+    spend.inputs = vec![InputRecord {
+        prev_txid: parent_txid,
+        parent: rbitcoin_store::InputParent::Prevout {
+            create_fk: parent,
+            vout: 0,
+        },
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    q.commit_class_a_only(&h1, &[cb1, spend]).unwrap();
+    q.confirm_block(Height(1), &h1.hash).unwrap();
+    let touch = q.block_touch(Height(1)).unwrap();
+    assert!(touch.touches(&script_hash(&[0x56])), "the spent output");
+    assert!(touch.touches(&script_hash(&[0x54])), "a created output");
+    assert!(
+        !touch.touches(&script_hash(&[0x55])),
+        "the parent's unspent output"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Newest-first pages stay on the page path above, at, and below the cap.
 /// Same-height order is txid, a sibling output's spend is not a row, and the
 /// page after the tip creates is the spend of an older coin.

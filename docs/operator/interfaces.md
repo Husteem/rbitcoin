@@ -75,9 +75,10 @@ Confirmed `/txs` uses join `tx_fk` (no second `tx.head`). `getblock` verbosity 1
 lists `txid.body`. Esplora `/utxo` applies the same mempool overlay as Electrum
 `listunspent`. `listunspent` loads `txid.body` only for unspent creates.
 `sh_join` with a history `to_height` skips Class A expand for creates at or
-past that exclusive bound. Electrum subscribe tip restatus intersects the SH
-posting list with the new block's tx fks and prevout `create_fk`s; a miss
-does not expand packed `txout`. Full status still runs on a hit. Each Electrum
+past that exclusive bound. Electrum subscribe tip restatus looks each
+subscribed hash up in the block's script hashes (the outputs it creates and
+spends, kept for the last 8 blocks and shared by every connection); a miss
+loads no posting list. Full status still runs on a hit. Each Electrum
 TCP connection keeps one last-scripthash join (outs + spentness) until tip
 height changes, so Casa `get_balance` → `get_history` → `listunspent` on the
 same socket pays Class A once. Not a process-global cache. Esplora REST keys
@@ -109,7 +110,7 @@ timeout (`TimeoutLayer`, status 408). `admit_connection` holds the wait.
 | Min Esplora drain rate | 16 KiB/s (`--esplora-min-drain-rate`) | A response write may stall for the request timeout; its total stalled time must stay under that plus bytes-written/rate. A reader that accepts a trickle is disconnected |
 | Max request line | 1 MiB | One JSON-RPC line including `\n` |
 | Idle timeout | 120 s | No complete request → disconnect |
-| Max scripthash subs / conn | 10000 (`--electrum-max-subs`) | Notify fan-out cap. A wallet subscribes every address up to its gap limit; each sub is ~170 B (≈0.45 GB worst case at 256 connections) plus one posting check per block against that block's shared touch set; a reorg restatuses every sub |
+| Max scripthash subs / conn | 10000 (`--electrum-max-subs`) | Notify fan-out cap. A wallet subscribes every address up to its gap limit; each sub is ~170 B (≈0.45 GB worst case at 256 connections) plus one set lookup per block in that block's shared script hashes; a reorg restatuses every sub |
 | Max silent-payment addresses / conn | 16 (`--electrum-max-sp-subs`) | Each address scans every new block with its own key, and its subscribe scans history from its start. At most 32 history scans run in the process; a subscribe past that is refused. They share three process-wide permits, 256 heights at a time. |
 | Max broadcast hex | ~8 MiB | `transaction.broadcast` hex length |
 | Max batch items | 345 | Requests in one JSON-RPC batch line; more is one `-32600`. The reply is written one slot at a time. A connection holds at most 1 MiB of finished, unwritten replies, or one reply (`BATCH_HELD_BYTES`): a read that finishes past that drops its reply and runs again at its slot, so a slow reader costs its own reads again, not RAM |

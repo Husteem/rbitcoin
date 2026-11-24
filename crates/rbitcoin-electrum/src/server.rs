@@ -2555,9 +2555,10 @@ pub fn restatus_notes(
     heights: Option<&[u32]>,
 ) -> Vec<([u8; 32], String)> {
     let mut out = Vec::new();
-    // Each height's touch set is the block's scripthashes, built once per
-    // block for every connection ([`Query::block_touch`]); a sub is checked
-    // by a set lookup. A height whose set fails to load counts as untouched.
+    // Each height's touch set is the block's scripthashes, kept for recent
+    // blocks and shared by every connection ([`Query::block_touch`]); a sub
+    // is checked by a set lookup. A height whose set fails to load counts
+    // as untouched.
     let mut touches: Option<Vec<Arc<rbitcoin_query::BlockTouch>>> = None;
     for sh in subs {
         let hit = match heights {

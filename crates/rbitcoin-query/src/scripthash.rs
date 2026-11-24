@@ -444,8 +444,8 @@ pub struct ScriptHashUtxo {
     pub create_tx_fk: rbitcoin_primitives::Fk,
 }
 
-/// Script hashes of the outputs of one block's txs and of the txs its
-/// inputs spend from ([`Query::block_touch`]).
+/// Script hashes of the outputs one block creates and spends
+/// ([`Query::block_touch`]).
 #[derive(Clone, Debug, Default)]
 pub struct BlockTouch {
     scripthashes: std::collections::HashSet<[u8; 32]>,
@@ -458,8 +458,9 @@ impl BlockTouch {
     }
 }
 
-/// Blocks whose [`BlockTouch`] [`Query::block_touch`] keeps: a tip and the
-/// heights a lagging subscriber catches up through.
+/// Blocks whose [`BlockTouch`] [`Query::block_touch`] keeps: the tip and a
+/// few heights before it. A catch-up over a longer gap reads the older
+/// blocks again.
 pub const BLOCK_TOUCH_KEEP: usize = 8;
 
 /// A kept [`BlockTouch`]: block height, block hash, set.
@@ -2126,10 +2127,11 @@ impl Query {
     /// One block's touch set, shared by every scripthash check and kept for
     /// the last [`BLOCK_TOUCH_KEEP`] blocks.
     ///
-    /// Holds the script hash of every output of every tx in the block and of
-    /// every tx an input spends from: the scripthashes whose posting list
-    /// (create fks) meets the block's tx fks or input `create_fk`s. A check is
-    /// then a set lookup, with no posting-list load per subscription.
+    /// Holds the script hash of every output the block creates and of every
+    /// output it spends: the scripthashes whose history gains a row at this
+    /// height. A check is then a set lookup, with no posting-list load per
+    /// subscription. The set grows with the block, not with the output count
+    /// of the txs it spends from.
     pub fn block_touch(&self, height: Height) -> Result<Arc<BlockTouch>, QueryError> {
         let Some((_, rec)) = self.header_at_height(height)? else {
             return Err(StoreError::NotFound);
@@ -2156,16 +2158,19 @@ impl Query {
         #[cfg(debug_assertions)]
         self.block_touch_builds
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut ids = Vec::new();
-        for fk in self.block_tx_fks(height)? {
-            ids.extend(fk.get());
-            for (create_fk, _) in self.tx_prevouts_for_fk(fk)? {
-                ids.extend(create_fk.get());
+        let fks = self.block_tx_fks(height)?;
+        let mut spent: std::collections::HashMap<Fk, Vec<u32>> = Default::default();
+        for fk in &fks {
+            for (create_fk, vout) in self.tx_prevouts_for_fk(*fk)? {
+                if !create_fk.is_null() {
+                    spent.entry(create_fk).or_default().push(vout);
+                }
             }
         }
-        ids.sort_unstable();
-        ids.dedup();
         let mut scripthashes = std::collections::HashSet::new();
+        // Every output the block's txs create, a span per run of fks.
+        let mut ids: Vec<u64> = fks.iter().filter_map(|f| f.get()).collect();
+        ids.sort_unstable();
         let mut i = 0;
         while i < ids.len() {
             let mut j = i;
@@ -2178,6 +2183,14 @@ impl Query {
                     Ok(())
                 })?;
             i = j + 1;
+        }
+        // Each input: the output it spends, not that tx's other outputs.
+        for (create_fk, mut vouts) in spent {
+            vouts.sort_unstable();
+            vouts.dedup();
+            for (_, out) in self.tx_outputs_at_fk(create_fk, &vouts)? {
+                scripthashes.insert(script_hash(&out.script));
+            }
         }
         Ok(BlockTouch { scripthashes })
     }
