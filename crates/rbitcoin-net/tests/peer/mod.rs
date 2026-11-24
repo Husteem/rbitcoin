@@ -7090,7 +7090,7 @@ fn persist_pending_path_starts_after_the_last_stored_header() {
         time += 1;
         pending.insert(prev, h);
     }
-    persist_pending_header_path(&hub, &pending, last);
+    let _ = persist_pending_header_path(&hub, &pending, last);
     assert!(hub.knows_header(&last), "the fork path is stored");
 
     let next = rbitcoin_consensus::mine_regtest_paying(
@@ -7103,7 +7103,7 @@ fn persist_pending_path_starts_after_the_last_stored_header() {
     .header;
     pending.insert(next.block_hash(), next);
     let _ = hub.take_header_contextual_checks();
-    persist_pending_header_path(&hub, &pending, next.block_hash());
+    let _ = persist_pending_header_path(&hub, &pending, next.block_hash());
     assert!(hub.knows_header(&next.block_hash()));
     assert_eq!(
         hub.take_header_contextual_checks(),

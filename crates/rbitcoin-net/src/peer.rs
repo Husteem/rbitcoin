@@ -5645,7 +5645,16 @@ fn note_stored_header_path(
 ) -> bool {
     let should_stamp =
         work_cmp == Some(std::cmp::Ordering::Greater) && !header_is_stored(hub, &last);
-    let stored = persist_pending_header_path(hub, pending, last);
+    let persisted = persist_pending_header_path(hub, pending, last);
+    // Core `BLOCK_INVALID_HEADER`: a header the store refuses (bad
+    // proof of work, bits, or time at or below the median) scores the peer.
+    // A local fault or a stamp still in the future is not the peer's.
+    if let Err(e) = &persisted {
+        if !e.is_local_fault() && !crate::chain::accept_err_is_temporary_time(e) {
+            apply.misbehave = true;
+        }
+    }
+    let stored = persisted.is_ok();
     apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
     queue_stored_header_admits(apply, hub, headers);
     apply.sync_height = Some(announced_h);
@@ -6604,7 +6613,8 @@ pub async fn on_cmpctblock(
             .zip(hub.chain_work().ok())
             .is_some_and(|(announced, tip)| announced > tip);
     let pending = follow.pending_headers.clone();
-    run_header_job(hub, move |hub| {
+    // The compact block's own header is checked again on reconstruct.
+    let _ = run_header_job(hub, move |hub| {
         persist_pending_header_path(hub, &pending, hash)
     })
     .await?;
@@ -8293,16 +8303,14 @@ pub fn persist_pending_header_path(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
-) -> bool {
+) -> Result<(), NetError> {
     let path = unstored_header_path(hub, tip, |hash| pending.get(&hash).copied());
     // One store batch. Per-header ensure walks parent heights to genesis, so a
     // full below-floor chain (thousands of headers) is quadratic.
     for chunk in path.chunks(MAX_HEADERS_RESULTS) {
-        if hub.ensure_headers_batch(chunk).is_err() {
-            return false;
-        }
+        hub.ensure_headers_batch(chunk)?;
     }
-    true
+    Ok(())
 }
 
 #[doc(hidden)]
