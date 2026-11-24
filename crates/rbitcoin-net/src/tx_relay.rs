@@ -5255,12 +5255,28 @@ impl MempoolHub {
         Arc::clone(&self.api_script_lane).acquire_owned().await.ok()
     }
 
-    /// Prepare + scripts + RBF checks, with scripts awaited on the caller.
+    /// Prepare + scripts + RBF checks, on a task the request cannot cancel:
+    /// its API lane permit is held until the scripts end, not until the
+    /// caller drops.
     pub async fn test_accept_async(
         self: &Arc<Self>,
         tx: Transaction,
     ) -> Result<AcceptResult, AcceptError> {
-        let _lane = self.api_lane().await;
+        let hub = Arc::clone(self);
+        crate::reactor::finish_join(
+            crate::reactor::spawn_with_store_budget(async move {
+                let _lane = hub.api_lane().await;
+                hub.test_accept_work(tx).await
+            })
+            .await,
+            "tx test",
+        )
+    }
+
+    async fn test_accept_work(
+        self: &Arc<Self>,
+        tx: Transaction,
+    ) -> Result<AcceptResult, AcceptError> {
         let t0 = Instant::now();
         let hub = Arc::clone(self);
         let id = tx.compute_txid();

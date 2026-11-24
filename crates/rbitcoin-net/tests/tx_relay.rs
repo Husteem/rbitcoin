@@ -6556,6 +6556,81 @@ fn api_admits_wait_on_their_script_lane() {
     });
 }
 
+/// A dropped API test keeps its lane permit until its work ends: the work
+/// runs on a task the request cannot cancel, so cancelled requests cannot
+/// run more API script work than the lane allows. Every script worker is
+/// held briefly, so the test's scripts wait while it holds its lane.
+#[test]
+fn dropped_test_accept_keeps_its_lane() {
+    use rbitcoin_consensus::script_pool;
+    use std::sync::{Condvar, Mutex};
+
+    let (_store, q, cbs) = pad_cbs(1);
+    let mp_dir = tmp();
+    let hub = Arc::new(MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap());
+    hub.set_relay_enabled(true);
+    let probed = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let gate = Arc::new((Mutex::new((0usize, false)), Condvar::new()));
+    let workers = script_pool::script_workers();
+    for _ in 0..workers {
+        let gate = Arc::clone(&gate);
+        script_pool::spawn_detached(move || {
+            let (lock, cv) = &*gate;
+            let mut g = lock.lock().unwrap();
+            g.0 += 1;
+            cv.notify_all();
+            while !g.1 {
+                g = cv.wait(g).unwrap();
+            }
+        });
+    }
+    let release = || {
+        let (lock, cv) = &*gate;
+        lock.lock().unwrap().1 = true;
+        cv.notify_all();
+    };
+    {
+        let (lock, cv) = &*gate;
+        let g = lock.lock().unwrap();
+        let (g, timeout) = cv
+            .wait_timeout_while(g, Duration::from_secs(5), |g| g.0 < workers)
+            .unwrap();
+        drop(g);
+        if timeout.timed_out() {
+            release();
+            panic!("the script workers were not all held");
+        }
+    }
+    let lane = hub.api_script_lane();
+    let all = lane.available_permits();
+    let held = rt.block_on(async {
+        let h = Arc::clone(&hub);
+        let request = tokio::spawn(async move { h.test_accept_async(probed).await });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lane.available_permits() == all && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        request.abort();
+        let _ = request.await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        lane.available_permits()
+    });
+    release();
+    assert_eq!(held, all - 1, "the dropped test still holds its lane");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while lane.available_permits() < all {
+        assert!(Instant::now() < deadline, "the test's work never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = std::fs::remove_dir_all(&mp_dir);
+}
+
 /// A script-bearing admit must finish while the one blocking thread is parked.
 #[test]
 fn script_admit_finishes_while_the_blocking_pool_is_parked() {
