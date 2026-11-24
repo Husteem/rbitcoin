@@ -147,11 +147,37 @@ async fn handshake_verack_and_addrv2(
         NetworkMessage::Verack,
     )
     .await;
+    // Core `LogDebug(BCLog::NET, ...)`: a repeated handshake message is a
+    // debug line, not an INFO line a peer can flood.
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
     assert!(
-        logs_have("ignoring redundant verack message"),
-        "redundant verack is ignored"
+        logs.iter().any(|(level, msg)| {
+            *level == rbitcoin_log::Level::Debug && msg.contains("ignoring redundant verack message")
+        }),
+        "redundant verack is a debug line: {logs:?}"
     );
     assert_eq!(follow.ban_score, 0, "redundant verack must not disconnect");
+
+    rbitcoin_log::capture_logs(true);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    push(
+        hub,
+        &out_tx,
+        &mut follow,
+        Some(sess.as_ref()),
+        NetworkMessage::Version(hostile_ver(addr)),
+    )
+    .await;
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        logs.iter().any(|(level, msg)| {
+            *level == rbitcoin_log::Level::Debug && msg.contains("redundant version message")
+        }),
+        "redundant version is a debug line: {logs:?}"
+    );
+    assert_eq!(follow.ban_score, 0, "redundant version must not disconnect");
 
     rbitcoin_log::capture_logs(true);
     push(

@@ -977,7 +977,7 @@ pub fn addrv2_message_size_log(n: usize) -> String {
 }
 
 pub fn received_addrv2_log(nbytes: usize, peer: u64) -> String {
-    format!("p2p: received: addrv2 ({nbytes} bytes) peer={peer}")
+    format!("received: addrv2 ({nbytes} bytes) peer={peer}")
 }
 
 pub fn sending_addrv2_log(nbytes: usize, peer: u64) -> String {
@@ -4257,20 +4257,23 @@ pub fn handle_peer_inventory_msg(
 }
 
 #[doc(hidden)]
+/// Core `LogDebug(BCLog::NET, ...)`: a peer can repeat this at the message
+/// rate, so it is not an INFO line.
 pub fn on_redundant_version(session: Option<&crate::peers::LivePeer>) {
     if let Some(s) = session {
-        rbitcoin_log::info!("p2p: redundant version message from peer={}", s.id);
+        rbitcoin_log::debug!(P2p, "redundant version message from peer={}", s.id);
     } else {
-        rbitcoin_log::info!("p2p: redundant version message from peer");
+        rbitcoin_log::debug!(P2p, "redundant version message from peer");
     }
 }
 
 #[doc(hidden)]
+/// Core `LogDebug(BCLog::NET, ...)`, as [`on_redundant_version`].
 pub fn on_redundant_verack(session: Option<&crate::peers::LivePeer>) {
     if let Some(s) = session {
-        rbitcoin_log::info!("p2p: ignoring redundant verack message from peer={}", s.id);
+        rbitcoin_log::debug!(P2p, "ignoring redundant verack message from peer={}", s.id);
     } else {
-        rbitcoin_log::info!("p2p: ignoring redundant verack message");
+        rbitcoin_log::debug!(P2p, "ignoring redundant verack message");
     }
 }
 
@@ -4429,15 +4432,17 @@ pub fn on_addrv2(
     list: &[bitcoin::p2p::address::AddrV2Message],
 ) -> Result<(), NetError> {
     let n = list.len();
-    let nbytes =
-        bitcoin::consensus::encode::serialize(&NetworkMessage::AddrV2(list.to_vec())).len();
-    let id = session.map(|s| s.id).unwrap_or(0);
-    rbitcoin_log::info!("{}", received_addrv2_log(nbytes, id));
+    // The count first: an oversized list is not serialized to be logged.
     if n > MAX_ADDR_TO_SEND {
         rbitcoin_log::info!("{}", addrv2_message_size_log(n));
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
+    let nbytes =
+        bitcoin::consensus::encode::serialize(&NetworkMessage::AddrV2(list.to_vec())).len();
+    let id = session.map(|s| s.id).unwrap_or(0);
+    // Core `LogDebug(BCLog::NET, "received: %s (%u bytes)")`.
+    rbitcoin_log::debug!(P2p, "{}", received_addrv2_log(nbytes, id));
     if let Some(s) = session.filter(|s| s.conn_type == crate::peers::PeerConnType::AddrFetch) {
         learn_addrfetch_reply(s, list, n);
         return Ok(());
