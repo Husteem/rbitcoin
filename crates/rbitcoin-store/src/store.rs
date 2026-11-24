@@ -1003,7 +1003,19 @@ impl Store {
         first: u64,
         last: u64,
     ) -> Result<Vec<Option<Vec<crate::input::InputEdge>>>, StoreError> {
+        #[cfg(debug_assertions)]
+        self.txs
+            .input_edge_spans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.txs.input.edges_span(first, last)
+    }
+
+    /// Sample-and-reset [`Self::input_edges_span`] reads. Debug builds only.
+    #[cfg(debug_assertions)]
+    pub fn sample_reset_input_edge_spans(&self) -> u64 {
+        self.txs
+            .input_edge_spans
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Copy parent edges onto seqsigwit records that do not store them.

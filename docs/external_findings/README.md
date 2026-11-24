@@ -96,7 +96,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [089](./089-missing-parent-verdict.md) | high | IBD halted on a block that spends an unknown txid; no verdict | fixed | `ibd_spend_of_an_unknown_txid_is_invalid`, `spend_of_a_create_the_head_lost_is_not_invalid`, `spend_of_an_unknown_txid_after_restart_is_invalid` |
 | [090](./090-getdata-serve-pause.md) | medium | Served getdata past the writer queue was dropped | fixed | `getdata_past_serve_cap_waits_for_writer`, `paused_session_still_times_out_a_silent_peer`, `paused_getdata_tail_is_served_before_the_next_getdata`, `uncounted_bodies_do_not_open_serve_slots` |
 | [092](./092-orphan-promote-stack.md) | medium | Orphan promotion recurses down the parked chain | fixed | `orphan_chain_promotes_to_the_cluster_cap`, `parked_chain_promotes_in_one_frame`, `package_inside_promote_admits_parent_orphans` |
-| [093](./093-history-window.md) | high | History catch-up scans every block in the window | fixed | `history_window_wider_than_eight_weeks_is_refused` |
+| [093](./093-history-window.md) | high | History catch-up scans every block in the window | fixed | `history_window_wider_than_eight_weeks_is_refused`, `height_window_reads_spend_slots_not_blocks` |
 | [094](./094-electrum-write-deadline.md) | high | Electrum writes have no deadline | fixed | `stalled_electrum_write_is_closed`, `stalled_scripthash_push_ends_the_connection` |
 | [095](./095-sv2-idle-deadline.md) | high | SV2 session has no idle deadline after setup | opt-in | `session_silent_after_constraints_is_dropped_at_the_idle_deadline` |
 | [096](./096-unconfirmed-rbf-input.md) | medium | Replacement may add an unconfirmed input | fixed | `replacement_unconfirmed_inputs_follow_libre_rule` |

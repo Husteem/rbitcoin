@@ -1589,58 +1589,6 @@ impl Query {
     }
 
     #[doc(hidden)]
-    pub fn spends_of_members(
-        &self,
-        members: &[Fk],
-        low: u32,
-        high: u32,
-    ) -> Result<Vec<SpendHit>, QueryError> {
-        if !self.spend_index_enabled() || members.is_empty() || low > high {
-            return Ok(Vec::new());
-        }
-        debug_assert!(
-            high.saturating_sub(low) <= MAX_HISTORY_WINDOW,
-            "block scan stays inside the history window"
-        );
-        let mut hits = Vec::new();
-        for height in (low..=high).rev() {
-            let (first, n) = self.tx_fk_span_at_height(Height(height))?;
-            if n == 0 {
-                continue;
-            }
-            let last = first.0.saturating_add(u64::from(n)).saturating_sub(1);
-            let rows = self.store.input_edges_span(first.0, last)?;
-            if rows.len() != n as usize {
-                return Err(StoreError::Corrupt("invariant: input edge span length"));
-            }
-            for (i, edges) in rows.into_iter().enumerate() {
-                let Some(edges) = edges else {
-                    continue;
-                };
-                let spender = Fk(first.0.saturating_add(i as u64));
-                for edge in edges {
-                    if edge.parent.is_null() {
-                        continue;
-                    }
-                    if members
-                        .binary_search_by_key(&edge.parent.0, |fk| fk.0)
-                        .is_err()
-                    {
-                        continue;
-                    }
-                    hits.push(SpendHit {
-                        spender,
-                        height,
-                        parent: edge.parent,
-                        vout: edge.vout,
-                    });
-                }
-            }
-        }
-        Ok(hits)
-    }
-
-    #[doc(hidden)]
     pub fn sh_matched_outs(
         &self,
         scripthash: &[u8; 32],
@@ -1685,10 +1633,10 @@ impl Query {
 
     /// Spends that can land on a newest-first page.
     ///
-    /// A gap inside [`MAX_HISTORY_WINDOW`] scans those blocks. A wider gap
-    /// reads spend slots of the page's creates and of creates below the page
-    /// bound. With no page limit to compare, every call takes the unpaged cap
-    /// and heavy turn. A spender counts only at a height inside `[low, high]`.
+    /// Reads the spend slots of the page's creates and of the creates below
+    /// the page bound: work per create, not per block of the gap. With no
+    /// page limit to compare, every call takes the unpaged cap and heavy
+    /// turn. A spender counts only at a height inside `[low, high]`.
     #[doc(hidden)]
     pub fn spends_for_newest_page(
         &self,
@@ -1722,9 +1670,6 @@ impl Query {
             return self.spends_of_retained_creates(scripthash, &window.creates, high, view);
         };
         note_sh_page_scan(self);
-        if high.saturating_sub(low) <= MAX_HISTORY_WINDOW {
-            return self.spends_of_members(members, low, high);
-        }
         let mut creates = window.creates.clone();
         let mut kept: Vec<u64> = window.creates.iter().map(|(_, fk)| fk.0).collect();
         kept.sort_unstable();
@@ -1890,12 +1835,11 @@ impl Query {
     /// Confirmed history for a scripthash, filtered by height window / limit / cursor.
     ///
     /// A limited newest-first page walks the posting tail. When that walk
-    /// counts `limit` creates and the height down to that create is inside
-    /// [`MAX_HISTORY_WINDOW`], it reads `input.body` for those blocks so a
-    /// spend of an older coin is included. A wider gap reads spend slots of
-    /// the page's creates and of creates below that height, and keeps a
-    /// spender only inside the page. When the list is shorter than the
-    /// limit, it reads the spend slots of the creates it kept. Other filters
+    /// counts `limit` creates, it reads the spend slots of the page's creates
+    /// and of creates below that height, so a spend of an older coin is
+    /// included, and keeps a spender only inside the page. When the list is
+    /// shorter than the limit, it reads the spend slots of the creates it
+    /// kept. Other filters
     /// assemble the confirmed history, then apply [`apply_history_filter`].
     /// Pins the SH watermark, not live tip.
     pub fn scripthash_history_filtered(
@@ -1914,11 +1858,11 @@ impl Query {
 
     /// Confirmed rows in `[from_height, to_height)`.
     ///
-    /// Creates below `from_height` stay as foreign keys. Spends of those
-    /// coins come from [`Self::spends_of_members`] on the window's blocks
-    /// (`input.body`), not from their spend slots, and not from [`Self::sh_join`].
-    /// A hit counts only when that input's output pays this script. The scan
-    /// reads every create, so it takes the unpaged cap and heavy turn.
+    /// Creates below `from_height` stay as foreign keys. Spends in the window
+    /// come from the spend slots of this script's outputs in every create at
+    /// or below the window's top, not from [`Self::sh_join`] and not from the
+    /// window's blocks. That reads every create, so it takes the unpaged cap
+    /// and heavy turn.
     #[doc(hidden)]
     pub fn height_window_history(
         &self,
@@ -1955,29 +1899,26 @@ impl Query {
             ));
         }
         let mut height_of: HashMap<Fk, u32> = HashMap::new();
-        for (fk, h) in members.iter().zip(heights) {
+        for (fk, h) in members.iter().zip(&heights) {
             let h = h.unwrap_or(0);
             if h < from || h > high {
                 continue;
             }
             height_of.insert(*fk, h);
         }
-        let hits = self.spends_of_members(&members, from, high)?;
-        let mut parents: Vec<Fk> = hits.iter().map(|hit| hit.parent).collect();
-        parents.sort_unstable_by_key(|fk| fk.0);
-        parents.dedup();
-        let matched = self.sh_matched_outs(scripthash, &parents)?;
-        for hit in hits {
-            if hit.height < from || hit.height > high {
-                continue;
+        // Spends in the window come from the spend slots of this script's
+        // outputs in every create at or below `high`: work per create, which
+        // the admit above caps, not per block of the window.
+        let below: Vec<(u32, Fk)> = members
+            .iter()
+            .zip(&heights)
+            .map(|(fk, h)| (h.unwrap_or(0), *fk))
+            .filter(|(h, _)| *h <= high)
+            .collect();
+        for hit in self.spends_of_retained_creates(scripthash, &below, high, view)? {
+            if hit.height >= from {
+                height_of.entry(hit.spender).or_insert(hit.height);
             }
-            let Some(outs) = matched.get(&hit.parent) else {
-                continue;
-            };
-            if !outs.iter().any(|(vout, _)| *vout == hit.vout) {
-                continue;
-            }
-            height_of.entry(hit.spender).or_insert(hit.height);
         }
         let mut row_fks: Vec<Fk> = height_of.keys().copied().collect();
         row_fks.sort_unstable_by_key(|fk| fk.0);

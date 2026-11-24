@@ -152,6 +152,69 @@ fn deep_cursor_obeys_create_cap(q: &Query, sh: &[u8; 32], cursor: [u8; 32], olde
     );
 }
 
+/// A `from_height` window answers spends from the spend slots of the
+/// script's creates, not by reading every block of the window: a one-create
+/// script spent inside a five-block window reads no `input.body` span.
+#[test]
+fn height_window_reads_spend_slots_not_blocks() {
+    let (dir, q) = temp_query("sh-window-slots");
+    let sh = script_hash(&[0x56]);
+    let (h0, mut cb0) = coinbase_block(0, Fk::NULL, None);
+    cb0.outputs = vec![OutputRecord::unspent(1, vec![0x56])];
+    let create_txid = cb0.tx.txid;
+    let mut prev = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let create = q.block_tx_fks(Height(0)).unwrap()[0];
+    let mut parent = Some(h0.hash);
+    let mut spend_txid = None;
+    for h in 1..=5u32 {
+        let (header, cb) = coinbase_block(h, prev, parent);
+        if h == 3 {
+            let mut spend = cb.clone();
+            spend.tx.txid[30] = 0x5e;
+            spend.outputs = vec![OutputRecord::unspent(1, vec![0x54])];
+            spend.inputs = vec![InputRecord {
+                prev_txid: create_txid,
+                parent: rbitcoin_store::InputParent::Prevout {
+                    create_fk: create,
+                    vout: 0,
+                },
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![],
+            }];
+            spend_txid = Some(spend.tx.txid);
+            q.commit_class_a_only(&header, &[cb, spend]).unwrap();
+            q.confirm_block(Height(h), &header.hash).unwrap();
+            prev = q.header_at_height(Height(h)).unwrap().unwrap().0;
+        } else {
+            prev = q.connect_block(Height(h), &header, &[cb]).unwrap();
+        }
+        parent = Some(header.hash);
+    }
+    q.apply_sh_pending().unwrap();
+    let filter = rbitcoin_query::scripthash::HistoryFilter {
+        from_height: 1,
+        ..rbitcoin_query::scripthash::HistoryFilter::open()
+    };
+    #[cfg(debug_assertions)]
+    let _ = q.store.sample_reset_input_edge_spans();
+    let rows: Vec<_> = q
+        .scripthash_history_filtered(&sh, &filter)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| (r.height, r.txid))
+        .collect();
+    assert_eq!(rows, vec![(3, spend_txid.unwrap())], "the spend in the window");
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        q.store.sample_reset_input_edge_spans(),
+        0,
+        "the window reads no block's inputs"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// One scripthash with more creates than `--max-sh-creates`: the full join
 /// refuses; height-ascending and cursor pages that close before the cap are
 /// still served; a full newest-first page refuses above the cap; and the
@@ -422,10 +485,10 @@ fn history_walk_fails_once_its_view_leaves_the_chain() {
 }
 
 /// A newest-first page that reaches a create below the page bound reads every
-/// create, whether it scans blocks inside the 8064-block window or joins spend
-/// slots across a wider gap. Both take the unpaged cap: over
-/// `--max-sh-creates` each refuses, and with the cap off each still returns
-/// the spend of the create below the page bound.
+/// create's spend slots, for a gap inside the 8064-block window and for a
+/// wider one alike; the two cases differ only in the height bound. Both take
+/// the unpaged cap: over `--max-sh-creates` each refuses, and with the cap
+/// off each still returns the spend of the create below the page bound.
 #[test]
 fn newest_page_gap_obeys_create_cap() {
     let (dir, q) = temp_query("sh-wide-gap-cap");
