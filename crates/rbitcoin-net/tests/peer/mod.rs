@@ -8045,8 +8045,10 @@ fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
         !peers.inbound_discouraged(same, ORDINARY_BIND),
         "the netgroup wait is ten minutes"
     );
-    peers.set_mock_now(now);
+    // At the cap a new entry evicts the one that expires first (the oldest),
+    // so a flood cannot switch the pause off (Core's rolling filter).
     for i in 0..rbitcoin_net::peers::PeerHub::DISCOURAGE_CAP {
+        peers.set_mock_now(if i == 0 { now - 1 } else { now });
         let a = (i / 256) as u8;
         let b = (i % 256) as u8;
         let slot = std::net::SocketAddr::from(([a, b, 1, 1], 1));
@@ -8055,33 +8057,66 @@ fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
     let overflow = std::net::SocketAddr::from(([255, 255, 1, 1], 1));
     peers.note_slot_evict(rbitcoin_net::eviction::eviction_netgroup(overflow));
     assert!(
-        !peers.inbound_discouraged(overflow, ORDINARY_BIND),
-        "a new netgroup past the cap is not stored"
+        peers.inbound_discouraged(overflow, ORDINARY_BIND),
+        "a new netgroup past the cap is stored"
+    );
+    let oldest = std::net::SocketAddr::from(([0, 0, 1, 1], 1));
+    assert!(
+        !peers.inbound_discouraged(oldest, ORDINARY_BIND),
+        "the oldest netgroup rolls out"
     );
     peers.set_mock_now(now + 100);
-    let refreshed = std::net::SocketAddr::from(([0, 0, 1, 1], 1));
+    let refreshed = std::net::SocketAddr::from(([0, 1, 1, 1], 1));
     peers.note_slot_evict(rbitcoin_net::eviction::eviction_netgroup(refreshed));
     peers.set_mock_now(now + 600);
     assert!(
         peers.inbound_discouraged(refreshed, ORDINARY_BIND),
         "a netgroup already stored is refreshed at the cap"
     );
-    peers.set_mock_now(now);
     for i in 0..rbitcoin_net::peers::PeerHub::DISCOURAGE_CAP {
+        peers.set_mock_now(if i == 0 { now - 1 } else { now });
         let ip = std::net::Ipv4Addr::from(i as u32);
         peers.note_misbehavior_addr(std::net::IpAddr::V4(ip));
     }
     let extra = std::net::SocketAddr::from(([255, 255, 255, 254], 1));
     peers.note_misbehavior_addr(extra.ip());
     assert!(
-        !peers.inbound_discouraged(extra, ORDINARY_BIND),
-        "past the cap the set does not grow"
+        peers.inbound_discouraged(extra, ORDINARY_BIND),
+        "past the cap a new address is still discouraged"
     );
     let first = std::net::SocketAddr::from((std::net::Ipv4Addr::from(0u32), 1));
     assert!(
-        peers.inbound_discouraged(first, ORDINARY_BIND),
-        "rows already stored stay until they expire"
+        !peers.inbound_discouraged(first, ORDINARY_BIND),
+        "the oldest address rolls out"
     );
+    let second = std::net::SocketAddr::from((std::net::Ipv4Addr::from(1u32), 1));
+    assert!(
+        peers.inbound_discouraged(second, ORDINARY_BIND),
+        "the rest stay until they expire"
+    );
+}
+
+/// The rate-strike map rolls too: at the cap a new address still records
+/// its strike, so its second rate-limit disconnect escalates, and the
+/// oldest strike rolls out.
+#[test]
+fn rate_strikes_roll_at_the_cap() {
+    use rbitcoin_net::peers::{DiscourageKey, PeerHub};
+    let peers = PeerHub::new();
+    let now = 1_800_000_000;
+    let key = |i: u32| DiscourageKey::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::from(i)));
+    for i in 0..PeerHub::DISCOURAGE_CAP as u32 {
+        peers.set_mock_now(if i == 0 { now - 1 } else { now });
+        assert!(!peers.note_rate_strike(key(i)));
+    }
+    let new = key(u32::MAX);
+    assert!(!peers.note_rate_strike(new), "the first strike is recorded");
+    assert!(peers.note_rate_strike(new), "the second strike escalates");
+    assert!(
+        !peers.note_rate_strike(key(0)),
+        "the oldest strike rolled out"
+    );
+    assert!(peers.note_rate_strike(key(2)), "the rest stay");
 }
 
 /// A full inbound table evicts one peer and pauses that netgroup. The pause
