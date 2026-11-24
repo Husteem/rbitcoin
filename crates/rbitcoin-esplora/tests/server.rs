@@ -2382,7 +2382,7 @@ fn block_template_rebuilds_for_pool_churn_only_after_5s() {
             updates,
             body: Arc::new(json!({"height": 1})),
         });
-        let r = handlers::block_template_sync(&st);
+        let r = handlers::block_template_sync(&st, None).expect("nothing armed");
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(
             calls.load(Ordering::Relaxed),
@@ -2390,6 +2390,47 @@ fn block_template_rebuilds_for_pool_churn_only_after_5s() {
             "a {age} s old template after a pool change"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A build whose armed template prev was read before a tip update does not
+/// run: it hands back for a fresh sample, so it cannot answer on the old
+/// tip. A prev read at the current settle generation builds.
+#[test]
+fn block_template_resamples_a_prev_armed_before_a_tip_update() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("gbt-stale-prev").expect("dir");
+    let q = Arc::new(Query::open_or_create_tiny(dir.path().join("store")).unwrap());
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let mp = rbitcoin_net::MempoolHub::open(dir.path().join("mempool"), Arc::clone(&q)).unwrap();
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_fn = Arc::clone(&calls);
+    let st = AppState {
+        query: Arc::clone(&q),
+        network: Network::Regtest,
+        mempool: Some(Arc::clone(&mp)),
+        max_body: 1 << 20,
+        sh_join: Arc::new(Mutex::new(JoinCache::default())),
+        join_header_trusted: false,
+        block_template: Some(BlockTemplateFn(Arc::new(move || {
+            calls_fn.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({"height": 1}))
+        }))),
+        gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(Mutex::new(())),
+        send_stall: Duration::from_secs(120),
+    };
+    let armed_at = mp.pool_settle_gen();
+    drop(mp.template_hold());
+    assert!(
+        handlers::block_template_sync(&st, Some(armed_at)).is_none(),
+        "a prev armed before the tip update was built on"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    let r = handlers::block_template_sync(&st, Some(mp.pool_settle_gen()))
+        .expect("a current prev builds");
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

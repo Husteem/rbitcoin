@@ -965,18 +965,24 @@ pub async fn block_template(State(st): State<AppState>) -> Response {
     // Confirm the tip after one store permit, before `gbt_cache`. The helper
     // already took that permit. A second acquire here would deadlock a budget
     // of 1. The 15s cache TTL is unchanged.
-    let sample =
-        rbitcoin_net::sample_template_prev_for_build(st.mempool.as_ref().map(Arc::clone)).await;
-    match tokio::task::spawn_blocking(move || {
-        let _g = rbitcoin_net::BlockingRegion::enter();
-        let _store = rbitcoin_net::hold_store_permit(sample.permit);
-        let _prev = sample.armed.map(rbitcoin_net::arm_template_prev_sample);
-        block_template_sync(&st)
-    })
-    .await
-    {
-        Ok(r) => crate::server::ensure_json(r).await,
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    // A build that waited on another one past a tip change samples again.
+    loop {
+        let sample =
+            rbitcoin_net::sample_template_prev_for_build(st.mempool.as_ref().map(Arc::clone)).await;
+        let st = st.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _g = rbitcoin_net::BlockingRegion::enter();
+            let _store = rbitcoin_net::hold_store_permit(sample.permit);
+            let settle = sample.armed.map(|_| sample.settle);
+            let _prev = sample.armed.map(rbitcoin_net::arm_template_prev_sample);
+            block_template_sync(&st, settle)
+        })
+        .await
+        {
+            Ok(Some(r)) => return crate::server::ensure_json(r).await,
+            Ok(None) => tokio::task::yield_now().await,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
     }
 }
 
@@ -994,10 +1000,13 @@ fn gbt_cache_hit(c: &GbtCache, tip: &[u8; 32], updates: u64) -> bool {
     c.tip == *tip && gbt_cache_fresh(age) && (c.updates == updates || age < Duration::from_secs(5))
 }
 
+/// `settle` is the pool settle generation the armed template prev was read
+/// at, `None` when nothing is armed. `None` back means that prev went stale
+/// while this waited on another build: release the permit and sample again.
 #[doc(hidden)]
-pub fn block_template_sync(st: &AppState) -> Response {
+pub fn block_template_sync(st: &AppState, settle: Option<u64>) -> Option<Response> {
     let Some(fun) = st.block_template.as_ref() else {
-        return not_found();
+        return Some(not_found());
     };
     // The tip and pool generation the cache is checked against.
     let sample = || -> Result<([u8; 32], u64), Box<Response>> {
@@ -1031,10 +1040,10 @@ pub fn block_template_sync(st: &AppState) -> Response {
     };
     let (tip, updates) = match sample() {
         Ok(v) => v,
-        Err(r) => return *r,
+        Err(r) => return Some(*r),
     };
     if let Some(body) = cached(&tip, updates) {
-        return gbt_json(&body);
+        return Some(gbt_json(&body));
     }
     // One build at a time: a concurrent miss waits for the build in progress
     // and then reads its result. The cache lock itself is not held across
@@ -1044,12 +1053,20 @@ pub fn block_template_sync(st: &AppState) -> Response {
     let _build = st.gbt_build.lock().unwrap_or_else(|p| p.into_inner());
     let (tip, updates) = match sample() {
         Ok(v) => v,
-        Err(r) => return *r,
+        Err(r) => return Some(*r),
     };
     if let Some(body) = cached(&tip, updates) {
-        return gbt_json(&body);
+        return Some(gbt_json(&body));
     }
-    match (fun.0)() {
+    // The armed prev is the pool's tip when it was sampled. A connect,
+    // disconnect, or reorg since then moves the settle generation; building
+    // on that prev would answer one block behind.
+    if let (Some(at), Some(mp)) = (settle, st.mempool.as_ref()) {
+        if mp.pool_settle_gen() != at {
+            return None;
+        }
+    }
+    Some(match (fun.0)() {
         Ok(body) => {
             let body = Arc::new(body);
             // The sample can be one connect behind the query tip. Do not
@@ -1070,7 +1087,7 @@ pub fn block_template_sync(st: &AppState) -> Response {
             gbt_json(&body)
         }
         Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e).into_response(),
-    }
+    })
 }
 
 #[doc(hidden)]
