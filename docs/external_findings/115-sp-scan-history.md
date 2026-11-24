@@ -28,8 +28,10 @@ way:
   16 addresses by default (`--electrum-max-sp-subs`), each with one scan.
 - The scan reads one chunk ahead of what the client has taken and no
   further.
-- The process runs at most 32 history scans at once, across connections.
-  A subscribe past that is refused in its reply until a scan ends.
+- The process runs at most 32 history scans at once, across connections,
+  and one connection at most 3. A connection's later subscribes wait for
+  one of its scans to end. A subscribe that finds the 32 taken while its
+  connection runs fewer than 3 is refused in its reply until a scan ends.
 
 What is not bounded: a connected client may ask for the whole chain, and
 ask again. A subscribe to an address it already holds starts that scan
