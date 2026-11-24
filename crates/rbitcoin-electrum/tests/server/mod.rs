@@ -3384,15 +3384,19 @@ async fn sp_scans_per_connection_leave_slots_for_others() {
 
 /// Subscribes that wait for a slot are scanned when the connection's
 /// earlier scans finish: five addresses on one reading client each get a
-/// whole history.
+/// whole history. Wallet 0, the one the chain pays, subscribes last, so its
+/// scan waits, and its history still holds every paid height.
 #[tokio::test]
 async fn sp_waiting_subscribes_scan_in_turn() {
     let chain = sp_chain_paying_every_height("el-sp-turns", 15);
     let mut s = sp_session_with(&chain.q, sp_cfg_slots(32), 1 << 16);
-    let lines: Vec<String> = (0..5u8)
-        .map(|w| sp_subscribe_line(u32::from(w) + 1, chain.sub_for(w, json!(0))))
+    let lines: Vec<String> = [1u8, 2, 3, 4, 0]
+        .iter()
+        .enumerate()
+        .map(|(i, w)| sp_subscribe_line(i as u32 + 1, chain.sub_for(*w, json!(0))))
         .collect();
     let replies = s.ask(&lines).await;
+    let paid_sub = replies[4]["result"].clone();
     let mut open: Vec<Value> = replies
         .iter()
         .map(|r| {
@@ -3400,13 +3404,21 @@ async fn sp_waiting_subscribes_scan_in_turn() {
             r["result"].clone()
         })
         .collect();
+    let mut paid = Vec::new();
     while !open.is_empty() {
         let note = sp_next_line(&mut s.client).await;
         let params = note["params"].as_array().expect("positional note");
+        let history = params[2].as_array().expect("history");
+        if params[0] == paid_sub {
+            paid.extend(history.iter().cloned());
+        } else {
+            assert!(history.is_empty(), "only wallet 0 is paid: {note}");
+        }
         if params[1].as_f64() == Some(1.0) {
             open.retain(|sub| sub != &params[0]);
         }
     }
+    assert_eq!(sp_heights(&paid), (0..=15).collect::<Vec<u64>>());
 }
 
 /// A waiting subscribe is a subscription: subscribing its address again
