@@ -539,7 +539,8 @@ pub fn spawn_inbound_accept(
                         drop(stream);
                         continue;
                     }
-                    let Some(incomplete) = peers.try_reserve_incomplete(peer_addr.ip()) else {
+                    let Some(incomplete) = peers.try_reserve_incomplete(peer_addr.ip(), local_addr)
+                    else {
                         rbitcoin_log::info!(
                             "p2p: reject inbound {peer_addr} (incomplete handshakes)"
                         );
