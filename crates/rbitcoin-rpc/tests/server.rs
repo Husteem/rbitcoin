@@ -1440,6 +1440,80 @@ async fn unauthorized_reply_closes_the_connection() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A client that stops reading a large reply loses the connection after the
+/// write deadline instead of holding it and the buffered reply. A client
+/// that trickles below the minimum rate is cut too.
+#[tokio::test]
+async fn unread_rpc_reply_hits_the_write_deadline() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const BODY: usize = 64 * 1024;
+    let app = axum::Router::new().route("/", axum::routing::get(|| async { vec![0u8; BODY] }));
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(());
+
+    // Reads the start of the reply, then nothing.
+    let (server, mut client) = tokio::io::duplex(128);
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: rpc\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let served = tokio::spawn(serve_rpc_connection(
+        server,
+        app.clone(),
+        Duration::from_millis(200),
+        64 * 1024,
+        stop_rx.clone(),
+    ));
+    let mut head = [0u8; 12];
+    client.read_exact(&mut head).await.unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200", "the reply started");
+    tokio::time::timeout(Duration::from_secs(5), served)
+        .await
+        .expect("an unread reply held the connection")
+        .expect("the server task did not panic");
+    drop(client);
+
+    // Reads 64 bytes every 5 ms, far below the minimum rate.
+    let (server, mut client) = tokio::io::duplex(128);
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: rpc\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let served = tokio::spawn(serve_rpc_connection(
+        server,
+        app,
+        Duration::from_millis(200),
+        1024 * 1024,
+        stop_rx,
+    ));
+    let reader = tokio::spawn(async move {
+        let mut total = 0usize;
+        let mut buf = [0u8; 64];
+        loop {
+            match client.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total += n;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+        total
+    });
+    let total = tokio::time::timeout(Duration::from_secs(10), reader)
+        .await
+        .expect("reader")
+        .expect("read task");
+    tokio::time::timeout(Duration::from_secs(5), served)
+        .await
+        .expect("a trickled reply held the connection")
+        .expect("the server task did not panic");
+    assert!(
+        total > 0 && total < BODY,
+        "the trickled reply was not cut mid-way: {total} bytes"
+    );
+}
+
 #[tokio::test]
 async fn stalled_rpc_connections_expire_and_free_capacity() {
     use std::time::Duration;

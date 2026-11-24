@@ -66,6 +66,8 @@ pub mod v1;
 pub mod v2;
 #[doc(hidden)]
 pub mod versionbits_warn;
+#[doc(hidden)]
+pub mod write_deadline;
 
 pub use asmap::{
     AsMap, ASMAP_EIGHT_TRAILING_ZEROS, ASMAP_JUMP_OFF_END, ASMAP_JUMP_PAST_FILE,
