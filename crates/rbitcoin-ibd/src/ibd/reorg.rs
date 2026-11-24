@@ -951,11 +951,13 @@ pub fn arm_after_header_rewind_prepare_for_test(hook: Option<fn()>) {
 
 /// Select the heavier path with the most work, disconnect, and commit it.
 /// Caller does not hold `shared`. One exclusion covers the select, the
-/// disconnect, and the commit. A moved tip or a hash marked invalid skips the commit, so
-/// `clear_path_above` and `set_lookup_taken_hi` stay off that stale height.
-/// A selected path that is not committed defers `cands` to the next
-/// coordinator turn. No candidates is no gate and no chain-work read.
-pub(crate) fn apply_off_lock_rewind(
+/// disconnect, and the commit. A moved tip, a hash marked invalid, or a hash
+/// abandoned as unservable skips the commit, so `clear_path_above` and
+/// `set_lookup_taken_hi` stay off that stale height. A selected path that is
+/// not committed defers `cands` to the next coordinator turn, which reseeds
+/// and plants from the LCA. No candidates is no gate and no chain-work read.
+#[doc(hidden)]
+pub fn apply_off_lock_rewind(
     shared: &Mutex<super::state::IbdWorkState>,
     hub: &ChainHub,
     cands: &[BlockHash],
@@ -1010,15 +1012,23 @@ pub(crate) fn apply_off_lock_rewind(
         .query
         .lock_tip_commit()
         .map_err(|e| NetError::Store(e.to_string()))?;
-    let marked_invalid = path
-        .iter()
-        .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()));
-    if marked_invalid || !rewind_tip_still(hub, &prep) {
+    let refused = path_refused_at_commit(&st, &path);
+    if refused || !rewind_tip_still(hub, &prep) {
         st.reorg.defer(cands);
         return Ok(false);
     }
     commit_header_rewind(&mut st, hub, &path, &prep);
     Ok(true)
+}
+
+/// A path hash the state refused after the off-lock selection snapshot. The
+/// snapshot runs under `shared`, then the lock is released for select and
+/// prepare, so a confirm reject can mark a path hash in that window. A path
+/// through it cannot be completed: IBD will not request that hash's body.
+#[doc(hidden)]
+pub fn path_refused_at_commit(st: &super::state::IbdWorkState, path: &[BlockHash]) -> bool {
+    path.iter()
+        .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()) || st.unservable.contains(hash))
 }
 
 /// Most-work rewind with the store reads outside `shared`. The commit puts
