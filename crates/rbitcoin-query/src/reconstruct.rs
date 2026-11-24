@@ -496,17 +496,9 @@ impl Query {
         let weight = u32::try_from(block.weight().to_wu())
             .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
         // Stamp the rows, as `getblockstats` does, so the next request is one
-        // txstat read and not another rebuild. Only the active block at its
-        // height: the stamp finds its rows by height. Best effort.
-        if let Ok(Some(height)) = self.height_of_hash(&hash) {
-            if self
-                .header_at_height(height)
-                .ok()
-                .flatten()
-                .is_some_and(|(fk, _)| fk == header_fk)
-            {
-                let _ = self.stamp_txstat_from_block(height, &block);
-            }
+        // txstat read and not another rebuild.
+        if let Ok(rows) = self.txstat_rows_from_block(&block) {
+            self.stamp_active_rows(header_fk, &hash, &rows);
         }
         Ok(Some((size, weight)))
     }
@@ -646,7 +638,8 @@ impl Query {
     /// Reads `txstat`, `create.loc`, `txout.body`, and `txid.body` over the
     /// block's create span. An active block with unstamped `txstat` rows gives
     /// the same rows from the reconstructed block, which needs `seqsigwit`
-    /// (`Pruned` when cut). Unstamped stale blocks return `None`. Nothing is written.
+    /// (`Pruned` when cut), and stamps those rows. Unstamped stale blocks
+    /// return `None`.
     pub fn block_tx_summary(
         &self,
         hash: &[u8; 32],
@@ -705,6 +698,9 @@ impl Query {
         if txids.len() != rows.len() {
             return Err(StoreError::Corrupt("invariant: block summary row count"));
         }
+        // The rows are computed anyway: stamp them, so the next summary of
+        // this block is the txstat read and not another rebuild.
+        self.stamp_active_rows(header_fk, hash, &rows);
         Ok(Some(
             block
                 .txdata
@@ -738,13 +734,52 @@ impl Query {
         Ok(rows)
     }
 
-    /// Fill unstamped `txstat` rows from a reconstructed wire block.
+    /// Write `rows`, computed from the block `hash` names, over that block's
+    /// creates, only while it is the active block at its height. The creates
+    /// come from the header, not a height, so a replace at that height cannot
+    /// receive another block's rows. Best effort: a miss writes nothing.
+    fn stamp_active_rows(
+        &self,
+        header_fk: Fk,
+        hash: &[u8; 32],
+        rows: &[rbitcoin_store::TxStatRow],
+    ) {
+        let Ok(Some(height)) = self.height_of_hash(hash) else {
+            return;
+        };
+        let active = self
+            .header_at_height(height)
+            .ok()
+            .flatten()
+            .is_some_and(|(fk, rec)| fk == header_fk && rec.hash == *hash);
+        if !active {
+            return;
+        }
+        let Ok(Some(fks)) = self.header_tx_fks(header_fk, Some(hash)) else {
+            return;
+        };
+        if fks.len() != rows.len() {
+            return;
+        }
+        if let Some(first) = fks.first().and_then(|fk| fk.get()) {
+            let _ = self.store.write_txstat_block(header_fk, first, rows);
+        }
+    }
+
+    /// Fill unstamped `txstat` rows from a reconstructed wire block. The
+    /// block must be the one at `height`, so a replace there is not stamped
+    /// with the rows of the block it replaced.
     pub fn stamp_txstat_from_block(&self, height: Height, block: &Block) -> Result<(), QueryError> {
-        let Some((header_fk, _)) = self.header_at_height(height)? else {
+        let Some((header_fk, rec)) = self.header_at_height(height)? else {
             return Err(StoreError::Corrupt(
                 "invariant: stamp txstat missing header",
             ));
         };
+        if rec.hash != block.block_hash().to_byte_array() {
+            return Err(StoreError::Corrupt(
+                "invariant: stamp txstat block not at height",
+            ));
+        }
         let fks = self.block_tx_fks(height)?;
         if fks.len() != block.txdata.len() {
             return Err(StoreError::Corrupt("invariant: stamp txstat fk count"));

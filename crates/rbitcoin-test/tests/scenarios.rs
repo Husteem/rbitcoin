@@ -3285,6 +3285,22 @@ fn pin_active_block_rebuild_stamps_txstat(q: &Query, b1: &Block) {
         0,
         "a stamped block is not rebuilt again"
     );
+
+    // The summary route's rebuild stamps too.
+    q.store().write_txstat_row(cb_fk, &zero).unwrap();
+    assert!(q.block_tx_summary(&hash).unwrap().is_some());
+    assert_eq!(q.sample_reset_reconstruct_archived(), 1);
+    assert_eq!(
+        q.get_txstat(cb_fk).unwrap(),
+        Some(row),
+        "the summary stamps"
+    );
+
+    // A block that is not the one at the height is never stamped there.
+    let mut other = b1.clone();
+    other.header.nonce = other.header.nonce.wrapping_add(1);
+    let err = q.stamp_txstat_from_block(Height(1), &other).unwrap_err();
+    assert!(err.to_string().contains("not at height"), "{err}");
 }
 
 fn pin_confirm_refuses_without_advancing_tip(
