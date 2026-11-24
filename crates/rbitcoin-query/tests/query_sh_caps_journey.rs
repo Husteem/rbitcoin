@@ -485,10 +485,10 @@ fn history_walk_fails_once_its_view_leaves_the_chain() {
 }
 
 /// A newest-first page that reaches a create below the page bound reads every
-/// create, whether it scans blocks inside the 8064-block window or joins spend
-/// slots across a wider gap. Both take the unpaged cap: over
-/// `--max-sh-creates` each refuses, and with the cap off each still returns
-/// the spend of the create below the page bound.
+/// create's spend slots, for a gap inside the 8064-block window and for a
+/// wider one alike; the two cases differ only in the height bound. Both take
+/// the unpaged cap: over `--max-sh-creates` each refuses, and with the cap
+/// off each still returns the spend of the create below the page bound.
 #[test]
 fn newest_page_gap_obeys_create_cap() {
     let (dir, q) = temp_query("sh-wide-gap-cap");

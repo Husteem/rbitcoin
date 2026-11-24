@@ -389,7 +389,7 @@ fn spend_op_true(
 }
 
 /// A one-block catch-up still returns the spend. A clipped window above
-/// eight weeks is refused before the block scan.
+/// eight weeks is refused before its spend-slot read.
 #[test]
 fn history_window_wider_than_eight_weeks_is_refused() {
     let (dir, q) = temp_query("history-window-width");
