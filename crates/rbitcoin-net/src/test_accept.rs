@@ -1,5 +1,5 @@
 //! `testmempoolaccept`: one row per submitted transaction, in submission
-//! order. JSON-RPC, Electrum, and Esplora render the same rows.
+//! order. JSON-RPC and Esplora render the same rows.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
@@ -50,8 +50,8 @@ impl TestAcceptRow {
         )
     }
 
-    /// Only an allowed member is a parent for a later one. A member over
-    /// `maxfeerate` is not, though it passed every other check.
+    /// Whether the member passed its own checks and `maxfeerate`. Only such a
+    /// member is a parent for a later one.
     fn is_allowed(&self) -> bool {
         matches!(self.verdict, TestAcceptVerdict::Allowed { .. })
     }
@@ -247,8 +247,10 @@ impl MempoolHub {
         vec![row]
     }
 
-    /// A member of an over-cap cluster is `too-large-cluster` and no parent
-    /// for a later member, which is in the same cluster if it spends one.
+    /// A member of an over-cap cluster that passes its own checks is
+    /// `too-large-cluster`, as Core checks the cluster after every member's
+    /// own checks and `maxfeerate`. It is still a parent for a later member,
+    /// which is in the same cluster if it spends one.
     async fn test_accept_package_rows_async(
         self: &Arc<Self>,
         txs: Vec<Transaction>,
@@ -258,10 +260,6 @@ impl MempoolHub {
         let mut tested = Arc::new(TestedMembers::default());
         let mut out = Vec::with_capacity(txs.len());
         for (i, tx) in txs.into_iter().enumerate() {
-            if over_cap.contains(&i) {
-                out.push(TestAcceptRow::rejected(&tx, "too-large-cluster"));
-                continue;
-            }
             if submit_tx_version_nonstandard(&tx) {
                 out.push(TestAcceptRow::rejected(&tx, "version"));
                 continue;
@@ -269,11 +267,14 @@ impl MempoolHub {
             let outcome = self
                 .test_accept_async(tx.clone(), Some(Arc::clone(&tested)))
                 .await;
-            let row = match outcome {
+            let mut row = match outcome {
                 Ok(r) => TestAcceptRow::admitted(&tx, &r, max_feerate_sat_kvb),
                 Err(e) => TestAcceptRow::refused(&tx, &e),
             };
             if row.is_allowed() {
+                if over_cap.contains(&i) {
+                    row = TestAcceptRow::rejected(&tx, "too-large-cluster");
+                }
                 Arc::make_mut(&mut tested).push(Arc::new(tx));
             }
             out.push(row);

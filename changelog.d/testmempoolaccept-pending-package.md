@@ -9,6 +9,6 @@ Fixed
   samples, and could leave behind an orphan the parent had promoted. Peers
   and Electrum subscribers could also see a member while the rest were
   checked. A later member now sees the earlier ones as unconfirmed parents
-  without any of them entering the pool. Only an allowed member counts: a
-  child of a member over `maxfeerate` is `missing-inputs`, not allowed
-  beside a parent that is not.
+  without any of them entering the pool. A member refused by its own
+  checks does not count: a child of a member over `maxfeerate` is
+  `missing-inputs`, not allowed beside a parent that is not.

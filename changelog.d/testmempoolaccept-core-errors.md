@@ -27,7 +27,8 @@ Fixed
   The cluster cap holds for each cluster a package would make with the
   mempool, and only that cluster's members are refused, with
   `reject-reason` `too-large-cluster` as a single transaction over the cap
-  gets. It used to add every member onto every pool parent's cluster and
+  gets, once that member passes its own checks, as Core asks the cluster
+  last. It used to add every member onto every pool parent's cluster and
   give every row `package-error`, so a member that touches none of them
   failed too. Core gives every row `package-error`.
   Unlike Core, a multi-transaction call does not stop at the first failed

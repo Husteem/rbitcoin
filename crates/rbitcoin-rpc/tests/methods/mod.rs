@@ -5045,7 +5045,11 @@ fn testmempoolaccept_package_applies_truc_to_an_untested_parent() {
 /// pooled tx and a tx that spends a confirmed coin make clusters of two and
 /// one, and both are allowed. Two children of the pooled tx make one cluster
 /// of three, and so does a chain of three that spends only a confirmed coin.
-/// Beside the two children, the unrelated tx is still allowed.
+/// Beside the two children, the unrelated tx is still allowed. As in Core,
+/// which checks the cluster only after every member's own checks, a member
+/// that fails its own check reports that, and a member refused only for its
+/// cluster is still a parent: a grandchild paying more than it spends is
+/// `bad-txns-in-belowout`, not `missing-inputs`.
 #[test]
 fn testmempoolaccept_package_counts_each_cluster_alone() {
     use bitcoin::consensus::encode::serialize;
@@ -5098,6 +5102,19 @@ fn testmempoolaccept_package_counts_each_cluster_alone() {
     let rows = test(&[&spend(0), &spend(1), &unrelated]);
     assert!(over_cap(&rows[0]) && over_cap(&rows[1]), "{rows}");
     assert_eq!(rows[2]["allowed"], true, "{rows}");
+    let mut odd = spend(1);
+    odd.version = TxVersion(4);
+    let rows = test(&[&spend(0), &odd]);
+    assert!(over_cap(&rows[0]), "{rows}");
+    assert_eq!(rows[1]["reject-reason"], "version", "{rows}");
+    let mut overpaid = child_of(&child, 1_000);
+    overpaid.output[0].value = child.output[0].value + Amount::from_sat(1);
+    let rows = test(&[&unrelated, &child, &overpaid]);
+    assert!(over_cap(&rows[0]) && over_cap(&rows[1]), "{rows}");
+    assert_eq!(rows[2]["reject-reason"], "bad-txns-in-belowout", "{rows}");
+    let grand = child_of(&child, 1_000);
+    let rows = test(&[&unrelated, &child, &grand, &child_of(&grand, 1_000)]);
+    assert!(rows.as_array().unwrap().iter().all(over_cap), "{rows}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
