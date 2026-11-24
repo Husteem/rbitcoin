@@ -1451,7 +1451,7 @@ async fn unread_rpc_reply_hits_the_write_deadline() {
     let app = axum::Router::new().route("/", axum::routing::get(|| async { vec![0u8; BODY] }));
     let (_stop_tx, stop_rx) = tokio::sync::watch::channel(());
 
-    // Never reads.
+    // Reads the start of the reply, then nothing.
     let (server, mut client) = tokio::io::duplex(128);
     client
         .write_all(b"GET / HTTP/1.1\r\nHost: rpc\r\nConnection: close\r\n\r\n")
@@ -1464,6 +1464,9 @@ async fn unread_rpc_reply_hits_the_write_deadline() {
         64 * 1024,
         stop_rx.clone(),
     ));
+    let mut head = [0u8; 12];
+    client.read_exact(&mut head).await.unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200", "the reply started");
     assert!(
         tokio::time::timeout(Duration::from_secs(5), served)
             .await
@@ -1510,8 +1513,8 @@ async fn unread_rpc_reply_hits_the_write_deadline() {
         "a trickled reply held the connection"
     );
     assert!(
-        total < BODY,
-        "the trickled reply was not cut: {total} bytes"
+        total > 0 && total < BODY,
+        "the trickled reply was not cut mid-way: {total} bytes"
     );
 }
 
