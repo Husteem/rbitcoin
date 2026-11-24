@@ -837,11 +837,20 @@ impl Query {
         if cap == 0 && heavy == 0 {
             return Ok(light);
         }
-        let n = self.scripthash_create_count(scripthash)?;
-        if cap > 0 && n > cap {
-            return Err(StoreError::ShCreatesCap { creates: n, cap });
+        self.creates_admit(self.scripthash_create_count(scripthash)?)
+    }
+
+    /// [`Self::unpaged_join_admit`] for a create count the caller read.
+    fn creates_admit(&self, creates: u32) -> Result<JoinAdmit<'_>, QueryError> {
+        let cap = if MAX_SH_CREATES_LIFTED.with(std::cell::Cell::get) {
+            0
+        } else {
+            self.max_sh_creates()
+        };
+        if cap > 0 && creates > cap {
+            return Err(StoreError::ShCreatesCap { creates, cap });
         }
-        Ok(self.heavy_turn(n))
+        Ok(self.heavy_turn(creates))
     }
 
     /// The node's single heavy turn when `creates` is above
@@ -1678,9 +1687,8 @@ impl Query {
     ///
     /// A gap inside [`MAX_HISTORY_WINDOW`] scans those blocks. A wider gap
     /// reads spend slots of the page's creates and of creates below the page
-    /// bound. Both read every create, so both are refused above
-    /// `--max-sh-creates` and hold the heavy turn. A spender counts only at a
-    /// height inside `[low, high]`.
+    /// bound. With no page limit to compare, every call takes the unpaged cap
+    /// and heavy turn. A spender counts only at a height inside `[low, high]`.
     #[doc(hidden)]
     pub fn spends_for_newest_page(
         &self,
@@ -1690,17 +1698,11 @@ impl Query {
         high: u32,
         view: &ChainView,
     ) -> Result<Vec<SpendHit>, QueryError> {
-        let admit = if window.bound.is_some() {
-            // Both a block scan and a spend-slot read walk every create, so
-            // each takes the unpaged cap and keeps the heavy turn for its read.
-            Some(self.unpaged_join_admit(scripthash)?)
-        } else {
-            None
-        };
+        let admit = self.unpaged_join_admit(scripthash)?;
         // Debug drops the probe before `admit`, so a released heavy turn is
         // not counted as still running. The turn covers the inner read.
         #[cfg(debug_assertions)]
-        let _probe = admit.as_ref().map(|a| self.sh_join_probe.enter(a.heavy));
+        let _probe = self.sh_join_probe.enter(admit.heavy);
         #[cfg(not(debug_assertions))]
         let _admit = admit;
         self.spends_for_newest_page_inner(scripthash, members, window, high, view)
@@ -1778,13 +1780,19 @@ impl Query {
         // longer one can walk every create above a deep cursor, so it takes
         // the unpaged cap and heavy turn from the create count, before the
         // posting list is loaded.
+        let over = |n: usize| n > k;
         let creates = self.scripthash_create_count(scripthash)?;
-        let admit = if usize::try_from(creates).map_or(true, |n| n > k) {
-            Some(self.unpaged_join_admit(scripthash)?)
+        let mut admit = if usize::try_from(creates).map_or(true, over) {
+            Some(self.creates_admit(creates)?)
         } else {
             None
         };
         let postings = self.stable_sh_create_fks(scripthash)?;
+        // A publish between the count and the list can grow it past the page.
+        if admit.is_none() && over(postings.len()) {
+            let n = u32::try_from(postings.len()).unwrap_or(u32::MAX);
+            admit = Some(self.creates_admit(n)?);
+        }
         let window = self.newest_create_window(&postings, k, scan.high, scan.strict, view)?;
         let full = window.bound.is_some();
         // Debug drops the probe before `admit`, so a released heavy turn is

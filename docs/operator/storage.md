@@ -240,14 +240,14 @@ before Class A expand: Esplora **503** / Electrum JSON-RPC error
 `scripthash join exceeds --max-sh-creates (<creates> creates, cap <N>)`. **0** is unlimited.
 A create is a transaction that pays the script, not an output: the index
 keeps one transaction key per create, so two outputs to the script in one
-transaction count once. A history request that names a page (Esplora's 25, or
-any caller that sets a limit) is served when the page closes before reading
-every create. A newest-first page that reaches its full limit reads every
-create at or below the page bound, and an Electrum `from_height` window reads
-every create to match spends in that window; both take the same cap and
-heavy-join turn as an unpaged join. An explorer that must page a busy address
-above the cap needs a higher `--max-sh-creates` or **0**; without that, the
-first full newest-first page is refused even when its newest rows are recent.
+transaction count once. A height-ascending page is served when it closes
+before reading every create. A newest-first page (Esplora's 25) of a script
+with no more creates than the page limit is served. One with more creates,
+at any cursor, and an Electrum `from_height` window take the same cap and
+heavy-join turn as an unpaged join, checked from the create count before the
+list is read. An explorer that must page a busy address above the cap needs a
+higher `--max-sh-creates` or **0**; without that, every newest-first page of
+that address is refused even when its newest rows are recent.
 
 On the Esplora unix socket, `GET /internal/address/:address` and
 `GET /internal/scripthash/:hash` answer the totals of `/address/:address` and

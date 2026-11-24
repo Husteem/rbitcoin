@@ -252,6 +252,16 @@ fn sh_history_caps() {
     );
     q.set_max_sh_creates(0);
     assert_eq!(
+        q.scripthash_history_filtered(&sh, &deep)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.txid)
+            .collect::<Vec<_>>(),
+        [cb_txids[0]],
+        "cap 0 serves the deep cursor's older row"
+    );
+    assert_eq!(
         sh_page(&q, &sh, NewestFirst, None).unwrap(),
         [spend_txid],
         "the newest row spends the oldest create"
