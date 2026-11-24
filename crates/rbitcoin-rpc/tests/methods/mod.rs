@@ -8068,6 +8068,12 @@ fn sendraw_while_tentative(
     send_hex: String,
 ) -> Result<Value, Value> {
     let mp = Arc::clone(ctx.mempool.as_ref().unwrap());
+    // One API script lane permit, as a small runner has: the parked call
+    // holds it, so the broadcast waits for the lane before it can wait on
+    // the tentative member.
+    let lane = mp.api_script_lane();
+    let spare = lane.available_permits().saturating_sub(1) as u32;
+    let _held = (spare > 0).then(|| lane.clone().try_acquire_many_owned(spare).unwrap());
     mp.pause_after_tentative_commit
         .store(true, Ordering::Release);
     let ctx = Arc::clone(ctx);
@@ -8093,13 +8099,17 @@ fn sendraw_while_tentative(
                 let params = RpcParams::positional(vec![json!(send_hex)]);
                 sendrawtransaction_async(&ctx, &params).await
             });
-            while !send.is_finished() && mp.tentative_waiters() == 0 {
+            // The broadcast waits on the member, or first on the lane the
+            // parked call holds.
+            while !send.is_finished() && mp.tentative_waiters() == 0 && lane.available_permits() > 0
+            {
                 assert!(
                     Instant::now() < deadline,
                     "sendrawtransaction neither answered nor waited"
                 );
                 tokio::task::yield_now().await;
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
             mp.pause_after_tentative_commit
                 .store(false, Ordering::Release);
             while !op.is_finished() || !send.is_finished() {
