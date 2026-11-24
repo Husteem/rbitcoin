@@ -24,6 +24,19 @@ use std::sync::{Condvar, Mutex};
 pub const FILTER_STILL_INDEXING: &str =
     "Filter not found. Block filters are still in the process of being indexed.";
 
+/// Stale ancestors a `getblockfilter` rebuild walks back to its best-chain
+/// fork point, the same bound as Esplora's stored-header walk. Each one is
+/// a block body rebuilt and filtered.
+#[doc(hidden)]
+pub const MAX_STALE_FILTER_WALK: usize = 10_000;
+
+/// `getblockfilter` for a stale block whose branch is longer than
+/// [`MAX_STALE_FILTER_WALK`]. Core keeps every connected block's filter
+/// and has no such limit.
+#[doc(hidden)]
+pub const FILTER_STALE_TOO_DEEP: &str =
+    "Filter not found. Stale branch is deeper than 10000 blocks.";
+
 /// BIP158 basic filter Golomb-Rice parameters (`M`, `P`).
 #[doc(hidden)]
 pub const BASIC_FILTER_M: u64 = 784_931;
@@ -339,6 +352,17 @@ impl Query {
         &self,
         hash: &[u8; 32],
     ) -> Result<Option<(Vec<u8>, FilterHeader)>, QueryError> {
+        self.basic_filter_for_hash_within(hash, MAX_STALE_FILTER_WALK)
+    }
+
+    /// [`Self::basic_filter_for_hash`] rebuilding at most `max_stale` stale
+    /// blocks, the requested one included.
+    #[doc(hidden)]
+    pub fn basic_filter_for_hash_within(
+        &self,
+        hash: &[u8; 32],
+        max_stale: usize,
+    ) -> Result<Option<(Vec<u8>, FilterHeader)>, QueryError> {
         let height = self.height_of_hash(hash)?;
         if let Some(h) = height {
             if let Some(row) = self.basic_filter_at(h.0)? {
@@ -351,7 +375,17 @@ impl Query {
         if height.is_none() && !self.store.header_txs.has_body(header_fk)? {
             return Ok(None);
         }
-        let parent_header = self.parent_basic_filter_header(&self.prev_header_hash(hash)?)?;
+        // A block off the best chain is itself one of the stale blocks
+        // rebuilt. A best-chain block's parent is never stale.
+        let ancestors = if height.is_some() {
+            max_stale
+        } else {
+            max_stale
+                .checked_sub(1)
+                .ok_or(StoreError::Rejected(FILTER_STALE_TOO_DEEP))?
+        };
+        let parent_header =
+            self.parent_basic_filter_header_within(&self.prev_header_hash(hash)?, ancestors)?;
         let block = self
             .block_body_for_filter(hash)?
             .ok_or(StoreError::Corrupt("invariant: blockfilter body missing"))?;
@@ -394,11 +428,24 @@ impl Query {
 
     /// Header of `prev_hash`. Zeros are the genesis prev-header. A sealed
     /// best-chain block is that row. A stale block is rebuilt back to the
-    /// best-chain fork point, and only when that fork point is sealed.
+    /// best-chain fork point, and only when that fork point is sealed and at
+    /// most [`MAX_STALE_FILTER_WALK`] stale blocks away.
     #[doc(hidden)]
     pub fn parent_basic_filter_header(
         &self,
         prev_hash: &[u8; 32],
+    ) -> Result<FilterHeader, QueryError> {
+        self.parent_basic_filter_header_within(prev_hash, MAX_STALE_FILTER_WALK)
+    }
+
+    /// [`Self::parent_basic_filter_header`] with at most `max_stale` stale
+    /// blocks rebuilt. One more is [`FILTER_STALE_TOO_DEEP`], found from
+    /// headers alone before any body is read.
+    #[doc(hidden)]
+    pub fn parent_basic_filter_header_within(
+        &self,
+        prev_hash: &[u8; 32],
+        max_stale: usize,
     ) -> Result<FilterHeader, QueryError> {
         if *prev_hash == [0u8; 32] {
             return Ok(FilterHeader::from_byte_array([0u8; 32]));
@@ -418,6 +465,9 @@ impl Query {
             }
             if !seen.insert(cursor) {
                 return Err(StoreError::Corrupt("invariant: blockfilter header cycle"));
+            }
+            if pending.len() >= max_stale {
+                return Err(StoreError::Rejected(FILTER_STALE_TOO_DEEP));
             }
             pending.push(cursor);
             cursor = self.prev_header_hash(&cursor)?;
