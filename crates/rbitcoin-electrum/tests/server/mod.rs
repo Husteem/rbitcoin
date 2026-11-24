@@ -3358,6 +3358,57 @@ async fn sp_scan_stops_when_the_session_drops_it() {
     );
 }
 
+/// One connection runs at most `MAX_SP_SCANS_PER_CONN` history scans; its
+/// other subscribes are accepted and wait for one of its slots. Two stalled
+/// clients with five and three addresses fit in six slots, where the first
+/// alone used to take five.
+#[tokio::test]
+async fn sp_scans_per_connection_leave_slots_for_others() {
+    let chain = sp_chain_paying_every_height("el-sp-per-conn", 15);
+    let cfg = sp_cfg_slots(6);
+    let mut one = sp_session_with(&chain.q, cfg.clone(), SP_STALL_BUF);
+    let lines: Vec<String> = (0..5u8)
+        .map(|w| sp_subscribe_line(u32::from(w) + 1, chain.sub_for(w, json!(0))))
+        .collect();
+    for reply in one.ask(&lines).await {
+        sp_accepted(&reply);
+    }
+    let mut two = sp_session_with(&chain.q, cfg, SP_STALL_BUF);
+    let lines: Vec<String> = (5..8u8)
+        .map(|w| sp_subscribe_line(u32::from(w) + 1, chain.sub_for(w, json!(0))))
+        .collect();
+    for reply in two.ask(&lines).await {
+        sp_accepted(&reply);
+    }
+}
+
+/// Subscribes that wait for a slot are scanned when the connection's
+/// earlier scans finish: five addresses on one reading client each get a
+/// whole history.
+#[tokio::test]
+async fn sp_waiting_subscribes_scan_in_turn() {
+    let chain = sp_chain_paying_every_height("el-sp-turns", 15);
+    let mut s = sp_session_with(&chain.q, sp_cfg_slots(32), 1 << 16);
+    let lines: Vec<String> = (0..5u8)
+        .map(|w| sp_subscribe_line(u32::from(w) + 1, chain.sub_for(w, json!(0))))
+        .collect();
+    let replies = s.ask(&lines).await;
+    let mut open: Vec<Value> = replies
+        .iter()
+        .map(|r| {
+            sp_accepted(r);
+            r["result"].clone()
+        })
+        .collect();
+    while !open.is_empty() {
+        let note = sp_next_line(&mut s.client).await;
+        let params = note["params"].as_array().expect("positional note");
+        if params[1].as_f64() == Some(1.0) {
+            open.retain(|sub| sub != &params[0]);
+        }
+    }
+}
+
 /// History scans are capped across connections. A subscribe past the cap is
 /// refused in its reply. Subscribing again hands a scan's slot on, and a
 /// scan that reaches the tip frees its slot.

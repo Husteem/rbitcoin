@@ -94,6 +94,12 @@ pub const DEFAULT_MAX_SP_SUBS: usize = 16;
 /// connection. The per-connection cap alone leaves connections x addresses.
 /// A subscribe past this is refused until a scan ends. Not a knob.
 pub const DEFAULT_MAX_SP_SCANS: usize = 32;
+/// History scans one connection runs at once, as many as the scans' shared
+/// store-read turns ([`crate::silent_scan::SP_SCAN_PERMITS`]). Its other
+/// subscribes wait and take the slot a finished scan of the connection
+/// hands on, so a few connections cannot hold every slot of
+/// [`DEFAULT_MAX_SP_SCANS`].
+pub const MAX_SP_SCANS_PER_CONN: usize = crate::silent_scan::SP_SCAN_PERMITS;
 /// Idle read timeout — disconnect quiet clients (DoS of FD/tasks).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Max raw tx hex chars for `transaction.broadcast` (~4 MiB wire → 8 MiB hex).
@@ -486,9 +492,15 @@ pub struct ElectrumConn {
     pub outpoint_subs: HashSet<([u8; 32], u32)>,
     /// Silent-payment subscriptions whose history has been sent.
     sp_subs: Vec<SpLive>,
-    /// History scans of subscribes that have not reached the tip. An address
-    /// is in one of the two lists, once.
+    /// History scans of subscribes that have not reached the tip, at most
+    /// [`MAX_SP_SCANS_PER_CONN`]. An address is in one of the three lists,
+    /// once.
     sp_scans: Vec<SpScanRun>,
+    /// Subscribes accepted past [`MAX_SP_SCANS_PER_CONN`], scanned in turn
+    /// with the slots this connection's scans hand on.
+    sp_waiting: std::collections::VecDeque<crate::silent_scan::SpSub>,
+    /// Slots of scans that ended, for the next waiting subscribe.
+    sp_spare: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl ElectrumConn {
@@ -502,6 +514,8 @@ impl ElectrumConn {
             outpoint_subs: HashSet::new(),
             sp_subs: Vec::new(),
             sp_scans: Vec::new(),
+            sp_waiting: std::collections::VecDeque::new(),
+            sp_spare: Vec::new(),
         }
     }
 }
@@ -540,6 +554,7 @@ where
     let mut read_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        start_waiting_sp_scans(&mut conn, &query, &params, config.sp_scan_chunk);
         let read_by =
             *read_deadline.get_or_insert_with(|| tokio::time::Instant::now() + writer.idle());
         let stop_wait = stop.notified();
@@ -1104,6 +1119,8 @@ fn read_conn(conn: &mut ElectrumConn, method: &str) -> ElectrumConn {
         outpoint_subs: HashSet::new(),
         sp_subs: Vec::new(),
         sp_scans: Vec::new(),
+        sp_waiting: std::collections::VecDeque::new(),
+        sp_spare: Vec::new(),
     }
 }
 
@@ -1303,6 +1320,8 @@ async fn answer_one(
         outpoint_subs: std::mem::take(&mut conn.outpoint_subs),
         sp_subs: std::mem::take(&mut conn.sp_subs),
         sp_scans: std::mem::take(&mut conn.sp_scans),
+        sp_waiting: std::mem::take(&mut conn.sp_waiting),
+        sp_spare: std::mem::take(&mut conn.sp_spare),
     };
     let (result, work, stamped, _ran) = spawn_dispatch(ctx, work, &asked)
         .await
@@ -1397,7 +1416,6 @@ where
     W: AsyncWrite + Unpin,
 {
     let max_subs = config.max_sp_subs;
-    let tip = query.tip_height().map(|h| h.0);
     let mut sub = match parse_sp_sub(params_v, query, chain).await {
         Ok(s) => s,
         Err(e) => {
@@ -1414,7 +1432,7 @@ where
         // An open subscription stays open. Two ranges keep the later end.
         sub.end = sub.end.zip(end).map(|(new, held)| new.max(held));
     }
-    let held = conn.sp_subs.len() + conn.sp_scans.len();
+    let held = conn.sp_subs.len() + conn.sp_scans.len() + conn.sp_waiting.len();
     if held_range.is_none() && held >= max_subs {
         let message = format!("subscription limit reached ({max_subs}) for this connection");
         writer
@@ -1439,15 +1457,17 @@ where
         return Ok(());
     }
     // One slot per running scan, process-wide. A scan this subscribe
-    // replaces hands its slot on.
+    // replaces hands its slot on. Past `MAX_SP_SCANS_PER_CONN` running here,
+    // the subscribe waits for one of them to hand its slot on.
     let replaced = conn
         .sp_scans
         .iter()
         .position(|run| run.sub.address == sub.address)
         .map(|i| conn.sp_scans.remove(i));
     let slot = match replaced {
-        Some(run) => run.slot,
-        None => {
+        Some(run) => Some(run.slot),
+        None if conn.sp_scans.len() >= MAX_SP_SCANS_PER_CONN => None,
+        None => Some({
             match Arc::clone(&config.sp_scan_slots).try_acquire_owned() {
                 Ok(slot) => slot,
                 Err(_) => {
@@ -1458,7 +1478,7 @@ where
                     return Ok(());
                 }
             }
-        }
+        }),
     };
     let result = crate::silent_scan::subscribe_result(&sub);
     rbitcoin_log::api_call(
@@ -1470,19 +1490,48 @@ where
         None,
     );
     writer.line(rpc_result(&id, &result, None)).await?;
-    let last = sub.end.unwrap_or(tip.unwrap_or(sub.start).max(sub.start));
     drop_sp_address(conn, &sub.address);
-    let from = sub.start;
-    conn.sp_scans.push(SpScanRun::start(
-        query,
-        chain,
-        sub,
-        from,
-        last,
-        config.sp_scan_chunk,
-        slot,
-    ));
+    match slot {
+        Some(slot) => start_sp_scan(conn, query, chain, sub, config.sp_scan_chunk, slot),
+        None => conn.sp_waiting.push_back(sub),
+    }
     Ok(())
+}
+
+/// Scan `sub` from its start to its end, or to the tip, in `slot`.
+fn start_sp_scan(
+    conn: &mut ElectrumConn,
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+    sub: crate::silent_scan::SpSub,
+    chunk: u32,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) {
+    let tip = query.tip_height().map(|h| h.0);
+    let last = sub.end.unwrap_or(tip.unwrap_or(sub.start).max(sub.start));
+    let from = sub.start;
+    conn.sp_scans
+        .push(SpScanRun::start(query, chain, sub, from, last, chunk, slot));
+}
+
+/// Hand the slots of scans that ended to this connection's waiting
+/// subscribes, oldest first, and give back the rest.
+fn start_waiting_sp_scans(
+    conn: &mut ElectrumConn,
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+    chunk: u32,
+) {
+    while conn.sp_scans.len() < MAX_SP_SCANS_PER_CONN {
+        let Some(slot) = conn.sp_spare.pop() else {
+            break;
+        };
+        let Some(sub) = conn.sp_waiting.pop_front() else {
+            break;
+        };
+        start_sp_scan(conn, query, chain, sub, chunk, slot);
+    }
+    conn.sp_spare.clear();
 }
 
 /// The start, and the end of a closed range, of the connection's
@@ -1491,14 +1540,21 @@ fn sp_held_range(conn: &ElectrumConn, address: &str) -> Option<(u32, Option<u32>
     let live = conn.sp_subs.iter().map(|live| &live.sub);
     let scanning = conn.sp_scans.iter().map(|run| &run.sub);
     live.chain(scanning)
+        .chain(conn.sp_waiting.iter())
         .find(|sub| sub.address == address)
         .map(|sub| (sub.start, sub.end))
 }
 
-/// End the subscription to `address`, live or still scanning.
+/// End the subscription to `address`, live, scanning or waiting. A scan's
+/// slot is kept for this connection's next waiting subscribe.
 fn drop_sp_address(conn: &mut ElectrumConn, address: &str) {
     conn.sp_subs.retain(|live| live.sub.address != address);
-    conn.sp_scans.retain(|run| run.sub.address != address);
+    conn.sp_waiting.retain(|sub| sub.address != address);
+    let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut conn.sp_scans)
+        .into_iter()
+        .partition(|run| run.sub.address == address);
+    conn.sp_scans = kept;
+    conn.sp_spare.extend(gone.into_iter().map(|run| run.slot));
 }
 
 /// Parse against the confirmed chain: its tip, and its header times for a
