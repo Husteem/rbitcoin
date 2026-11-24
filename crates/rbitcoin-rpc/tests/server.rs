@@ -1940,6 +1940,18 @@ async fn rest_waits_on_its_share_before_the_store_budget() {
     }
     assert_eq!(rest_store_share(1), 1);
     assert_eq!(rest_store_share(7), 3);
+    // The share is sized from the configured budget, not from what happens
+    // to be free when the listener binds.
+    ctx.query.set_api_read_budget(8);
+    let busy = ctx
+        .query
+        .api_read_budget()
+        .acquire_many_owned(7)
+        .await
+        .expect("permits");
+    assert_eq!(ctx.query.api_read_budget_size(), 8);
+    assert_eq!(rest_store_share(ctx.query.api_read_budget_size()), 4);
+    drop(busy);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

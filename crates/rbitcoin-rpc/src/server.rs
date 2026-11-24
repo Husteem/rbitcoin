@@ -263,7 +263,7 @@ pub async fn run_rpc(
     let work_queue = Arc::new(tokio::sync::Semaphore::new(n));
     let rest_queue = Arc::new(tokio::sync::Semaphore::new(DEFAULT_RPC_WORK_QUEUE));
     let rest_store = Arc::new(tokio::sync::Semaphore::new(rest_store_share(
-        ctx.query.api_read_budget().available_permits(),
+        ctx.query.api_read_budget_size(),
     )));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, _) = tokio::sync::watch::channel(());
@@ -443,9 +443,10 @@ pub async fn rest_entry(State(state): State<AppState>, req: axum::extract::Reque
     let ctx = Arc::clone(&state.ctx);
     // REST's share first, then a budget permit: REST alone cannot take every
     // permit the other readers share.
-    let Ok(share) = Arc::clone(&state.rest_store).acquire_owned().await else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let share = Arc::clone(&state.rest_store)
+        .acquire_owned()
+        .await
+        .expect("REST store share");
     let store_permit = acquire_store_budget(&ctx).await;
     let reply = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
