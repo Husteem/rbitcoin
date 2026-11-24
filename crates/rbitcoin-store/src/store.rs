@@ -328,6 +328,9 @@ pub struct Store {
     pub header_txs: HeaderTxsTable,
     /// Resident create-height fence (confirmed[] + header_txs). No `tx_height.body`.
     pub height_fence: std::sync::RwLock<HeightFence>,
+    /// [`Self::get_fk_by_txid_tip_height`] calls. Debug builds only.
+    #[cfg(debug_assertions)]
+    pub tip_txid_lookups: std::sync::atomic::AtomicU64,
     /// BIP113 window at the fence tip (extend O(1); pop rebuilds).
     pub mtp_ring: std::sync::RwLock<MtpRing>,
     /// Latest confirm height plus one. Zero means no snapshot yet.
@@ -496,6 +499,8 @@ impl Store {
             header_txs: HeaderTxsTable::create(&path)?,
             height_fence: std::sync::RwLock::new(HeightFence::empty()),
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
+            #[cfg(debug_assertions)]
+            tip_txid_lookups: std::sync::atomic::AtomicU64::new(0),
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
@@ -567,6 +572,8 @@ impl Store {
             header_txs,
             height_fence: std::sync::RwLock::new(height_fence),
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
+            #[cfg(debug_assertions)]
+            tip_txid_lookups: std::sync::atomic::AtomicU64::new(0),
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
@@ -1290,6 +1297,13 @@ impl Store {
     }
 
     /// Confirm / consensus: connected instance only.
+    /// Sample-and-reset [`Self::tip_txid_lookups`].
+    #[cfg(debug_assertions)]
+    pub fn sample_reset_tip_txid_lookups(&self) -> u64 {
+        self.tip_txid_lookups
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn get_fk_by_txid_tip(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
         Ok(self.get_fk_by_txid_tip_height(txid)?.map(|(fk, _)| fk))
     }
@@ -1301,6 +1315,9 @@ impl Store {
         &self,
         txid: &[u8; 32],
     ) -> Result<Option<(Fk, u32)>, StoreError> {
+        #[cfg(debug_assertions)]
+        self.tip_txid_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let fks = self.txs.fks_by_txid(txid)?;
         let heights = self.tx_height_get_batch(&fks)?;
         Ok(fks
@@ -1689,8 +1706,23 @@ impl Store {
         out_index: u32,
         tip: Option<u32>,
     ) -> Result<Vec<PointRecord>, StoreError> {
+        let Some(create_fk) = self.get_fk_by_txid_tip(out_txid)? else {
+            return Ok(Vec::new());
+        };
+        self.spenders_at_fk(out_txid, create_fk, out_index, tip)
+    }
+
+    /// [`Self::spenders_at`] for a create the caller already resolved, so
+    /// the outputs of one tx share one txid lookup.
+    pub fn spenders_at_fk(
+        &self,
+        out_txid: &[u8; 32],
+        create_fk: Fk,
+        out_index: u32,
+        tip: Option<u32>,
+    ) -> Result<Vec<PointRecord>, StoreError> {
         let mut out = Vec::new();
-        for rec in self.spenders_raw(out_txid, out_index)? {
+        for rec in self.spenders_raw_fk(out_txid, create_fk, out_index)? {
             if self.is_confirmed_strong_at(rec.spending_tx_fk, tip)? {
                 out.push(rec);
             }
@@ -1708,6 +1740,15 @@ impl Store {
         let Some(create_fk) = self.get_fk_by_txid_tip(out_txid)? else {
             return Ok(Vec::new());
         };
+        self.spenders_raw_fk(out_txid, create_fk, out_index)
+    }
+
+    fn spenders_raw_fk(
+        &self,
+        out_txid: &[u8; 32],
+        create_fk: Fk,
+        out_index: u32,
+    ) -> Result<Vec<PointRecord>, StoreError> {
         let mut out = Vec::new();
         point_table::for_each_spender_create(
             &self.txs,

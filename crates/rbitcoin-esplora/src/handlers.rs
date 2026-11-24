@@ -868,12 +868,13 @@ pub fn write_outspends(
     nout: u32,
     view: Option<&rbitcoin_query::ChainView>,
 ) -> Result<(), rbitcoin_query::QueryError> {
+    let create = spend_create(query, txid, view)?;
     out.push(b'[');
     for vout in 0..nout {
         if vout > 0 {
             out.push(b',');
         }
-        let slot = outspend_json(query, mempool, txid, vout, view)?;
+        let slot = outspend_slot(query, mempool, txid, create, vout, view)?;
         serde_json::to_writer(&mut *out, &slot).expect("Value encodes into a Vec");
     }
     out.push(b']');
@@ -887,8 +888,36 @@ pub fn outspend_json(
     vout: u32,
     view: Option<&rbitcoin_query::ChainView>,
 ) -> Result<Value, rbitcoin_query::QueryError> {
-    if let Some(view) = view {
-        let spenders = query.spenders_at(txid, vout, Some(view.height.0))?;
+    let create = spend_create(query, txid, view)?;
+    outspend_slot(query, mempool, txid, create, vout, view)
+}
+
+/// The confirmed create of `txid` whose spends a view reads, looked up once
+/// for every output of the tx.
+fn spend_create(
+    query: &Query,
+    txid: &[u8; 32],
+    view: Option<&rbitcoin_query::ChainView>,
+) -> Result<Option<Fk>, rbitcoin_query::QueryError> {
+    if view.is_none() {
+        return Ok(None);
+    }
+    query.store().get_fk_by_txid_tip(txid)
+}
+
+/// [`outspend_json`] for the create [`spend_create`] resolved.
+fn outspend_slot(
+    query: &Query,
+    mempool: Option<&MempoolHub>,
+    txid: &[u8; 32],
+    create: Option<Fk>,
+    vout: u32,
+    view: Option<&rbitcoin_query::ChainView>,
+) -> Result<Value, rbitcoin_query::QueryError> {
+    if let (Some(view), Some(create)) = (view, create) {
+        let spenders = query
+            .store()
+            .spenders_at_fk(txid, create, vout, Some(view.height.0))?;
         if !spenders.is_empty() {
             let p = &spenders[0];
             let spend_txid = query.store().txs.body_txid(p.spending_tx_fk)?;
