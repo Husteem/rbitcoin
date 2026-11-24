@@ -812,7 +812,8 @@ pub use rbitcoin_net::MIN_BLOCKING_POOL;
 
 /// Read-only batch items one connection may have in flight for a blocking
 /// pool of `blocking_pool` threads: half of it, at least one. Each item holds
-/// a thread while it runs and its reply until written. Block decode, compact
+/// a thread while it runs, and its reply until written within
+/// [`BATCH_HELD_BYTES`]. Block decode, compact
 /// reconstruct, header jobs and mempool accept share that pool
 /// (`docs/concurrency.md`), so one batch leaves them the other half.
 pub fn batch_window(blocking_pool: usize) -> usize {
@@ -1086,9 +1087,9 @@ fn hold_reply(
 /// `i` is written before read `i + window` starts, so a client that
 /// stops reading stops the work. The finished replies it holds unwritten
 /// stay within [`BATCH_HELD_BYTES`], or one reply: a read that finishes
-/// past that drops its reply and runs again at its slot. Any other item waits until every earlier slot is
-/// written, then runs alone, so later items see what it did. A batch of
-/// only notifications writes nothing.
+/// past that drops its reply and runs again at its slot. Any other item
+/// waits until every earlier slot is written, then runs alone, so later
+/// items see what it did. A batch of only notifications writes nothing.
 async fn answer_batch<W: AsyncWrite + Unpin>(
     ctx: &RequestCtx<'_>,
     conn: &mut ElectrumConn,

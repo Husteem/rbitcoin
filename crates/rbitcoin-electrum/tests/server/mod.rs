@@ -1004,14 +1004,20 @@ fn at(trace: &[BatchStep], step: BatchStep) -> usize {
         .unwrap_or_else(|| panic!("{step:?} missing from {trace:?}"))
 }
 
-/// A batch whose client stops reading holds a bounded amount of finished
-/// replies. Four `transaction.get` reads of a transaction whose hex is
-/// larger than `BATCH_HELD_BYTES` run in a window of four while the client
-/// reads nothing: one reply is held, the others run again at their slots,
-/// and every slot still arrives, in order.
+/// A connection over a 64 KiB duplex to a store holding one transaction
+/// whose output script is `script` bytes, batched `window` reads at a time.
+/// Returns the client, the store dir, the transaction's id hex, and the
+/// tip sender, which keeps the connection open.
 #[cfg(debug_assertions)]
-#[tokio::test]
-async fn stalled_batch_holds_bounded_reply_bytes() {
+fn big_tx_conn(
+    script: usize,
+    window: usize,
+) -> (
+    BufReader<tokio::io::DuplexStream>,
+    rbitcoin_query::testutil::TempDir,
+    String,
+    broadcast::Sender<TipNotify>,
+) {
     use rbitcoin_query::TxApply;
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 
@@ -1046,13 +1052,13 @@ async fn stalled_batch_holds_bounded_reply_bytes() {
             script_sig: vec![0],
             witness: vec![],
         }],
-        outputs: vec![OutputRecord::unspent(1, vec![0x6a; 600_000])],
+        outputs: vec![OutputRecord::unspent(1, vec![0x6a; script])],
     };
     q.connect_block(Height(0), &header, &[ta]).unwrap();
     let params = ChainParams::regtest();
     let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    cfg.batch_window = 4;
-    let (_tip_tx, tip_rx) = broadcast::channel(4);
+    cfg.batch_window = window;
+    let (tip_tx, tip_rx) = broadcast::channel(4);
     let (client, server) = tokio::io::duplex(1 << 16);
     tokio::spawn(handle_client(
         server,
@@ -1066,15 +1072,34 @@ async fn stalled_batch_holds_bounded_reply_bytes() {
     ));
     let mut shown = txid;
     shown.reverse();
-    let txid_hex = rbitcoin_primitives::hex_encode(shown);
-    let items: Vec<Value> = (0..4)
-        .map(|id| {
-            json!({"jsonrpc":"2.0","id":id,"method":"blockchain.transaction.get","params":[txid_hex]})
-        })
+    (
+        BufReader::new(client),
+        dir,
+        rbitcoin_primitives::hex_encode(shown),
+        tip_tx,
+    )
+}
+
+/// `n` `transaction.get` items for `txid_hex` as one batch line.
+fn tx_get_batch(txid_hex: &str, n: usize) -> String {
+    let items: Vec<Value> = (0..n)
+        .map(|id| json!({"jsonrpc":"2.0","id":id,"method":"blockchain.transaction.get","params":[txid_hex]}))
         .collect();
     let mut line = serde_json::to_string(&items).unwrap();
     line.push('\n');
-    let mut client = BufReader::new(client);
+    line
+}
+
+/// A batch whose client stops reading holds a bounded amount of finished
+/// replies. Four `transaction.get` reads of a transaction whose hex is
+/// larger than `BATCH_HELD_BYTES` run in a window of four while the client
+/// reads nothing: one reply is held, the others run again at their slots,
+/// and every slot still arrives, in order.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn stalled_batch_holds_bounded_reply_bytes() {
+    let (mut client, dir, txid_hex, _tip_tx) = big_tx_conn(600_000, 4);
+    let line = tx_get_batch(&txid_hex, 4);
     let _ = take_batch_held_peak();
     batch_trace_arm();
     client.get_mut().write_all(line.as_bytes()).await.unwrap();
@@ -1111,6 +1136,31 @@ async fn stalled_batch_holds_bounded_reply_bytes() {
         .filter(|s| matches!(s, BatchStep::Again(_)))
         .count();
     assert!((1..=3).contains(&again), "{trace:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Held reply bytes go down as slots are written: eight ~300 KB replies in a
+/// window of three, read as they come, never hold past `BATCH_HELD_BYTES`,
+/// so no read runs again.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn read_batch_releases_held_bytes_as_slots_are_written() {
+    let (mut client, dir, txid_hex, _tip_tx) = big_tx_conn(150_000, 3);
+    let line = tx_get_batch(&txid_hex, 8);
+    batch_trace_arm();
+    client.get_mut().write_all(line.as_bytes()).await.unwrap();
+    let mut reply = String::new();
+    tokio::time::timeout(Duration::from_secs(10), client.read_line(&mut reply))
+        .await
+        .expect("the batch reply")
+        .unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply.as_array().map(Vec::len), Some(8));
+    let trace = batch_trace_snapshot();
+    assert!(
+        !trace.iter().any(|s| matches!(s, BatchStep::Again(_))),
+        "three replies fit, so none ran again: {trace:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
