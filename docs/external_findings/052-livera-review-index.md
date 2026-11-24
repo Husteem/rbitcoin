@@ -9,7 +9,7 @@ steps.
 | C1 | critical | Unbounded parent-request tracker | fixed | `parent_req_stops_at_per_peer_cap`, `rows_are_bounded_per_live_peer`, `second_peer_take_due_does_not_drop_other_peers_keys` ([053](./053-parent-req-cap.md)) |
 | N2 | low | Wtxid follow-up requested as a txid | fixed | `wtxid_followup_is_requested_as_wtx` ([054](./054-wtxid-getdata.md)) |
 | H1 | high | Decoy and invalid-type packets skip the rate window | fixed | `decoy_packet_is_handed_to_the_rate_hook` ([055](./055-decoy-rate.md)) |
-| H2 | high | Inbound eviction drops the longest-connected peer | fixed | `eviction_drops_the_newest_in_the_largest_netgroup` ([060](./060-evict-newest-netgroup.md)) |
+| H2 | high | Inbound eviction drops the longest-connected peer | fixed | `half_the_rest_is_kept_by_uptime` ([060](./060-evict-newest-netgroup.md)) |
 | H2-ban | high | Misbehavior disconnect is not remembered | fixed | `misbehavior_disconnect_refuses_the_same_address` ([061](./061-misbehavior-remembered.md)) |
 | H3 | high | REST always on and shares the RPC work queue | fixed | `rest_is_404_without_the_flag` ([063](./063-rest-own-queue.md)) |
 | H4 | medium | Silent-payment unsubscribe logs the scan secret | fixed | `api_call_redacts_scan_secrets_and_ext_privkeys` ([064](./064-api-log-redaction.md)) |

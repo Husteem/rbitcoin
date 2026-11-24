@@ -638,6 +638,9 @@ pub struct LivePeer {
     pub tcp_shutdown: Mutex<Option<std::net::TcpStream>>,
     /// VERSION+VERACK finished. Connecting rows stay false (`p2p_timeouts`).
     pub handshake_complete: AtomicBool,
+    /// The VERSION offered every service this node wanted for its tip then
+    /// (Core `m_has_all_wanted_services`). Inbound eviction reads it.
+    pub wanted_services: AtomicBool,
     /// BIP324 transport finished. False while EARLY_KEY_RESPONSE / garbage.
     pub v2_transport_ready: AtomicBool,
     /// Block hashes this session already asked other high-bandwidth peers to send.
@@ -808,6 +811,11 @@ impl LivePeer {
 
     pub fn mark_handshake_complete(&self) {
         self.handshake_complete.store(true, Ordering::Release);
+    }
+
+    /// Record whether the VERSION offered every wanted service.
+    pub fn set_wanted_services(&self, wanted: bool) {
+        self.wanted_services.store(wanted, Ordering::Relaxed);
     }
 
     pub fn handshake_complete(&self) -> bool {
@@ -2197,6 +2205,9 @@ pub struct PeerHub {
     pub discouraged_addrs: Mutex<HashMap<DiscourageKey, u64>>,
     /// Netgroup → unix second a slot-loss refusal ends.
     pub discouraged_groups: Mutex<HashMap<u64, u64>>,
+    /// This process's secret SipHash key for keyed netgroups (Core
+    /// `nKeyedNetGroup`): inbound eviction orders peers by it.
+    pub netgroup_key: std::hash::RandomState,
     /// Rate-limit disconnect key → unix second its strike ends.
     pub rate_strikes: Mutex<HashMap<DiscourageKey, u64>>,
     /// This node's version messages include `NODE_COMPACT_FILTERS`.
@@ -2448,6 +2459,7 @@ impl PeerHub {
             overlay_loopback_forward: AtomicBool::new(false),
             discouraged_addrs: Mutex::new(HashMap::new()),
             discouraged_groups: Mutex::new(HashMap::new()),
+            netgroup_key: std::hash::RandomState::new(),
             rate_strikes: Mutex::new(HashMap::new()),
             compact_filters: AtomicBool::new(false),
             incomplete_inbound: Mutex::new(HashMap::new()),
@@ -3726,6 +3738,7 @@ impl PeerHub {
             writer_abort: Mutex::new(None),
             tcp_shutdown: Mutex::new(None),
             handshake_complete: AtomicBool::new(false),
+            wanted_services: AtomicBool::new(false),
             v2_transport_ready: AtomicBool::new(false),
             hb_body_fanned: Mutex::new(HashSet::new()),
             v1_transport: AtomicBool::new(false),
@@ -4626,7 +4639,9 @@ impl PeerHub {
     }
 
     fn evict_inbound_from(&self, eligible: impl Fn(&LivePeer) -> bool, why: &str) -> bool {
+        use std::hash::BuildHasher;
         let now = self.now_secs();
+        let onion_bind = self.onion_bind();
         let cands: Vec<crate::eviction::InboundEvictCandidate> = self
             .live_peers()
             .into_iter()
@@ -4639,8 +4654,12 @@ impl PeerHub {
                     min_ping: minping,
                     last_block: p.last_block.load(Ordering::Relaxed),
                     last_tx: p.last_transaction.load(Ordering::Relaxed),
-                    netgroup: p.netgroup,
+                    netgroup: self.netgroup_key.hash_one(p.netgroup),
                     noban: p.session_noban(),
+                    relay_txs: p.relay,
+                    relevant_services: p.wanted_services.load(Ordering::Relaxed),
+                    is_local: crate::eviction::is_local_addr(&p.net),
+                    network: crate::eviction::evict_net(&p.net, p.addrbind, onion_bind),
                 }
             })
             .collect();
