@@ -1196,7 +1196,9 @@ async fn tx_routes(addr: SocketAddr, txid: &str) -> Vec<(String, u16, String)> {
 
 /// A transaction that was in a block, is no longer on the active chain, and is
 /// not in the mempool is gone: 404 on every `/tx/:txid` route. It answers
-/// `confirmed: false` only while the mempool holds it.
+/// `confirmed: false` only while the mempool holds it. A txid that is neither
+/// stored nor in the mempool answers `200 {"confirmed":false}` on `/status`, as
+/// electrs does, and 404 on the routes that return the transaction.
 #[tokio::test(flavor = "current_thread")]
 async fn reorged_out_tx_is_404_unless_the_mempool_holds_it() {
     use bitcoin::absolute::LockTime;
@@ -1301,8 +1303,14 @@ async fn reorged_out_tx_is_404_unless_the_mempool_holds_it() {
             assert_eq!(st, 404, "reorged out, not in the mempool: {path}: {body}");
         }
     }
-    let (st, body) = http_get(pad.addr, &format!("/tx/{}/status", "ee".repeat(32))).await;
-    assert_eq!((st, body.as_str()), (404, "Not Found"));
+    let unknown = "ee".repeat(32);
+    for (path, st, body) in tx_routes(pad.addr, &unknown).await {
+        if path.ends_with("/status") {
+            assert_eq!((st, body.as_str()), (200, r#"{"confirmed":false}"#));
+        } else {
+            assert_eq!((st, body.as_str()), (404, "Not Found"), "never seen: {path}");
+        }
+    }
 
     // The mempool takes the non-conflicting one back: pending, not gone.
     let (st, body) = http_post(pad.addr, "/tx", serialize_hex(&dropped).as_bytes()).await;
@@ -1330,6 +1338,8 @@ async fn reorged_out_tx_is_404_unless_the_mempool_holds_it() {
     let asof = block_hash_hex(&pad.hashes[0]);
     let (st, body) = http_get(pad.addr, &format!("/tx/{}/status?asof={asof}", ids[1])).await;
     assert_eq!((st, body.as_str()), (200, r#"{"confirmed":false}"#));
+    let (st, _) = http_get(pad.addr, &format!("/tx/{unknown}/status?asof={asof}")).await;
+    assert_eq!(st, 404, "asof never answers for a txid the store never saw");
 
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -1526,9 +1536,9 @@ async fn unlisted_tx_is_503_while_a_reorg_holds_the_pool() {
     for (path, st, body) in tx_routes(pad.addr, &id).await {
         assert_eq!((st, body.as_str()), (503, "chain view moved"), "{path}");
     }
-    // A txid the store never saw is a plain 404 at any time.
-    let (st, _) = http_get(pad.addr, &format!("/tx/{}/status", "ee".repeat(32))).await;
-    assert_eq!(st, 404);
+    // A txid the store never saw is unconfirmed at any time.
+    let (st, body) = http_get(pad.addr, &format!("/tx/{}/status", "ee".repeat(32))).await;
+    assert_eq!((st, body.as_str()), (200, r#"{"confirmed":false}"#));
     drop(hold);
     for (path, st, body) in tx_routes(pad.addr, &id).await {
         assert_eq!((st, body.as_str()), (404, "Not Found"), "{path}");
