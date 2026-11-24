@@ -639,7 +639,10 @@ async fn hostile_addr_relay(
         };
         assert_eq!(sent, &list);
         let nbytes = serialize(&got).len();
-        let want = sending_addrv2_log(nbytes, batched_id.expect("neighbor id"));
+        let want = format!(
+            "p2p: {}",
+            sending_addrv2_log(nbytes, batched_id.expect("neighbor id"))
+        );
         assert!(
             lines.iter().any(|(_, l)| l == &want),
             "missing {want:?} in {lines:?}"
