@@ -107,6 +107,7 @@ fn core_limits_documented() {
     }
     let mut at_cap = vec![0xfd];
     at_cap.extend_from_slice(&50_000u16.to_le_bytes());
+    at_cap.resize(at_cap.len() + 50_000 * 36, 0);
     let at_cap = FramedMessage {
         magic: Magic::from(bitcoin::Network::Regtest),
         command: *b"inv\0\0\0\0\0\0\0\0\0",
@@ -638,4 +639,123 @@ fn walk_cmpctblock_rejects_one_prefill_in_twelve_bytes() {
         matches!(walk_cmpctblock(&mut cur), Bound::TooLarge(_)),
         "one prefill needs more than twelve bytes"
     );
+}
+
+/// Each count-prefixed command outside the tx family: the bytes before its
+/// compact-size count and the fewest bytes one item can take.
+const COUNTED: [(&str, usize, u64); 10] = [
+    ("addr", 0, 30),
+    ("addrv2", 0, 9),
+    ("inv", 0, 36),
+    ("getdata", 0, 36),
+    ("notfound", 0, 36),
+    ("getheaders", 4, 32),
+    ("getblocks", 4, 32),
+    ("cfheaders", 65, 32),
+    ("cfcheckpt", 33, 32),
+    ("getblocktxn", 32, 1),
+];
+
+/// `prefix` zero bytes, a compact-size `count`, then `body` zero bytes.
+fn counted_payload(prefix: usize, count: u64, body: usize) -> Vec<u8> {
+    use bitcoin::consensus::encode::{Encodable, VarInt};
+    let mut p = vec![0u8; prefix];
+    VarInt(count)
+        .consensus_encode(&mut p)
+        .unwrap_or_else(|e| panic!("encode count: {e}"));
+    p.resize(p.len() + body, 0);
+    p
+}
+
+#[test]
+fn a_count_that_cannot_fit_is_message_too_large() {
+    for (name, prefix, min_each) in COUNTED {
+        let body = 4 * usize::try_from(min_each).unwrap_or(usize::MAX);
+        match frame(padded(name), counted_payload(prefix, 5, body)).try_decode() {
+            Err(rbitcoin_net::error::NetError::MessageTooLarge(n)) => assert_eq!(n, 5, "{name}"),
+            other => panic!("{name}: 5 items in 4 items of bytes must be refused, got {other:?}"),
+        }
+        match frame(padded(name), counted_payload(prefix, 1_000, 2)).try_decode() {
+            Err(rbitcoin_net::error::NetError::MessageTooLarge(n)) => {
+                assert_eq!(n, 1_000, "{name}")
+            }
+            other => panic!("{name}: a short frame with a large count, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn a_count_that_fits_is_left_to_the_decoder() {
+    for (name, prefix, min_each) in COUNTED {
+        let body = 4 * usize::try_from(min_each).unwrap_or(usize::MAX);
+        let r = frame(padded(name), counted_payload(prefix, 4, body)).try_decode();
+        assert!(
+            !matches!(r, Err(rbitcoin_net::error::NetError::MessageTooLarge(_))),
+            "{name}: 4 items in exactly 4 items of bytes must reach the decoder"
+        );
+        let r = frame(padded(name), vec![0u8; prefix]).try_decode();
+        assert!(
+            !matches!(r, Err(rbitcoin_net::error::NetError::MessageTooLarge(_))),
+            "{name}: a frame cut before its count is the decoder's to refuse"
+        );
+    }
+}
+
+#[test]
+fn counted_messages_still_decode() {
+    use bitcoin::bip152::BlockTransactionsRequest;
+    use bitcoin::hashes::Hash as _;
+    use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
+    use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
+    use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders};
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::{BlockHash, FilterHash, FilterHeader, Txid};
+
+    let hash = BlockHash::from_byte_array([7u8; 32]);
+    let sock: std::net::SocketAddr = ([10, 0, 0, 1], 8333).into();
+    let v2 = AddrV2Message {
+        time: 1,
+        services: ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4([10, 0, 0, 1].into()),
+        port: 8333,
+    };
+    let gh = GetHeadersMessage::new(vec![hash, hash], BlockHash::all_zeros());
+    let filter_hashes = vec![FilterHash::from_byte_array([1u8; 32]); 3];
+    let filter_headers = vec![FilterHeader::from_byte_array([2u8; 32]); 3];
+    let msgs = vec![
+        NetworkMessage::Addr(vec![(1, Address::new(&sock, ServiceFlags::NETWORK)); 3]),
+        NetworkMessage::AddrV2(vec![v2.clone(), v2]),
+        NetworkMessage::Inv(vec![Inventory::Transaction(Txid::all_zeros()); 3]),
+        NetworkMessage::GetData(vec![Inventory::Block(hash); 2]),
+        NetworkMessage::NotFound(vec![Inventory::WTx(bitcoin::Wtxid::all_zeros())]),
+        NetworkMessage::GetHeaders(gh.clone()),
+        NetworkMessage::GetBlocks(bitcoin::p2p::message_blockdata::GetBlocksMessage::new(
+            gh.locator_hashes,
+            gh.stop_hash,
+        )),
+        NetworkMessage::CFHeaders(CFHeaders {
+            filter_type: 0,
+            stop_hash: hash,
+            previous_filter_header: FilterHeader::all_zeros(),
+            filter_hashes,
+        }),
+        NetworkMessage::CFCheckpt(CFCheckpt {
+            filter_type: 0,
+            stop_hash: hash,
+            filter_headers,
+        }),
+        NetworkMessage::GetBlockTxn(bitcoin::p2p::message_compact_blocks::GetBlockTxn {
+            txs_request: BlockTransactionsRequest {
+                block_hash: hash,
+                indexes: vec![0, 1, 5, 300],
+            },
+        }),
+    ];
+    for msg in msgs {
+        let name = msg.cmd();
+        let got = frame(padded(name), serialize(&msg))
+            .try_decode()
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(got.payload(), &msg, "{name}");
+    }
 }

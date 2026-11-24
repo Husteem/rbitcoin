@@ -4916,6 +4916,52 @@ fn bloom_disabled_messages_request_disconnect() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// An `addr`, `addrv2`, locator, `cfheaders` or `getblocktxn` frame that
+/// claims more items than its bytes can hold is refused before the decoder
+/// sizes a vector from that count, and scores like any oversize frame.
+#[test]
+fn short_counted_frames_disconnect_before_decode() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("short-counted");
+    hub.ensure_genesis().unwrap();
+    let (out_tx, _out_rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // 0xfe 0x00 0x09 0x3d 0x00 is a compact-size of 4_000_000.
+    let huge = [0xfe, 0x00, 0x09, 0x3d, 0x00];
+    for (command, prefix) in [
+        (*b"addr\0\0\0\0\0\0\0\0", 0),
+        (*b"addrv2\0\0\0\0\0\0", 0),
+        (*b"getheaders\0\0", 4),
+        (*b"getblocks\0\0\0", 4),
+        (*b"cfheaders\0\0\0", 65),
+        (*b"getblocktxn\0", 32),
+    ] {
+        let mut payload = vec![0u8; prefix];
+        payload.extend_from_slice(&huge);
+        payload.extend_from_slice(&[0u8; 64]);
+        let frame = FramedMessage {
+            magic: Magic::from(Network::Regtest),
+            command,
+            payload,
+        };
+        follow.ban_score = 0;
+        let r = rt.block_on(handle_peer_frame(frame, &hub, &out_tx, &mut follow, None));
+        assert!(
+            matches!(r, Err(NetError::MessageTooLarge(4_000_000))),
+            "{command:?}: got {r:?}"
+        );
+        assert!(
+            follow.ban_score >= BAN_SCORE_THRESHOLD,
+            "{command:?}: ban={}",
+            follow.ban_score
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `p2p_invalid_locator.py`: getheaders/getblocks with locator > MAX_LOCATOR_SZ disconnect.
 #[test]
 fn oversize_locator_request_disconnect() {
