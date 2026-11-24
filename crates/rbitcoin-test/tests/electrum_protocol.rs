@@ -1352,11 +1352,12 @@ async fn electrum_mempool_notify_follows_funding_and_rbf_on() {
 }
 
 /// A tip restatuses the subscribed outpoints its block spends, and the ones
-/// whose mempool spender has left the pool without an announce (here by
-/// expiry). Coin 0 is spent in the pool after its subscribe, coins 2 and 3
-/// before theirs, and coin 3 is unsubscribed; then every pool spender
-/// expires and the next block spends coin 1. Coins 0, 1 and 2 are pushed
-/// with their new status, and nothing else is.
+/// whose pool spender changed without an announce: a spender expired, or a
+/// rollback put one back. Coin 0 is spent in the pool after its subscribe,
+/// coins 2 and 3 before theirs, and coin 3 is unsubscribed; every pool
+/// spender expires. Then a rollback silently restores a new spender of coin
+/// 0 and one of the unspent coin 4, and the next block spends coin 1. Coins
+/// 0, 1, 2 and 4 are pushed with their new status, and nothing else is.
 #[test]
 fn electrum_tip_restatuses_spent_and_freed_outpoints() {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1389,11 +1390,7 @@ async fn electrum_tip_restatuses_spent_and_freed_outpoints_on() {
         }],
         output: vec![
             TxOut {
-                value: Amount::from_sat(if outs == 1 {
-                    11_0000_0000
-                } else {
-                    12_0000_0000
-                }),
+                value: Amount::from_sat(if outs == 1 { 8_0000_0000 } else { 9_0000_0000 }),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             };
             outs
@@ -1418,7 +1415,7 @@ async fn electrum_tip_restatuses_spent_and_freed_outpoints_on() {
             txid: coinbase_txids[0],
             vout: 0,
         },
-        4,
+        5,
     );
     let b102 = connect(tip, 102, vec![split.clone()]);
     let coin = |vout: u32| OutPoint {
@@ -1442,7 +1439,7 @@ async fn electrum_tip_restatuses_spent_and_freed_outpoints_on() {
     let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
     let hex = split.compute_txid().to_string();
     let subscribe = |vout: u32| json!([hex.clone(), vout]);
-    for vout in [0u32, 1] {
+    for vout in [0u32, 1, 4] {
         let v = rpc(
             &mut stream,
             u64::from(vout) + 1,
@@ -1473,7 +1470,7 @@ async fn electrum_tip_restatuses_spent_and_freed_outpoints_on() {
     }
     let v = rpc(
         &mut stream,
-        5,
+        6,
         "blockchain.outpoint.unsubscribe",
         subscribe(3),
     )
@@ -1481,6 +1478,15 @@ async fn electrum_tip_restatuses_spent_and_freed_outpoints_on() {
     assert_eq!(v["result"], true, "{v}");
     let ids: Vec<_> = spenders.iter().map(Transaction::compute_txid).collect();
     assert_eq!(mp.remove_expired_roots(&ids), 3);
+    // A rollback puts back a victim still in the relay index without an
+    // announce: a new spender of coin 0, and a first spender of coin 4.
+    let mut again = spend(coin(0), 1);
+    again.output[0].value = Amount::from_sat(7_0000_0000);
+    let silent = [again, spend(coin(4), 1)];
+    for tx in &silent {
+        mp.insert_relay_maps(tx.compute_txid(), tx.compute_wtxid(), 0, 0);
+    }
+    mp.restore_replaced(&silent);
 
     let b103 = connect(b102.block_hash(), 103, vec![spend(coin(1), 1)]);
     tip_tx
@@ -1491,7 +1497,7 @@ async fn electrum_tip_restatuses_spent_and_freed_outpoints_on() {
         })
         .expect("tip push");
     let mut pushes = Vec::new();
-    for label in ["coin push 1", "coin push 2", "coin push 3"] {
+    for label in ["coin push 1", "coin push 2", "coin push 3", "coin push 4"] {
         let push = read_notify(&mut stream, label).await;
         assert_eq!(push["method"], "blockchain.outpoint.subscribe", "{push}");
         pushes.push(push["params"][2].clone());
@@ -1500,13 +1506,16 @@ async fn electrum_tip_restatuses_spent_and_freed_outpoints_on() {
     assert_eq!(
         pushes,
         vec![
-            json!({"txid": hex, "vout": 0, "spent": false}),
+            json!({"txid": hex, "vout": 0, "spent": true, "height": 0,
+                "spending_txid": silent[0].compute_txid().to_string()}),
             json!({"txid": hex, "vout": 1, "spent": true, "height": 103}),
             json!({"txid": hex, "vout": 2, "spent": false}),
+            json!({"txid": hex, "vout": 4, "spent": true, "height": 0,
+                "spending_txid": silent[1].compute_txid().to_string()}),
         ]
     );
-    let ping = rpc(&mut stream, 6, "server.ping", json!([])).await;
-    assert_eq!(ping["id"], 6, "one push per changed outpoint: {ping}");
+    let ping = rpc(&mut stream, 7, "server.ping", json!([])).await;
+    assert_eq!(ping["id"], 7, "one push per changed outpoint: {ping}");
 
     handle.shutdown().await;
 }

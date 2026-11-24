@@ -546,16 +546,15 @@ pub struct ElectrumConn {
     pub header_sub: bool,
     pub sh_subs: HashSet<[u8; 32]>,
     pub sh_join: Option<Arc<ShJoinSlot>>,
-    pub outpoint_subs: HashSet<([u8; 32], u32)>,
+    /// Subscribed outpoints, each with the pool spender (`spending_txid`) its
+    /// last status sent named. A spender can leave the pool, or a rollback
+    /// put one back, without an announce, so each block also restatuses the
+    /// outpoints whose pool spender is no longer the one sent.
+    pub outpoint_subs: HashMap<([u8; 32], u32), Option<String>>,
     /// Height the outpoint statuses were last checked at. The next block
     /// restatuses only the outpoints it touches; a gap or a reorg restatuses
     /// all.
     outpoint_tip: Option<u32>,
-    /// Subscribed outpoints whose last status sent was a mempool spend. A
-    /// spender can leave the pool without an announce (eviction, expiry, a
-    /// block conflict, a rolled-back package), so each block also restatuses
-    /// the ones the pool no longer spends.
-    outpoint_pool_spent: HashSet<([u8; 32], u32)>,
     /// Silent-payment subscriptions whose history has been sent.
     sp_subs: Vec<SpLive>,
     /// History scans of subscribes that have not reached the tip, at most
@@ -577,9 +576,8 @@ impl ElectrumConn {
             header_sub: false,
             sh_subs: HashSet::new(),
             sh_join: None,
-            outpoint_subs: HashSet::new(),
+            outpoint_subs: HashMap::new(),
             outpoint_tip: None,
-            outpoint_pool_spent: HashSet::new(),
             sp_subs: Vec::new(),
             sp_scans: Vec::new(),
             sp_waiting: std::collections::VecDeque::new(),
@@ -656,18 +654,18 @@ where
                             };
                             let mut ops: Vec<([u8; 32], u32)> = conn
                                 .outpoint_subs
-                                .iter()
+                                .keys()
                                 .copied()
                                 .filter(|op| touch.as_ref().is_none_or(|t| t.touches(op)))
                                 .collect();
                             if let Some(t) = &touch {
-                                let held: Vec<_> = conn
-                                    .outpoint_pool_spent
+                                let rest: Vec<_> = conn
+                                    .outpoint_subs
                                     .iter()
-                                    .copied()
-                                    .filter(|op| !t.touches(op))
+                                    .filter(|(op, _)| !t.touches(op))
+                                    .map(|(op, sent)| (*op, sent.clone()))
                                     .collect();
-                                ops.extend(spenders_left_pool(&query, mempool.clone(), held).await);
+                                ops.extend(pool_spender_changed(&query, mempool.clone(), rest).await);
                             }
                             if !ops.is_empty() {
                                 emit_outpoint_notes(
@@ -675,7 +673,7 @@ where
                                     &query,
                                     mempool.clone(),
                                     ops,
-                                    &mut conn.outpoint_pool_spent,
+                                    &mut conn.outpoint_subs,
                                 )
                                 .await?;
                             }
@@ -770,7 +768,7 @@ where
                             .outpoints
                             .iter()
                             .map(|op| (op.txid.to_byte_array(), op.vout))
-                            .filter(|op| conn.outpoint_subs.contains(op))
+                            .filter(|op| conn.outpoint_subs.contains_key(op))
                             .collect();
                         if !touched_ops.is_empty() {
                             emit_outpoint_notes(
@@ -778,7 +776,7 @@ where
                                 &query,
                                 mempool.clone(),
                                 touched_ops,
-                                &mut conn.outpoint_pool_spent,
+                                &mut conn.outpoint_subs,
                             )
                             .await?;
                         }
@@ -1293,9 +1291,8 @@ fn read_conn(conn: &mut ElectrumConn, method: &str) -> ElectrumConn {
         } else {
             None
         },
-        outpoint_subs: HashSet::new(),
+        outpoint_subs: HashMap::new(),
         outpoint_tip: None,
-        outpoint_pool_spent: HashSet::new(),
         sp_subs: Vec::new(),
         sp_scans: Vec::new(),
         sp_waiting: std::collections::VecDeque::new(),
@@ -1515,7 +1512,6 @@ async fn answer_one(
         sh_join: conn.sh_join.take(),
         outpoint_subs: std::mem::take(&mut conn.outpoint_subs),
         outpoint_tip: conn.outpoint_tip,
-        outpoint_pool_spent: std::mem::take(&mut conn.outpoint_pool_spent),
         sp_subs: std::mem::take(&mut conn.sp_subs),
         sp_scans: std::mem::take(&mut conn.sp_scans),
         sp_waiting: std::mem::take(&mut conn.sp_waiting),
@@ -1869,14 +1865,14 @@ async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     Ok(true)
 }
 
-/// Push the current status of each of `outpoints`, and note in `pool_spent`
-/// which of them the pool now spends.
+/// Push the current status of each of `outpoints`, and note in `subs` the
+/// pool spender each status names.
 pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     mempool: Option<Arc<MempoolHub>>,
     outpoints: Vec<([u8; 32], u32)>,
-    pool_spent: &mut HashSet<([u8; 32], u32)>,
+    subs: &mut HashMap<([u8; 32], u32), Option<String>>,
 ) -> Result<(), std::io::Error> {
     let q = Arc::clone(query);
     let looked = budgeted_blocking(query, move || {
@@ -1892,7 +1888,7 @@ pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
     .await
     .unwrap_or_default();
     for (txid, vout, status) in looked {
-        note_pool_spent(pool_spent, (txid, vout), &status);
+        note_pool_spender(subs, (txid, vout), &status);
         let note = json!({
             "jsonrpc": "2.0",
             "method": "blockchain.outpoint.subscribe",
@@ -1903,37 +1899,48 @@ pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Record whether `status` is a mempool spend of `op`.
-fn note_pool_spent(pool_spent: &mut HashSet<([u8; 32], u32)>, op: ([u8; 32], u32), status: &Value) {
-    if status.get("spending_txid").is_some() {
-        pool_spent.insert(op);
-    } else {
-        pool_spent.remove(&op);
+/// Record the pool spender `status` names for the subscribed `op`.
+fn note_pool_spender(
+    subs: &mut HashMap<([u8; 32], u32), Option<String>>,
+    op: ([u8; 32], u32),
+    status: &Value,
+) {
+    if let Some(sent) = subs.get_mut(&op) {
+        *sent = status
+            .get("spending_txid")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
     }
 }
 
-/// The outpoints of `held` (last sent as spent by the pool) that no pool
-/// transaction spends now. A pool lookup each, no store read.
-async fn spenders_left_pool(
+/// A subscribed outpoint and the pool spender its last status named.
+type SentSpender = (([u8; 32], u32), Option<String>);
+
+/// The outpoints of `sent` (each with the pool spender its last status
+/// named) that the pool now spends with another transaction or not at all.
+/// A pool lookup each, no store read.
+async fn pool_spender_changed(
     query: &Arc<Query>,
     mempool: Option<Arc<MempoolHub>>,
-    held: Vec<([u8; 32], u32)>,
+    sent: Vec<SentSpender>,
 ) -> Vec<([u8; 32], u32)> {
-    if held.is_empty() {
-        return held;
+    let Some(mp) = mempool else {
+        return Vec::new();
+    };
+    if sent.is_empty() {
+        return Vec::new();
     }
     budgeted_blocking(query, move || {
         use bitcoin::hashes::Hash;
-        held.into_iter()
-            .filter(|(txid, vout)| {
-                mempool.as_ref().is_none_or(|mp| {
-                    mp.spending_txid(&bitcoin::OutPoint {
-                        txid: bitcoin::Txid::from_byte_array(*txid),
-                        vout: *vout,
-                    })
-                    .is_none()
-                })
+        sent.into_iter()
+            .filter(|((txid, vout), was)| {
+                let now = mp.spending_txid(&bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array(*txid),
+                    vout: *vout,
+                });
+                now.map(|t| t.to_string()) != *was
             })
+            .map(|(op, _)| op)
             .collect()
     })
     .await
@@ -3625,13 +3632,12 @@ fn dispatch_method(
                 conn.outpoint_tip = query.tip_height().map(|h| h.0);
             }
             let status = outpoint_status(query, mempool, params)?;
-            note_pool_spent(&mut conn.outpoint_pool_spent, (txid, vout), &status);
+            note_pool_spender(&mut conn.outpoint_subs, (txid, vout), &status);
             Ok(status)
         }
         "blockchain.outpoint.unsubscribe" => {
             let (txid, vout) = param_outpoint(params)?;
-            conn.outpoint_pool_spent.remove(&(txid, vout));
-            Ok(json!(conn.outpoint_subs.remove(&(txid, vout))))
+            Ok(json!(conn.outpoint_subs.remove(&(txid, vout)).is_some()))
         }
         "blockchain.silentpayments.unsubscribe" => {
             silentpayments_unsubscribe(conn, query, chain, params)
@@ -3740,16 +3746,16 @@ pub fn protocol_ge_1_6(protocol: &str) -> bool {
 
 #[doc(hidden)]
 pub fn admit_outpoint_sub(
-    subs: &mut HashSet<([u8; 32], u32)>,
+    subs: &mut HashMap<([u8; 32], u32), Option<String>>,
     txid: [u8; 32],
     vout: u32,
     cap: usize,
 ) -> Result<(), String> {
     let key = (txid, vout);
-    if !subs.contains(&key) && subs.len() >= cap {
+    if !subs.contains_key(&key) && subs.len() >= cap {
         return Err(format!("too many outpoint subscriptions (max {cap})"));
     }
-    subs.insert(key);
+    subs.entry(key).or_insert(None);
     Ok(())
 }
 
