@@ -745,6 +745,9 @@ pub struct TxTable {
     /// Output records materialized from packed bodies (instance stats).
     #[cfg(debug_assertions)]
     pub outputs_decoded: std::sync::atomic::AtomicU64,
+    /// `Store::input_edges_span` reads (instance stats).
+    #[cfg(debug_assertions)]
+    pub input_edge_spans: std::sync::atomic::AtomicU64,
 }
 
 /// Structural-meta backend from env hierarchy.
@@ -1461,6 +1464,8 @@ impl TxTable {
             body_decodes: std::sync::atomic::AtomicU64::new(0),
             #[cfg(debug_assertions)]
             outputs_decoded: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(debug_assertions)]
+            input_edge_spans: std::sync::atomic::AtomicU64::new(0),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
@@ -1734,6 +1739,8 @@ impl TxTable {
             body_decodes: std::sync::atomic::AtomicU64::new(0),
             #[cfg(debug_assertions)]
             outputs_decoded: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(debug_assertions)]
+            input_edge_spans: std::sync::atomic::AtomicU64::new(0),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
