@@ -281,7 +281,8 @@ const RAW_TX_NOT_FOUND: &str =
     "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.";
 const RAW_TX_NOT_IN_BLOCK: &str =
     "No such transaction found in the provided block. Use gettransaction for wallet transactions.";
-const RAW_TX_PRUNED: &str = "Transaction not available (pruned data)";
+const RAW_TX_PRUNED: &str = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.";
+const RAW_TX_PRUNED_IN_BLOCK: &str = "Transaction not available (pruned data)";
 
 fn raw_tx_verbosity(params: &RpcParams) -> Result<u32, Value> {
     match params
@@ -559,7 +560,7 @@ fn getrawtransaction_in_block(
     let tx = ctx
         .query
         .reconstruct_tx(fk)
-        .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
+        .map_err(|e| map_query(e, ERR_INVALID_PARAMETER, RAW_TX_PRUNED_IN_BLOCK))?;
     if verbosity == 0 {
         return Ok(json!(serialize_hex(&tx)));
     }
@@ -615,7 +616,7 @@ pub(crate) fn locate_raw_tx(ctx: &RpcContext, want: [u8; 32]) -> Result<Option<R
     let tx = ctx
         .query
         .reconstruct_tx(fk)
-        .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
+        .map_err(|e| map_query(e, ERR_INVALID_ADDRESS_OR_KEY, RAW_TX_PRUNED))?;
     Ok(Some(RawTxHit::Chain { tx, fk }))
 }
 

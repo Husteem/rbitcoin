@@ -460,9 +460,9 @@ pub const ERR_INVALID_PARAMS: i64 = -32602;
 pub const ERR_INTERNAL: i64 = -32603;
 pub const ERR_METHOD_NOT_FOUND: i64 = -32601;
 
-pub fn map_query(e: rbitcoin_query::QueryError, pruned: &'static str) -> Value {
+pub fn map_query(e: rbitcoin_query::QueryError, pruned_code: i64, pruned: &'static str) -> Value {
     match e {
-        rbitcoin_store::StoreError::Pruned { .. } => rpc_error(ERR_INVALID_PARAMETER, pruned),
+        rbitcoin_store::StoreError::Pruned { .. } => rpc_error(pruned_code, pruned),
         other => rpc_error(ERR_MISC, other.to_string()),
     }
 }

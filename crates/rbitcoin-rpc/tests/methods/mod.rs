@@ -3252,6 +3252,7 @@ const TX_NOT_FOUND: &str =
     "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.";
 const TX_NOT_IN_BLOCK: &str =
     "No such transaction found in the provided block. Use gettransaction for wallet transactions.";
+const TX_PRUNED: &str = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.";
 
 fn assert_raw_tx_error(err: &Value, code: i64, message: &str) {
     assert_eq!(err["code"], code, "{err}");
@@ -3499,11 +3500,7 @@ fn assert_inactive_block_and_pruned(
         .to_string();
     ctx.query.set_pruneheight(Some(Height(1))).unwrap();
     let pruned = dispatch(ctx, "getrawtransaction", vec![json!(h1_cb)]).unwrap_err();
-    assert_raw_tx_error(
-        &pruned,
-        ERR_INVALID_PARAMETER,
-        "Transaction not available (pruned data)",
-    );
+    assert_raw_tx_error(&pruned, ERR_INVALID_ADDRESS_OR_KEY, TX_PRUNED);
     let genesis_still = dispatch(ctx, "getrawtransaction", vec![json!(genesis_tx)]).unwrap_err();
     assert_raw_tx_error(
         &genesis_still,
@@ -5850,12 +5847,16 @@ fn prune_life_getblock(ctx: &RpcContext) {
     assert_eq!(info["pruned"], true);
     assert_eq!(info["pruneheight"], 0);
     let err = dispatch(ctx, "getblock", vec![genesis_hash.clone(), json!(0)]).unwrap_err();
-    assert_eq!(err["code"], json!(-8));
-    assert!(err["message"].as_str().unwrap().contains("pruned"), "{err}");
+    assert_eq!(err["code"], ERR_MISC, "{err}");
+    assert_eq!(err["message"], "Block not available (pruned data)", "{err}");
     let v1 = dispatch(ctx, "getblock", vec![genesis_hash.clone(), json!(1)]).unwrap();
     assert_eq!(v1["tx"].as_array().unwrap().len(), 1);
     let err2 = dispatch(ctx, "getblock", vec![genesis_hash, json!(2)]).unwrap_err();
-    assert_eq!(err2["code"], json!(-8));
+    assert_eq!(err2["code"], ERR_MISC, "{err2}");
+    assert_eq!(
+        err2["message"], "Block not available (pruned data)",
+        "{err2}"
+    );
     let rerr = dispatch(ctx, "getrawtransaction", vec![v1["tx"][0].clone()]).unwrap_err();
     assert_eq!(
         rerr["code"], ERR_INVALID_ADDRESS_OR_KEY,
@@ -5878,7 +5879,7 @@ fn prune_life_getblock(ctx: &RpcContext) {
     let h1 = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
     let b1 = dispatch(ctx, "getblock", vec![h1, json!(1)]).unwrap();
     let rerr = dispatch(ctx, "getrawtransaction", vec![b1["tx"][0].clone()]).unwrap_err();
-    assert_eq!(rerr["code"], json!(-8), "{rerr}");
+    assert_raw_tx_error(&rerr, ERR_INVALID_ADDRESS_OR_KEY, TX_PRUNED);
 }
 
 #[test]
