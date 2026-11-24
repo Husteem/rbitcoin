@@ -3147,7 +3147,7 @@ fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
                 version: Version::from_consensus(4),
                 prev_blockhash: hub.tip_hash().unwrap(),
                 merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
-                time: 1,
+                time: hub.tip_header().unwrap().time + 1,
                 bits: CompactTarget::from_consensus(0x207f_ffff),
                 nonce: 0,
             },
@@ -4553,7 +4553,7 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
             version: Version::from_consensus(4),
             prev_blockhash: hub.tip_hash().unwrap(),
             merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
-            time: 1,
+            time: hub.tip_header().unwrap().time + 1,
             bits: CompactTarget::from_consensus(0x207f_ffff),
             nonce: 0,
         },
@@ -7235,7 +7235,7 @@ fn persist_pending_path_starts_after_the_last_stored_header() {
         time += 1;
         pending.insert(prev, h);
     }
-    persist_pending_header_path(&hub, &pending, last);
+    let _ = persist_pending_header_path(&hub, &pending, last);
     assert!(hub.knows_header(&last), "the fork path is stored");
 
     let next = rbitcoin_consensus::mine_regtest_paying(
@@ -7248,7 +7248,7 @@ fn persist_pending_path_starts_after_the_last_stored_header() {
     .header;
     pending.insert(next.block_hash(), next);
     let _ = hub.take_header_contextual_checks();
-    persist_pending_header_path(&hub, &pending, next.block_hash());
+    let _ = persist_pending_header_path(&hub, &pending, next.block_hash());
     assert!(hub.knows_header(&next.block_hash()));
     assert_eq!(
         hub.take_header_contextual_checks(),

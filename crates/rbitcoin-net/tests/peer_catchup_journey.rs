@@ -515,7 +515,7 @@ async fn peer_catchup_compact_reorg() {
             version: BlockVersion::from_consensus(4),
             prev_blockhash: hub.tip_hash().unwrap(),
             merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
-            time: 1,
+            time: hub.tip_header().unwrap().time + 1,
             bits: CompactTarget::from_consensus(0x207f_ffff),
             nonce: 0,
         },

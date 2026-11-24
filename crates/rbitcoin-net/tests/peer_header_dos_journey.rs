@@ -1001,6 +1001,90 @@ async fn tall_unknown_parent_skips_reconstruct(
     );
 }
 
+/// A bad-pow header in a `headers` message is scored too (Core
+/// `BLOCK_INVALID_HEADER`), not only dropped. A fresh header, so the
+/// cached-invalid check does not catch it first.
+async fn headers_with_bad_pow_disconnect(hub: &rbitcoin_net::chain::ChainHub) {
+    let gen = hub.tip_hash().unwrap();
+    let tip_time = hub.tip_header().unwrap().time;
+    let next_h = hub.tip_height().unwrap().saturating_add(1);
+    let mut bad_header = rbitcoin_consensus::mine_regtest_paying(
+        gen,
+        tip_time.saturating_add(7),
+        next_h,
+        op_true(),
+        vec![],
+    )
+    .header;
+    let target = bitcoin::Target::from_compact(bad_header.bits);
+    while bad_header.validate_pow(target).is_ok() {
+        bad_header.nonce = bad_header.nonce.wrapping_add(1);
+    }
+    assert!(!hub.is_block_invalid(&bad_header.block_hash()));
+    let (out_tx, _rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    push(
+        hub,
+        &out_tx,
+        &mut follow,
+        None,
+        NetworkMessage::Headers(vec![bad_header]),
+    )
+    .await;
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "a headers message with bad pow must disconnect"
+    );
+    assert!(!hub.knows_header(&bad_header.block_hash()));
+
+    // A stamp past the two-hour window is temporary: not the peer's fault.
+    let now = u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap();
+    let future =
+        rbitcoin_consensus::mine_regtest_paying(gen, now + 3 * 3600 + 7, next_h, op_true(), vec![]);
+    let mut follow = PeerFollowState::new();
+    push(
+        hub,
+        &out_tx,
+        &mut follow,
+        None,
+        NetworkMessage::Headers(vec![future.header]),
+    )
+    .await;
+    assert_eq!(follow.ban_score, 0, "time-too-new headers must not disconnect");
+
+    // The same checks score a compact block's header (Core `invalid header
+    // via cmpctblock`). A fresh too-old stamp, so no cache catches it first.
+    let too_old = rbitcoin_consensus::mine_regtest_paying(gen, 2, next_h, op_true(), vec![]);
+    assert!(!hub.is_block_invalid(&too_old.block_hash()));
+    let cmpct = bitcoin::p2p::message_compact_blocks::CmpctBlock {
+        compact_block: bitcoin::bip152::HeaderAndShortIds {
+            header: too_old.header,
+            nonce: 0,
+            short_ids: vec![],
+            prefilled_txs: vec![bitcoin::bip152::PrefilledTransaction {
+                idx: 0,
+                tx: too_old.txdata[0].clone(),
+            }],
+        },
+    };
+    // Requested, so the low-work filter for unsolicited compact blocks does
+    // not drop it before the header is checked.
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+    assert!(follow.requested_blocks.claim(hub, too_old.block_hash()));
+    push(hub, &out_tx, &mut follow, None, NetworkMessage::CmpctBlock(cmpct)).await;
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "a compact block with a too-old header must disconnect"
+    );
+}
+
 /// Bad proof-of-work and a stamp at or below the parent's median time past
 /// disconnect. A stamp past the two-hour window does not.
 async fn header_reject_punishes_except_time(hub: &rbitcoin_net::chain::ChainHub) {
@@ -2885,6 +2969,7 @@ async fn peer_header_dos_and_self_announce() {
 
     tall_unknown_parent_skips_reconstruct(&hub, &peers).await;
     header_reject_punishes_except_time(&hub).await;
+    headers_with_bad_pow_disconnect(&hub).await;
     noban_and_manual_bad_block_is_not_punished(&hub, &peers).await;
     sixty_four_byte_body_is_mutated(&hub, &peers).await;
     empty_body_null_merkle_bans_before_the_header(&hub, &peers).await;
