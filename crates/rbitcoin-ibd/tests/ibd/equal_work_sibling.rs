@@ -25,6 +25,9 @@ const A_ASKS_AFTER_B: usize = 8;
 /// Getdata for B before the peer stops waiting for B. Same budget as A: a
 /// healthy sibling is asked for once and answered.
 const B_ASKS_BEFORE_GIVE_UP: usize = 8;
+/// A's ask count after which the peer re-announces the abandoned A. The third
+/// copy is the one that abandons it.
+const REANNOUNCE_AFTER_A_ASKS: usize = 3;
 
 /// The sibling body the peer serves for B.
 #[derive(Clone, Copy, PartialEq)]
@@ -38,6 +41,10 @@ enum Sibling {
     /// B's own body arrives mutated every time, like A's: the ask lane for B
     /// must be dropped too, or the same loop just moves one header over.
     Mutated,
+    /// B is invalid like [`Sibling::Invalid`], and the peer re-announces the
+    /// abandoned A in later `getheaders` replies. A stored reply that continues
+    /// the cut-back walk tip must not put A back on the path and queue it.
+    InvalidReannounced,
 }
 
 struct Fixture {
@@ -88,7 +95,7 @@ impl Fixture {
     fn announced(&self, kind: Sibling) -> &Block {
         match kind {
             Sibling::Valid | Sibling::Mutated => &self.b,
-            Sibling::Invalid => &self.bad_b,
+            Sibling::Invalid | Sibling::InvalidReannounced => &self.bad_b,
         }
     }
 
@@ -96,7 +103,7 @@ impl Fixture {
     fn body(&self, kind: Sibling) -> Block {
         match kind {
             Sibling::Valid => self.b.clone(),
-            Sibling::Invalid => self.bad_b.clone(),
+            Sibling::Invalid | Sibling::InvalidReannounced => self.bad_b.clone(),
             Sibling::Mutated => {
                 let mut block = self.b.clone();
                 let out = &mut block.txdata[0].output[0];
@@ -124,6 +131,7 @@ impl Fixture {
 struct Seen {
     a_asks: usize,
     a_asks_after_b: usize,
+    a_reannounced: usize,
     b_asks: usize,
     b_asked: bool,
     gave_up: bool,
@@ -159,6 +167,7 @@ async fn serve(
     let b_hash = fx.announced(sibling).block_hash();
     let mut announced = false;
     let mut b_announced = false;
+    let mut reannounced = 0usize;
     loop {
         let frame = read_v2_frame(&mut reader, Magic::REGTEST)
             .await
@@ -172,7 +181,15 @@ async fn serve(
             let mut seen = seen.lock().unwrap();
             match message.payload() {
                 NetworkMessage::GetHeaders(request) => {
-                    if announced {
+                    let reannounce = sibling == Sibling::InvalidReannounced
+                        && b_announced
+                        && seen.a_asks >= REANNOUNCE_AFTER_A_ASKS
+                        && reannounced < 2;
+                    if reannounce {
+                        send.push(NetworkMessage::Headers(vec![fx.a.header]));
+                        reannounced += 1;
+                        seen.a_reannounced = reannounced;
+                    } else if announced {
                         send.push(NetworkMessage::Headers(Vec::new()));
                     } else {
                         let start = (0..=CHAIN)
@@ -328,6 +345,28 @@ async fn a_mutated_equal_work_sibling_stops_being_asked() {
         "the node must stop asking for mutated B: {:?}",
         out.seen
     );
+    assert!(out.synced.is_ok(), "{:?}", out.synced);
+    assert_eq!(out.tip, Some(out.fx.chain[CHAIN].block_hash()));
+}
+
+/// The abandoned header must stay off the path when the kept peer announces it
+/// again: a stored reply that continues the cut-back walk tip is not a new
+/// candidate, and asking for its body only produces another mutated copy.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reannounced_abandoned_header_is_not_asked_again() {
+    let out = run(Sibling::InvalidReannounced).await;
+    assert!(out.seen.b_asked, "{:?}", out.seen);
+    assert!(
+        out.seen.a_reannounced >= 1,
+        "the fixture must re-announce A after the abandon: {:?}",
+        out.seen
+    );
+    assert!(
+        out.seen.a_asks <= REANNOUNCE_AFTER_A_ASKS,
+        "the re-announced abandoned header must not be asked for again: {:?}",
+        out.seen
+    );
+    assert!(!out.seen.gave_up, "{:?}", out.seen);
     assert!(out.synced.is_ok(), "{:?}", out.synced);
     assert_eq!(out.tip, Some(out.fx.chain[CHAIN].block_hash()));
 }

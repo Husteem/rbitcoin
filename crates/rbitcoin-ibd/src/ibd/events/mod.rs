@@ -176,6 +176,13 @@ pub fn note_header_path(
     height: u32,
     prev: BlockHash,
 ) {
+    // An abandoned header can be announced again by the peer we keep. Its
+    // reply still gets written, but it must not take the path slot at this
+    // height back: a stored reply that continues the cut-back walk tip would
+    // otherwise queue the same body and start the loop over (#1811).
+    if st.unservable.contains(&hash) {
+        return;
+    }
     let tip = hub.tip_height().zip(hub.tip_hash());
     if st.try_set_path_slot(hash, height, prev, tip) {
         st.max_peer_height = st.max_peer_height.max(height);
@@ -199,7 +206,10 @@ fn try_enqueue_ordered_header(
         st.known_headers.insert(hash);
         return false;
     }
-    if st.body.is_rejected(&hash) || st.reorg.invalid.contains(hash.to_byte_array()) {
+    if st.body.is_rejected(&hash)
+        || st.reorg.invalid.contains(hash.to_byte_array())
+        || st.unservable.contains(&hash)
+    {
         return false;
     }
     let prev_ok = st.known_headers.contains(&prev)
