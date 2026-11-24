@@ -1196,9 +1196,9 @@ async fn tx_routes(addr: SocketAddr, txid: &str) -> Vec<(String, u16, String)> {
 
 /// A transaction that was in a block, is no longer on the active chain, and is
 /// not in the mempool is gone: 404 on every `/tx/:txid` route. It answers
-/// `confirmed: false` only while the mempool holds it. A txid the store never
-/// saw answers `200 {"confirmed":false}` on `/status`, as electrs does, and 404
-/// on the routes that return the transaction.
+/// `confirmed: false` only while the mempool holds it. A txid that is neither
+/// stored nor in the mempool answers `200 {"confirmed":false}` on `/status`, as
+/// electrs does, and 404 on the routes that return the transaction.
 #[tokio::test(flavor = "current_thread")]
 async fn reorged_out_tx_is_404_unless_the_mempool_holds_it() {
     use bitcoin::absolute::LockTime;

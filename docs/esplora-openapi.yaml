@@ -389,13 +389,13 @@ paths:
       summary: Confirmation status
       description: |
         Live: confirmed status at the tip, or `{"confirmed": false}` for a mempool tx
-        and for a txid this node never saw, as electrs answers (the other `/tx/{txid}`
-        routes are 404 for that txid).
+        and for a txid that is neither stored nor in the mempool, as electrs answers
+        (the other `/tx/{txid}` routes are 404 for that txid).
         A stored tx that is in neither (reorged out and not back in the mempool) is **404**,
         or **503** `chain view moved` while a connect, disconnect or reorg holds the pool.
         With `?asof=`: confirmed only if the tx is in a block at or below the
         as-of block; a tx confirmed later reads `{"confirmed": false}`, and a txid
-        this node never saw is **404**.
+        that is not stored is **404**.
       parameters:
         - { $ref: "#/components/parameters/Txid" }
         - { $ref: "#/components/parameters/AsOf" }
