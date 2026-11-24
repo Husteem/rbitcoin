@@ -13,8 +13,9 @@ Fixed
   An input repeated inside one member is that member's
   `bad-txns-inputs-duplicate`, not `conflict-in-package`, here and in
   `submitpackage`. In `submitpackage` a child of a member that fails
-  `CheckTransaction` is `bad-txns-inputs-missingorspent`, as in Core, not
-  `max feerate exceeded` priced from the invalid member's outputs.
+  `CheckTransaction`, or that spends an output found in neither the chain,
+  the mempool nor the package, is `bad-txns-inputs-missingorspent`, as in
+  Core, not `max feerate exceeded` priced from that member's outputs.
   A transaction the active chain already holds is `txn-already-known` on
   every admit: a package member now says so, as a single transaction did,
   and so do `submitpackage`, P2P, Esplora and Electrum, where it was

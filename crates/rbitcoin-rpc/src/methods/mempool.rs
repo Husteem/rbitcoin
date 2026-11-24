@@ -957,7 +957,8 @@ pub fn prevout_txout_in_package(
 }
 
 /// Core `submitpackage`: the member's modified fee over its sigop-adjusted
-/// vsize is above `max_sat_kvb`.
+/// vsize is above `max_sat_kvb`. `None` when an input resolves in neither
+/// the package, the mempool nor the chain: the member fails alone.
 #[doc(hidden)]
 pub fn package_tx_fee_exceeds_max(
     ctx: &RpcContext,
@@ -965,27 +966,26 @@ pub fn package_tx_fee_exceeds_max(
     tx: &Transaction,
     package: &[Transaction],
     max_sat_kvb: u64,
-) -> bool {
-    let Some(prevouts) = tx
+) -> Option<bool> {
+    let prevouts = tx
         .input
         .iter()
         .map(|inp| prevout_txout_in_package(ctx, &inp.previous_output, package))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return false;
-    };
-    match fold_tx_fee_sat(
-        prevouts.iter().map(|o| Some(o.value.to_sat())),
-        tx_output_sum_sat(tx),
-    ) {
-        TxFeeLook::Fee(fee) => feerate_exceeds_max(
-            fee.saturating_add_signed(mp.fee_delta(&tx.compute_txid())),
-            mp.sigops_adjusted_weight(tx, &prevouts),
-            max_sat_kvb,
-        ),
-        TxFeeLook::Overflow => max_sat_kvb != 0,
-        TxFeeLook::MissingPrevout => false,
-    }
+        .collect::<Option<Vec<_>>>()?;
+    Some(
+        match fold_tx_fee_sat(
+            prevouts.iter().map(|o| Some(o.value.to_sat())),
+            tx_output_sum_sat(tx),
+        ) {
+            TxFeeLook::Fee(fee) => feerate_exceeds_max(
+                fee.saturating_add_signed(mp.fee_delta(&tx.compute_txid())),
+                mp.sigops_adjusted_weight(tx, &prevouts),
+                max_sat_kvb,
+            ),
+            TxFeeLook::Overflow => max_sat_kvb != 0,
+            TxFeeLook::MissingPrevout => false,
+        },
+    )
 }
 
 /// RPC-submit `maxburnamount` (BTC). Omitted → 0.
@@ -1938,9 +1938,10 @@ fn submitpackage_plan(
     // Core tries each member alone in package order, so a member that
     // spends a refused one (directly or through another) is missing inputs,
     // not over the cap.
-    // Core runs `CheckTransaction` before the cap, so a member that fails
-    // it is evaluated and reports that error. It is refused too, so its
-    // child is missing inputs and not priced from its outputs.
+    // Core runs `CheckTransaction` before the cap, and finds the inputs
+    // before it, so a member that fails either is evaluated and reports its
+    // own error. It is refused too, so its child is missing inputs and not
+    // priced from its outputs.
     let mut eval_txs = Vec::new();
     let mut over_max = Vec::new();
     let mut refused = std::collections::HashSet::new();
@@ -1949,12 +1950,21 @@ fn submitpackage_plan(
             .input
             .iter()
             .any(|i| refused.contains(&i.previous_output.txid));
-        if spends_refused || rbitcoin_net::check_transaction(&tx, false).is_err() {
-            refused.insert(tx.compute_txid());
-        } else if package_tx_fee_exceeds_max(ctx, mp, &tx, txs, max_feerate) {
-            refused.insert(tx.compute_txid());
-            over_max.push(tx);
-            continue;
+        let over = if spends_refused || rbitcoin_net::check_transaction(&tx, false).is_err() {
+            None
+        } else {
+            package_tx_fee_exceeds_max(ctx, mp, &tx, txs, max_feerate)
+        };
+        match over {
+            Some(false) => {}
+            Some(true) => {
+                refused.insert(tx.compute_txid());
+                over_max.push(tx);
+                continue;
+            }
+            None => {
+                refused.insert(tx.compute_txid());
+            }
         }
         eval_txs.push(tx);
     }

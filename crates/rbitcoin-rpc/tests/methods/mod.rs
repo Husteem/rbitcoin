@@ -10342,6 +10342,33 @@ fn testmempoolaccept_parent_over_maxfeerate_is_not_a_parent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A member whose input is in neither the chain, the mempool nor the
+/// package fails alone, so its child is missing inputs even when the
+/// child's own feerate is over `maxfeerate`. Core tries each member alone
+/// and asks `maxfeerate` only once the inputs are found.
+#[test]
+fn package_child_of_a_member_with_an_unknown_input_is_missing_inputs() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let (_, mut parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk);
+    parent.input[0].previous_output = bitcoin::OutPoint::new(Txid::from_byte_array([7; 32]), 0);
+    // 0.01 BTC on about 61 vB is over the default 0.10 BTC/kvB cap.
+    let child = child_of(&parent, 1_000_000);
+    let hexes = json!([hex(&parent), hex(&child)]);
+    let rows = dispatch(&ctx, "testmempoolaccept", vec![hexes.clone()]).unwrap();
+    assert_eq!(rows[0]["reject-reason"], "missing-inputs", "{rows}");
+    assert_eq!(rows[1]["reject-reason"], "missing-inputs", "{rows}");
+    let sub = dispatch(&ctx, "submitpackage", vec![hexes]).unwrap();
+    let child_row = &sub["tx-results"][child.compute_wtxid().to_string()];
+    assert_eq!(
+        child_row["error"], "bad-txns-inputs-missingorspent",
+        "{sub}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core's block count and decode text on the request task.
 #[test]
 fn request_task_methods_answer_as_core() {
