@@ -493,6 +493,10 @@ pub fn verify_tx_scripts(tx: &Transaction, prevouts: Vec<TxOut>) -> Result<(), A
         .map_err(|e| AcceptError::Script(e.to_string()))
 }
 
+/// Core `MAX_REPLACEMENT_CANDIDATES`: the most distinct clusters one
+/// replacement may conflict with.
+pub const MAX_REPLACEMENT_CANDIDATES: usize = 100;
+
 /// Knobs for [`ActiveMempool::prepare_admit`]. One argument so the admit
 /// helper stays within the argument cap.
 #[doc(hidden)]
@@ -1944,6 +1948,18 @@ impl ActiveMempool {
         direct_conflicts.extend(sibling);
         let conflict_set = if !direct_conflicts.is_empty() {
             let direct: Vec<Txid> = direct_conflicts.iter().copied().collect();
+            // Core rule 5 (`GetEntriesForConflicts`): at most 100 distinct
+            // conflicting clusters, before the conflict set is walked.
+            if self
+                .graph
+                .clusters_exceed(&direct, MAX_REPLACEMENT_CANDIDATES)
+            {
+                return Err(AcceptError::Policy(if sibling.is_some() {
+                    "too many potential replacements (including sibling eviction)"
+                } else {
+                    "too many potential replacements"
+                }));
+            }
             let set = self.graph.conflict_set(&direct);
             let (old_fee, old_weight) = self.graph.set_fee_weight(&set);
             let (direct_fee, direct_weight) = self
