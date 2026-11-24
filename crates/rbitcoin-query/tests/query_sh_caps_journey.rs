@@ -120,6 +120,38 @@ fn height_window_obeys_create_cap(
     q.set_max_sh_creates(2);
 }
 
+/// A cursor with fewer than a page of creates below it, on a script longer
+/// than the page: refused above the cap from the create count, served at
+/// cap 0. Leaves the cap at 0.
+fn deep_cursor_obeys_create_cap(q: &Query, sh: &[u8; 32], cursor: [u8; 32], older: [u8; 32]) {
+    use rbitcoin_query::scripthash::HistoryOrder::NewestFirst;
+
+    // A cursor with fewer than a page of creates below it walks every
+    // create above it: a list longer than the page takes the cap too.
+    let deep = rbitcoin_query::scripthash::HistoryFilter {
+        limit: Some(3),
+        order: NewestFirst,
+        after_txid: Some(cursor),
+        ..rbitcoin_query::scripthash::HistoryFilter::open()
+    };
+    let err = q.scripthash_history_filtered(sh, &deep).unwrap_err();
+    assert!(
+        err.to_string() == "scripthash join exceeds --max-sh-creates (7 creates, cap 2)",
+        "a deep cursor over the cap must refuse: {err}"
+    );
+    q.set_max_sh_creates(0);
+    assert_eq!(
+        q.scripthash_history_filtered(sh, &deep)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r.txid)
+            .collect::<Vec<_>>(),
+        [older],
+        "cap 0 serves the deep cursor's older row"
+    );
+}
+
 /// One scripthash with more creates than `--max-sh-creates`: the full join
 /// refuses; height-ascending and cursor pages that close before the cap are
 /// still served; a full newest-first page refuses above the cap; and the
@@ -237,30 +269,7 @@ fn sh_history_caps() {
         err.to_string() == "scripthash join exceeds --max-sh-creates (7 creates, cap 2)",
         "a full newest page over the cap must refuse: {err}"
     );
-    // A cursor with fewer than a page of creates below it walks every
-    // create above it: a list longer than the page takes the cap too.
-    let deep = rbitcoin_query::scripthash::HistoryFilter {
-        limit: Some(3),
-        order: NewestFirst,
-        after_txid: Some(cb_txids[1]),
-        ..rbitcoin_query::scripthash::HistoryFilter::open()
-    };
-    let err = q.scripthash_history_filtered(&sh, &deep).unwrap_err();
-    assert!(
-        err.to_string() == "scripthash join exceeds --max-sh-creates (7 creates, cap 2)",
-        "a deep cursor over the cap must refuse: {err}"
-    );
-    q.set_max_sh_creates(0);
-    assert_eq!(
-        q.scripthash_history_filtered(&sh, &deep)
-            .unwrap()
-            .rows
-            .iter()
-            .map(|r| r.txid)
-            .collect::<Vec<_>>(),
-        [cb_txids[0]],
-        "cap 0 serves the deep cursor's older row"
-    );
+    deep_cursor_obeys_create_cap(&q, &sh, cb_txids[1], cb_txids[0]);
     assert_eq!(
         sh_page(&q, &sh, NewestFirst, None).unwrap(),
         [spend_txid],
