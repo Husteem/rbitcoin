@@ -5211,6 +5211,19 @@ fn testmempoolaccept_package_reports_a_repeated_input_on_its_row() {
         sub["tx-results"][&dup_wtxid]["error"], "bad-txns-inputs-duplicate",
         "{sub}"
     );
+    // Its child is missing inputs (`bad-txns-inputs-missingorspent`, Core's
+    // state text in `submitpackage`), as Core tries each member alone. It is
+    // not priced from the invalid member's outputs against `maxfeerate`.
+    let sub = dispatch(&ctx, "submitpackage", vec![json!(hexes), json!(0.00001)]).unwrap();
+    let child_wtxid = child.compute_wtxid().to_string();
+    assert_eq!(
+        sub["tx-results"][&dup_wtxid]["error"], "bad-txns-inputs-duplicate",
+        "{sub}"
+    );
+    assert_eq!(
+        sub["tx-results"][&child_wtxid]["error"], "bad-txns-inputs-missingorspent",
+        "{sub}"
+    );
     let null_tx = "02000000000000000000";
     let (_, other) = spend_generated_coinbase(&ctx, 2, 50_0000_0000 - 1_000, spk);
     let other_hex = rbitcoin_primitives::hex_encode(serialize(&other));
