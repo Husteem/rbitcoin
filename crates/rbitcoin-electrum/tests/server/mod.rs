@@ -365,13 +365,19 @@ fn restatus_notes_scans_intermediate_tick_heights() {
     .unwrap();
     q.apply_sh_pending().unwrap();
     let sh = rbitcoin_store::script_hash(&[0x51]);
-    let _ = q.sample_reset_sh_posting_loads();
-    let _ = q.sample_reset_block_touch_builds();
+    // The load and build meters are debug-only; release builds check the
+    // answers alone.
+    #[cfg(debug_assertions)]
+    {
+        let _ = q.sample_reset_sh_posting_loads();
+        let _ = q.sample_reset_block_touch_builds();
+    }
     let only_tip = restatus_notes(&q, None, &[sh], Some(&[1]));
     assert!(
         only_tip.is_empty(),
         "height 1 does not touch the OP_TRUE script"
     );
+    #[cfg(debug_assertions)]
     assert_eq!(
         q.sample_reset_sh_posting_loads(),
         0,
@@ -379,6 +385,7 @@ fn restatus_notes_scans_intermediate_tick_heights() {
     );
     let again = restatus_notes(&q, None, &[sh], Some(&[1]));
     assert!(again.is_empty());
+    #[cfg(debug_assertions)]
     assert_eq!(
         q.sample_reset_block_touch_builds(),
         1,
