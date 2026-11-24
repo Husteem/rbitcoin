@@ -45,6 +45,36 @@ pub(crate) fn tmp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}-{seq}"))
 }
 
+/// Core `m_lazy_recent_rejects` keeps taking inserts: a full set drops its
+/// oldest entry, not the newest reject. Junk rejects cannot switch the
+/// filter off until the next block.
+#[test]
+fn recent_rejects_roll_instead_of_refusing() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("recent-rejects-roll");
+    let hub = MempoolHub::open(dir.join("mp"), Arc::new(q)).unwrap();
+    let w = |i: u32| {
+        let mut b = [0x5au8; 32];
+        b[..4].copy_from_slice(&i.to_le_bytes());
+        Wtxid::from_byte_array(b)
+    };
+    for i in 0..5_000 {
+        hub.note_recent_reject(w(i));
+    }
+    assert!(
+        hub.try_recent_reject(&w(4_999)),
+        "the newest reject is kept"
+    );
+    assert!(hub.try_recent_reject(&w(0)));
+    let cap = rbitcoin_net::tx_relay::RECENT_REJECTS_MAX as u32;
+    for i in 5_000..cap + 1 {
+        hub.note_recent_reject(w(i));
+    }
+    assert!(!hub.try_recent_reject(&w(0)), "the oldest reject rolls out");
+    assert!(hub.try_recent_reject(&w(1)));
+    assert!(hub.try_recent_reject(&w(cap)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fullness_decile_scales_by_ten() {
     assert_eq!(fullness_decile(0.0), 0);
@@ -240,32 +270,6 @@ fn smart_fee_target_one_is_two_until_flow_is_warm() {
     }
     let _ = std::fs::remove_dir_all(&mp_dir);
     let _ = std::fs::remove_dir_all(&store_dir);
-}
-
-#[test]
-fn recent_reject_at_the_cap_does_not_clear() {
-    let dir = tmp();
-    let mdir = tmp();
-    let q = Query::open_or_create_tiny(&dir).unwrap();
-    let hub = MempoolHub::open(&mdir, std::sync::Arc::new(q)).unwrap();
-    let first = bitcoin::Wtxid::from_byte_array({
-        let mut b = [0u8; 32];
-        b[0] = 1;
-        b
-    });
-    hub.note_recent_reject(first);
-    // 2..4097 is 4095 ids and does not collide with `first` (byte 0 == 1).
-    for i in 2..4_097u32 {
-        let mut b = [0u8; 32];
-        b[0..4].copy_from_slice(&i.to_le_bytes());
-        hub.note_recent_reject(bitcoin::Wtxid::from_byte_array(b));
-    }
-    let extra = bitcoin::Wtxid::from_byte_array([0xff; 32]);
-    hub.note_recent_reject(extra);
-    assert!(hub.try_recent_reject(&first));
-    assert!(!hub.try_recent_reject(&extra));
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&mdir);
 }
 
 #[test]
