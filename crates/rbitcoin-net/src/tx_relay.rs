@@ -4510,6 +4510,7 @@ impl MempoolHub {
         let hub = Arc::clone(self);
         crate::reactor::finish_join(
             crate::reactor::spawn_with_store_budget(async move {
+                let _lane = hub.api_lane().await;
                 hub.accept_with_utxo_async(
                     tx,
                     TxOrigin::Relay(None),
@@ -4535,6 +4536,12 @@ impl MempoolHub {
         let hub = Arc::clone(self);
         crate::reactor::finish_join(
             crate::reactor::spawn_with_store_budget(async move {
+                // On the task, so a dropped request does not free the lane
+                // while its scripts still run.
+                let _lane = match origin {
+                    TxOrigin::Local => hub.api_lane().await,
+                    TxOrigin::Relay(_) => None,
+                };
                 hub.accept_tx_from_work(tx, origin).await
             })
             .await,
@@ -4553,7 +4560,6 @@ impl MempoolHub {
         self: &Arc<Self>,
         tx: Transaction,
     ) -> Result<LocalBroadcast, AcceptError> {
-        let _lane = self.api_lane().await;
         let txid = tx.compute_txid();
         loop {
             let admitted =
@@ -5094,9 +5100,9 @@ impl MempoolHub {
         self: &Arc<Self>,
         txs: Vec<Transaction>,
     ) -> Result<Vec<AcceptResult>, AcceptError> {
-        let _lane = self.api_lane().await;
         let hub = Arc::clone(self);
         crate::reactor::spawn_with_store_budget(async move {
+            let _lane = hub.api_lane().await;
             let guard = hub.begin_tentative_guard();
             let accepted = hub.admit_package_work(txs, guard.admit()).await;
             guard.settle_async().await;
@@ -5238,7 +5244,6 @@ impl MempoolHub {
         }
     }
 
-    /// Prepare + scripts + RBF checks, with scripts awaited on the caller.
     /// The API script lane. Hidden: tests hold it.
     #[doc(hidden)]
     pub fn api_script_lane(&self) -> Arc<tokio::sync::Semaphore> {
@@ -5250,6 +5255,7 @@ impl MempoolHub {
         Arc::clone(&self.api_script_lane).acquire_owned().await.ok()
     }
 
+    /// Prepare + scripts + RBF checks, with scripts awaited on the caller.
     pub async fn test_accept_async(
         self: &Arc<Self>,
         tx: Transaction,

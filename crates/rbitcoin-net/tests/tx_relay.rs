@@ -6476,13 +6476,13 @@ async fn try_contains_does_not_panic_on_tokio_worker() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
-/// A script-bearing admit must finish while the one blocking thread is parked.
 /// This node's API clients run their admits and tests in one lane: with
-/// every lane permit held, a test, a broadcast and a package wait; relay
-/// admits do not take the lane. The lane leaves script workers to blocks.
+/// every lane permit held, a test, a broadcast, a package and a multi-tx
+/// `testmempoolaccept` member wait; relay admits do not take the lane. The
+/// lane leaves script workers to blocks.
 #[test]
 fn api_admits_wait_on_their_script_lane() {
-    let (_store, q, cbs) = pad_cbs(4);
+    let (_store, q, cbs) = pad_cbs(5);
     let mp_dir = tmp();
     let hub = Arc::new(MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap());
     hub.set_relay_enabled(true);
@@ -6490,6 +6490,7 @@ fn api_admits_wait_on_their_script_lane() {
     let probed = spend_true(cbs[1], 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let local = spend_true(cbs[2], 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let pkg = spend_true(cbs[3], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let member_tx = spend_true(cbs[4], 1_000, ScriptBuf::from_bytes(vec![0x51]));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -6509,10 +6510,23 @@ fn api_admits_wait_on_their_script_lane() {
         let bcast = tokio::spawn(async move { h.broadcast_local_async(local).await });
         let h = Arc::clone(&hub);
         let package = tokio::spawn(async move { h.accept_package_async(vec![pkg]).await });
+        let h = Arc::clone(&hub);
+        let member = tokio::spawn(async move {
+            let guard = h.begin_tentative_guard();
+            let r = h
+                .accept_test_package_member_async(member_tx, guard.admit())
+                .await;
+            guard.settle_async().await;
+            r
+        });
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!test.is_finished(), "a test waits on the API lane");
         assert!(!bcast.is_finished(), "a broadcast waits on the API lane");
         assert!(!package.is_finished(), "a package waits on the API lane");
+        assert!(
+            !member.is_finished(),
+            "a multi-tx testmempoolaccept member waits on the API lane"
+        );
         drop(held);
         for done in [
             tokio::time::timeout(Duration::from_secs(10), test)
@@ -6524,6 +6538,9 @@ fn api_admits_wait_on_their_script_lane() {
             tokio::time::timeout(Duration::from_secs(10), package)
                 .await
                 .map(|r| r.unwrap().map(|_| ())),
+            tokio::time::timeout(Duration::from_secs(10), member)
+                .await
+                .map(|r| r.unwrap().map(|_| ())),
         ] {
             done.expect("finishes once the lane frees")
                 .expect("api admit");
@@ -6531,6 +6548,7 @@ fn api_admits_wait_on_their_script_lane() {
     });
 }
 
+/// A script-bearing admit must finish while the one blocking thread is parked.
 #[test]
 fn script_admit_finishes_while_the_blocking_pool_is_parked() {
     let (_store, q, cbs) = pad_cbs(3);
