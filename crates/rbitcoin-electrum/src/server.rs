@@ -92,7 +92,9 @@ pub const DEFAULT_MAX_SCRIPTHASH_SUBS: usize = 10_000;
 pub const DEFAULT_MAX_SP_SUBS: usize = 16;
 /// Silent-payment history scans the process runs at once, across every
 /// connection. The per-connection cap alone leaves connections x addresses.
-/// A subscribe past this is refused until a scan ends. Not a knob.
+/// A subscribe on a connection running fewer than
+/// [`MAX_SP_SCANS_PER_CONN`] scans is refused past this until a scan ends;
+/// one at that cap waits for its connection's next slot. Not a knob.
 pub const DEFAULT_MAX_SP_SCANS: usize = 32;
 /// History scans one connection runs at once, as many as the scans' shared
 /// store-read turns ([`crate::silent_scan::SP_SCAN_PERMITS`]). Its other
@@ -1490,10 +1492,16 @@ where
         None,
     );
     writer.line(rpc_result(&id, &result, None)).await?;
+    // A waiting address subscribed again keeps its turn.
+    let turn = conn
+        .sp_waiting
+        .iter()
+        .position(|w| w.address == sub.address)
+        .unwrap_or(conn.sp_waiting.len());
     drop_sp_address(conn, &sub.address);
     match slot {
         Some(slot) => start_sp_scan(conn, query, chain, sub, config.sp_scan_chunk, slot),
-        None => conn.sp_waiting.push_back(sub),
+        None => conn.sp_waiting.insert(turn.min(conn.sp_waiting.len()), sub),
     }
     Ok(())
 }
@@ -1507,8 +1515,10 @@ fn start_sp_scan(
     chunk: u32,
     slot: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let tip = query.tip_height().map(|h| h.0);
-    let last = sub.end.unwrap_or(tip.unwrap_or(sub.start).max(sub.start));
+    // A closed range ends at the tip when a reorg lowered it since the
+    // subscribe, as a running scan's does.
+    let tip = query.tip_height().map_or(sub.start, |h| h.0).max(sub.start);
+    let last = sub.end.map_or(tip, |end| end.min(tip)).max(sub.start);
     let from = sub.start;
     conn.sp_scans
         .push(SpScanRun::start(query, chain, sub, from, last, chunk, slot));

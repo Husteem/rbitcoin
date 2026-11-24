@@ -3409,6 +3409,43 @@ async fn sp_waiting_subscribes_scan_in_turn() {
     }
 }
 
+/// A waiting subscribe is a subscription: subscribing its address again
+/// keeps the earlier start, and unsubscribing it means it is never scanned.
+#[tokio::test]
+async fn sp_waiting_subscribe_keeps_its_start_and_can_be_dropped() {
+    let chain = sp_chain_paying_every_height("el-sp-wait-edit", 15);
+    let mut s = sp_session_with(&chain.q, sp_cfg_slots(32), 1 << 16);
+    let mut lines: Vec<String> = (0..5u8)
+        .map(|w| sp_subscribe_line(u32::from(w) + 1, chain.sub_for(w, json!(0))))
+        .collect();
+    // Wallets 3 and 4 wait. Wallet 3 again with a later start; wallet 4 gone.
+    lines.push(sp_subscribe_line(6, chain.sub_for(3, json!(5))));
+    lines.push(sp_unsubscribe_line(7, chain.sub_for(4, json!(0))));
+    let replies = s.ask(&lines).await;
+    assert_eq!(
+        replies[5]["result"]["start_height"], 0,
+        "the waiting subscription keeps its start: {}",
+        replies[5]
+    );
+    let dropped = replies[4]["result"].clone();
+    let mut open: Vec<Value> = replies[..4].iter().map(|r| r["result"].clone()).collect();
+    while !open.is_empty() {
+        let note = sp_next_line(&mut s.client).await;
+        let params = note["params"].as_array().expect("positional note");
+        assert_ne!(
+            params[0], dropped,
+            "an unsubscribed waiting address scanned"
+        );
+        if params[1].as_f64() == Some(1.0) {
+            open.retain(|sub| sub != &params[0]);
+        }
+    }
+    // Wallet 4 has no payments: its only note would be its last.
+    let mut line = String::new();
+    let late = tokio::time::timeout(Duration::from_secs(3), s.client.read_line(&mut line)).await;
+    assert!(late.is_err(), "a note after the histories: {line}");
+}
+
 /// History scans are capped across connections. A subscribe past the cap is
 /// refused in its reply. Subscribing again hands a scan's slot on, and a
 /// scan that reaches the tip frees its slot.
