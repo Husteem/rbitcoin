@@ -6055,7 +6055,10 @@ async fn v2_messages_count_contents_plus_cipher_expansion() {
 /// the length byte of the user agent, and the user agent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_version_counts_the_length_the_peer_sent() {
-    let agents = ["/rbitcoin:test(v2a)/", "/rbitcoin:test(v2-longer-agent-string)/"];
+    let agents = [
+        "/rbitcoin:test(v2a)/",
+        "/rbitcoin:test(v2-longer-agent-string)/",
+    ];
     let t = paused_serve("v2-version-bytes", 0, &agents).await;
     for (agent, (_, sess)) in agents.iter().zip(&t.clients) {
         let want = (13 + 85 + 1 + agent.len() + 20) as u64;
