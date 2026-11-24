@@ -3214,6 +3214,7 @@ impl MempoolHub {
                     report_orphans: spec.report_orphans,
                     min_relay: spec.min_relay,
                     waive: spec.waive,
+                    sibling_eviction: spec.sibling_eviction,
                 },
             )
         };
@@ -3221,9 +3222,8 @@ impl MempoolHub {
             *lock_us = lock_us.saturating_add(t_prep.elapsed().as_micros() as u64);
         }
         match prep {
-            Ok(mut p) => {
+            Ok(p) => {
                 stages.utxo_us = stages.utxo_us.saturating_add(p.utxo_us);
-                p.sibling_eviction = spec.sibling_eviction;
                 Ok(p)
             }
             Err(e) => Err(e),
