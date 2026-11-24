@@ -8050,6 +8050,29 @@ fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
     );
 }
 
+/// The rate-strike map rolls too: at the cap a new address still records
+/// its strike, so its second rate-limit disconnect escalates, and the
+/// oldest strike rolls out.
+#[test]
+fn rate_strikes_roll_at_the_cap() {
+    use rbitcoin_net::peers::{DiscourageKey, PeerHub};
+    let peers = PeerHub::new();
+    let now = 1_800_000_000;
+    let key = |i: u32| DiscourageKey::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::from(i)));
+    for i in 0..PeerHub::DISCOURAGE_CAP as u32 {
+        peers.set_mock_now(if i == 0 { now - 1 } else { now });
+        assert!(!peers.note_rate_strike(key(i)));
+    }
+    let new = key(u32::MAX);
+    assert!(!peers.note_rate_strike(new), "the first strike is recorded");
+    assert!(peers.note_rate_strike(new), "the second strike escalates");
+    assert!(
+        !peers.note_rate_strike(key(0)),
+        "the oldest strike rolled out"
+    );
+    assert!(peers.note_rate_strike(key(2)), "the rest stay");
+}
+
 /// A full inbound table evicts one peer and pauses that netgroup. The pause
 /// must not refuse outbound dials to the rest of the prefix.
 #[test]
