@@ -1513,6 +1513,14 @@ pub(crate) fn finish_deferred_archived_clear(
             if !dropped && note_mutated_copy(st, hash) {
                 st.unservable.insert(hash);
                 st.body.stop_reget(hash);
+                // A tip+1 sibling is never on the path, so the walk cut below
+                // does not reach it. Drop its ask lane here or assign keeps
+                // asking for a body the peer always sends mutated.
+                st.tip_siblings.retain(|h| *h != hash);
+                if !st.is_on_path(&hash, height) {
+                    super::header_walk::forget_sibling_rows(st, hash);
+                    return;
+                }
                 if let Some(hub) = hub {
                     super::header_walk::retire_unservable(st, hub, hash, height);
                 }
@@ -1704,8 +1712,8 @@ const MUTATED_TRACK_CAP: usize = 256;
 /// Count one mutated body copy for `hash`. True once the abandon limit is
 /// reached (see [`MUTATED_COPIES_BEFORE_ABANDON`]).
 ///
-/// Dropping a count at [`MUTATED_TRACK_CAP`] only costs retries for that
-/// hash; it can never retire a hash that has not been copied that often.
+/// Dropping a count at the tracking cap only costs retries for that hash; it
+/// can never retire a hash that has not been copied that often.
 pub fn note_mutated_copy(st: &mut IbdWorkState, hash: BlockHash) -> bool {
     if st.mutated_copies.len() >= MUTATED_TRACK_CAP && !st.mutated_copies.contains_key(&hash) {
         if let Some(victim) = st.mutated_copies.keys().next().copied() {
@@ -1733,7 +1741,9 @@ pub fn punish_mutated_sender(st: &mut IbdWorkState, peer: usize, hash: BlockHash
         .find(|s| s.id == peer && s.alive)
         .map(|s| (s.addr, s.conn_type))
     else {
-        return false;
+        // The slot is gone: this copy is a stale answer from a peer that is
+        // no longer kept, so it does not count toward the abandon bound.
+        return true;
     };
     if conn_type == rbitcoin_net::peers::PeerConnType::Manual {
         warn!("ibd: peer[{peer}] sent mutated block {hash}; not punishing manually connected peer");

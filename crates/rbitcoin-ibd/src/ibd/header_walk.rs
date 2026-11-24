@@ -1153,15 +1153,22 @@ pub fn refuse_invalid_linked(
 /// leaving them in the maps after the walk moved past their height would keep
 /// bodies for an old tip askable.
 fn forget_tip_siblings(st: &mut IbdWorkState) {
-    for h in st.tip_siblings.drain(..) {
-        st.hash_height.remove(&h);
-        st.known_headers.remove(&h);
-        st.header_fks.remove(&h);
+    let siblings = std::mem::take(&mut st.tip_siblings);
+    for h in siblings {
+        forget_sibling_rows(st, h);
     }
 }
 
-/// Equal-work siblings assign may ask for at one tip. Small: each is at most
-/// one distinct body at tip+1, and a peer can announce them for free.
+/// Drop the rows a tip+1 sibling occupies. It is not a stored header, so
+/// leaving it in the maps keeps bodies for a tip the walk left askable.
+pub(crate) fn forget_sibling_rows(st: &mut IbdWorkState, hash: BlockHash) {
+    st.hash_height.remove(&hash);
+    st.known_headers.remove(&hash);
+    st.header_fks.remove(&hash);
+}
+
+/// Equal-work siblings kept for planting at one tip. Small: each is at most
+/// one distinct header at tip+1, and a peer can announce them for free.
 pub const TIP_SIBLINGS_CAP: usize = 8;
 
 /// The block at `height` failed consensus. When the download path holds it,
@@ -1403,6 +1410,9 @@ pub fn offer_alternate(
     if !pow_linked(headers) {
         return None;
     }
+    if st.unservable.contains(&headers[0].block_hash()) {
+        return Some(true);
+    }
     if short_below_floor(st, hub, headers) {
         return Some(true);
     }
@@ -1430,19 +1440,23 @@ pub fn offer_alternate(
         return Some(st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP);
     }
     note_challenger(st, hub, prev, fork_height, parent, headers, peer);
-    // The walk stays first-seen, but a sibling that attaches at the walk tip
-    // is a body the announcing peer has and we never ask for. Core moves a
-    // peer's best known block on equal work (`UpdateBlockAvailability`,
-    // `nChainWork >=`), so `FindNextBlocksToDownload` asks for it. Fetch just
-    // that header's body: the announcement itself is still not written.
+    // The walk stays first-seen, but a sibling of the walk tip is a block the
+    // announcing peer has and we never ask for. Core moves a peer's best known
+    // block on equal work (`UpdateBlockAvailability`, `nChainWork >=`), so
+    // `FindNextBlocksToDownload` asks for it. Record it so the tip can be
+    // planted at this height once the header in that slot is abandoned; the
+    // announcement itself is still not written, and it is not asked for
+    // before the slot frees (a body for a non-occupant cannot be applied).
     if st.header_walk.tip_height() == fork_height.saturating_add(1) {
         if let Some(sibling) = headers.first().map(Header::block_hash) {
             st.hash_height
                 .insert(sibling, fork_height.saturating_add(1));
             st.known_headers.insert(sibling);
+            st.note_path_prev(sibling, prev);
             if !st.tip_siblings.contains(&sibling) {
                 if st.tip_siblings.len() >= TIP_SIBLINGS_CAP {
-                    st.tip_siblings.remove(0);
+                    let evicted = st.tip_siblings.remove(0);
+                    forget_sibling_rows(st, evicted);
                 }
                 st.tip_siblings.push(sibling);
             }
@@ -2753,6 +2767,12 @@ fn extend_connected(
     headers: &[Header],
     peer: Option<usize>,
 ) -> bool {
+    if headers
+        .first()
+        .is_some_and(|h| st.unservable.contains(&h.block_hash()))
+    {
+        return false;
+    }
     if over_length(st, headers.len()) {
         st.header_walk.length_exceeded = true;
         return false;
@@ -2779,6 +2799,7 @@ fn extend_connected(
     }
     st.header_walk.emptied.clear();
     st.header_walk.restored_unproved = false;
+    forget_tip_siblings(st);
     publish_work(st, hub);
     if adopt_checkpoint_due(
         st.header_walk.proven,

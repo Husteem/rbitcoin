@@ -22,6 +22,9 @@ use tokio::net::TcpListener;
 const CHAIN: usize = 3;
 /// Getdata for A after B was announced, before the peer stops waiting for B.
 const A_ASKS_AFTER_B: usize = 8;
+/// Getdata for B before the peer stops waiting for B. Same budget as A: a
+/// healthy sibling is asked for once and answered.
+const B_ASKS_BEFORE_GIVE_UP: usize = 8;
 
 /// The sibling body the peer serves for B.
 #[derive(Clone, Copy, PartialEq)]
@@ -32,6 +35,9 @@ enum Sibling {
     /// outpoint (`bad-txns-prevout-null`): catch-up must still end, at the
     /// chain tip, instead of re-asking for mutated A forever.
     Invalid,
+    /// B's own body arrives mutated every time, like A's: the ask lane for B
+    /// must be dropped too, or the same loop just moves one header over.
+    Mutated,
 }
 
 struct Fixture {
@@ -78,10 +84,25 @@ impl Fixture {
         Self { chain, a, b, bad_b }
     }
 
-    fn sibling(&self, kind: Sibling) -> &Block {
+    /// The header the peer announces for B.
+    fn announced(&self, kind: Sibling) -> &Block {
         match kind {
-            Sibling::Valid => &self.b,
+            Sibling::Valid | Sibling::Mutated => &self.b,
             Sibling::Invalid => &self.bad_b,
+        }
+    }
+
+    /// The body the peer serves when B is asked for.
+    fn body(&self, kind: Sibling) -> Block {
+        match kind {
+            Sibling::Valid => self.b.clone(),
+            Sibling::Invalid => self.bad_b.clone(),
+            Sibling::Mutated => {
+                let mut block = self.b.clone();
+                let out = &mut block.txdata[0].output[0];
+                out.value = out.value.checked_sub(Amount::from_sat(1)).unwrap();
+                block
+            }
         }
     }
 
@@ -103,6 +124,7 @@ impl Fixture {
 struct Seen {
     a_asks: usize,
     a_asks_after_b: usize,
+    b_asks: usize,
     b_asked: bool,
     gave_up: bool,
 }
@@ -134,7 +156,7 @@ async fn serve(
     .await
     .map_err(|e| e.to_string())?;
     let a_hash = fx.a.block_hash();
-    let b_hash = fx.sibling(sibling).block_hash();
+    let b_hash = fx.announced(sibling).block_hash();
     let mut announced = false;
     let mut b_announced = false;
     loop {
@@ -179,20 +201,21 @@ async fn serve(
                             send.push(NetworkMessage::Block(fx.mutated_a()));
                             if seen.a_asks == 2 {
                                 send.push(NetworkMessage::Headers(vec![
-                                    fx.sibling(sibling).header,
+                                    fx.announced(sibling).header,
                                 ]));
                                 b_announced = true;
                             }
                         } else if *hash == b_hash {
                             seen.b_asked = true;
-                            send.push(NetworkMessage::Block(fx.sibling(sibling).clone()));
+                            seen.b_asks += 1;
+                            send.push(NetworkMessage::Block(fx.body(sibling)));
                         }
                     }
                 }
                 NetworkMessage::Ping(nonce) => send.push(NetworkMessage::Pong(*nonce)),
                 _ => {}
             }
-            if seen.a_asks_after_b >= A_ASKS_AFTER_B {
+            if seen.a_asks_after_b >= A_ASKS_AFTER_B || seen.b_asks >= B_ASKS_BEFORE_GIVE_UP {
                 seen.gave_up = true;
                 stop = true;
             }
@@ -286,6 +309,23 @@ async fn an_invalid_equal_work_sibling_ends_catch_up_instead_of_re_asking_mutate
         "the node must stop asking for mutated A (the give-up threshold is \
          {A_ASKS_AFTER_B}; the exact count depends on how many copies were in \
          flight when the sibling was announced): {:?}",
+        out.seen
+    );
+    assert!(out.synced.is_ok(), "{:?}", out.synced);
+    assert_eq!(out.tip, Some(out.fx.chain[CHAIN].block_hash()));
+}
+
+/// A peer that also serves B mutated must not keep its ask lane: the sibling
+/// is abandoned after the same bound, catch-up ends, and neither A nor B is
+/// asked for forever.
+#[tokio::test(flavor = "current_thread")]
+async fn a_mutated_equal_work_sibling_stops_being_asked() {
+    let out = run(Sibling::Mutated).await;
+    assert!(out.seen.b_asked, "{:?}", out.seen);
+    assert!(!out.seen.gave_up, "{:?}", out.seen);
+    assert!(
+        out.seen.b_asks <= 4,
+        "the node must stop asking for mutated B: {:?}",
         out.seen
     );
     assert!(out.synced.is_ok(), "{:?}", out.synced);

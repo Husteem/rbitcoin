@@ -323,9 +323,9 @@ pub struct IbdWorkState {
     /// the work path and never re-seeded from the store this session. The
     /// header itself is still valid; another peer may still serve its body.
     pub unservable: BlockHashSet,
-    /// Equal-work siblings announced at tip+1 that assign still asks for.
-    /// Their header is written when its body is delivered, not on the
-    /// announcement. Bounded like the explore lists.
+    /// Equal-work siblings announced at tip+1, kept so the tip can be planted
+    /// at that height once the header in the slot is abandoned. Bounded like
+    /// the explore lists; none of them is stored on the announcement.
     pub tip_siblings: Vec<BlockHash>,
     /// Set when a second engine-fault hits the same hash — IBD must halt.
     pub halt: Option<String>,
