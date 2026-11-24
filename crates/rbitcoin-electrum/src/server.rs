@@ -2555,29 +2555,21 @@ pub fn restatus_notes(
     heights: Option<&[u32]>,
 ) -> Vec<([u8; 32], String)> {
     let mut out = Vec::new();
-    // Each height's touch set is built at most once, and only when a sub with
-    // postings needs it: a hash with no history can't be touched, so a
-    // connection watching only fresh addresses never loads the block's
-    // prevouts. (Probing per sub reloaded the block and its prevouts for each
-    // subscribed hash with history.) A height whose set fails to load counts
-    // as untouched, as the per-sub probe's `.ok().unwrap_or(false)` did.
-    let mut touches: Option<Vec<rbitcoin_query::BlockTouch>> = None;
+    // Each height's touch set is the block's scripthashes, built once per
+    // block for every connection ([`Query::block_touch`]); a sub is checked
+    // by a set lookup. A height whose set fails to load counts as untouched.
+    let mut touches: Option<Vec<Arc<rbitcoin_query::BlockTouch>>> = None;
     for sh in subs {
         let hit = match heights {
             None => true,
-            Some(hs) => {
-                if !query.scripthash_has_postings(sh).unwrap_or(false) {
-                    false
-                } else {
-                    let ts = touches.get_or_insert_with(|| {
-                        hs.iter()
-                            .filter_map(|h| query.block_touch(Height(*h)).ok())
-                            .collect()
-                    });
-                    ts.iter()
-                        .any(|t| query.scripthash_touched_by(sh, t).ok().unwrap_or(false))
-                }
-            }
+            Some(hs) => touches
+                .get_or_insert_with(|| {
+                    hs.iter()
+                        .filter_map(|h| query.block_touch(Height(*h)).ok())
+                        .collect()
+                })
+                .iter()
+                .any(|t| t.touches(sh)),
         };
         if !hit {
             continue;

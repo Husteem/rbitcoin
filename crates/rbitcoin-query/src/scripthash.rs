@@ -444,11 +444,26 @@ pub struct ScriptHashUtxo {
     pub create_tx_fk: rbitcoin_primitives::Fk,
 }
 
-/// Tx fks and input `create_fk`s of one block ([`Query::block_touch`]).
+/// Script hashes of the outputs of one block's txs and of the txs its
+/// inputs spend from ([`Query::block_touch`]).
 #[derive(Clone, Debug, Default)]
 pub struct BlockTouch {
-    pub ids: std::collections::HashSet<u64>,
+    scripthashes: std::collections::HashSet<[u8; 32]>,
 }
+
+impl BlockTouch {
+    /// Whether the block touches `scripthash`: a set lookup, no store read.
+    pub fn touches(&self, scripthash: &[u8; 32]) -> bool {
+        self.scripthashes.contains(scripthash)
+    }
+}
+
+/// Blocks whose [`BlockTouch`] [`Query::block_touch`] keeps: a tip and the
+/// heights a lagging subscriber catches up through.
+pub const BLOCK_TOUCH_KEEP: usize = 8;
+
+/// A kept [`BlockTouch`]: block height, block hash, set.
+pub type CachedTouch = (u32, [u8; 32], Arc<BlockTouch>);
 
 /// Esplora-style confirmed chain stats for a scripthash.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -1428,6 +1443,9 @@ impl Query {
 
     /// Durable creates and pending RAM creates from one even `publish_seq`.
     fn stable_sh_postings(&self, scripthash: &[u8; 32]) -> Result<(Vec<Fk>, Vec<Fk>), QueryError> {
+        #[cfg(debug_assertions)]
+        self.sh_posting_loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.read_stable_sh_publish(|query| {
             let durable = query.sh_create_fks(scripthash)?;
             note_sh_posting_gap(query)?;
@@ -2105,110 +2123,63 @@ impl Query {
         )
     }
 
-    /// Confirmed txs in `height` that create or spend a posting-list out for `scripthash`.
+    /// One block's touch set, shared by every scripthash check and kept for
+    /// the last [`BLOCK_TOUCH_KEEP`] blocks.
     ///
-    /// Intersects the SH posting list with the block's tx fks and input
-    /// `create_fk`s. Does not expand packed `txout`.
-    pub fn scripthash_tx_fks_at_height(
-        &self,
-        scripthash: &[u8; 32],
-        height: Height,
-    ) -> Result<Vec<Fk>, QueryError> {
-        let (entries, pending) = self.stable_sh_postings(scripthash)?;
-        let mut posting: Vec<u64> = entries.iter().filter_map(|fk| fk.get()).collect();
-        for fk in pending {
-            if let Some(id) = fk.get() {
-                posting.push(id);
-            }
-        }
-        if posting.is_empty() {
-            return Ok(Vec::new());
-        }
-        posting.sort_unstable();
-        posting.dedup();
-        let block_fks = self.block_tx_fks(height)?;
-        let mut out = Vec::new();
-        for fk in &block_fks {
-            let mut hit = false;
-            if let Some(id) = fk.get() {
-                if posting.binary_search(&id).is_ok() {
-                    hit = true;
-                }
-            }
-            if !hit {
-                let prevs = self.tx_prevouts_for_fk(*fk)?;
-                for (create_fk, _) in prevs {
-                    if let Some(id) = create_fk.get() {
-                        if posting.binary_search(&id).is_ok() {
-                            hit = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if hit {
-                out.push(*fk);
-            }
-        }
-        Ok(out)
-    }
-
-    /// True when [`Self::scripthash_tx_fks_at_height`] is non-empty.
-    pub fn scripthash_touched_at_height(
-        &self,
-        scripthash: &[u8; 32],
-        height: Height,
-    ) -> Result<bool, QueryError> {
-        Ok(!self
-            .scripthash_tx_fks_at_height(scripthash, height)?
-            .is_empty())
-    }
-
-    /// One block's touch set, built once and shared by many scripthash checks.
-    ///
-    /// Holds every tx fk in the block plus every input's `create_fk`. A
-    /// scripthash is touched at that height exactly when its posting list meets
-    /// this set, the same predicate as [`Self::scripthash_touched_at_height`],
-    /// without reloading the block and its prevouts per scripthash.
-    pub fn block_touch(&self, height: Height) -> Result<BlockTouch, QueryError> {
-        let mut ids = std::collections::HashSet::new();
-        for fk in self.block_tx_fks(height)? {
-            if let Some(id) = fk.get() {
-                ids.insert(id);
-            }
-            for (create_fk, _) in self.tx_prevouts_for_fk(fk)? {
-                if let Some(id) = create_fk.get() {
-                    ids.insert(id);
-                }
-            }
-        }
-        Ok(BlockTouch { ids })
-    }
-
-    /// Whether `scripthash` has any posting at all (durable or pending).
-    ///
-    /// The cheap test that lets callers skip [`Self::block_touch`] when no
-    /// subscribed hash could possibly be touched.
-    pub fn scripthash_has_postings(&self, scripthash: &[u8; 32]) -> Result<bool, QueryError> {
-        Ok(self.scripthash_create_count(scripthash)? > 0)
-    }
-
-    /// [`Self::scripthash_touched_at_height`] against a prebuilt [`BlockTouch`].
-    pub fn scripthash_touched_by(
-        &self,
-        scripthash: &[u8; 32],
-        touch: &BlockTouch,
-    ) -> Result<bool, QueryError> {
-        if touch.ids.is_empty() {
-            return Ok(false);
-        }
-        let (entries, pending) = self.stable_sh_postings(scripthash)?;
-        let hit = entries
+    /// Holds the script hash of every output of every tx in the block and of
+    /// every tx an input spends from: the scripthashes whose posting list
+    /// (create fks) meets the block's tx fks or input `create_fk`s. A check is
+    /// then a set lookup, with no posting-list load per subscription.
+    pub fn block_touch(&self, height: Height) -> Result<Arc<BlockTouch>, QueryError> {
+        let Some((_, rec)) = self.header_at_height(height)? else {
+            return Err(StoreError::NotFound);
+        };
+        let mut cache = self
+            .block_touch_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((_, _, touch)) = cache
             .iter()
-            .chain(pending.iter())
-            .filter_map(|fk| fk.get())
-            .any(|id| touch.ids.contains(&id));
-        Ok(hit)
+            .find(|(h, hash, _)| *h == height.0 && *hash == rec.hash)
+        {
+            return Ok(Arc::clone(touch));
+        }
+        let touch = Arc::new(self.build_block_touch(height)?);
+        if cache.len() >= BLOCK_TOUCH_KEEP {
+            cache.pop_front();
+        }
+        cache.push_back((height.0, rec.hash, Arc::clone(&touch)));
+        Ok(touch)
+    }
+
+    fn build_block_touch(&self, height: Height) -> Result<BlockTouch, QueryError> {
+        #[cfg(debug_assertions)]
+        self.block_touch_builds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut ids = Vec::new();
+        for fk in self.block_tx_fks(height)? {
+            ids.extend(fk.get());
+            for (create_fk, _) in self.tx_prevouts_for_fk(fk)? {
+                ids.extend(create_fk.get());
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let mut scripthashes = std::collections::HashSet::new();
+        let mut i = 0;
+        while i < ids.len() {
+            let mut j = i;
+            while j + 1 < ids.len() && ids[j + 1] == ids[j] + 1 {
+                j += 1;
+            }
+            self.store
+                .for_each_create_script_hashes_in_fk_span(ids[i], ids[j], |_, sh| {
+                    scripthashes.insert(sh);
+                    Ok(())
+                })?;
+            i = j + 1;
+        }
+        Ok(BlockTouch { scripthashes })
     }
 
     /// Confirmed balance for a scripthash.

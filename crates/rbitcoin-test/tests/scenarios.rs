@@ -2382,28 +2382,30 @@ fn pin_scripthash_views_on_pad(
     assert_eq!(q.scripthash_listunspent_slot(&sh, slot).unwrap(), utxos);
     assert_eq!(q.scripthash_chain_stats_slot(&sh, slot).unwrap(), stats);
 
-    assert_eq!(
-        q.scripthash_tx_fks_at_height(&sh, Height(tip_h)).unwrap(),
-        q.block_tx_fks(Height(tip_h)).unwrap(),
+    let touched = |probe: &[u8; 32], h: u32| q.block_touch(Height(h)).unwrap().touches(probe);
+    assert!(
+        touched(&sh, tip_h),
         "tip coinbase creates and the spend spends the scripthash"
     );
     assert!(
-        !q.scripthash_touched_at_height(&sh, Height::GENESIS)
-            .unwrap(),
+        !touched(&sh, 0),
         "the genesis coinbase pays a pubkey, not OP_TRUE"
     );
-    assert!(q.scripthash_touched_at_height(&sh, Height(1)).unwrap());
-    assert!(!q
-        .scripthash_touched_at_height(&script_hash(&[0x52]), Height(tip_h))
-        .unwrap());
-    // The shared per-block touch set must agree with the per-hash probe at
-    // every height (creates, spends, and blocks that never touch it).
-    for h in 0..=tip_h {
-        let touch = q.block_touch(Height(h)).unwrap();
-        for probe in [sh, script_hash(&[0x52])] {
+    assert!(touched(&sh, 1));
+    assert!(!touched(&script_hash(&[0x52]), tip_h));
+    // The shared per-block touch set sees exactly the heights where the
+    // scripthash has history (creates, spends, and blocks that never touch it).
+    for probe in [sh, script_hash(&[0x52])] {
+        let history: std::collections::HashSet<i64> = q
+            .scripthash_history(&probe)
+            .unwrap()
+            .iter()
+            .map(|r| r.height)
+            .collect();
+        for h in 0..=tip_h {
             assert_eq!(
-                q.scripthash_touched_by(&probe, &touch).unwrap(),
-                q.scripthash_touched_at_height(&probe, Height(h)).unwrap(),
+                touched(&probe, h),
+                history.contains(&i64::from(h)),
                 "height {h}"
             );
         }

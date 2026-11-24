@@ -520,13 +520,14 @@ fn newest_page_gap_obeys_create_cap() {
         q.pending_sh_create_fks(&pending_only).len() == 1,
         "the pending output is not durable yet"
     );
+    let touch = q.block_touch(Height(2)).unwrap();
     assert!(
-        q.scripthash_has_postings(&pending_only).unwrap(),
-        "a pending-only scripthash still has postings"
+        touch.touches(&pending_only),
+        "a block touches a script it pays before that posting is durable"
     );
-    assert!(!q.scripthash_has_postings(&script_hash(&[0x00])).unwrap());
+    assert!(touch.touches(&sh), "the block spends an OP_TRUE output");
+    assert!(!touch.touches(&script_hash(&[0x00])));
     q.apply_sh_pending().unwrap();
-    assert!(q.scripthash_has_postings(&sh).unwrap());
     assert_eq!(q.scripthash_create_count(&sh).unwrap(), 3);
 
     let view = q.pin_sh_chain_view().unwrap().expect("sh view");

@@ -696,6 +696,15 @@ pub struct Query {
     /// Debug builds only.
     #[cfg(debug_assertions)]
     pub reconstruct_archived: AtomicU64,
+    /// [`Self::block_touch`] sets of the last few blocks, keyed by height and
+    /// hash, shared by every subscriber. Each is built under this lock, once.
+    pub block_touch_cache: Mutex<VecDeque<scripthash::CachedTouch>>,
+    /// Scripthash posting-list loads. Debug builds only.
+    #[cfg(debug_assertions)]
+    pub sh_posting_loads: AtomicU64,
+    /// [`Self::block_touch`] sets built from the store. Debug builds only.
+    #[cfg(debug_assertions)]
+    pub block_touch_builds: AtomicU64,
     /// Network genesis coinbase txid ([`Self::set_genesis_coinbase_txid`]).
     pub genesis_coinbase_txid: std::sync::OnceLock<[u8; 32]>,
     /// That tx's fk once the genesis block is stored. Genesis never reorgs.
@@ -1067,6 +1076,11 @@ impl Query {
             height_by_hash: std::sync::RwLock::new(HeightByHashIndex::default()),
             #[cfg(debug_assertions)]
             reconstruct_archived: AtomicU64::new(0),
+            block_touch_cache: Mutex::new(VecDeque::new()),
+            #[cfg(debug_assertions)]
+            sh_posting_loads: AtomicU64::new(0),
+            #[cfg(debug_assertions)]
+            block_touch_builds: AtomicU64::new(0),
             genesis_coinbase_txid: std::sync::OnceLock::new(),
             genesis_coinbase_fk: std::sync::OnceLock::new(),
             max_sh_creates: AtomicU32::new(DEFAULT_MAX_SH_CREATES),
@@ -2222,6 +2236,18 @@ impl Query {
     #[cfg(debug_assertions)]
     pub fn sample_reset_reconstruct_archived(&self) -> u64 {
         self.reconstruct_archived.swap(0, AtomicOrdering::Relaxed)
+    }
+
+    /// Sample-and-reset scripthash posting-list loads.
+    #[cfg(debug_assertions)]
+    pub fn sample_reset_sh_posting_loads(&self) -> u64 {
+        self.sh_posting_loads.swap(0, AtomicOrdering::Relaxed)
+    }
+
+    /// Sample-and-reset [`Self::block_touch`] sets built from the store.
+    #[cfg(debug_assertions)]
+    pub fn sample_reset_block_touch_builds(&self) -> u64 {
+        self.block_touch_builds.swap(0, AtomicOrdering::Relaxed)
     }
 
     /// [`StoreError::Rejected`] payload from [`Self::block_queue_offer`] for

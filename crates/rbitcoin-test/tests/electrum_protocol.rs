@@ -1183,26 +1183,18 @@ fn block_touch_sees_spend_only_heights() {
     let spent_only = script_hash(&[0x51]);
     let touch = q.block_touch(Height(102)).unwrap();
     assert!(
-        q.scripthash_touched_at_height(&spent_only, Height(102))
-            .unwrap(),
+        q.scripthash_history(&spent_only)
+            .unwrap()
+            .iter()
+            .any(|r| r.height == 102),
         "fixture: OP_TRUE is spent (not paid) at 102"
     );
     assert!(
-        q.scripthash_touched_by(&spent_only, &touch).unwrap(),
-        "block_touch must include the spent outputs' create fks"
+        touch.touches(&spent_only),
+        "block_touch must include the scripts of the spent outputs' txs"
     );
     for (script, want) in [(vec![0x52], true), (vec![0x53], true), (vec![0x54], false)] {
-        let sh = script_hash(&script);
-        assert_eq!(
-            q.scripthash_touched_by(&sh, &touch).unwrap(),
-            want,
-            "{script:?}"
-        );
-        assert_eq!(
-            q.scripthash_touched_at_height(&sh, Height(102)).unwrap(),
-            want,
-            "{script:?}"
-        );
+        assert_eq!(touch.touches(&script_hash(&script)), want, "{script:?}");
     }
 }
 
