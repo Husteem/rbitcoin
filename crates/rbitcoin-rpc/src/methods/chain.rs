@@ -1064,7 +1064,7 @@ fn getblock_body(
     verbosity: u32,
 ) -> Result<Value, Value> {
     let misc = |e: rbitcoin_query::QueryError| rpc_error(ERR_MISC, e.to_string());
-    let pruned = |e| map_query(e, "Block not available (pruned data)");
+    let pruned = |e| map_query(e, ERR_MISC, "Block not available (pruned data)");
     ctx.query.require_seqsigwit_at(at.height).map_err(pruned)?;
     let prev = prev_hash_of(ctx, &rec)?;
     let fks = ctx

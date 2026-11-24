@@ -861,7 +861,7 @@ pub fn getblockstats(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
     let block = ctx
         .query
         .reconstruct_block_at_height(height)
-        .map_err(|e| map_query(e, "Block not available (pruned data)"))?;
+        .map_err(|e| map_query(e, ERR_MISC, "Block not available (pruned data)"))?;
     let parents = prevout_map_for_block(ctx, height, &block)?;
     let _ = ctx.query.stamp_txstat_from_block(height, &block);
     let stats = stats_for_connected(ctx, height, &block, &parents)?;
