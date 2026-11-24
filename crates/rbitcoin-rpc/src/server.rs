@@ -253,7 +253,6 @@ pub async fn run_rpc(
     let rest_queue = Arc::new(tokio::sync::Semaphore::new(DEFAULT_RPC_WORK_QUEUE));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, _) = tokio::sync::watch::channel(());
-    let accept_sem = Arc::new(Semaphore::new(RPC_MAX_CONNECTIONS));
     let mut tasks = Vec::new();
     let mut local_addr = None;
 
@@ -286,7 +285,7 @@ pub async fn run_rpc(
         };
         let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
-        let accept_sem = Arc::clone(&accept_sem);
+        let accept_sem = Arc::new(Semaphore::new(RPC_MAX_CONNECTIONS));
         tasks.push(tokio::spawn(serve_rpc(
             listener,
             app,
@@ -341,7 +340,9 @@ pub async fn run_rpc(
         };
         let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
-        let accept_sem = Arc::clone(&accept_sem);
+        // Each listener has its own connection slots, so TCP clients
+        // (authenticated or not) cannot lock out the local socket.
+        let accept_sem = Arc::new(Semaphore::new(RPC_MAX_CONNECTIONS));
         tasks.push(tokio::spawn(serve_rpc(
             listener,
             app,
@@ -461,12 +462,16 @@ pub async fn reject_unauthorized(
         } else {
             "Bearer realm=\"jsonrpc\""
         };
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, challenge)],
-            "Unauthorized\n",
-        )
-            .into_response();
+        // Close after the 401: an unauthenticated client must not keep a
+        // connection slot with keep-alive.
+        return closing(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, challenge)],
+                "Unauthorized\n",
+            )
+                .into_response(),
+        );
     }
     next.run(req).await
 }

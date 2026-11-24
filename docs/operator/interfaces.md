@@ -390,7 +390,7 @@ services.rbitcoin.sv2.tp = {
 ## Core-class JSON-RPC
 
 Optional HTTP JSON-RPC subset (default **off**). TCP and the unix socket
-share a 256-connection cap; the deadlines are in [`docs/rpc.md`](../../docs/rpc.md).
+each have a 256-connection cap; the deadlines are in [`docs/rpc.md`](../../docs/rpc.md).
 `--rpc` binds
 `{datadir}/rpc.sock` (mode **0600**, filesystem auth, no HTTP header).
 `--rpc-socket PATH` binds that socket at PATH instead, mode **0660**, so a
