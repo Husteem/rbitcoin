@@ -87,13 +87,14 @@ pub fn submit_tx_version_nonstandard(tx: &Transaction) -> bool {
     !(1..=3).contains(&tx.version.0)
 }
 
-/// Two members spend the same outpoint. Core `IsConsistentPackage` adds a
+/// Two members spend the same outpoint, or a member has no inputs. Core
+/// `IsConsistentPackage` cannot check a member without inputs, and it adds a
 /// member's inputs only after checking all of them, so an input repeated
 /// inside one tx is left to that tx's `bad-txns-inputs-duplicate`.
 pub fn package_has_conflicts(txs: &[Transaction]) -> bool {
     let mut spent = HashSet::new();
     for tx in txs {
-        if tx.input.iter().any(|i| spent.contains(&i.previous_output)) {
+        if tx.input.is_empty() || tx.input.iter().any(|i| spent.contains(&i.previous_output)) {
             return true;
         }
         spent.extend(tx.input.iter().map(|i| i.previous_output));

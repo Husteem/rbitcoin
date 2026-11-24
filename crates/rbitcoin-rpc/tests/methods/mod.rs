@@ -5167,7 +5167,9 @@ fn testmempoolaccept_tells_a_witness_swap_from_a_duplicate() {
 /// Core adds a member's inputs as a batch, so an input repeated inside one
 /// tx is that row's `bad-txns-inputs-duplicate`, not `conflict-in-package`
 /// (Core `IsConsistentPackage`). `submitpackage` reports it before the
-/// doubled input sum can trip `maxfeerate`.
+/// doubled input sum can trip `maxfeerate`. A member with no inputs, Core's
+/// 10-byte null tx, makes the package inconsistent: `IsConsistentPackage`
+/// cannot check it, so every row is `conflict-in-package`.
 #[test]
 fn testmempoolaccept_package_reports_a_repeated_input_on_its_row() {
     use bitcoin::consensus::encode::serialize;
@@ -5192,6 +5194,16 @@ fn testmempoolaccept_package_reports_a_repeated_input_on_its_row() {
         sub["tx-results"][&dup_wtxid]["error"], "bad-txns-inputs-duplicate",
         "{sub}"
     );
+    let null_tx = "02000000000000000000";
+    let (_, other) = spend_generated_coinbase(&ctx, 2, 50_0000_0000 - 1_000, spk);
+    let other_hex = rbitcoin_primitives::hex_encode(serialize(&other));
+    let pair = json!([other_hex, null_tx]);
+    let rows = dispatch(&ctx, "testmempoolaccept", vec![pair.clone()]).unwrap();
+    for row in rows.as_array().unwrap() {
+        assert_eq!(row["package-error"], "conflict-in-package", "{rows}");
+    }
+    let sub = dispatch(&ctx, "submitpackage", vec![pair]).unwrap();
+    assert_eq!(sub["package_msg"], "conflict-in-package", "{sub}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

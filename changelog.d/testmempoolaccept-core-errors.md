@@ -21,6 +21,9 @@ Fixed
   A package member that clashes with a pool tx and also fails
   `CheckTransaction`, such as a repeated input, reports the
   `CheckTransaction` reason, not `bip125-replacement-disallowed`.
+  A package with a member that has no inputs is `conflict-in-package`, as
+  Core `IsConsistentPackage` refuses it, here and in `submitpackage`, which
+  admitted the other members.
   The cluster cap holds for each cluster a package would make with the
   mempool, and only that cluster's members are refused, with
   `reject-reason` `too-large-cluster` as a single transaction over the cap
