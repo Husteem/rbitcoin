@@ -775,10 +775,26 @@ impl LivePeer {
             .or_insert(0) += nbytes;
     }
 
-    /// The session writer calls this once per frame it wrote. A command
-    /// already in the map takes no allocation.
+    /// The session writer calls this once per v1 frame it wrote: payload
+    /// plus Core's 24-byte header.
     pub fn note_sent(&self, cmd: &str, nbytes: u64) {
-        let n = acct_bytes(cmd, nbytes);
+        self.add_sent(cmd, acct_bytes(cmd, nbytes));
+    }
+
+    /// The session writer calls this once per v2 frame it wrote, with the
+    /// length of the BIP324 contents it encrypted.
+    pub fn note_sent_v2(&self, cmd: &str, contents_len: usize) {
+        self.add_sent(cmd, crate::v2::v2_msg_bytes(contents_len));
+    }
+
+    /// The session reader calls this once per v2 frame it read, with the
+    /// length of the decrypted contents.
+    pub fn note_recv_v2(&self, cmd: &str, contents_len: usize) {
+        self.note_recv_raw(cmd, crate::v2::v2_msg_bytes(contents_len));
+    }
+
+    /// A command already in the map takes no allocation.
+    fn add_sent(&self, cmd: &str, n: u64) {
         let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
         match sent.get_mut(cmd) {
             Some(total) => *total += n,
@@ -3641,11 +3657,17 @@ impl PeerHub {
         if from.wtxid_relay() {
             peer.set_wtxid_relay();
         }
-        if from.transport() == crate::v1::Transport::V1 {
-            peer.mark_v1_transport();
+        match from.transport() {
+            crate::v1::Transport::V1 => {
+                peer.mark_v1_transport();
+                peer.note_recv("version", 100);
+                peer.note_recv("verack", 0);
+            }
+            crate::v1::Transport::V2 => {
+                peer.note_recv_v2("version", crate::v2::V2_LONG_TYPE_LEN + 100);
+                peer.note_recv_v2("verack", crate::v2::V2_LONG_TYPE_LEN);
+            }
         }
-        peer.note_recv("version", 100);
-        peer.note_recv("verack", 0);
         peer.attach_wire(wire);
         peer.mark_handshake_complete();
         self.unregister(from.id);

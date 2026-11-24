@@ -63,7 +63,7 @@ fn short_ids_cover_live_ibd_tip_commands() {
         "p2p: v2 packet is longer than the cap (4000014 bytes)"
     );
     assert_eq!(V2_CIPHER_EXPANSION, 20);
-    assert_eq!(v2_other_recv_bytes(3), 23);
+    assert_eq!(v2_msg_bytes(3), 23);
     assert!(short_id_for_command("wtxidrelay").is_none());
     assert!(short_id_for_command("sendheaders").is_none());
     assert!(short_id_for_command("sendaddrv2").is_none());
@@ -149,7 +149,7 @@ fn unknown_short_id_is_invalid_type_not_protocol() {
     match parse_v2_contents(magic, &contents) {
         Err(NetError::InvalidV2Type { contents_len }) => {
             assert_eq!(contents_len, 3);
-            assert_eq!(v2_other_recv_bytes(contents_len), 23);
+            assert_eq!(v2_msg_bytes(contents_len), 23);
         }
         other => panic!("expected InvalidV2Type, got {other:?}"),
     }
