@@ -3313,6 +3313,18 @@ impl Query {
             .spenders_at_fk(out_txid, create_fk, out_index, tip)
     }
 
+    /// See [`rbitcoin_store::Store::first_strong_spenders_at_range`].
+    pub fn first_strong_spenders_at_range(
+        &self,
+        out_txid: &[u8; 32],
+        start: u32,
+        end: u32,
+        tip: Option<u32>,
+    ) -> Result<Vec<Option<(PointRecord, u32)>>, QueryError> {
+        self.store
+            .first_strong_spenders_at_range(out_txid, start, end, tip)
+    }
+
     pub fn spenders_raw(
         &self,
         out_txid: &[u8; 32],
