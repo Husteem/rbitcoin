@@ -22,9 +22,10 @@ use tokio::net::TcpListener;
 const CHAIN: usize = 3;
 /// Getdata for A after B was announced, before the peer stops waiting for B.
 const A_ASKS_AFTER_B: usize = 8;
-/// Getdata for B before the peer stops waiting for B. Same budget as A: a
-/// healthy sibling is asked for once and answered.
-const B_ASKS_BEFORE_GIVE_UP: usize = 8;
+/// Getdata for B or C before the peer stops waiting for one. Higher than A's:
+/// the first body for a recorded sibling is dropped so the header thread can
+/// write the header, and the body is asked for again.
+const B_ASKS_BEFORE_GIVE_UP: usize = 12;
 /// A's ask count after which the peer re-announces the abandoned A. The third
 /// copy is the one that abandons it.
 const REANNOUNCE_AFTER_A_ASKS: usize = 3;
@@ -45,12 +46,17 @@ enum Sibling {
     /// abandoned A in later `getheaders` replies. A stored reply that continues
     /// the cut-back walk tip must not put A back on the path and queue it.
     InvalidReannounced,
+    /// Two equal-work siblings: the first is served mutated and abandoned, the
+    /// second is valid. Abandoning the first must plant the second, or its
+    /// body is fetched but never applied and the tip stays at the chain.
+    FirstMutatedSecondValid,
 }
 
 struct Fixture {
     chain: Vec<Block>,
     a: Block,
     b: Block,
+    c: Block,
     bad_b: Block,
 }
 
@@ -63,6 +69,8 @@ impl Fixture {
             rbitcoin_consensus::mine_empty_regtest(parent.block_hash(), parent.time + 600, height);
         let b =
             rbitcoin_consensus::mine_empty_regtest(parent.block_hash(), parent.time + 601, height);
+        let c =
+            rbitcoin_consensus::mine_empty_regtest(parent.block_hash(), parent.time + 602, height);
         let bad_b = rbitcoin_consensus::mine_regtest_paying(
             parent.block_hash(),
             parent.time + 602,
@@ -88,13 +96,19 @@ impl Fixture {
         );
         assert_eq!(a.header.work(), b.header.work());
         assert_eq!(a.header.work(), bad_b.header.work());
-        Self { chain, a, b, bad_b }
+        Self {
+            chain,
+            a,
+            b,
+            c,
+            bad_b,
+        }
     }
 
     /// The header the peer announces for B.
     fn announced(&self, kind: Sibling) -> &Block {
         match kind {
-            Sibling::Valid | Sibling::Mutated => &self.b,
+            Sibling::Valid | Sibling::Mutated | Sibling::FirstMutatedSecondValid => &self.b,
             Sibling::Invalid | Sibling::InvalidReannounced => &self.bad_b,
         }
     }
@@ -104,13 +118,15 @@ impl Fixture {
         match kind {
             Sibling::Valid => self.b.clone(),
             Sibling::Invalid | Sibling::InvalidReannounced => self.bad_b.clone(),
-            Sibling::Mutated => {
-                let mut block = self.b.clone();
-                let out = &mut block.txdata[0].output[0];
-                out.value = out.value.checked_sub(Amount::from_sat(1)).unwrap();
-                block
-            }
+            Sibling::Mutated | Sibling::FirstMutatedSecondValid => self.mutated(&self.b),
         }
+    }
+
+    fn mutated(&self, block: &Block) -> Block {
+        let mut block = block.clone();
+        let out = &mut block.txdata[0].output[0];
+        out.value = out.value.checked_sub(Amount::from_sat(1)).unwrap();
+        block
     }
 
     /// Same header as A, so the same hash, with a coinbase the merkle root
@@ -134,6 +150,8 @@ struct Seen {
     a_reannounced: usize,
     b_asks: usize,
     b_asked: bool,
+    c_asks: usize,
+    c_asked: bool,
     gave_up: bool,
 }
 
@@ -165,6 +183,7 @@ async fn serve(
     .map_err(|e| e.to_string())?;
     let a_hash = fx.a.block_hash();
     let b_hash = fx.announced(sibling).block_hash();
+    let c_hash = fx.c.block_hash();
     let mut announced = false;
     let mut b_announced = false;
     let mut reannounced = 0usize;
@@ -226,13 +245,27 @@ async fn serve(
                             seen.b_asked = true;
                             seen.b_asks += 1;
                             send.push(NetworkMessage::Block(fx.body(sibling)));
+                            if sibling == Sibling::FirstMutatedSecondValid && seen.b_asks == 2 {
+                                send.push(NetworkMessage::Headers(vec![fx.c.header]));
+                            }
+                        } else if *hash == c_hash {
+                            seen.c_asked = true;
+                            seen.c_asks += 1;
+                            let body = match sibling {
+                                Sibling::FirstMutatedSecondValid => fx.c.clone(),
+                                _ => fx.mutated(&fx.c),
+                            };
+                            send.push(NetworkMessage::Block(body));
                         }
                     }
                 }
                 NetworkMessage::Ping(nonce) => send.push(NetworkMessage::Pong(*nonce)),
                 _ => {}
             }
-            if seen.a_asks_after_b >= A_ASKS_AFTER_B || seen.b_asks >= B_ASKS_BEFORE_GIVE_UP {
+            if seen.a_asks_after_b >= A_ASKS_AFTER_B
+                || seen.b_asks >= B_ASKS_BEFORE_GIVE_UP
+                || seen.c_asks >= B_ASKS_BEFORE_GIVE_UP
+            {
                 seen.gave_up = true;
                 stop = true;
             }
@@ -341,7 +374,7 @@ async fn a_mutated_equal_work_sibling_stops_being_asked() {
     assert!(out.seen.b_asked, "{:?}", out.seen);
     assert!(!out.seen.gave_up, "{:?}", out.seen);
     assert!(
-        out.seen.b_asks <= 4,
+        out.seen.b_asks <= 8,
         "the node must stop asking for mutated B: {:?}",
         out.seen
     );
@@ -369,4 +402,26 @@ async fn a_reannounced_abandoned_header_is_not_asked_again() {
     assert!(!out.seen.gave_up, "{:?}", out.seen);
     assert!(out.synced.is_ok(), "{:?}", out.synced);
     assert_eq!(out.tip, Some(out.fx.chain[CHAIN].block_hash()));
+}
+
+/// Abandoning a planted sibling must plant the next recorded one: C is
+/// announced while B is the planted target, and only becomes the download
+/// target when B is abandoned. Its valid body must then connect.
+#[tokio::test(flavor = "current_thread")]
+async fn the_next_recorded_sibling_is_planted_after_an_abandon() {
+    let out = run(Sibling::FirstMutatedSecondValid).await;
+    assert!(out.seen.b_asked, "{:?}", out.seen);
+    assert!(
+        out.seen.c_asked,
+        "the second recorded sibling must be asked for after the first is abandoned: {:?}",
+        out.seen
+    );
+    assert!(!out.seen.gave_up, "{:?}", out.seen);
+    assert!(out.synced.is_ok(), "{:?}", out.synced);
+    assert_eq!(
+        out.tip,
+        Some(out.fx.c.block_hash()),
+        "the valid second sibling must be planted and connect: {:?}",
+        out.seen
+    );
 }

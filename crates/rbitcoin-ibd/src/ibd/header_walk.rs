@@ -1152,7 +1152,8 @@ pub fn refuse_invalid_linked(
 /// Forget the tip+1 equal-work siblings. They are not stored headers, so
 /// leaving them in the maps after the walk moved past their height would keep
 /// bodies for an old tip askable.
-fn forget_tip_siblings(st: &mut IbdWorkState) {
+#[doc(hidden)]
+pub fn forget_tip_siblings(st: &mut IbdWorkState) {
     let siblings = std::mem::take(&mut st.tip_siblings);
     for h in siblings {
         forget_sibling_rows(st, h);
@@ -1161,7 +1162,16 @@ fn forget_tip_siblings(st: &mut IbdWorkState) {
 
 /// Drop the rows a tip+1 sibling occupies. It is not a stored header, so
 /// leaving it in the maps keeps bodies for a tip the walk left askable.
-pub(crate) fn forget_sibling_rows(st: &mut IbdWorkState, hash: BlockHash) {
+/// A hash that is the path occupant at its height has been planted and must
+/// keep its rows: they are what lets `apply_block_framed` accept its body.
+#[doc(hidden)]
+pub fn forget_sibling_rows(st: &mut IbdWorkState, hash: BlockHash) {
+    let Some(&ht) = st.hash_height.get(&hash) else {
+        return;
+    };
+    if st.is_on_path(&hash, ht) {
+        return;
+    }
     st.hash_height.remove(&hash);
     st.known_headers.remove(&hash);
     st.header_fks.remove(&hash);
@@ -1197,9 +1207,10 @@ pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
 /// empties, and IBD never leaves catch-up (#1811).
 ///
 /// This is not an invalidity claim: the header breaks no rule, so it is not
-/// marked failed and a later valid copy from another peer can still connect.
-/// It is only taken off the download path, and the path above its parent is
-/// re-seeded so an equal-work sibling at tip+1 can be asked for instead.
+/// marked failed. It is taken off the download path and no IBD peer asks for
+/// it again this session; the path above its parent is re-seeded so an
+/// equal-work sibling at tip+1 can be asked for instead. After IBD,
+/// tip-follow can still connect a block a peer serves for it.
 pub fn retire_unservable(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u32) {
     if !cut_walk_to_parent(st, hub, hash, height) {
         return;
@@ -1231,8 +1242,15 @@ fn cut_walk_to_parent(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
     };
     let parent_h = height.saturating_sub(1);
     drop_dead_path(st, Some(hub.query.as_ref()), parent_h);
-    if !st.header_walk.origin || st.header_walk.tip_height() < height {
+    if !st.header_walk.origin {
         return false;
+    }
+    if st.header_walk.tip_height() < height {
+        // The hash was planted at tip+1 by an earlier abandon, so it sits
+        // above the walk tip. The path above its parent is already dropped;
+        // the walk already ends at that parent. Reporting true lets the
+        // caller plant the next recorded sibling at the same height.
+        return st.header_walk.tip_height() == parent_h;
     }
     let tip = cut_back_to(st, hub, parent, parent_h);
     if st.header_walk.base_height > parent_h {

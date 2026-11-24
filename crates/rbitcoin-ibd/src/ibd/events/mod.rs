@@ -847,32 +847,41 @@ pub fn apply_block_framed(
     if st.body.is_rejected(&hash) || hub.has_block(&hash) {
         return;
     }
-    let header_fk = if let Some(&fk) = st.header_fks.get(&hash) {
-        fk
-    } else if st.hash_height.contains_key(&hash) {
-        // An equal-work sibling is only asked for; its header was never
-        // written with the announcement. Write the header this body carries:
-        // a peer must deliver a block, not just announce one, to reach the
-        // header store.
-        match store_delivered_header(hub, &payload, hash) {
-            Some(fk) => {
-                st.header_fks.insert(hash, fk);
-                fk
-            }
-            None => {
-                st.body.mark_missing(hash);
-                return;
-            }
-        }
-    } else {
-        st.body.mark_missing(hash);
-        return;
-    };
-    let tip_h = hub.tip_height().unwrap_or(0);
     let Some(height) = st.hash_height.get(&hash).copied() else {
         st.body.mark_missing(hash);
         return;
     };
+    let header_fk = match st.header_fks.get(&hash) {
+        Some(&fk) => {
+            st.header_write_misses.remove(&hash);
+            fk
+        }
+        None => {
+            // A recorded sibling's header is not written with its
+            // announcement. Header persist belongs to the header thread and
+            // must not run in this drain under `shared`; hand it the header
+            // this body carries, then ask for the body again once the fk
+            // exists. One extra getdata per sibling at most.
+            let misses = st.header_write_misses.entry(hash).or_insert(0);
+            *misses = misses.saturating_add(1);
+            if *misses >= SIBLING_HEADER_WRITE_TRIES {
+                // The header thread could not write it: stop asking for a
+                // body we can never attach, instead of re-getting it forever.
+                st.unservable.insert(hash);
+                st.body.stop_reget(hash);
+                st.tip_siblings.retain(|h| *h != hash);
+                super::header_walk::forget_sibling_rows(st, hash);
+                st.header_write_misses.remove(&hash);
+                return;
+            }
+            if let Some(header) = header_from_body(&payload, hash) {
+                apply_headers_event(st, hub, peer, vec![header]);
+            }
+            st.body.mark_missing(hash);
+            return;
+        }
+    };
+    let tip_h = hub.tip_height().unwrap_or(0);
     let write_next = archive_write_next.load(Ordering::Relaxed);
     let tip_hi = tip_h.saturating_add(CONTIG_DENSIFY_AHEAD);
     let densify_hi = write_next.saturating_add(CONTIG_DENSIFY_AHEAD);
@@ -926,19 +935,13 @@ pub fn apply_block_framed(
     }
 }
 
-/// Store the header a delivered body carries, for a hash that was announced
-/// but not written (an equal-work sibling). The payload's header must hash to
-/// `hash`; the stored row is what gives the body a header fk.
-fn store_delivered_header(
-    hub: &ChainHub,
-    payload: &[u8],
-    hash: BlockHash,
-) -> Option<rbitcoin_primitives::Fk> {
-    let block = bitcoin::consensus::deserialize::<bitcoin::Block>(payload).ok()?;
-    if block.block_hash() != hash {
-        return None;
-    }
-    prepare_header_store(hub, &[block.header]).first().copied()
+/// The header a delivered body carries, when it hashes to `hash`. Decodes the
+/// 80-byte header only; the body itself is not decoded here.
+fn header_from_body(payload: &[u8], hash: BlockHash) -> Option<bitcoin::block::Header> {
+    use bitcoin::consensus::Decodable;
+    let mut cursor = std::io::Cursor::new(payload);
+    let header = bitcoin::block::Header::consensus_decode(&mut cursor).ok()?;
+    (header.block_hash() == hash).then_some(header)
 }
 
 /// Undecodable wire is the sender's block. Any other store refusal stays a
@@ -1710,6 +1713,11 @@ pub fn bad_prev_parent(
         BadPrevParent::OffPath
     }
 }
+
+/// Bodies for one hash whose header write produced no fk before the header is
+/// abandoned. The first body is dropped so the header thread can write the
+/// header; this only bounds a store that keeps refusing it.
+const SIBLING_HEADER_WRITE_TRIES: u8 = 4;
 
 /// Mutated copies of one hash before its header is abandoned. Three matches
 /// `TIP_CHILD_HALT_AFTER`: one can be a fluke, two a peer still resending the

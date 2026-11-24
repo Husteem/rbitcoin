@@ -266,6 +266,9 @@ pub fn plant_commit_header(
     if on_path && st.ordered_set.insert(cur) {
         st.ordered.push_back(cur);
     }
+    // A planted sibling is a download target now, not a recorded sibling: a
+    // later walk move must not forget its rows while it is on the path.
+    st.tip_siblings.retain(|h| *h != cur);
     st.known_headers.insert(cur);
     true
 }

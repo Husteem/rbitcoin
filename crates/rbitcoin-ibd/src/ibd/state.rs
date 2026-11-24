@@ -319,9 +319,14 @@ pub struct IbdWorkState {
     /// sender cannot be punished (`-connect` / noban), which would otherwise
     /// keep IBD open forever (#1811).
     pub mutated_copies: BlockHashMap<u8>,
+    /// Bodies whose serialized header has not produced an fk yet (the header
+    /// thread writes it). Bounded so a store that keeps refusing the header
+    /// cannot re-ask for the same body forever.
+    pub header_write_misses: BlockHashMap<u8>,
     /// Headers abandoned because every body copy arrived mutated. Retired from
     /// the work path and never re-seeded from the store this session. The
-    /// header itself is still valid; another peer may still serve its body.
+    /// header itself is still valid; after IBD, tip-follow can still connect a
+    /// block a peer serves for it, but no IBD peer asks for it again.
     pub unservable: BlockHashSet,
     /// Equal-work siblings announced at tip+1, kept so the tip can be planted
     /// at that height once the header in the slot is abandoned. Bounded like
@@ -448,6 +453,7 @@ impl IbdWorkState {
             assign_path_lo: 0,
             engine_fault_seen: HashSet::new(),
             mutated_copies: BlockHashMap::default(),
+            header_write_misses: BlockHashMap::default(),
             unservable: BlockHashSet::default(),
             tip_siblings: Vec::new(),
             halt: None,
