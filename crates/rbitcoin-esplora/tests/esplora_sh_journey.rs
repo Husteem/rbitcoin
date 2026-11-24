@@ -368,6 +368,48 @@ async fn template_cached_until_tip_moves(q: Arc<Query>, prev: Fk, parent: [u8; 3
     handle.shutdown().await;
 }
 
+/// Core `getblocktemplate` reuse: a mempool change within 5 s keeps the
+/// cached template. Concurrent misses share one build instead of each
+/// running their own.
+async fn template_build_is_shared_and_keeps_through_pool_churn() {
+    let (dir, q) = temp_query("gbt-shared");
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let q = Arc::new(q);
+    let mp_dir = dir.join("mp");
+    let mp = Arc::new(rbitcoin_net::MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap());
+    let calls = Arc::new(AtomicU64::new(0));
+    let c = Arc::clone(&calls);
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.block_template = Some(BlockTemplateFn(Arc::new(move || {
+        let n = c.fetch_add(1, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        Ok(json!({"height": 1, "rules": ["segwit"], "gen": n}))
+    })));
+    let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&mp)))
+        .await
+        .expect("listen");
+    let addr = handle.local_addr;
+    let gets: Vec<_> = (0..8)
+        .map(|_| tokio::spawn(async move { http_get(addr, "/block-template").await }))
+        .collect();
+    for g in gets {
+        let (st, body) = g.await.unwrap();
+        assert_eq!(st, 200, "{body}");
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "concurrent misses share one build");
+    mp.note_template_update();
+    let (st, body) = http_get(addr, "/block-template").await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "a pool change within 5 s keeps the template"
+    );
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 async fn template_missing_tip_or_knob() {
     let (dir, empty) = temp_query("gbt-notip");
     let mut cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
@@ -578,5 +620,6 @@ async fn esplora_sh_join_and_template() {
     untrusted_header_is_ignored(Arc::clone(&q), sh1).await;
     template_cached_until_tip_moves(q, prev, h2.hash).await;
     template_missing_tip_or_knob().await;
+    template_build_is_shared_and_keeps_through_pool_churn().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

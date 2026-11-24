@@ -986,6 +986,14 @@ fn gbt_cache_fresh(elapsed: Duration) -> bool {
     elapsed < Duration::from_secs(15)
 }
 
+/// Core `getblocktemplate` reuse: on the same tip, a template is rebuilt for
+/// a mempool change only once it is at least 5 s old, so churn cannot force
+/// a build per request.
+fn gbt_cache_hit(c: &GbtCache, tip: &[u8; 32], updates: u64) -> bool {
+    let age = c.at.elapsed();
+    c.tip == *tip && gbt_cache_fresh(age) && (c.updates == updates || age < Duration::from_secs(5))
+}
+
 #[doc(hidden)]
 pub fn block_template_sync(st: &AppState) -> Response {
     let Some(fun) = st.block_template.as_ref() else {
@@ -1004,16 +1012,23 @@ pub fn block_template_sync(st: &AppState) -> Response {
         .as_ref()
         .map(|m| m.template_updates())
         .unwrap_or(0);
-    {
+    let cached = || {
         let cache = st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(c) = cache.as_ref() {
-            if c.tip == tip && c.updates == updates && gbt_cache_fresh(c.at.elapsed()) {
-                return gbt_json(&c.body);
-            }
-        }
+        cache
+            .as_ref()
+            .filter(|c| gbt_cache_hit(c, &tip, updates))
+            .map(|c| Arc::clone(&c.body))
+    };
+    if let Some(body) = cached() {
+        return gbt_json(&body);
     }
-    // The cache lock is not held across selection. A second template would
-    // otherwise take the disk permit and then wait on this lock for the build.
+    // One build at a time: a concurrent miss waits for the build in progress
+    // and then reads its result. The cache lock itself is not held across
+    // selection, so a hit never waits on a build.
+    let _build = st.gbt_build.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(body) = cached() {
+        return gbt_json(&body);
+    }
     match (fun.0)() {
         Ok(body) => {
             let body = Arc::new(body);

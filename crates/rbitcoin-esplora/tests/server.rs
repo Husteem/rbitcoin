@@ -937,6 +937,7 @@ fn join_only_state(q: Arc<Query>, cache: Arc<Mutex<JoinCache>>) -> AppState {
         join_header_trusted: true,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(Mutex::new(())),
         send_stall: Duration::from_secs(120),
     }
 }
@@ -1263,6 +1264,7 @@ fn app_with_join(q: Arc<Query>, cache: Arc<Mutex<JoinCache>>, trusted: bool) -> 
         join_header_trusted: trusted,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     Router::new()
@@ -1417,6 +1419,7 @@ async fn address_without_sh_index_is_503_disabled() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     let app = Router::new()
@@ -1463,6 +1466,7 @@ async fn http_503_chain_view_moved_omits_tip_header() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     async fn die_tip(State(st): State<AppState>) -> &'static str {
@@ -1520,6 +1524,7 @@ async fn asof_of_a_moved_view_is_404() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     async fn pin_then_move(State(st): State<AppState>, AsOf(asof): AsOf) -> Response {
@@ -1571,6 +1576,7 @@ async fn body_at_max_is_not_413_and_300_slots_fit() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     let at = Bytes::new();
@@ -2381,6 +2387,7 @@ async fn block_template_does_not_lock_the_cache_across_template_prev() {
             Ok(json!({"height": 1}))
         }))),
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     let cache = Arc::clone(&st.gbt_cache);
