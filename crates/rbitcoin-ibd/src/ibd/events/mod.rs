@@ -858,27 +858,37 @@ pub fn apply_block_framed(
         }
         None => {
             // A recorded sibling's header is not written with its
-            // announcement. Header persist belongs to the header thread and
-            // must not run in this drain under `shared`; hand it the header
-            // this body carries, then ask for the body again once the fk
-            // exists. One extra getdata per sibling at most.
-            let misses = st.header_write_misses.entry(hash).or_insert(0);
-            *misses = misses.saturating_add(1);
-            if *misses >= SIBLING_HEADER_WRITE_TRIES {
-                // The header thread could not write it: stop asking for a
-                // body we can never attach, instead of re-getting it forever.
-                st.unservable.insert(hash);
-                st.body.stop_reget(hash);
-                st.tip_siblings.retain(|h| *h != hash);
-                super::header_walk::forget_sibling_rows(st, hash);
-                st.header_write_misses.remove(&hash);
+            // announcement, and the body cannot be queued without its fk.
+            // Write the 80-byte header here (not the body) and keep going.
+            // A store that keeps refusing it is bounded by
+            // `SIBLING_HEADER_WRITE_TRIES`; the follow-up issue moves this
+            // write to the ibd-header thread so it leaves the drain lock.
+            let Some(header) = header_from_body(&payload, hash) else {
+                st.body.mark_missing(hash);
                 return;
+            };
+            let fks = prepare_header_store(hub, &[header]);
+            match fks.first() {
+                Some(&fk) => {
+                    st.header_fks.insert(hash, fk);
+                    st.header_write_misses.remove(&hash);
+                    fk
+                }
+                None => {
+                    let misses = st.header_write_misses.entry(hash).or_insert(0);
+                    *misses = misses.saturating_add(1);
+                    if *misses >= SIBLING_HEADER_WRITE_TRIES {
+                        st.unservable.insert(hash);
+                        st.body.stop_reget(hash);
+                        st.tip_siblings.retain(|h| *h != hash);
+                        super::header_walk::forget_sibling_rows(st, hash);
+                        st.header_write_misses.remove(&hash);
+                        return;
+                    }
+                    st.body.mark_missing(hash);
+                    return;
+                }
             }
-            if let Some(header) = header_from_body(&payload, hash) {
-                apply_headers_event(st, hub, peer, vec![header]);
-            }
-            st.body.mark_missing(hash);
-            return;
         }
     };
     let tip_h = hub.tip_height().unwrap_or(0);
