@@ -4337,12 +4337,59 @@ async fn failure_walk_does_not_spend_the_work_walk_cache() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Fill `follow`'s pending map to the cap with headers whose parents are
+/// unknown.
+fn fill_pending_orphans(follow: &mut PeerFollowState, like: &bitcoin::block::Header) {
+    let mut leaf = 0u32;
+    while follow.pending_headers.len() < MAX_PENDING_HEADERS {
+        let mut merkle = [0x6bu8; 32];
+        merkle[..4].copy_from_slice(&leaf.to_le_bytes());
+        let mut hdr = *like;
+        hdr.prev_blockhash = bitcoin::BlockHash::from_byte_array([0x77; 32]);
+        hdr.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
+        hdr.time = like.time + 1;
+        rbitcoin_consensus::grind_regtest_pow(&mut hdr);
+        follow.pending_headers.insert(hdr.block_hash(), hdr);
+        leaf += 1;
+    }
+}
+
+/// Bytes of the entries of a full pending map. A copy of its table is
+/// about twice that.
+fn pending_map_bytes() -> usize {
+    std::mem::size_of::<(bitcoin::BlockHash, bitcoin::block::Header)>() * MAX_PENDING_HEADERS
+}
+
+/// Send `msg` and return the largest allocation this thread asked for, and
+/// how many asks had the size of `table`, the pending map's own table: a
+/// copy of the map asks for exactly that. The header job runs on this
+/// thread for a hub with no shared handle.
+async fn asks_for(
+    hub: &rbitcoin_net::chain::ChainHub,
+    out_tx: &PeerOutTx,
+    follow: &mut PeerFollowState,
+    peer: &rbitcoin_net::peers::LivePeer,
+    table: usize,
+    msg: NetworkMessage,
+) -> (usize, usize) {
+    crate::alloc_count::watch(table);
+    let _ = crate::alloc_count::take_largest();
+    push(hub, out_tx, follow, Some(peer), msg).await;
+    (
+        crate::alloc_count::take_largest(),
+        crate::alloc_count::take_hits(),
+    )
+}
+
 /// A headers message does not copy the peer's pending map: against a full
 /// map of 8,000 headers, a one-header batch that does not connect asks for
-/// nothing the size of that map's table. The stack hub runs the header job
-/// on this thread, so its asks count too.
+/// nothing the size of that map's table, above the work floor or under it.
+/// A compact block on our tip does not copy it either.
 #[tokio::test]
 async fn headers_message_does_not_copy_the_pending_map() {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pending-no-copy");
     // Not `into_arc`: with no shared handle the header job runs here.
     let hub = std::sync::Arc::new(hub);
@@ -4353,39 +4400,97 @@ async fn headers_message_does_not_copy_the_pending_map() {
     let peer = live_peer(&peers, 18624, 64, true);
     let (out_tx, _rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
-    let mut leaf = 0u32;
-    while follow.pending_headers.len() < MAX_PENDING_HEADERS {
-        let mut merkle = [0x6bu8; 32];
-        merkle[..4].copy_from_slice(&leaf.to_le_bytes());
-        let mut hdr = tip;
-        hdr.prev_blockhash = bitcoin::BlockHash::from_byte_array([0x77; 32]);
-        hdr.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
-        hdr.time = tip.time + 1;
-        rbitcoin_consensus::grind_regtest_pow(&mut hdr);
-        follow.pending_headers.insert(hdr.block_hash(), hdr);
-        leaf += 1;
-    }
-    let mut stray = tip;
-    stray.prev_blockhash = bitcoin::BlockHash::from_byte_array([0x78; 32]);
-    stray.time = tip.time + 2;
-    rbitcoin_consensus::grind_regtest_pow(&mut stray);
-    let table = std::mem::size_of::<(bitcoin::BlockHash, bitcoin::block::Header)>()
-        * MAX_PENDING_HEADERS;
     let _ = crate::alloc_count::take_largest();
-    push(
+    fill_pending_orphans(&mut follow, &tip);
+    let table = crate::alloc_count::take_largest();
+    let entries = pending_map_bytes();
+    for (case, floor) in [("above the floor", None), ("under the floor", Some([0x7f; 32]))] {
+        hub.set_minimum_chain_work(floor);
+        let mut stray = tip;
+        stray.prev_blockhash = bitcoin::BlockHash::from_byte_array([0x78; 32]);
+        stray.time = tip.time + 2;
+        stray.nonce = u32::from(floor.is_some());
+        rbitcoin_consensus::grind_regtest_pow(&mut stray);
+        let (largest, copies) = asks_for(
+            &hub,
+            &out_tx,
+            &mut follow,
+            &peer,
+            table,
+            NetworkMessage::Headers(vec![stray]),
+        )
+        .await;
+        assert_eq!(copies, 0, "{case}: a {table} B ask copied the map");
+        assert!(largest < entries / 8, "{case}: largest ask {largest} B against a {entries} B map");
+        assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS, "{case}");
+    }
+    // A compact block on our tip reaches the header job.
+    hub.set_minimum_chain_work(None);
+    follow.send_cmpct = true;
+    follow.cmpct_version = 2;
+    let mut block = orphan_body(tip.block_hash(), 0);
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+    let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
+    let (_, copies) = asks_for(
         &hub,
         &out_tx,
         &mut follow,
-        Some(peer.as_ref()),
-        NetworkMessage::Headers(vec![stray]),
+        &peer,
+        table,
+        NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi }),
     )
     .await;
-    let largest = crate::alloc_count::take_largest();
-    assert!(
-        largest < table / 8,
-        "largest ask {largest} B against a {table} B map"
-    );
-    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert_eq!(copies, 0, "compact block: a {table} B ask copied the map");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A connecting batch at the cap stages its evictions in the map and puts
+/// them back when it still does not fit: 7,000 parked ancestors of its
+/// parent stay, 1,000 headers that fail proof of work go, and 2,000 more
+/// would still overflow. The map is as it was, and no step copied it. The
+/// eviction's path-work memo and the batch's path walk are map-sized here,
+/// so this pins copies by the map's exact table size.
+#[tokio::test]
+async fn refused_room_for_a_batch_restores_the_pending_map() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pending-no-copy-evict");
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
+    let tip = hub.tip_header().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18625, 65, true);
+    let (out_tx, _rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let trunk = regtest_headers_after(&tip, 7_000);
+    let _ = crate::alloc_count::take_largest();
+    for hdr in &trunk {
+        follow.pending_headers.insert(hdr.block_hash(), *hdr);
+    }
+    let mut leaf = 0u32;
+    while follow.pending_headers.len() < MAX_PENDING_HEADERS {
+        let mut hdr = tip;
+        hdr.prev_blockhash = bitcoin::BlockHash::from_byte_array([0x79; 32]);
+        hdr.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x5c; 32]);
+        hdr.nonce = leaf;
+        // Mainnet's target: these headers do not meet the work they claim.
+        hdr.bits = bitcoin::CompactTarget::from_consensus(0x1d00ffff);
+        follow.pending_headers.insert(hdr.block_hash(), hdr);
+        leaf += 1;
+    }
+    let table = crate::alloc_count::take_largest();
+    let before = follow.pending_headers.clone();
+    let batch = regtest_headers_after(trunk.last().unwrap(), 2_000);
+    let (_, copies) = asks_for(
+        &hub,
+        &out_tx,
+        &mut follow,
+        &peer,
+        table,
+        NetworkMessage::Headers(batch),
+    )
+    .await;
+    assert_eq!(copies, 0, "a {table} B ask copied the map");
+    assert!(follow.pending_headers == before, "the refused batch left the map as it was");
     let _ = std::fs::remove_dir_all(dir);
 }
 
