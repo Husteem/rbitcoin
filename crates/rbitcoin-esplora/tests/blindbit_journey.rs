@@ -674,7 +674,12 @@ async fn dropped_blindbit_waiter_clears_waiting() {
 
 /// A forward-tx keeps its permit until the admit returns, not until the
 /// request ends: one that times out mid-admit still fills the limit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// Both 408s are the 1 s request timeout, which the config cannot lower. The
+/// clock pauses once the admit holds the permit, so tokio advances to each
+/// timeout instead of waiting it out. `pause` needs the current-thread
+/// runtime; the admit and the lock holder are OS threads.
+#[tokio::test]
 async fn blindbit_forward_tx_holds_its_permit_through_the_admit() {
     use bitcoin::hashes::Hash;
 
@@ -726,12 +731,23 @@ async fn blindbit_forward_tx_holds_its_permit_through_the_admit() {
         }],
     };
     let body = json!({ "data": bitcoin::consensus::encode::serialize_hex(&tx) }).to_string();
-    let (st, _) = http_post(addr, "/blindbit/v1/forward-tx", body.as_bytes()).await;
+    let post =
+        tokio::spawn(async move { http_post(addr, "/blindbit/v1/forward-tx", body.as_bytes()).await });
+    // Pause only once the handler has taken the permit, so the timeout
+    // cannot fire before the admit starts.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handle.blindbit.held() == 0 {
+        assert!(Instant::now() < deadline, "forward-tx never took the permit");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::pause();
+    let (st, _) = post.await.unwrap();
     assert_eq!(st, 408, "the admit is stalled on the pool lock");
 
     // The admit is still running, so the one permit is still taken.
     let (st, _) = http_get(addr, "/blindbit/v1/tweak-index/0").await;
     assert_eq!(st, 408, "a timed-out forward-tx still holds its permit");
+    tokio::time::resume();
 
     release_tx.send(()).unwrap();
     locker.join().unwrap();

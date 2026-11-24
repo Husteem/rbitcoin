@@ -1,6 +1,7 @@
 use crate::Admit;
 use crate::Mine;
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
+use bitcoin::block::Header;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
@@ -25,11 +26,11 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 use rbitcoin_consensus::{ChainParams, Milestone};
 
@@ -469,9 +470,8 @@ async fn session_start_does_not_announce_a_quiet_tip() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let mut sess = open_decode_session(Arc::clone(&hub), &peers, 18470, Some(tip)).await;
     assert_eq!(sess.live.header_marks().0, None);
-    assert_eq!(
-        count_block_invs(&mut sess.reader, sess.magic, tip, Duration::from_secs(2)).await,
-        0,
+    assert!(
+        !block_invs_before_pong(&mut sess, 1).await.contains(&tip),
         "a connect to a tip already in place sends no block inv"
     );
     assert_eq!(sess.live.header_marks().0, None);
@@ -494,8 +494,9 @@ async fn session_start_announces_a_tip_mined_during_handshake() {
     assert_ne!(at_handshake, tip);
     let peers = rbitcoin_net::peers::PeerHub::new();
     let mut sess = open_decode_session(Arc::clone(&hub), &peers, 18471, Some(at_handshake)).await;
+    let invs = block_invs_before_pong(&mut sess, 1).await;
     assert_eq!(
-        count_block_invs(&mut sess.reader, sess.magic, tip, Duration::from_secs(2)).await,
+        invs.iter().filter(|h| **h == tip).count(),
         1,
         "a tip mined during the handshake is one block inv"
     );
@@ -547,8 +548,9 @@ async fn queued_tip_before_session_start_is_one_inv() {
         Some(tip_rx),
     )
     .await;
+    let invs = block_invs_before_pong(&mut sess, 1).await;
     assert_eq!(
-        count_block_invs(&mut sess.reader, sess.magic, tip, Duration::from_secs(2)).await,
+        invs.iter().filter(|h| **h == tip).count(),
         1,
         "a tip queued before the session starts is one block inv"
     );
@@ -588,23 +590,19 @@ async fn inv_then_non_descendant_waits_out_the_batch() {
     let hub = hub.into_arc();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let mut sess = open_decode_session(Arc::clone(&hub), &peers, 18472, Some(genesis)).await;
-    let _ = collect_block_invs(&mut sess.reader, sess.magic, Duration::from_millis(200)).await;
+    let _ = block_invs_before_pong(&mut sess, 1).await;
     assert_eq!(
         sess.live.last_tip_offered(),
         None,
         "a quiet connect offers nothing"
     );
-    let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
-    hub.mine(1, script.clone(), vec![]).unwrap();
+    hub.mine(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
     let offered = hub.tip_hash().unwrap();
+    let mut invs = block_invs_until(&mut sess, offered).await;
+    invs.extend(block_invs_before_pong(&mut sess, 2).await);
     assert_eq!(
-        count_block_invs(
-            &mut sess.reader,
-            sess.magic,
-            offered,
-            Duration::from_secs(2)
-        )
-        .await,
+        invs.iter().filter(|h| **h == offered).count(),
         1,
         "the first tip is one inv"
     );
@@ -620,10 +618,14 @@ async fn inv_then_non_descendant_waits_out_the_batch() {
         early.is_empty(),
         "a non-descendant tip waits out the batch, got {early:?}"
     );
-    hub.mine(1, script, vec![]).unwrap();
+    // Another coinbase script: inside the same second, the same script would
+    // rebuild `offered`, which is invalidated.
+    hub.mine(1, bitcoin::ScriptBuf::from_bytes(vec![0x52]), vec![])
+        .unwrap();
     let next = hub.tip_hash().unwrap();
     assert_ne!(next, offered);
-    let later = collect_block_invs(&mut sess.reader, sess.magic, Duration::from_millis(500)).await;
+    let mut later = block_invs_until(&mut sess, next).await;
+    later.extend(block_invs_before_pong(&mut sess, 3).await);
     assert_eq!(
         later,
         vec![next],
@@ -647,20 +649,13 @@ async fn child_of_an_inv_is_not_held() {
     let hub = hub.into_arc();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let mut sess = open_decode_session(Arc::clone(&hub), &peers, 18474, Some(genesis)).await;
-    let _ = collect_block_invs(&mut sess.reader, sess.magic, Duration::from_millis(200)).await;
+    let _ = block_invs_before_pong(&mut sess, 1).await;
     let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
     hub.mine(1, script.clone(), vec![]).unwrap();
     let offered = hub.tip_hash().unwrap();
-    assert_eq!(
-        count_block_invs(
-            &mut sess.reader,
-            sess.magic,
-            offered,
-            Duration::from_secs(2)
-        )
-        .await,
-        1
-    );
+    let mut invs = block_invs_until(&mut sess, offered).await;
+    invs.extend(block_invs_before_pong(&mut sess, 2).await);
+    assert_eq!(invs.iter().filter(|h| **h == offered).count(), 1);
     assert_eq!(sess.live.header_marks().0, None);
     hub.mine(1, script, vec![]).unwrap();
     let child = hub.tip_hash().unwrap();
@@ -688,7 +683,7 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
     let hub = hub.into_arc();
     let peers = rbitcoin_net::peers::PeerHub::new();
     let mut sess = open_decode_session(Arc::clone(&hub), &peers, 18479, Some(genesis)).await;
-    let _ = collect_block_invs(&mut sess.reader, sess.magic, Duration::from_millis(200)).await;
+    let _ = block_invs_before_pong(&mut sess, 7).await;
     write_v2_msg(&mut sess.writer, NetworkMessage::SendHeaders)
         .await
         .unwrap();
@@ -699,16 +694,14 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
     let script = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
     hub.mine(1, script.clone(), vec![]).unwrap();
     let parent = hub.tip_hash().unwrap();
-    let parent_hdrs =
-        collect_header_tips(&mut sess.reader, sess.magic, Duration::from_secs(2)).await;
+    let parent_hdrs = header_tips_until(&mut sess.reader, sess.magic, parent).await;
     assert!(
         parent_hdrs.contains(&parent),
         "the parent is announced, got {parent_hdrs:?}"
     );
     hub.mine(1, script.clone(), vec![]).unwrap();
     let offered = hub.tip_hash().unwrap();
-    let offered_hdrs =
-        collect_header_tips(&mut sess.reader, sess.magic, Duration::from_secs(2)).await;
+    let offered_hdrs = header_tips_until(&mut sess.reader, sess.magic, offered).await;
     assert!(
         offered_hdrs.contains(&offered),
         "the child is announced, got {offered_hdrs:?}"
@@ -755,7 +748,10 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
             break;
         }
     }
-    hub.mine(1, script, vec![]).unwrap();
+    // Another coinbase script: inside the same second, the same script would
+    // rebuild `offered`, which is invalidated.
+    hub.mine(1, bitcoin::ScriptBuf::from_bytes(vec![0x52]), vec![])
+        .unwrap();
     let child = hub.tip_hash().unwrap();
     assert_ne!(child, offered);
     assert_ne!(child, parent);
@@ -1094,31 +1090,6 @@ async fn getheaders_announces_a_block_connected_during_the_reply() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-async fn count_block_invs(
-    reader: &mut rbitcoin_net::v2::V2Reader,
-    magic: Magic,
-    tip: BlockHash,
-    wait: Duration,
-) -> u32 {
-    use rbitcoin_net::v2::read_v2_frame;
-    let deadline = std::time::Instant::now() + wait;
-    let mut n = 0u32;
-    while std::time::Instant::now() < deadline {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        let frame = match tokio::time::timeout(left, read_v2_frame(reader, magic)).await {
-            Ok(Ok(frame)) => frame,
-            _ => break,
-        };
-        if let NetworkMessage::Inv(inv) = frame.decode().payload() {
-            n += u32::from(
-                inv.iter()
-                    .any(|i| matches!(i, Inventory::Block(h) if *h == tip)),
-            );
-        }
-    }
-    n
-}
-
 async fn collect_header_tips(
     reader: &mut rbitcoin_net::v2::V2Reader,
     magic: Magic,
@@ -1161,6 +1132,84 @@ async fn collect_block_invs(
                 if let Inventory::Block(h) = item {
                     hashes.push(*h);
                 }
+            }
+        }
+    }
+    hashes
+}
+
+/// Send `Ping(nonce)` and return the block hashes of every inv the session
+/// writes before its pong. Replies leave on one queue in order, so an inv
+/// queued before the session read the ping is in the list. This is the
+/// "nothing else was sent" read without a fixed quiet window.
+async fn block_invs_before_pong(sess: &mut DecodeSession, nonce: u64) -> Vec<BlockHash> {
+    use rbitcoin_net::v2::{read_v2_frame, write_v2_msg};
+    write_v2_msg(&mut sess.writer, NetworkMessage::Ping(nonce))
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut hashes = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let frame = tokio::time::timeout(left, read_v2_frame(&mut sess.reader, sess.magic))
+            .await
+            .expect("pong within 2 s")
+            .unwrap();
+        if frame_is_pong(&frame, nonce) {
+            return hashes;
+        }
+        if let NetworkMessage::Inv(inv) = frame.decode().payload() {
+            for item in inv {
+                if let Inventory::Block(h) = item {
+                    hashes.push(*h);
+                }
+            }
+        }
+    }
+}
+
+/// Read until a block inv names `want`, then return every block hash the
+/// invs named up to and including it.
+async fn block_invs_until(sess: &mut DecodeSession, want: BlockHash) -> Vec<BlockHash> {
+    use rbitcoin_net::v2::read_v2_frame;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut hashes = Vec::new();
+    while !hashes.contains(&want) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let frame = tokio::time::timeout(left, read_v2_frame(&mut sess.reader, sess.magic))
+            .await
+            .unwrap_or_else(|_| panic!("block inv {want} within 2 s, got {hashes:?}"))
+            .unwrap();
+        if let NetworkMessage::Inv(inv) = frame.decode().payload() {
+            for item in inv {
+                if let Inventory::Block(h) = item {
+                    hashes.push(*h);
+                }
+            }
+        }
+    }
+    hashes
+}
+
+/// Read until a headers message ends at `want`. Returns the last hash of
+/// each headers message read.
+async fn header_tips_until(
+    reader: &mut rbitcoin_net::v2::V2Reader,
+    magic: Magic,
+    want: BlockHash,
+) -> Vec<BlockHash> {
+    use rbitcoin_net::v2::read_v2_frame;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut hashes = Vec::new();
+    while !hashes.contains(&want) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let frame = tokio::time::timeout(left, read_v2_frame(reader, magic))
+            .await
+            .unwrap_or_else(|_| panic!("headers ending at {want} within 2 s, got {hashes:?}"))
+            .unwrap();
+        if let NetworkMessage::Headers(headers) = frame.decode().payload() {
+            if let Some(last) = headers.last() {
+                hashes.push(last.block_hash());
             }
         }
     }
@@ -8494,7 +8543,6 @@ include!("../peer_catchup_journey.rs");
 include!("../peer_hostile_journey.rs");
 include!("../peer_tip_announce_journey.rs");
 include!("../peer_header_dos_journey.rs");
-include!("../peer_header_sync_journey.rs");
 include!("../peer_blocksonly_journey.rs");
 
 /// A headers batch and a getheaders reply must not read or write the store

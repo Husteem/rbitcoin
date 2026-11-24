@@ -3322,6 +3322,35 @@ fn tip_within(
     }
 }
 
+/// Let the confirm lookup thread finish at least `n` more selection passes.
+/// Each pass adds its time to `thr_lookup_other_ns`, a counter the perf log
+/// publishes, and a pass that takes a wave advances `lookup_taken_hi` on the
+/// same thread before the next pass adds to the counter.
+fn after_lookup_passes(hub: &rbitcoin_net::chain::ChainHub, n: u32) {
+    use std::sync::atomic::Ordering;
+    let ns = || {
+        hub.query
+            .confirm_stats()
+            .thr_lookup_other_ns
+            .load(Ordering::Relaxed)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut last = ns();
+    let mut seen = 0;
+    while seen < n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the lookup ran {seen} of {n} passes"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let now = ns();
+        if now != last {
+            seen += 1;
+            last = now;
+        }
+    }
+}
+
 #[test]
 fn confirm_engine_stops_when_the_lead_is_exhausted() {
     let LeadEngine {
@@ -3331,12 +3360,14 @@ fn confirm_engine_stops_when_the_lead_is_exhausted() {
         engine,
         ..
     } = engine_with_blocks("lead-engine-height", 1, |_| (Some(0), 0, Some(u64::MAX)));
-    let tip = tip_within(
-        &hub,
-        |t| t.is_some_and(|h| h >= 1),
-        std::time::Duration::from_secs(3),
-    );
+    // Three passes: whatever the first took has been marked by the third.
+    after_lookup_passes(&hub, 3);
+    let (taken, tip) = (hub.query.lookup_taken_hi(), hub.tip_height());
     stop_confirm_engine(&feed, engine);
+    assert!(
+        taken.is_none_or(|h| h == 0),
+        "a zero height cap lets the lookup take no block, took {taken:?}"
+    );
     assert_eq!(
         tip,
         Some(0),

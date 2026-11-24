@@ -419,7 +419,9 @@ async fn ephemeral_broadcast() {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    const BURST: u32 = 44;
+    // Past 32 queued behind the stuck send is what lagged the old kick
+    // channel; each extra tx is one more SOCKS and BIP324 handshake.
+    const BURST: u32 = 34;
     let cb2 = hub
         .query
         .reconstruct_block_at_height(Height(2))
@@ -751,7 +753,8 @@ async fn ephemeral_broadcast() {
     }
     mp.note_returned(&txid);
     mp.note_mock_now(now + 2 * 181);
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    // Three sweeps of the 50 ms resend interval.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
     while let Ok(Some(sent)) = tokio::time::timeout_at(deadline, got_rx.recv()).await {
         assert_ne!(sent, txid, "a tx that came back is not sent again");
     }

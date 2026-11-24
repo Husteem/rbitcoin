@@ -318,7 +318,9 @@ jobs:
         run: >-
           env -u RBITCOIN_IO
           cargo test -p rbitcoin-query -p rbitcoin-net -p rbitcoin-rpc
-          -p rbitcoin-ibd -p rbitcoin-test --features skip-flushes --test suite
+          -p rbitcoin-ibd -p rbitcoin-test -p rbitcoin-electrum
+          -p rbitcoin-esplora -p rbitcoin-sv2 -p rbitcoin-node
+          --features skip-flushes --test suite
           -- --quiet flushes_skipped_matches_the_skip_flushes_feature
 
   # Forward rustc. Same wait as pread: a red `test` does not compile it.
@@ -389,6 +391,8 @@ jobs:
         timeout-minutes: 15
         env:
           COVERAGE_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Only badge.json and crap.json are uploaded; skip the HTML tree.
+          COVERAGE_HTML: "0"
         run: ./scripts/coverage.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

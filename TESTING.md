@@ -217,9 +217,13 @@ absolute path. Keep default-tier fixtures small: on tmpfs, test bytes are RAM.
 on the whole drive, so suites that run many stores at once queue behind each
 other and miss their wall clocks. `cargo test --workspace --features
 skip-flushes` turns flushes off before any test runs in the query, net, rpc,
-ibd, and `rbitcoin-test` suites (`-p <crate> --features skip-flushes` for
-one). On one Mac those five took 1962 s with 24 failures, and 272 s with one
-failure that does not involve flushes.
+ibd, `rbitcoin-test`, electrum, esplora, sv2, and node suites (`-p <crate>
+--features skip-flushes` for one). On one Mac the first five took 1962 s with
+24 failures, and 272 s with one failure that does not involve flushes. In the
+`macos-test` job, electrum, esplora, and sv2 took 17–42 s, 18–37 s, and
+16–18 s with flushes, against about 3 s each on Linux, and node's
+`restart_seals_a_pruned_tweak_gap_before_the_prune_height_advances`
+(290 connects) took 19.6 s against 0.6 s.
 
 A suite opts in with `skip-flushes = []` in its `Cargo.toml` and
 `rbitcoin_store::skip_flushes_before_main!();` at the top of
@@ -234,8 +238,8 @@ still flushes. A test that needs a real flush belongs in a suite that does
 not call the macro, such as `rbitcoin-store`'s. The `skip-flushes-call` and
 `skip-flushes-macro` ast-grep rules refuse the switch anywhere else. CI's
 `pread` job runs each suite's switch test with the flag. The `macos-test`
-job runs the whole workspace with the flag, but only the five suites above
-skip flushes. The rest, such as electrum, esplora, and store, still flush.
+job runs the whole workspace with the flag, but only the nine suites above
+skip flushes. The rest, such as store and mempool, still flush.
 The workspace `cargo test` step in the required `test` job and
 `ci-os-smoke.sh` do not pass the flag, so every suite they run flushes.
 
@@ -344,7 +348,8 @@ they must sum to the badge `lh`/`lf`. A red PR does not publish.
 `cargo llvm-cov`'s text “Missed Lines” column can count *partial regions within
 a line* (for example match or-patterns) even when the line executed. The gate
 uses LCOV line hit/total (`LH`/`LF`). HTML remains a diagnostic report under
-`coverage/`.
+`coverage/`. CI sets `COVERAGE_HTML=0` and skips it, since it uploads only
+`badge.json` and `crap.json`.
 
 ```bash
 nix-shell
@@ -540,7 +545,7 @@ A cell that names a crate-local test describes the witness that exists today. It
 | `tip_follow_getheaders_catches_missed_blocks` | P2P (**default**) | Blocks mined while disconnected fill via post-connect `getheaders` |
 | `outbound_full_relay_refills_to_max_outbound` | P2P (**default**) | After catch-up, with no `--connect` and no `--trust-peer`, live `outbound-full-relay` sessions equal `--max-outbound` (more than 3) from the address book. Disconnecting those sessions brings the count back to that cap without a stale-tip wait. A `--seed-node` `getaddr` reply of more than 3 addresses is dialed as outbound full-relay. A pinned `--connect` or `--trust-peer` set does not gain book peers. At the cap, a stale tip rotates one outbound full-relay peer only when seeds are enabled |
 | `trust_peer_applies_waivable_faults_from_its_session_only` | Node CLI + P2P + RPC | The operator CLI (`journey-node`) with `--trust-peer` naming a scripted listener, stderr as the operator log. Catch-up from that peer connects a block whose coinbase commits to the wrong height and logs one `WARN trust-peer: applied block <hash> height 1: bad-cb-height`. With the mode on, `submitblock` of an excess-subsidy child is `bad-cb-amount`, the tip stays, and no `trust-peer:` line names it. The trusted session announcing that same block connects it with one `bad-cb-amount` applied line. Header faults, proof of work, the other waivable rules, and the mempool marks stay crate units |
-| `end_of_ibd_follow` | P2P (**default**) | Miner plus `--sh-index` syncer. One mature regtest: coinbases pay script A, one spend pays script B. IBD reaches that tip, leaves IBD, and Electrum history matches. The next block tip-follows. Restart does not rewrite the scripthash pack mark; one more block arrives by write-behind. Cancelling IBD once the height is below the miner, then `run_p2p`, finishes the same tip and history. With the syncer caught up, dropping the miner leaves tip follow (not IBD). A partial datadir whose miner is down does not open Electrum and stays short of that tip; the same miner address coming back lets that datadir finish |
+| `end_of_ibd_follow` | P2P (**default**) | Miner plus `--sh-index` syncer. One mature regtest: coinbases pay script A, one spend pays script B. IBD reaches that tip, leaves IBD, and Electrum history matches. The next block tip-follows. Restart does not rewrite the scripthash pack mark; one more block arrives by write-behind. Cancelling IBD once the height is below the miner, then `run_p2p`, finishes the same tip and history. With the syncer caught up, dropping the miner leaves tip follow (not IBD). A partial datadir whose only peer is unreachable does not open Electrum and stays short of that tip; pointed back at the miner, it finishes |
 | `end_of_ibd_sh_interrupt` | P2P (**default**) | Same miner and scripts. The syncer first catches up with `--sh-index` off, then the datadir is frozen after pass 1 (`DONE.keys`, no `DONE.post`). Resume builds the index and Electrum's first answer is the full A/B history; restart does not rewrite the pack mark. A block mined after the freeze is in that history. A copy that already has the block, with `include_hwm` at the new tip and that create appended on the unsealed head, still serves the same history and does not open Electrum early |
 | `end_of_ibd_work_fork` | P2P (**default**) | Two miners on a regtest with retargeting and min-difficulty. One chain retargets harder and stops shorter. The other forks after that retarget, resets to the pow limit, and grows taller with less work. The syncer IBD-adopts the heavier tip and keeps it across a reopen. A scripted BIP324 peer advertises height 100,000, supplies two consecutive full windows of a lighter fork, then replays the second: the syncer asks to continue after each advancing window but finishes IBD after the replay. It then follows one more heavy block from the miners. This journey exceeds 2s because the replay must reach the protocol’s 2,000-header boundary; 89 harder blocks outweigh both windows without confirming 4,001 easy blocks |
 | `end_of_ibd_invalid_heavier_fork` | P2P (**default**) | Three miners on one regtest. The split miner never halves the subsidy, so from height 20 its taller chain is coinbase excess to the syncer while it still carries the most header work. Honest forks at 14 and the third miner forks at the first invalid block. With honest at 17 the syncer keeps the split chain's valid prefix (19) and IBD returns. Once honest reaches 30, a fresh syncer confirms that prefix, retires the split candidate on the invalid block, rewinds 19 → 14, and finishes at honest 30. The syncer that kept the prefix restarts, with both peers and then with honest alone, and finishes at honest 30 without rewinding to chase the stored split headers. A syncer whose only other peer forks at the invalid block finishes on that fork |

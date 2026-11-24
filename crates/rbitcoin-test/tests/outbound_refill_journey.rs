@@ -25,6 +25,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 
 const MAX_OUT: u32 = 5;
+/// Each redial pass opens one outbound, so every phase fills its
+/// `MAX_OUT` slots in about `MAX_OUT` passes. The journey asserts counts and
+/// rotation, not pacing.
+const REDIAL: Duration = Duration::from_millis(50);
 /// One seed plus enough other listeners that a `getaddr` reply (23% of the
 /// book, at least one) is more than 3 addresses.
 const LEARNED_PEERS: usize = 18;
@@ -176,7 +180,7 @@ fn base_cfg(dir: &Path) -> NodeConfig {
     cfg.listen.max_outbound = MAX_OUT;
     cfg.rpc.listen = Some("127.0.0.1:0".parse().expect("rpc"));
     cfg.max_tip_age_secs = Some(u64::MAX);
-    cfg.connect_redial = rbitcoin_net::REDIAL_INTERVAL_TEST;
+    cfg.connect_redial = REDIAL;
     cfg
 }
 
@@ -542,7 +546,7 @@ async fn pinned_trust(root: &Path, pinned: SocketAddr, book: &[SocketAddr]) {
     let mut cfg = base_cfg(&dir);
     cfg.trust_peer = Some(NetAddr::Ip(pinned));
     cfg.seal_trust_peer().expect("trust-peer");
-    cfg.connect_redial = rbitcoin_net::REDIAL_INTERVAL_TEST;
+    cfg.connect_redial = REDIAL;
     cfg.rpc.listen = Some("127.0.0.1:0".parse().expect("rpc"));
     cfg.max_tip_age_secs = Some(u64::MAX);
     let mut join = spawn_run(cfg);

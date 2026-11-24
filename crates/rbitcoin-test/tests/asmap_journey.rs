@@ -138,7 +138,11 @@ fn spawn_node(dir: &Path, extra: &[&str]) -> JourneyNode {
         .arg("--log-level")
         .arg("info")
         .arg("--milestone")
-        .arg("0");
+        .arg("0")
+        // Mainnet heads cost each boot about 2 s. `trust_peer_waiver_journey`
+        // keeps its child on them.
+        .arg("--head-scale")
+        .arg("tiny");
     cmd.args(extra);
     JourneyNode::spawn(cmd)
 }

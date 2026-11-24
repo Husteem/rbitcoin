@@ -77,6 +77,11 @@ assert_ok "llvm-cov test is GNU-timeout wrapped" \
   grep -q 'timeout --kill-after=30s' "$COV"
 assert_ok "llvm-cov test does not pass --report-time (stable rustc)" \
   bash -c '! grep -E "report-time" "$1"' _ "$COV"
+# CI uploads badge.json and crap.json, never the HTML tree.
+assert_ok "COVERAGE_HTML=0 runs llvm-cov test with --no-report" \
+  bash -c 'grep -q "COVERAGE_HTML:-1" "$1" && grep -q -- "--no-report" "$1"' _ "$COV"
+assert_ok "ci coverage step skips the HTML report" \
+  bash -c 'awk "/^  coverage:/{p=1;next} p&&/^  [a-z]/{exit} p" "$1" | grep -Eq "COVERAGE_HTML: \"0\""' _ "$ROOT/.github/workflows/ci.yml"
 assert_ok "ci coverage job has a wall timeout" \
   bash -c 'awk "/^  coverage:/{p=1} p&&/timeout-minutes:/{print; exit}" "$1" | grep -q timeout-minutes' _ "$ROOT/.github/workflows/ci.yml"
 assert_ok "required test job excludes rbitcoin-bench" \

@@ -380,7 +380,7 @@ async fn expect_process_stays_up_without_electrum(
         );
         assert!(
             !node.is_finished(),
-            "syncer with the miner down exited instead of waiting for peers"
+            "syncer with no reachable peer exited instead of waiting for peers"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -510,7 +510,7 @@ async fn finish_partial(dir: &Path, miner: SocketAddr, synced: &Synced) {
     stop_run_p2p(rpc, node).await;
 }
 
-async fn partial_with_miner_down(miner_dir: &Path, synced: &mut Synced) {
+async fn partial_with_an_unreachable_peer(miner_dir: &Path, synced: &mut Synced) {
     let miner = start_miner(miner_dir).await;
     let miner_addr = miner.local_addr;
     assert_eq!(miner.tip_height().unwrap(), synced.height);
@@ -522,19 +522,24 @@ async fn partial_with_miner_down(miner_dir: &Path, synced: &mut Synced) {
     let held_dir = TestDatadir::new().unwrap();
     copy_dir(&partial_dir.store_path(), &held_dir.store_path());
 
-    miner.shutdown().await;
-    let held = spawn_run_p2p(syncer_cfg(held_dir.path().as_path(), miner_addr));
-    expect_process_stays_up_without_electrum(held, held_dir.path().as_path()).await;
+    // The held copy restarts with its only peer unreachable: nothing listens
+    // on port 1. The miner stays up, so the partial copy finishes during the
+    // held copy's watch instead of after it.
+    let unreachable = SocketAddr::from(([127, 0, 0, 1], 1));
+    let (held_path, partial_path) = (held_dir.path(), partial_dir.path());
+    let held = spawn_run_p2p(syncer_cfg(held_path.as_path(), unreachable));
+    tokio::join!(
+        expect_process_stays_up_without_electrum(held, held_path.as_path()),
+        finish_partial(partial_path.as_path(), miner_addr, synced),
+    );
     let held_tip = store_tip(&held_dir.store_path());
     assert!(
         held_tip > 0 && held_tip < synced.height,
-        "miner-down restart tip={held_tip} partial={partial_tip} full={}",
+        "unreachable-peer restart tip={held_tip} partial={partial_tip} full={}",
         synced.height
     );
 
-    let miner = start_miner(miner_dir).await;
-    finish_partial(partial_dir.path().as_path(), miner.local_addr, synced).await;
-    finish_partial(held_dir.path().as_path(), miner.local_addr, synced).await;
+    finish_partial(held_dir.path().as_path(), miner_addr, synced).await;
     crash_with_class_a_above_tip(&miner, synced).await;
     miner.shutdown().await;
 }
@@ -742,7 +747,7 @@ async fn follow_journey() {
     assert_eq!(synced.height as usize, blocks.len() - 1);
 
     ibd_then_restart(miner, miner_addr, &mut synced).await;
-    partial_with_miner_down(miner_dir.path().as_path(), &mut synced).await;
+    partial_with_an_unreachable_peer(miner_dir.path().as_path(), &mut synced).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -249,7 +249,11 @@ async fn metrics_route_needs_the_flag() {
 /// Idle TCP to the health listener is capped, and a socket that sends
 /// nothing is closed. A client must not be able to hold a connection until
 /// the process runs out of descriptors.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// The cap phase runs on real time. The idle phase advances tokio's paused
+/// clock, which hyper's header-read timer reads, so it does not wait out the
+/// real `REQUEST_TIMEOUT`. `pause` needs the current-thread runtime.
+#[tokio::test]
 async fn listener_cap_idle_health_is_closed() {
     let status = NodeStatus::new(Network::Regtest, false);
     let handle = run_health("127.0.0.1:0".parse().unwrap(), status, false)
@@ -294,12 +298,19 @@ async fn listener_cap_idle_health_is_closed() {
     );
     let mut idle = still.pop().expect("accepted idle client");
     drop(still);
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The timer started at accept, under a second ago, so half the timeout
+    // is still short of it.
+    tokio::time::pause();
+    tokio::time::advance(REQUEST_TIMEOUT / 2).await;
+    tokio::time::resume();
     assert!(
         tcp_still_open(&mut idle).await,
         "idle health connection closed before the header timeout"
     );
-    let closed = tokio::time::timeout(REQUEST_TIMEOUT + Duration::from_secs(2), async {
+    tokio::time::pause();
+    tokio::time::advance(REQUEST_TIMEOUT).await;
+    tokio::time::resume();
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
         let mut buf = [0u8; 8];
         loop {
             match idle.read(&mut buf).await {

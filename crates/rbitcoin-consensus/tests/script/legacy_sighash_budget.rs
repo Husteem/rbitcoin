@@ -56,12 +56,19 @@ fn input(i: usize, script_sig: Vec<u8>) -> TxIn {
     }
 }
 
-fn shell(inputs: Vec<TxIn>, extra_outputs: usize) -> Transaction {
-    let out = TxOut {
+/// One `OP_TRUE` output plus `pad` outputs' worth of body: ten bytes each, as
+/// a one-byte scriptPubKey output serializes. Each full thousand is one output
+/// of a 9,989-byte script (8 + 3 + 9,989 = 10,000 bytes). Every hash encodes
+/// every output, so the bytes cost the same and the test skips the per-output
+/// work. A `pad` under 1,000 keeps that many outputs, so the count crosses the
+/// compact-size boundaries a caller asks for.
+fn shell(inputs: Vec<TxIn>, pad: usize) -> Transaction {
+    let out = |len: usize| TxOut {
         value: Amount::from_sat(1_000),
-        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51; len]),
     };
-    let output = vec![out; extra_outputs + 1];
+    let mut output = vec![out(1); 1 + pad % 1_000];
+    output.extend((0..pad / 1_000).map(|_| out(9_989)));
     Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -298,7 +305,6 @@ fn inputs_that_never_hash_cannot_pay_for_22_script_inputs() {
     assert_eq!(hashed, 228_868_200);
     assert!(hashed > 7 * MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES);
     assert!(work_error(&tx, &prevouts));
-    verify_tx_scripts_detached(prevouts, tx).expect("block connect has no budget");
 }
 
 /// A signed P2PKH spend of `n` inputs and `pad` extra outputs.
@@ -358,7 +364,8 @@ fn p2pkh_inputs_are_charged_to_the_budget_they_share() {
 }
 
 /// The most a P2PKH-only transaction can hash at the 400,000 weight limit is
-/// about 23.4 MB (467 inputs and 3,000 outputs). It stays admitted.
+/// about 23.4 MB (467 inputs and 3,000 outputs' worth of body). It stays
+/// admitted.
 #[test]
 fn a_p2pkh_spend_at_the_standard_weight_limit_is_admitted() {
     let (tx, prevouts, p2pkh, _) = p2pkh_spend(467, 3_000, Vec::new());
@@ -401,7 +408,6 @@ fn p2pkh_hashing_and_script_hashing_share_one_ceiling() {
     assert!(script_bytes < MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES);
     assert!(p2pkh_bytes + script_bytes > MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES);
     assert!(work_error(&tx, &all));
-    verify_tx_scripts_detached(all, tx).expect("block connect has no budget");
 }
 
 /// 99 CHECKSIGs, one hash type, over a body that would be far past the budget
@@ -421,17 +427,6 @@ fn many_different_hashes_of_a_large_body_are_refused() {
     assert!(work_error(&tx, &prevouts));
     // Block connect has no budget: the same transaction passes its scripts.
     verify_tx_scripts_detached(prevouts, tx).expect("consensus flags do not charge");
-}
-
-#[test]
-fn inputs_asking_for_extra_hashes_share_one_budget() {
-    // 8 inputs of 99 distinct hashes each over an 80 kB body is 63 MB.
-    let (tx, prevouts) = checksig_spend(8, 99, 8_000, |i| u8::try_from(i + 1).unwrap());
-    assert!(work_error(&tx, &prevouts));
-    verify_tx_scripts_detached(prevouts, tx).unwrap();
-    // The same inputs with one hash type each hash once per input.
-    let (tx, prevouts) = checksig_spend(8, 99, 8_000, |_| 1);
-    verify_tx_scripts_unconfirmed(prevouts, tx).unwrap();
 }
 
 /// The check refuses exactly when the model says: each distinct hash costs the

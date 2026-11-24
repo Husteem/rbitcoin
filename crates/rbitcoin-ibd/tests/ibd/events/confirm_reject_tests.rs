@@ -3906,8 +3906,14 @@ fn mutated_clear_is_deferred_without_the_debug_lock_flag() {
         !saw.load(Ordering::Relaxed),
         "clear is not sent inside take_confirm_events"
     );
-    worker.join().unwrap();
+    // Query held the only sender: dropping it ends the worker's wait at
+    // once, and any clear sent before then is still seen.
     hub.query.detach_confirm_write();
+    worker.join().unwrap();
+    assert!(
+        !saw.load(Ordering::Relaxed),
+        "no clear was sent after take_confirm_events returned"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -822,14 +822,25 @@ fn checkpoint_merge_reads_records_in_one_batch() {
     assert_eq!(log.slot(pages[1]).unwrap(), Some([4; 8]));
 }
 
+/// An open-note cap small enough that reaching it costs nothing. The cap's
+/// own sizing is `a_window_after_the_cap_fills_past_it_without_growing`'s,
+/// at the production [`OPEN_EDGE_CAP`].
+///
+/// [`OPEN_EDGE_CAP`]: rbitcoin_store::spend_delta::OPEN_EDGE_CAP
+const EDGE_CAP: u64 = 1_024;
+
 /// A freeze empties the open notes, so it releases a confirm thread parked
 /// at the edge cap before the checkpoint writes anything.
 #[test]
 fn freeze_releases_an_edge_cap_waiter() {
     use std::sync::{mpsc, Arc, Condvar, Mutex};
     let d = dir();
-    let log = Arc::new(SpendPageLog::create(&d).unwrap());
-    let cap = rbitcoin_store::spend_delta::OPEN_EDGE_CAP;
+    let policy = Policy {
+        open_edge_cap: EDGE_CAP,
+        ..Policy::DEFAULT
+    };
+    let log = Arc::new(SpendPageLog::create_with(&d, policy).unwrap());
+    let cap = EDGE_CAP;
     let slots: Vec<(u64, [u8; 8])> = (0..cap).map(|i| (16 + i * 8, [1u8; 8])).collect();
     log.note_slots(&slots).unwrap();
     log.bind_sync_wake(Arc::new((Mutex::new(false), Condvar::new())));
@@ -1082,6 +1093,7 @@ const SMALL: Policy = Policy {
     reclaim_rate: 1,
     fold_round_pages: usize::MAX,
     log_fold_min: 4 << 20,
+    open_edge_cap: rbitcoin_store::spend_delta::OPEN_EDGE_CAP,
 };
 
 /// Below the ceiling at any size: reclaim every segment not wholly live, and
@@ -2288,6 +2300,7 @@ fn reclaim_reads_only_the_live_records() {
         reclaim_rate: 100,
         fold_round_pages: usize::MAX,
         log_fold_min: 4 << 20,
+        open_edge_cap: rbitcoin_store::spend_delta::OPEN_EDGE_CAP,
     };
     let d = dir();
     let mut body = MemBody::new(8 * 4096);
@@ -2325,6 +2338,7 @@ fn reclaim_does_not_read_a_record_this_checkpoint_rewrites() {
         reclaim_rate: 100,
         fold_round_pages: usize::MAX,
         log_fold_min: 4 << 20,
+        open_edge_cap: rbitcoin_store::spend_delta::OPEN_EDGE_CAP,
     };
     let d = dir();
     let mut body = MemBody::new(8 * 4096);
@@ -3154,11 +3168,15 @@ fn a_fold_file_that_stays_fails_the_checkpoint() {
 /// returns an error, and one success clears the count.
 #[test]
 fn checkpoints_that_keep_failing_stop_the_edge_cap_wait() {
-    use rbitcoin_store::spend_delta::{CHECKPOINT_FAILURES_STOP, OPEN_EDGE_CAP};
+    use rbitcoin_store::spend_delta::CHECKPOINT_FAILURES_STOP;
     use std::sync::{mpsc, Arc, Condvar, Mutex};
     let d = dir();
-    let log = Arc::new(SpendPageLog::create(&d).unwrap());
-    let slots: Vec<(u64, [u8; 8])> = (0..OPEN_EDGE_CAP).map(|i| (16 + i * 8, [1u8; 8])).collect();
+    let policy = Policy {
+        open_edge_cap: EDGE_CAP,
+        ..Policy::DEFAULT
+    };
+    let log = Arc::new(SpendPageLog::create_with(&d, policy).unwrap());
+    let slots: Vec<(u64, [u8; 8])> = (0..EDGE_CAP).map(|i| (16 + i * 8, [1u8; 8])).collect();
     log.note_slots(&slots).unwrap();
     log.bind_sync_wake(Arc::new((Mutex::new(false), Condvar::new())));
     let (tx, rx) = mpsc::channel();
@@ -3205,7 +3223,6 @@ fn checkpoints_that_keep_failing_stop_the_edge_cap_wait() {
 /// [`checkpoints_that_keep_failing_stop_the_edge_cap_wait`] covers the stop.
 #[test]
 fn notes_a_failed_checkpoint_sealed_still_hold_the_edge_cap() {
-    use rbitcoin_store::spend_delta::OPEN_EDGE_CAP;
     use std::sync::{mpsc, Arc, Condvar, Mutex};
     let d = dir();
     let mut body = MemBody::new((PAGES * 4096) as usize);
@@ -3214,7 +3231,11 @@ fn notes_a_failed_checkpoint_sealed_still_hold_the_edge_cap() {
         body.bytes[at..at + 8].copy_from_slice(&[0xa5u8; 8]);
     }
     body.fail_writes = true;
-    let log = Arc::new(SpendPageLog::create_with(&d, SMALL).unwrap());
+    let policy = Policy {
+        open_edge_cap: EDGE_CAP,
+        ..SMALL
+    };
+    let log = Arc::new(SpendPageLog::create_with(&d, policy).unwrap());
     log.adopt_v29(Vec::new(), 0, &body).unwrap();
     let mut tip = 0;
     let mut failed = 0;
@@ -3226,7 +3247,7 @@ fn notes_a_failed_checkpoint_sealed_still_hold_the_edge_cap() {
             failed += 1;
         }
     }
-    let slots: Vec<(u64, [u8; 8])> = (0..OPEN_EDGE_CAP).map(|i| (16 + i * 8, [1u8; 8])).collect();
+    let slots: Vec<(u64, [u8; 8])> = (0..EDGE_CAP).map(|i| (16 + i * 8, [1u8; 8])).collect();
     log.note_slots(&slots).unwrap();
     log.bind_sync_wake(Arc::new((Mutex::new(false), Condvar::new())));
     let (tx, rx) = mpsc::channel();
@@ -3412,6 +3433,7 @@ fn confirm_spend_meta_reads_delta_records_in_one_bulk() {
         reclaim_rate: 4,
         fold_round_pages: 64,
         log_fold_min: 4 << 20,
+        open_edge_cap: rbitcoin_store::spend_delta::OPEN_EDGE_CAP,
     };
     let mut body = FileBody {
         file: std::fs::OpenOptions::new()

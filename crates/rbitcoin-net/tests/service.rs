@@ -711,15 +711,29 @@ async fn listener_cap_silent_inbound_releases_the_slot() {
         );
     }
     let cap = rbitcoin_net::peers::MAX_INCOMPLETE_INBOUND_PER_ADDR;
+    // The listener drops each connect past the cap at accept, so that
+    // socket reads EOF. Wait until every one of those has, with the cap's
+    // worth of handshakes holding slots.
     let wait = std::time::Instant::now();
-    let mut saw = 0usize;
-    while wait.elapsed() < Duration::from_secs(2) {
+    let mut refused = vec![false; parked.len()];
+    loop {
         let n = node.peers.snapshot().len();
         assert!(n <= cap, "one address held {n} unfinished handshakes");
-        saw = saw.max(n);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for (s, r) in parked.iter().zip(refused.iter_mut()) {
+            let mut b = [0u8; 1];
+            *r |= matches!(s.try_read(&mut b), Ok(0));
+        }
+        let closed = refused.iter().filter(|r| **r).count();
+        if n == cap && closed == parked.len() - cap {
+            break;
+        }
+        assert!(
+            wait.elapsed() < Duration::from_secs(5),
+            "{n} slots held and {closed} of {} over-cap connects closed",
+            parked.len() - cap
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(saw > 0, "no unfinished handshake took a slot");
     drop(parked);
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

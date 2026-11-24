@@ -1069,7 +1069,6 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
  "rbitcoin-consensus",
- "rbitcoin-ibd",
  "rbitcoin-log",
  "rbitcoin-mempool",
  "rbitcoin-primitives",

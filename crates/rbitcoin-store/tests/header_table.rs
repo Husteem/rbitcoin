@@ -24,6 +24,37 @@ fn sample(hash: [u8; 32]) -> HeaderRecord {
     }
 }
 
+/// A lookup probes every generation of `header.head`, one file each. Each
+/// roll doubles the slots of the generation before it, so the tiny scale
+/// still rolls at 56 headers, and a chain of `n` headers costs a lookup
+/// about log2(n) generations instead of n / 56.
+#[test]
+fn each_header_head_roll_doubles_the_generation() {
+    let dir = tmp();
+    let head = HeaderHead::create(dir.join("header.head"), HeadScale::Tiny).unwrap();
+    let entries: Vec<([u8; 32], Fk)> = (1..=3_000u64)
+        .map(|i| {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&i.to_le_bytes());
+            h[8] = 0x5a;
+            (h, Fk(i))
+        })
+        .collect();
+    head.insert_many(&entries).unwrap();
+    let slots: Vec<u64> = head
+        .gens
+        .read()
+        .unwrap()
+        .iter()
+        .map(|g| g.slots())
+        .collect();
+    assert_eq!(slots, vec![64, 128, 256, 512, 1_024, 2_048]);
+    for (h, fk) in [entries[0], entries[55], entries[56], entries[2_999]] {
+        assert_eq!(head.get_all(&h).unwrap(), vec![fk]);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn header_put_get_by_hash_open_flush() {
     let dir = tmp();

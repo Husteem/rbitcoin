@@ -3452,8 +3452,10 @@ async fn earlier_wait_reports_the_tip_from_when_it_finished() {
         rest: false,
         require_auth: false,
     };
+    // The first wait only has to stay listed long enough to be seen; it runs
+    // out in real time on the RPC runtime.
     let body = serde_json::json!([
-        {"jsonrpc":"1.0","id":1,"method":"waitfornewblock","params":[2_000]},
+        {"jsonrpc":"1.0","id":1,"method":"waitfornewblock","params":[300]},
         {"jsonrpc":"1.0","id":2,"method":"waitfornewblock","params":[5_000]}
     ])
     .to_string();

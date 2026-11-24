@@ -165,6 +165,9 @@ pub struct Policy {
     /// The directory log folds into a new base once it is longer than this
     /// and than the base.
     pub log_fold_min: u64,
+    /// Open notes, plus a failed checkpoint's sealed ones, at which confirm
+    /// waits for a checkpoint. [`OPEN_EDGE_CAP`] outside tests.
+    pub open_edge_cap: u64,
 }
 
 impl Policy {
@@ -182,6 +185,7 @@ impl Policy {
         reclaim_rate: 2,
         fold_round_pages: 4096,
         log_fold_min: 4 << 20,
+        open_edge_cap: OPEN_EDGE_CAP,
     };
 
     /// The live share, in thousandths, under which a segment is reclaimed
@@ -1725,11 +1729,11 @@ impl SpendPageLog {
     fn at_edge_cap(&self, g: &Inner) -> bool {
         let failed = self.pace.failures.load(Ordering::Acquire) > 0;
         let held = if failed { g.held_notes() } else { 0 };
-        (g.open.len() as u64).saturating_add(held) >= OPEN_EDGE_CAP
+        (g.open.len() as u64).saturating_add(held) >= self.policy.open_edge_cap
     }
 
     /// Wait while the open notes, and the sealed ones once a checkpoint
-    /// failed, are at [`OPEN_EDGE_CAP`] and a sync thread
+    /// failed, are at [`Policy::open_edge_cap`] and a sync thread
     /// is bound to drain them. Past [`CHECKPOINT_FAILURES_STOP`] failed
     /// checkpoints in a row this returns an error instead of waiting.
     pub fn wait_open_edge_room(&self) -> Result<(), StoreError> {

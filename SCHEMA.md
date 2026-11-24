@@ -383,7 +383,7 @@ Open-address hash head (see [Hash heads](#hash-heads-headerhead-generic)): key =
 
 **Create:** single file. Mainnet **2²²** slots (~96 MiB sparse, ~3.67 M headers at 7/8). Tiny tests use 64 slots so generation roll is exercised.
 
-**Overflow:** `header.head.g1`, `.g2`, … same slot count as create. Probe newest-first. No schema bump — same 24 B OA slot format.
+**Overflow:** `header.head.g1`, `.g2`, … each twice the slots of the generation before it, so a lookup probes about log₂ generations, not one per 7/8 of the create count. Each file carries its own slot count, so older equal-size generations still open. Probe newest-first. No schema bump — same 24 B OA slot format.
 
 **Open:** leftover `header.head/` directory (old 256-way shards) is **Layout refuse** (wipe `header.head` and `header.body`, reindex). A **single** file smaller than the create target is rewritten on open at the target slot count: write `header.head.grow`, fsync, rename over the live file (`.mlt` kept; no concurrent probes). Crash during rewrite leaves the previous undersized file. A target-sized gen0 with `occupied==0` and a non-empty `header.body` or `.mlt` is **Layout refuse** (wipe `header.head`, `header.head.mlt`, and `header.body`, reindex) — not a silent empty index.
 
@@ -741,7 +741,7 @@ Not `tx.head` — see [`docs/heads.md`](./docs/heads.md).
 - Packed value: sole fk (high bit clear), or `MULTI_BIT | list_fk` → sibling `.mlt` (`create_fk:u64 | next:u64`, newest first).
 - Multi-list: 16 B prefix collisions and BIP30-style multiples.
 - Identity: `get_all` candidates + **body verify**.
-- Insert past **7/8** is full: `header.head` rolls a sibling generation at the same slot count. Occupied tables are never rewritten while serving. Undersized **single-gen** files are rewritten at the create target **on open** (`header.head.grow` then rename). Target-sized empty gen0 with a non-empty body/`.mlt` is Layout refuse. Leftover 256-way `header.head/` is **Layout refuse**.
+- Insert past **7/8** is full: `header.head` rolls a sibling generation at twice the last generation's slot count. Occupied tables are never rewritten while serving. Undersized **single-gen** files are rewritten at the create target **on open** (`header.head.grow` then rename). Target-sized empty gen0 with a non-empty body/`.mlt` is Layout refuse. Leftover 256-way `header.head/` is **Layout refuse**.
 
 **Not** used for `tx.head` (keyless address) or for scripthash **create lists** (slabs; megakey page chains).
 
