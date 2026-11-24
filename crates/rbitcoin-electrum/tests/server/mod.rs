@@ -51,12 +51,34 @@ async fn config_helpers_and_param_parsers() {
     assert!(param_i64(&json!([true]), 0).is_err());
     assert!(param_str(&json!([false]), 0).is_err());
     assert!(param_str(&json!({}), 0).is_err());
-    assert!(parse_electrum_request_line("{").is_none());
-    assert!(parse_electrum_request_line("").is_none());
-    assert!(parse_electrum_request_line("not-json").is_none());
-    let ping_line = parse_electrum_request_line(r#"{"id":1,"method":"server.ping"}"#).unwrap();
+    for bad in ["{", "", "not-json"] {
+        assert!(matches!(
+            parse_electrum_request_line(bad),
+            RequestLine::Invalid
+        ));
+    }
+    let RequestLine::Value(ping_line) =
+        parse_electrum_request_line(r#"{"id":1,"method":"server.ping"}"#)
+    else {
+        panic!("ping parses");
+    };
     assert_eq!(ping_line["method"], "server.ping");
-    assert!(parse_electrum_request_line("[1]").unwrap().is_array());
+    assert!(matches!(
+        parse_electrum_request_line("[1]"),
+        RequestLine::Value(v) if v.is_array()
+    ));
+    // A batch past the cap is refused from a count of its items, before any
+    // item becomes a `Value` (a 1 MiB line of `0,` is ~500k of them).
+    let at_cap = format!("[{}]", vec!["0"; MAX_BATCH_ITEMS].join(","));
+    assert!(matches!(
+        parse_electrum_request_line(&at_cap),
+        RequestLine::Value(v) if v.as_array().map(Vec::len) == Some(MAX_BATCH_ITEMS)
+    ));
+    let past_cap = format!(" [{}]", vec!["0"; MAX_BATCH_ITEMS + 1].join(","));
+    assert!(matches!(
+        parse_electrum_request_line(&past_cap),
+        RequestLine::BatchTooLarge
+    ));
     assert_eq!(param_i64(&json!([-1]), 0).unwrap(), -1);
     assert_eq!(param_i64(&json!(["10"]), 0).unwrap(), 10);
     assert_eq!(param_str(&json!(["hi"]), 0).unwrap(), "hi");
