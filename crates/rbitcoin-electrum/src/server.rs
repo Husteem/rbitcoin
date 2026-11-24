@@ -98,6 +98,8 @@ pub const DEFAULT_MAX_SP_SCANS: usize = 32;
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Max raw tx hex chars for `transaction.broadcast` (~4 MiB wire → 8 MiB hex).
 pub const DEFAULT_MAX_BROADCAST_HEX: usize = 8_388_608;
+const RAW_TX_NOT_FOUND: &str =
+    "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.";
 
 /// Shared application DoS bounds for internet-facing query surfaces.
 ///
@@ -1372,7 +1374,8 @@ fn finish_reply(
                 wall_ms,
                 Some(&e),
             );
-            json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}})
+            let code = if e == RAW_TX_NOT_FOUND { 2 } else { 1 };
+            json!({"jsonrpc":"2.0","id": id, "error": {"code": code, "message": e}})
         }
     }
 }
@@ -3216,7 +3219,7 @@ fn dispatch_method(
                     }
                 }
             }
-            Err("tx not found".into())
+            Err(RAW_TX_NOT_FOUND.into())
         }
         "blockchain.transaction.get_merkle" => {
             let txid = param_txid(params, 0)?;
