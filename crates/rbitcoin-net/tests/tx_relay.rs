@@ -3908,12 +3908,13 @@ fn broadcast_replaces_the_conflict_a_failed_package_restores() {
     };
     bad_child.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
 
-    // One API script lane permit, as a small runner has: the parked package
-    // holds it, so the broadcast waits for the lane before it can wait on
-    // the package.
+    // As on a runner with one API script lane permit (macOS CI): the parked
+    // package takes that one. One more lets the broadcast reach the
+    // tentative wait instead of waiting on the lane, which this test pins.
     let lane = hub.api_script_lane();
     let spare = lane.available_permits().saturating_sub(1) as u32;
     let _held = (spare > 0).then(|| lane.clone().try_acquire_many_owned(spare).unwrap());
+    lane.add_permits(1);
     hub.pause_after_tentative_commit
         .store(true, Ordering::Release);
     let hub_pkg = Arc::clone(&hub);
@@ -3927,15 +3928,13 @@ fn broadcast_replaces_the_conflict_a_failed_package_restores() {
 
     let hub_send = Arc::clone(&hub);
     let send = std::thread::spawn(move || block_on(hub_send.broadcast_local_async(c)));
-    // The broadcast waits on the package, or first on the lane it holds.
-    while !send.is_finished() && hub.tentative_waiters() == 0 && lane.available_permits() > 0 {
+    while !send.is_finished() && hub.tentative_waiters() == 0 {
         assert!(
             Instant::now() < deadline,
             "the broadcast neither answered nor waited"
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(50));
     assert!(
         !send.is_finished(),
         "the broadcast answered before the package settled"
