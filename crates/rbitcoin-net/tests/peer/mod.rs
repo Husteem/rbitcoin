@@ -6004,6 +6004,22 @@ async fn v2_messages_count_contents_plus_cipher_expansion() {
     let _ = std::fs::remove_dir_all(&t.dir);
 }
 
+/// The `version` a v2 peer sent counts at its own length, so two peers with
+/// different user agents read different sizes. The payload is 85 fixed bytes,
+/// the length byte of the user agent, and the user agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_version_counts_the_length_the_peer_sent() {
+    let agents = ["/rbitcoin:test(v2a)/", "/rbitcoin:test(v2-longer-agent-string)/"];
+    let t = paused_serve("v2-version-bytes", 0, &agents).await;
+    for (agent, (_, sess)) in agents.iter().zip(&t.clients) {
+        let want = (13 + 85 + 1 + agent.len() + 20) as u64;
+        wait_bytes_recv(&t.node, sess.id, "version", want).await;
+    }
+
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
+
 fn getdata_msg(hashes: &[BlockHash]) -> NetworkMessage {
     NetworkMessage::GetData(hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect())
 }

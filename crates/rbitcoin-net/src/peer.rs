@@ -1693,6 +1693,7 @@ pub async fn read_peer_version<R: FrameRead>(
     loop {
         let frame = read_handshake_frame(reader, magic, policy).await?;
         let cmd = command_label(&frame.command);
+        let payload_len = frame.payload_len();
         let msg = frame.decode();
         match msg.payload() {
             NetworkMessage::Version(v) => {
@@ -1708,6 +1709,9 @@ pub async fn read_peer_version<R: FrameRead>(
                         }
                     }
                     return Err(NetError::Protocol("obsolete version"));
+                }
+                if let Some(s) = policy.session {
+                    s.set_version_payload_len(payload_len);
                 }
                 return Ok(v.clone());
             }

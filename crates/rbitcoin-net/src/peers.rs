@@ -648,6 +648,9 @@ pub struct LivePeer {
     pub wants_addrv2: AtomicBool,
     /// Peer sent BIP339 `wtxidrelay` (handshake, before VERACK).
     pub wtxid_relay: AtomicBool,
+    /// Payload length of the VERSION the handshake read, for the row that
+    /// replaces this one.
+    version_payload_len: AtomicUsize,
     /// Next self-announce unix seconds (`0` = never sent).
     pub next_local_addr_send: AtomicU64,
     /// The routable clearnet IP this outbound peer's VERSION says it reached
@@ -854,6 +857,10 @@ impl LivePeer {
 
     pub fn set_wants_addrv2(&self) {
         self.wants_addrv2.store(true, Ordering::Relaxed);
+    }
+
+    pub fn set_version_payload_len(&self, len: usize) {
+        self.version_payload_len.store(len, Ordering::Relaxed);
     }
 
     pub fn wants_addrv2(&self) -> bool {
@@ -3664,7 +3671,8 @@ impl PeerHub {
                 peer.note_recv("verack", 0);
             }
             crate::v1::Transport::V2 => {
-                peer.note_recv_v2("version", crate::v2::V2_LONG_TYPE_LEN + 100);
+                let version_payload = from.version_payload_len.load(Ordering::Relaxed);
+                peer.note_recv_v2("version", crate::v2::V2_LONG_TYPE_LEN + version_payload);
                 peer.note_recv_v2("verack", crate::v2::V2_LONG_TYPE_LEN);
             }
         }
@@ -3753,6 +3761,7 @@ impl PeerHub {
             v1_transport: AtomicBool::new(false),
             wants_addrv2: AtomicBool::new(false),
             wtxid_relay: AtomicBool::new(false),
+            version_payload_len: AtomicUsize::new(0),
             next_local_addr_send: AtomicU64::new(0),
             // The connecting placeholder's `receiver` is the peer's own socket.
             reported_local_ip: (!inbound && ver.version != 0)
