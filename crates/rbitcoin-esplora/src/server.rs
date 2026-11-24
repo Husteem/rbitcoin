@@ -1850,6 +1850,9 @@ pub async fn tx_status(
 /// mempool, so a tip change between the reads cannot turn a confirmed tx into
 /// a 200 `confirmed: false` for a tx the mempool does not hold: the pool's
 /// settle generation was taken first and a moved one is a 503.
+///
+/// A txid the store never saw answers 200 `confirmed: false`, as electrs does;
+/// clients ask before the tx is broadcast. With `asof` it is a 404.
 #[doc(hidden)]
 pub fn tx_status_reply(
     st: &AppState,
@@ -1882,16 +1885,8 @@ pub fn tx_status_reply(
             }
             maybe_attach_view(json_reply_here(status), view)
         }
-        Ok(None) => {
-            if asof.is_some() {
-                return not_found();
-            }
-            if mempool_wire_contains(st, txid) {
-                json_reply_here(json!({ "confirmed": false }))
-            } else {
-                not_found()
-            }
-        }
+        Ok(None) if asof.is_some() => not_found(),
+        Ok(None) => json_reply_here(json!({ "confirmed": false })),
         Err(e) => store_err(e),
     }
 }

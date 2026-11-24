@@ -665,7 +665,7 @@ reason = "core-net-policy"
 name = "p2p_eviction.py"
 status = "skip"
 reason = "core-net-policy"
-analog = "21 inbound peers (4 block, 5 slow, 4 tx, 8 fast ping) are all protected, including longest-connected; the extra inbound is rejected (eviction::tests::eviction_protects_block_tx_ping_and_netgroup). Core accepts that peer and evicts one slow peer."
+analog = "Core SelectNodeToEvict protects and selects as in eviction::each_fixed_protect_keeps_its_cohort and half_the_rest_is_kept_by_uptime. The skip predates that port and the script has not been run against it."
 
 [[test]]
 name = "p2p_feefilter.py"

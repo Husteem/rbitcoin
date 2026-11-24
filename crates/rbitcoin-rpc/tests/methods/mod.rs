@@ -814,7 +814,7 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
         )),
         "a stale block builds from its sealed best-chain parent, got {stale_two}"
     );
-    let stale_three = dispatch(&ctx, "getblockfilter", vec![height3]).unwrap();
+    let stale_three = dispatch(&ctx, "getblockfilter", vec![height3.clone()]).unwrap();
     assert_eq!(
         stale_three["header"],
         json!(filter_header_hex(
@@ -823,6 +823,35 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
         )),
         "a stale grandchild walks back to the sealed fork point, got {stale_three}"
     );
+    // Height 3 is the tip of a two-block stale branch. A bound of two
+    // rebuilds both and gives the RPC answer. A bound of one or zero is
+    // refused from the headers, before any body is rebuilt.
+    let three_hash = BlockHash::from_str(height3.as_str().unwrap())
+        .unwrap()
+        .to_byte_array();
+    let (filter, header) = ctx
+        .query
+        .basic_filter_for_hash_within(&three_hash, 2)
+        .unwrap()
+        .expect("stale height 3");
+    assert_eq!(
+        json!(rbitcoin_primitives::hex_encode(&filter)),
+        stale_three["filter"]
+    );
+    assert_eq!(
+        json!(rbitcoin_primitives::hex_encode(header.as_byte_array())),
+        stale_three["header"]
+    );
+    for bound in [0, 1] {
+        match ctx.query.basic_filter_for_hash_within(&three_hash, bound) {
+            Err(rbitcoin_store::StoreError::Rejected(m)) => {
+                assert_eq!(m, rbitcoin_query::block_filter::FILTER_STALE_TOO_DEEP)
+            }
+            other => panic!("bound {bound} must refuse two stale blocks, got {other:?}"),
+        }
+    }
+    assert!(rbitcoin_query::block_filter::FILTER_STALE_TOO_DEEP
+        .contains(&rbitcoin_query::block_filter::MAX_STALE_FILTER_WALK.to_string()));
 
     // Core #36613: the tip is height 1 again and its filter is sealed. A
     // header submitted on it is a known block that never connected.

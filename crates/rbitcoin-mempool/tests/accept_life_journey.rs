@@ -151,6 +151,7 @@ fn orphan_parks_then_promotes(life: &mut Life) {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .unwrap_err();
@@ -206,6 +207,25 @@ fn full_rbf_and_staged_commit(life: &mut Life) -> (OutPoint, Txid) {
     assert!(!life.live(&low));
     let err = life.accept(&low).unwrap_err();
     assert!(matches!(err, AcceptError::RbfInsufficient), "{err}");
+    // The replacement check runs in prepare, before scripts (Core runs
+    // `ReplacementChecks` right after PreChecks), so an underpaying
+    // replacement costs no script verification.
+    let err = life
+        .mp
+        .prepare_admit(
+            &low,
+            &life.chain,
+            life.tip,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: false,
+                min_relay: None,
+                waive: false,
+                sibling_eviction: SiblingEviction::Off,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, AcceptError::RbfInsufficient), "{err}");
 
     let e = life.chain.fund(100_000);
     let first = spend_tx(e, 50_000);
@@ -221,6 +241,7 @@ fn full_rbf_and_staged_commit(life: &mut Life) -> (OutPoint, Txid) {
                 report_orphans: false,
                 min_relay: None,
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .expect("prevout free at prepare");
@@ -230,6 +251,24 @@ fn full_rbf_and_staged_commit(life: &mut Life) -> (OutPoint, Txid) {
     assert!(life.live(&first));
     assert!(!life.live(&second));
     (d, high.compute_txid())
+}
+
+/// A replacement that underpays and also fails its scripts is refused for
+/// the fee: the replacement check runs before scripts, as in Core.
+fn underpaying_bad_script_replacement_reports_the_fee(life: &mut Life) {
+    let wscript = ScriptBuf::from_bytes(vec![0x51]);
+    let c = life
+        .chain
+        .fund_paying(100_000, ScriptBuf::new_p2wsh(&wscript.wscript_hash()));
+    let mut paid = spend_tx(c, 50_000);
+    paid.input[0].witness = Witness::from_slice(&[wscript.as_bytes()]);
+    life.accept(&paid).expect("the first spend");
+    // The witness script does not hash to the program, so scripts fail.
+    let mut bad = spend_tx(c, 99_000);
+    bad.input[0].witness = Witness::from_slice(&[[0x00u8].as_slice()]);
+    let err = life.accept(&bad).unwrap_err();
+    assert!(matches!(err, AcceptError::RbfInsufficient), "{err}");
+    assert!(life.live(&paid));
 }
 
 /// Pure RBFR: fee 1,500 loses BIP125's absolute fee to the 2,000 parent and
@@ -909,6 +948,7 @@ fn mempool_accept_life() {
     orphan_parks_then_promotes(&mut life);
     invalid_or_spent_parent_does_not_park(&mut life);
     let (rbf_coin, rbf_winner) = full_rbf_and_staged_commit(&mut life);
+    underpaying_bad_script_replacement_reports_the_fee(&mut life);
     replacements_unpin_and_leave_the_cluster_count(&mut life);
     cluster_vsize_cap(&mut life);
     let (cpfp_coin, [cp, cc]) = packages_accept_and_roll_back(&mut life);

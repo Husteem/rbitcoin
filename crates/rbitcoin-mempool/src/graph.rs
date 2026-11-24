@@ -818,6 +818,34 @@ impl TxGraph {
         (seen.len(), weight)
     }
 
+    /// Whether `txids` touch more than `limit` distinct clusters. Each
+    /// cluster is walked once, and the walk stops at cluster `limit + 1`.
+    pub fn clusters_exceed(&self, txids: &[Txid], limit: usize) -> bool {
+        let mut seen = BTreeSet::new();
+        let mut clusters = 0usize;
+        for t in txids {
+            if !self.entries.contains_key(t) || !seen.insert(*t) {
+                continue;
+            }
+            clusters += 1;
+            if clusters > limit {
+                return true;
+            }
+            let mut q = VecDeque::from([*t]);
+            while let Some(cur) = q.pop_front() {
+                let Some(e) = self.entries.get(&cur) else {
+                    continue;
+                };
+                for n in e.parents.iter().chain(e.children.iter()) {
+                    if seen.insert(*n) {
+                        q.push_back(*n);
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Connected component containing `txid` (undirected parent/child).
     fn component_members(&self, txid: &Txid) -> Option<(BTreeSet<Txid>, u64)> {
         if !self.entries.contains_key(txid) {

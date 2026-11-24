@@ -64,7 +64,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [057](./057-block-getdata-budget.md) | medium | Block serving stops when the send budget is over | fixed | `getdata_over_send_budget_waits_for_writer` |
 | [058](./058-tx-inv-batch.md) | medium | Mempool announcements batch into one inv | fixed | `tx_inv_over_one_thousand_is_two_messages` |
 | [059](./059-rate-window-boundary.md) | low | Rate window keeps the previous second | fixed | `rate_limiter_boundary_does_not_grant_a_second_budget` |
-| [060](./060-evict-newest-netgroup.md) | high | Evict the newest inbound in the largest netgroup | fixed | `eviction_drops_the_newest_in_the_largest_netgroup` |
+| [060](./060-evict-newest-netgroup.md) | high | Evict the newest inbound in the largest netgroup | fixed | `half_the_rest_is_kept_by_uptime` |
 | [061](./061-misbehavior-remembered.md) | high | Misbehavior disconnect is remembered in memory | fixed | `misbehavior_disconnect_refuses_the_same_address` |
 | [062](./062-ibd-requested-progress.md) | high | Only a requested block moves the IBD stall clock | fixed | `unsolicited_block_does_not_refresh_progress` |
 | [063](./063-rest-own-queue.md) | high | REST is off unless --rest is set | fixed | `rest_is_404_without_the_flag` |
@@ -83,7 +83,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [076](./076-bip68-genesis-median.md) | low | Height 0 is a genesis coin for BIP68 | fixed | `bip68_height_zero_time_lock_uses_the_median` |
 | [077](./077-empty-median.md) | low | Empty median time is an error | fixed | `empty_median_time_is_an_error` |
 | [078](./078-version-nonce.md) | low | Version nonce comes from the CSPRNG | fixed | `rand_nonce_changes` |
-| [079](./079-recent-reject-cap.md) | low | Recent-reject set stops at 4096 | fixed | `recent_reject_at_the_cap_does_not_clear` |
+| [079](./079-recent-reject-cap.md) | low | Recent-reject set stops at 4096 | fixed | `recent_rejects_roll_instead_of_refusing` |
 | [080](./080-tor-control-password.md) | low | Tor control password rejects a line break | fixed | `tor_control_password_rejects_a_line_break` |
 | [081](./081-conf-error-line.md) | low | Conf errors name the file and line | fixed | `conf_error_names_the_file_and_line` |
 | [082](./082-invalid-hash-cap.md) | low | Invalid-hash set stops at 4096 | fixed | `invalid_hash_set_stops_at_the_cap` |

@@ -15,7 +15,7 @@ use rbitcoin_store::StoreError;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -92,12 +92,22 @@ pub const DEFAULT_MAX_SCRIPTHASH_SUBS: usize = 10_000;
 pub const DEFAULT_MAX_SP_SUBS: usize = 16;
 /// Silent-payment history scans the process runs at once, across every
 /// connection. The per-connection cap alone leaves connections x addresses.
-/// A subscribe past this is refused until a scan ends. Not a knob.
+/// A subscribe on a connection running fewer than
+/// [`MAX_SP_SCANS_PER_CONN`] scans is refused past this until a scan ends;
+/// one at that cap waits for its connection's next slot. Not a knob.
 pub const DEFAULT_MAX_SP_SCANS: usize = 32;
+/// History scans one connection runs at once, as many as the scans' shared
+/// store-read turns ([`crate::silent_scan::SP_SCAN_PERMITS`]). Its other
+/// subscribes wait and take the slot a finished scan of the connection
+/// hands on, so a few connections cannot hold every slot of
+/// [`DEFAULT_MAX_SP_SCANS`].
+pub const MAX_SP_SCANS_PER_CONN: usize = crate::silent_scan::SP_SCAN_PERMITS;
 /// Idle read timeout — disconnect quiet clients (DoS of FD/tasks).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Max raw tx hex chars for `transaction.broadcast` (~4 MiB wire → 8 MiB hex).
 pub const DEFAULT_MAX_BROADCAST_HEX: usize = 8_388_608;
+const RAW_TX_NOT_FOUND: &str =
+    "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.";
 
 /// Shared application DoS bounds for internet-facing query surfaces.
 ///
@@ -486,9 +496,15 @@ pub struct ElectrumConn {
     pub outpoint_subs: HashSet<([u8; 32], u32)>,
     /// Silent-payment subscriptions whose history has been sent.
     sp_subs: Vec<SpLive>,
-    /// History scans of subscribes that have not reached the tip. An address
-    /// is in one of the two lists, once.
+    /// History scans of subscribes that have not reached the tip, at most
+    /// [`MAX_SP_SCANS_PER_CONN`]. An address is in one of the three lists,
+    /// once.
     sp_scans: Vec<SpScanRun>,
+    /// Subscribes accepted past [`MAX_SP_SCANS_PER_CONN`], scanned in turn
+    /// with the slots this connection's scans hand on.
+    sp_waiting: std::collections::VecDeque<crate::silent_scan::SpSub>,
+    /// Slots of scans that ended, for the next waiting subscribe.
+    sp_spare: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl ElectrumConn {
@@ -502,6 +518,8 @@ impl ElectrumConn {
             outpoint_subs: HashSet::new(),
             sp_subs: Vec::new(),
             sp_scans: Vec::new(),
+            sp_waiting: std::collections::VecDeque::new(),
+            sp_spare: Vec::new(),
         }
     }
 }
@@ -540,6 +558,7 @@ where
     let mut read_deadline: Option<tokio::time::Instant> = None;
 
     loop {
+        start_waiting_sp_scans(&mut conn, &query, &params, config.sp_scan_chunk);
         let read_by =
             *read_deadline.get_or_insert_with(|| tokio::time::Instant::now() + writer.idle());
         let stop_wait = stop.notified();
@@ -812,7 +831,8 @@ pub use rbitcoin_net::MIN_BLOCKING_POOL;
 
 /// Read-only batch items one connection may have in flight for a blocking
 /// pool of `blocking_pool` threads: half of it, at least one. Each item holds
-/// a thread while it runs and its reply until written. Block decode, compact
+/// a thread while it runs, and its reply until written within
+/// [`BATCH_HELD_BYTES`]. Block decode, compact
 /// reconstruct, header jobs and mempool accept share that pool
 /// (`docs/concurrency.md`), so one batch leaves them the other half.
 pub fn batch_window(blocking_pool: usize) -> usize {
@@ -828,6 +848,9 @@ pub enum BatchStep {
     Write(usize),
     /// Item and the wall time it reports to the API log and the meter.
     Timed(usize, Duration),
+    /// Item whose finished reply was dropped past
+    /// [`BATCH_HELD_BYTES`]; it runs again at its slot.
+    Again(usize),
 }
 
 #[cfg(debug_assertions)]
@@ -973,6 +996,8 @@ fn batch_item(item: &Value) -> BatchItem {
 struct BatchOut<'w, W> {
     writer: &'w mut ConnWrite<W>,
     opened: bool,
+    /// Bytes of the replies finished and not yet written.
+    held: Arc<AtomicUsize>,
 }
 
 impl<W: AsyncWrite + Unpin> BatchOut<'_, W> {
@@ -1009,16 +1034,81 @@ type Dispatched = (
 struct InFlight {
     index: usize,
     asked: Asked,
+    task: JoinHandle<Result<Landing, tokio::task::JoinError>>,
+}
+
+/// Bytes of finished batch replies one connection holds unwritten. A read
+/// that finishes past it drops its reply and runs again at its slot.
+pub const BATCH_HELD_BYTES: usize = 1 << 20;
+
+/// A finished batch read, waiting for its slot.
+enum Landing {
+    /// The reply, held until written, and the bytes it counts in
+    /// [`BatchOut::held`].
+    Ready(Box<Dispatched>, usize),
+    /// The reply would have held more than [`BATCH_HELD_BYTES`] beside the
+    /// others, so it was dropped. The join cache the read hands back stays.
+    Again(Option<Arc<ShJoinSlot>>),
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static BATCH_HELD_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The most reply bytes a batch held finished and unwritten on this
+/// thread since the last call. Debug builds only.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn take_batch_held_peak() -> usize {
+    BATCH_HELD_PEAK.with(|p| p.replace(0))
+}
+
+/// About how many bytes `v` encodes to.
+fn json_len(v: &Value) -> usize {
+    match v {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 8,
+        Value::String(s) => s.len() + 2,
+        Value::Array(a) => a.iter().map(json_len).sum::<usize>() + a.len() + 2,
+        Value::Object(o) => {
+            o.iter()
+                .map(|(k, v)| k.len() + 4 + json_len(v))
+                .sum::<usize>()
+                + 2
+        }
+    }
+}
+
+/// Count a finished read's reply in `held` until its slot is written. A
+/// reply that would take `held` past [`BATCH_HELD_BYTES`] while others are
+/// held is dropped, so a client that stops reading holds at most that, or
+/// one reply.
+fn hold_reply(
     task: JoinHandle<Dispatched>,
+    held: Arc<AtomicUsize>,
+) -> JoinHandle<Result<Landing, tokio::task::JoinError>> {
+    tokio::spawn(async move {
+        let done = task.await?;
+        let size = done.0.as_ref().map_or(0, json_len);
+        let now = held.fetch_add(size, Ordering::SeqCst) + size;
+        if now > BATCH_HELD_BYTES && now > size {
+            held.fetch_sub(size, Ordering::SeqCst);
+            return Ok(Landing::Again(done.1.sh_join));
+        }
+        #[cfg(debug_assertions)]
+        BATCH_HELD_PEAK.with(|p| p.set(p.get().max(now)));
+        Ok(Landing::Ready(Box::new(done), size))
+    })
 }
 
 /// JSON-RPC 2.0 batch, one array line on the wire, slots in request order.
 /// Read-only items run up to [`ElectrumConfig::batch_window`] at once; slot
 /// `i` is written before read `i + window` starts, so a client that
-/// stops reading stops the work and the connection holds at most that many
-/// unwritten replies. Any other item waits until every earlier slot is
-/// written, then runs alone, so later items see what it did. A batch of
-/// only notifications writes nothing.
+/// stops reading stops the work. The finished replies it holds unwritten
+/// stay within [`BATCH_HELD_BYTES`], or one reply: a read that finishes
+/// past that drops its reply and runs again at its slot. Any other item
+/// waits until every earlier slot is written, then runs alone, so later
+/// items see what it did. A batch of only notifications writes nothing.
 async fn answer_batch<W: AsyncWrite + Unpin>(
     ctx: &RequestCtx<'_>,
     conn: &mut ElectrumConn,
@@ -1039,6 +1129,7 @@ async fn answer_batch<W: AsyncWrite + Unpin>(
     let mut out = BatchOut {
         writer,
         opened: false,
+        held: Arc::new(AtomicUsize::new(0)),
     };
     let limit = ctx.config.batch_window.max(1);
     let mut window: VecDeque<InFlight> = VecDeque::with_capacity(limit);
@@ -1052,7 +1143,10 @@ async fn answer_batch<W: AsyncWrite + Unpin>(
                     }
                 }
                 batch_mark(BatchStep::Spawn(index));
-                let task = spawn_dispatch(ctx, read_conn(conn, &asked.method), &asked);
+                let task = hold_reply(
+                    spawn_dispatch(ctx, read_conn(conn, &asked.method), &asked),
+                    Arc::clone(&out.held),
+                );
                 window.push_back(InFlight { index, asked, task });
                 continue;
             }
@@ -1104,6 +1198,8 @@ fn read_conn(conn: &mut ElectrumConn, method: &str) -> ElectrumConn {
         outpoint_subs: HashSet::new(),
         sp_subs: Vec::new(),
         sp_scans: Vec::new(),
+        sp_waiting: std::collections::VecDeque::new(),
+        sp_spare: Vec::new(),
     }
 }
 
@@ -1118,7 +1214,22 @@ async fn land<W: AsyncWrite + Unpin>(
     out: &mut BatchOut<'_, W>,
     flight: InFlight,
 ) -> Result<(), std::io::Error> {
-    let (result, work, stamped, ran) = flight.task.await.map_err(std::io::Error::other)?;
+    let landing = flight
+        .task
+        .await
+        .map_err(std::io::Error::other)?
+        .map_err(std::io::Error::other)?;
+    let ((result, work, stamped, ran), size) = match landing {
+        Landing::Ready(done, size) => (*done, size),
+        Landing::Again(join) => {
+            if join.is_some() {
+                conn.sh_join = join;
+            }
+            batch_mark(BatchStep::Again(flight.index));
+            let task = spawn_dispatch(ctx, read_conn(conn, &flight.asked.method), &flight.asked);
+            (task.await.map_err(std::io::Error::other)?, 0)
+        }
+    };
     if work.sh_join.is_some() {
         conn.sh_join = work.sh_join;
     }
@@ -1132,7 +1243,9 @@ async fn land<W: AsyncWrite + Unpin>(
         stamped,
         Took::Ran(ran),
     );
-    out.slot(flight.index, answer).await
+    out.slot(flight.index, answer).await?;
+    out.held.fetch_sub(size, Ordering::SeqCst);
+    Ok(())
 }
 
 /// The wall time a reply reports. A single request counts from when it was
@@ -1303,6 +1416,8 @@ async fn answer_one(
         outpoint_subs: std::mem::take(&mut conn.outpoint_subs),
         sp_subs: std::mem::take(&mut conn.sp_subs),
         sp_scans: std::mem::take(&mut conn.sp_scans),
+        sp_waiting: std::mem::take(&mut conn.sp_waiting),
+        sp_spare: std::mem::take(&mut conn.sp_spare),
     };
     let (result, work, stamped, _ran) = spawn_dispatch(ctx, work, &asked)
         .await
@@ -1372,7 +1487,8 @@ fn finish_reply(
                 wall_ms,
                 Some(&e),
             );
-            json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}})
+            let code = if e == RAW_TX_NOT_FOUND { 2 } else { 1 };
+            json!({"jsonrpc":"2.0","id": id, "error": {"code": code, "message": e}})
         }
     }
 }
@@ -1397,7 +1513,6 @@ where
     W: AsyncWrite + Unpin,
 {
     let max_subs = config.max_sp_subs;
-    let tip = query.tip_height().map(|h| h.0);
     let mut sub = match parse_sp_sub(params_v, query, chain).await {
         Ok(s) => s,
         Err(e) => {
@@ -1414,7 +1529,7 @@ where
         // An open subscription stays open. Two ranges keep the later end.
         sub.end = sub.end.zip(end).map(|(new, held)| new.max(held));
     }
-    let held = conn.sp_subs.len() + conn.sp_scans.len();
+    let held = conn.sp_subs.len() + conn.sp_scans.len() + conn.sp_waiting.len();
     if held_range.is_none() && held >= max_subs {
         let message = format!("subscription limit reached ({max_subs}) for this connection");
         writer
@@ -1439,15 +1554,17 @@ where
         return Ok(());
     }
     // One slot per running scan, process-wide. A scan this subscribe
-    // replaces hands its slot on.
+    // replaces hands its slot on. Past `MAX_SP_SCANS_PER_CONN` running here,
+    // the subscribe waits for one of them to hand its slot on.
     let replaced = conn
         .sp_scans
         .iter()
         .position(|run| run.sub.address == sub.address)
         .map(|i| conn.sp_scans.remove(i));
     let slot = match replaced {
-        Some(run) => run.slot,
-        None => {
+        Some(run) => Some(run.slot),
+        None if conn.sp_scans.len() >= MAX_SP_SCANS_PER_CONN => None,
+        None => Some({
             match Arc::clone(&config.sp_scan_slots).try_acquire_owned() {
                 Ok(slot) => slot,
                 Err(_) => {
@@ -1458,7 +1575,7 @@ where
                     return Ok(());
                 }
             }
-        }
+        }),
     };
     let result = crate::silent_scan::subscribe_result(&sub);
     rbitcoin_log::api_call(
@@ -1470,19 +1587,56 @@ where
         None,
     );
     writer.line(rpc_result(&id, &result, None)).await?;
-    let last = sub.end.unwrap_or(tip.unwrap_or(sub.start).max(sub.start));
+    // A waiting address subscribed again keeps its turn.
+    let turn = conn
+        .sp_waiting
+        .iter()
+        .position(|w| w.address == sub.address)
+        .unwrap_or(conn.sp_waiting.len());
     drop_sp_address(conn, &sub.address);
-    let from = sub.start;
-    conn.sp_scans.push(SpScanRun::start(
-        query,
-        chain,
-        sub,
-        from,
-        last,
-        config.sp_scan_chunk,
-        slot,
-    ));
+    match slot {
+        Some(slot) => start_sp_scan(conn, query, chain, sub, config.sp_scan_chunk, slot),
+        None => conn.sp_waiting.insert(turn.min(conn.sp_waiting.len()), sub),
+    }
     Ok(())
+}
+
+/// Scan `sub` from its start to its end, or to the tip, in `slot`.
+fn start_sp_scan(
+    conn: &mut ElectrumConn,
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+    sub: crate::silent_scan::SpSub,
+    chunk: u32,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) {
+    // A closed range ends at the tip when a reorg lowered it since the
+    // subscribe, as a running scan's does.
+    let tip = query.tip_height().map_or(sub.start, |h| h.0).max(sub.start);
+    let last = sub.end.map_or(tip, |end| end.min(tip)).max(sub.start);
+    let from = sub.start;
+    conn.sp_scans
+        .push(SpScanRun::start(query, chain, sub, from, last, chunk, slot));
+}
+
+/// Hand the slots of scans that ended to this connection's waiting
+/// subscribes, oldest first, and give back the rest.
+fn start_waiting_sp_scans(
+    conn: &mut ElectrumConn,
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+    chunk: u32,
+) {
+    while conn.sp_scans.len() < MAX_SP_SCANS_PER_CONN {
+        let Some(slot) = conn.sp_spare.pop() else {
+            break;
+        };
+        let Some(sub) = conn.sp_waiting.pop_front() else {
+            break;
+        };
+        start_sp_scan(conn, query, chain, sub, chunk, slot);
+    }
+    conn.sp_spare.clear();
 }
 
 /// The start, and the end of a closed range, of the connection's
@@ -1491,14 +1645,21 @@ fn sp_held_range(conn: &ElectrumConn, address: &str) -> Option<(u32, Option<u32>
     let live = conn.sp_subs.iter().map(|live| &live.sub);
     let scanning = conn.sp_scans.iter().map(|run| &run.sub);
     live.chain(scanning)
+        .chain(conn.sp_waiting.iter())
         .find(|sub| sub.address == address)
         .map(|sub| (sub.start, sub.end))
 }
 
-/// End the subscription to `address`, live or still scanning.
+/// End the subscription to `address`, live, scanning or waiting. A scan's
+/// slot is kept for this connection's next waiting subscribe.
 fn drop_sp_address(conn: &mut ElectrumConn, address: &str) {
     conn.sp_subs.retain(|live| live.sub.address != address);
-    conn.sp_scans.retain(|run| run.sub.address != address);
+    conn.sp_waiting.retain(|sub| sub.address != address);
+    let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut conn.sp_scans)
+        .into_iter()
+        .partition(|run| run.sub.address == address);
+    conn.sp_scans = kept;
+    conn.sp_spare.extend(gone.into_iter().map(|run| run.slot));
 }
 
 /// Parse against the confirmed chain: its tip, and its header times for a
@@ -3216,7 +3377,7 @@ fn dispatch_method(
                     }
                 }
             }
-            Err("tx not found".into())
+            Err(RAW_TX_NOT_FOUND.into())
         }
         "blockchain.transaction.get_merkle" => {
             let txid = param_txid(params, 0)?;

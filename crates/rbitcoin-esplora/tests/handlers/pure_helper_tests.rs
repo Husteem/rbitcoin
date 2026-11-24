@@ -145,6 +145,29 @@ fn outspend_json_spent_includes_vin() {
     let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
     keys.sort();
     assert_eq!(keys, ["spent", "status", "txid", "vin"], "{v}");
+    // A tx's outspends resolve its txid once, not once per output.
+    #[cfg(debug_assertions)]
+    {
+        let _ = q.store().sample_reset_tip_txid_lookups();
+        let mut body = Vec::new();
+        rbitcoin_esplora::handlers::write_outspends(
+            &mut body,
+            &q,
+            None,
+            &[0xcb; 32],
+            30,
+            Some(&view),
+        )
+        .unwrap();
+        let slots: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(slots.len(), 30);
+        assert_eq!(slots[0]["spent"], true);
+        assert_eq!(
+            q.store().sample_reset_tip_txid_lookups(),
+            1,
+            "one txid lookup for every output"
+        );
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 

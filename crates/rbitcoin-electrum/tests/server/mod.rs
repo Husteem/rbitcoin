@@ -1004,6 +1004,166 @@ fn at(trace: &[BatchStep], step: BatchStep) -> usize {
         .unwrap_or_else(|| panic!("{step:?} missing from {trace:?}"))
 }
 
+/// A connection over a 64 KiB duplex to a store holding one transaction
+/// whose output script is `script` bytes, batched `window` reads at a time.
+/// Returns the client, the store dir, the transaction's id hex, and the
+/// tip sender, which keeps the connection open.
+#[cfg(debug_assertions)]
+fn big_tx_conn(
+    script: usize,
+    window: usize,
+) -> (
+    BufReader<tokio::io::DuplexStream>,
+    rbitcoin_query::testutil::TempDir,
+    String,
+    broadcast::Sender<TipNotify>,
+) {
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let (dir, q) = tmp_store();
+    let mut hash = [0u8; 32];
+    hash[0] = 0x46;
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: hash,
+        hash,
+        size: 0,
+        weight: 0,
+    };
+    let mut txid = [0u8; 32];
+    txid[31] = 0xbb;
+    let ta = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: [0u8; 32],
+            parent: rbitcoin_store::InputParent::Coinbase,
+            sequence: u32::MAX,
+            script_sig: vec![0],
+            witness: vec![],
+        }],
+        outputs: vec![OutputRecord::unspent(1, vec![0x6a; script])],
+    };
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    let params = ChainParams::regtest();
+    let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    cfg.batch_window = window;
+    let (tip_tx, tip_rx) = broadcast::channel(4);
+    let (client, server) = tokio::io::duplex(1 << 16);
+    tokio::spawn(handle_client(
+        server,
+        "127.0.0.1:9".parse().unwrap(),
+        Arc::new(q),
+        Arc::new(cfg),
+        Arc::new(params),
+        tip_rx,
+        None,
+        ElectrumStop::new(false),
+    ));
+    let mut shown = txid;
+    shown.reverse();
+    (
+        BufReader::new(client),
+        dir,
+        rbitcoin_primitives::hex_encode(shown),
+        tip_tx,
+    )
+}
+
+/// `n` `transaction.get` items for `txid_hex` as one batch line.
+fn tx_get_batch(txid_hex: &str, n: usize) -> String {
+    let items: Vec<Value> = (0..n)
+        .map(|id| json!({"jsonrpc":"2.0","id":id,"method":"blockchain.transaction.get","params":[txid_hex]}))
+        .collect();
+    let mut line = serde_json::to_string(&items).unwrap();
+    line.push('\n');
+    line
+}
+
+/// A batch whose client stops reading holds a bounded amount of finished
+/// replies. Four `transaction.get` reads of a transaction whose hex is
+/// larger than `BATCH_HELD_BYTES` run in a window of four while the client
+/// reads nothing: one reply is held, the others run again at their slots,
+/// and every slot still arrives, in order.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn stalled_batch_holds_bounded_reply_bytes() {
+    let (mut client, dir, txid_hex, _tip_tx) = big_tx_conn(600_000, 4);
+    let line = tx_get_batch(&txid_hex, 4);
+    let _ = take_batch_held_peak();
+    batch_trace_arm();
+    client.get_mut().write_all(line.as_bytes()).await.unwrap();
+    // Read nothing while the reads finish: the first slot's write stalls.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut reply = String::new();
+    tokio::time::timeout(Duration::from_secs(10), client.read_line(&mut reply))
+        .await
+        .expect("the batch reply")
+        .unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    let ids: Vec<Value> = reply
+        .as_array()
+        .expect("one array")
+        .iter()
+        .map(|v| v["id"].clone())
+        .collect();
+    assert_eq!(ids, [json!(0), json!(1), json!(2), json!(3)]);
+    for slot in reply.as_array().unwrap() {
+        assert!(
+            slot["result"]
+                .as_str()
+                .is_some_and(|hex| hex.len() > BATCH_HELD_BYTES),
+            "each slot is the transaction"
+        );
+    }
+    let one = reply[0]["result"].as_str().unwrap().len() + 2;
+    let peak = take_batch_held_peak();
+    assert_eq!(peak, one, "one reply held at a time");
+    // The first reply to finish is held alone, so at most three run again.
+    let trace = batch_trace_snapshot();
+    let again = trace
+        .iter()
+        .filter(|s| matches!(s, BatchStep::Again(_)))
+        .count();
+    assert!((1..=3).contains(&again), "{trace:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Held reply bytes go down as slots are written: eight ~300 KB replies in a
+/// window of three, read as they come, never hold past `BATCH_HELD_BYTES`,
+/// so no read runs again.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn read_batch_releases_held_bytes_as_slots_are_written() {
+    let (mut client, dir, txid_hex, _tip_tx) = big_tx_conn(150_000, 3);
+    let line = tx_get_batch(&txid_hex, 8);
+    batch_trace_arm();
+    client.get_mut().write_all(line.as_bytes()).await.unwrap();
+    let mut reply = String::new();
+    tokio::time::timeout(Duration::from_secs(10), client.read_line(&mut reply))
+        .await
+        .expect("the batch reply")
+        .unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply.as_array().map(Vec::len), Some(8));
+    let trace = batch_trace_snapshot();
+    assert!(
+        !trace.iter().any(|s| matches!(s, BatchStep::Again(_))),
+        "three replies fit, so none ran again: {trace:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn batch_window_is_half_the_blocking_pool() {
     assert_eq!(batch_window(1), 1);
@@ -3358,6 +3518,106 @@ async fn sp_scan_stops_when_the_session_drops_it() {
     );
 }
 
+/// One connection runs at most `MAX_SP_SCANS_PER_CONN` history scans; its
+/// other subscribes are accepted and wait for one of its slots. Two stalled
+/// clients with five and three addresses fit in six slots, where the first
+/// alone used to take five.
+#[tokio::test]
+async fn sp_scans_per_connection_leave_slots_for_others() {
+    let chain = sp_chain_paying_every_height("el-sp-per-conn", 15);
+    let cfg = sp_cfg_slots(6);
+    let mut one = sp_session_with(&chain.q, cfg.clone(), SP_STALL_BUF);
+    let lines: Vec<String> = (0..5u8)
+        .map(|w| sp_subscribe_line(u32::from(w) + 1, chain.sub_for(w, json!(0))))
+        .collect();
+    for reply in one.ask(&lines).await {
+        sp_accepted(&reply);
+    }
+    let mut two = sp_session_with(&chain.q, cfg, SP_STALL_BUF);
+    let lines: Vec<String> = (5..8u8)
+        .map(|w| sp_subscribe_line(u32::from(w) + 1, chain.sub_for(w, json!(0))))
+        .collect();
+    for reply in two.ask(&lines).await {
+        sp_accepted(&reply);
+    }
+}
+
+/// Subscribes that wait for a slot are scanned when the connection's
+/// earlier scans finish: five addresses on one reading client each get a
+/// whole history. Wallet 0, the one the chain pays, subscribes last, so its
+/// scan waits, and its history still holds every paid height.
+#[tokio::test]
+async fn sp_waiting_subscribes_scan_in_turn() {
+    let chain = sp_chain_paying_every_height("el-sp-turns", 15);
+    let mut s = sp_session_with(&chain.q, sp_cfg_slots(32), 1 << 16);
+    let lines: Vec<String> = [1u8, 2, 3, 4, 0]
+        .iter()
+        .enumerate()
+        .map(|(i, w)| sp_subscribe_line(i as u32 + 1, chain.sub_for(*w, json!(0))))
+        .collect();
+    let replies = s.ask(&lines).await;
+    let paid_sub = replies[4]["result"].clone();
+    let mut open: Vec<Value> = replies
+        .iter()
+        .map(|r| {
+            sp_accepted(r);
+            r["result"].clone()
+        })
+        .collect();
+    let mut paid = Vec::new();
+    while !open.is_empty() {
+        let note = sp_next_line(&mut s.client).await;
+        let params = note["params"].as_array().expect("positional note");
+        let history = params[2].as_array().expect("history");
+        if params[0] == paid_sub {
+            paid.extend(history.iter().cloned());
+        } else {
+            assert!(history.is_empty(), "only wallet 0 is paid: {note}");
+        }
+        if params[1].as_f64() == Some(1.0) {
+            open.retain(|sub| sub != &params[0]);
+        }
+    }
+    assert_eq!(sp_heights(&paid), (0..=15).collect::<Vec<u64>>());
+}
+
+/// A waiting subscribe is a subscription: subscribing its address again
+/// keeps the earlier start, and unsubscribing it means it is never scanned.
+#[tokio::test]
+async fn sp_waiting_subscribe_keeps_its_start_and_can_be_dropped() {
+    let chain = sp_chain_paying_every_height("el-sp-wait-edit", 15);
+    let mut s = sp_session_with(&chain.q, sp_cfg_slots(32), 1 << 16);
+    let mut lines: Vec<String> = (0..5u8)
+        .map(|w| sp_subscribe_line(u32::from(w) + 1, chain.sub_for(w, json!(0))))
+        .collect();
+    // Wallets 3 and 4 wait. Wallet 3 again with a later start; wallet 4 gone.
+    lines.push(sp_subscribe_line(6, chain.sub_for(3, json!(5))));
+    lines.push(sp_unsubscribe_line(7, chain.sub_for(4, json!(0))));
+    let replies = s.ask(&lines).await;
+    assert_eq!(
+        replies[5]["result"]["start_height"], 0,
+        "the waiting subscription keeps its start: {}",
+        replies[5]
+    );
+    let dropped = replies[4]["result"].clone();
+    let mut open: Vec<Value> = replies[..4].iter().map(|r| r["result"].clone()).collect();
+    while !open.is_empty() {
+        let note = sp_next_line(&mut s.client).await;
+        let params = note["params"].as_array().expect("positional note");
+        assert_ne!(
+            params[0], dropped,
+            "an unsubscribed waiting address scanned"
+        );
+        if params[1].as_f64() == Some(1.0) {
+            open.retain(|sub| sub != &params[0]);
+        }
+    }
+    // Wallet 4 has no payments: its only note would be its last.
+    let mut line = String::new();
+    let late = tokio::time::timeout(Duration::from_secs(3), s.client.read_line(&mut line)).await;
+    assert!(late.is_err(), "a note after the histories: {line}");
+}
+
 /// History scans are capped across connections. A subscribe past the cap is
 /// refused in its reply. Subscribing again hands a scan's slot on, and a
 /// scan that reaches the tip frees its slot.
@@ -4540,4 +4800,30 @@ async fn panicked_electrum_disconnect_logs_at_warn() {
         .collect();
     rbitcoin_log::capture_logs(false);
     assert_eq!(levels, [Level::Debug, Level::Debug, Level::Warn]);
+}
+
+#[tokio::test]
+async fn transaction_get_unknown_txid_reports_core_not_found() {
+    let (dir, q) = tmp_store();
+    let q = Arc::new(q);
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let (handle, mut stream) = electrum_tcp_client(&q, cfg, None).await;
+    let missing = "2222222222222222222222222222222222222222222222222222222222222222";
+    let reply = electrum_tcp_rpc(
+        &mut stream,
+        1,
+        "blockchain.transaction.get",
+        json!([missing, true]),
+    )
+    .await;
+    assert_eq!(reply["jsonrpc"], "2.0");
+    assert_eq!(reply["id"], 1);
+    assert_eq!(reply["error"]["code"], 2);
+    assert_eq!(
+        reply["error"]["message"],
+        "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
+    );
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

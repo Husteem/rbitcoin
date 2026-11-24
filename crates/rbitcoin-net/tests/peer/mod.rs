@@ -4305,8 +4305,8 @@ fn inv_of_a_pooled_tx_that_is_also_parked_is_not_requested() {
         addr,
         addr,
         &ver,
-        true,
-        rbitcoin_net::peers::PeerConnType::Inbound,
+        false,
+        rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
     );
     let (out_tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
@@ -4416,8 +4416,8 @@ fn recent_reject_is_not_requested_from_other_peers() {
                 addr,
                 addr,
                 &ver,
-                true,
-                rbitcoin_net::peers::PeerConnType::Inbound,
+                false,
+                rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
             )
         };
         let sender = register(18444, 1);
@@ -4910,6 +4910,52 @@ fn bloom_disabled_messages_request_disconnect() {
         assert!(
             follow.ban_score >= BAN_SCORE_THRESHOLD,
             "bloom-off message must punish-disconnect (ban={})",
+            follow.ban_score
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An `addr`, `addrv2`, locator, `cfheaders` or `getblocktxn` frame that
+/// claims more items than its bytes can hold is refused before the decoder
+/// sizes a vector from that count, and scores like any oversize frame.
+#[test]
+fn short_counted_frames_disconnect_before_decode() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("short-counted");
+    hub.ensure_genesis().unwrap();
+    let (out_tx, _out_rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // 0xfe 0x00 0x09 0x3d 0x00 is a compact-size of 4_000_000.
+    let huge = [0xfe, 0x00, 0x09, 0x3d, 0x00];
+    for (command, prefix) in [
+        (*b"addr\0\0\0\0\0\0\0\0", 0),
+        (*b"addrv2\0\0\0\0\0\0", 0),
+        (*b"getheaders\0\0", 4),
+        (*b"getblocks\0\0\0", 4),
+        (*b"cfheaders\0\0\0", 65),
+        (*b"getblocktxn\0", 32),
+    ] {
+        let mut payload = vec![0u8; prefix];
+        payload.extend_from_slice(&huge);
+        payload.extend_from_slice(&[0u8; 64]);
+        let frame = FramedMessage {
+            magic: Magic::from(Network::Regtest),
+            command,
+            payload,
+        };
+        follow.ban_score = 0;
+        let r = rt.block_on(handle_peer_frame(frame, &hub, &out_tx, &mut follow, None));
+        assert!(
+            matches!(r, Err(NetError::MessageTooLarge(4_000_000))),
+            "{command:?}: got {r:?}"
+        );
+        assert!(
+            follow.ban_score >= BAN_SCORE_THRESHOLD,
+            "{command:?}: ban={}",
             follow.ban_score
         );
     }
@@ -6016,6 +6062,56 @@ async fn v2_version_counts_the_length_the_peer_sent() {
         wait_bytes_recv(&t.node, sess.id, "version", want).await;
     }
 
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// Made-up long-form commands all count under one `*other*` key, so a peer
+/// cannot grow `bytesrecv_per_msg` with fresh names (Core
+/// `ALL_NET_MESSAGE_TYPES`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_commands_share_one_other_key() {
+    let mut t = paused_serve("made-up-cmds", 0, &["/rbitcoin:test(madeup)/"]).await;
+    let (raw, sess) = &mut t.clients[0];
+    let id = sess.id;
+    let first_ping = loop {
+        if let NetworkMessage::Ping(n) = next_peer_msg(raw).await.unwrap() {
+            break n;
+        }
+    };
+    write_peer_msg(raw, NetworkMessage::Pong(first_ping)).await;
+    let names: [&[u8; 12]; 3] = [b"madeup000001", b"madeup000002", b"madeup000003"];
+    for name in names {
+        // Long encoding: 0, 12-byte command, then a 2-byte payload.
+        let mut contents = vec![0u8];
+        contents.extend_from_slice(name);
+        contents.extend_from_slice(&[7, 7]);
+        raw.write_contents(&contents).await.unwrap();
+    }
+    write_peer_msg(raw, NetworkMessage::Ping(9)).await;
+    let pong = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let NetworkMessage::Pong(n) = next_peer_msg(raw).await.unwrap() {
+                return n;
+            }
+        }
+    })
+    .await
+    .expect("session stays up after made-up commands");
+    assert_eq!(pong, 9);
+    let snap = t.node.peers.snapshot();
+    let row = snap.iter().find(|p| p.id == id).expect("peer row");
+    for name in ["madeup000001", "madeup000002", "madeup000003"] {
+        assert!(
+            !row.bytesrecv_per_msg.contains_key(name),
+            "{name} got its own key: {:?}",
+            row.bytesrecv_per_msg.keys().collect::<Vec<_>>()
+        );
+    }
+    assert_eq!(
+        row.bytesrecv_per_msg.get("*other*").copied(),
+        Some(3 * (13 + 2 + 20))
+    );
     t.node.shutdown().await;
     let _ = std::fs::remove_dir_all(&t.dir);
 }
@@ -7535,6 +7631,33 @@ fn inbound_peer(
     )
 }
 
+/// A preferred tx-download peer (outbound full relay): its tx invs are
+/// asked at once, with no `NONPREF_PEER_TX_DELAY`.
+fn preferred_peer(
+    peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
+    port: u16,
+) -> std::sync::Arc<rbitcoin_net::peers::LivePeer> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: bitcoin::p2p::ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: u64::from(port),
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    peers.register(
+        addr,
+        addr,
+        &ver,
+        false,
+        rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
+    )
+}
+
 #[test]
 fn inbound_netgroup_is_fixed_at_accept() {
     let peers = rbitcoin_net::peers::PeerHub::new();
@@ -7989,8 +8112,10 @@ fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
         !peers.inbound_discouraged(same, ORDINARY_BIND),
         "the netgroup wait is ten minutes"
     );
-    peers.set_mock_now(now);
+    // At the cap a new entry evicts the one that expires first (the oldest),
+    // so a flood cannot switch the pause off (Core's rolling filter).
     for i in 0..rbitcoin_net::peers::PeerHub::DISCOURAGE_CAP {
+        peers.set_mock_now(if i == 0 { now - 1 } else { now });
         let a = (i / 256) as u8;
         let b = (i % 256) as u8;
         let slot = std::net::SocketAddr::from(([a, b, 1, 1], 1));
@@ -7999,33 +8124,66 @@ fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
     let overflow = std::net::SocketAddr::from(([255, 255, 1, 1], 1));
     peers.note_slot_evict(rbitcoin_net::eviction::eviction_netgroup(overflow));
     assert!(
-        !peers.inbound_discouraged(overflow, ORDINARY_BIND),
-        "a new netgroup past the cap is not stored"
+        peers.inbound_discouraged(overflow, ORDINARY_BIND),
+        "a new netgroup past the cap is stored"
+    );
+    let oldest = std::net::SocketAddr::from(([0, 0, 1, 1], 1));
+    assert!(
+        !peers.inbound_discouraged(oldest, ORDINARY_BIND),
+        "the oldest netgroup rolls out"
     );
     peers.set_mock_now(now + 100);
-    let refreshed = std::net::SocketAddr::from(([0, 0, 1, 1], 1));
+    let refreshed = std::net::SocketAddr::from(([0, 1, 1, 1], 1));
     peers.note_slot_evict(rbitcoin_net::eviction::eviction_netgroup(refreshed));
     peers.set_mock_now(now + 600);
     assert!(
         peers.inbound_discouraged(refreshed, ORDINARY_BIND),
         "a netgroup already stored is refreshed at the cap"
     );
-    peers.set_mock_now(now);
     for i in 0..rbitcoin_net::peers::PeerHub::DISCOURAGE_CAP {
+        peers.set_mock_now(if i == 0 { now - 1 } else { now });
         let ip = std::net::Ipv4Addr::from(i as u32);
         peers.note_misbehavior_addr(std::net::IpAddr::V4(ip));
     }
     let extra = std::net::SocketAddr::from(([255, 255, 255, 254], 1));
     peers.note_misbehavior_addr(extra.ip());
     assert!(
-        !peers.inbound_discouraged(extra, ORDINARY_BIND),
-        "past the cap the set does not grow"
+        peers.inbound_discouraged(extra, ORDINARY_BIND),
+        "past the cap a new address is still discouraged"
     );
     let first = std::net::SocketAddr::from((std::net::Ipv4Addr::from(0u32), 1));
     assert!(
-        peers.inbound_discouraged(first, ORDINARY_BIND),
-        "rows already stored stay until they expire"
+        !peers.inbound_discouraged(first, ORDINARY_BIND),
+        "the oldest address rolls out"
     );
+    let second = std::net::SocketAddr::from((std::net::Ipv4Addr::from(1u32), 1));
+    assert!(
+        peers.inbound_discouraged(second, ORDINARY_BIND),
+        "the rest stay until they expire"
+    );
+}
+
+/// The rate-strike map rolls too: at the cap a new address still records
+/// its strike, so its second rate-limit disconnect escalates, and the
+/// oldest strike rolls out.
+#[test]
+fn rate_strikes_roll_at_the_cap() {
+    use rbitcoin_net::peers::{DiscourageKey, PeerHub};
+    let peers = PeerHub::new();
+    let now = 1_800_000_000;
+    let key = |i: u32| DiscourageKey::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::from(i)));
+    for i in 0..PeerHub::DISCOURAGE_CAP as u32 {
+        peers.set_mock_now(if i == 0 { now - 1 } else { now });
+        assert!(!peers.note_rate_strike(key(i)));
+    }
+    let new = key(u32::MAX);
+    assert!(!peers.note_rate_strike(new), "the first strike is recorded");
+    assert!(peers.note_rate_strike(new), "the second strike escalates");
+    assert!(
+        !peers.note_rate_strike(key(0)),
+        "the oldest strike rolled out"
+    );
+    assert!(peers.note_rate_strike(key(2)), "the rest stay");
 }
 
 /// A full inbound table evicts one peer and pauses that netgroup. The pause
@@ -8066,6 +8224,54 @@ fn slot_evict_does_not_block_an_outbound_dial() {
     );
 }
 
+/// An inbound peer's tx inv is not asked at once (Core
+/// `NONPREF_PEER_TX_DELAY`). The heartbeat sweep asks it once the delay has
+/// passed, so inbound announcements are still fetched.
+#[tokio::test]
+async fn inbound_tx_inv_is_asked_after_the_nonpref_delay() {
+    use bitcoin::hashes::Hash;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("inbound-tx-delay");
+    hub.ensure_genesis().unwrap();
+    let t = hub.tip_header().unwrap().time;
+    hub.clock.set_mock(i64::from(t) + 1);
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
+            .unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(10_000);
+    let peer = inbound_peer(&peers);
+    peer.set_wtxid_relay();
+    let (out_tx, mut rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let wtxid = bitcoin::Wtxid::from_byte_array([0x5a; 32]);
+    let getdata = |rx: &mut PeerOutRx| {
+        let mut want = Vec::new();
+        while let Ok(out) = rx.try_recv() {
+            if let NetworkMessage::GetData(v) = out.expect_msg() {
+                want.extend(v);
+            }
+        }
+        want
+    };
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[Inventory::WTx(wtxid)],
+    )
+    .unwrap();
+    rbitcoin_net::peer::queue_due_parent_getdata(&hub, &peer, &out_tx);
+    assert!(getdata(&mut rx).is_empty(), "an inbound announcer waits");
+    peers.set_mock_now(10_000 + rbitcoin_net::tx_relay::NONPREF_PEER_TX_DELAY_SECS);
+    rbitcoin_net::peer::queue_due_parent_getdata(&hub, &peer, &out_tx);
+    assert_eq!(getdata(&mut rx), vec![Inventory::WTx(wtxid)]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn inv_getdata_charges_send_budget() {
     use bitcoin::hashes::Hash;
@@ -8082,7 +8288,7 @@ async fn inv_getdata_charges_send_budget() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
-    let peer = inbound_peer(&peers);
+    let peer = preferred_peer(&peers, 2);
     let (out_tx, _rx) = peer.open_out();
     let mut follow = PeerFollowState::new();
     let tx = Inventory::WitnessTransaction(Txid::from_byte_array([0x42; 32]));
@@ -8194,8 +8400,10 @@ async fn notfound_makes_the_waiting_wtxid_peer_due() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
-    let peer1 = inbound_peer(&peers);
-    let peer2 = inbound_peer(&peers);
+    // A fixed clock: `noted` and the note read the same second.
+    peers.set_mock_now(1_000_000);
+    let peer1 = preferred_peer(&peers, 2);
+    let peer2 = preferred_peer(&peers, 3);
     let wtxid = bitcoin::Wtxid::from_byte_array([0xef; 32]);
     let inv = [Inventory::WTx(wtxid)];
     let noted = peer1.clock_now();
@@ -8243,9 +8451,11 @@ async fn notfound_for_txid_inventory_wakes_the_waiter() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
+    // A fixed clock: `noted` and the note read the same second.
+    peers.set_mock_now(1_000_000);
     for (n, witness) in [(0xab_u8, false), (0xcd, true)] {
-        let peer1 = inbound_peer(&peers);
-        let peer2 = inbound_peer(&peers);
+        let peer1 = preferred_peer(&peers, 2);
+        let peer2 = preferred_peer(&peers, 3);
         let txid = bitcoin::Txid::from_byte_array([n; 32]);
         let item = if witness {
             Inventory::WitnessTransaction(txid)
@@ -8298,8 +8508,8 @@ async fn second_wtxid_inv_waits_while_first_request_is_inflight() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
-    let peer1 = inbound_peer(&peers);
-    let peer2 = inbound_peer(&peers);
+    let peer1 = preferred_peer(&peers, 2);
+    let peer2 = preferred_peer(&peers, 3);
     let wtxid = bitcoin::Wtxid::from_byte_array([0xee; 32]);
     let inv = [Inventory::WTx(wtxid)];
     let noted = peer1.clock_now();
@@ -8353,7 +8563,7 @@ async fn other_peers_rows_do_not_skip_a_fresh_announcement() {
     assert!(hub.attach_mempool(mp).is_ok());
     let mp = hub.mempool().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
-    let peer = inbound_peer(&peers);
+    let peer = preferred_peer(&peers, 2);
     let keep = [0x42; 32];
     assert_eq!(
         mp.note_inv_tx_requested(peer.id, keep, true, 1_000, false),
@@ -10412,6 +10622,89 @@ fn headers_poll_expires_a_stale_tx_off_the_tokio_worker() {
     assert!(!mp.contains(&tid));
 }
 
+/// Compact-filter requests read the store on the blocking pool, not on the
+/// session's `tokio-rt-worker` (`assert_not_reactor` panics there), and the
+/// replies still go out.
+#[test]
+fn compact_filter_requests_read_the_store_off_the_reactor() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cfilter-off-reactor");
+    hub.query.set_block_filter_index(true).unwrap();
+    hub.ensure_genesis().unwrap();
+    let heights = hub.query.index_heights(0, 0, None).unwrap();
+    let window = hub.query.read_index_window(&heights).unwrap();
+    let filter = hub.query.basic_filter_from_window(&window, 0).unwrap();
+    hub.query
+        .commit_window_filters(0, &[(filter, heights[0].header_fk)])
+        .unwrap();
+    let hub = hub.into_arc();
+    let genesis = hub.tip_hash().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        tokio::spawn(async move {
+            let (out_tx, mut out_rx) = peer_out_channel();
+            let mut follow = PeerFollowState::new();
+            for msg in [
+                NetworkMessage::GetCFHeaders(bitcoin::p2p::message_filter::GetCFHeaders {
+                    filter_type: 0,
+                    start_height: 0,
+                    stop_hash: genesis,
+                }),
+                NetworkMessage::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
+                    filter_type: 0,
+                    start_height: 0,
+                    stop_hash: genesis,
+                }),
+                NetworkMessage::GetCFCheckpt(bitcoin::p2p::message_filter::GetCFCheckpt {
+                    filter_type: 0,
+                    stop_hash: genesis,
+                }),
+            ] {
+                handle_peer_frame(frame_for(msg), &hub, &out_tx, &mut follow, None)
+                    .await
+                    .expect("filter request");
+            }
+            let mut got = Vec::new();
+            while let Ok(out) = out_rx.try_recv() {
+                got.push(out.expect_msg());
+            }
+            assert!(
+                matches!(
+                    got.as_slice(),
+                    [
+                        NetworkMessage::CFHeaders(_),
+                        NetworkMessage::CFilter(_),
+                        NetworkMessage::CFCheckpt(_)
+                    ]
+                ),
+                "{got:?}"
+            );
+        })
+        .await
+        .expect("reactor task")
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// [`on_compact_filters`] on a one-off runtime. A stack hub runs the
+/// filter read inline.
+fn serve_filters(
+    hub: &ChainHub,
+    tx: &PeerOutTx,
+    session: Option<&rbitcoin_net::peers::LivePeer>,
+    msg: NetworkMessage,
+) -> Result<(), NetError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(on_compact_filters(msg, hub, tx, session))
+}
+
 #[test]
 fn compact_filter_ranges_past_core_limits_disconnect() {
     assert!(compact_filter_range(5, 4, MAX_GETCFILTERS).is_err());
@@ -10440,7 +10733,13 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
         start_height: 0,
         stop_hash: tip,
     };
-    on_getcfheaders(&hub, &tx, &headers).unwrap();
+    serve_filters(
+        &hub,
+        &tx,
+        None,
+        NetworkMessage::GetCFHeaders(headers.clone()),
+    )
+    .unwrap();
     match rx.try_recv().expect("cfheaders").into_out() {
         rbitcoin_net::peers::PeerOut::Msg(NetworkMessage::CFHeaders(m)) => {
             assert_eq!(m.previous_filter_header.as_byte_array(), &[0u8; 32]);
@@ -10453,7 +10752,7 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
         start_height: 0,
         stop_hash: tip,
     };
-    on_getcfilters(&hub, &tx, None, &typed).unwrap();
+    serve_filters(&hub, &tx, None, NetworkMessage::GetCFilters(typed.clone())).unwrap();
     assert!(rx.try_recv().is_err(), "a non-basic filter is silence");
     hub.query.set_block_filter_index(false).unwrap();
     let basic = bitcoin::p2p::message_filter::GetCFilters {
@@ -10461,7 +10760,7 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
         start_height: 0,
         stop_hash: tip,
     };
-    on_getcfilters(&hub, &tx, None, &basic).unwrap();
+    serve_filters(&hub, &tx, None, NetworkMessage::GetCFilters(basic.clone())).unwrap();
     assert!(rx.try_recv().is_err(), "filters off is silence");
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -10518,7 +10817,13 @@ fn getcfilters_stops_after_the_filter_that_crosses_the_send_budget() {
         start_height: 0,
         stop_hash: hub.tip_hash().unwrap(),
     };
-    on_getcfilters(&hub, &tx, Some(peer.as_ref()), &req).unwrap();
+    serve_filters(
+        &hub,
+        &tx,
+        Some(peer.as_ref()),
+        NetworkMessage::GetCFilters(req.clone()),
+    )
+    .unwrap();
     assert!(peer.send_over_budget());
     let mut n = 0usize;
     while let Ok(msg) = rx.try_recv().map(Queued::into_out) {
@@ -10547,7 +10852,7 @@ fn getcfcheckpt_returns_a_header_every_thousand_heights() {
         filter_type: 0,
         stop_hash: hub.tip_hash().unwrap(),
     };
-    on_getcfcheckpt(&hub, &tx, &below).unwrap();
+    serve_filters(&hub, &tx, None, NetworkMessage::GetCFCheckpt(below.clone())).unwrap();
     match rx.try_recv().expect("cfcheckpt below 1000").into_out() {
         PeerOut::Msg(NetworkMessage::CFCheckpt(m)) => {
             assert!(
@@ -10570,7 +10875,7 @@ fn getcfcheckpt_returns_a_header_every_thousand_heights() {
         filter_type: 0,
         stop_hash: hub.tip_hash().unwrap(),
     };
-    on_getcfcheckpt(&hub, &tx, &req).unwrap();
+    serve_filters(&hub, &tx, None, NetworkMessage::GetCFCheckpt(req.clone())).unwrap();
     match rx.try_recv().expect("cfcheckpt").into_out() {
         PeerOut::Msg(NetworkMessage::CFCheckpt(m)) => {
             assert_eq!(m.filter_headers, vec![rows[0].1]);
@@ -12404,7 +12709,7 @@ mod peer_session_pins {
             false,
             PeerConnType::OutboundFullRelay,
         );
-        mp.note_inv_tx_requested(other.id, [1; 32], false, 5_000, false);
+        mp.note_inv_tx_requested(other.id, [1; 32], true, 5_000, false);
         let parent = bitcoin::Txid::from_byte_array([9; 32]);
         use bitcoin::absolute::LockTime;
         use bitcoin::transaction::Version as TxVersion;

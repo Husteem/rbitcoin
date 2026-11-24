@@ -2,7 +2,7 @@ use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-use rbitcoin_mempool::accept::{MapUtxoProvider, PrepareOpts};
+use rbitcoin_mempool::accept::{MapUtxoProvider, PrepareOpts, SiblingEviction};
 use rbitcoin_mempool::{
     ActiveMempool, ChainTipCtx, Coin, PoolSequence, Removal, RemovalReason, RemovedRow,
     REMOVED_ROWS,
@@ -483,6 +483,7 @@ fn a_failed_replacement_keeps_its_row_until_the_victim_is_back() {
                 report_orphans: false,
                 min_relay: Some(0),
                 waive: false,
+                sibling_eviction: SiblingEviction::Off,
             },
         )
         .expect("bump prepares");

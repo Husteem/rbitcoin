@@ -639,7 +639,10 @@ async fn hostile_addr_relay(
         };
         assert_eq!(sent, &list);
         let nbytes = serialize(&got).len();
-        let want = sending_addrv2_log(nbytes, batched_id.expect("neighbor id"));
+        let want = format!(
+            "p2p: {}",
+            sending_addrv2_log(nbytes, batched_id.expect("neighbor id"))
+        );
         assert!(
             lines.iter().any(|(_, l)| l == &want),
             "missing {want:?} in {lines:?}"
@@ -1609,4 +1612,45 @@ async fn cap_already_stored_tip_frees_no_slot() {
         .count();
     assert_eq!(dropped, 0, "an already-stored last header frees no slot");
     assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+}
+
+/// An empty `headers` answers our getheaders without a header job, so with
+/// every ctrl-decode permit held it still finishes.
+#[test]
+fn empty_headers_takes_no_header_permit() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("empty-headers");
+    let hub = rbitcoin_net::ChainHub::into_arc(hub);
+    hub.ensure_genesis().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+    let peer = peers.register(
+        bind,
+        bind,
+        &hostile_ver(bind),
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let (out_tx, _out_rx) = peer.open_out();
+    let mut follow = PeerFollowState::new();
+    peer.note_awaiting_headers();
+    let sem = Arc::clone(rbitcoin_net::msg_decode::ctrl_decode_semaphore());
+    let all = u32::try_from(rbitcoin_net::msg_decode::ctrl_decode_permits()).unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("headers runtime")
+        .block_on(async {
+            let held = sem
+                .acquire_many_owned(all)
+                .await
+                .expect("hold every permit");
+            let headers = on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[]);
+            tokio::time::timeout(Duration::from_secs(10), headers)
+                .await
+                .expect("an empty headers takes no header permit")
+                .expect("empty headers");
+            drop(held);
+        });
+    assert!(!peer.is_awaiting_headers());
+    let _ = std::fs::remove_dir_all(dir);
 }

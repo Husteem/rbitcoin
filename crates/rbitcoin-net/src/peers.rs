@@ -638,6 +638,9 @@ pub struct LivePeer {
     pub tcp_shutdown: Mutex<Option<std::net::TcpStream>>,
     /// VERSION+VERACK finished. Connecting rows stay false (`p2p_timeouts`).
     pub handshake_complete: AtomicBool,
+    /// The VERSION offered every service this node wanted for its tip then
+    /// (Core `m_has_all_wanted_services`). Inbound eviction reads it.
+    pub wanted_services: AtomicBool,
     /// BIP324 transport finished. False while EARLY_KEY_RESPONSE / garbage.
     pub v2_transport_ready: AtomicBool,
     /// Block hashes this session already asked other high-bandwidth peers to send.
@@ -758,24 +761,21 @@ impl LivePeer {
         self.held_front_queued.store(true, Ordering::Release);
     }
 
+    /// A command outside Core's `ALL_NET_MESSAGE_TYPES` counts as `*other*`, so a peer
+    /// that sends made-up names adds one key, not one per name.
     pub fn note_recv(&self, cmd: &str, nbytes: u64) {
-        let n = acct_bytes(cmd, nbytes);
-        *self
-            .recv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(cmd.into())
-            .or_insert(0) += n;
+        self.note_recv_raw(recv_msg_type(cmd), acct_bytes(cmd, nbytes));
     }
 
     /// Store an already-computed wire size (v2 `*other*` = contents + expansion).
-    pub fn note_recv_raw(&self, cmd: &str, nbytes: u64) {
-        *self
-            .recv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(cmd.into())
-            .or_insert(0) += nbytes;
+    pub fn note_recv_raw(&self, cmd: &'static str, nbytes: u64) {
+        let mut recv = self.recv.lock().unwrap_or_else(|e| e.into_inner());
+        match recv.get_mut(cmd) {
+            Some(total) => *total += nbytes,
+            None => {
+                recv.insert(cmd.to_owned(), nbytes);
+            }
+        }
     }
 
     /// The session writer calls this once per v1 frame it wrote: payload
@@ -793,7 +793,7 @@ impl LivePeer {
     /// The session reader calls this once per v2 frame it read, with the
     /// length of the decrypted contents.
     pub fn note_recv_v2(&self, cmd: &str, contents_len: usize) {
-        self.note_recv_raw(cmd, crate::v2::v2_msg_bytes(contents_len));
+        self.note_recv_raw(recv_msg_type(cmd), crate::v2::v2_msg_bytes(contents_len));
     }
 
     /// A command already in the map takes no allocation.
@@ -827,6 +827,11 @@ impl LivePeer {
 
     pub fn mark_handshake_complete(&self) {
         self.handshake_complete.store(true, Ordering::Release);
+    }
+
+    /// Record whether the VERSION offered every wanted service.
+    pub fn set_wanted_services(&self, wanted: bool) {
+        self.wanted_services.store(wanted, Ordering::Relaxed);
     }
 
     pub fn handshake_complete(&self) -> bool {
@@ -1967,6 +1972,76 @@ pub fn rand_ping_nonce() -> u64 {
         | 1
 }
 
+/// Core `ALL_NET_MESSAGE_TYPES` (protocol.h): the `bytesrecv_per_msg` keys.
+/// Anything else, `reject` and `alert` included, is `*other*`.
+const RECV_MSG_TYPES: &[&str] = &[
+    "version",
+    "verack",
+    "addr",
+    "addrv2",
+    "sendaddrv2",
+    "inv",
+    "getdata",
+    "merkleblock",
+    "getblocks",
+    "getheaders",
+    "tx",
+    "headers",
+    "block",
+    "getaddr",
+    "mempool",
+    "ping",
+    "pong",
+    "notfound",
+    "filterload",
+    "filteradd",
+    "filterclear",
+    "sendheaders",
+    "feefilter",
+    "sendcmpct",
+    "cmpctblock",
+    "getblocktxn",
+    "blocktxn",
+    "getcfilters",
+    "cfilter",
+    "getcfheaders",
+    "cfheaders",
+    "getcfcheckpt",
+    "cfcheckpt",
+    "wtxidrelay",
+    "sendtxrcncl",
+];
+
+fn recv_msg_type(cmd: &str) -> &'static str {
+    RECV_MSG_TYPES
+        .iter()
+        .copied()
+        .find(|&t| t == cmd)
+        .unwrap_or("*other*")
+}
+
+/// Insert or refresh `key` until `until`. A new key at `cap` first drops
+/// expired entries, then the entry that expires soonest; one map has one
+/// TTL, so that is the oldest. Core's rolling filters evict the same way
+/// instead of refusing, so a flood of new keys cannot switch the map off.
+fn insert_rolling<K: std::hash::Hash + Eq + Copy>(
+    map: &mut HashMap<K, u64>,
+    key: K,
+    until: u64,
+    now: u64,
+    cap: usize,
+) {
+    if !map.contains_key(&key) && map.len() >= cap {
+        map.retain(|_, t| *t > now);
+        if map.len() >= cap {
+            if let Some(oldest) = map.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
+                map.remove(&oldest);
+            }
+        }
+    }
+    map.insert(key, until);
+}
+
 /// Count at least Core's 24-byte header; `pong` must be ≥29 for `connect_nodes`.
 #[doc(hidden)]
 pub fn acct_bytes(cmd: &str, payload: u64) -> u64 {
@@ -2220,6 +2295,9 @@ pub struct PeerHub {
     pub discouraged_addrs: Mutex<HashMap<DiscourageKey, u64>>,
     /// Netgroup → unix second a slot-loss refusal ends.
     pub discouraged_groups: Mutex<HashMap<u64, u64>>,
+    /// This process's secret SipHash key for keyed netgroups (Core
+    /// `nKeyedNetGroup`): inbound eviction orders peers by it.
+    pub netgroup_key: std::hash::RandomState,
     /// Rate-limit disconnect key → unix second its strike ends.
     pub rate_strikes: Mutex<HashMap<DiscourageKey, u64>>,
     /// This node's version messages include `NODE_COMPACT_FILTERS`.
@@ -2471,6 +2549,7 @@ impl PeerHub {
             overlay_loopback_forward: AtomicBool::new(false),
             discouraged_addrs: Mutex::new(HashMap::new()),
             discouraged_groups: Mutex::new(HashMap::new()),
+            netgroup_key: std::hash::RandomState::new(),
             rate_strikes: Mutex::new(HashMap::new()),
             compact_filters: AtomicBool::new(false),
             incomplete_inbound: Mutex::new(HashMap::new()),
@@ -3331,7 +3410,8 @@ impl PeerHub {
     /// Shorter than [`Self::DISCOURAGE_TTL_SECS`]. A netgroup that just lost
     /// an inbound slot cannot refill it immediately.
     pub const NETGROUP_SLOT_WAIT_SECS: u64 = 10 * 60;
-    /// The in-memory set does not grow past this many addresses.
+    /// The in-memory set does not grow past this many addresses. A new one at
+    /// the cap evicts the entry that expires first.
     pub const DISCOURAGE_CAP: usize = 10_000;
     /// A rate-limit strike counts toward the next one for this long.
     pub const RATE_STRIKE_SECS: u64 = 60 * 60;
@@ -3349,7 +3429,7 @@ impl PeerHub {
     }
 
     /// Record `ip` until [`Self::DISCOURAGE_TTL_SECS`] from now. At the cap a
-    /// new address is ignored; an address already stored is refreshed.
+    /// new address evicts the oldest; an address already stored is refreshed.
     #[cfg(debug_assertions)]
     pub fn note_misbehavior_addr(&self, ip: IpAddr) {
         self.note_misbehavior_key(DiscourageKey::Ip(ip));
@@ -3362,16 +3442,13 @@ impl PeerHub {
             .discouraged_addrs
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !g.contains_key(&key) && g.len() >= Self::DISCOURAGE_CAP {
-            return;
-        }
-        g.insert(key, until);
+        insert_rolling(&mut g, key, until, now, Self::DISCOURAGE_CAP);
     }
 
     /// True when `ip` still has a strike from an earlier rate-limit
     /// disconnect; that strike is spent. Otherwise records one for
     /// [`Self::RATE_STRIKE_SECS`]. Expired strikes are dropped here. At
-    /// [`Self::DISCOURAGE_CAP`] a new address is not recorded.
+    /// [`Self::DISCOURAGE_CAP`] a new address evicts the oldest strike.
     pub fn note_rate_strike(&self, key: DiscourageKey) -> bool {
         let now = self.now_secs();
         let mut g = self.rate_strikes.lock().unwrap_or_else(|e| e.into_inner());
@@ -3379,26 +3456,21 @@ impl PeerHub {
         if g.remove(&key).is_some() {
             return true;
         }
-        if g.len() < Self::DISCOURAGE_CAP {
-            g.insert(key, now.saturating_add(Self::RATE_STRIKE_SECS));
-        }
+        let until = now.saturating_add(Self::RATE_STRIKE_SECS);
+        insert_rolling(&mut g, key, until, now, Self::DISCOURAGE_CAP);
         false
     }
 
     /// The netgroup that just lost an inbound slot waits
     /// [`Self::NETGROUP_SLOT_WAIT_SECS`].
     pub fn note_slot_evict(&self, group: u64) {
-        let until = self
-            .now_secs()
-            .saturating_add(Self::NETGROUP_SLOT_WAIT_SECS);
+        let now = self.now_secs();
+        let until = now.saturating_add(Self::NETGROUP_SLOT_WAIT_SECS);
         let mut g = self
             .discouraged_groups
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !g.contains_key(&group) && g.len() >= Self::DISCOURAGE_CAP {
-            return;
-        }
-        g.insert(group, until);
+        insert_rolling(&mut g, group, until, now, Self::DISCOURAGE_CAP);
     }
 
     /// Misbehavior key for this net. A slot-eviction netgroup stays inbound-only.
@@ -3756,6 +3828,7 @@ impl PeerHub {
             writer_abort: Mutex::new(None),
             tcp_shutdown: Mutex::new(None),
             handshake_complete: AtomicBool::new(false),
+            wanted_services: AtomicBool::new(false),
             v2_transport_ready: AtomicBool::new(false),
             hb_body_fanned: Mutex::new(HashSet::new()),
             v1_transport: AtomicBool::new(false),
@@ -4657,7 +4730,9 @@ impl PeerHub {
     }
 
     fn evict_inbound_from(&self, eligible: impl Fn(&LivePeer) -> bool, why: &str) -> bool {
+        use std::hash::BuildHasher;
         let now = self.now_secs();
+        let onion_bind = self.onion_bind();
         let cands: Vec<crate::eviction::InboundEvictCandidate> = self
             .live_peers()
             .into_iter()
@@ -4670,8 +4745,12 @@ impl PeerHub {
                     min_ping: minping,
                     last_block: p.last_block.load(Ordering::Relaxed),
                     last_tx: p.last_transaction.load(Ordering::Relaxed),
-                    netgroup: p.netgroup,
+                    netgroup: self.netgroup_key.hash_one(p.netgroup),
                     noban: p.session_noban(),
+                    relay_txs: p.relay,
+                    relevant_services: p.wanted_services.load(Ordering::Relaxed),
+                    is_local: crate::eviction::is_local_addr(&p.net),
+                    network: crate::eviction::evict_net(&p.net, p.addrbind, onion_bind),
                 }
             })
             .collect();

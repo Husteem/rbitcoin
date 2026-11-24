@@ -925,8 +925,8 @@ async fn pin_esplora_tx_status(
     let miss = "ff".repeat(32);
     let (st, _) = http_get(esplora_addr, &format!("/tx/{miss}/hex")).await;
     assert_eq!(st, 404);
-    let (st, _) = http_get(esplora_addr, &format!("/tx/{miss}/status")).await;
-    assert_eq!(st, 404);
+    let (st, body) = http_get(esplora_addr, &format!("/tx/{miss}/status")).await;
+    assert_eq!((st, body.as_str()), (200, r#"{"confirmed":false}"#));
     let (st, _) = http_get(esplora_addr, &format!("/tx/{miss}")).await;
     assert_eq!(st, 404);
 }

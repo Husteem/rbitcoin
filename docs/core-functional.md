@@ -227,7 +227,7 @@ P2P port another process holds fails startup with Core's
 parent and its child are admitted together only when the child spends the
 parent's 0-value anchor (#1407). Core does this for any low-fee parent, and
 ignores a re-announced parent that failed only on fee.
-`p2p_eviction.py` is skip (`core-net-policy`): the 21-peer set in that script is fully protected, including a share of the longest-connected peers, so the extra inbound is rejected. Core accepts it and evicts one slow peer.
+`p2p_eviction.py` is skip (`core-net-policy`). The skip was recorded when protection kept 8 longest-connected peers, which covered that script's 21-peer set and rejected its extra inbound. Selection now follows Core's `SelectNodeToEvict` (half of the rest by uptime); the script has not been run against it.
 `feature_filelock.py` is skip (`harness`): the node exclusive-locks `{datadir}`
 (unit + shim InitError tests). Core `-wallet` SQLite flock and `-blocksdir`
 `blocks/.lock` are not product. `rpc_orphans.py` is `run`: hidden

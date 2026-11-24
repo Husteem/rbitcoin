@@ -3225,6 +3225,18 @@ impl Query {
         self.store.spenders_at(out_txid, out_index, tip)
     }
 
+    /// [`Self::spenders_at`] for a create the caller already resolved.
+    pub fn spenders_at_fk(
+        &self,
+        out_txid: &[u8; 32],
+        create_fk: Fk,
+        out_index: u32,
+        tip: Option<u32>,
+    ) -> Result<Vec<PointRecord>, QueryError> {
+        self.store
+            .spenders_at_fk(out_txid, create_fk, out_index, tip)
+    }
+
     pub fn spenders_raw(
         &self,
         out_txid: &[u8; 32],

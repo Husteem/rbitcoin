@@ -589,7 +589,7 @@ pub fn spawn_inbound_accept(
                         )
                         .await;
                         drop(incomplete);
-                        let (_ver, reader, writer, tcp_shutdown, sess) = match handshake {
+                        let (ver, reader, writer, tcp_shutdown, sess) = match handshake {
                             Ok(x) => x,
                             Err(e) => {
                                 rbitcoin_log::debug!(
@@ -600,6 +600,10 @@ pub fn spawn_inbound_accept(
                             }
                         };
                         sess.attach_tcp_shutdown(tcp_shutdown);
+                        sess.set_wanted_services(crate::peer::has_all_desirable_service_flags(
+                            ver.services,
+                            crate::peer::approximate_best_block_depth(&hub),
+                        ));
                         if !peers.make_room_for_tx_relay_inbound(&sess, max_inbound) {
                             rbitcoin_log::debug!(P2p,
                                 "failed to find a tx-relaying eviction candidate - connection dropped after the handshake, peer={}",

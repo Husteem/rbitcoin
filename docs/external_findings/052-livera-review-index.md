@@ -9,7 +9,7 @@ steps.
 | C1 | critical | Unbounded parent-request tracker | fixed | `parent_req_stops_at_per_peer_cap`, `rows_are_bounded_per_live_peer`, `second_peer_take_due_does_not_drop_other_peers_keys` ([053](./053-parent-req-cap.md)) |
 | N2 | low | Wtxid follow-up requested as a txid | fixed | `wtxid_followup_is_requested_as_wtx` ([054](./054-wtxid-getdata.md)) |
 | H1 | high | Decoy and invalid-type packets skip the rate window | fixed | `decoy_packet_is_handed_to_the_rate_hook` ([055](./055-decoy-rate.md)) |
-| H2 | high | Inbound eviction drops the longest-connected peer | fixed | `eviction_drops_the_newest_in_the_largest_netgroup` ([060](./060-evict-newest-netgroup.md)) |
+| H2 | high | Inbound eviction drops the longest-connected peer | fixed | `half_the_rest_is_kept_by_uptime` ([060](./060-evict-newest-netgroup.md)) |
 | H2-ban | high | Misbehavior disconnect is not remembered | fixed | `misbehavior_disconnect_refuses_the_same_address` ([061](./061-misbehavior-remembered.md)) |
 | H3 | high | REST always on and shares the RPC work queue | fixed | `rest_is_404_without_the_flag` ([063](./063-rest-own-queue.md)) |
 | H4 | medium | Silent-payment unsubscribe logs the scan secret | fixed | `api_call_redacts_scan_secrets_and_ext_privkeys` ([064](./064-api-log-redaction.md)) |
@@ -28,7 +28,7 @@ steps.
 | L1 | low | Height-0 BIP68 time lock uses median time 0 | fixed | `bip68_height_zero_time_lock_uses_the_median` ([076](./076-bip68-genesis-median.md)) |
 | L4 | low | Empty median time panics | fixed | `empty_median_time_is_an_error` ([077](./077-empty-median.md)) |
 | L5 | low | Version nonce is not a CSPRNG | fixed | `rand_nonce_changes` ([078](./078-version-nonce.md)) |
-| L6 | low | Recent-reject set clears at the cap | fixed | `recent_reject_at_the_cap_does_not_clear` ([079](./079-recent-reject-cap.md)) |
+| L6 | low | Recent-reject set clears at the cap | fixed | `recent_rejects_roll_instead_of_refusing` ([079](./079-recent-reject-cap.md)) |
 | L8 | low | Manifest and txstat lengths allocate before a size check | fixed | `map_prefix_longer_than_file_is_corrupt`, `txstat_blob_longer_than_the_file_is_corrupt` ([070](./070-manifest-length.md)) |
 | L9 | low | Tor control password on argv | fixed | `tor_control_password_rejects_a_line_break` ([080](./080-tor-control-password.md)) |
 | L10 | low | Datadir lock follows a symlink | fixed | `lock_file_does_not_follow_a_symlink` ([071](./071-datadir-lock-symlink.md)) |

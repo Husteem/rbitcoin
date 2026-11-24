@@ -45,6 +45,36 @@ pub(crate) fn tmp() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}-{seq}"))
 }
 
+/// Core `m_lazy_recent_rejects` keeps taking inserts: a full set drops its
+/// oldest entry, not the newest reject. Junk rejects cannot switch the
+/// filter off until the next block.
+#[test]
+fn recent_rejects_roll_instead_of_refusing() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("recent-rejects-roll");
+    let hub = MempoolHub::open(dir.join("mp"), Arc::new(q)).unwrap();
+    let w = |i: u32| {
+        let mut b = [0x5au8; 32];
+        b[..4].copy_from_slice(&i.to_le_bytes());
+        Wtxid::from_byte_array(b)
+    };
+    for i in 0..5_000 {
+        hub.note_recent_reject(w(i));
+    }
+    assert!(
+        hub.try_recent_reject(&w(4_999)),
+        "the newest reject is kept"
+    );
+    assert!(hub.try_recent_reject(&w(0)));
+    let cap = rbitcoin_net::tx_relay::RECENT_REJECTS_MAX as u32;
+    for i in 5_000..cap + 1 {
+        hub.note_recent_reject(w(i));
+    }
+    assert!(!hub.try_recent_reject(&w(0)), "the oldest reject rolls out");
+    assert!(hub.try_recent_reject(&w(1)));
+    assert!(hub.try_recent_reject(&w(cap)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn fullness_decile_scales_by_ten() {
     assert_eq!(fullness_decile(0.0), 0);
@@ -240,32 +270,6 @@ fn smart_fee_target_one_is_two_until_flow_is_warm() {
     }
     let _ = std::fs::remove_dir_all(&mp_dir);
     let _ = std::fs::remove_dir_all(&store_dir);
-}
-
-#[test]
-fn recent_reject_at_the_cap_does_not_clear() {
-    let dir = tmp();
-    let mdir = tmp();
-    let q = Query::open_or_create_tiny(&dir).unwrap();
-    let hub = MempoolHub::open(&mdir, std::sync::Arc::new(q)).unwrap();
-    let first = bitcoin::Wtxid::from_byte_array({
-        let mut b = [0u8; 32];
-        b[0] = 1;
-        b
-    });
-    hub.note_recent_reject(first);
-    // 2..4097 is 4095 ids and does not collide with `first` (byte 0 == 1).
-    for i in 2..4_097u32 {
-        let mut b = [0u8; 32];
-        b[0..4].copy_from_slice(&i.to_le_bytes());
-        hub.note_recent_reject(bitcoin::Wtxid::from_byte_array(b));
-    }
-    let extra = bitcoin::Wtxid::from_byte_array([0xff; 32]);
-    hub.note_recent_reject(extra);
-    assert!(hub.try_recent_reject(&first));
-    assert!(!hub.try_recent_reject(&extra));
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&mdir);
 }
 
 #[test]
@@ -684,6 +688,27 @@ fn reorg_reaccept_then_unindex_drops_relay() {
         !hub.is_relay_servable(&w, u64::MAX),
         "unindex must drop relay maps with the live graph entry"
     );
+    let _ = std::fs::remove_dir_all(&mp);
+}
+
+/// A tx put back by `reorg_reaccept` reports the sigop-adjusted weight, not
+/// its raw weight: 100 legacy CHECKSIG ops cost 400 sigops, which is 8,000 WU
+/// at the default 20 bytes per sigop.
+#[test]
+fn reorg_reaccept_records_sigop_adjusted_weight() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let tx = spend_true(cbs[0], 10_000, ScriptBuf::from_bytes(vec![0xac; 100]));
+    let txid = tx.compute_txid();
+    let adjusted = 100 * 4 * 20;
+    assert!(
+        tx.weight().to_wu() < adjusted,
+        "raw weight must sit below the adjusted weight"
+    );
+    assert_eq!(hub.reorg_reaccept(std::slice::from_ref(&tx)), 1);
+    assert_eq!(hub.get_live_adjusted_weight(&txid), Some(adjusted));
     let _ = std::fs::remove_dir_all(&mp);
 }
 
@@ -3380,7 +3405,7 @@ fn take_due_parent_getdata_one_flush_covers_max_ancestor_package() {
         missing.insert(Txid::from_byte_array([i + 1; 32]));
     }
     let t0 = 1_000u64;
-    hub.schedule_orphan_parents(&missing, 1, true, t0);
+    hub.schedule_orphan_parents(&missing, 1, false, t0);
     let due = t0 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
     let first = hub.take_due_parent_getdata(1, due);
     assert_eq!(
@@ -3407,7 +3432,7 @@ fn take_due_parent_getdata_caps_per_flush() {
         missing.insert(Txid::from_byte_array(h));
     }
     let t0 = 1_000u64;
-    hub.schedule_orphan_parents(&missing, 1, true, t0);
+    hub.schedule_orphan_parents(&missing, 1, false, t0);
     let due = t0 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
     let first = hub.take_due_parent_getdata(1, due);
     assert_eq!(first.len(), MAX_PARENTS_PER_PARK);
@@ -3431,7 +3456,7 @@ fn parent_req_stops_at_per_peer_cap() {
     let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
     let cap = parent_req::MAX_PARENT_ANN_PER_PEER;
     for i in 0..(cap as u32 + 10) {
-        let accepted = hub.note_inv_tx_requested(7, parent_hash(i), false, 1_000, false);
+        let accepted = hub.note_inv_tx_requested(7, parent_hash(i), true, 1_000, false);
         if i < cap as u32 {
             assert_eq!(
                 accepted,
@@ -3460,7 +3485,7 @@ fn second_peer_take_due_does_not_drop_other_peers_keys() {
     let txid = Txid::from_byte_array(hash);
     let wtxid = Wtxid::from_byte_array(hash);
     assert_eq!(
-        hub.note_inv_tx_requested(1, hash, false, 1_000, false),
+        hub.note_inv_tx_requested(1, hash, true, 1_000, false),
         ParentNote::RequestNow
     );
     hub.note_recent_reject(wtxid);
@@ -3556,16 +3581,16 @@ fn wtxid_followup_is_requested_as_wtx() {
     let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
     let hash = [0xab; 32];
     assert_eq!(
-        hub.note_inv_tx_requested(1, hash, false, 1_000, true),
+        hub.note_inv_tx_requested(1, hash, true, 1_000, true),
         ParentNote::RequestNow
     );
     assert_eq!(
-        hub.note_inv_tx_requested(3, hash, false, 1_000, true),
+        hub.note_inv_tx_requested(3, hash, true, 1_000, true),
         ParentNote::Deferred,
         "the wtxid follow-up is its own row and is not a second getdata"
     );
     let missing = BTreeSet::from([Txid::from_byte_array(hash)]);
-    hub.schedule_orphan_parents(&missing, 2, false, 1_000);
+    hub.schedule_orphan_parents(&missing, 2, true, 1_000);
     let expired = 1_000 + GETDATA_TX_INTERVAL_SECS;
     assert!(hub.take_due_parent_getdata(1, expired).is_empty());
     let follow = hub.take_due_parent_getdata(3, expired);
@@ -3596,9 +3621,9 @@ fn same_peer_wtxid_inflight_expires_back_to_txid_parent() {
     let hash = [0xbc; 32];
     let missing = BTreeSet::from([Txid::from_byte_array(hash)]);
     let t0 = 1_000u64;
-    hub.schedule_orphan_parents(&missing, 2, false, t0);
+    hub.schedule_orphan_parents(&missing, 2, true, t0);
     assert_eq!(
-        hub.note_inv_tx_requested(2, hash, false, t0, true),
+        hub.note_inv_tx_requested(2, hash, true, t0, true),
         ParentNote::RequestNow,
         "the same peer's wtxid inv is a second announcement"
     );
@@ -3634,7 +3659,7 @@ fn take_due_parent_getdata_waits_inbound_txid_delay() {
         missing.insert(Txid::from_byte_array([i + 1; 32]));
     }
     let t0 = 1_000u64;
-    hub.schedule_orphan_parents(&missing, 1, true, t0);
+    hub.schedule_orphan_parents(&missing, 1, false, t0);
     assert!(
         hub.take_due_parent_getdata(1, t0 + NONPREF_PEER_TX_DELAY_SECS)
             .is_empty(),
@@ -3652,7 +3677,7 @@ fn take_due_parent_getdata_waits_inbound_txid_delay() {
         hub.take_due_parent_getdata(1, expired).is_empty(),
         "same peer is not retried after interval"
     );
-    hub.schedule_orphan_parents(&missing, 2, true, expired);
+    hub.schedule_orphan_parents(&missing, 2, false, expired);
     let other = hub.take_due_parent_getdata(
         2,
         expired + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS,
@@ -3673,14 +3698,14 @@ fn resolve_tx_request_lets_other_peer_fetch_after_reject() {
     let wtxid = Wtxid::from_byte_array(hash);
     hub.note_inv_tx_requested(1, hash, true, 1_000, false);
     let missing = BTreeSet::from([txid]);
-    hub.schedule_orphan_parents(&missing, 2, true, 1_000);
+    hub.schedule_orphan_parents(&missing, 2, false, 1_000);
     let due = 1_000 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
     assert!(
         hub.take_due_parent_getdata(2, due).is_empty(),
         "in-flight INV GETDATA must block other peer"
     );
     hub.resolve_tx_request(&txid, &wtxid, false);
-    hub.schedule_orphan_parents(&missing, 2, true, due);
+    hub.schedule_orphan_parents(&missing, 2, false, due);
     let got =
         hub.take_due_parent_getdata(2, due + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS);
     assert_eq!(got.len(), 1);
@@ -7027,6 +7052,104 @@ fn trust_peer_reorg_evict_keeps_nonfinal() {
     assert!(
         !hub.try_contains(&txid),
         "the mark does not keep a tx whose input the reorg took away"
+    );
+    let _ = std::fs::remove_dir_all(&mp);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// A BIP68-locked spend and an immature-coinbase spend from the trusted
+/// session stay through hub reorg eviction while the reorg leaves them
+/// non-final. An unmarked twin of each, valid when admitted, leaves with a
+/// `reorg` row once the lower tip makes it non-final or immature.
+#[test]
+fn trust_peer_reorg_evict_keeps_immature_and_bip68() {
+    use rbitcoin_mempool::RemovalReason;
+    let (store, q, cbs) = copy_maturity_pad(3);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    q.set_trust_peer(true);
+    let session = 11u64;
+    hub.set_trusted_session(Some(session));
+    let from_session = TxOrigin::Relay(Some(session));
+    let marked = |id: &Txid| hub.lock_read().trust_kept.contains(id);
+    let reorg_rows = || -> BTreeSet<(Txid, RemovalReason)> {
+        hub.removed_rows()
+            .rows
+            .iter()
+            .map(|r| (r.txid, r.reason))
+            .collect()
+    };
+    let relative_lock = |cb: Txid, blocks: u32| {
+        let mut tx = spend_true(cb, 1_000, ScriptBuf::from_bytes(vec![0x51]));
+        tx.input[0].sequence = Sequence::from_consensus(blocks);
+        tx
+    };
+
+    assert_eq!(q.tip_height().unwrap().0, 103);
+    let locked = relative_lock(cbs[0], 200);
+    let err = hub.admit(&locked).unwrap_err();
+    assert!(matches!(err, AcceptError::NonBip68Final), "{err}");
+    hub.admit_from(&locked, from_session)
+        .expect("a BIP68-locked spend from the trusted session");
+    let locked_id = locked.compute_txid();
+    assert!(marked(&locked_id));
+    let locked_twin = relative_lock(cbs[1], 102);
+    hub.admit(&locked_twin)
+        .expect("the lock on the twin is met at the next block");
+    let locked_twin_id = locked_twin.compute_txid();
+    assert!(!marked(&locked_twin_id));
+
+    q.disconnect_tip().unwrap();
+    hub.evict_after_reorg();
+    assert!(
+        !hub.try_contains(&locked_twin_id),
+        "an unmarked tx the lower tip leaves BIP68-locked must leave"
+    );
+    assert_eq!(
+        reorg_rows(),
+        BTreeSet::from([(locked_twin_id, RemovalReason::Reorg)])
+    );
+    assert!(
+        hub.try_contains(&locked_id),
+        "the mark keeps the BIP68-locked tx through the same sweep"
+    );
+
+    q.disconnect_tip().unwrap();
+    let young = ScriptBuf::from_bytes(vec![0x52]);
+    let immature = spend_true(cbs[2], 1_000, young.clone());
+    let err = hub.admit(&immature).unwrap_err();
+    assert!(matches!(err, AcceptError::ImmatureCoinbase), "{err}");
+    hub.admit_from(&immature, from_session)
+        .expect("an immature coinbase spend from the trusted session");
+    let immature_id = immature.compute_txid();
+    assert!(marked(&immature_id));
+    let immature_twin = spend_true(cbs[1], 1_000, young);
+    hub.admit(&immature_twin)
+        .expect("the coinbase is mature at the next block");
+    let immature_twin_id = immature_twin.compute_txid();
+    assert!(!marked(&immature_twin_id));
+
+    q.disconnect_tip().unwrap();
+    hub.evict_after_reorg();
+    assert!(
+        !hub.try_contains(&immature_twin_id),
+        "an unmarked spend the lower tip makes immature must leave"
+    );
+    assert_eq!(
+        reorg_rows(),
+        BTreeSet::from([
+            (locked_twin_id, RemovalReason::Reorg),
+            (immature_twin_id, RemovalReason::Reorg),
+        ])
+    );
+    assert!(
+        hub.try_contains(&immature_id),
+        "the mark keeps the immature coinbase spend through the sweep"
+    );
+    assert!(
+        hub.try_contains(&locked_id),
+        "the BIP68-locked tx is still held"
     );
     let _ = std::fs::remove_dir_all(&mp);
     let _ = std::fs::remove_dir_all(&store);

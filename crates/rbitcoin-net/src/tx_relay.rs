@@ -683,6 +683,60 @@ pub fn is_hard_recent_reject(e: &AcceptError) -> bool {
     )
 }
 
+/// Core `m_lazy_recent_rejects` size: rejects remembered until the next
+/// block, oldest dropped first.
+pub const RECENT_REJECTS_MAX: usize = 120_000;
+
+/// Recent rejects as keyed 64-bit digests in insert order. A full set drops
+/// its oldest entry, so new rejects are always kept (Core's rolling bloom
+/// filter). The per-process random key makes a digest collision as hard to
+/// aim as a bloom false positive.
+#[doc(hidden)]
+pub struct RecentRejects {
+    key: std::collections::hash_map::RandomState,
+    set: HashSet<u64>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl Default for RecentRejects {
+    fn default() -> Self {
+        Self {
+            key: std::collections::hash_map::RandomState::new(),
+            set: HashSet::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl RecentRejects {
+    fn digest(&self, wtxid: &Wtxid) -> u64 {
+        use std::hash::BuildHasher;
+        self.key.hash_one(wtxid.to_byte_array())
+    }
+
+    pub fn insert(&mut self, wtxid: &Wtxid) {
+        let d = self.digest(wtxid);
+        if !self.set.insert(d) {
+            return;
+        }
+        self.order.push_back(d);
+        if self.order.len() > RECENT_REJECTS_MAX {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+    }
+
+    pub fn contains(&self, wtxid: &Wtxid) -> bool {
+        self.set.contains(&self.digest(wtxid))
+    }
+
+    pub fn clear(&mut self) {
+        self.set.clear();
+        self.order.clear();
+    }
+}
+
 /// One recently accepted mempool tx (for explorer "recent" strips).
 #[derive(Clone, Debug)]
 pub struct RecentAccept {
@@ -1275,7 +1329,7 @@ pub struct MempoolHub {
     /// Recently confirmed txid/wtxid for INV AlreadyHave.
     pub recent_confirmed: Mutex<RecentConfirmed>,
     /// Core `m_lazy_recent_rejects` (wtxid). Forcerelay second-send skips ATMP.
-    pub recent_rejects: Mutex<HashSet<Wtxid>>,
+    pub recent_rejects: Mutex<RecentRejects>,
     /// Own feerates (sat/kvB) of the 64 newest confirmed entries, for the N=1 floor.
     pub confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
     /// Per-block vsize-weighted p10 hurdle, bounded by txstat body bytes.
@@ -1667,7 +1721,7 @@ impl MempoolHub {
                 MEMPOOL_RECENT_CAP,
             )),
             recent_confirmed: Mutex::new(RecentConfirmed::new()),
-            recent_rejects: Mutex::new(HashSet::new()),
+            recent_rejects: Mutex::new(RecentRejects::default()),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
             block_p10_history: Mutex::new(FeeHistory::new(
                 FEE_HISTORY_TXSTAT_BYTE_BUDGET,
@@ -3043,10 +3097,7 @@ impl MempoolHub {
         let Ok(mut g) = self.recent_rejects.lock() else {
             return;
         };
-        if g.len() >= 4_096 {
-            return;
-        }
-        g.insert(wtxid);
+        g.insert(&wtxid);
     }
 
     /// Session TX filter: never parks. Busy lock → `false` (re-ATMP).
@@ -3214,6 +3265,7 @@ impl MempoolHub {
                     report_orphans: spec.report_orphans,
                     min_relay: spec.min_relay,
                     waive: spec.waive,
+                    sibling_eviction: spec.sibling_eviction,
                 },
             )
         };
@@ -3221,9 +3273,8 @@ impl MempoolHub {
             *lock_us = lock_us.saturating_add(t_prep.elapsed().as_micros() as u64);
         }
         match prep {
-            Ok(mut p) => {
+            Ok(p) => {
                 stages.utxo_us = stages.utxo_us.saturating_add(p.utxo_us);
-                p.sibling_eviction = spec.sibling_eviction;
                 Ok(p)
             }
             Err(e) => Err(e),
@@ -5992,11 +6043,11 @@ impl MempoolHub {
         &self,
         missing: &BTreeSet<Txid>,
         peer: u64,
-        inbound: bool,
+        preferred: bool,
         now: u64,
     ) {
         let mut g = self.parent_req.lock().unwrap_or_else(|e| e.into_inner());
-        self.schedule_parents_locked(&mut g, missing, peer, inbound, now);
+        self.schedule_parents_locked(&mut g, missing, peer, preferred, now);
     }
 
     /// Another announcer of the orphan is asked only while the tracker still
@@ -6006,12 +6057,12 @@ impl MempoolHub {
         &self,
         missing: &BTreeSet<Txid>,
         peer: u64,
-        inbound: bool,
+        preferred: bool,
         now: u64,
     ) {
         let mut g = self.parent_req.lock().unwrap_or_else(|e| e.into_inner());
         if g.sessions.contains(&peer) {
-            self.schedule_parents_locked(&mut g, missing, peer, inbound, now);
+            self.schedule_parents_locked(&mut g, missing, peer, preferred, now);
         }
     }
 
@@ -6020,17 +6071,16 @@ impl MempoolHub {
         g: &mut parent_req::ParentTracker,
         missing: &BTreeSet<Txid>,
         peer: u64,
-        inbound: bool,
+        preferred: bool,
         now: u64,
     ) {
         let delay = TXID_RELAY_DELAY_SECS
-            + if inbound {
-                NONPREF_PEER_TX_DELAY_SECS
-            } else {
+            + if preferred {
                 0
+            } else {
+                NONPREF_PEER_TX_DELAY_SECS
             };
         let reqtime = now.saturating_add(delay);
-        let preferred = !inbound;
         for p in missing {
             if self.parent_already_have(p) {
                 continue;
@@ -6047,14 +6097,14 @@ impl MempoolHub {
         &self,
         peer: u64,
         hash: [u8; 32],
-        inbound: bool,
+        preferred: bool,
         now: u64,
         wtxid: bool,
     ) -> ParentNote {
         self.parent_req
             .lock()
             .unwrap()
-            .note_inv(peer, hash, inbound, now, wtxid)
+            .note_inv(peer, hash, preferred, now, wtxid)
     }
 
     pub fn forget_parent_anns_for_peer(&self, peer: u64) {

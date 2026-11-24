@@ -89,7 +89,7 @@ the same POST with `after_txid` reuse. Idle **30s**; **256** clients (evict
 idle-longest). Not an 8-script LRU and not a >5s process whale cache. Extra
 operator RAM is the kernel page cache of Class A `txout` / SH heads. Public
 explorer second-hit of a whale GET is nginx/CDN (`/api/address/` is cacheable).
-`--max-sh-creates N` (`N>0` → Esplora **503** on an unpaged join) is the fuse; default **10000**. **0** is unlimited. A short paged history request is still served; a full newest-first page or a `from_height` window reads every create and takes the cap.
+`--max-sh-creates N` (`N>0` → Esplora **503** on an unpaged join) is the fuse; default **10000**. **0** is unlimited. A height-ascending page that closes before the cap, or a newest-first page of a script with no more creates than the page limit, is still served; any other newest-first page (a deep cursor included) or a `from_height` window takes the cap.
 
 Re-measure fat keys on the operator host (`rbitcoin-bench --suite casa
 --passes 1 --warmup 1`). Do not treat agent-VM times as product numbers.
@@ -112,7 +112,7 @@ timeout (`TimeoutLayer`, status 408). `admit_connection` holds the wait.
 | Max scripthash subs / conn | 10000 (`--electrum-max-subs`) | Notify fan-out cap. A wallet subscribes every address up to its gap limit; each sub is ~170 B (≈0.45 GB worst case at 256 connections) plus one posting check per block against that block's shared touch set; a reorg restatuses every sub |
 | Max silent-payment addresses / conn | 16 (`--electrum-max-sp-subs`) | Each address scans every new block with its own key, and its subscribe scans history from its start. At most 32 history scans run in the process; a subscribe past that is refused. They share three process-wide permits, 256 heights at a time. |
 | Max broadcast hex | ~8 MiB | `transaction.broadcast` hex length |
-| Max batch items | 345 | Requests in one JSON-RPC batch line; more is one `-32600`. The reply is written one slot at a time, so a slow reader holds back the server, not RAM |
+| Max batch items | 345 | Requests in one JSON-RPC batch line; more is one `-32600`. The reply is written one slot at a time. A connection holds at most 1 MiB of finished, unwritten replies, or one reply (`BATCH_HELD_BYTES`): a read that finishes past that drops its reply and runs again at its slot, so a slow reader costs its own reads again, not RAM |
 | Batch reads at once | half the blocking pool, at least 1 (2 at 4 threads) | Read-only batch items in flight per connection (tasks and unwritten replies). Node-wide disk slots are `--store-read-budget`, not half the pool. One batch no longer keeps half the pool by occupying it. The tasks wait asynchronously when the budget is taken |
 | Heavy SH joins at once | 1 (`--heavy-sh-creates`, default 10000) | Node-wide: an unpaged Electrum/Esplora join above N creates waits for any other such join, from any connection or batch. Lighter joins stay parallel. **0** turns it off |
 
@@ -207,7 +207,7 @@ surface: [`COMPAT.md`](../../COMPAT.md).
 ```
 
 Conf: `sh_index=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
-For explorer backends, keep `--max-sh-creates` at **10000** unless the public listener must serve the first newest-first page of an address with more creates than that: such an address needs a cap above its create count, or **0**. A short page still stops at the page; a full newest-first page takes the cap. The unix `/internal/*` totals and history routes stay available above the cap to the trusted local process.
+For explorer backends, keep `--max-sh-creates` at **10000** unless the public listener must serve the first newest-first page of an address with more creates than that: such an address needs a cap above its create count, or **0**. A newest-first page of a script with more creates than the page limit takes the cap, at any cursor. The unix `/internal/*` totals and history routes stay available above the cap to the trusted local process.
 An explorer on the unix socket can read one script's totals above the cap with
 `GET /internal/address/:address` or `/internal/scripthash/:hash`, and its
 whole confirmed history with the same paths plus `/history`, without
@@ -390,7 +390,7 @@ services.rbitcoin.sv2.tp = {
 ## Core-class JSON-RPC
 
 Optional HTTP JSON-RPC subset (default **off**). TCP and the unix socket
-share a 256-connection cap; the deadlines are in [`docs/rpc.md`](../../docs/rpc.md).
+each have a 256-connection cap; the deadlines are in [`docs/rpc.md`](../../docs/rpc.md).
 `--rpc` binds
 `{datadir}/rpc.sock` (mode **0600**, filesystem auth, no HTTP header).
 `--rpc-socket PATH` binds that socket at PATH instead, mode **0660**, so a

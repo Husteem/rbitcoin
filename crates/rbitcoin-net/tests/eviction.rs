@@ -1,167 +1,148 @@
 use rbitcoin_net::eviction::*;
 
-fn cand(
-    id: u64,
-    connected_at: u64,
-    min_ping: Option<f64>,
-    last_block: u64,
-    last_tx: u64,
-) -> InboundEvictCandidate {
+/// An ordinary inbound peer alone in its netgroup: relays txs, offers the
+/// wanted services, has sent no block or tx, and pings slower than every
+/// peer the ping protect keeps.
+fn peer(id: u64, connected_at: u64) -> InboundEvictCandidate {
     InboundEvictCandidate {
         id,
         connected_at,
-        min_ping,
-        last_block,
-        last_tx,
-        netgroup: 1,
-        noban: false,
+        min_ping: Some(1.0),
+        netgroup: id,
+        relay_txs: true,
+        relevant_services: true,
+        ..Default::default()
     }
 }
 
-#[test]
-fn eviction_drops_the_newest_in_the_largest_netgroup() {
-    // Low ids are one-peer groups with a better ping, so the block, tx,
-    // ping, and netgroup protects consume them. The interesting peers are
-    // a size-3 group and one newer peer alone in another group.
-    let mut cands = Vec::new();
-    for i in 1..=40 {
-        cands.push(InboundEvictCandidate {
-            id: i,
-            connected_at: 1,
-            min_ping: Some(0.01),
-            last_block: 0,
-            last_tx: 0,
-            netgroup: 1_000 + i,
-            noban: false,
+/// Fillers newer than every subject, one cohort per fixed protect (Core
+/// `SelectNodeToEvict`): 4 highest keyed netgroups, 8 lowest pings, 4 latest
+/// txs, 8 non-tx-relay peers with the latest blocks, 4 latest blocks. Each
+/// cohort is kept only by its own protect, so a missing protect leaves a
+/// filler, the newest peer, as the victim.
+fn fillers() -> Vec<InboundEvictCandidate> {
+    let mut v = Vec::new();
+    let mut id = 1_000;
+    let mut next = |v: &mut Vec<InboundEvictCandidate>, f: &dyn Fn(&mut InboundEvictCandidate)| {
+        id += 1;
+        let mut c = peer(id, 1_000_000 + id);
+        f(&mut c);
+        v.push(c);
+    };
+    for i in 0..4 {
+        next(&mut v, &|c| c.netgroup = u64::MAX - i);
+    }
+    for _ in 0..8 {
+        next(&mut v, &|c| c.min_ping = Some(0.001));
+    }
+    for i in 0..4 {
+        next(&mut v, &|c| c.last_tx = 10_000 + i);
+    }
+    for i in 0..8 {
+        next(&mut v, &|c| {
+            c.relay_txs = false;
+            c.last_block = 10_000 + i;
         });
     }
-    cands.push(InboundEvictCandidate {
-        id: 100,
-        connected_at: 10,
-        min_ping: Some(1.0),
-        last_block: 0,
-        last_tx: 0,
-        netgroup: 50_000,
-        noban: false,
-    });
-    cands.push(InboundEvictCandidate {
-        id: 101,
-        connected_at: 50,
-        min_ping: Some(1.0),
-        last_block: 0,
-        last_tx: 0,
-        netgroup: 50_000,
-        noban: false,
-    });
-    cands.push(InboundEvictCandidate {
-        id: 102,
-        connected_at: 200,
-        min_ping: Some(1.0),
-        last_block: 0,
-        last_tx: 0,
-        netgroup: 50_000,
-        noban: false,
-    });
-    cands.push(InboundEvictCandidate {
-        id: 103,
-        connected_at: 500,
-        min_ping: Some(1.0),
-        last_block: 0,
-        last_tx: 0,
-        netgroup: 9_000,
-        noban: false,
-    });
-    let victim = select_inbound_eviction(cands).expect("one inbound to evict");
-    assert_ne!(victim, 101, "the oldest peer in the largest group stays");
-    assert_ne!(victim, 103, "a newer peer in a smaller group stays");
-    assert_eq!(victim, 102, "evict the newest peer in the largest netgroup");
+    for i in 0..4 {
+        next(&mut v, &|c| c.last_block = 20_000 + i);
+    }
+    v
+}
+
+/// The fillers and `n` subjects, ids 1..=n connected at 100..: none of the
+/// fixed protects keeps a subject.
+fn with_subjects(n: u64) -> Vec<InboundEvictCandidate> {
+    let mut v = fillers();
+    v.extend((1..=n).map(|i| peer(i, 99 + i)));
+    v
 }
 
 #[test]
-fn eviction_protects_block_tx_ping_and_netgroup() {
-    // 27 peers. Each protected set holds a peer newer than the two
-    // unprotected peers (ids 25 and 26), or sits in a larger netgroup, so
-    // dropping any one protect evicts from that set (Core #36470). Netgroup
-    // keeps ids 0 and 1. Longest keeps ids 2..=8 and 25. The unprotected
-    // peers hold the highest ids, so a protect sorted by id keeps them.
-    let mut cands = vec![cand(0, 500, Some(1.0), 0, 0)];
-    for i in 1..=8 {
-        cands.push(InboundEvictCandidate {
-            netgroup: 2,
-            ..cand(i, i, Some(1.0), 0, 0)
-        });
+fn each_fixed_protect_keeps_its_cohort() {
+    // Ten subjects: the five oldest are the uptime half, and the newest of
+    // the rest, alone in its netgroup like every other, is the victim.
+    assert_eq!(select_inbound_eviction(with_subjects(10)), Some(10));
+}
+
+#[test]
+fn half_the_rest_is_kept_by_uptime() {
+    // Thirty subjects. The fifteen oldest share one netgroup, the largest.
+    // Half of thirty keeps all of them, so the newest single peer goes.
+    // Keeping fewer leaves that group the largest, and its newest goes.
+    let mut cands = with_subjects(30);
+    for c in cands.iter_mut().filter(|c| (1..=15).contains(&c.id)) {
+        c.netgroup = 7;
     }
-    // The ping, tx, and block cohorts interleave in `connected_at`, which
-    // runs against each protect key, so a protect sorted by connection time
-    // keeps a different set. Ping id 9 is older than ids 25 and 26, so the
-    // ping cohort is not the newest eight either. Id 16, the last ping
-    // protect by key, is newer, so a smaller ping budget leaves it to evict.
-    for (i, at) in (9..=16).zip([50, 214, 213, 212, 209, 208, 207, 204]) {
-        cands.push(cand(i, at, Some(0.01), 0, 0));
+    assert_eq!(select_inbound_eviction(cands), Some(30));
+}
+
+#[test]
+fn a_tie_goes_to_the_group_with_the_youngest_member() {
+    // Eight subjects: the four oldest are kept by uptime. The other four
+    // are two groups of two. Group 99 holds the newest peer, so its newest
+    // member goes, though group 1 has the lower key.
+    let mut cands = with_subjects(8);
+    for c in cands.iter_mut() {
+        match c.id {
+            5 | 7 => c.netgroup = 1,
+            6 | 8 => c.netgroup = 99,
+            _ => {}
+        }
     }
-    for (i, at) in (17..=20).zip([215, 210, 205, 200]) {
-        cands.push(cand(i, at, Some(1.0), 0, 1000 + i));
+    assert_eq!(select_inbound_eviction(cands), Some(8));
+}
+
+#[test]
+fn onion_and_local_peers_share_the_uptime_protection() {
+    // 24 subjects, so 12 are kept by uptime and up to 6 of those by network.
+    // Three onion peers (group 50) and three local peers (group 51) are the
+    // newest and each fill the largest groups. Three slots go to each
+    // network, then the six oldest of the rest. The newest remaining
+    // ordinary peer goes.
+    let mut cands = with_subjects(24);
+    for c in cands.iter_mut() {
+        if (19..=21).contains(&c.id) {
+            c.network = EvictNet::Onion;
+            c.netgroup = 50;
+            c.connected_at += 1_000;
+        } else if (22..=24).contains(&c.id) {
+            c.is_local = true;
+            c.netgroup = 51;
+            c.connected_at += 1_000;
+        }
     }
-    for (i, at) in (21..=24).zip([216, 211, 206, 201]) {
-        cands.push(cand(i, at, Some(1.0), 1000 + i, 0));
-    }
-    cands.push(cand(25, 100, Some(1.0), 0, 0));
-    cands.push(cand(26, 101, Some(1.0), 0, 0));
-    assert_eq!(
-        select_inbound_eviction(cands),
-        Some(26),
-        "netgroup, block, tx, ping, and longest protects leave only id 26"
-    );
+    assert_eq!(select_inbound_eviction(cands), Some(18));
+}
+
+#[test]
+fn block_relay_only_protect_needs_the_wanted_services() {
+    // A non-tx-relay peer with a newer block than every block-relay filler
+    // but without the wanted services takes a place in that window and is
+    // not kept, so it, the newest peer, goes.
+    let mut cands = with_subjects(10);
+    let mut odd = peer(500, 5_000_000);
+    odd.relay_txs = false;
+    odd.relevant_services = false;
+    odd.last_block = 15_000;
+    cands.push(odd);
+    assert_eq!(select_inbound_eviction(cands), Some(500));
 }
 
 #[test]
 fn noban_never_evicted_alone() {
     let cands = vec![InboundEvictCandidate {
-        id: 7,
-        connected_at: 1,
-        min_ping: Some(9.0),
-        last_block: 0,
-        last_tx: 0,
-        netgroup: 1,
         noban: true,
+        ..peer(7, 1)
     }];
     assert!(select_inbound_eviction(cands).is_none());
 }
 
 #[test]
 fn maxconnections_shaped_protect_count() {
-    // Fewer than protect budget → nothing to evict.
-    let cands: Vec<_> = (0..8).map(|i| cand(i, i, Some(0.1), i, i)).collect();
+    // Fewer than the fixed protects → nothing to evict.
+    let cands: Vec<_> = (0..8).map(|i| peer(i, i)).collect();
     assert!(select_inbound_eviction(cands).is_none());
-}
-
-#[test]
-fn protect_by_netgroup_keeps_one_peer_from_each_largest_group() {
-    let mut untouched = vec![cand(1, 1, None, 0, 0)];
-    protect_by_netgroup(&mut untouched, 0);
-    assert_eq!(untouched.len(), 1, "k = 0 protects nobody");
-    let mut empty = Vec::new();
-    protect_by_netgroup(&mut empty, 4);
-    assert!(empty.is_empty());
-
-    let group = |id, netgroup| InboundEvictCandidate {
-        netgroup,
-        ..cand(id, id, None, 0, 0)
-    };
-    // Group 10 has two peers. Group 1 has one. k = 1 protects the lowest
-    // id in the larger group and leaves the other two.
-    let mut cands = vec![group(1, 10), group(2, 10), group(3, 1)];
-    protect_by_netgroup(&mut cands, 1);
-    let ids: Vec<_> = cands.iter().map(|c| c.id).collect();
-    assert_eq!(ids, vec![2, 3]);
-
-    let mut capped = vec![group(1, 10), group(3, 1)];
-    protect_by_netgroup(&mut capped, 1);
-    assert_eq!(capped.iter().map(|c| c.id).collect::<Vec<_>>(), vec![1]);
-
-    let mut mismatched = vec![group(8, 4), group(9, 5)];
-    protect_by_netgroup(&mut mismatched, 1);
-    assert_eq!(mismatched.iter().map(|c| c.id).collect::<Vec<_>>(), vec![9]);
 }
 
 #[test]
@@ -177,4 +158,40 @@ fn eviction_netgroup_ipv4_slash16() {
         eviction_netgroup(b),
         "a dual-stack accept of 1.2.3.4 is still 1.2/16"
     );
+}
+
+#[test]
+fn eviction_network_and_local() {
+    use rbitcoin_net::NetAddr;
+    let ip = |s: &str| NetAddr::Ip(s.parse().unwrap());
+    let bind: std::net::SocketAddr = "127.0.0.1:8334".parse().unwrap();
+    let other: std::net::SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    assert!(is_local_addr(&ip("127.0.0.1:1")));
+    assert!(is_local_addr(&ip("[::1]:1")));
+    assert!(is_local_addr(&ip("[::ffff:127.0.0.1]:1")));
+    assert!(!is_local_addr(&ip("1.2.3.4:1")));
+    assert_eq!(
+        evict_net(&ip("127.0.0.1:1"), bind, Some(bind)),
+        EvictNet::Onion,
+        "the onion listener is onion"
+    );
+    assert_eq!(
+        evict_net(&ip("127.0.0.1:1"), other, Some(bind)),
+        EvictNet::Other
+    );
+    assert_eq!(evict_net(&ip("[fc00::1]:1"), other, None), EvictNet::Cjdns);
+}
+
+#[test]
+fn the_netgroup_key_is_per_process() {
+    use std::hash::BuildHasher;
+    let a = rbitcoin_net::PeerHub::new();
+    let b = rbitcoin_net::PeerHub::new();
+    let order = |hub: &rbitcoin_net::PeerHub| {
+        let mut g: Vec<u64> = (0..64).collect();
+        g.sort_by_key(|n| hub.netgroup_key.hash_one(n));
+        g
+    };
+    assert_ne!(order(&a), order(&b), "each hub draws its own key");
+    assert_ne!(order(&a), (0..64).collect::<Vec<_>>(), "not the raw order");
 }

@@ -969,19 +969,19 @@ pub fn addr_relay_key(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
 pub const MAX_PCT_ADDR_TO_SEND: usize = 23;
 
 pub fn sendaddrv2_after_verack_log(peer: u64) -> String {
-    format!("p2p: sendaddrv2 received after verack, disconnecting peer={peer}")
+    format!("sendaddrv2 received after verack, disconnecting peer={peer}")
 }
 
 pub fn addrv2_message_size_log(n: usize) -> String {
-    format!("p2p: addrv2 message size = {n}")
+    format!("addrv2 message size = {n}")
 }
 
 pub fn received_addrv2_log(nbytes: usize, peer: u64) -> String {
-    format!("p2p: received: addrv2 ({nbytes} bytes) peer={peer}")
+    format!("received: addrv2 ({nbytes} bytes) peer={peer}")
 }
 
 pub fn sending_addrv2_log(nbytes: usize, peer: u64) -> String {
-    format!("p2p: sending addrv2 ({nbytes} bytes) peer={peer}")
+    format!("sending addrv2 ({nbytes} bytes) peer={peer}")
 }
 
 pub fn block_download_timeout_log(hash: BlockHash, peer: u64) -> String {
@@ -1513,7 +1513,7 @@ pub async fn run_feeler_inner(
     write_v2_msg(&mut writer, NetworkMessage::Version(version)).await?;
     loop {
         let frame = read_v2_frame(&mut reader, magic).await?;
-        let msg = frame.decode();
+        let msg = frame.try_decode()?;
         if matches!(msg.payload(), NetworkMessage::Version(_)) {
             break;
         }
@@ -1694,7 +1694,7 @@ pub async fn read_peer_version<R: FrameRead>(
         let frame = read_handshake_frame(reader, magic, policy).await?;
         let cmd = command_label(&frame.command);
         let payload_len = frame.payload_len();
-        let msg = frame.decode();
+        let msg = frame.try_decode()?;
         match msg.payload() {
             NetworkMessage::Version(v) => {
                 if (v.version as i32) < MIN_PEER_PROTO_VERSION {
@@ -1737,7 +1737,7 @@ pub async fn wait_peer_verack<R: FrameRead>(
     loop {
         let frame = read_handshake_frame(reader, magic, policy).await?;
         let cmd = command_label(&frame.command);
-        let msg = frame.decode();
+        let msg = frame.try_decode()?;
         if apply_pre_verack(policy.session, peer_version, msg.payload(), &cmd) {
             return Ok(());
         }
@@ -3988,6 +3988,9 @@ pub async fn handle_decoded_peer_msg(
             on_blocktxn(hub, out_tx, follow, session, &bt).await?
         }
         NetworkMessage::Tx(tx) => on_tx(hub, out_tx, follow, session, &tx).await?,
+        msg @ (NetworkMessage::GetCFilters(_)
+        | NetworkMessage::GetCFHeaders(_)
+        | NetworkMessage::GetCFCheckpt(_)) => on_compact_filters(msg, hub, out_tx, session).await?,
         NetworkMessage::GetBlockTxn(GetBlockTxn { txs_request }) => {
             serve_getblocktxn(hub, out_tx, follow, session, txs_request).await?
         }
@@ -4075,17 +4078,41 @@ pub fn filter_q<T>(r: Result<T, rbitcoin_store::StoreError>) -> Result<T, NetErr
 }
 
 #[doc(hidden)]
-pub fn on_compact_filters(
-    payload: &NetworkMessage,
+pub async fn on_compact_filters(
+    payload: NetworkMessage,
     hub: &ChainHub,
     out_tx: &PeerOutTx,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
+    // The reply that crossed the budget is already queued.
+    if session.is_some_and(|s| s.send_over_budget()) {
+        return Ok(());
+    }
+    // Up to 1,000 filters or 2,000 filter headers are read on the blocking
+    // pool under a header permit, not on the session's worker.
+    let replies = run_header_job(hub, move |hub| compact_filter_replies(hub, &payload)).await??;
+    for reply in replies {
+        if session.is_some_and(|s| s.send_over_budget()) {
+            return Ok(());
+        }
+        out_tx.send(reply)?;
+    }
+    Ok(())
+}
+
+/// The replies to a compact-filter request, read from the store. Runs off
+/// the reactor. An `Err` disconnects the peer.
+#[doc(hidden)]
+pub fn compact_filter_replies(
+    hub: &ChainHub,
+    payload: &NetworkMessage,
+) -> Result<Vec<NetworkMessage>, NetError> {
+    crate::reactor::assert_not_reactor("compact filter read");
     match payload {
-        NetworkMessage::GetCFilters(m) => on_getcfilters(hub, out_tx, session, m),
-        NetworkMessage::GetCFHeaders(m) => on_getcfheaders(hub, out_tx, m),
-        NetworkMessage::GetCFCheckpt(m) => on_getcfcheckpt(hub, out_tx, m),
-        _ => Ok(()),
+        NetworkMessage::GetCFilters(m) => getcfilters_replies(hub, m),
+        NetworkMessage::GetCFHeaders(m) => Ok(getcfheaders_reply(hub, m)?.into_iter().collect()),
+        NetworkMessage::GetCFCheckpt(m) => Ok(getcfcheckpt_reply(hub, m)?.into_iter().collect()),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -4128,107 +4155,96 @@ pub fn within_filter_watermark(hub: &ChainHub, stop: u32) -> Result<bool, NetErr
     Ok(filter_q(hub.query.basic_filter_hwm())?.is_some_and(|hwm| stop <= hwm))
 }
 
-#[doc(hidden)]
-pub fn on_getcfilters(
+fn getcfilters_replies(
     hub: &ChainHub,
-    out_tx: &PeerOutTx,
-    session: Option<&crate::peers::LivePeer>,
     m: &bitcoin::p2p::message_filter::GetCFilters,
-) -> Result<(), NetError> {
+) -> Result<Vec<NetworkMessage>, NetError> {
     use bitcoin::hashes::Hash;
     let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     compact_filter_range(m.start_height, stop, MAX_GETCFILTERS)?;
     if !within_filter_watermark(hub, stop)? {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let Some(filters) = filter_q(hub.query.basic_filters(m.start_height, stop))? else {
-        return Ok(());
+        return Ok(Vec::new());
     };
+    let mut out = Vec::with_capacity(filters.len());
     for (h, body) in (m.start_height..).zip(filters) {
-        if session.is_some_and(|s| s.send_over_budget()) {
-            return Ok(());
-        }
         let Some((_, rec)) = filter_q(hub.query.header_at_height(rbitcoin_primitives::Height(h)))?
         else {
-            return Ok(());
+            break;
         };
-        out_tx.send(NetworkMessage::CFilter(
+        out.push(NetworkMessage::CFilter(
             bitcoin::p2p::message_filter::CFilter {
                 filter_type: 0,
                 block_hash: bitcoin::BlockHash::from_byte_array(rec.hash),
                 filter: body,
             },
-        ))?;
+        ));
     }
-    Ok(())
+    Ok(out)
 }
 
-#[doc(hidden)]
-pub fn on_getcfheaders(
+fn getcfheaders_reply(
     hub: &ChainHub,
-    out_tx: &PeerOutTx,
     m: &bitcoin::p2p::message_filter::GetCFHeaders,
-) -> Result<(), NetError> {
+) -> Result<Option<NetworkMessage>, NetError> {
     use bitcoin::bip158::FilterHeader;
     use bitcoin::hashes::Hash;
     let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
-        return Ok(());
+        return Ok(None);
     };
     compact_filter_range(m.start_height, stop, MAX_GETCFHEADERS)?;
     if !within_filter_watermark(hub, stop)? {
-        return Ok(());
+        return Ok(None);
     }
     // One idx read covers the previous header and every hash in range.
     let first = m.start_height.saturating_sub(1);
     let Some(rows) = filter_q(hub.query.basic_filter_hashes_and_headers(first, stop))? else {
-        return Ok(());
+        return Ok(None);
     };
     let (previous, hashes) = if m.start_height == 0 {
         (FilterHeader::from_byte_array([0u8; 32]), &rows[..])
     } else {
         (rows[0].1, &rows[1..])
     };
-    out_tx.send(NetworkMessage::CFHeaders(
+    Ok(Some(NetworkMessage::CFHeaders(
         bitcoin::p2p::message_filter::CFHeaders {
             filter_type: 0,
             stop_hash: m.stop_hash,
             previous_filter_header: previous,
             filter_hashes: hashes.iter().map(|(hash, _)| *hash).collect(),
         },
-    ))?;
-    Ok(())
+    )))
 }
 
-#[doc(hidden)]
-pub fn on_getcfcheckpt(
+fn getcfcheckpt_reply(
     hub: &ChainHub,
-    out_tx: &PeerOutTx,
     m: &bitcoin::p2p::message_filter::GetCFCheckpt,
-) -> Result<(), NetError> {
+) -> Result<Option<NetworkMessage>, NetError> {
     use bitcoin::hashes::Hash;
     let Some(stop) = compact_filter_stop(hub, m.filter_type, m.stop_hash.as_byte_array())? else {
-        return Ok(());
+        return Ok(None);
     };
     if !within_filter_watermark(hub, stop)? {
-        return Ok(());
+        return Ok(None);
     }
     let mut filter_headers = Vec::new();
     if stop >= 1000 {
         let Some(headers) = filter_q(hub.query.basic_filter_checkpoint_headers(stop))? else {
-            return Ok(());
+            return Ok(None);
         };
         filter_headers = headers;
     }
-    out_tx.send(NetworkMessage::CFCheckpt(
+    Ok(Some(NetworkMessage::CFCheckpt(
         bitcoin::p2p::message_filter::CFCheckpt {
             filter_type: 0,
             stop_hash: m.stop_hash,
             filter_headers,
         },
-    ))?;
-    Ok(())
+    )))
 }
 
 #[doc(hidden)]
@@ -4254,14 +4270,18 @@ pub fn handle_peer_inventory_msg(
         | NetworkMessage::FilterAdd(_)
         | NetworkMessage::FilterClear => on_bloom_forbidden(follow, session)?,
         NetworkMessage::GetAddr => on_getaddr(hub, out_tx, session)?,
-        NetworkMessage::GetCFilters(_)
-        | NetworkMessage::GetCFHeaders(_)
-        | NetworkMessage::GetCFCheckpt(_) => on_compact_filters(payload, hub, out_tx, session)?,
         NetworkMessage::Headers(_)
         | NetworkMessage::GetHeaders(_)
         | NetworkMessage::GetBlocks(_) => {
             return Err(NetError::Protocol(
                 "header work is not on the sync inventory path",
+            ));
+        }
+        NetworkMessage::GetCFilters(_)
+        | NetworkMessage::GetCFHeaders(_)
+        | NetworkMessage::GetCFCheckpt(_) => {
+            return Err(NetError::Protocol(
+                "compact filter reads are not on the sync inventory path",
             ));
         }
         _ => {}
@@ -4270,20 +4290,23 @@ pub fn handle_peer_inventory_msg(
 }
 
 #[doc(hidden)]
+/// Core `LogDebug(BCLog::NET, ...)`: a peer can repeat this at the message
+/// rate, so it is not an INFO line.
 pub fn on_redundant_version(session: Option<&crate::peers::LivePeer>) {
     if let Some(s) = session {
-        rbitcoin_log::info!("p2p: redundant version message from peer={}", s.id);
+        rbitcoin_log::debug!(P2p, "redundant version message from peer={}", s.id);
     } else {
-        rbitcoin_log::info!("p2p: redundant version message from peer");
+        rbitcoin_log::debug!(P2p, "redundant version message from peer");
     }
 }
 
 #[doc(hidden)]
+/// Core `LogDebug(BCLog::NET, ...)`, as [`on_redundant_version`].
 pub fn on_redundant_verack(session: Option<&crate::peers::LivePeer>) {
     if let Some(s) = session {
-        rbitcoin_log::info!("p2p: ignoring redundant verack message from peer={}", s.id);
+        rbitcoin_log::debug!(P2p, "ignoring redundant verack message from peer={}", s.id);
     } else {
-        rbitcoin_log::info!("p2p: ignoring redundant verack message");
+        rbitcoin_log::debug!(P2p, "ignoring redundant verack message");
     }
 }
 
@@ -4379,7 +4402,7 @@ pub fn on_wtxid_relay(session: Option<&crate::peers::LivePeer>) {
 #[doc(hidden)]
 pub fn on_sendaddrv2(follow: &mut PeerFollowState, session: Option<&crate::peers::LivePeer>) {
     let id = session.map(|s| s.id).unwrap_or(0);
-    rbitcoin_log::info!("{}", sendaddrv2_after_verack_log(id));
+    rbitcoin_log::debug!(P2p, "{}", sendaddrv2_after_verack_log(id));
     punish_disconnect(&mut follow.ban_score, session);
 }
 
@@ -4442,15 +4465,17 @@ pub fn on_addrv2(
     list: &[bitcoin::p2p::address::AddrV2Message],
 ) -> Result<(), NetError> {
     let n = list.len();
-    let nbytes =
-        bitcoin::consensus::encode::serialize(&NetworkMessage::AddrV2(list.to_vec())).len();
-    let id = session.map(|s| s.id).unwrap_or(0);
-    rbitcoin_log::info!("{}", received_addrv2_log(nbytes, id));
+    // The count first: an oversized list is not serialized to be logged.
     if n > MAX_ADDR_TO_SEND {
-        rbitcoin_log::info!("{}", addrv2_message_size_log(n));
+        rbitcoin_log::debug!(P2p, "{}", addrv2_message_size_log(n));
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
+    let nbytes =
+        bitcoin::consensus::encode::serialize(&NetworkMessage::AddrV2(list.to_vec())).len();
+    let id = session.map(|s| s.id).unwrap_or(0);
+    // Core `LogDebug(BCLog::NET, "received: %s (%u bytes)")`.
+    rbitcoin_log::debug!(P2p, "{}", received_addrv2_log(nbytes, id));
     if let Some(s) = session.filter(|s| s.conn_type == crate::peers::PeerConnType::AddrFetch) {
         learn_addrfetch_reply(s, list, n);
         return Ok(());
@@ -4512,7 +4537,7 @@ pub fn on_addrv2(
                 if let Some(tx) = other.writer() {
                     let msg = NetworkMessage::AddrV2(batch);
                     let sent = bitcoin::consensus::encode::serialize(&msg).len();
-                    rbitcoin_log::info!("{}", sending_addrv2_log(sent, other.id));
+                    rbitcoin_log::debug!(P2p, "{}", sending_addrv2_log(sent, other.id));
                     tx.send(msg)?;
                 }
             }
@@ -5358,8 +5383,13 @@ pub fn on_inv_txid(
         return None;
     }
     if let Some(s) = session {
-        match mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false)
-        {
+        match mp.note_inv_tx_requested(
+            s.id,
+            txid.to_byte_array(),
+            tx_download_preferred(s),
+            s.clock_now(),
+            false,
+        ) {
             crate::tx_relay::ParentNote::RequestNow => {}
             crate::tx_relay::ParentNote::Deferred => return None,
             crate::tx_relay::ParentNote::PeerCapped => {
@@ -5369,6 +5399,14 @@ pub fn on_inv_txid(
         }
     }
     Some(Inventory::WitnessTransaction(*txid))
+}
+
+/// Core `fPreferredDownload`: an outbound peer or an inbound one with
+/// `noban`, that is not an addr-fetch connection and can serve blocks.
+fn tx_download_preferred(s: &crate::peers::LivePeer) -> bool {
+    (!s.inbound || s.session_noban())
+        && s.conn_type != crate::peers::PeerConnType::AddrFetch
+        && s.can_serve_blocks()
 }
 
 fn asks_back_local_tx(
@@ -5403,7 +5441,7 @@ pub fn on_inv_wtxid(
             match mp.note_inv_tx_requested(
                 s.id,
                 wtxid.to_byte_array(),
-                s.inbound,
+                tx_download_preferred(s),
                 s.clock_now(),
                 true,
             ) {
@@ -5436,7 +5474,7 @@ fn note_parked_announcer(
         return;
     }
     let _ = mp.add_orphan_announcer(&parked.compute_wtxid(), s.id);
-    mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
+    mp.schedule_orphan_parents(&missing, s.id, tx_download_preferred(s), s.clock_now());
 }
 
 struct HeadersApply {
@@ -6272,14 +6310,21 @@ pub async fn on_headers(
     headers: &[bitcoin::block::Header],
 ) -> Result<(), NetError> {
     let noban = session.is_some_and(|s| s.session_noban());
-    let pending = follow.pending_headers.clone();
-    let requested = follow.requested_blocks.hashes().clone();
-    let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
-    let headers = headers.to_vec();
-    let apply = run_header_job(hub, move |hub| {
-        classify_headers(hub, &headers, &pending, &requested, &have_bodies, noban)
-    })
-    .await?;
+    let apply = if headers.is_empty() {
+        // An empty reply reads neither the store nor the peer's maps, so it
+        // takes no header permit and copies no pending headers.
+        let none = HashSet::new();
+        classify_headers(hub, &[], &HashMap::new(), &none, &none, noban)
+    } else {
+        let pending = follow.pending_headers.clone();
+        let requested = follow.requested_blocks.hashes().clone();
+        let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
+        let headers = headers.to_vec();
+        run_header_job(hub, move |hub| {
+            classify_headers(hub, &headers, &pending, &requested, &have_bodies, noban)
+        })
+        .await?
+    };
     let accepted = !apply.misbehave;
     let stamp_block_announcement = apply.stamp_block_announcement;
     apply_headers(apply, hub, out_tx, follow, session)?;
@@ -7170,7 +7215,7 @@ pub fn schedule_orphan_parent_getdata(
     };
     let missing = mp.orphan_getdata_parents(tx);
     let now = s.clock_now();
-    mp.schedule_orphan_parents(&missing, s.id, s.inbound, now);
+    mp.schedule_orphan_parents(&missing, s.id, tx_download_preferred(s), now);
     let Some(ph) = s.peer_hub() else {
         return;
     };
@@ -7179,7 +7224,7 @@ pub fn schedule_orphan_parent_getdata(
             continue;
         }
         if let Some(p) = ph.live_peers().into_iter().find(|p| p.id == *id) {
-            mp.schedule_announcer_parents(&missing, p.id, p.inbound, now);
+            mp.schedule_announcer_parents(&missing, p.id, tx_download_preferred(&p), now);
         }
     }
 }
