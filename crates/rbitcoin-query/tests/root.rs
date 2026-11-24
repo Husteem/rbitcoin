@@ -1367,9 +1367,10 @@ fn block_tx_summary_rows_match_the_wire_block() {
     assert!(q.stamped_txstat_block(Height(1)).unwrap().is_none());
     assert_eq!(rows(&q), want, "unstamped rows come from the wire block");
     assert!(
-        q.stamped_txstat_block(Height(1)).unwrap().is_none(),
-        "a summary read does not stamp"
+        q.stamped_txstat_block(Height(1)).unwrap().is_some(),
+        "the rebuild stamps the rows, so the next summary is a txstat read"
     );
+    assert_eq!(rows(&q), want, "the stamped rows match the wire block");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
