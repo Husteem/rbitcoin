@@ -680,9 +680,21 @@ pub const ESPLORA_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// request is answered. As many as listener slots, so bodies read or
 /// waiting for a slot stay under `max_conn * max_body` bytes.
 #[derive(Clone)]
-struct BodyGate {
+#[doc(hidden)]
+pub struct BodyGate {
     sem: Arc<Semaphore>,
     max_body: usize,
+    #[cfg(debug_assertions)]
+    permits: usize,
+}
+
+#[cfg(debug_assertions)]
+impl BodyGate {
+    /// Upload permits taken. Debug builds only, for tests.
+    #[doc(hidden)]
+    pub fn held(&self) -> usize {
+        self.permits - self.sem.available_permits()
+    }
 }
 
 /// Read a request body before [`admit_connection`], under an upload permit
@@ -742,6 +754,9 @@ pub struct EsploraHandle {
     /// Listener slot gate. Tests wait on `waiting` instead of a settle sleep.
     #[doc(hidden)]
     pub admit: Arc<AdmitGate>,
+    /// Upload permit gate for request bodies.
+    #[doc(hidden)]
+    pub uploads: BodyGate,
     /// `/blindbit/v1/` permit gate, mounted only while tweaks are on.
     #[doc(hidden)]
     pub blindbit: Arc<crate::blindbit::BlindbitLimit>,
@@ -1713,6 +1728,8 @@ pub async fn run_esplora(
     let body_gate = BodyGate {
         sem: Arc::new(Semaphore::new(max_conn)),
         max_body,
+        #[cfg(debug_assertions)]
+        permits: max_conn,
     };
     let blindbit_limit = crate::blindbit::BlindbitLimit::new(config.blindbit_max_inflight.max(1));
     let listener_layers = |r: Router<AppState>| {
@@ -1778,6 +1795,7 @@ pub async fn run_esplora(
                 socket_path: None,
                 shutdown,
                 admit: Arc::clone(&admit),
+                uploads: body_gate.clone(),
                 blindbit: Arc::clone(&blindbit_limit),
                 task,
             })
@@ -1803,6 +1821,7 @@ pub async fn run_esplora(
                 socket_path: Some(path),
                 shutdown,
                 admit: Arc::clone(&admit),
+                uploads: body_gate.clone(),
                 blindbit: Arc::clone(&blindbit_limit),
                 task,
             })

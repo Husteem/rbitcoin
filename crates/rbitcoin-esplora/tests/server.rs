@@ -2399,6 +2399,56 @@ async fn block_template_does_not_lock_the_cache_across_template_prev() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
+/// A POST keeps its upload permit until it is answered, not just while
+/// its body is read, so bodies waiting for a slot stay under
+/// `max_conn * max_body`. The POST takes the only slot and waits on the
+/// store permit the test holds.
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answered_upload_holds_its_permit_until_the_response() {
+    let (_dir, q) = temp_query("upload-held");
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.max_connections = 1;
+    q.set_api_read_budget(1);
+    let q = Arc::new(q);
+    let store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
+        .await
+        .expect("listen");
+    let body = br#"{"addresses":[]}"#;
+    let mut post = TcpStream::connect(handle.local_addr).await.unwrap();
+    post.write_all(
+        format!(
+            "POST /addresses/txs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    post.write_all(body).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let notified = handle.admit.notified();
+        if handle.admit.holding() >= 1 {
+            break;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "the POST did not take the listener slot");
+        if tokio::time::timeout(left, notified).await.is_err() {
+            panic!("the POST did not take the listener slot");
+        }
+    }
+    assert_eq!(
+        handle.uploads.held(),
+        1,
+        "a read body gave its upload permit back before its answer"
+    );
+    drop(store);
+    drop(post);
+    handle.shutdown().await;
+}
+
 /// A POST whose body has not arrived holds an upload permit, not a
 /// listener slot. With every slot's worth of stalled uploads open, a
 /// bodiless request is still served.
