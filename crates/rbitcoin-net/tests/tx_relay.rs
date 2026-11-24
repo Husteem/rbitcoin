@@ -691,6 +691,27 @@ fn reorg_reaccept_then_unindex_drops_relay() {
     let _ = std::fs::remove_dir_all(&mp);
 }
 
+/// A tx put back by `reorg_reaccept` reports the sigop-adjusted weight, not
+/// its raw weight: 100 legacy CHECKSIG ops cost 400 sigops, which is 8,000 WU
+/// at the default 20 bytes per sigop.
+#[test]
+fn reorg_reaccept_records_sigop_adjusted_weight() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let tx = spend_true(cbs[0], 10_000, ScriptBuf::from_bytes(vec![0xac; 100]));
+    let txid = tx.compute_txid();
+    let adjusted = 100 * 4 * 20;
+    assert!(
+        tx.weight().to_wu() < adjusted,
+        "raw weight must sit below the adjusted weight"
+    );
+    assert_eq!(hub.reorg_reaccept(std::slice::from_ref(&tx)), 1);
+    assert_eq!(hub.get_live_adjusted_weight(&txid), Some(adjusted));
+    let _ = std::fs::remove_dir_all(&mp);
+}
+
 #[tokio::test]
 async fn unreturned_isolated_tx_is_sent_again_until_the_cap() {
     let (_store, q, cbs) = pad_cbs(12);
@@ -7031,6 +7052,104 @@ fn trust_peer_reorg_evict_keeps_nonfinal() {
     assert!(
         !hub.try_contains(&txid),
         "the mark does not keep a tx whose input the reorg took away"
+    );
+    let _ = std::fs::remove_dir_all(&mp);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// A BIP68-locked spend and an immature-coinbase spend from the trusted
+/// session stay through hub reorg eviction while the reorg leaves them
+/// non-final. An unmarked twin of each, valid when admitted, leaves with a
+/// `reorg` row once the lower tip makes it non-final or immature.
+#[test]
+fn trust_peer_reorg_evict_keeps_immature_and_bip68() {
+    use rbitcoin_mempool::RemovalReason;
+    let (store, q, cbs) = copy_maturity_pad(3);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    q.set_trust_peer(true);
+    let session = 11u64;
+    hub.set_trusted_session(Some(session));
+    let from_session = TxOrigin::Relay(Some(session));
+    let marked = |id: &Txid| hub.lock_read().trust_kept.contains(id);
+    let reorg_rows = || -> BTreeSet<(Txid, RemovalReason)> {
+        hub.removed_rows()
+            .rows
+            .iter()
+            .map(|r| (r.txid, r.reason))
+            .collect()
+    };
+    let relative_lock = |cb: Txid, blocks: u32| {
+        let mut tx = spend_true(cb, 1_000, ScriptBuf::from_bytes(vec![0x51]));
+        tx.input[0].sequence = Sequence::from_consensus(blocks);
+        tx
+    };
+
+    assert_eq!(q.tip_height().unwrap().0, 103);
+    let locked = relative_lock(cbs[0], 200);
+    let err = hub.admit(&locked).unwrap_err();
+    assert!(matches!(err, AcceptError::NonBip68Final), "{err}");
+    hub.admit_from(&locked, from_session)
+        .expect("a BIP68-locked spend from the trusted session");
+    let locked_id = locked.compute_txid();
+    assert!(marked(&locked_id));
+    let locked_twin = relative_lock(cbs[1], 102);
+    hub.admit(&locked_twin)
+        .expect("the lock on the twin is met at the next block");
+    let locked_twin_id = locked_twin.compute_txid();
+    assert!(!marked(&locked_twin_id));
+
+    q.disconnect_tip().unwrap();
+    hub.evict_after_reorg();
+    assert!(
+        !hub.try_contains(&locked_twin_id),
+        "an unmarked tx the lower tip leaves BIP68-locked must leave"
+    );
+    assert_eq!(
+        reorg_rows(),
+        BTreeSet::from([(locked_twin_id, RemovalReason::Reorg)])
+    );
+    assert!(
+        hub.try_contains(&locked_id),
+        "the mark keeps the BIP68-locked tx through the same sweep"
+    );
+
+    q.disconnect_tip().unwrap();
+    let young = ScriptBuf::from_bytes(vec![0x52]);
+    let immature = spend_true(cbs[2], 1_000, young.clone());
+    let err = hub.admit(&immature).unwrap_err();
+    assert!(matches!(err, AcceptError::ImmatureCoinbase), "{err}");
+    hub.admit_from(&immature, from_session)
+        .expect("an immature coinbase spend from the trusted session");
+    let immature_id = immature.compute_txid();
+    assert!(marked(&immature_id));
+    let immature_twin = spend_true(cbs[1], 1_000, young);
+    hub.admit(&immature_twin)
+        .expect("the coinbase is mature at the next block");
+    let immature_twin_id = immature_twin.compute_txid();
+    assert!(!marked(&immature_twin_id));
+
+    q.disconnect_tip().unwrap();
+    hub.evict_after_reorg();
+    assert!(
+        !hub.try_contains(&immature_twin_id),
+        "an unmarked spend the lower tip makes immature must leave"
+    );
+    assert_eq!(
+        reorg_rows(),
+        BTreeSet::from([
+            (locked_twin_id, RemovalReason::Reorg),
+            (immature_twin_id, RemovalReason::Reorg),
+        ])
+    );
+    assert!(
+        hub.try_contains(&immature_id),
+        "the mark keeps the immature coinbase spend through the sweep"
+    );
+    assert!(
+        hub.try_contains(&locked_id),
+        "the BIP68-locked tx is still held"
     );
     let _ = std::fs::remove_dir_all(&mp);
     let _ = std::fs::remove_dir_all(&store);
