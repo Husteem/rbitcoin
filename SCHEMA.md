@@ -741,7 +741,7 @@ Not `tx.head` — see [`docs/heads.md`](./docs/heads.md).
 - Packed value: sole fk (high bit clear), or `MULTI_BIT | list_fk` → sibling `.mlt` (`create_fk:u64 | next:u64`, newest first).
 - Multi-list: 16 B prefix collisions and BIP30-style multiples.
 - Identity: `get_all` candidates + **body verify**.
-- Insert past **7/8** is full: `header.head` rolls a sibling generation at the same slot count. Occupied tables are never rewritten while serving. Undersized **single-gen** files are rewritten at the create target **on open** (`header.head.grow` then rename). Target-sized empty gen0 with a non-empty body/`.mlt` is Layout refuse. Leftover 256-way `header.head/` is **Layout refuse**.
+- Insert past **7/8** is full: `header.head` rolls a sibling generation at twice the last generation's slot count. Occupied tables are never rewritten while serving. Undersized **single-gen** files are rewritten at the create target **on open** (`header.head.grow` then rename). Target-sized empty gen0 with a non-empty body/`.mlt` is Layout refuse. Leftover 256-way `header.head/` is **Layout refuse**.
 
 **Not** used for `tx.head` (keyless address) or for scripthash **create lists** (slabs; megakey page chains).
 
