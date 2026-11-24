@@ -489,11 +489,25 @@ impl Query {
         };
         #[cfg(debug_assertions)]
         self.note_reconstruct_archived();
+        let hash = rec.hash;
         let block = self.reconstruct_archived_block_from_parts(rec, tx_fks)?;
         let size = u32::try_from(block.total_size())
             .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
         let weight = u32::try_from(block.weight().to_wu())
             .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
+        // Stamp the rows, as `getblockstats` does, so the next request is one
+        // txstat read and not another rebuild. Only the active block at its
+        // height: the stamp finds its rows by height. Best effort.
+        if let Ok(Some(height)) = self.height_of_hash(&hash) {
+            if self
+                .header_at_height(height)
+                .ok()
+                .flatten()
+                .is_some_and(|(fk, _)| fk == header_fk)
+            {
+                let _ = self.stamp_txstat_from_block(height, &block);
+            }
+        }
         Ok(Some((size, weight)))
     }
 

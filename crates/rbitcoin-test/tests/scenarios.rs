@@ -3178,6 +3178,7 @@ fn unified_wire_pipeline_multi_block_to_tip() {
     pin_block_size_weight_from_txstat(&q, &b1);
     confirm_wire_run(&q, &params, ms, &[(Height(1), b1.clone())]).unwrap();
     assert_eq!(q.tip_height(), Some(Height(1)));
+    pin_active_block_rebuild_stamps_txstat(&q, &b1);
     assert_eq!(
         q.tx_body_count(),
         n_before,
@@ -3255,6 +3256,35 @@ fn pin_block_size_weight_from_txstat(q: &Query, b1: &Block) {
     assert_eq!(q.sample_reset_reconstruct_archived(), 1);
     q.store().write_txstat_row(cb_fk, &row).unwrap();
     assert!(q.block_size_weight(Fk(99)).unwrap().is_none());
+}
+
+/// An active block with an unstamped row is rebuilt once: the rebuild
+/// stamps the rows, as `getblockstats` does, so the next read is the txstat
+/// sum again and repeated requests cannot each rebuild.
+fn pin_active_block_rebuild_stamps_txstat(q: &Query, b1: &Block) {
+    use rbitcoin_store::TxStatRow;
+
+    let hash = b1.block_hash().to_byte_array();
+    let (hfk, _) = q.get_header_by_hash(&hash).unwrap().unwrap();
+    let want = (b1.total_size() as u32, b1.weight().to_wu() as u32);
+    let cb_fk = q.header_tx_fks(hfk, Some(&hash)).unwrap().unwrap()[0];
+    let row = q.get_txstat(cb_fk).unwrap().unwrap();
+    let zero = TxStatRow {
+        fee_sat: 0,
+        base: 0,
+        wit_extra: 0,
+    };
+    q.store().write_txstat_row(cb_fk, &zero).unwrap();
+    let _ = q.sample_reset_reconstruct_archived();
+    assert_eq!(q.block_size_weight(hfk).unwrap(), Some(want));
+    assert_eq!(q.sample_reset_reconstruct_archived(), 1);
+    assert_eq!(q.get_txstat(cb_fk).unwrap(), Some(row));
+    assert_eq!(q.block_size_weight(hfk).unwrap(), Some(want));
+    assert_eq!(
+        q.sample_reset_reconstruct_archived(),
+        0,
+        "a stamped block is not rebuilt again"
+    );
 }
 
 fn pin_confirm_refuses_without_advancing_tip(
