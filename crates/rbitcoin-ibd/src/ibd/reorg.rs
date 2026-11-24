@@ -1025,8 +1025,7 @@ pub fn apply_off_lock_rewind(
 /// snapshot runs under `shared`, then the lock is released for select and
 /// prepare, so a confirm reject can mark a path hash in that window. A path
 /// through it cannot be completed: IBD will not request that hash's body.
-#[doc(hidden)]
-pub fn path_refused_at_commit(st: &super::state::IbdWorkState, path: &[BlockHash]) -> bool {
+fn path_refused_at_commit(st: &super::state::IbdWorkState, path: &[BlockHash]) -> bool {
     path.iter()
         .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()) || st.unservable.contains(hash))
 }

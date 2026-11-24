@@ -1809,61 +1809,62 @@ fn rewind_refuses_a_path_through_an_unservable_header() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A hash a confirm reject abandons after the off-lock selection snapshot must
-/// not commit: the path was selected before the mark, and IBD will not request
-/// that hash's body. The invalid arm covers the same window.
-#[test]
-fn commit_refuses_a_path_hash_refused_after_the_snapshot() {
-    use rbitcoin_ibd::ibd::reorg::path_refused_at_commit;
-
-    let mut st = rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), None, Some(2));
-    let path = vec![pin_hash(0x41), pin_hash(0x42)];
-    assert!(!path_refused_at_commit(&st, &path));
-    st.unservable.insert(path[1]);
-    assert!(
-        path_refused_at_commit(&st, &path),
-        "an unservable hash added after the snapshot refuses the commit"
-    );
-    st.unservable.clear();
-    st.reorg.invalid.mark(path[0].to_byte_array());
-    assert!(path_refused_at_commit(&st, &path));
-}
-
-/// A path hash abandoned after the snapshot refuses the commit, and the
-/// prepare has already disconnected. The existing invalid-arm recovery applies:
-/// the candidate is deferred and the store stays at the LCA, so the next
+/// A path hash refused after the snapshot is not committed, for both refusal
+/// arms: one abandoned as unservable, and one marked invalid. The prepare has
+/// already disconnected, so the existing invalid-arm recovery applies: the
+/// candidate is deferred and the store stays at the LCA, and the next
 /// coordinator turn reseeds and plants from there.
 #[test]
 fn a_refused_commit_leaves_the_store_at_the_lca_and_defers() {
     use rbitcoin_ibd::ibd::reorg::apply_off_lock_rewind;
     use std::sync::Mutex;
 
-    let (dir, hub) = tmp_hub();
-    let t = 1_500_099_945;
-    let chain = confirmed_chain(&hub, 2, t);
-    let fork = side_headers(&hub, &chain, 0, 5, t + 1);
-    let mut st =
-        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
-    st.reorg
-        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
-    st.unservable.insert(fork[2]);
-    let shared = Mutex::new(st);
-    // Snapshot taken before `fork[2]` was abandoned.
-    let none = std::collections::HashSet::new();
+    #[derive(Clone, Copy, Debug)]
+    enum Refused {
+        Unservable,
+        Invalid,
+    }
 
-    assert!(!apply_off_lock_rewind(&shared, &hub, &[fork[4]], &none).unwrap());
+    for kind in [Refused::Unservable, Refused::Invalid] {
+        let (dir, hub) = tmp_hub();
+        let t = 1_500_099_945;
+        let chain = confirmed_chain(&hub, 2, t);
+        let fork = side_headers(&hub, &chain, 0, 5, t + 1);
+        let mut st = rbitcoin_ibd::ibd::state::IbdWorkState::new(
+            Vec::new(),
+            hub.tip_hash(),
+            hub.tip_height(),
+        );
+        st.reorg
+            .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
+        match kind {
+            Refused::Unservable => {
+                st.unservable.insert(fork[2]);
+            }
+            Refused::Invalid => {
+                st.reorg.invalid.mark(fork[2].to_byte_array());
+            }
+        }
+        let shared = Mutex::new(st);
+        // Snapshot taken before `fork[2]` was refused.
+        let none = std::collections::HashSet::new();
 
-    let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-    assert_eq!(
-        hub.tip_height(),
-        Some(0),
-        "the prepare had already disconnected to the LCA"
-    );
-    assert!(
-        st.height_to_hash.get(&1).is_none(),
-        "the refused path is not committed"
-    );
-    assert_eq!(st.reorg.deferred, vec![fork[4]]);
-    assert!(st.unservable.contains(&fork[2]));
-    let _ = std::fs::remove_dir_all(dir);
+        assert!(
+            !apply_off_lock_rewind(&shared, &hub, &[fork[4]], &none).unwrap(),
+            "{kind:?}: the refused path is not committed"
+        );
+
+        let st = shared.lock().unwrap_or_else(|err| err.into_inner());
+        assert_eq!(
+            hub.tip_height(),
+            Some(0),
+            "{kind:?}: the prepare had already disconnected to the LCA"
+        );
+        assert!(
+            st.height_to_hash.get(&1).is_none(),
+            "{kind:?}: the refused path is not committed"
+        );
+        assert_eq!(st.reorg.deferred, vec![fork[4]], "{kind:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
