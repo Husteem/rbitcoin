@@ -28,7 +28,7 @@ steps.
 | L1 | low | Height-0 BIP68 time lock uses median time 0 | fixed | `bip68_height_zero_time_lock_uses_the_median` ([076](./076-bip68-genesis-median.md)) |
 | L4 | low | Empty median time panics | fixed | `empty_median_time_is_an_error` ([077](./077-empty-median.md)) |
 | L5 | low | Version nonce is not a CSPRNG | fixed | `rand_nonce_changes` ([078](./078-version-nonce.md)) |
-| L6 | low | Recent-reject set clears at the cap | fixed | `recent_reject_at_the_cap_does_not_clear` ([079](./079-recent-reject-cap.md)) |
+| L6 | low | Recent-reject set clears at the cap | fixed | `recent_rejects_roll_instead_of_refusing` ([079](./079-recent-reject-cap.md)) |
 | L8 | low | Manifest and txstat lengths allocate before a size check | fixed | `map_prefix_longer_than_file_is_corrupt`, `txstat_blob_longer_than_the_file_is_corrupt` ([070](./070-manifest-length.md)) |
 | L9 | low | Tor control password on argv | fixed | `tor_control_password_rejects_a_line_break` ([080](./080-tor-control-password.md)) |
 | L10 | low | Datadir lock follows a symlink | fixed | `lock_file_does_not_follow_a_symlink` ([071](./071-datadir-lock-symlink.md)) |

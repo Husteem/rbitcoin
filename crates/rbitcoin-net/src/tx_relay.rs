@@ -683,6 +683,60 @@ pub fn is_hard_recent_reject(e: &AcceptError) -> bool {
     )
 }
 
+/// Core `m_lazy_recent_rejects` size: rejects remembered until the next
+/// block, oldest dropped first.
+pub const RECENT_REJECTS_MAX: usize = 120_000;
+
+/// Recent rejects as keyed 64-bit digests in insert order. A full set drops
+/// its oldest entry, so new rejects are always kept (Core's rolling bloom
+/// filter). The per-process random key makes a digest collision as hard to
+/// aim as a bloom false positive.
+#[doc(hidden)]
+pub struct RecentRejects {
+    key: std::collections::hash_map::RandomState,
+    set: HashSet<u64>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl Default for RecentRejects {
+    fn default() -> Self {
+        Self {
+            key: std::collections::hash_map::RandomState::new(),
+            set: HashSet::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+impl RecentRejects {
+    fn digest(&self, wtxid: &Wtxid) -> u64 {
+        use std::hash::BuildHasher;
+        self.key.hash_one(wtxid.to_byte_array())
+    }
+
+    pub fn insert(&mut self, wtxid: &Wtxid) {
+        let d = self.digest(wtxid);
+        if !self.set.insert(d) {
+            return;
+        }
+        self.order.push_back(d);
+        if self.order.len() > RECENT_REJECTS_MAX {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+    }
+
+    pub fn contains(&self, wtxid: &Wtxid) -> bool {
+        self.set.contains(&self.digest(wtxid))
+    }
+
+    pub fn clear(&mut self) {
+        self.set.clear();
+        self.order.clear();
+    }
+}
+
 /// One recently accepted mempool tx (for explorer "recent" strips).
 #[derive(Clone, Debug)]
 pub struct RecentAccept {
@@ -1275,7 +1329,7 @@ pub struct MempoolHub {
     /// Recently confirmed txid/wtxid for INV AlreadyHave.
     pub recent_confirmed: Mutex<RecentConfirmed>,
     /// Core `m_lazy_recent_rejects` (wtxid). Forcerelay second-send skips ATMP.
-    pub recent_rejects: Mutex<HashSet<Wtxid>>,
+    pub recent_rejects: Mutex<RecentRejects>,
     /// Own feerates (sat/kvB) of the 64 newest confirmed entries, for the N=1 floor.
     pub confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
     /// Per-block vsize-weighted p10 hurdle, bounded by txstat body bytes.
@@ -1667,7 +1721,7 @@ impl MempoolHub {
                 MEMPOOL_RECENT_CAP,
             )),
             recent_confirmed: Mutex::new(RecentConfirmed::new()),
-            recent_rejects: Mutex::new(HashSet::new()),
+            recent_rejects: Mutex::new(RecentRejects::default()),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
             block_p10_history: Mutex::new(FeeHistory::new(
                 FEE_HISTORY_TXSTAT_BYTE_BUDGET,
@@ -3043,10 +3097,7 @@ impl MempoolHub {
         let Ok(mut g) = self.recent_rejects.lock() else {
             return;
         };
-        if g.len() >= 4_096 {
-            return;
-        }
-        g.insert(wtxid);
+        g.insert(&wtxid);
     }
 
     /// Session TX filter: never parks. Busy lock → `false` (re-ATMP).
