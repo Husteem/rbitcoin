@@ -969,11 +969,11 @@ pub fn addr_relay_key(msg: &bitcoin::p2p::address::AddrV2Message) -> u64 {
 pub const MAX_PCT_ADDR_TO_SEND: usize = 23;
 
 pub fn sendaddrv2_after_verack_log(peer: u64) -> String {
-    format!("p2p: sendaddrv2 received after verack, disconnecting peer={peer}")
+    format!("sendaddrv2 received after verack, disconnecting peer={peer}")
 }
 
 pub fn addrv2_message_size_log(n: usize) -> String {
-    format!("p2p: addrv2 message size = {n}")
+    format!("addrv2 message size = {n}")
 }
 
 pub fn received_addrv2_log(nbytes: usize, peer: u64) -> String {
@@ -981,7 +981,7 @@ pub fn received_addrv2_log(nbytes: usize, peer: u64) -> String {
 }
 
 pub fn sending_addrv2_log(nbytes: usize, peer: u64) -> String {
-    format!("p2p: sending addrv2 ({nbytes} bytes) peer={peer}")
+    format!("sending addrv2 ({nbytes} bytes) peer={peer}")
 }
 
 pub fn block_download_timeout_log(hash: BlockHash, peer: u64) -> String {
@@ -4369,7 +4369,7 @@ pub fn on_wtxid_relay(session: Option<&crate::peers::LivePeer>) {
 #[doc(hidden)]
 pub fn on_sendaddrv2(follow: &mut PeerFollowState, session: Option<&crate::peers::LivePeer>) {
     let id = session.map(|s| s.id).unwrap_or(0);
-    rbitcoin_log::info!("{}", sendaddrv2_after_verack_log(id));
+    rbitcoin_log::debug!(P2p, "{}", sendaddrv2_after_verack_log(id));
     punish_disconnect(&mut follow.ban_score, session);
 }
 
@@ -4434,7 +4434,7 @@ pub fn on_addrv2(
     let n = list.len();
     // The count first: an oversized list is not serialized to be logged.
     if n > MAX_ADDR_TO_SEND {
-        rbitcoin_log::info!("{}", addrv2_message_size_log(n));
+        rbitcoin_log::debug!(P2p, "{}", addrv2_message_size_log(n));
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
@@ -4504,7 +4504,7 @@ pub fn on_addrv2(
                 if let Some(tx) = other.writer() {
                     let msg = NetworkMessage::AddrV2(batch);
                     let sent = bitcoin::consensus::encode::serialize(&msg).len();
-                    rbitcoin_log::info!("{}", sending_addrv2_log(sent, other.id));
+                    rbitcoin_log::debug!(P2p, "{}", sending_addrv2_log(sent, other.id));
                     tx.send(msg)?;
                 }
             }

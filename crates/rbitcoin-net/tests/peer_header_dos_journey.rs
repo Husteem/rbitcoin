@@ -69,10 +69,73 @@ fn orphan_body(prev: BlockHash, nonce: u32) -> bitcoin::Block {
     block
 }
 
+/// A captured line at DEBUG that contains `needle`.
+fn debug_logged(logs: &[(rbitcoin_log::Level, String)], needle: &str) -> bool {
+    logs.iter()
+        .any(|(level, msg)| *level == rbitcoin_log::Level::Debug && msg.contains(needle))
+}
+
 fn logs_have(needle: &str) -> bool {
     let logs = rbitcoin_log::take_logs();
     rbitcoin_log::capture_logs(false);
     logs.iter().any(|(_, msg)| msg.contains(needle))
+}
+
+/// Core `LogDebug(BCLog::NET, ...)`: a repeated `version` is a debug line
+/// and keeps the session.
+async fn redundant_version_is_a_debug_line(
+    hub: &rbitcoin_net::chain::ChainHub,
+    out_tx: &PeerOutTx,
+    follow: &mut PeerFollowState,
+    sess: &std::sync::Arc<rbitcoin_net::peers::LivePeer>,
+) {
+    rbitcoin_log::capture_logs(true);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    push(
+        hub,
+        out_tx,
+        follow,
+        Some(sess.as_ref()),
+        NetworkMessage::Version(hostile_ver(addr)),
+    )
+    .await;
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        debug_logged(&logs, "redundant version message"),
+        "redundant version is a debug line: {logs:?}"
+    );
+    assert_eq!(follow.ban_score, 0, "redundant version must not disconnect");
+}
+
+/// A received addrv2 is a debug line (Core `LogDebug(BCLog::NET,
+/// "received: ...")`). Logs stay captured for the caller.
+async fn received_addrv2_is_a_debug_line(
+    hub: &rbitcoin_net::chain::ChainHub,
+    out_tx: &PeerOutTx,
+    follow: &mut PeerFollowState,
+    sess: &std::sync::Arc<rbitcoin_net::peers::LivePeer>,
+) {
+    use bitcoin::p2p::address::AddrV2;
+    let one = vec![bitcoin::p2p::address::AddrV2Message {
+        time: 1_700_000_000,
+        services: ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4(std::net::Ipv4Addr::new(123, 123, 123, 2)),
+        port: 8333,
+    }];
+    push(
+        hub,
+        out_tx,
+        follow,
+        Some(sess.as_ref()),
+        NetworkMessage::AddrV2(one),
+    )
+    .await;
+    let logs = rbitcoin_log::take_logs();
+    assert!(
+        debug_logged(&logs, "received: addrv2"),
+        "a received addrv2 is a debug line: {logs:?}"
+    );
 }
 
 /// wtxidrelay and sendaddrv2 before verack stick. Ping is logged. A second
@@ -84,11 +147,11 @@ async fn handshake_verack_and_addrv2(
     use bitcoin::p2p::address::AddrV2;
     assert_eq!(
         rbitcoin_net::peer::sendaddrv2_after_verack_log(0),
-        "p2p: sendaddrv2 received after verack, disconnecting peer=0"
+        "sendaddrv2 received after verack, disconnecting peer=0"
     );
     assert_eq!(
         rbitcoin_net::peer::addrv2_message_size_log(1010),
-        "p2p: addrv2 message size = 1010"
+        "addrv2 message size = 1010"
     );
 
     let sess = live_peer(peers, 18444, 1, true);
@@ -152,32 +215,12 @@ async fn handshake_verack_and_addrv2(
     let logs = rbitcoin_log::take_logs();
     rbitcoin_log::capture_logs(false);
     assert!(
-        logs.iter().any(|(level, msg)| {
-            *level == rbitcoin_log::Level::Debug && msg.contains("ignoring redundant verack message")
-        }),
+        debug_logged(&logs, "ignoring redundant verack message"),
         "redundant verack is a debug line: {logs:?}"
     );
     assert_eq!(follow.ban_score, 0, "redundant verack must not disconnect");
 
-    rbitcoin_log::capture_logs(true);
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-    push(
-        hub,
-        &out_tx,
-        &mut follow,
-        Some(sess.as_ref()),
-        NetworkMessage::Version(hostile_ver(addr)),
-    )
-    .await;
-    let logs = rbitcoin_log::take_logs();
-    rbitcoin_log::capture_logs(false);
-    assert!(
-        logs.iter().any(|(level, msg)| {
-            *level == rbitcoin_log::Level::Debug && msg.contains("redundant version message")
-        }),
-        "redundant version is a debug line: {logs:?}"
-    );
-    assert_eq!(follow.ban_score, 0, "redundant version must not disconnect");
+    redundant_version_is_a_debug_line(hub, &out_tx, &mut follow, &sess).await;
 
     rbitcoin_log::capture_logs(true);
     push(
@@ -206,7 +249,10 @@ async fn handshake_verack_and_addrv2(
         })
         .collect();
     follow.ban_score = 0;
+    // Core logs a received addrv2 and its size refusal at debug, and the
+    // oversized list is refused before it is measured.
     rbitcoin_log::capture_logs(true);
+    received_addrv2_is_a_debug_line(hub, &out_tx, &mut follow, &sess).await;
     push(
         hub,
         &out_tx,
@@ -219,9 +265,15 @@ async fn handshake_verack_and_addrv2(
         follow.ban_score >= BAN_SCORE_THRESHOLD,
         "oversized addrv2 must disconnect"
     );
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
     assert!(
-        logs_have("addrv2 message size = 1010"),
-        "oversized addrv2 logs the count"
+        debug_logged(&logs, "addrv2 message size = 1010"),
+        "oversized addrv2 logs the count at debug: {logs:?}"
+    );
+    assert!(
+        !logs.iter().any(|(_, m)| m.contains("received: addrv2")),
+        "an oversized addrv2 is refused before it is measured: {logs:?}"
     );
 }
 
