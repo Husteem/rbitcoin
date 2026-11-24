@@ -31,6 +31,11 @@ pub const DEFAULT_RPC_WORK_QUEUE: usize = 16;
 /// Accept cap, copied from the Electrum public listener. Not a knob.
 #[doc(hidden)]
 pub const RPC_MAX_CONNECTIONS: usize = 256;
+/// Built REST reply bytes still waiting to be written, across every listener.
+/// A reply holds its share until hyper drops its body. A reply larger than
+/// this takes the whole budget, so one still goes out at a time.
+#[doc(hidden)]
+pub const REST_REPLY_BYTES: usize = 64 * 1024 * 1024;
 const RPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 use rbitcoin_log::info;
 #[cfg(unix)]
@@ -231,6 +236,8 @@ pub struct AppState {
     /// so REST alone can never hold every permit Electrum, Esplora and RPC
     /// read through.
     pub rest_store: Arc<tokio::sync::Semaphore>,
+    /// Built REST reply bytes not yet written. [`REST_REPLY_BYTES`] in a server.
+    pub rest_reply_bytes: ReplyBytes,
     pub rest: bool,
     pub require_auth: bool,
 }
@@ -240,6 +247,36 @@ pub struct AppState {
 #[doc(hidden)]
 pub fn rest_store_share(budget: usize) -> usize {
     (budget / 2).max(1)
+}
+
+/// A byte budget shared by the replies it was built for. One permit is one
+/// byte.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct ReplyBytes {
+    permits: Arc<Semaphore>,
+    total: u32,
+}
+
+impl ReplyBytes {
+    pub fn new(total: usize) -> Self {
+        let total = u32::try_from(total).unwrap_or(u32::MAX);
+        Self {
+            permits: Arc::new(Semaphore::new(total as usize)),
+            total,
+        }
+    }
+
+    pub fn available(&self) -> usize {
+        self.permits.available_permits()
+    }
+
+    /// `len` bytes, or the whole budget when `len` is larger. `None` when
+    /// they are not free now.
+    fn try_take(&self, len: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let want = u32::try_from(len).map_or(self.total, |n| n.min(self.total));
+        Arc::clone(&self.permits).try_acquire_many_owned(want).ok()
+    }
 }
 
 /// Omitted and `0` are [`DEFAULT_RPC_WORK_QUEUE`]. A positive `N` is `N`.
@@ -312,6 +349,7 @@ pub async fn run_rpc(
     let rest_store = Arc::new(tokio::sync::Semaphore::new(rest_store_share(
         ctx.query.api_read_budget_size(),
     )));
+    let rest_reply_bytes = ReplyBytes::new(REST_REPLY_BYTES);
     let shutdown = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, _) = tokio::sync::watch::channel(());
     let mut tasks = Vec::new();
@@ -342,6 +380,7 @@ pub async fn run_rpc(
             work_queue: work_queue.clone(),
             rest_queue: rest_queue.clone(),
             rest_store: rest_store.clone(),
+            rest_reply_bytes: rest_reply_bytes.clone(),
             rest: config.rest,
             require_auth: true,
         };
@@ -398,6 +437,7 @@ pub async fn run_rpc(
             work_queue,
             rest_queue,
             rest_store,
+            rest_reply_bytes,
             rest: config.rest,
             require_auth: false,
         };
@@ -478,15 +518,13 @@ pub async fn rest_entry(State(state): State<AppState>, req: axum::extract::Reque
         Ok(body) => body,
         Err(response) => return response,
     };
-    let _permit = match state.rest_queue.try_acquire() {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Work queue depth exceeded\n",
-            )
-                .into_response();
-        }
+    // A spent reply budget refuses before the build, so a slow reader's body
+    // also stops new ones being built.
+    if state.rest_reply_bytes.available() == 0 {
+        return rest_queue_full();
+    }
+    let Ok(_permit) = state.rest_queue.try_acquire() else {
+        return rest_queue_full();
     };
     let ctx = Arc::clone(&state.ctx);
     // REST's share first, then a budget permit: REST alone cannot take every
@@ -508,12 +546,63 @@ pub async fn rest_entry(State(state): State<AppState>, req: axum::extract::Reque
         content_type: "text/plain",
         body: b"rest failed\n".to_vec(),
     });
+    let Some(bytes) = state.rest_reply_bytes.try_take(reply.body.len()) else {
+        return rest_queue_full();
+    };
     (
         reply.status,
         [(header::CONTENT_TYPE, reply.content_type)],
-        reply.body,
+        axum::body::Body::new(RestReplyBody {
+            rest: Bytes::from(reply.body),
+            _bytes: bytes,
+        }),
     )
         .into_response()
+}
+
+fn rest_queue_full() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Work queue depth exceeded\n",
+    )
+        .into_response()
+}
+
+/// Largest slice of a REST reply handed to hyper at once. Hyper polls for
+/// the next slice only once its write buffer has room, so the body, and the
+/// budget it holds, lives until about this much is left unwritten.
+const REST_REPLY_CHUNK: usize = 64 * 1024;
+
+/// A built REST reply and its share of [`REST_REPLY_BYTES`]. The share goes
+/// back when hyper drops the body: written, or the connection gone.
+struct RestReplyBody {
+    rest: Bytes,
+    _bytes: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl HttpBody for RestReplyBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        if self.rest.is_empty() {
+            return std::task::Poll::Ready(None);
+        }
+        let n = self.rest.len().min(REST_REPLY_CHUNK);
+        let chunk = self.rest.split_to(n);
+        std::task::Poll::Ready(Some(Ok(Frame::data(chunk))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.rest.is_empty()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.rest.len() as u64)
+    }
 }
 
 pub async fn reject_unauthorized(
