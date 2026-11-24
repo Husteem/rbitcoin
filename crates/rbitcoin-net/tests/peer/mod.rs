@@ -7507,6 +7507,8 @@ fn inbound_netgroup_is_fixed_at_accept() {
     );
 }
 
+const ORDINARY_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+
 // The reconnect refusal after a misbehavior disconnect has no default journey:
 // default harness peers dial from loopback, which `ip_skips_discourage`
 // exempts. These units own it in default CI (TESTING.md witness table,
@@ -7539,14 +7541,17 @@ fn misbehavior_disconnect_refuses_the_same_address() {
     punish_disconnect(&mut score, Some(peer.as_ref()));
     let other_port = std::net::SocketAddr::from(([9, 9, 9, 9], 9999));
     assert!(
-        peers.inbound_discouraged(other_port),
+        peers.inbound_discouraged(other_port, ORDINARY_BIND),
         "a misbehavior disconnect refuses that address"
     );
     peers.set_mock_now(now + 86_400 - 1);
-    assert!(peers.inbound_discouraged(addr), "the refusal lasts a day");
+    assert!(
+        peers.inbound_discouraged(addr, ORDINARY_BIND),
+        "the refusal lasts a day"
+    );
     peers.set_mock_now(now + 86_400);
     assert!(
-        !peers.inbound_discouraged(addr),
+        !peers.inbound_discouraged(addr, ORDINARY_BIND),
         "the refusal ends after a day"
     );
 }
@@ -7582,7 +7587,7 @@ fn misbehavior_disconnect_does_not_refuse_loopback() {
     );
     let other_port = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 18444));
     assert!(
-        !peers.inbound_discouraged(other_port),
+        !peers.inbound_discouraged(other_port, ORDINARY_BIND),
         "one loopback disconnect must not refuse every local connection"
     );
 }
@@ -7624,7 +7629,7 @@ fn overlay_misbehavior_discourages_that_net() {
         "a misbehavior disconnect refuses that overlay net"
     );
     assert!(
-        !peers.inbound_discouraged(sock),
+        !peers.inbound_discouraged(sock, ORDINARY_BIND),
         "0.0.0.0 must not become a clearnet refusal"
     );
 }
@@ -7688,7 +7693,7 @@ fn threshold_exit_refuses_the_address_without_punish_disconnect() {
     ));
     let other_port = std::net::SocketAddr::from(([8, 8, 4, 4], 9999));
     assert!(
-        peers.inbound_discouraged(other_port),
+        peers.inbound_discouraged(other_port, ORDINARY_BIND),
         "a rate-limit or score-threshold exit refuses that address"
     );
 
@@ -7702,7 +7707,7 @@ fn threshold_exit_refuses_the_address_without_punish_disconnect() {
     );
     let _ = threshold_disconnect(Some(noban.as_ref()));
     assert!(
-        !peers.inbound_discouraged(std::net::SocketAddr::from(([1, 2, 3, 4], 1))),
+        !peers.inbound_discouraged(std::net::SocketAddr::from(([1, 2, 3, 4], 1)), ORDINARY_BIND),
         "noban is not recorded"
     );
     peers.set_noban(false);
@@ -7724,7 +7729,7 @@ fn threshold_exit_refuses_the_address_without_punish_disconnect() {
         "a protocol violation drops a manual peer"
     );
     assert!(
-        !peers.inbound_discouraged(std::net::SocketAddr::from(([5, 6, 7, 8], 1))),
+        !peers.inbound_discouraged(std::net::SocketAddr::from(([5, 6, 7, 8], 1)), ORDINARY_BIND),
         "a manual peer is not recorded"
     );
 }
@@ -7768,7 +7773,7 @@ fn second_rate_limit_disconnect_from_an_address_discourages_it() {
         rbitcoin_net::error::NetError::Protocol("peer rate limit")
     ));
     assert!(
-        !peers.inbound_discouraged(first),
+        !peers.inbound_discouraged(first, ORDINARY_BIND),
         "one rate-limit disconnect does not refuse the address"
     );
     assert!(matches!(
@@ -7776,7 +7781,7 @@ fn second_rate_limit_disconnect_from_an_address_discourages_it() {
         rbitcoin_net::error::NetError::Protocol("peer misbehavior threshold")
     ));
     assert!(
-        peers.inbound_discouraged(first),
+        peers.inbound_discouraged(first, ORDINARY_BIND),
         "a second rate-limit disconnect from that address refuses it"
     );
 
@@ -7785,7 +7790,7 @@ fn second_rate_limit_disconnect_from_an_address_discourages_it() {
     peers.set_mock_now(now + rbitcoin_net::peers::PeerHub::RATE_STRIKE_SECS);
     let _ = flood(slow);
     assert!(
-        !peers.inbound_discouraged(slow),
+        !peers.inbound_discouraged(slow, ORDINARY_BIND),
         "a strike older than the window does not count"
     );
 }
@@ -7831,7 +7836,7 @@ fn exempt_peer_rate_limit_leaves_no_strike_on_its_address() {
             ),
             "{exempt}: an exempt overflow leaves no strike for the next peer"
         );
-        assert!(!peers.inbound_discouraged(again));
+        assert!(!peers.inbound_discouraged(again, ORDINARY_BIND));
     }
 }
 
@@ -7904,17 +7909,17 @@ fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
     peers.note_slot_evict(group);
     let same = "8.8.9.9:8333".parse().unwrap();
     assert!(
-        peers.inbound_discouraged(same),
+        peers.inbound_discouraged(same, ORDINARY_BIND),
         "a netgroup that just lost a slot is refused"
     );
     peers.set_mock_now(now + 600 - 1);
     assert!(
-        peers.inbound_discouraged(same),
+        peers.inbound_discouraged(same, ORDINARY_BIND),
         "the netgroup wait holds until ten minutes"
     );
     peers.set_mock_now(now + 600);
     assert!(
-        !peers.inbound_discouraged(same),
+        !peers.inbound_discouraged(same, ORDINARY_BIND),
         "the netgroup wait is ten minutes"
     );
     peers.set_mock_now(now);
@@ -7927,7 +7932,7 @@ fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
     let overflow = std::net::SocketAddr::from(([255, 255, 1, 1], 1));
     peers.note_slot_evict(rbitcoin_net::eviction::eviction_netgroup(overflow));
     assert!(
-        !peers.inbound_discouraged(overflow),
+        !peers.inbound_discouraged(overflow, ORDINARY_BIND),
         "a new netgroup past the cap is not stored"
     );
     peers.set_mock_now(now + 100);
@@ -7935,7 +7940,7 @@ fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
     peers.note_slot_evict(rbitcoin_net::eviction::eviction_netgroup(refreshed));
     peers.set_mock_now(now + 600);
     assert!(
-        peers.inbound_discouraged(refreshed),
+        peers.inbound_discouraged(refreshed, ORDINARY_BIND),
         "a netgroup already stored is refreshed at the cap"
     );
     peers.set_mock_now(now);
@@ -7946,12 +7951,12 @@ fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
     let extra = std::net::SocketAddr::from(([255, 255, 255, 254], 1));
     peers.note_misbehavior_addr(extra.ip());
     assert!(
-        !peers.inbound_discouraged(extra),
+        !peers.inbound_discouraged(extra, ORDINARY_BIND),
         "past the cap the set does not grow"
     );
     let first = std::net::SocketAddr::from((std::net::Ipv4Addr::from(0u32), 1));
     assert!(
-        peers.inbound_discouraged(first),
+        peers.inbound_discouraged(first, ORDINARY_BIND),
         "rows already stored stay until they expire"
     );
 }
@@ -7966,7 +7971,7 @@ fn slot_evict_does_not_block_an_outbound_dial() {
     peers.note_slot_evict(rbitcoin_net::netgroup::slot_pause_group(evicted));
     let neighbor: std::net::SocketAddr = "8.8.9.9:8333".parse().unwrap();
     assert!(
-        peers.inbound_discouraged(neighbor),
+        peers.inbound_discouraged(neighbor, ORDINARY_BIND),
         "the slot wait still refuses another inbound from that /16"
     );
     assert!(
@@ -7977,7 +7982,7 @@ fn slot_evict_does_not_block_an_outbound_dial() {
     let cjdns_sock = std::net::SocketAddr::from((cjdns_ip, 8333));
     peers.note_slot_evict(rbitcoin_net::netgroup::slot_pause_group(cjdns_sock));
     assert!(
-        peers.inbound_discouraged(cjdns_sock),
+        peers.inbound_discouraged(cjdns_sock, ORDINARY_BIND),
         "the slot wait still refuses another inbound from that cjdns /32"
     );
     assert!(

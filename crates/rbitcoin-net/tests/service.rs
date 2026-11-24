@@ -488,6 +488,66 @@ async fn listen_onion_loopback_inbound_handshake() {
     assert_eq!(inbound.version, rbitcoin_net::peer::OUR_PROTOCOL_VERSION);
 }
 
+#[tokio::test]
+async fn onion_bind_admission_skips_group_cooldown() {
+    use rbitcoin_net::net_permissions::NetPermTable;
+    use rbitcoin_net::peer::{connect_and_handshake_timed, HandshakePolicy};
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpStream;
+
+    let (_dir, query) = rbitcoin_query::testutil::tiny_query_labeled("onion-bind-admission");
+    let listen = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+    let mut node = P2PNode::start(
+        listen,
+        query,
+        ChainParams::regtest(),
+        Milestone::NONE,
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .unwrap();
+    let ordinary = node.local_addr;
+    let onion = node.add_listen(listen).await.unwrap();
+    node.peers.set_net_perms(NetPermTable {
+        onion_bind: Some(onion),
+        ..Default::default()
+    });
+
+    for port in 40000..40030 {
+        node.peers.register_connecting(
+            SocketAddr::from(([127, 0, 4, 9], port)),
+            ordinary,
+            true,
+            PeerConnType::Inbound,
+        );
+    }
+    assert!(node.peers.try_evict_inbound());
+
+    let mut stream = TcpStream::connect(ordinary).await.unwrap();
+    let bytes = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0]))
+        .await
+        .expect("the ordinary listener should refuse the connection before handshake")
+        .unwrap();
+    assert_eq!(bytes, 0);
+
+    let stream = TcpStream::connect(onion).await.unwrap();
+    connect_and_handshake_timed(
+        Duration::from_secs(5),
+        stream,
+        Magic::REGTEST,
+        onion,
+        onion,
+        0,
+        false,
+        "/rbitcoin:test/",
+        HandshakePolicy::plain(),
+    )
+    .await
+    .expect("the marked listener should admit the forwarder during the group cooldown");
+    node.shutdown().await;
+}
+
 /// The 2 s redial pass must not stack a dial that is still connecting,
 /// and must not lose the target to one that never finishes. A SOCKS
 /// proxy that accepts and never answers holds the first dial in

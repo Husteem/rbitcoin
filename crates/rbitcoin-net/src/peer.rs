@@ -324,6 +324,7 @@ fn store_has_announced_body(hub: &ChainHub, hash: &bitcoin::BlockHash) -> bool {
 /// The hub and key a misbehavior exit may record. Noban and manual peers
 /// are not recorded. A loopback or `0.0.0.0` identity is every local
 /// connection, so Core disconnects that peer and does not discourage it.
+/// A marked onion listener can likewise see one TCP source for many peers.
 /// Onion and I2P use [`crate::peers::LivePeer::net`], not that socket.
 #[doc(hidden)]
 pub fn refusable_addr(
@@ -331,7 +332,14 @@ pub fn refusable_addr(
 ) -> Option<(Arc<crate::peers::PeerHub>, crate::peers::DiscourageKey)> {
     let s = session.filter(|s| !misbehavior_exempt(s))?;
     let key = crate::peers::DiscourageKey::from_net(s.net)?;
-    Some((s.peer_hub()?, key))
+    let hub = s.peer_hub()?;
+    if s.inbound
+        && matches!(key, crate::peers::DiscourageKey::Ip(_))
+        && hub.onion_bind() == Some(s.addrbind)
+    {
+        return None;
+    }
+    Some((hub, key))
 }
 
 /// One-day in-memory refusal.

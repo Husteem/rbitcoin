@@ -1002,10 +1002,9 @@ impl LivePeer {
         }
     }
 
-    /// The network this link carries, which decides the one local address
-    /// it may announce. Tor and I2P inbound both arrive on the loopback
-    /// listener, so with both overlays accepting, a loopback inbound link
-    /// cannot be told apart and announces nothing.
+    /// Choose the network for self-announcements. The local bind identifies
+    /// the marked Tor listener. When Tor and I2P share a loopback listener,
+    /// the source address is ambiguous and neither address is announced.
     fn self_announce_link(&self, hub: &PeerHub) -> SelfAnnounceLink {
         let onion_bind = if self.inbound && self.net.socket_addr().is_some() {
             hub.onion_bind()
@@ -2489,7 +2488,7 @@ impl PeerHub {
         self.overlay_loopback_forward.store(on, Ordering::Relaxed);
     }
 
-    fn onion_bind(&self) -> Option<SocketAddr> {
+    pub(crate) fn onion_bind(&self) -> Option<SocketAddr> {
         self.net_perms
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3389,12 +3388,16 @@ impl PeerHub {
             .contains_key(&key)
     }
 
-    /// True when this inbound address or its accept-time netgroup is still
-    /// refused. Expired rows are dropped here, which is the only sweep.
-    pub fn inbound_discouraged(&self, addr: SocketAddr) -> bool {
+    /// Exact-IP refusals apply to every listener. The marked onion listener
+    /// skips eviction group cooldowns at admission.
+    #[doc(hidden)]
+    pub fn inbound_discouraged(&self, addr: SocketAddr, bind: SocketAddr) -> bool {
         // `key_refused` drops expired rows.
         if self.key_refused(DiscourageKey::Ip(addr.ip())) {
             return true;
+        }
+        if self.onion_bind() == Some(bind) {
+            return false;
         }
         let group = crate::netgroup::slot_pause_group(addr);
         self.discouraged_groups
@@ -4641,7 +4644,7 @@ impl PeerHub {
         };
         if let Some(p) = self
             .get(id)
-            .filter(|p| !p.addr.ip().is_loopback() || self.onion_bind() != Some(p.addrbind))
+            .filter(|p| p.net.socket_addr().is_none() || self.onion_bind() != Some(p.addrbind))
         {
             self.note_slot_evict(crate::netgroup::slot_pause_group(p.addr));
         }

@@ -122,7 +122,7 @@ pub struct ListenOpts {
     pub i2p_sam: Option<SocketAddr>,
     /// Persistent SAM destination + STREAM FORWARD to the P2P bind (`--i2p-accept-incoming`).
     pub i2p_accept_incoming: bool,
-    /// Loopback P2P accept + Tor `ADD_ONION` (`--listen-onion`).
+    /// Tor `ADD_ONION` to the marked P2P bind, with a loopback fallback (`--listen-onion`).
     pub listen_onion: bool,
     /// `--listen` or `--no-listen` was set. Default auto-listen is not explicit.
     pub p2p_explicit: bool,
