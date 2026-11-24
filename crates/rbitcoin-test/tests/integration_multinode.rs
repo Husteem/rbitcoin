@@ -12,9 +12,7 @@ use bitcoin::BlockHash;
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_ibd::{rehydrate_block_queue_residue, IbdConfig};
 use rbitcoin_net::tip_accept::run_on_tip_accept;
-use rbitcoin_net::{
-    run_feeler_timed, select_inbound_eviction, InboundEvictCandidate, NetAddr, NetError, P2PNode,
-};
+use rbitcoin_net::{run_feeler_timed, NetAddr, NetError, P2PNode};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_test::llvm_cov_wall;
@@ -1554,61 +1552,6 @@ async fn pin_feeler_handshake_timeout_after_silence() {
     }
 }
 
-fn pin_select_node_to_evict_ranking() {
-    fn cand(
-        id: u64,
-        connected_at: u64,
-        min_ping: Option<f64>,
-        last_block: u64,
-        last_tx: u64,
-    ) -> InboundEvictCandidate {
-        InboundEvictCandidate {
-            id,
-            connected_at,
-            min_ping,
-            last_block,
-            last_tx,
-            netgroup: 1,
-            noban: false,
-        }
-    }
-    let mut covered = Vec::new();
-    for i in 0..4 {
-        covered.push(cand(i, 100 + i, Some(0.05), 1000 + i, 0));
-    }
-    for i in 4..9 {
-        covered.push(cand(i, 200 + i, Some(0.5), 0, 0));
-    }
-    for i in 9..13 {
-        covered.push(cand(i, 300 + i, Some(0.05), 0, 1000 + i));
-    }
-    for i in 13..21 {
-        covered.push(cand(i, 400 + i, Some(0.01), 0, 0));
-    }
-    assert!(
-        select_inbound_eviction(covered).is_none(),
-        "longest-connected protection covers the remaining slow peers"
-    );
-
-    // Ten slow peers: netgroup and the fourth block slot take one, the eight
-    // longest-connected stay, and the newest slow peer is the victim.
-    let mut cands = Vec::new();
-    for i in 0..4 {
-        cands.push(cand(i, 100 + i, Some(0.05), 1000 + i, 0));
-    }
-    for i in 4..14 {
-        cands.push(cand(i, 200 + i, Some(0.5), 0, 0));
-    }
-    for i in 14..18 {
-        cands.push(cand(i, 300 + i, Some(0.05), 0, 1000 + i));
-    }
-    for i in 18..26 {
-        cands.push(cand(i, 400 + i, Some(0.01), 0, 0));
-    }
-    let victim = select_inbound_eviction(cands).expect("one unprotected slow");
-    assert_eq!(victim, 13, "evict the newest slow peer, victim={victim}");
-}
-
 #[tokio::test]
 async fn p2p_feeler_completes_and_closes() {
     use rbitcoin_net::PeerConnType;
@@ -1760,7 +1703,6 @@ impl RawInbound {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_inbound_full_rejects_extra() {
     let fut = async {
-        pin_select_node_to_evict_ranking();
         let seed_dir = TempDir::new().unwrap();
         let a_dir = TempDir::new().unwrap();
         let b_dir = TempDir::new().unwrap();
@@ -1846,9 +1788,10 @@ async fn p2p_inbound_full_rejects_extra() {
 
 /// `max_inbound=52` holds 26 tx-relaying inbounds. With all 26 connected
 /// and one block-relay-only inbound, a new tx-relaying inbound evicts an
-/// older tx-relaying peer. Protection keeps 25 of those 26 (netgroup, 4
-/// block, 4 tx, 8 ping, 8 longest-connected), so the newest is the victim.
-/// The block-relay-only peer and the newcomer stay.
+/// older tx-relaying peer. Core's protects keep 20 of those 26 (4 keyed
+/// netgroup, 8 ping, 4 tx, 4 block; none relays only blocks) and half of
+/// the other 6 by uptime, so the newest is the victim. The block-relay-only
+/// peer and the newcomer stay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_tx_relay_inbound_past_half_evicts_a_tx_peer() {
     let fut = async {
