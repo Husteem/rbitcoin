@@ -551,6 +551,11 @@ pub struct ElectrumConn {
     /// restatuses only the outpoints it touches; a gap or a reorg restatuses
     /// all.
     outpoint_tip: Option<u32>,
+    /// Subscribed outpoints whose last status sent was a mempool spend. A
+    /// spender can leave the pool without an announce (eviction, expiry, a
+    /// block conflict, a rolled-back package), so each block also restatuses
+    /// the ones the pool no longer spends.
+    outpoint_pool_spent: HashSet<([u8; 32], u32)>,
     /// Silent-payment subscriptions whose history has been sent.
     sp_subs: Vec<SpLive>,
     /// History scans of subscribes that have not reached the tip, at most
@@ -574,6 +579,7 @@ impl ElectrumConn {
             sh_join: None,
             outpoint_subs: HashSet::new(),
             outpoint_tip: None,
+            outpoint_pool_spent: HashSet::new(),
             sp_subs: Vec::new(),
             sp_scans: Vec::new(),
             sp_waiting: std::collections::VecDeque::new(),
@@ -648,14 +654,30 @@ where
                             } else {
                                 None
                             };
-                            let ops: Vec<([u8; 32], u32)> = conn
+                            let mut ops: Vec<([u8; 32], u32)> = conn
                                 .outpoint_subs
                                 .iter()
                                 .copied()
                                 .filter(|op| touch.as_ref().is_none_or(|t| t.touches(op)))
                                 .collect();
+                            if let Some(t) = &touch {
+                                let held: Vec<_> = conn
+                                    .outpoint_pool_spent
+                                    .iter()
+                                    .copied()
+                                    .filter(|op| !t.touches(op))
+                                    .collect();
+                                ops.extend(spenders_left_pool(&query, mempool.clone(), held).await);
+                            }
                             if !ops.is_empty() {
-                                emit_outpoint_notes(&mut writer, &query, mempool.clone(), ops).await?;
+                                emit_outpoint_notes(
+                                    &mut writer,
+                                    &query,
+                                    mempool.clone(),
+                                    ops,
+                                    &mut conn.outpoint_pool_spent,
+                                )
+                                .await?;
                             }
                         }
                         conn.outpoint_tip = Some(t.height);
@@ -751,8 +773,14 @@ where
                             .filter(|op| conn.outpoint_subs.contains(op))
                             .collect();
                         if !touched_ops.is_empty() {
-                            emit_outpoint_notes(&mut writer, &query, mempool.clone(), touched_ops)
-                                .await?;
+                            emit_outpoint_notes(
+                                &mut writer,
+                                &query,
+                                mempool.clone(),
+                                touched_ops,
+                                &mut conn.outpoint_pool_spent,
+                            )
+                            .await?;
                         }
                         // Walk the tx's few scripthashes and probe the sub set,
                         // so the cost per accept does not grow with sub count.
@@ -1267,6 +1295,7 @@ fn read_conn(conn: &mut ElectrumConn, method: &str) -> ElectrumConn {
         },
         outpoint_subs: HashSet::new(),
         outpoint_tip: None,
+        outpoint_pool_spent: HashSet::new(),
         sp_subs: Vec::new(),
         sp_scans: Vec::new(),
         sp_waiting: std::collections::VecDeque::new(),
@@ -1486,6 +1515,7 @@ async fn answer_one(
         sh_join: conn.sh_join.take(),
         outpoint_subs: std::mem::take(&mut conn.outpoint_subs),
         outpoint_tip: conn.outpoint_tip,
+        outpoint_pool_spent: std::mem::take(&mut conn.outpoint_pool_spent),
         sp_subs: std::mem::take(&mut conn.sp_subs),
         sp_scans: std::mem::take(&mut conn.sp_scans),
         sp_waiting: std::mem::take(&mut conn.sp_waiting),
@@ -1839,12 +1869,14 @@ async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     Ok(true)
 }
 
-/// Push the current status of each of `outpoints`.
+/// Push the current status of each of `outpoints`, and note in `pool_spent`
+/// which of them the pool now spends.
 pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     mempool: Option<Arc<MempoolHub>>,
     outpoints: Vec<([u8; 32], u32)>,
+    pool_spent: &mut HashSet<([u8; 32], u32)>,
 ) -> Result<(), std::io::Error> {
     let q = Arc::clone(query);
     let looked = budgeted_blocking(query, move || {
@@ -1860,6 +1892,7 @@ pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
     .await
     .unwrap_or_default();
     for (txid, vout, status) in looked {
+        note_pool_spent(pool_spent, (txid, vout), &status);
         let note = json!({
             "jsonrpc": "2.0",
             "method": "blockchain.outpoint.subscribe",
@@ -1868,6 +1901,43 @@ pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
         writer.line(note).await?;
     }
     Ok(())
+}
+
+/// Record whether `status` is a mempool spend of `op`.
+fn note_pool_spent(pool_spent: &mut HashSet<([u8; 32], u32)>, op: ([u8; 32], u32), status: &Value) {
+    if status.get("spending_txid").is_some() {
+        pool_spent.insert(op);
+    } else {
+        pool_spent.remove(&op);
+    }
+}
+
+/// The outpoints of `held` (last sent as spent by the pool) that no pool
+/// transaction spends now. A pool lookup each, no store read.
+async fn spenders_left_pool(
+    query: &Arc<Query>,
+    mempool: Option<Arc<MempoolHub>>,
+    held: Vec<([u8; 32], u32)>,
+) -> Vec<([u8; 32], u32)> {
+    if held.is_empty() {
+        return held;
+    }
+    budgeted_blocking(query, move || {
+        use bitcoin::hashes::Hash;
+        held.into_iter()
+            .filter(|(txid, vout)| {
+                mempool.as_ref().is_none_or(|mp| {
+                    mp.spending_txid(&bitcoin::OutPoint {
+                        txid: bitcoin::Txid::from_byte_array(*txid),
+                        vout: *vout,
+                    })
+                    .is_none()
+                })
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// Txids a block created and outpoints it spent: the outpoint
@@ -3554,10 +3624,13 @@ fn dispatch_method(
             if conn.outpoint_tip.is_none() {
                 conn.outpoint_tip = query.tip_height().map(|h| h.0);
             }
-            outpoint_status(query, mempool, params)
+            let status = outpoint_status(query, mempool, params)?;
+            note_pool_spent(&mut conn.outpoint_pool_spent, (txid, vout), &status);
+            Ok(status)
         }
         "blockchain.outpoint.unsubscribe" => {
             let (txid, vout) = param_outpoint(params)?;
+            conn.outpoint_pool_spent.remove(&(txid, vout));
             Ok(json!(conn.outpoint_subs.remove(&(txid, vout))))
         }
         "blockchain.silentpayments.unsubscribe" => {

@@ -1351,6 +1351,166 @@ async fn electrum_mempool_notify_follows_funding_and_rbf_on() {
     handle.shutdown().await;
 }
 
+/// A tip restatuses the subscribed outpoints its block spends, and the ones
+/// whose mempool spender has left the pool without an announce (here by
+/// expiry). Coin 0 is spent in the pool after its subscribe, coins 2 and 3
+/// before theirs, and coin 3 is unsubscribed; then every pool spender
+/// expires and the next block spends coin 1. Coins 0, 1 and 2 are pushed
+/// with their new status, and nothing else is.
+#[test]
+fn electrum_tip_restatuses_spent_and_freed_outpoints() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("tokio-rt-worker")
+        .build()
+        .expect("runtime");
+    rt.block_on(electrum_tip_restatuses_spent_and_freed_outpoints_on());
+}
+
+async fn electrum_tip_restatuses_spent_and_freed_outpoints_on() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_net::MempoolHub;
+
+    let dir = TempDir::new().unwrap();
+    let params = ChainParams::regtest();
+    let (q, tip, tip_time, coinbase_txids) = open_electrum_maturity(&dir);
+    let q = Arc::new(q);
+    let spend = |op: OutPoint, outs: usize| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: op,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(if outs == 1 {
+                    11_0000_0000
+                } else {
+                    12_0000_0000
+                }),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            };
+            outs
+        ],
+    };
+    let connect = |prev: bitcoin::BlockHash, h: u32, txs: Vec<Transaction>| {
+        let block =
+            rbitcoin_test::mine::mine_regtest_block(prev, tip_time + 600 * (h - 101), h, txs);
+        rbitcoin_query::accept_and_connect_block(
+            q.as_ref(),
+            &params,
+            rbitcoin_primitives::Height(h),
+            &block,
+            Milestone::NONE,
+        )
+        .unwrap();
+        block
+    };
+    // Block 102 splits the mature coinbase into the watched outpoints.
+    let split = spend(
+        OutPoint {
+            txid: coinbase_txids[0],
+            vout: 0,
+        },
+        4,
+    );
+    let b102 = connect(tip, 102, vec![split.clone()]);
+    let coin = |vout: u32| OutPoint {
+        txid: split.compute_txid(),
+        vout,
+    };
+
+    let mp = Arc::new(MempoolHub::open(dir.path().join("mempool"), Arc::clone(&q)).unwrap());
+    mp.set_relay_enabled(true);
+    let (tip_tx, _) = broadcast::channel(4);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let handle = run_electrum(
+        cfg,
+        Arc::clone(&q),
+        params.clone(),
+        tip_tx.clone(),
+        Some(Arc::clone(&mp)),
+    )
+    .await
+    .expect("electrum listen");
+    let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+    let hex = split.compute_txid().to_string();
+    let subscribe = |vout: u32| json!([hex.clone(), vout]);
+    for vout in [0u32, 1] {
+        let v = rpc(
+            &mut stream,
+            u64::from(vout) + 1,
+            "blockchain.outpoint.subscribe",
+            subscribe(vout),
+        )
+        .await;
+        assert_eq!(v["result"]["spent"], false, "{v}");
+    }
+    let spenders: Vec<Transaction> = [0, 2, 3].map(|v| spend(coin(v), 1)).into();
+    mp.admit(&spenders[0]).expect("accept the coin 0 spender");
+    let push = read_notify(&mut stream, "coin 0 mempool spend").await;
+    assert_eq!(
+        push["params"][2]["spending_txid"],
+        spenders[0].compute_txid().to_string(),
+        "{push}"
+    );
+    for (tx, vout) in spenders[1..].iter().zip([2u32, 3]) {
+        mp.admit(tx).expect("accept a pool spender");
+        let v = rpc(
+            &mut stream,
+            u64::from(vout) + 1,
+            "blockchain.outpoint.subscribe",
+            subscribe(vout),
+        )
+        .await;
+        assert_eq!(v["result"]["height"], 0, "{v}");
+    }
+    let v = rpc(
+        &mut stream,
+        5,
+        "blockchain.outpoint.unsubscribe",
+        subscribe(3),
+    )
+    .await;
+    assert_eq!(v["result"], true, "{v}");
+    let ids: Vec<_> = spenders.iter().map(Transaction::compute_txid).collect();
+    assert_eq!(mp.remove_expired_roots(&ids), 3);
+
+    let b103 = connect(b102.block_hash(), 103, vec![spend(coin(1), 1)]);
+    tip_tx
+        .send(TipNotify {
+            height: 103,
+            header_hex: bitcoin::consensus::encode::serialize_hex(&b103.header),
+            reorg_from_height: None,
+        })
+        .expect("tip push");
+    let mut pushes = Vec::new();
+    for label in ["coin push 1", "coin push 2", "coin push 3"] {
+        let push = read_notify(&mut stream, label).await;
+        assert_eq!(push["method"], "blockchain.outpoint.subscribe", "{push}");
+        pushes.push(push["params"][2].clone());
+    }
+    pushes.sort_by_key(|s| s["vout"].as_u64());
+    assert_eq!(
+        pushes,
+        vec![
+            json!({"txid": hex, "vout": 0, "spent": false}),
+            json!({"txid": hex, "vout": 1, "spent": true, "height": 103}),
+            json!({"txid": hex, "vout": 2, "spent": false}),
+        ]
+    );
+    let ping = rpc(&mut stream, 6, "server.ping", json!([])).await;
+    assert_eq!(ping["id"], 6, "one push per changed outpoint: {ping}");
+
+    handle.shutdown().await;
+}
+
 /// Sparrow subscribes every receive and change address up to its gap limit on
 /// one connection; the old 1,000 default refused `../0/332` of a real wallet.
 /// The default must take a wallet well past that.
