@@ -1774,16 +1774,19 @@ impl Query {
                 cursor_missing: true,
             });
         };
-        // Walk the posting tail before the full strong list: a full page over
-        // the cap is refused after reading only the page, not every create.
-        let postings = self.stable_sh_create_fks(scripthash)?;
-        let window = self.newest_create_window(&postings, k, scan.high, scan.strict, view)?;
-        let full = window.bound.is_some();
-        let admit = if full {
+        // A list no longer than the page reads at most a page of creates. A
+        // longer one can walk every create above a deep cursor, so it takes
+        // the unpaged cap and heavy turn from the create count, before the
+        // posting list is loaded.
+        let creates = self.scripthash_create_count(scripthash)?;
+        let admit = if usize::try_from(creates).map_or(true, |n| n > k) {
             Some(self.unpaged_join_admit(scripthash)?)
         } else {
             None
         };
+        let postings = self.stable_sh_create_fks(scripthash)?;
+        let window = self.newest_create_window(&postings, k, scan.high, scan.strict, view)?;
+        let full = window.bound.is_some();
         // Debug drops the probe before `admit`, so a released heavy turn is
         // not counted as still running. The turn covers the body load below.
         #[cfg(debug_assertions)]

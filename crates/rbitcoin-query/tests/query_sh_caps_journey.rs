@@ -237,6 +237,19 @@ fn sh_history_caps() {
         err.to_string() == "scripthash join exceeds --max-sh-creates (7 creates, cap 2)",
         "a full newest page over the cap must refuse: {err}"
     );
+    // A cursor with fewer than a page of creates below it walks every
+    // create above it: a list longer than the page takes the cap too.
+    let deep = rbitcoin_query::scripthash::HistoryFilter {
+        limit: Some(3),
+        order: NewestFirst,
+        after_txid: Some(cb_txids[1]),
+        ..rbitcoin_query::scripthash::HistoryFilter::open()
+    };
+    let err = q.scripthash_history_filtered(&sh, &deep).unwrap_err();
+    assert!(
+        err.to_string() == "scripthash join exceeds --max-sh-creates (7 creates, cap 2)",
+        "a deep cursor over the cap must refuse: {err}"
+    );
     q.set_max_sh_creates(0);
     assert_eq!(
         sh_page(&q, &sh, NewestFirst, None).unwrap(),
