@@ -5115,6 +5115,19 @@ fn testmempoolaccept_package_counts_each_cluster_alone() {
     let grand = child_of(&child, 1_000);
     let rows = test(&[&unrelated, &child, &grand, &child_of(&grand, 1_000)]);
     assert!(rows.as_array().unwrap().iter().all(over_cap), "{rows}");
+    // A member whose pool parent's cluster is already at the cap is still a
+    // parent for a later member. Over `maxfeerate` it is not, as Core asks
+    // that before the cluster.
+    let pooled_child = spend(0);
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&pooled_child))]).unwrap();
+    let member = child_of(&pooled_child, 1_000);
+    let member_child = child_of(&member, 1_000);
+    let rows = test(&[&member, &member_child]);
+    assert!(rows.as_array().unwrap().iter().all(over_cap), "{rows}");
+    let hexes = json!([hex(&member), hex(&member_child)]);
+    let rows = dispatch(&ctx, "testmempoolaccept", vec![hexes, json!(0.00001)]).unwrap();
+    assert_eq!(rows[0]["reject-reason"], "max-fee-exceeded", "{rows}");
+    assert_eq!(rows[1]["reject-reason"], "missing-inputs", "{rows}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

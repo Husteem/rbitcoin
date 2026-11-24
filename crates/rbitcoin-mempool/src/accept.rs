@@ -2180,13 +2180,17 @@ impl ActiveMempool {
         };
         let parent_txids = scan.parent_txids;
         // Cluster limits count raw weight (Libre): at 20 B/sigop an adjusted
-        // cap would reject any tx above ~20,200 sigop cost.
+        // cap would reject any tx above ~20,200 sigop cost. A package dry run
+        // (tested members present) leaves the cap to its package precheck,
+        // which counts every member and asks after the member's own checks
+        // and `maxfeerate`, as Core does.
         let (n_members, base_w) = self
             .graph
             .connected_weight_except(&parent_txids, &conflict_set);
         let combined_w = base_w.saturating_add(prep.weight);
-        if n_members + 1 > self.graph.cluster_count_limit()
-            || combined_w.saturating_add(3) / 4 > self.graph.cluster_vsize_limit()
+        if prep.tested.is_none()
+            && (n_members + 1 > self.graph.cluster_count_limit()
+                || combined_w.saturating_add(3) / 4 > self.graph.cluster_vsize_limit())
         {
             return Err(AcceptError::ClusterTooLarge {
                 count: n_members + 1,
