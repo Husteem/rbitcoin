@@ -547,6 +547,10 @@ pub struct ElectrumConn {
     pub sh_subs: HashSet<[u8; 32]>,
     pub sh_join: Option<Arc<ShJoinSlot>>,
     pub outpoint_subs: HashSet<([u8; 32], u32)>,
+    /// Height the outpoint statuses were last checked at. The next block
+    /// restatuses only the outpoints it touches; a gap or a reorg restatuses
+    /// all.
+    outpoint_tip: Option<u32>,
     /// Silent-payment subscriptions whose history has been sent.
     sp_subs: Vec<SpLive>,
     /// History scans of subscribes that have not reached the tip, at most
@@ -569,6 +573,7 @@ impl ElectrumConn {
             sh_subs: HashSet::new(),
             sh_join: None,
             outpoint_subs: HashSet::new(),
+            outpoint_tip: None,
             sp_subs: Vec::new(),
             sp_scans: Vec::new(),
             sp_waiting: std::collections::VecDeque::new(),
@@ -633,14 +638,27 @@ where
                             writer.line(msg).await?;
                         }
                         if !conn.outpoint_subs.is_empty() {
-                            emit_outpoint_notes(
-                                &mut writer,
-                                &query,
-                                mempool.clone(),
-                                conn.outpoint_subs.iter().copied().collect(),
-                            )
-                            .await?;
+                            // The next block: only the outpoints it creates or
+                            // spends. A reorg, a gap, or a block that cannot
+                            // be read restatuses every subscription.
+                            let next = t.reorg_from_height.is_none()
+                                && conn.outpoint_tip.and_then(|h| h.checked_add(1)) == Some(t.height);
+                            let touch = if next {
+                                block_outpoint_touch(&query, t.height).await
+                            } else {
+                                None
+                            };
+                            let ops: Vec<([u8; 32], u32)> = conn
+                                .outpoint_subs
+                                .iter()
+                                .copied()
+                                .filter(|op| touch.as_ref().is_none_or(|t| t.touches(op)))
+                                .collect();
+                            if !ops.is_empty() {
+                                emit_outpoint_notes(&mut writer, &query, mempool.clone(), ops).await?;
+                            }
                         }
+                        conn.outpoint_tip = Some(t.height);
                         restart_sp_scans_after_reorg(&mut conn.sp_scans, &query, &params, &t);
                         emit_sp_tips(&mut writer, &query, &params, &mut conn, &t).await?;
                         if !conn.sh_subs.is_empty() {
@@ -1248,6 +1266,7 @@ fn read_conn(conn: &mut ElectrumConn, method: &str) -> ElectrumConn {
             None
         },
         outpoint_subs: HashSet::new(),
+        outpoint_tip: None,
         sp_subs: Vec::new(),
         sp_scans: Vec::new(),
         sp_waiting: std::collections::VecDeque::new(),
@@ -1466,6 +1485,7 @@ async fn answer_one(
         sh_subs: std::mem::take(&mut conn.sh_subs),
         sh_join: conn.sh_join.take(),
         outpoint_subs: std::mem::take(&mut conn.outpoint_subs),
+        outpoint_tip: conn.outpoint_tip,
         sp_subs: std::mem::take(&mut conn.sp_subs),
         sp_scans: std::mem::take(&mut conn.sp_scans),
         sp_waiting: std::mem::take(&mut conn.sp_waiting),
@@ -1848,6 +1868,61 @@ pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
         writer.line(note).await?;
     }
     Ok(())
+}
+
+/// Txids a block created and outpoints it spent: the outpoint
+/// subscriptions whose status that block can change.
+#[doc(hidden)]
+pub struct OutpointTouch {
+    created: HashSet<[u8; 32]>,
+    spent: HashSet<([u8; 32], u32)>,
+}
+
+impl OutpointTouch {
+    fn touches(&self, op: &([u8; 32], u32)) -> bool {
+        self.created.contains(&op.0) || self.spent.contains(op)
+    }
+}
+
+/// The touch set of the active block at `height`, built once per block for
+/// every connection: (store, height, block hash) → set. `None` when the
+/// block cannot be read (for example its bodies were pruned).
+async fn block_outpoint_touch(query: &Arc<Query>, height: u32) -> Option<Arc<OutpointTouch>> {
+    type Cached = Option<(usize, u32, [u8; 32], Arc<OutpointTouch>)>;
+    static LAST: std::sync::OnceLock<std::sync::Mutex<Cached>> = std::sync::OnceLock::new();
+    let q = Arc::clone(query);
+    budgeted_blocking(query, move || {
+        let (fk, rec) = q.header_at_height(Height(height)).ok()??;
+        let store = Arc::as_ptr(&q) as usize;
+        let last = LAST.get_or_init(|| std::sync::Mutex::new(None));
+        if let Some((s, h, hash, touch)) = last.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if *s == store && *h == height && *hash == rec.hash {
+                return Some(Arc::clone(touch));
+            }
+        }
+        let created = q.header_txids(fk).ok()?.into_iter().collect();
+        let block = q.reconstruct_archived_block(&rec.hash).ok()??;
+        let spent = block
+            .txdata
+            .iter()
+            .flat_map(|tx| tx.input.iter())
+            .filter(|i| !i.previous_output.is_null())
+            .map(|i| {
+                use bitcoin::hashes::Hash;
+                (
+                    i.previous_output.txid.to_byte_array(),
+                    i.previous_output.vout,
+                )
+            })
+            .collect();
+        let touch = Arc::new(OutpointTouch { created, spent });
+        *last.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((store, height, rec.hash, Arc::clone(&touch)));
+        Some(touch)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[doc(hidden)]
@@ -3476,6 +3551,9 @@ fn dispatch_method(
                 vout,
                 config.max_scripthash_subs,
             )?;
+            if conn.outpoint_tip.is_none() {
+                conn.outpoint_tip = query.tip_height().map(|h| h.0);
+            }
             outpoint_status(query, mempool, params)
         }
         "blockchain.outpoint.unsubscribe" => {

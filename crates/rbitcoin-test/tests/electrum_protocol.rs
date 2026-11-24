@@ -829,15 +829,9 @@ async fn electrum_server_version_history_balance() {
         })
         .expect("scripthash tip push");
     {
+        // The subscribed all-zero outpoint is not touched by this empty
+        // block, so only the scripthash is pushed.
         let mut reader = BufReader::new(&mut stream);
-        let mut op_line = String::new();
-        read_line_timeout(&mut reader, &mut op_line, "outpoint notification").await;
-        let op_push: Value = serde_json::from_str(&op_line).unwrap();
-        assert_eq!(
-            op_push["method"].as_str(),
-            Some("blockchain.outpoint.subscribe"),
-            "{op_push}"
-        );
         let mut sh_line = String::new();
         read_line_timeout(&mut reader, &mut sh_line, "scripthash notification").await;
         let push: Value = serde_json::from_str(&sh_line).unwrap();

@@ -2364,6 +2364,86 @@ async fn announce_pushes_only_subscribed_outpoints() {
     let _ = std::fs::remove_dir_all(&pad.dir);
 }
 
+/// A new block restatuses only the subscribed outpoints it creates or
+/// spends. An outpoint the block does not touch gets no lookup and no push.
+#[tokio::test]
+async fn tip_pushes_only_outpoints_the_block_touches() {
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let mut pad = pool_pad().await;
+    let untouched = "11".repeat(32);
+    let mut cb1 = [0u8; 32];
+    cb1[0] = 0x71;
+    cb1[31] = 0xd1;
+    let created = {
+        let mut r = cb1;
+        r.reverse();
+        rbitcoin_primitives::hex_encode(r)
+    };
+    for (id, (hex, vout)) in [(untouched.clone(), 1), (created.clone(), 0)]
+        .into_iter()
+        .enumerate()
+    {
+        let sub = pad
+            .call(
+                id as u32 + 1,
+                "blockchain.outpoint.subscribe",
+                json!([hex, vout]),
+            )
+            .await;
+        assert_eq!(sub["result"]["spent"], false, "{sub}");
+    }
+    let (fk0, rec0) = pad.q.header_at_height(Height(0)).unwrap().unwrap();
+    let merkle = rbitcoin_store::merkle_root_from_txids(&[cb1]);
+    let hash = rbitcoin_store::block_header_hash(1, &rec0.hash, &merkle, 2, 0x207fffff, 0);
+    let header = HeaderRecord {
+        prev_fk: fk0,
+        version: 1,
+        timestamp: 2,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: merkle,
+        hash,
+        size: 0,
+        weight: 0,
+    };
+    let ta = TxApply {
+        tx: TxRecord {
+            txid: cb1,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: [0u8; 32],
+            parent: rbitcoin_store::InputParent::Coinbase,
+            sequence: u32::MAX,
+            script_sig: vec![1, 1],
+            witness: vec![],
+        }],
+        outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+    };
+    pad.q.connect_block(Height(1), &header, &[ta]).unwrap();
+    pad.tip_tx
+        .send(TipNotify {
+            height: 1,
+            header_hex: "00".repeat(80),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    let push = pad.read().await;
+    assert_eq!(push["method"], "blockchain.outpoint.subscribe", "{push}");
+    assert_eq!(push["params"][0], created, "{push}");
+    let ping = pad.call(9, "server.ping", json!([])).await;
+    assert_eq!(
+        ping["id"], 9,
+        "pushed an outpoint the block did not touch: {ping}"
+    );
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
 #[tokio::test]
 async fn chain_view_reorg_notifies_dropped_scripthash() {
     use rbitcoin_query::TxApply;
