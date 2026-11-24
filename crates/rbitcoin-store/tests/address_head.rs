@@ -885,3 +885,41 @@ fn entry_from_page_reads_four_and_skips_short() {
     );
     assert_eq!(entry_from_page_buf(&word[..3], 0), None);
 }
+
+/// A caller sees a snapshot's layout and generation before any slot is
+/// allocated, and `load` gives the table `write_snapshot` wrote.
+#[test]
+fn snapshot_image_reads_the_footer_before_the_slots() {
+    let path = tmp("image");
+    let h = head_bits(&path, 12).unwrap();
+    let mut batch: Vec<_> = (1..=300u64)
+        .map(|i| {
+            let mut txid = [0u8; 32];
+            txid[0..8].copy_from_slice(&i.to_le_bytes());
+            (txid, Fk(i))
+        })
+        .collect();
+    h.insert_many_in_place(&mut batch).unwrap();
+    h.write_snapshot(&path, 300).unwrap();
+
+    let image = SnapshotImage::open(&path).unwrap();
+    assert_eq!(image.layout(), HeadLayout::new(12).unwrap());
+    assert_eq!(image.generation(), 300);
+    let loaded = image.load().unwrap();
+    assert_eq!(loaded.snapshot_generation(), Some(300));
+    assert_eq!(loaded.layout, h.layout);
+    for slot in 0..h.layout.slots() {
+        assert_eq!(loaded.slot_word(slot), h.slot_word(slot), "slot {slot}");
+    }
+
+    h.write_snapshot(&path, 0).unwrap();
+    assert_eq!(SnapshotImage::open(&path).unwrap().generation(), 0);
+
+    let raw = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &raw[4..]).unwrap();
+    assert!(
+        matches!(SnapshotImage::open(&path), Err(StoreError::Corrupt(_))),
+        "a short image must not open"
+    );
+    let _ = std::fs::remove_file(&path);
+}

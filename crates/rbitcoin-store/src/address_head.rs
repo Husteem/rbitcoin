@@ -477,6 +477,78 @@ pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError
     Ok((HeadLayout::new(bits)?, generation))
 }
 
+/// A `tx.head` snapshot file whose footer and size were read and checked.
+/// No slot is allocated until [`Self::load`], so a caller can refuse a
+/// layout or generation it does not trust without paying for the table.
+pub struct SnapshotImage {
+    file: TableFile,
+    layout: HeadLayout,
+    generation: u64,
+}
+
+impl SnapshotImage {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        let path = path.into();
+        if path.is_dir() {
+            return Err(StoreError::Corrupt(
+                "tx.head is a directory (legacy shards); wipe datadir for address head",
+            ));
+        }
+        let (file, ext) = TableFile::open_trailing_header_from_end(&path, TableKind::HashHead)?;
+        let (layout, generation) = decode_layout_ext(&ext)?;
+        let body = file.data_len();
+        if body == 0 {
+            return Err(StoreError::Corrupt("address head size"));
+        }
+        if body != layout.body_bytes() {
+            return Err(StoreError::Corrupt(
+                "address head size mismatch vs footer layout",
+            ));
+        }
+        remove_legacy_meta_sidecar(&path);
+        Ok(Self {
+            file,
+            layout,
+            generation,
+        })
+    }
+
+    #[inline]
+    pub fn layout(&self) -> HeadLayout {
+        self.layout
+    }
+
+    /// Footer generation. 0 is an image whose writer died before the
+    /// footer commit.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Read every slot into a new table. Each word is written once, from the
+    /// file, with no zero fill first.
+    pub fn load(self) -> Result<AddressHead, StoreError> {
+        let body = self.layout.body_bytes();
+        let n = usize::try_from(self.layout.slots())
+            .map_err(|_| StoreError::Corrupt("address head slot count"))?;
+        let mut slots: Vec<AtomicU32> = Vec::with_capacity(n);
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut off = 0u64;
+        while off < body {
+            let len = usize::try_from(body - off).map_or(buf.len(), |r| r.min(buf.len()));
+            self.file.read_at(off, &mut buf[..len])?;
+            slots.extend((0..len / 4).map(|i| AtomicU32::new(word_at(&buf, i))));
+            off += len as u64;
+        }
+        Ok(AddressHead {
+            layout: self.layout,
+            slots: slots.into_boxed_slice(),
+            snapshot_generation: Some(self.generation),
+            dirty: AtomicBool::new(false),
+        })
+    }
+}
+
 /// Fixed-width keyless txid → dense create_fk table.
 ///
 /// The slot array is anonymous memory. A slot is `rel | fp << bits`. The
@@ -520,42 +592,7 @@ impl AddressHead {
     /// Load a snapshot image. The caller trusts it only when
     /// [`Self::snapshot_generation`] equals the segment's meta count.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        let path = path.into();
-        if path.is_dir() {
-            return Err(StoreError::Corrupt(
-                "tx.head is a directory (legacy shards); wipe datadir for address head",
-            ));
-        }
-        let (file, ext) = TableFile::open_trailing_header_from_end(&path, TableKind::HashHead)?;
-        let (layout, generation) = decode_layout_ext(&ext)?;
-        let expect_body = layout.body_bytes();
-        let body = file.data_len();
-        if body == 0 {
-            return Err(StoreError::Corrupt("address head size"));
-        }
-        if body != expect_body {
-            return Err(StoreError::Corrupt(
-                "address head size mismatch vs footer layout",
-            ));
-        }
-        remove_legacy_meta_sidecar(&path);
-        let head = Self::empty(layout);
-        let mut buf = vec![0u8; 1024 * 1024];
-        let mut off = 0u64;
-        while off < body {
-            let n = ((body - off) as usize).min(buf.len());
-            file.read_at(off, &mut buf[..n])?;
-            let start = (off / 4) as usize;
-            let words = n / 4;
-            for i in 0..words {
-                head.slots[start + i].store(word_at(&buf, i), Ordering::Relaxed);
-            }
-            off += n as u64;
-        }
-        Ok(Self {
-            snapshot_generation: Some(generation),
-            ..head
-        })
+        SnapshotImage::open(path)?.load()
     }
 
     /// Footer generation of the image [`Self::open`] loaded. `None` on a

@@ -23,7 +23,7 @@
 //! **Lookup:** unsealed OAs newest-first; then sealed newest→oldest gated by fuse8;
 //! candidates are absolute fks for body-verify by the caller.
 
-use crate::address_head::{AddressHead, HeadLayout, HEAD_LOAD_START, MAINNET_BITS};
+use crate::address_head::{AddressHead, HeadLayout, SnapshotImage, HEAD_LOAD_START, MAINNET_BITS};
 use crate::error::StoreError;
 use crate::fuse8_filter::{fuse_key_from_mixed, open_file, SealedFuse8};
 use crate::tx_head_mphf::TxHeadMphf;
@@ -1197,17 +1197,24 @@ fn load_trusted_snapshot(
     if !path.is_file() {
         return Ok(None);
     }
-    match AddressHead::open(path) {
-        Ok(h) if h.bits() != layout.bits => {
-            Err(StoreError::Corrupt("tx.head segment layout mismatch"))
-        }
-        Ok(h) if h.snapshot_generation() == Some(count) => Ok(Some(h)),
-        Ok(_) => Ok(None),
-        Err(e) => {
-            rbitcoin_log::warn!("store: tx.head snapshot ignored ({e})");
-            Ok(None)
-        }
+    // The footer decides before any slot is allocated: an image from a
+    // writer that died before its footer commit is generation 0.
+    let image = match SnapshotImage::open(path) {
+        Ok(image) => image,
+        Err(e) => return Ok(ignored_snapshot(&e)),
+    };
+    if image.layout().bits != layout.bits {
+        return Err(StoreError::Corrupt("tx.head segment layout mismatch"));
     }
+    if image.generation() != count {
+        return Ok(None);
+    }
+    Ok(image.load().map_or_else(|e| ignored_snapshot(&e), Some))
+}
+
+fn ignored_snapshot(e: &StoreError) -> Option<AddressHead> {
+    rbitcoin_log::warn!("store: tx.head snapshot ignored ({e})");
+    None
 }
 
 /// Load the open tail when the snapshot footer names `count`. Anything else
