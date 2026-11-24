@@ -999,34 +999,54 @@ pub fn block_template_sync(st: &AppState) -> Response {
     let Some(fun) = st.block_template.as_ref() else {
         return not_found();
     };
-    let Some(h) = st.query.tip_height() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response();
+    // The tip and pool generation the cache is checked against.
+    let sample = || -> Result<([u8; 32], u64), Box<Response>> {
+        let Some(h) = st.query.tip_height() else {
+            return Err(Box::new(
+                (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response(),
+            ));
+        };
+        let tip = match st.query.header_at_height(h) {
+            Ok(Some((_, rec))) => rec.hash,
+            Ok(None) => {
+                return Err(Box::new(
+                    (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response(),
+                ))
+            }
+            Err(e) => return Err(Box::new(store_err(e))),
+        };
+        let updates = st
+            .mempool
+            .as_ref()
+            .map(|m| m.template_updates())
+            .unwrap_or(0);
+        Ok((tip, updates))
     };
-    let tip = match st.query.header_at_height(h) {
-        Ok(Some((_, rec))) => rec.hash,
-        Ok(None) => return (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response(),
-        Err(e) => return store_err(e),
-    };
-    let updates = st
-        .mempool
-        .as_ref()
-        .map(|m| m.template_updates())
-        .unwrap_or(0);
-    let cached = || {
+    let cached = |tip: &[u8; 32], updates: u64| {
         let cache = st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner());
         cache
             .as_ref()
-            .filter(|c| gbt_cache_hit(c, &tip, updates))
+            .filter(|c| gbt_cache_hit(c, tip, updates))
             .map(|c| Arc::clone(&c.body))
     };
-    if let Some(body) = cached() {
+    let (tip, updates) = match sample() {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if let Some(body) = cached(&tip, updates) {
         return gbt_json(&body);
     }
     // One build at a time: a concurrent miss waits for the build in progress
     // and then reads its result. The cache lock itself is not held across
-    // selection, so a hit never waits on a build.
+    // selection, so a hit never waits on a build. The tip is read again
+    // after the wait: a block that connected during it must not be answered
+    // with the template the wait started on.
     let _build = st.gbt_build.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(body) = cached() {
+    let (tip, updates) = match sample() {
+        Ok(v) => v,
+        Err(r) => return *r,
+    };
+    if let Some(body) = cached(&tip, updates) {
         return gbt_json(&body);
     }
     match (fun.0)() {

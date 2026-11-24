@@ -2344,6 +2344,55 @@ async fn esplora_blocks_waits_on_the_store_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core `getblocktemplate` reuse, both sides: on the same tip a template
+/// younger than 5 s survives a mempool change, and an older one is rebuilt
+/// for it within the 15 s TTL.
+#[test]
+fn block_template_rebuilds_for_pool_churn_only_after_5s() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("gbt-5s").expect("dir");
+    let q = Arc::new(Query::open_or_create_tiny(dir.path().join("store")).unwrap());
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let tip = q.header_at_height(Height(0)).unwrap().unwrap().1.hash;
+    let mp = rbitcoin_net::MempoolHub::open(dir.path().join("mempool"), Arc::clone(&q)).unwrap();
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_fn = Arc::clone(&calls);
+    let st = AppState {
+        query: Arc::clone(&q),
+        network: Network::Regtest,
+        mempool: Some(Arc::clone(&mp)),
+        max_body: 1 << 20,
+        sh_join: Arc::new(Mutex::new(JoinCache::default())),
+        join_header_trusted: false,
+        block_template: Some(BlockTemplateFn(Arc::new(move || {
+            calls_fn.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({"height": 1}))
+        }))),
+        gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(Mutex::new(())),
+        send_stall: Duration::from_secs(120),
+    };
+    let updates = mp.template_updates();
+    mp.note_template_update();
+    for (age, rebuilds) in [(2, 0), (6, 1)] {
+        calls.store(0, Ordering::Relaxed);
+        *st.gbt_cache.lock().unwrap() = Some(GbtCache {
+            at: std::time::Instant::now() - Duration::from_secs(age),
+            tip,
+            updates,
+            body: Arc::new(json!({"height": 1})),
+        });
+        let r = handlers::block_template_sync(&st);
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            rebuilds,
+            "a {age} s old template after a pool change"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The 15s cache mutex is not held while `template_prev` waits on connect.
 #[tokio::test]
 async fn block_template_does_not_lock_the_cache_across_template_prev() {
