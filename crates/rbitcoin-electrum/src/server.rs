@@ -1325,7 +1325,7 @@ async fn land<W: AsyncWrite + Unpin>(
         conn,
         last_sent,
         flight.asked,
-        result,
+        result.map_err(ReplyError::from),
         stamped,
         Took::Ran(ran),
     );
@@ -1460,7 +1460,9 @@ async fn answer_one(
                 broadcast_raw_tx_async(&asked.params, ctx.config, ctx.mempool.as_ref()).await
             }
             "blockchain.transaction.broadcast_package" => {
-                broadcast_package_async(&asked.params, ctx.config, ctx.mempool.as_ref()).await
+                broadcast_package_async(&asked.params, ctx.config, ctx.mempool.as_ref())
+                    .await
+                    .map_err(ReplyError::from)
             }
             _ => Err("unknown broadcast".into()),
         };
@@ -1489,7 +1491,7 @@ async fn answer_one(
             conn,
             last_sent,
             asked,
-            result,
+            result.map_err(ReplyError::from),
             None,
             Took::Since(t0),
         ));
@@ -1519,10 +1521,38 @@ async fn answer_one(
         conn,
         last_sent,
         asked,
-        result,
+        result.map_err(ReplyError::from),
         stamped,
         Took::Since(t0),
     ))
+}
+
+/// A method error and the JSON-RPC code to answer it with. A broadcast
+/// refusal is electrs's daemon-error class (2); other method errors are 1.
+pub(crate) struct ReplyError {
+    message: String,
+    code: i16,
+}
+
+impl From<String> for ReplyError {
+    fn from(message: String) -> Self {
+        Self { message, code: 1 }
+    }
+}
+
+impl From<&str> for ReplyError {
+    fn from(message: &str) -> Self {
+        Self {
+            message: message.into(),
+            code: 1,
+        }
+    }
+}
+
+impl ReplyError {
+    fn daemon(message: String) -> Self {
+        Self { message, code: 2 }
+    }
 }
 
 /// Status bookkeeping, metering, the API log line, and the reply object.
@@ -1532,7 +1562,7 @@ fn finish_reply(
     conn: &ElectrumConn,
     last_sent: &mut HashMap<[u8; 32], String>,
     asked: Asked,
-    result: Result<Value, String>,
+    result: Result<Value, ReplyError>,
     stamped: Option<ChainView>,
     took: Took,
 ) -> Value {
@@ -1576,10 +1606,14 @@ fn finish_reply(
                 method,
                 &params_s,
                 wall_ms,
-                Some(&e),
+                Some(&e.message),
             );
-            let code = if e == RAW_TX_NOT_FOUND { 2 } else { 1 };
-            json!({"jsonrpc":"2.0","id": id, "error": {"code": code, "message": e}})
+            let code = if e.message == RAW_TX_NOT_FOUND {
+                2
+            } else {
+                e.code
+            };
+            json!({"jsonrpc":"2.0","id": id, "error": {"code": code, "message": e.message}})
         }
     }
 }
@@ -3462,21 +3496,23 @@ fn package_broadcast_value(verbose: bool, accepted: &[rbitcoin_net::AcceptResult
 }
 
 /// Accept one raw tx, with script verify awaited on the connection task. A tx
-/// whose txid is already pooled answers the txid too.
-pub async fn broadcast_raw_tx_async(
+/// whose txid is already pooled answers the txid too. A refusal is the
+/// message `sendrawtransaction` gives, which electrs forwards from Core, at
+/// electrs's daemon-error code.
+pub(crate) async fn broadcast_raw_tx_async(
     params: &Value,
     config: &ElectrumConfig,
     mempool: Option<&Arc<MempoolHub>>,
-) -> Result<Value, String> {
+) -> Result<Value, ReplyError> {
     let tx = broadcast_tx_from_params(params, config)?;
     let mp = mempool
         .ok_or_else(|| "mempool not available".to_string())?
         .clone();
     let txid = tx.compute_txid();
     let budget = mp.query.api_read_budget();
-    rbitcoin_net::with_store_budget(budget, ApiSurface::Electrum, mp.broadcast_local_async(tx))
+    rbitcoin_net::with_store_budget(budget, ApiSurface::Electrum, mp.broadcast_client_async(tx))
         .await
-        .map_err(|e| format!("broadcast reject: {e}"))?;
+        .map_err(|reject| ReplyError::daemon(reject.message))?;
     Ok(json!(txid.to_string()))
 }
 
