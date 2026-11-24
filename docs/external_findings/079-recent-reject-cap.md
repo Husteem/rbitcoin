@@ -4,6 +4,6 @@
 **Status:** fixed
 **Found by:** Stephan Livera, 2026-10-02 (L6)
 
-The recent-reject set cleared itself when it reached the cap, so it could keep growing. It stops at 4096 entries and does not clear.
+The recent-reject set cleared itself when it reached the cap, so it could keep growing. It then stopped at 4096 entries, which let cheap rejects switch it off until the next block (#1949). It now rolls: up to 120,000 entries, as Core, and a full set drops its oldest entry.
 
-**Regression:** `rbitcoin-net` `recent_reject_at_the_cap_does_not_clear`.
+**Regression:** `rbitcoin-net` `recent_rejects_roll_instead_of_refusing`.
