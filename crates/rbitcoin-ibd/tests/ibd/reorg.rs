@@ -1781,3 +1781,30 @@ fn reorg_pin_a_planted_queue_hides_the_walk_tip() {
     assert!(cands.is_empty(), "{cands:?}");
     let _ = dir;
 }
+
+/// A rewind path that crosses an abandoned (unservable) header is refused, like
+/// one that crosses an invalid header: IBD will not request the abandoned
+/// header's body, so a rewind onto it could never be completed.
+#[test]
+fn rewind_refuses_a_path_through_an_unservable_header() {
+    let (dir, hub) = tmp_hub();
+    let t = 1_500_099_940;
+    let chain = confirmed_chain(&hub, 2, t);
+    let fork = side_headers(&hub, &chain, 0, 5, t + 1);
+    let mut st =
+        rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    st.reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(fork[4]));
+    st.unservable.insert(fork[2]);
+
+    assert!(
+        !maybe_rewind_to_best_work(&mut st, &hub).unwrap(),
+        "a path through an unservable header is not a rewind candidate"
+    );
+    assert_eq!(
+        hub.tip_height(),
+        Some(2),
+        "the confirmed tip is not disconnected for an unservable path"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

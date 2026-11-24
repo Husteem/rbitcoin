@@ -88,18 +88,23 @@ pub fn install_resume(
     );
     // `load_resume_entries` runs outside the shared lock, so a hash abandoned
     // while it loaded is not in the exclusion list. Refuse it here, while the
-    // path is installed, or it restarts the mutated-copy cycle (#1811).
+    // path is installed, or it restarts the mutated-copy cycle (#1811). The
+    // explore tip below must also stay inside this prefix: a tip past a
+    // refused entry is a rewind candidate whose path needs a body IBD will
+    // not request.
     fn refused(st: &IbdWorkState, e: &rbitcoin_query::ResumeWorkEntry) -> bool {
         st.reorg.invalid.contains(e.hash)
             || st.unservable.contains(&BlockHash::from_byte_array(e.hash))
     }
+    let installed = path
+        .iter()
+        .position(|e| refused(st, e))
+        .unwrap_or(path.len());
+    let path = &path[..installed];
     let mut explore_is_sibling_fork = false;
     let mut explore_need = Vec::new();
     for e in path {
         let hash = BlockHash::from_byte_array(e.hash);
-        if refused(st, e) {
-            break;
-        }
         st.known_headers.insert(hash);
         st.hash_height.insert(hash, e.height);
         st.header_fks.insert(hash, e.header_fk);
@@ -113,11 +118,7 @@ pub fn install_resume(
         }
     }
     if explore_is_sibling_fork {
-        let explore_tip = path
-            .iter()
-            .rev()
-            .find(|e| !refused(st, e))
-            .map(|e| BlockHash::from_byte_array(e.hash));
+        let explore_tip = path.last().map(|e| BlockHash::from_byte_array(e.hash));
         st.reorg.register_explore(explore_need, explore_tip);
         if rewind_now {
             match super::reorg::maybe_rewind_to_best_work(st, hub) {
@@ -146,9 +147,6 @@ pub fn install_resume(
     let mut ready_prefix = true;
     let tip = hub.tip_height().zip(hub.tip_hash());
     for e in path {
-        if refused(st, e) {
-            break;
-        }
         let hash = BlockHash::from_byte_array(e.hash);
         let prev = BlockHash::from_byte_array(e.prev_hash);
         let on_path = st.try_set_path_slot(hash, e.height, prev, tip);

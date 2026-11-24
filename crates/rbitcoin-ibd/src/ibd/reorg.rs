@@ -395,8 +395,8 @@ pub fn heavier_fork_candidates(
         cands.extend(unplanted_walk_tip(st, hub));
     }
     st.reorg.drain_deferred_into(&mut cands);
-    let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
-    Ok((cands, invalid))
+    let refused = refused_hashes(st);
+    Ok((cands, refused))
 }
 
 /// Scan a competing work-path tip+1 for a heavier disconnected fork and
@@ -554,7 +554,7 @@ pub fn maybe_rewind_to_best_work_n(
     walk_max: usize,
 ) -> Result<bool, NetError> {
     let cands = rewind_candidate_hashes(st, hub)?;
-    let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
+    let invalid = refused_hashes(st);
     let mut cap = None;
     let tip_before = tip_pair(hub);
     let picked = select_heavier_path(
@@ -596,6 +596,18 @@ pub fn rewind_candidate_hashes(
         }
     }
     Ok(cands)
+}
+
+/// Hashes a rewind path must never cross: consensus-invalid ones, and headers
+/// IBD abandoned because their body cannot be delivered. A path through either
+/// cannot be completed from the peers IBD keeps, so selecting it would rewind
+/// onto work the pipeline can never finish.
+fn refused_hashes(st: &super::state::IbdWorkState) -> HashSet<[u8; 32]> {
+    st.reorg
+        .invalid
+        .iter()
+        .chain(st.unservable.iter().map(|h| h.to_byte_array()))
+        .collect()
 }
 
 /// Which eligible path a selection returns.
@@ -1021,8 +1033,8 @@ pub fn rewind_off_coord_lock(
         let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
         let mut cands = rewind_candidate_hashes(&st, hub)?;
         st.reorg.drain_deferred_into(&mut cands);
-        let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
-        (cands, invalid)
+        let refused = refused_hashes(&st);
+        (cands, refused)
     };
     apply_off_lock_rewind(shared, hub, &cands, &invalid)
 }

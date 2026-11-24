@@ -5534,41 +5534,62 @@ fn abandoning_an_unwritable_planted_sibling_clears_the_path_and_plants_the_next(
 }
 
 /// A resume path loaded outside the lock can contain a hash abandoned while it
-/// loaded. Installation must refuse it, or it restarts the mutated-copy cycle.
+/// loaded. Installation must refuse it, and the explore tip must stay inside
+/// the installed prefix: a tip past the refused entry is a rewind candidate
+/// whose path needs a body IBD will not request.
 #[test]
-fn resume_installation_refuses_an_unservable_entry() {
+fn resume_installation_refuses_an_unservable_entry_and_bounds_the_explore_tip() {
     use bitcoin::Network;
     use rbitcoin_ibd::ibd::path::install_resume;
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("resume-unservable");
     hub.ensure_genesis().unwrap();
-    let tip = hub.tip_hash().unwrap();
-    let t = hub.tip_height().unwrap();
-    let height = t + 1;
     let time = bitcoin::blockdata::constants::genesis_block(Network::Regtest)
         .header
         .time
         .saturating_add(600);
-    let block = rbitcoin_consensus::mine_empty_regtest(tip, time, height);
-    let fks = hub.ensure_headers_batch(&[block.header]).unwrap();
-    let hash = block.block_hash();
-    let entry = rbitcoin_query::ResumeWorkEntry {
-        height,
-        hash: hash.to_byte_array(),
-        prev_hash: tip.to_byte_array(),
-        header_fk: fks[0],
-        has_body: false,
-    };
+    let mut prev = hub.tip_hash().unwrap();
+    let mut blocks = Vec::new();
+    for height in 1..=3u32 {
+        let block = rbitcoin_consensus::mine_empty_regtest(prev, time + 100 * height, height);
+        hub.accept_block(block.clone()).unwrap();
+        prev = block.block_hash();
+        blocks.push(block);
+    }
+    let tip = hub.tip_hash().unwrap();
+    let t = hub.tip_height().unwrap();
+    let mut entries = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        let fk = hub.ensure_headers_batch(&[block.header]).unwrap()[0];
+        let prev_hash = if i == 0 {
+            bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash()
+        } else {
+            blocks[i - 1].block_hash()
+        };
+        entries.push(rbitcoin_query::ResumeWorkEntry {
+            height: i as u32 + 1,
+            hash: block.block_hash().to_byte_array(),
+            prev_hash: prev_hash.to_byte_array(),
+            header_fk: fk,
+            has_body: true,
+        });
+    }
+    let middle = blocks[1].block_hash();
+    let last = blocks[2].block_hash();
+    let first = blocks[0].block_hash();
 
     let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
-    st.unservable.insert(hash);
-    install_resume(&mut st, &hub, &[entry], false);
+    st.unservable.insert(middle);
+    install_resume(&mut st, &hub, &entries, false);
 
     assert!(
-        !st.ordered_set.contains(&hash),
-        "an abandoned header must not be installed from a stale resume path"
+        !st.ordered_set.contains(&last),
+        "an abandoned header must stop installation before the entries above it"
     );
-    assert_ne!(st.height_to_hash.get(&height), Some(&hash));
-    assert!(!st.tip_siblings.contains(&hash));
+    assert_eq!(
+        st.reorg.explore_tips(),
+        &[first],
+        "the explore tip stops at the installed prefix, not the last entry"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
