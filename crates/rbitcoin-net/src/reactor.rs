@@ -82,6 +82,15 @@ fn off_pool_tx() -> mpsc::Sender<Box<dyn FnOnce() + Send>> {
     .clone()
 }
 
+/// Queue `f` on the one `rbtc-off-pool` thread without waiting.
+///
+/// Cleanup that must leave a Tokio worker (a `Drop`) uses this. The job must
+/// not call [`off_pool`], same as any other job on that thread.
+pub(crate) fn queue_off_pool(f: impl FnOnce() + Send + 'static) {
+    let job: Box<dyn FnOnce() + Send> = Box::new(f);
+    let _ = off_pool_tx().send(job);
+}
+
 /// Run `f` on the one `rbtc-off-pool` thread and await it.
 ///
 /// Not the Tokio blocking pool: a parked pool must still finish a connect or
