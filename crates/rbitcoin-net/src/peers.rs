@@ -1989,6 +1989,28 @@ fn recv_msg_type(cmd: &str) -> &'static str {
         .unwrap_or("*other*")
 }
 
+/// Insert or refresh `key` until `until`. A new key at `cap` first drops
+/// expired entries, then the entry that expires soonest; one map has one
+/// TTL, so that is the oldest. Core's rolling filters evict the same way
+/// instead of refusing, so a flood of new keys cannot switch the map off.
+fn insert_rolling<K: std::hash::Hash + Eq + Copy>(
+    map: &mut HashMap<K, u64>,
+    key: K,
+    until: u64,
+    now: u64,
+    cap: usize,
+) {
+    if !map.contains_key(&key) && map.len() >= cap {
+        map.retain(|_, t| *t > now);
+        if map.len() >= cap {
+            if let Some(oldest) = map.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k) {
+                map.remove(&oldest);
+            }
+        }
+    }
+    map.insert(key, until);
+}
+
 /// Count at least Core's 24-byte header; `pong` must be ≥29 for `connect_nodes`.
 #[doc(hidden)]
 pub fn acct_bytes(cmd: &str, payload: u64) -> u64 {
@@ -3353,7 +3375,8 @@ impl PeerHub {
     /// Shorter than [`Self::DISCOURAGE_TTL_SECS`]. A netgroup that just lost
     /// an inbound slot cannot refill it immediately.
     pub const NETGROUP_SLOT_WAIT_SECS: u64 = 10 * 60;
-    /// The in-memory set does not grow past this many addresses.
+    /// The in-memory set does not grow past this many addresses. A new one at
+    /// the cap evicts the entry that expires first.
     pub const DISCOURAGE_CAP: usize = 10_000;
     /// A rate-limit strike counts toward the next one for this long.
     pub const RATE_STRIKE_SECS: u64 = 60 * 60;
@@ -3371,7 +3394,7 @@ impl PeerHub {
     }
 
     /// Record `ip` until [`Self::DISCOURAGE_TTL_SECS`] from now. At the cap a
-    /// new address is ignored; an address already stored is refreshed.
+    /// new address evicts the oldest; an address already stored is refreshed.
     #[cfg(debug_assertions)]
     pub fn note_misbehavior_addr(&self, ip: IpAddr) {
         self.note_misbehavior_key(DiscourageKey::Ip(ip));
@@ -3384,16 +3407,13 @@ impl PeerHub {
             .discouraged_addrs
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !g.contains_key(&key) && g.len() >= Self::DISCOURAGE_CAP {
-            return;
-        }
-        g.insert(key, until);
+        insert_rolling(&mut g, key, until, now, Self::DISCOURAGE_CAP);
     }
 
     /// True when `ip` still has a strike from an earlier rate-limit
     /// disconnect; that strike is spent. Otherwise records one for
     /// [`Self::RATE_STRIKE_SECS`]. Expired strikes are dropped here. At
-    /// [`Self::DISCOURAGE_CAP`] a new address is not recorded.
+    /// [`Self::DISCOURAGE_CAP`] a new address evicts the oldest strike.
     pub fn note_rate_strike(&self, key: DiscourageKey) -> bool {
         let now = self.now_secs();
         let mut g = self.rate_strikes.lock().unwrap_or_else(|e| e.into_inner());
@@ -3401,26 +3421,21 @@ impl PeerHub {
         if g.remove(&key).is_some() {
             return true;
         }
-        if g.len() < Self::DISCOURAGE_CAP {
-            g.insert(key, now.saturating_add(Self::RATE_STRIKE_SECS));
-        }
+        let until = now.saturating_add(Self::RATE_STRIKE_SECS);
+        insert_rolling(&mut g, key, until, now, Self::DISCOURAGE_CAP);
         false
     }
 
     /// The netgroup that just lost an inbound slot waits
     /// [`Self::NETGROUP_SLOT_WAIT_SECS`].
     pub fn note_slot_evict(&self, group: u64) {
-        let until = self
-            .now_secs()
-            .saturating_add(Self::NETGROUP_SLOT_WAIT_SECS);
+        let now = self.now_secs();
+        let until = now.saturating_add(Self::NETGROUP_SLOT_WAIT_SECS);
         let mut g = self
             .discouraged_groups
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !g.contains_key(&group) && g.len() >= Self::DISCOURAGE_CAP {
-            return;
-        }
-        g.insert(group, until);
+        insert_rolling(&mut g, group, until, now, Self::DISCOURAGE_CAP);
     }
 
     /// Misbehavior key for this net. A slot-eviction netgroup stays inbound-only.
