@@ -681,3 +681,52 @@ fn sealed_segment_probe_is_sized_by_active_keys() {
     assert!(cands[0].1.contains(&Fk(5)), "{cands:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The open tail's snapshot footer is checked before its slots are read. A
+/// snapshot written with other bits is refused; one cut short is ignored
+/// and the tail is rebuilt.
+#[test]
+fn open_tail_snapshot_footer_decides_before_load() {
+    let dir = tmp();
+    let layout = HeadLayout::new(10).unwrap();
+    {
+        let h = SegmentedTxHead::create(&dir, layout).unwrap();
+        let mut entries: Vec<_> = (0..100u64).map(|i| (mixed(i + 1), Fk(i + 1))).collect();
+        h.insert_many(&mut entries).unwrap();
+        h.flush().unwrap();
+    }
+    let oa = dir.join("tx.head").join("000000");
+    let good = std::fs::read(&oa).unwrap();
+    {
+        let other = dir.join("other-bits");
+        let wide = rbitcoin_store::address_head::AddressHead::create_with_layout(
+            &other,
+            HeadLayout::new(11).unwrap(),
+        )
+        .unwrap();
+        wide.write_snapshot(&oa, 100).unwrap();
+    }
+    match SegmentedTxHead::open(&dir) {
+        Err(StoreError::Corrupt(m)) => assert_eq!(m, "tx.head segment layout mismatch"),
+        Err(e) => panic!("expected layout mismatch, got {e}"),
+        Ok(_) => panic!("a snapshot with other bits must not open"),
+    }
+
+    std::fs::write(&oa, &good[..good.len() - 40]).unwrap();
+    let h = SegmentedTxHead::open(&dir).unwrap();
+    assert_eq!(
+        h.open_tail_rebuild_from().unwrap(),
+        Some(1),
+        "a short snapshot is not trusted"
+    );
+
+    drop(h);
+    std::fs::write(&oa, &good).unwrap();
+    let h = SegmentedTxHead::open(&dir).unwrap();
+    assert_eq!(h.open_tail_rebuild_from().unwrap(), None);
+    for i in [1u64, 50, 100] {
+        let cands = h.probe_candidates(&mixed(i)).unwrap();
+        assert!(cands.iter().any(|f| f.0 == i), "missing {i}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
