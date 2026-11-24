@@ -3467,7 +3467,13 @@ fn assert_inactive_block_and_pruned(
 ) {
     let h1_early = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
     ctx.query.set_pruneheight(Some(Height(1))).unwrap();
-    assert_raw_tx_not_in_block(ctx, txid, json!(true), h1_early.as_str().unwrap());
+    let pruned_block = dispatch(
+        ctx,
+        "getrawtransaction",
+        vec![json!(txid), json!(true), h1_early],
+    )
+    .unwrap_err();
+    assert_raw_tx_error(&pruned_block, ERR_MISC, "Block not available");
     let above_prune = dispatch(ctx, "getrawtransaction", vec![json!(txid), json!(true)])
         .unwrap_or_else(|e| panic!("unscoped lookup of an unpruned tx must succeed: {e}"));
     assert!(
@@ -3494,13 +3500,28 @@ fn assert_inactive_block_and_pruned(
         .unwrap_or_else(|e| panic!("lookup without blockhash must still succeed: {e}"));
     assert!(unscoped.get("in_active_chain").is_none(), "{unscoped}");
     let h1 = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
-    let h1_cb = dispatch(ctx, "getblock", vec![h1, json!(1)]).unwrap()["tx"][0]
+    let h1_cb = dispatch(ctx, "getblock", vec![h1.clone(), json!(1)]).unwrap()["tx"][0]
         .as_str()
         .unwrap()
         .to_string();
     ctx.query.set_pruneheight(Some(Height(1))).unwrap();
-    let pruned = dispatch(ctx, "getrawtransaction", vec![json!(h1_cb)]).unwrap_err();
+    let pruned = dispatch(ctx, "getrawtransaction", vec![json!(h1_cb.clone())]).unwrap_err();
     assert_raw_tx_error(&pruned, ERR_INVALID_ADDRESS_OR_KEY, TX_PRUNED);
+    let scoped = dispatch(
+        ctx,
+        "getrawtransaction",
+        vec![json!(h1_cb.clone()), json!(true), h1],
+    )
+    .unwrap_err();
+    assert_raw_tx_error(&scoped, ERR_MISC, "Block not available");
+    let (status, body) = rest_text(ctx, &format!("/rest/tx/{h1_cb}.json"), "");
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body.trim_end(), format!("{h1_cb} not found"));
+    for ext in ["hex", "bin"] {
+        let (status, body) = rest_text(ctx, &format!("/rest/tx/{h1_cb}.{ext}"), "");
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{ext}: {body}");
+        assert_eq!(body.trim_end(), TX_PRUNED, "{ext}: {body}");
+    }
     let genesis_still = dispatch(ctx, "getrawtransaction", vec![json!(genesis_tx)]).unwrap_err();
     assert_raw_tx_error(
         &genesis_still,
@@ -5876,6 +5897,24 @@ fn prune_life_getblock(ctx: &RpcContext) {
     assert_eq!(stats["outs"], 1);
     assert_eq!(ctx.query.sample_reset_reconstruct_archived(), 0);
     ctx.query.set_pruneheight(Some(Height(1))).unwrap();
+    let stat_fk = ctx.query.block_tx_fks(Height(1)).unwrap()[0];
+    ctx.query
+        .store()
+        .write_txstat_row(
+            stat_fk,
+            &rbitcoin_store::TxStatRow {
+                fee_sat: 0,
+                base: 0,
+                wit_extra: 0,
+            },
+        )
+        .unwrap();
+    let pruned_stats = dispatch(ctx, "getblockstats", vec![json!(1)]).unwrap_err();
+    assert_eq!(pruned_stats["code"], ERR_MISC, "{pruned_stats}");
+    assert_eq!(
+        pruned_stats["message"], "Block not available (pruned data)",
+        "{pruned_stats}"
+    );
     let h1 = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
     let b1 = dispatch(ctx, "getblock", vec![h1, json!(1)]).unwrap();
     let rerr = dispatch(ctx, "getrawtransaction", vec![b1["tx"][0].clone()]).unwrap_err();
