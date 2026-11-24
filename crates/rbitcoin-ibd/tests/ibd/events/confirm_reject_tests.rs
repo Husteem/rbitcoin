@@ -5480,3 +5480,95 @@ fn sibling_header_write_misses_are_capped_and_bounded() {
         st.header_write_misses.len()
     );
 }
+
+/// A planted sibling whose header was never written (the store refused it) must
+/// still leave the path: its parent comes from `path_prev`, not the store, and
+/// the next recorded sibling is planted at the freed height.
+#[test]
+fn abandoning_an_unwritable_planted_sibling_clears_the_path_and_plants_the_next() {
+    use bitcoin::Network;
+    use rbitcoin_ibd::ibd::events::abandon_unwritable_sibling;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("unwritable-sibling");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let t = hub.tip_height().unwrap();
+    let height = t + 1;
+    let time = bitcoin::blockdata::constants::genesis_block(Network::Regtest)
+        .header
+        .time
+        .saturating_add(600);
+    let planted = rbitcoin_consensus::mine_empty_regtest(tip, time, height);
+    let next = rbitcoin_consensus::mine_empty_regtest(tip, time + 1, height);
+    // The store refused the planted header: no row, no fk.
+    assert!(hub.header_of(&planted.block_hash()).is_none());
+
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
+    st.header_walk.origin = true;
+    let planted_hash = planted.block_hash();
+    let next_hash = next.block_hash();
+    st.record_height(planted_hash, height);
+    st.note_path_prev(planted_hash, tip);
+    st.known_headers.insert(planted_hash);
+    st.ordered.push_back(planted_hash);
+    st.ordered_set.insert(planted_hash);
+    st.hash_height.insert(next_hash, height);
+    st.known_headers.insert(next_hash);
+    st.note_path_prev(next_hash, tip);
+    st.tip_siblings.push(next_hash);
+
+    abandon_unwritable_sibling(&mut st, &hub, planted_hash, height);
+
+    assert!(st.unservable.contains(&planted_hash));
+    assert!(
+        !st.ordered_set.contains(&planted_hash),
+        "the abandoned path occupant must leave the queue"
+    );
+    assert_eq!(
+        st.height_to_hash.get(&height),
+        Some(&next_hash),
+        "the next recorded sibling must be planted at the freed height"
+    );
+    assert!(st.ordered_set.contains(&next_hash));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A resume path loaded outside the lock can contain a hash abandoned while it
+/// loaded. Installation must refuse it, or it restarts the mutated-copy cycle.
+#[test]
+fn resume_installation_refuses_an_unservable_entry() {
+    use bitcoin::Network;
+    use rbitcoin_ibd::ibd::path::install_resume;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("resume-unservable");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let t = hub.tip_height().unwrap();
+    let height = t + 1;
+    let time = bitcoin::blockdata::constants::genesis_block(Network::Regtest)
+        .header
+        .time
+        .saturating_add(600);
+    let block = rbitcoin_consensus::mine_empty_regtest(tip, time, height);
+    let fks = hub.ensure_headers_batch(&[block.header]).unwrap();
+    let hash = block.block_hash();
+    let entry = rbitcoin_query::ResumeWorkEntry {
+        height,
+        hash: hash.to_byte_array(),
+        prev_hash: tip.to_byte_array(),
+        header_fk: fks[0],
+        has_body: false,
+    };
+
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
+    st.unservable.insert(hash);
+    install_resume(&mut st, &hub, &[entry], false);
+
+    assert!(
+        !st.ordered_set.contains(&hash),
+        "an abandoned header must not be installed from a stale resume path"
+    );
+    assert_ne!(st.height_to_hash.get(&height), Some(&hash));
+    assert!(!st.tip_siblings.contains(&hash));
+    let _ = std::fs::remove_dir_all(dir);
+}

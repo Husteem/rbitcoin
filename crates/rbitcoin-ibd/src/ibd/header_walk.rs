@@ -1231,13 +1231,42 @@ pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
 /// it again this session; the path above its parent is re-seeded so an
 /// equal-work sibling at tip+1 can be asked for instead. After IBD,
 /// tip-follow can still connect a block a peer serves for it.
+#[doc(hidden)]
 pub fn retire_unservable(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u32) {
+    retire_undeliverable(
+        st,
+        hub,
+        hash,
+        height,
+        "every body copy arrived mutated and the sender cannot be dropped",
+    );
+}
+
+/// Retire a header the store will not write. Its body cannot be attached this
+/// session; it is dropped like a mutated one. The parent comes from
+/// [`IbdWorkState::path_prev`] because the failed write leaves no store row.
+#[doc(hidden)]
+pub fn retire_unwritable_header(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    hash: BlockHash,
+    height: u32,
+) {
+    retire_undeliverable(st, hub, hash, height, "its header could not be written");
+}
+
+fn retire_undeliverable(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    hash: BlockHash,
+    height: u32,
+    why: &str,
+) {
     if !cut_walk_to_parent(st, hub, hash, height) {
         return;
     }
     rbitcoin_log::warn!(
-        "ibd: header abandoned at {hash} height={height}: every body copy arrived mutated \
-         and the sender cannot be dropped; walk back to {:?} height={}",
+        "ibd: header abandoned at {hash} height={height}: {why}; walk back to {:?} height={}",
         st.header_walk.tip_hash(),
         st.header_walk.tip_height()
     );
@@ -1249,6 +1278,15 @@ pub fn retire_unservable(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash,
     super::path::plant_valid_tip_child(st, hub);
 }
 
+/// The parent a work-path hash entered with. The store row is preferred; a
+/// sibling whose header write failed has none, and `path_prev` is its only
+/// record.
+fn parent_of(st: &IbdWorkState, hub: &ChainHub, hash: BlockHash) -> Option<BlockHash> {
+    hub.header_of(&hash)
+        .map(|h| h.prev_blockhash)
+        .or_else(|| st.path_prev.get(&hash).copied())
+}
+
 /// Drop the walk and the download path above `hash`'s parent. False when the
 /// hash is not on the path or its parent header is unknown, which leaves the
 /// caller nothing safe to cut.
@@ -1257,7 +1295,7 @@ fn cut_walk_to_parent(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
     if !st.is_on_path(&hash, height) {
         return false;
     }
-    let Some(parent) = hub.header_of(&hash).map(|h| h.prev_blockhash) else {
+    let Some(parent) = parent_of(st, hub, hash) else {
         return false;
     };
     let parent_h = height.saturating_sub(1);

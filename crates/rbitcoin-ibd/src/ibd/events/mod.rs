@@ -876,11 +876,7 @@ pub fn apply_block_framed(
                 }
                 None => {
                     if note_header_write_miss(st, hash) {
-                        st.unservable.insert(hash);
-                        st.body.stop_reget(hash);
-                        st.tip_siblings.retain(|h| *h != hash);
-                        super::header_walk::forget_sibling_rows(st, hash);
-                        st.header_write_misses.remove(&hash);
+                        abandon_unwritable_sibling(st, hub, hash, height);
                         return;
                     }
                     st.body.mark_missing(hash);
@@ -1740,6 +1736,27 @@ pub fn note_header_write_miss(st: &mut IbdWorkState, hash: BlockHash) -> bool {
     let misses = st.header_write_misses.entry(hash).or_insert(0);
     *misses = misses.saturating_add(1);
     *misses >= SIBLING_HEADER_WRITE_TRIES
+}
+
+/// The header write for `hash` failed its bound. Stop the sibling lane and take
+/// the hash off the path: a planted sibling keeps its slot otherwise, `ordered`
+/// never empties, and the next recorded sibling is never planted.
+#[doc(hidden)]
+pub fn abandon_unwritable_sibling(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    hash: BlockHash,
+    height: u32,
+) {
+    st.unservable.insert(hash);
+    st.body.stop_reget(hash);
+    st.tip_siblings.retain(|h| *h != hash);
+    st.header_write_misses.remove(&hash);
+    if st.is_on_path(&hash, height) {
+        super::header_walk::retire_unwritable_header(st, hub, hash, height);
+    } else {
+        super::header_walk::forget_sibling_rows(st, hash);
+    }
 }
 
 /// Mutated copies of one hash before its header is abandoned. Three matches

@@ -86,11 +86,18 @@ pub fn install_resume(
         path.len(),
         t0.elapsed()
     );
+    // `load_resume_entries` runs outside the shared lock, so a hash abandoned
+    // while it loaded is not in the exclusion list. Refuse it here, while the
+    // path is installed, or it restarts the mutated-copy cycle (#1811).
+    fn refused(st: &IbdWorkState, e: &rbitcoin_query::ResumeWorkEntry) -> bool {
+        st.reorg.invalid.contains(e.hash)
+            || st.unservable.contains(&BlockHash::from_byte_array(e.hash))
+    }
     let mut explore_is_sibling_fork = false;
     let mut explore_need = Vec::new();
     for e in path {
         let hash = BlockHash::from_byte_array(e.hash);
-        if st.reorg.invalid.contains(e.hash) {
+        if refused(st, e) {
             break;
         }
         st.known_headers.insert(hash);
@@ -109,7 +116,7 @@ pub fn install_resume(
         let explore_tip = path
             .iter()
             .rev()
-            .find(|e| !st.reorg.invalid.contains(e.hash))
+            .find(|e| !refused(st, e))
             .map(|e| BlockHash::from_byte_array(e.hash));
         st.reorg.register_explore(explore_need, explore_tip);
         if rewind_now {
@@ -139,7 +146,7 @@ pub fn install_resume(
     let mut ready_prefix = true;
     let tip = hub.tip_height().zip(hub.tip_hash());
     for e in path {
-        if st.reorg.invalid.contains(e.hash) {
+        if refused(st, e) {
             break;
         }
         let hash = BlockHash::from_byte_array(e.hash);
