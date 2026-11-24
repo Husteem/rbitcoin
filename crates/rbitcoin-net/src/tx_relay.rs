@@ -5992,11 +5992,11 @@ impl MempoolHub {
         &self,
         missing: &BTreeSet<Txid>,
         peer: u64,
-        inbound: bool,
+        preferred: bool,
         now: u64,
     ) {
         let mut g = self.parent_req.lock().unwrap_or_else(|e| e.into_inner());
-        self.schedule_parents_locked(&mut g, missing, peer, inbound, now);
+        self.schedule_parents_locked(&mut g, missing, peer, preferred, now);
     }
 
     /// Another announcer of the orphan is asked only while the tracker still
@@ -6006,12 +6006,12 @@ impl MempoolHub {
         &self,
         missing: &BTreeSet<Txid>,
         peer: u64,
-        inbound: bool,
+        preferred: bool,
         now: u64,
     ) {
         let mut g = self.parent_req.lock().unwrap_or_else(|e| e.into_inner());
         if g.sessions.contains(&peer) {
-            self.schedule_parents_locked(&mut g, missing, peer, inbound, now);
+            self.schedule_parents_locked(&mut g, missing, peer, preferred, now);
         }
     }
 
@@ -6020,17 +6020,16 @@ impl MempoolHub {
         g: &mut parent_req::ParentTracker,
         missing: &BTreeSet<Txid>,
         peer: u64,
-        inbound: bool,
+        preferred: bool,
         now: u64,
     ) {
         let delay = TXID_RELAY_DELAY_SECS
-            + if inbound {
-                NONPREF_PEER_TX_DELAY_SECS
-            } else {
+            + if preferred {
                 0
+            } else {
+                NONPREF_PEER_TX_DELAY_SECS
             };
         let reqtime = now.saturating_add(delay);
-        let preferred = !inbound;
         for p in missing {
             if self.parent_already_have(p) {
                 continue;
@@ -6047,14 +6046,14 @@ impl MempoolHub {
         &self,
         peer: u64,
         hash: [u8; 32],
-        inbound: bool,
+        preferred: bool,
         now: u64,
         wtxid: bool,
     ) -> ParentNote {
         self.parent_req
             .lock()
             .unwrap()
-            .note_inv(peer, hash, inbound, now, wtxid)
+            .note_inv(peer, hash, preferred, now, wtxid)
     }
 
     pub fn forget_parent_anns_for_peer(&self, peer: u64) {

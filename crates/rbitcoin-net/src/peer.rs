@@ -5345,8 +5345,13 @@ pub fn on_inv_txid(
         return None;
     }
     if let Some(s) = session {
-        match mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false)
-        {
+        match mp.note_inv_tx_requested(
+            s.id,
+            txid.to_byte_array(),
+            tx_download_preferred(s),
+            s.clock_now(),
+            false,
+        ) {
             crate::tx_relay::ParentNote::RequestNow => {}
             crate::tx_relay::ParentNote::Deferred => return None,
             crate::tx_relay::ParentNote::PeerCapped => {
@@ -5356,6 +5361,14 @@ pub fn on_inv_txid(
         }
     }
     Some(Inventory::WitnessTransaction(*txid))
+}
+
+/// Core `fPreferredDownload`: an outbound peer or an inbound one with
+/// `noban`, that is not an addr-fetch connection and can serve blocks.
+fn tx_download_preferred(s: &crate::peers::LivePeer) -> bool {
+    (!s.inbound || s.session_noban())
+        && s.conn_type != crate::peers::PeerConnType::AddrFetch
+        && s.can_serve_blocks()
 }
 
 fn asks_back_local_tx(
@@ -5390,7 +5403,7 @@ pub fn on_inv_wtxid(
             match mp.note_inv_tx_requested(
                 s.id,
                 wtxid.to_byte_array(),
-                s.inbound,
+                tx_download_preferred(s),
                 s.clock_now(),
                 true,
             ) {
@@ -5423,7 +5436,7 @@ fn note_parked_announcer(
         return;
     }
     let _ = mp.add_orphan_announcer(&parked.compute_wtxid(), s.id);
-    mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
+    mp.schedule_orphan_parents(&missing, s.id, tx_download_preferred(s), s.clock_now());
 }
 
 struct HeadersApply {
@@ -7164,7 +7177,7 @@ pub fn schedule_orphan_parent_getdata(
     };
     let missing = mp.orphan_getdata_parents(tx);
     let now = s.clock_now();
-    mp.schedule_orphan_parents(&missing, s.id, s.inbound, now);
+    mp.schedule_orphan_parents(&missing, s.id, tx_download_preferred(s), now);
     let Some(ph) = s.peer_hub() else {
         return;
     };
@@ -7173,7 +7186,7 @@ pub fn schedule_orphan_parent_getdata(
             continue;
         }
         if let Some(p) = ph.live_peers().into_iter().find(|p| p.id == *id) {
-            mp.schedule_announcer_parents(&missing, p.id, p.inbound, now);
+            mp.schedule_announcer_parents(&missing, p.id, tx_download_preferred(&p), now);
         }
     }
 }

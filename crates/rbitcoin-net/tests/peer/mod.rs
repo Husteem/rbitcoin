@@ -4305,8 +4305,8 @@ fn inv_of_a_pooled_tx_that_is_also_parked_is_not_requested() {
         addr,
         addr,
         &ver,
-        true,
-        rbitcoin_net::peers::PeerConnType::Inbound,
+        false,
+        rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
     );
     let (out_tx, mut rx) = peer_out_channel();
     let mut follow = PeerFollowState::new();
@@ -4416,8 +4416,8 @@ fn recent_reject_is_not_requested_from_other_peers() {
                 addr,
                 addr,
                 &ver,
-                true,
-                rbitcoin_net::peers::PeerConnType::Inbound,
+                false,
+                rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
             )
         };
         let sender = register(18444, 1);
@@ -7518,6 +7518,33 @@ fn inbound_peer(
     )
 }
 
+/// A preferred tx-download peer (outbound full relay): its tx invs are
+/// asked at once, with no `NONPREF_PEER_TX_DELAY`.
+fn preferred_peer(
+    peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
+    port: u16,
+) -> std::sync::Arc<rbitcoin_net::peers::LivePeer> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: bitcoin::p2p::ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: u64::from(port),
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    peers.register(
+        addr,
+        addr,
+        &ver,
+        false,
+        rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
+    )
+}
+
 #[test]
 fn inbound_netgroup_is_fixed_at_accept() {
     let peers = rbitcoin_net::peers::PeerHub::new();
@@ -8049,6 +8076,54 @@ fn slot_evict_does_not_block_an_outbound_dial() {
     );
 }
 
+/// An inbound peer's tx inv is not asked at once (Core
+/// `NONPREF_PEER_TX_DELAY`). The heartbeat sweep asks it once the delay has
+/// passed, so inbound announcements are still fetched.
+#[tokio::test]
+async fn inbound_tx_inv_is_asked_after_the_nonpref_delay() {
+    use bitcoin::hashes::Hash;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("inbound-tx-delay");
+    hub.ensure_genesis().unwrap();
+    let t = hub.tip_header().unwrap().time;
+    hub.clock.set_mock(i64::from(t) + 1);
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
+            .unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(10_000);
+    let peer = inbound_peer(&peers);
+    peer.set_wtxid_relay();
+    let (out_tx, mut rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let wtxid = bitcoin::Wtxid::from_byte_array([0x5a; 32]);
+    let getdata = |rx: &mut PeerOutRx| {
+        let mut want = Vec::new();
+        while let Ok(out) = rx.try_recv() {
+            if let NetworkMessage::GetData(v) = out.expect_msg() {
+                want.extend(v);
+            }
+        }
+        want
+    };
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[Inventory::WTx(wtxid)],
+    )
+    .unwrap();
+    rbitcoin_net::peer::queue_due_parent_getdata(&hub, &peer, &out_tx);
+    assert!(getdata(&mut rx).is_empty(), "an inbound announcer waits");
+    peers.set_mock_now(10_000 + rbitcoin_net::tx_relay::NONPREF_PEER_TX_DELAY_SECS);
+    rbitcoin_net::peer::queue_due_parent_getdata(&hub, &peer, &out_tx);
+    assert_eq!(getdata(&mut rx), vec![Inventory::WTx(wtxid)]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn inv_getdata_charges_send_budget() {
     use bitcoin::hashes::Hash;
@@ -8065,7 +8140,7 @@ async fn inv_getdata_charges_send_budget() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
-    let peer = inbound_peer(&peers);
+    let peer = preferred_peer(&peers, 2);
     let (out_tx, _rx) = peer.open_out();
     let mut follow = PeerFollowState::new();
     let tx = Inventory::WitnessTransaction(Txid::from_byte_array([0x42; 32]));
@@ -8177,8 +8252,10 @@ async fn notfound_makes_the_waiting_wtxid_peer_due() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
-    let peer1 = inbound_peer(&peers);
-    let peer2 = inbound_peer(&peers);
+    // A fixed clock: `noted` and the note read the same second.
+    peers.set_mock_now(1_000_000);
+    let peer1 = preferred_peer(&peers, 2);
+    let peer2 = preferred_peer(&peers, 3);
     let wtxid = bitcoin::Wtxid::from_byte_array([0xef; 32]);
     let inv = [Inventory::WTx(wtxid)];
     let noted = peer1.clock_now();
@@ -8226,9 +8303,11 @@ async fn notfound_for_txid_inventory_wakes_the_waiter() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
+    // A fixed clock: `noted` and the note read the same second.
+    peers.set_mock_now(1_000_000);
     for (n, witness) in [(0xab_u8, false), (0xcd, true)] {
-        let peer1 = inbound_peer(&peers);
-        let peer2 = inbound_peer(&peers);
+        let peer1 = preferred_peer(&peers, 2);
+        let peer2 = preferred_peer(&peers, 3);
         let txid = bitcoin::Txid::from_byte_array([n; 32]);
         let item = if witness {
             Inventory::WitnessTransaction(txid)
@@ -8281,8 +8360,8 @@ async fn second_wtxid_inv_waits_while_first_request_is_inflight() {
     mp.set_relay_enabled(true);
     assert!(hub.attach_mempool(mp).is_ok());
     let peers = rbitcoin_net::peers::PeerHub::new();
-    let peer1 = inbound_peer(&peers);
-    let peer2 = inbound_peer(&peers);
+    let peer1 = preferred_peer(&peers, 2);
+    let peer2 = preferred_peer(&peers, 3);
     let wtxid = bitcoin::Wtxid::from_byte_array([0xee; 32]);
     let inv = [Inventory::WTx(wtxid)];
     let noted = peer1.clock_now();
@@ -8336,7 +8415,7 @@ async fn other_peers_rows_do_not_skip_a_fresh_announcement() {
     assert!(hub.attach_mempool(mp).is_ok());
     let mp = hub.mempool().unwrap();
     let peers = rbitcoin_net::peers::PeerHub::new();
-    let peer = inbound_peer(&peers);
+    let peer = preferred_peer(&peers, 2);
     let keep = [0x42; 32];
     assert_eq!(
         mp.note_inv_tx_requested(peer.id, keep, true, 1_000, false),
@@ -12384,7 +12463,7 @@ mod peer_session_pins {
             false,
             PeerConnType::OutboundFullRelay,
         );
-        mp.note_inv_tx_requested(other.id, [1; 32], false, 5_000, false);
+        mp.note_inv_tx_requested(other.id, [1; 32], true, 5_000, false);
         let parent = bitcoin::Txid::from_byte_array([9; 32]);
         use bitcoin::absolute::LockTime;
         use bitcoin::transaction::Version as TxVersion;

@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 
 use rbitcoin_net::tx_relay::parent_req::*;
-use rbitcoin_net::tx_relay::{GETDATA_TX_INTERVAL_SECS, MAX_PARENTS_PER_PARK};
+use rbitcoin_net::tx_relay::{
+    GETDATA_TX_INTERVAL_SECS, MAX_PARENTS_PER_PARK, NONPREF_PEER_TX_DELAY_SECS,
+};
 
 #[test]
 fn txid_parent_already_have_does_not_follow_another_peers_wtxid() {
@@ -9,13 +11,10 @@ fn txid_parent_already_have_does_not_follow_another_peers_wtxid() {
     let hash = [0xcd; 32];
     t.schedule(hash, 2, true, 1_000);
     assert_eq!(
-        t.note_inv(1, hash, false, 1_000, true),
+        t.note_inv(1, hash, true, 1_000, true),
         ParentNote::RequestNow
     );
-    assert_eq!(
-        t.note_inv(3, hash, false, 1_000, true),
-        ParentNote::Deferred
-    );
+    assert_eq!(t.note_inv(3, hash, true, 1_000, true), ParentNote::Deferred);
     let now = 1_000 + GETDATA_TX_INTERVAL_SECS;
     let mut saw_txid = false;
     let dropped = t.take_due(2, now, |h, wtxid| {
@@ -35,6 +34,48 @@ fn txid_parent_already_have_does_not_follow_another_peers_wtxid() {
     });
     assert_eq!(follow.len(), 1);
     assert!(follow[0].wtxid);
+}
+
+/// Core `NONPREF_PEER_TX_DELAY`: a non-preferred (inbound) announcer is not
+/// asked at once, so a preferred announcer that arrives within the delay
+/// gets the request. Alone, the inbound announcer is asked when the delay
+/// ends, and a second announcement from it does not skip the delay.
+#[test]
+fn non_preferred_announcer_waits_for_a_preferred_one() {
+    let mut t = ParentTracker::new();
+    let hash = [0x77; 32];
+    assert_eq!(
+        t.note_inv(1, hash, false, 1_000, true),
+        ParentNote::Deferred
+    );
+    assert_eq!(
+        t.note_inv(1, hash, false, 1_001, true),
+        ParentNote::Deferred
+    );
+    assert!(t.take_due(1, 1_001, |_, _| false).is_empty());
+    assert_eq!(
+        t.note_inv(2, hash, true, 1_001, true),
+        ParentNote::RequestNow
+    );
+    assert!(
+        t.take_due(1, 1_000 + NONPREF_PEER_TX_DELAY_SECS, |_, _| false)
+            .is_empty(),
+        "the preferred announcer holds the request"
+    );
+
+    let mut t = ParentTracker::new();
+    let alone = [0x78; 32];
+    assert_eq!(
+        t.note_inv(1, alone, false, 2_000, true),
+        ParentNote::Deferred
+    );
+    assert!(t
+        .take_due(1, 2_000 + NONPREF_PEER_TX_DELAY_SECS - 1, |_, _| false)
+        .is_empty());
+    let due = t.take_due(1, 2_000 + NONPREF_PEER_TX_DELAY_SECS, |_, _| false);
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].hash, alone);
+    assert!(due[0].wtxid);
 }
 
 #[test]

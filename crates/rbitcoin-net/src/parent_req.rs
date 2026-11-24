@@ -14,7 +14,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU64;
 
-use super::{GETDATA_TX_INTERVAL_SECS, MAX_PARENTS_PER_PARK};
+use super::{GETDATA_TX_INTERVAL_SECS, MAX_PARENTS_PER_PARK, NONPREF_PEER_TX_DELAY_SECS};
 
 /// Announcements one peer may add. Past this the map does not grow.
 pub const MAX_PARENT_ANN_PER_PEER: usize = 5_000;
@@ -201,11 +201,15 @@ impl ParentTracker {
         self.ann_per_peer.get(&peer).copied().unwrap_or(0) >= MAX_PARENT_ANN_PER_PEER
     }
 
+    /// `preferred` is Core's preferred download peer (outbound, or noban).
+    /// A non-preferred announcer is first due after
+    /// [`NONPREF_PEER_TX_DELAY_SECS`], so a preferred announcer that arrives
+    /// in that time is asked instead (Core `TxRequestTracker`).
     pub fn note_inv(
         &mut self,
         peer: u64,
         hash: [u8; 32],
-        inbound: bool,
+        preferred: bool,
         now: u64,
         wtxid: bool,
     ) -> ParentNote {
@@ -216,10 +220,16 @@ impl ParentTracker {
             return ParentNote::PeerCapped;
         }
         let exp = now.saturating_add(GETDATA_TX_INTERVAL_SECS);
+        let reqtime = if preferred {
+            now
+        } else {
+            now.saturating_add(NONPREF_PEER_TX_DELAY_SECS)
+        };
         // Same-kind in-flight stays the one request. This announcer waits
         // until that window ends and keeps its own getdata type.
         let (due_at, requested_until) = match self.kind_inflight_until(&hash, wtxid) {
-            Some(until) => (Some(until), None),
+            Some(until) => (Some(until.max(reqtime)), None),
+            None if reqtime > now => (Some(reqtime), None),
             None => (None, Some(exp)),
         };
         let note = if requested_until.is_some() {
@@ -231,8 +241,8 @@ impl ParentTracker {
             hash,
             ParentAnn {
                 peer,
-                preferred: !inbound,
-                reqtime: now,
+                preferred,
+                reqtime,
                 due_at,
                 requested_until,
                 failed: false,
@@ -286,7 +296,13 @@ impl ParentTracker {
             .iter()
             .any(|a| a.wtxid == wtxid && a.peer != peer && a.requested_until.is_some());
         let due_at = {
-            if slot.anns[pos].requested_until.is_some() || slot.anns[pos].failed || other_inflight {
+            // A row still inside its announcement delay stays deferred, so
+            // announcing again does not skip the delay.
+            if slot.anns[pos].requested_until.is_some()
+                || slot.anns[pos].failed
+                || other_inflight
+                || slot.anns[pos].reqtime > now
+            {
                 return Some(ParentNote::Deferred);
             }
             let exp = now.saturating_add(GETDATA_TX_INTERVAL_SECS);
