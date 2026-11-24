@@ -9,3 +9,7 @@ Security
   mempool spender changed since the last notification (a pool lookup, no
   store read). A reorg, a skipped height, or a block that cannot be read
   still restatuses every subscription.
+
+- **An Electrum outpoint's confirmed-spent status reports the spending
+  block's height.** It reported the current tip, so the status changed on
+  every block without anything happening to the outpoint.

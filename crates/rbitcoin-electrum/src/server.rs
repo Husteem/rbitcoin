@@ -1978,20 +1978,24 @@ async fn block_outpoint_touch(query: &Arc<Query>, height: u32) -> Option<Arc<Out
             }
         }
         let created = q.header_txids(fk).ok()?.into_iter().collect();
-        let block = q.reconstruct_archived_block(&rec.hash).ok()??;
-        let spent = block
-            .txdata
+        // Each input's parent and vout from the stored edges, and the
+        // parents' txids: no block rebuild, so a pruned witness window does
+        // not turn every tip into a full restatus.
+        let mut edges = Vec::new();
+        for tx in q.block_tx_fks(Height(height)).ok()? {
+            for (parent, vout) in q.tx_prevouts_for_fk(tx).ok()? {
+                if !parent.is_null() {
+                    edges.push((parent, vout));
+                }
+            }
+        }
+        let parents: Vec<Fk> = edges.iter().map(|(parent, _)| *parent).collect();
+        let txids = q.store().txids_get_many(&parents).ok()?;
+        let spent = edges
             .iter()
-            .flat_map(|tx| tx.input.iter())
-            .filter(|i| !i.previous_output.is_null())
-            .map(|i| {
-                use bitcoin::hashes::Hash;
-                (
-                    i.previous_output.txid.to_byte_array(),
-                    i.previous_output.vout,
-                )
-            })
-            .collect();
+            .zip(txids)
+            .map(|((_, vout), txid)| txid.map(|t| (t, *vout)))
+            .collect::<Option<_>>()?;
         let touch = Arc::new(OutpointTouch { created, spent });
         *last.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((store, height, rec.hash, Arc::clone(&touch)));
@@ -3773,15 +3777,27 @@ pub fn outpoint_status(
     params: &Value,
 ) -> Result<Value, String> {
     let (txid, vout) = param_outpoint(params)?;
-    if query
-        .is_outpoint_spent(&txid, vout)
-        .map_err(|e| e.to_string())?
-    {
+    // A confirmed spend reports the spending block's height, not the tip's:
+    // the status then holds until a block touches the outpoint, which is
+    // when a tip pushes it.
+    let tip = query.tip_height().map(|h| h.0);
+    let spenders = query
+        .spenders_at(&txid, vout, tip)
+        .map_err(|e| e.to_string())?;
+    if let Some(spend) = spenders.first() {
+        let height = query
+            .store()
+            .tx_height_get_batch(&[spend.spending_tx_fk])
+            .map_err(|e| e.to_string())?
+            .first()
+            .copied()
+            .flatten()
+            .unwrap_or(0);
         return Ok(json!({
             "txid": txid_hex(&txid),
             "vout": vout,
             "spent": true,
-            "height": query.tip_height().map(|h| h.0).unwrap_or(0),
+            "height": height,
         }));
     }
     if let Some(mp) = mempool {

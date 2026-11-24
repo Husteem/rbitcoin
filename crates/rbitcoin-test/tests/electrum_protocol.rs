@@ -1517,7 +1517,49 @@ async fn electrum_tip_restatuses_spent_and_freed_outpoints_on() {
     let ping = rpc(&mut stream, 7, "server.ping", json!([])).await;
     assert_eq!(ping["id"], 7, "one push per changed outpoint: {ping}");
 
+    // The next block touches nothing watched.
+    let b104 = connect(b103.block_hash(), 104, vec![]);
+    untouched_block_keeps_spend_height(&mut stream, &q, &tip_tx, &b104.header, &hex).await;
+
     handle.shutdown().await;
+}
+
+/// A block that touches no watched outpoint pushes nothing. A confirmed
+/// spend's status is the spend's height (103), not the tip's, so the status
+/// coin 1 was sent stays true. The touch set reads the store, not a rebuilt
+/// block.
+async fn untouched_block_keeps_spend_height(
+    stream: &mut TcpStream,
+    q: &Query,
+    tip_tx: &broadcast::Sender<TipNotify>,
+    header: &bitcoin::block::Header,
+    hex: &str,
+) {
+    #[cfg(debug_assertions)]
+    let _ = q.sample_reset_reconstruct_archived();
+    #[cfg(not(debug_assertions))]
+    let _ = q;
+    tip_tx
+        .send(TipNotify {
+            height: 104,
+            header_hex: bitcoin::consensus::encode::serialize_hex(header),
+            reorg_from_height: None,
+        })
+        .expect("tip push");
+    let ping = rpc(stream, 8, "server.ping", json!([])).await;
+    assert_eq!(ping["id"], 8, "no push for an untouched block: {ping}");
+    let v = rpc(stream, 9, "blockchain.outpoint.get_status", json!([hex, 1])).await;
+    assert_eq!(
+        v["result"],
+        json!({"txid": hex, "vout": 1, "spent": true, "height": 103}),
+        "the spend's height, as pushed"
+    );
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        q.sample_reset_reconstruct_archived(),
+        0,
+        "the touch set rebuilt a block"
+    );
 }
 
 /// Sparrow subscribes every receive and change address up to its gap limit on
