@@ -6,4 +6,4 @@
 
 Inbound eviction disconnected the oldest unprotected peer. It protects a share of the longest-connected peers, then disconnects the newest peer in the largest netgroup. The netgroup key is fixed when the peer is accepted. Asmap stays outbound-only.
 
-**Regression:** `rbitcoin-net` `eviction_drops_the_newest_in_the_largest_netgroup`.
+**Regression:** `rbitcoin-net` `half_the_rest_is_kept_by_uptime`.

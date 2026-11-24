@@ -1942,6 +1942,36 @@ fn try_evict_inbound_disconnects_one_peer() {
     );
 }
 
+/// The netgroup protect orders peers by this hub's secret key, not by the
+/// raw group: 24 inbound peers, each alone in a /16 that rises with its id.
+/// By raw group the newest peer is always among the four protected; keyed,
+/// it is left to evict in most hubs.
+#[test]
+fn eviction_orders_netgroups_by_the_hub_key() {
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let mut newest_evicted = 0;
+    for _ in 0..32 {
+        let hub = PeerHub::new();
+        let mut newest = None;
+        for i in 0..24u8 {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(i + 1, 1, 0, 1)), 8333);
+            newest = Some(
+                hub.register_connecting(addr, bind, true, PeerConnType::Inbound)
+                    .id,
+            );
+        }
+        assert!(hub.try_evict_inbound(), "an inbound peer is evicted");
+        let newest = newest.unwrap();
+        if !hub.snapshot().iter().any(|p| p.id == newest) {
+            newest_evicted += 1;
+        }
+    }
+    assert!(
+        newest_evicted > 0,
+        "the newest peer's raw /16 is the highest, and a keyed order leaves it unprotected"
+    );
+}
+
 #[test]
 fn onion_bind_eviction_skips_the_forwarder_group() {
     for (local, evicted_source, next_source, marked) in [

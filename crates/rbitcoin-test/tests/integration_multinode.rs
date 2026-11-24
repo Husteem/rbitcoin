@@ -1788,9 +1788,10 @@ async fn p2p_inbound_full_rejects_extra() {
 
 /// `max_inbound=52` holds 26 tx-relaying inbounds. With all 26 connected
 /// and one block-relay-only inbound, a new tx-relaying inbound evicts an
-/// older tx-relaying peer. Protection keeps 25 of those 26 (netgroup, 4
-/// block, 4 tx, 8 ping, 8 longest-connected), so the newest is the victim.
-/// The block-relay-only peer and the newcomer stay.
+/// older tx-relaying peer. Core's protects keep 20 of those 26 (4 keyed
+/// netgroup, 8 ping, 4 tx, 4 block; none relays only blocks) and half of
+/// the other 6 by uptime, so the newest is the victim. The block-relay-only
+/// peer and the newcomer stay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_tx_relay_inbound_past_half_evicts_a_tx_peer() {
     let fut = async {
