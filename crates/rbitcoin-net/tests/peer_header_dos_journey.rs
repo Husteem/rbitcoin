@@ -4337,6 +4337,58 @@ async fn failure_walk_does_not_spend_the_work_walk_cache() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A headers message does not copy the peer's pending map: against a full
+/// map of 8,000 headers, a one-header batch that does not connect asks for
+/// nothing the size of that map's table. The stack hub runs the header job
+/// on this thread, so its asks count too.
+#[tokio::test]
+async fn headers_message_does_not_copy_the_pending_map() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pending-no-copy");
+    // Not `into_arc`: with no shared handle the header job runs here.
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
+    let tip = hub.tip_header().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18624, 64, true);
+    let (out_tx, _rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let mut leaf = 0u32;
+    while follow.pending_headers.len() < MAX_PENDING_HEADERS {
+        let mut merkle = [0x6bu8; 32];
+        merkle[..4].copy_from_slice(&leaf.to_le_bytes());
+        let mut hdr = tip;
+        hdr.prev_blockhash = bitcoin::BlockHash::from_byte_array([0x77; 32]);
+        hdr.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
+        hdr.time = tip.time + 1;
+        rbitcoin_consensus::grind_regtest_pow(&mut hdr);
+        follow.pending_headers.insert(hdr.block_hash(), hdr);
+        leaf += 1;
+    }
+    let mut stray = tip;
+    stray.prev_blockhash = bitcoin::BlockHash::from_byte_array([0x78; 32]);
+    stray.time = tip.time + 2;
+    rbitcoin_consensus::grind_regtest_pow(&mut stray);
+    let table = std::mem::size_of::<(bitcoin::BlockHash, bitcoin::block::Header)>()
+        * MAX_PENDING_HEADERS;
+    let _ = crate::alloc_count::take_largest();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(vec![stray]),
+    )
+    .await;
+    let largest = crate::alloc_count::take_largest();
+    assert!(
+        largest < table / 8,
+        "largest ask {largest} B against a {table} B map"
+    );
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A connecting batch that needs room in a full pending map scores each
 /// parked fork once, however many leaves share its trunk.
 #[tokio::test]

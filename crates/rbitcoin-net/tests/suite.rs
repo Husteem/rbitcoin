@@ -1,5 +1,10 @@
 rbitcoin_store::skip_flushes_before_main!();
 
+#[global_allocator]
+static ALLOC: alloc_count::Counting = alloc_count::Counting;
+
+mod alloc_count;
+
 /// Arm the tip-accept lane permit before any test thread starts. A node
 /// binary does not link this suite, so production never takes that lock.
 #[used]
