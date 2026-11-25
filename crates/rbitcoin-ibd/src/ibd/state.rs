@@ -271,7 +271,9 @@ const MUTATED_REOPENS: u8 = 3;
 /// Mutated body copies of one hash, the peers that sent them (by IP, so a
 /// reconnect from a new port is the same peer), and how often it was
 /// reopened. Held inline so the bounded map holds no heap. An entry the
-/// tracking cap evicts loses all three, which only costs that hash retries.
+/// tracking cap evicts loses all three: that hash takes the full bound of
+/// copies again, and a peer that sent its copies may reopen it again. Each
+/// takes 256 other tracked hashes first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MutatedCopies {
     pub copies: u8,
