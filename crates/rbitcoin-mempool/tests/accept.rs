@@ -137,6 +137,68 @@ fn reject_immature_coinbase() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Finality needs only the tip, so a non-final tx is refused before its
+/// inputs resolve: one with an unknown parent is not an orphan (Core
+/// `PreChecks`).
+#[test]
+fn non_final_tx_is_refused_before_its_parent_is_looked_up() {
+    let dir = tmp_dir();
+    let unknown = OutPoint {
+        txid: Txid::from_byte_array([0x33; 32]),
+        vout: 0,
+    };
+    let mut tx = spend_tx(unknown, 49_000);
+    tx.lock_time = LockTime::from_height(1_000).unwrap();
+    let utxos = MapUtxoProvider {
+        map: HashMap::new(),
+    };
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let tip = ChainTipCtx {
+        height: 20,
+        mtp: 1_000_000,
+    };
+    let err = mp.accept_tx(&tx, &utxos, tip).unwrap_err();
+    assert!(matches!(err, AcceptError::NotFinal), "got {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core asks BIP68 before coinbase maturity, so a spend that fails both is
+/// `non-BIP68-final`.
+#[test]
+fn bip68_comes_before_coinbase_maturity() {
+    let dir = tmp_dir();
+    let op = OutPoint {
+        txid: Txid::from_byte_array([0x44; 32]),
+        vout: 0,
+    };
+    let mut map = HashMap::new();
+    map.insert(
+        op,
+        Coin {
+            txout: TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            create_height: 10,
+            create_mtp: 1_000_000,
+            is_coinbase: true,
+            create_fk: None,
+        },
+    );
+    let utxos = MapUtxoProvider { map };
+    let mut tx = spend_tx(op, 49_000);
+    // A 50-block relative lock and a coinbase 11 blocks deep: both unmet.
+    tx.input[0].sequence = Sequence::from_consensus(50);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let tip = ChainTipCtx {
+        height: 20,
+        mtp: 1_000_000,
+    };
+    let err = mp.accept_tx(&tx, &utxos, tip).unwrap_err();
+    assert!(matches!(err, AcceptError::NonBip68Final), "got {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn bip68_time_lock_uses_coin_create_mtp() {
     let dir = tmp_dir();
@@ -476,6 +538,7 @@ fn prepare_admit_negative_output_is_check_transaction_not_panic() {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .expect_err("overflowing output sum");
@@ -503,10 +566,78 @@ fn prepare_admit_rejects_negative_fee() {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .expect_err("outputs exceed inputs");
     assert!(matches!(err, AcceptError::Policy("negative fee")));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A vout past a tested member's outputs is a missing input, not an orphan
+/// waiting on a parent the walk already holds.
+#[test]
+fn prepare_admit_refuses_a_vout_past_a_tested_member() {
+    let dir = tmp_dir();
+    let (op, _, utxos) = chain_utxo(100_000);
+    let parent = spend_tx(op, 99_000);
+    let mut tested = TestedMembers::default();
+    tested.push(Arc::new(parent.clone()));
+    let past = OutPoint::new(parent.compute_txid(), 1);
+    let child = spend_tx(past, 98_000);
+    let mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let err = mp
+        .prepare_admit(
+            &child,
+            &utxos,
+            TIP_OK,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: true,
+                min_relay: None,
+                waive: false,
+                sibling_eviction: SiblingEviction::Off,
+                tested: Some(Arc::new(tested)),
+            },
+        )
+        .expect_err("no such output");
+    assert!(err == AcceptError::MissingPrevout(past), "got {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A package dry-run member may not replace. A conflict that enters the
+/// pool while the member's scripts run is refused after scripts too, not
+/// reported as a replacement.
+#[test]
+fn package_dry_run_member_refuses_a_conflict_that_arrives_during_scripts() {
+    let dir = tmp_dir();
+    let (op, _, utxos) = chain_utxo(100_000);
+    let low = spend_tx(op, 99_000);
+    let high = spend_tx(op, 50_000);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let prep = mp
+        .prepare_admit(
+            &high,
+            &utxos,
+            TIP_OK,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: true,
+                min_relay: None,
+                waive: false,
+                sibling_eviction: SiblingEviction::Off,
+                tested: Some(Arc::new(TestedMembers::default())),
+            },
+        )
+        .expect("no conflict yet");
+    mp.accept_tx(&low, &utxos, TIP_OK).unwrap();
+    let err = mp
+        .evaluate_after_script(&high, prep)
+        .expect_err("a dry-run member may not replace");
+    assert!(
+        err == AcceptError::Policy("bip125-replacement-disallowed"),
+        "got {err}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -870,6 +1001,7 @@ fn truc_sibling_eviction_survives_a_floor_rise_before_commit() {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::On,
+                tested: None,
             },
         )
         .unwrap();
@@ -901,6 +1033,7 @@ fn truc_child_limit_holds_across_staged_admits() {
         min_relay: None,
         waive: false,
         sibling_eviction: SiblingEviction::Off,
+        tested: None,
     };
     let prep_a = mp.prepare_admit(&a, &utxos, TIP_OK, opts()).unwrap();
     let prep_b = mp.prepare_admit(&b, &utxos, TIP_OK, opts()).unwrap();
@@ -1154,6 +1287,7 @@ fn evaluate_after_script_rbf_leaves_conflict() {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .unwrap();
@@ -1206,6 +1340,7 @@ fn prepare_and_preview_enforce_cluster_limits() {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )?;
         let r = mp
@@ -1249,6 +1384,7 @@ fn commit_after_script_does_not_take_utxo_provider() {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .unwrap();
@@ -1275,6 +1411,7 @@ fn prepare_admit_stashes_txid() {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .unwrap();
@@ -1303,6 +1440,7 @@ fn commit_after_script_parent_body_missing_is_durable() {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .unwrap();
@@ -1470,7 +1608,7 @@ fn accept_error_display_and_reject_paths() {
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint::null(),
-            script_sig: ScriptBuf::new(),
+            script_sig: ScriptBuf::from_bytes(vec![0x51; 2]),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
@@ -1483,6 +1621,14 @@ fn accept_error_display_and_reject_paths() {
         mp.accept_tx(&cb, &utxos, TIP_OK),
         Err(AcceptError::Coinbase)
     ));
+    // Core `CheckTransaction` asks a coinbase's scriptSig length first.
+    let mut short_cb = cb.clone();
+    short_cb.input[0].script_sig = ScriptBuf::new();
+    let err = mp.accept_tx(&short_cb, &utxos, TIP_OK).unwrap_err();
+    assert!(
+        matches!(&err, AcceptError::CheckTransaction(r) if r == "bad-cb-length"),
+        "{err}"
+    );
 
     assert!(matches!(
         mp.accept_package(&[], &utxos, TIP_OK),
@@ -2566,6 +2712,7 @@ fn duplicate_commit_after_prepare_is_duplicate() {
                 min_relay: None,
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .unwrap();
@@ -2704,6 +2851,7 @@ fn waive_opts() -> PrepareOpts {
         min_relay: None,
         waive: true,
         sibling_eviction: SiblingEviction::Off,
+        tested: None,
     }
 }
 
@@ -3146,6 +3294,7 @@ fn review_trust_failed_restore_drops_mark() {
                 min_relay: Some(0),
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .expect("replacement prepares");

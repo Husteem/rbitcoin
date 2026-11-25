@@ -484,6 +484,7 @@ fn a_failed_replacement_keeps_its_row_until_the_victim_is_back() {
                 min_relay: Some(0),
                 waive: false,
                 sibling_eviction: SiblingEviction::Off,
+                tested: None,
             },
         )
         .expect("bump prepares");
