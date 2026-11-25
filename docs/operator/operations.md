@@ -275,11 +275,14 @@ bind keeps the per-IP limit. Those peers also skip the ten-minute netgroup wait 
 inbound eviction, as on the marked listener. Other TCP sources allow up to
 eight unfinished handshakes per IP.
 
-On NixOS, append the Tor listener alongside the module-managed P2P listener:
+On NixOS, set the Tor listener beside the module-managed P2P listener:
 
 ```nix
-services.rbitcoin.extraArgs = [ "--listen" "127.0.0.1:8334=onion" ];
+services.rbitcoin.p2p.onionListen = "127.0.0.1:8334";
 ```
+
+The module refuses a `v1` bind on that port and never opens it in the
+firewall.
 
 `--tor-control [HOST:PORT]` talks to **system tor** (SAFECOOKIE/COOKIE or password). Omit
 ADDR for `127.0.0.1:9051`. Failed AUTH is a start error. Unset: no control

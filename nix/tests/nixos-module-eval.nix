@@ -358,7 +358,27 @@ let
       blockTime = 120;
     };
   };
-  v1PortMsg = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, Electrum, or Esplora port";
+  v1PortMsg = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, onion, Electrum, or Esplora port";
+  onionListenNeedsOnionMsg = "services.rbitcoin.p2p.onionListen requires p2p.listenOnion or an onion p2p.externalIp";
+  onionListenAddrMsg = "services.rbitcoin.p2p.onionListen needs a specific IP and a nonzero port, as ADDR:PORT or [ADDR]:PORT";
+  onionListenInboundMsg = "services.rbitcoin.p2p.onionListen requires p2p.maxInbound > 0";
+  onionListenPortMsg = "services.rbitcoin.p2p.onionListen needs its own port, not the P2P, Electrum, or Esplora port";
+  onionListenTrustMsg = "services.rbitcoin.trustPeer cannot be combined with p2p.onionListen";
+  onionListenI2pMsg = "services.rbitcoin.i2p.acceptIncoming with p2p.onionListen requires p2p.listen (the onion listener is reserved for Tor)";
+  onionListenOpts = {
+    p2p = {
+      listenOnion = true;
+      onionListen = "127.0.0.1:8334";
+    };
+  };
+  onionListenExec = execOf onionListenOpts;
+  onionOnlyExec = execOf {
+    p2p = {
+      listen = false;
+      listenOnion = true;
+      onionListen = "127.0.0.1:8334";
+    };
+  };
   v1InboundMsg = "services.rbitcoin.netPermissionBind v1 needs p2p.maxInbound greater than 0";
   spPruneExec = execOf {
     silentPaymentIndex = true;
@@ -941,6 +961,67 @@ assert !builtins.elem v1PortMsg (rbitcoinFailures (moduleOnly {
     socketPath = "/run/rbitcoin/esplora.sock";
   };
   netPermissionBind = [ "v1,noban@127.0.0.1:3002" ];
+}));
+# p2p.onionListen marks the Tor forwarding listener after the primary bind,
+# so a --no-listen earlier in argv does not clear it.
+assert builtins.match ".*--listen 0.0.0.0:8333 .*--listen '?127.0.0.1:8334=onion'?( .*|$)" onionListenExec != null;
+assert builtins.match ".*--listen-onion.*" onionListenExec != null;
+assert builtins.match ".*--no-listen .*--listen '?127.0.0.1:8334=onion'?( .*|$)" onionOnlyExec != null;
+assert builtins.match ".*=onion.*" (execOf { p2p.listenOnion = true; }) == null;
+assert rbitcoinFailures (moduleOnly onionListenOpts) == [ ];
+assert rbitcoinFailures (moduleOnly {
+  p2p = {
+    externalIp = [ "${"a" + builtins.substring 0 55 (builtins.hashString "sha512" "x")}d.onion:8333" ];
+    onionListen = "[::1]:8334";
+  };
+}) == [ ];
+assert
+  (moduleOnly (onionListenOpts // { p2p = onionListenOpts.p2p // { openFirewall = true; }; }))
+  .config.networking.firewall.allowedTCPPorts == [ 8333 ];
+assert builtins.elem onionListenNeedsOnionMsg (failedAssertions (badSystem {
+  p2p.onionListen = "127.0.0.1:8334";
+}));
+assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "0.0.0.0:8334"; };
+}));
+assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "[::]:8334"; };
+}));
+assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "127.0.0.1:0"; };
+}));
+assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "127.0.0.1"; };
+}));
+assert builtins.elem onionListenInboundMsg (failedAssertions (badSystem {
+  p2p = {
+    externalIp = [ "${"a" + builtins.substring 0 55 (builtins.hashString "sha512" "x")}d.onion" ];
+    onionListen = "127.0.0.1:8334";
+    maxInbound = 0;
+  };
+}));
+assert builtins.elem onionListenPortMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "127.0.0.1:8333"; };
+}));
+assert builtins.elem onionListenPortMsg (failedAssertions (badSystem (onionListenOpts // {
+  electrum = {
+    enable = true;
+    port = 8334;
+  };
+})));
+assert builtins.elem v1PortMsg (failedAssertions (badSystem (onionListenOpts // {
+  netPermissionBind = [ "v1,noban@127.0.0.1:8334" ];
+})));
+assert builtins.elem onionListenTrustMsg (failedAssertions (badSystem {
+  trustPeer = "192.0.2.10:8333";
+  p2p.onionListen = "127.0.0.1:8334";
+}));
+assert builtins.elem onionListenI2pMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { listen = false; };
+  i2p = {
+    sam = "127.0.0.1:7656";
+    acceptIncoming = true;
+  };
 }));
 assert builtins.elem signetChallengeMsg (failedAssertions (badSystem {
   signet.challenge = "51";

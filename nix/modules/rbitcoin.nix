@@ -65,6 +65,27 @@ let
     optional cfg.p2p.listen cfg.p2p.port
     ++ optional cfg.electrum.enable cfg.electrum.port
     ++ optional (cfg.esplora.enable && cfg.esplora.socketPath == null) cfg.esplora.port;
+  # The marked Tor listener's port; v1 binds may not share it.
+  onionListenPort = if cfg.p2p.onionListen == null then null else whitebindPort cfg.p2p.onionListen;
+  onionListenHost =
+    let
+      a = cfg.p2p.onionListen;
+    in
+    if a == null then
+      ""
+    else if lib.hasPrefix "[" a then
+      lib.removePrefix "[" (lib.head (lib.splitString "]" a))
+    else
+      lib.head (lib.splitString ":" a);
+  onionListenValid =
+    onionListenPort != null
+    && onionListenPort > 0
+    && !builtins.elem onionListenHost [
+      ""
+      "0.0.0.0"
+      "::"
+      "0:0:0:0:0:0:0:0"
+    ];
   # Port after the last @. IPv6 is `[addr]:port`. A grant with no port is left out;
   # the node rejects it at start.
   whitebindPort = spec:
@@ -246,6 +267,11 @@ let
     else
       [ "--no-listen" ]
   )
+  # After --listen/--no-listen: a later --no-listen clears the marked listener.
+  ++ lib.optionals (cfg.p2p.onionListen != null) [
+    "--listen"
+    "${cfg.p2p.onionListen}=onion"
+  ]
   ++ [
     "--log-level"
     cfg.logLevel
@@ -1037,6 +1063,24 @@ in
           The unit joins group tor, and creates that group with the NixOS tor gid
           when it is missing, so it can read the cookie.
           Gossip the onion, not a home IPv4, when discover is off.
+          Set `onionListen` to give Tor its own listener, so source-IP grants on
+          the P2P listener do not reach Tor-forwarded peers.
+        '';
+      };
+
+      onionListen = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:8334";
+        description = ''
+          Pass `--listen ADDR:PORT=onion`: a separate P2P listener for Tor forwarding.
+          `listenOnion` publishes this listener instead of the P2P bind, and an operator's
+          own onion service (an onion `externalIp`) forwards to it. Source-IP permission
+          grants skip it and keep applying on the P2P listener.
+          Needs a specific IP and a nonzero port (`[ADDR]:PORT` for IPv6), its own port,
+          and `maxInbound` > 0. Works with `listen = false` for Tor-only inbound.
+          The firewall never opens it. On a non-loopback address, restrict it to the
+          Tor forwarder with a firewall or network policy.
         '';
       };
 
@@ -1520,8 +1564,35 @@ in
         message = "services.rbitcoin.netPermissionBind requires p2p.listen";
       }
       {
-        assertion = lib.all (p: !builtins.elem p forwardedPorts) v1BindPorts;
-        message = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, Electrum, or Esplora port";
+        assertion = lib.all (p: !builtins.elem p (forwardedPorts ++ optional (onionListenPort != null) onionListenPort)) v1BindPorts;
+        message = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, onion, Electrum, or Esplora port";
+      }
+      {
+        assertion =
+          cfg.p2p.onionListen == null
+          || cfg.p2p.listenOnion
+          || lib.any (a: lib.hasInfix ".onion" a) cfg.p2p.externalIp;
+        message = "services.rbitcoin.p2p.onionListen requires p2p.listenOnion or an onion p2p.externalIp";
+      }
+      {
+        assertion = cfg.p2p.onionListen == null || onionListenValid;
+        message = "services.rbitcoin.p2p.onionListen needs a specific IP and a nonzero port, as ADDR:PORT or [ADDR]:PORT";
+      }
+      {
+        assertion = cfg.p2p.onionListen == null || cfg.p2p.maxInbound > 0;
+        message = "services.rbitcoin.p2p.onionListen requires p2p.maxInbound > 0";
+      }
+      {
+        assertion = onionListenPort == null || !builtins.elem onionListenPort forwardedPorts;
+        message = "services.rbitcoin.p2p.onionListen needs its own port, not the P2P, Electrum, or Esplora port";
+      }
+      {
+        assertion = cfg.trustPeer == null || cfg.p2p.onionListen == null;
+        message = "services.rbitcoin.trustPeer cannot be combined with p2p.onionListen";
+      }
+      {
+        assertion = !cfg.i2p.acceptIncoming || cfg.p2p.onionListen == null || cfg.p2p.listen;
+        message = "services.rbitcoin.i2p.acceptIncoming with p2p.onionListen requires p2p.listen (the onion listener is reserved for Tor)";
       }
       {
         assertion = v1BindPorts == [ ] || cfg.p2p.maxInbound > 0;
