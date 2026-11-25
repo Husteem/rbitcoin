@@ -5,9 +5,10 @@ use rbitcoin_primitives::Network;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 pub const RPC_BEARER: &str = "Bearer pass";
@@ -225,16 +226,14 @@ pub fn hs_desc_uploaded(line: &str, service_id: &str) -> bool {
 /// close of the subscription moves to `Dropped`, and only then does `UPLOADED`
 /// count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum HsDescWatch {
+enum HsDescWatch {
     Attaching,
     Subscribed,
     Dropped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[doc(hidden)]
-pub enum HsDescWatchEvent {
+enum HsDescWatchEvent {
     /// Auth or `SETEVENTS` failed before this connection was subscribed.
     Miss,
     Subscribed,
@@ -242,8 +241,7 @@ pub enum HsDescWatchEvent {
     Closed,
 }
 
-#[doc(hidden)]
-pub fn hs_desc_watch_advance(phase: HsDescWatch, event: HsDescWatchEvent) -> HsDescWatch {
+fn hs_desc_watch_advance(phase: HsDescWatch, event: HsDescWatchEvent) -> HsDescWatch {
     match (phase, event) {
         (HsDescWatch::Attaching, HsDescWatchEvent::Subscribed) => HsDescWatch::Subscribed,
         (HsDescWatch::Subscribed, HsDescWatchEvent::Closed) => HsDescWatch::Dropped,
@@ -255,16 +253,21 @@ pub fn hs_desc_watch_advance(phase: HsDescWatch, event: HsDescWatchEvent) -> HsD
 /// connection opened after the previous one dropped.
 ///
 /// `attached` fires once `SETEVENTS HS_DESC` is live, so the caller can restart
-/// tor only after this watch is on the process it is about to kill. A SOCKS
-/// connect before the post-restart upload fetches the descriptor still stored
-/// from that process. Those introduction points are gone, and the client keeps
-/// them until it decides to refetch.
+/// tor only after this watch is on the process it is about to kill. `resumed`
+/// fires when a later connection has subscribed after that one closed.
+///
+/// Tor 0.4.9 does not replay `HS_DESC`. The caller holds the node's control
+/// port until `resumed`, so `ADD_ONION` cannot finish an upload before this
+/// subscription. The service descriptor cache is not that signal: Tor fills it
+/// before any directory stores the descriptor. A SOCKS connect in that gap
+/// fetches the descriptor still stored from the process that just died.
 pub async fn wait_hs_desc_uploaded(
     addr: SocketAddr,
     cookie: &Path,
     service_id: &str,
     wall: Duration,
     attached: &tokio::sync::Notify,
+    resumed: &tokio::sync::Notify,
 ) {
     use rbitcoin_node::tor_control::{TorAuth, TorControl};
     let deadline = Instant::now() + wall;
@@ -292,10 +295,14 @@ pub async fn wait_hs_desc_uploaded(
             phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Miss);
             continue;
         }
+        let before = phase;
         phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Subscribed);
-        if !told_attached {
+        if before == HsDescWatch::Attaching && !told_attached {
             attached.notify_one();
             told_attached = true;
+        }
+        if before == HsDescWatch::Dropped {
+            resumed.notify_one();
         }
         let mut lines = ctl.reader.lines();
         loop {
@@ -316,6 +323,92 @@ pub async fn wait_hs_desc_uploaded(
                 Err(_) => panic!("HS_DESC UPLOADED {service_id} wall {wall:?}"),
             }
         }
+    }
+}
+
+/// Forwards control-port bytes to `upstream`. [`ControlGate::hold`] keeps a new
+/// connection here until [`ControlGate::release`], so the node cannot
+/// `ADD_ONION` on the replacement tor before the upload watch has subscribed.
+#[derive(Clone)]
+pub struct ControlGate {
+    pub listen: SocketAddr,
+    hold: tokio::sync::watch::Sender<bool>,
+    _task: Arc<AbortJoin>,
+}
+
+struct AbortJoin(Mutex<Option<JoinHandle<()>>>);
+
+impl Drop for AbortJoin {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.lock().expect("control gate").take() {
+            task.abort();
+        }
+    }
+}
+
+struct AbortConn(JoinHandle<()>);
+
+impl Drop for AbortConn {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+pub async fn control_gate(upstream: SocketAddr) -> ControlGate {
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap_or_else(|e| panic!("control gate: {e}"));
+    let listen = listener
+        .local_addr()
+        .unwrap_or_else(|e| panic!("control gate: {e}"));
+    let (hold, held) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(async move {
+        let mut conns = Vec::new();
+        loop {
+            let Ok((down, _)) = listener.accept().await else {
+                break;
+            };
+            conns.retain(|conn: &AbortConn| !conn.0.is_finished());
+            let mut held = held.clone();
+            conns.push(AbortConn(tokio::spawn(async move {
+                while *held.borrow() {
+                    if held.changed().await.is_err() {
+                        return;
+                    }
+                }
+                let Ok(up) = TcpStream::connect(upstream).await else {
+                    return;
+                };
+                let (mut dr, mut dw) = down.into_split();
+                let (mut ur, mut uw) = up.into_split();
+                // A finished copy has to close the other write half. Otherwise
+                // the node keeps the dead control session and never republishes.
+                let to_up = async move {
+                    let _ = tokio::io::copy(&mut dr, &mut uw).await;
+                    let _ = uw.shutdown().await;
+                };
+                let to_down = async move {
+                    let _ = tokio::io::copy(&mut ur, &mut dw).await;
+                    let _ = dw.shutdown().await;
+                };
+                tokio::join!(to_up, to_down);
+            })));
+        }
+    });
+    ControlGate {
+        listen,
+        hold,
+        _task: Arc::new(AbortJoin(Mutex::new(Some(task)))),
+    }
+}
+
+impl ControlGate {
+    pub fn hold(&self) {
+        self.hold.send(true).ok();
+    }
+
+    pub fn release(&self) {
+        self.hold.send(false).ok();
     }
 }
 
