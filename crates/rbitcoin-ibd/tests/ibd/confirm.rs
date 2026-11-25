@@ -3229,10 +3229,13 @@ fn an_old_writer_leaves_a_newer_load_claim_in_flight() {
 /// an unconnected height has no event coming and returns its bytes now.
 #[test]
 fn a_pre_write_stale_batch_keeps_a_connected_heights_reservation() {
+    use crate::Mine;
     use rbitcoin_ibd::ibd::confirm::{finish_pre_write_stale, take_unproven_lead};
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pre-write-stale-claim");
+    let hub = std::sync::Arc::new(hub);
     hub.ensure_genesis().unwrap();
-    let genesis = hub.tip_hash().unwrap();
+    hub.mine(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), Vec::new())
+        .unwrap();
     let missing = BlockHash::from_byte_array([0x55; 32]);
 
     let connected = ConfirmFeed::new();
@@ -3249,7 +3252,7 @@ fn a_pre_write_stale_batch_keeps_a_connected_heights_reservation() {
     );
     let second = connected.epoch();
     connected.finish_claim([1], first);
-    finish_pre_write_stale(&hub, &connected, &[(1, genesis.to_byte_array())], second);
+    finish_pre_write_stale(&hub, &connected, &[(1, missing.to_byte_array())], second);
     assert!(
         connected
             .inner
@@ -3257,7 +3260,7 @@ fn a_pre_write_stale_batch_keeps_a_connected_heights_reservation() {
             .unwrap()
             .lead_reserved
             .contains_key(&1),
-        "the connected height waits for the first batch's Accepted"
+        "a different hash at the connected height still waits for Accepted"
     );
     connected.release_lead_reserve(1);
     assert!(!connected
@@ -3270,25 +3273,25 @@ fn a_pre_write_stale_batch_keeps_a_connected_heights_reservation() {
     let unconnected = ConfirmFeed::new();
     unconnected.set_unproven_bounds(Some(10), 0, Some(40));
     assert_eq!(
-        take_unproven_lead(&unconnected, Some(&[40]), vec![1]),
-        vec![1]
+        take_unproven_lead(&unconnected, Some(&[40]), vec![2]),
+        vec![2]
     );
     let first = unconnected.epoch();
     unconnected.drop_plan();
     assert_eq!(
-        take_unproven_lead(&unconnected, Some(&[40]), vec![1]),
-        vec![1]
+        take_unproven_lead(&unconnected, Some(&[40]), vec![2]),
+        vec![2]
     );
     let second = unconnected.epoch();
-    unconnected.finish_claim([1], first);
-    finish_pre_write_stale(&hub, &unconnected, &[(1, missing.to_byte_array())], second);
+    unconnected.finish_claim([2], first);
+    finish_pre_write_stale(&hub, &unconnected, &[(2, missing.to_byte_array())], second);
     assert!(
         !unconnected
             .inner
             .lock()
             .unwrap()
             .lead_reserved
-            .contains_key(&1),
+            .contains_key(&2),
         "an unconnected height returns its bytes at once"
     );
     let _ = std::fs::remove_dir_all(dir);

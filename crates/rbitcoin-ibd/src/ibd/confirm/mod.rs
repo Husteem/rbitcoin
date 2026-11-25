@@ -2334,7 +2334,16 @@ pub fn finish_pre_write_stale(
     let mut connected = Vec::new();
     let mut unconnected = Vec::new();
     for &(height, raw) in heights_hashes {
-        if hub.is_connected(&BlockHash::from_byte_array(raw)) {
+        let hash_connected = hub.is_connected(&BlockHash::from_byte_array(raw));
+        // A different hash can be the connected block at this height. Keep
+        // the reservation for any confirmed header at the height.
+        let height_connected = hub
+            .query
+            .header_at_height(rbitcoin_primitives::Height(height))
+            .ok()
+            .flatten()
+            .is_some();
+        if hash_connected || height_connected {
             connected.push(height);
         } else {
             unconnected.push(height);
