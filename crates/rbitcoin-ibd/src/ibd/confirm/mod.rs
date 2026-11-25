@@ -525,9 +525,8 @@ impl ConfirmFeed {
         let mut g = self.inner.lock().unwrap();
         let mut released = false;
         for h in heights {
-            g.inflight.remove(&h);
-            let claimed = g.claimed_epoch.remove(&h);
-            let epoch = explicit_epoch.or(claimed);
+            let stored_claim = g.claimed_epoch.get(&h).copied();
+            let epoch = explicit_epoch.or(stored_claim);
             let mut empty = false;
             if let Some(claims) = g.lead_claims.get_mut(&h) {
                 match epoch {
@@ -548,6 +547,13 @@ impl ConfirmFeed {
                     released = true;
                 }
             }
+            let owns_load = explicit_epoch.is_none()
+                || stored_claim.is_none()
+                || stored_claim == explicit_epoch;
+            if owns_load {
+                g.inflight.remove(&h);
+                g.claimed_epoch.remove(&h);
+            }
         }
         drop(g);
         if released {
@@ -564,6 +570,12 @@ impl ConfirmFeed {
     /// [`Self::finish_stale_plan`], which returns the reservation.
     pub fn finish(&self, heights: impl IntoIterator<Item = u32>) {
         self.finish_inner(heights, false, None);
+    }
+
+    /// Finish a batch that carries its own claim epoch. A newer load that
+    /// replaced the height's ownership is left in flight.
+    pub fn finish_claim(&self, heights: impl IntoIterator<Item = u32>, claim_epoch: u64) {
+        self.finish_inner(heights, false, Some(claim_epoch));
     }
 
     /// A stale plan batch will not write and sends no `Accepted`. Drop the
@@ -2276,12 +2288,14 @@ pub fn write_batch_is_stale_plan(hub: &ChainHub, feed: &ConfirmFeed, first_h: u3
 /// height already in the store so the walk charges it and the accept arm
 /// releases its reservation; release the rest now because no event follows.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub fn settle_failed_write(
     hub: &ChainHub,
     feed: &ConfirmFeed,
     event_tx: &std::sync::mpsc::Sender<ConfirmEvent>,
     heights_hashes: &[(u32, [u8; 32])],
     wire_sizes: &[u64],
+    claim_epoch: u64,
     loop_stats: &LoopStats,
     accepted: &AtomicU32,
 ) {
@@ -2302,8 +2316,8 @@ pub fn settle_failed_write(
             unwritten.push(height);
         }
     }
-    feed.finish_stale_plan(unwritten, None);
-    feed.finish(written);
+    feed.finish_stale_plan(unwritten, Some(claim_epoch));
+    feed.finish_claim(written, claim_epoch);
 }
 
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
@@ -2416,6 +2430,7 @@ pub fn spawn_confirm_engine(
                     .iter()
                     .map(|b| b.total_size() as u64)
                     .collect();
+                let batch_epoch = batch.epoch;
                 if write_batch_is_stale_plan(&hub_wb, &feed_wb, first_h) {
                     debug!(Ibd,
                         "confirm write drop stale batch first={first_h} (tip moved)"
@@ -2426,6 +2441,7 @@ pub fn spawn_confirm_engine(
                         &event_tx_wb,
                         &heights_hashes,
                         &wire_sizes,
+                        batch_epoch,
                         &loop_stats_wb,
                         &accepted_wb,
                     );
@@ -2435,7 +2451,7 @@ pub fn spawn_confirm_engine(
                     Ok(h) => h,
                     Err(e) => {
                         warn!("ibd: confirm write {e}");
-                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                        feed_wb.finish_claim(heights_hashes.iter().map(|(h, _)| *h), batch_epoch);
                         break;
                     }
                 };
@@ -2475,11 +2491,11 @@ pub fn spawn_confirm_engine(
                                 })
                                 .is_err()
                             {
-                                feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                                feed_wb.finish_claim(heights_hashes.iter().map(|(h, _)| *h), batch_epoch);
                                 return;
                             }
                         }
-                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                        feed_wb.finish_claim(heights_hashes.iter().map(|(h, _)| *h), batch_epoch);
                         let deq_ns = t_deq.elapsed().as_nanos() as u64;
                         rbitcoin_query::note_confirm(&stats.write_dequeue_ns, deq_ns);
                         let elapsed = t0.elapsed();
@@ -2537,13 +2553,14 @@ pub fn spawn_confirm_engine(
                                                 })
                                                 .is_err()
                                             {
-                                                feed_wb.finish(
+                                                feed_wb.finish_claim(
                                                     heights_hashes.iter().map(|(hh, _)| *hh),
+                                                    batch_epoch,
                                                 );
                                                 return;
                                             }
                                         }
-                                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                                        feed_wb.finish_claim(heights_hashes.iter().map(|(h, _)| *h), batch_epoch);
                                         continue;
                                     }
                                     Err(e2) => {
@@ -2585,6 +2602,7 @@ pub fn spawn_confirm_engine(
                                 &event_tx_wb,
                                 &heights_hashes,
                                 &wire_sizes,
+                                batch_epoch,
                                 &loop_stats_wb,
                                 &accepted_wb,
                             );
@@ -2609,12 +2627,13 @@ pub fn spawn_confirm_engine(
                                 &event_tx_wb,
                                 &heights_hashes,
                                 &wire_sizes,
+                                batch_epoch,
                                 &loop_stats_wb,
                                 &accepted_wb,
                             );
                             continue;
                         }
-                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                        feed_wb.finish_claim(heights_hashes.iter().map(|(h, _)| *h), batch_epoch);
                         loop_stats_wb
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
@@ -2737,9 +2756,9 @@ pub fn spawn_confirm_engine(
                         .first()
                         .map(|(h, raw)| (*h, BlockHash::from_byte_array(*raw)))
                         .unwrap_or((meta.first_h, BlockHash::from_byte_array([0u8; 32])));
-                    feed_sc.finish(meta.heights_hashes.iter().map(|(h, _)| *h));
+                    feed_sc.finish_claim(meta.heights_hashes.iter().map(|(h, _)| *h), meta.epoch);
                     for d in dropped {
-                        feed_sc.finish(d.heights_hashes.iter().map(|(h, _)| *h));
+                        feed_sc.finish_claim(d.heights_hashes.iter().map(|(h, _)| *h), d.epoch);
                     }
                     loop_stats_sc
                         .confirm_reject_stops
@@ -3102,6 +3121,7 @@ pub fn spawn_confirm_engine(
 
                 match mat_res {
                     Ok(mut outcome) => {
+                        outcome.batch.epoch = claim_epoch;
                         outcome.batch.holds = wire_batch
                             .iter()
                             .map(|(_, _, w)| Arc::clone(&w.heap))

@@ -86,6 +86,7 @@ fn script_ok_append_contiguous_and_gap() {
     fn batch_one(h: u32) -> ScriptOkBatch {
         let block = rbitcoin_consensus::genesis_block(&rbitcoin_consensus::ChainParams::regtest());
         ScriptOkBatch {
+            epoch: 0,
             prepared: vec![empty_prepared(h, h as u8)],
             wire_bytes: block.total_size(),
             wire_blocks: vec![Arc::new(block)],
@@ -124,6 +125,7 @@ fn script_ok_append_contiguous_and_gap() {
 
     assert!(a
         .append_contiguous(ScriptOkBatch {
+            epoch: 0,
             prepared: vec![],
             wire_blocks: vec![],
             batch_parents: rbitcoin_query::BatchParents::new(),
@@ -137,6 +139,7 @@ fn script_ok_append_contiguous_and_gap() {
     assert_eq!(a.len(), 3);
 
     let mut empty = ScriptOkBatch {
+        epoch: 0,
         prepared: vec![],
         wire_blocks: vec![],
         batch_parents: rbitcoin_query::BatchParents::new(),
@@ -222,6 +225,7 @@ fn three_stage_write_filter_and_scripts_surface() {
 
     use rbitcoin_query::confirm_run::{confirm_scripts_phase, LoadedBatch, ScriptPreverified};
     let batch = LoadedBatch {
+        epoch: 0,
         prepared: Vec::new(),
         wire_blocks: Vec::new(),
         batch_parents: rbitcoin_query::BatchParents::new(),
@@ -239,6 +243,7 @@ fn three_stage_write_filter_and_scripts_surface() {
     assert_eq!(batch.parent_count(), 0);
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
     let mut metered = LoadedBatch {
+        epoch: 0,
         prepared: Vec::new(),
         wire_bytes: genesis.total_size(),
         wire_blocks: vec![std::sync::Arc::new(genesis)],
@@ -271,6 +276,7 @@ fn three_stage_write_filter_and_scripts_surface() {
     );
     assert_eq!(metered.parent_count(), 1);
     let script_ok = rbitcoin_query::confirm_run::ScriptOkBatch {
+        epoch: 0,
         prepared: Vec::new(),
         wire_blocks: Vec::new(),
         batch_parents: metered.batch_parents,
@@ -323,6 +329,7 @@ fn confirm_archive_kind_refuses_mixed() {
 
 fn empty_loaded_batch() -> rbitcoin_query::confirm_run::LoadedBatch {
     rbitcoin_query::confirm_run::LoadedBatch {
+        epoch: 0,
         prepared: Vec::new(),
         wire_blocks: Vec::new(),
         batch_parents: rbitcoin_query::BatchParents::new(),
@@ -555,6 +562,7 @@ fn loaded_at(
     check_scripts: bool,
 ) -> rbitcoin_query::confirm_run::LoadedBatch {
     rbitcoin_query::confirm_run::LoadedBatch {
+        epoch: 0,
         prepared: vec![prepared_at(height, hash, jobs, check_scripts)],
         wire_blocks: Vec::new(),
         batch_parents: rbitcoin_query::BatchParents::new(),
@@ -761,6 +769,7 @@ fn expected_bits_extending_height0_and_no_retarget() {
     // ScriptOkBatch empty surfaces (mirror LoadedBatch).
     use rbitcoin_query::confirm_run::{confirm_scripts_phase, LoadedBatch, ScriptPreverified};
     let loaded = LoadedBatch {
+        epoch: 0,
         prepared: Vec::new(),
         wire_blocks: Vec::new(),
         batch_parents: rbitcoin_query::BatchParents::new(),
@@ -959,6 +968,7 @@ fn script_wave_skips_preverified_txids() {
         prev_mtp: 0,
     };
     let batch = LoadedBatch {
+        epoch: 0,
         prepared: vec![prepared],
         wire_blocks: vec![],
         batch_parents: rbitcoin_query::BatchParents::new(),

@@ -658,6 +658,7 @@ fn already_committed_batch(
     use rbitcoin_query::confirm_run::Prepared;
     let hash = q.get_header(header_fk).unwrap().hash;
     rbitcoin_query::confirm_run::ScriptOkBatch {
+            epoch: 0,
         prepared: vec![Prepared {
             height: Height(0),
             header_fk,

@@ -624,6 +624,7 @@ fn load_from_plan_inner(
     let work_ns = t_work.elapsed().as_nanos() as u64;
     Ok(ConfirmLoadOutcome {
         batch: LoadedBatch {
+            epoch: 0,
             prepared,
             wire_bytes,
             wire_blocks,

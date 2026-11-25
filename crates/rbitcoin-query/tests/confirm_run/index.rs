@@ -628,6 +628,7 @@ fn two_block_index_batch(
     let (b0, p0) = index_block(10, 40, ser, p2wpkh, p2tr);
     let (b1, p1) = index_block(11, 33, ser, p2wpkh, p2tr);
     LoadedBatch {
+        epoch: 0,
         prepared: vec![p0, p1],
         wire_blocks: vec![Arc::new(b0), Arc::new(b1)],
         batch_parents: rbitcoin_query::BatchParents::new(),

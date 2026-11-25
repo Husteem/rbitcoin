@@ -3179,6 +3179,51 @@ fn a_stale_drop_keeps_a_reservation_a_new_claim_still_owns() {
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(40));
 }
 
+/// An old writer can finish after a rewind while a new load has already
+/// claimed the same height. The old finish must leave the new claim in flight
+/// and keep its reservation.
+#[test]
+fn an_old_writer_leaves_a_newer_load_claim_in_flight() {
+    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    let old_epoch = feed.epoch();
+    {
+        let mut g = feed.inner.lock().unwrap();
+        g.inflight.insert(1);
+        g.claimed_epoch.insert(1, old_epoch);
+    }
+    feed.drop_plan();
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    let new_epoch = feed.epoch();
+    {
+        let mut g = feed.inner.lock().unwrap();
+        g.inflight.insert(1);
+        g.claimed_epoch.insert(1, new_epoch);
+    }
+    feed.finish_claim([1], old_epoch);
+    {
+        let g = feed.inner.lock().unwrap();
+        assert!(
+            g.inflight.contains(&1),
+            "the new load claim stays in flight"
+        );
+        assert_eq!(
+            g.claimed_epoch.get(&1),
+            Some(&new_epoch),
+            "the old writer does not replace the new load epoch"
+        );
+        assert!(
+            g.lead_reserved.contains_key(&1),
+            "the new claim keeps its reservation"
+        );
+    }
+    feed.finish_stale_plan([1], Some(new_epoch));
+    assert!(!feed.holds(1));
+    assert!(!feed.inner.lock().unwrap().lead_reserved.contains_key(&1));
+}
+
 /// A replacement body at a height that still holds a reservation may be
 /// larger. The claim charges the increase so the reservation covers it.
 #[test]
@@ -3246,6 +3291,7 @@ fn a_failed_write_sends_accepted_for_committed_heights_only() {
         &tx,
         &[(2, missing.to_byte_array()), (3, genesis.to_byte_array())],
         &[12, 34],
+        feed.epoch(),
         &stats,
         &accepted,
     );
@@ -3308,6 +3354,7 @@ fn a_failed_write_does_not_accept_a_cache_only_body() {
         &tx,
         &[(1, hash.to_byte_array())],
         &[40],
+        feed.epoch(),
         &stats,
         &accepted,
     );

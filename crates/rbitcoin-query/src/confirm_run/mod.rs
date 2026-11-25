@@ -174,6 +174,9 @@ pub struct WireLoadPipeline<'a> {
 /// When `archive_plan` is `Some`, commit stage appends Class A before
 /// structural / annotate (single ordered commit era).
 pub struct LoadedBatch {
+    /// Confirm-feed epoch when this batch was claimed. IBD carries it through
+    /// scripts and write so late completion settles only its own claim.
+    pub epoch: u64,
     pub prepared: Vec<Prepared>,
     /// Shared wire (Arc) so load→scripts→write does not deep-clone full blocks.
     pub wire_blocks: Vec<Arc<Block>>,
@@ -205,6 +208,8 @@ pub struct LoadedBatch {
 ///
 /// `Send` so IBD can hand off scripts → write.
 pub struct ScriptOkBatch {
+    /// Confirm-feed epoch carried from [`LoadedBatch::epoch`].
+    pub epoch: u64,
     pub prepared: Vec<Prepared>,
     pub wire_blocks: Vec<Arc<Block>>,
     /// Wire bytes of `wire_blocks`, measured once at load for the queue
