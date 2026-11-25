@@ -5,7 +5,8 @@ Security
   peer already had 100 requests waiting for an answer, or announced it by
   txid while peers that relay by wtxid were connected. A peer that never
   answered could still hold a transaction back for up to a minute. As in
-  Core, a peer with 100 or more requests outstanding and no relay
-  permission is now asked 2 seconds after its announcement, and so is a
-  txid announcement while a wtxid-relay peer is connected, so an honest
-  peer that announces in that time is asked instead.
+  Core, each of these adds 2 seconds to the wait before the node asks: a
+  peer with 100 or more requests outstanding and no relay permission, and a
+  txid announcement while a wtxid-relay peer is connected. They add to each
+  other and to the 2 seconds a non-preferred peer already waits. A peer
+  whose own wait ends sooner is asked first.

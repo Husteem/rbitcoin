@@ -5222,6 +5222,7 @@ pub fn on_inv(
         && (hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false)
             || session.is_some_and(|s| s.session_relay_perm()));
     let mut path_work = PathWorkMemo::default();
+    let wtxid_peer_scan = std::cell::OnceCell::new();
     for item in items {
         match item {
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
@@ -5247,7 +5248,14 @@ pub fn on_inv(
                 if !seen_txids.insert(*txid) {
                     continue;
                 }
-                if let Some(inv) = on_inv_txid(hub, session, relay, txid, &mut parent_capped) {
+                if let Some(inv) = on_inv_txid(
+                    hub,
+                    session,
+                    relay,
+                    txid,
+                    &mut parent_capped,
+                    &wtxid_peer_scan,
+                ) {
                     want.push(inv);
                     inv_tx_n = inv_tx_n.saturating_add(1);
                 }
@@ -5353,6 +5361,7 @@ pub fn on_inv_txid(
     relay: bool,
     txid: &bitcoin::Txid,
     parent_capped: &mut bool,
+    wtxid_peer_scan: &std::cell::OnceCell<bool>,
 ) -> Option<Inventory> {
     if !relay {
         return None;
@@ -5370,7 +5379,8 @@ pub fn on_inv_txid(
         return None;
     }
     if let Some(s) = session {
-        let wtxid_peers = s.peer_hub().is_some_and(|h| h.has_wtxid_relay_peer());
+        let wtxid_peers =
+            *wtxid_peer_scan.get_or_init(|| s.peer_hub().is_some_and(|h| h.has_wtxid_relay_peer()));
         match mp.note_inv_tx_requested(
             tx_inv_source(s, wtxid_peers),
             txid.to_byte_array(),
