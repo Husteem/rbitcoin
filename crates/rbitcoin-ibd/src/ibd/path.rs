@@ -32,9 +32,20 @@ pub fn load_resume_entries(
 }
 
 pub fn seed_work_path_from_store(st: &mut IbdWorkState, hub: &ChainHub) {
-    let exclude: Vec<[u8; 32]> = st.reorg.invalid.iter().collect();
+    let exclude = resume_exclude(st);
     let path = load_resume_entries(hub, &exclude);
     install_resumed_path(st, hub, &path);
+}
+
+/// Headers the resume seed must not plant: consensus-invalid ones, and ones
+/// this session abandoned because every body copy arrived mutated. Without the
+/// second set a stale store header resurrects the abandoned tip on every
+/// reject-path reseed and the re-get loop restarts (#1811).
+#[doc(hidden)]
+pub fn resume_exclude(st: &IbdWorkState) -> Vec<[u8; 32]> {
+    let mut exclude: Vec<[u8; 32]> = st.reorg.invalid.iter().collect();
+    exclude.extend(st.unservable.iter().map(|h| h.to_byte_array()));
+    exclude
 }
 
 pub fn install_resumed_path(
@@ -75,13 +86,25 @@ pub fn install_resume(
         path.len(),
         t0.elapsed()
     );
+    // `load_resume_entries` runs outside the shared lock, so a hash abandoned
+    // while it loaded is not in the exclusion list. Refuse it here, while the
+    // path is installed, or it restarts the mutated-copy cycle (#1811). The
+    // explore tip below must also stay inside this prefix: a tip past a
+    // refused entry is a rewind candidate whose path needs a body IBD will
+    // not request.
+    fn refused(st: &IbdWorkState, e: &rbitcoin_query::ResumeWorkEntry) -> bool {
+        st.reorg.invalid.contains(e.hash)
+            || st.unservable.contains(&BlockHash::from_byte_array(e.hash))
+    }
+    let installed = path
+        .iter()
+        .position(|e| refused(st, e))
+        .unwrap_or(path.len());
+    let path = &path[..installed];
     let mut explore_is_sibling_fork = false;
     let mut explore_need = Vec::new();
     for e in path {
         let hash = BlockHash::from_byte_array(e.hash);
-        if st.reorg.invalid.contains(e.hash) {
-            break;
-        }
         st.known_headers.insert(hash);
         st.hash_height.insert(hash, e.height);
         st.header_fks.insert(hash, e.header_fk);
@@ -95,11 +118,7 @@ pub fn install_resume(
         }
     }
     if explore_is_sibling_fork {
-        let explore_tip = path
-            .iter()
-            .rev()
-            .find(|e| !st.reorg.invalid.contains(e.hash))
-            .map(|e| BlockHash::from_byte_array(e.hash));
+        let explore_tip = path.last().map(|e| BlockHash::from_byte_array(e.hash));
         st.reorg.register_explore(explore_need, explore_tip);
         if rewind_now {
             match super::reorg::maybe_rewind_to_best_work(st, hub) {
@@ -128,9 +147,6 @@ pub fn install_resume(
     let mut ready_prefix = true;
     let tip = hub.tip_height().zip(hub.tip_hash());
     for e in path {
-        if st.reorg.invalid.contains(e.hash) {
-            break;
-        }
         let hash = BlockHash::from_byte_array(e.hash);
         let prev = BlockHash::from_byte_array(e.prev_hash);
         let on_path = st.try_set_path_slot(hash, e.height, prev, tip);
@@ -184,7 +200,10 @@ pub fn plant_find_valid_child(
         tip_h.saturating_add(1)
     };
     if let Some(&cur) = st.height_to_hash.get(&expect) {
-        if !st.reorg.invalid.contains(cur.to_byte_array()) && !st.body.is_rejected(&cur) {
+        if !st.reorg.invalid.contains(cur.to_byte_array())
+            && !st.body.is_rejected(&cur)
+            && !st.unservable.contains(&cur)
+        {
             return None;
         }
     }
@@ -192,7 +211,10 @@ pub fn plant_find_valid_child(
         if ht != expect {
             continue;
         }
-        if st.reorg.invalid.contains(h.to_byte_array()) || st.body.is_rejected(&h) {
+        if st.reorg.invalid.contains(h.to_byte_array())
+            || st.body.is_rejected(&h)
+            || st.unservable.contains(&h)
+        {
             continue;
         }
         let Some(prev) = st.path_prev.get(&h).copied().or_else(|| hub.prev_of(&h)) else {
@@ -238,7 +260,10 @@ pub fn plant_commit_header(
     ht: u32,
     prev: BlockHash,
 ) -> bool {
-    if st.reorg.invalid.contains(cur.to_byte_array()) || st.body.is_rejected(&cur) {
+    if st.reorg.invalid.contains(cur.to_byte_array())
+        || st.body.is_rejected(&cur)
+        || st.unservable.contains(&cur)
+    {
         return false;
     }
     let tip = hub.tip_height().zip(hub.tip_hash());
@@ -247,6 +272,9 @@ pub fn plant_commit_header(
     if on_path && st.ordered_set.insert(cur) {
         st.ordered.push_back(cur);
     }
+    // A planted sibling is a download target now, not a recorded sibling: a
+    // later walk move must not forget its rows while it is on the path.
+    st.tip_siblings.retain(|h| *h != cur);
     st.known_headers.insert(cur);
     true
 }

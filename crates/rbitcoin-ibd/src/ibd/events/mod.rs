@@ -176,6 +176,13 @@ pub fn note_header_path(
     height: u32,
     prev: BlockHash,
 ) {
+    // An abandoned header can be announced again by the peer we keep. Its
+    // reply still gets written, but it must not take the path slot at this
+    // height back: a stored reply that continues the cut-back walk tip would
+    // otherwise queue the same body and start the loop over (#1811).
+    if st.unservable.contains(&hash) {
+        return;
+    }
     let tip = hub.tip_height().zip(hub.tip_hash());
     if st.try_set_path_slot(hash, height, prev, tip) {
         st.max_peer_height = st.max_peer_height.max(height);
@@ -199,7 +206,10 @@ fn try_enqueue_ordered_header(
         st.known_headers.insert(hash);
         return false;
     }
-    if st.body.is_rejected(&hash) || st.reorg.invalid.contains(hash.to_byte_array()) {
+    if st.body.is_rejected(&hash)
+        || st.reorg.invalid.contains(hash.to_byte_array())
+        || st.unservable.contains(&hash)
+    {
         return false;
     }
     let prev_ok = st.known_headers.contains(&prev)
@@ -549,7 +559,7 @@ pub fn run_header_batch(
         HeaderPlan::Resume => {
             let exclude: Vec<[u8; 32]> = {
                 let st = shared.lock().unwrap_or_else(|err| err.into_inner());
-                st.reorg.invalid.iter().collect()
+                super::path::resume_exclude(&st)
             };
             let path = super::path::load_resume_entries(hub, &exclude);
             {
@@ -837,17 +847,45 @@ pub fn apply_block_framed(
     if st.body.is_rejected(&hash) || hub.has_block(&hash) {
         return;
     }
-    let header_fk = if let Some(&fk) = st.header_fks.get(&hash) {
-        fk
-    } else {
-        st.body.mark_missing(hash);
-        return;
-    };
-    let tip_h = hub.tip_height().unwrap_or(0);
     let Some(height) = st.hash_height.get(&hash).copied() else {
         st.body.mark_missing(hash);
         return;
     };
+    let header_fk = match st.header_fks.get(&hash) {
+        Some(&fk) => {
+            st.header_write_misses.remove(&hash);
+            fk
+        }
+        None => {
+            // A recorded sibling's header is not written with its
+            // announcement, and the body cannot be queued without its fk.
+            // Write the 80-byte header here (not the body) and keep going.
+            // A store that keeps refusing it is bounded by
+            // `SIBLING_HEADER_WRITE_TRIES`; the follow-up issue moves this
+            // write to the ibd-header thread so it leaves the drain lock.
+            let Some(header) = header_from_body(&payload, hash) else {
+                st.body.mark_missing(hash);
+                return;
+            };
+            let fks = prepare_header_store(hub, &[header]);
+            match fks.first() {
+                Some(&fk) => {
+                    st.header_fks.insert(hash, fk);
+                    st.header_write_misses.remove(&hash);
+                    fk
+                }
+                None => {
+                    if note_header_write_miss(st, hash) {
+                        abandon_unwritable_sibling(st, hub, hash, height);
+                        return;
+                    }
+                    st.body.mark_missing(hash);
+                    return;
+                }
+            }
+        }
+    };
+    let tip_h = hub.tip_height().unwrap_or(0);
     let write_next = archive_write_next.load(Ordering::Relaxed);
     let tip_hi = tip_h.saturating_add(CONTIG_DENSIFY_AHEAD);
     let densify_hi = write_next.saturating_add(CONTIG_DENSIFY_AHEAD);
@@ -899,6 +937,15 @@ pub fn apply_block_framed(
     if let Some(feed) = confirm_feed {
         feed.note(height, hash);
     }
+}
+
+/// The header a delivered body carries, when it hashes to `hash`. Decodes the
+/// 80-byte header only; the body itself is not decoded here.
+fn header_from_body(payload: &[u8], hash: BlockHash) -> Option<bitcoin::block::Header> {
+    use bitcoin::consensus::Decodable;
+    let mut cursor = std::io::Cursor::new(payload);
+    let header = bitcoin::block::Header::consensus_decode(&mut cursor).ok()?;
+    (header.block_hash() == hash).then_some(header)
 }
 
 /// Undecodable wire is the sender's block. Any other store refusal stays a
@@ -1262,7 +1309,15 @@ pub fn take_confirm_events(
                 st.confirm_stuck_since = None;
                 remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                 st.body.mark_archived(hash);
+                // A valid copy arrived after all (another peer, or the same
+                // one on retry): this hash is servable and keeps its path.
+                st.unservable.remove(&hash);
+                st.mutated_copies.remove(&hash);
+                st.tip_siblings.retain(|h| *h != hash);
                 let tip = hub.tip_height().unwrap_or(0);
+                // A confirmed block at or above a recorded sibling's height
+                // makes that sibling moot; a walk move does not.
+                super::header_walk::forget_tip_siblings(st, tip);
                 // The write recorded this height. Do not look it up: a fork
                 // promotion can drop `hash_height` first, and a header read
                 // here runs while the coordinator holds `shared`. A rewind
@@ -1467,8 +1522,29 @@ pub(crate) fn finish_deferred_archived_clear(
         // `hash` is the block that failed and `sender` sent that copy. The
         // live pending sender may be a replacement's.
         if !retry_tip_child && rbitcoin_net::chain::reject_is_mutated(err) {
-            if let Some(peer) = sender {
-                punish_mutated_sender(st, peer, hash);
+            // A dropped sender is a different peer next round, so only the
+            // copies from peers we keep count toward the abandon bound.
+            let dropped = sender.is_some_and(|peer| punish_mutated_sender(st, peer, hash));
+            // The sender is still connected (`-connect` / noban), so the hash
+            // re-opens and is asked for again on every copy. Past
+            // `MUTATED_COPIES_BEFORE_ABANDON` copies no peer we keep can serve
+            // it: stop the re-get and take the header off the path, or
+            // `ordered` never empties and IBD never leaves catch-up (#1811).
+            if !dropped && note_mutated_copy(st, hash) {
+                st.unservable.insert(hash);
+                st.body.stop_reget(hash);
+                // A tip+1 sibling is never on the path, so the walk cut below
+                // does not reach it. Drop its ask lane here or assign keeps
+                // asking for a body the peer always sends mutated.
+                st.tip_siblings.retain(|h| *h != hash);
+                if !st.is_on_path(&hash, height) {
+                    super::header_walk::forget_sibling_rows(st, hash);
+                    return;
+                }
+                if let Some(hub) = hub {
+                    super::header_walk::retire_unservable(st, hub, hash, height);
+                }
+                return;
             }
         }
         // A batched soft reject was isolated as a cascade. It landed here on
@@ -1645,24 +1721,103 @@ pub fn bad_prev_parent(
     }
 }
 
+/// Bodies for one hash whose header write produced no fk before the header is
+/// abandoned. Bounds a store that keeps refusing the header; the hash is then
+/// dropped from the sibling lane instead of re-asked forever.
+#[doc(hidden)]
+pub const SIBLING_HEADER_WRITE_TRIES: u8 = 4;
+
+/// Tracked hashes with failed sibling header writes. Bounds the map a peer can
+/// grow.
+const HEADER_WRITE_TRACK_CAP: usize = 256;
+
+/// Count one delivered body whose header could not be written (`None` fk).
+/// True once [`SIBLING_HEADER_WRITE_TRIES`] is reached.
+#[doc(hidden)]
+pub fn note_header_write_miss(st: &mut IbdWorkState, hash: BlockHash) -> bool {
+    cap_tracked(&mut st.header_write_misses, hash, HEADER_WRITE_TRACK_CAP);
+    let misses = st.header_write_misses.entry(hash).or_insert(0);
+    *misses = misses.saturating_add(1);
+    *misses >= SIBLING_HEADER_WRITE_TRIES
+}
+
+/// The header write for `hash` failed its bound. Stop the sibling lane and take
+/// the hash off the path: a planted sibling keeps its slot otherwise, `ordered`
+/// never empties, and the next recorded sibling is never planted.
+#[doc(hidden)]
+pub fn abandon_unwritable_sibling(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    hash: BlockHash,
+    height: u32,
+) {
+    st.unservable.insert(hash);
+    st.body.stop_reget(hash);
+    st.tip_siblings.retain(|h| *h != hash);
+    st.header_write_misses.remove(&hash);
+    if st.is_on_path(&hash, height) {
+        super::header_walk::retire_unwritable_header(st, hub, hash, height);
+    } else {
+        super::header_walk::forget_sibling_rows(st, hash);
+    }
+}
+
+/// Mutated copies of one hash before its header is abandoned. Three matches
+/// `TIP_CHILD_HALT_AFTER`: one can be a fluke, two a peer still resending the
+/// same bad copy, three means the kept peers that answered cannot serve it
+/// (another kept peer may still have it; see #1992).
+#[doc(hidden)]
+pub const MUTATED_COPIES_BEFORE_ABANDON: u8 = 3;
+
+/// Tracked hashes with mutated copies. Bounds the map a peer can grow.
+const MUTATED_TRACK_CAP: usize = 256;
+
+/// Make room for one more count without growing past `cap`: drop an arbitrary
+/// tracked hash. A dropped count only costs that hash more retries; it can
+/// never retire a hash that has not been copied that often.
+fn cap_tracked(counts: &mut crate::ibd::state::BlockHashMap<u8>, hash: BlockHash, cap: usize) {
+    if counts.len() >= cap && !counts.contains_key(&hash) {
+        if let Some(victim) = counts.keys().next().copied() {
+            counts.remove(&victim);
+        }
+    }
+}
+
+/// Count one mutated body copy for `hash`. True once the abandon limit is
+/// reached (see [`MUTATED_COPIES_BEFORE_ABANDON`]).
+///
+/// Dropping a count at the tracking cap only costs retries for that hash; it
+/// can never retire a hash that has not been copied that often.
+pub fn note_mutated_copy(st: &mut IbdWorkState, hash: BlockHash) -> bool {
+    cap_tracked(&mut st.mutated_copies, hash, MUTATED_TRACK_CAP);
+    let copies = st.mutated_copies.entry(hash).or_insert(0);
+    *copies = copies.saturating_add(1);
+    *copies >= MUTATED_COPIES_BEFORE_ABANDON
+}
+
 /// Core `MaybePunishNodeForBlock` (`BLOCK_MUTATED`): drop the sender and
 /// cool down its address so the re-get goes to another peer. Redial falls
 /// back to a cooling address when no other is dialable. A noban peer stays,
 /// and so does a manual one (`--connect`): Core `MaybeDiscourageAndDisconnect`
 /// never drops a manual peer for misbehavior.
+///
+/// False when the peer is kept (`-connect` / noban), which is the case the
+/// re-get bound in [`note_mutated_copy`] exists for.
 #[doc(hidden)]
-pub fn punish_mutated_sender(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
+pub fn punish_mutated_sender(st: &mut IbdWorkState, peer: usize, hash: BlockHash) -> bool {
     let Some((addr, conn_type)) = st
         .slots
         .iter()
         .find(|s| s.id == peer && s.alive)
         .map(|s| (s.addr, s.conn_type))
     else {
-        return;
+        // The slot is gone: this copy is a stale answer from a peer that is
+        // no longer kept, so it does not count toward the abandon bound.
+        return true;
     };
     if conn_type == rbitcoin_net::peers::PeerConnType::Manual {
         warn!("ibd: peer[{peer}] sent mutated block {hash}; not punishing manually connected peer");
-        return;
+        return false;
     }
     // IBD dials outbound only. A bind address only matters for inbound
     // (`-whitebind`), so the peer address fills that slot.
@@ -1673,10 +1828,11 @@ pub fn punish_mutated_sender(st: &mut IbdWorkState, peer: usize, hash: BlockHash
     });
     if noban {
         warn!("ibd: peer[{peer}] sent mutated block {hash}; not punishing noban peer");
-        return;
+        return false;
     }
     warn!("ibd: peer[{peer}] sent mutated block {hash}; dropping peer");
     disconnect_peer(st, peer);
+    true
 }
 
 fn apply_tip_child_bad_prev(
@@ -1819,6 +1975,7 @@ pub fn apply_consensus_invalid_reject(
     }
     st.body.mark_rejected(hash);
     st.reorg.invalid.mark(hash.to_byte_array());
+    st.tip_siblings.retain(|h| *h != hash);
     if let Some(h) = hub {
         // The failure goes to disk before the retired walk does: a walk saved
         // with its failure lost would resume onto the invalid chain, and

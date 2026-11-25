@@ -315,6 +315,23 @@ pub struct IbdWorkState {
     pub assign_path_lo: u32,
     /// Hashes that already produced one [`super::confirm::ConfirmRejectClass::EngineFault`].
     pub engine_fault_seen: HashSet<BlockHash>,
+    /// Mutated body copies received per hash. Bounds re-getting a hash whose
+    /// sender cannot be punished (`-connect` / noban), which would otherwise
+    /// keep IBD open forever (#1811).
+    pub mutated_copies: BlockHashMap<u8>,
+    /// Bodies whose serialized header has not produced an fk yet (the drain
+    /// writes it inline; see #1994). Bounded so a store that keeps refusing
+    /// the header cannot re-ask for the same body forever.
+    pub header_write_misses: BlockHashMap<u8>,
+    /// Headers abandoned because every body copy arrived mutated. Retired from
+    /// the work path and never re-seeded from the store this session. The
+    /// header itself is still valid; after IBD, tip-follow can still connect a
+    /// block a peer serves for it, but no IBD peer asks for it again.
+    pub unservable: BlockHashSet,
+    /// Equal-work siblings announced at tip+1, kept so the tip can be planted
+    /// at that height once the header in the slot is abandoned. Bounded like
+    /// the explore lists; none of them is stored on the announcement.
+    pub tip_siblings: Vec<BlockHash>,
     /// Set when a second engine-fault hits the same hash — IBD must halt.
     pub halt: Option<String>,
     /// First time confirm rejected without tip progress (download gate timer).
@@ -435,6 +452,10 @@ impl IbdWorkState {
             densify_scan_lo: 0,
             assign_path_lo: 0,
             engine_fault_seen: HashSet::new(),
+            mutated_copies: BlockHashMap::default(),
+            header_write_misses: BlockHashMap::default(),
+            unservable: BlockHashSet::default(),
+            tip_siblings: Vec::new(),
             halt: None,
             confirm_stuck_since: None,
             confirm_quiesce: ConfirmQuiesce::Live,
@@ -577,6 +598,10 @@ impl IbdWorkState {
             + self.body.heap_bytes()
             + hash_table_bytes::<BlockHash, Fk>(self.header_fks.capacity())
             + hash_table_bytes::<NetAddr, Instant>(self.addr_cooldown.capacity())
+            + hash_table_bytes::<BlockHash, u8>(self.mutated_copies.capacity())
+            + hash_table_bytes::<BlockHash, u8>(self.header_write_misses.capacity())
+            + hash_table_bytes::<BlockHash, ()>(self.unservable.capacity())
+            + (self.tip_siblings.capacity() * std::mem::size_of::<BlockHash>()) as u64
     }
 
     /// True when `ordered` has piled up ghost entries (completed hashes left
@@ -682,6 +707,11 @@ impl IbdWorkState {
             self.header_fks.retain(|h, _| keep(h));
             self.path_prev.retain(|h, _| keep(h));
         }
+        // Sibling header-write misses are one per delivered body. Keep only
+        // hashes the work state still knows; the cap only bounds a burst.
+        let heights = &self.hash_height;
+        self.header_write_misses
+            .retain(|h, _| heights.contains_key(h));
     }
 }
 

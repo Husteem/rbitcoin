@@ -395,8 +395,8 @@ pub fn heavier_fork_candidates(
         cands.extend(unplanted_walk_tip(st, hub));
     }
     st.reorg.drain_deferred_into(&mut cands);
-    let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
-    Ok((cands, invalid))
+    let refused = refused_hashes(st);
+    Ok((cands, refused))
 }
 
 /// Scan a competing work-path tip+1 for a heavier disconnected fork and
@@ -554,7 +554,7 @@ pub fn maybe_rewind_to_best_work_n(
     walk_max: usize,
 ) -> Result<bool, NetError> {
     let cands = rewind_candidate_hashes(st, hub)?;
-    let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
+    let invalid = refused_hashes(st);
     let mut cap = None;
     let tip_before = tip_pair(hub);
     let picked = select_heavier_path(
@@ -596,6 +596,18 @@ pub fn rewind_candidate_hashes(
         }
     }
     Ok(cands)
+}
+
+/// Hashes a rewind path must never cross: consensus-invalid ones, and headers
+/// IBD abandoned because their body cannot be delivered. A path through either
+/// cannot be completed from the peers IBD keeps, so selecting it would rewind
+/// onto work the pipeline can never finish.
+fn refused_hashes(st: &super::state::IbdWorkState) -> HashSet<[u8; 32]> {
+    st.reorg
+        .invalid
+        .iter()
+        .chain(st.unservable.iter().map(|h| h.to_byte_array()))
+        .collect()
 }
 
 /// Which eligible path a selection returns.
@@ -939,11 +951,13 @@ pub fn arm_after_header_rewind_prepare_for_test(hook: Option<fn()>) {
 
 /// Select the heavier path with the most work, disconnect, and commit it.
 /// Caller does not hold `shared`. One exclusion covers the select, the
-/// disconnect, and the commit. A moved tip or a hash marked invalid skips the commit, so
-/// `clear_path_above` and `set_lookup_taken_hi` stay off that stale height.
-/// A selected path that is not committed defers `cands` to the next
-/// coordinator turn. No candidates is no gate and no chain-work read.
-pub(crate) fn apply_off_lock_rewind(
+/// disconnect, and the commit. A moved tip, a hash marked invalid, or a hash
+/// abandoned as unservable skips the commit, so `clear_path_above` and
+/// `set_lookup_taken_hi` stay off that stale height. A selected path that is
+/// not committed defers `cands` to the next coordinator turn, which reseeds
+/// and plants from the LCA. No candidates is no gate and no chain-work read.
+#[doc(hidden)]
+pub fn apply_off_lock_rewind(
     shared: &Mutex<super::state::IbdWorkState>,
     hub: &ChainHub,
     cands: &[BlockHash],
@@ -998,15 +1012,22 @@ pub(crate) fn apply_off_lock_rewind(
         .query
         .lock_tip_commit()
         .map_err(|e| NetError::Store(e.to_string()))?;
-    let marked_invalid = path
-        .iter()
-        .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()));
-    if marked_invalid || !rewind_tip_still(hub, &prep) {
+    let refused = path_refused_at_commit(&st, &path);
+    if refused || !rewind_tip_still(hub, &prep) {
         st.reorg.defer(cands);
         return Ok(false);
     }
     commit_header_rewind(&mut st, hub, &path, &prep);
     Ok(true)
+}
+
+/// A path hash the state refused after the off-lock selection snapshot. The
+/// snapshot runs under `shared`, then the lock is released for select and
+/// prepare, so a confirm reject can mark a path hash in that window. A path
+/// through it cannot be completed: IBD will not request that hash's body.
+fn path_refused_at_commit(st: &super::state::IbdWorkState, path: &[BlockHash]) -> bool {
+    path.iter()
+        .any(|hash| st.reorg.invalid.contains(hash.to_byte_array()) || st.unservable.contains(hash))
 }
 
 /// Most-work rewind with the store reads outside `shared`. The commit puts
@@ -1021,8 +1042,8 @@ pub fn rewind_off_coord_lock(
         let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
         let mut cands = rewind_candidate_hashes(&st, hub)?;
         st.reorg.drain_deferred_into(&mut cands);
-        let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
-        (cands, invalid)
+        let refused = refused_hashes(&st);
+        (cands, refused)
     };
     apply_off_lock_rewind(shared, hub, &cands, &invalid)
 }

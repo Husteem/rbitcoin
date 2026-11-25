@@ -5225,3 +5225,371 @@ fn coord_loop_body_and_reject_apply_from_event_facts() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// #1811: re-gets for a hash whose body only arrives mutated are bounded. The
+/// first copies still report "retry", the limit reports "abandon", and the
+/// resume seed skips an abandoned hash so a stale store header cannot
+/// resurrect it on the next reject-path reseed.
+#[test]
+fn mutated_copies_are_bounded_and_abandoned_hashes_are_not_reseeded() {
+    use rbitcoin_ibd::ibd::events::{note_mutated_copy, MUTATED_COPIES_BEFORE_ABANDON};
+    use rbitcoin_ibd::ibd::path::resume_exclude;
+
+    let mut st = IbdWorkState::new(Vec::new(), None, Some(4));
+    let hash = h(0x77);
+    for _ in 1..MUTATED_COPIES_BEFORE_ABANDON {
+        assert!(
+            !note_mutated_copy(&mut st, hash),
+            "a copy below the limit must keep the hash on the retry path"
+        );
+    }
+    assert!(
+        note_mutated_copy(&mut st, hash),
+        "the limit must report the hash as unservable"
+    );
+    assert!(
+        !resume_exclude(&st).contains(&hash.to_byte_array()),
+        "an abandoned hash is not excluded before it is abandoned"
+    );
+    st.unservable.insert(hash);
+    assert!(
+        resume_exclude(&st).contains(&hash.to_byte_array()),
+        "the resume seed must not plant an abandoned header again"
+    );
+}
+
+/// A planted sibling is the path occupant at its height. Forgetting the
+/// recorded siblings of a tip the walk has left must keep its rows, or
+/// `apply_block_framed` cannot find the fk/height for the body it is
+/// downloading. A sibling that was never planted still loses its rows.
+#[test]
+fn forgetting_sibling_rows_keeps_a_planted_sibling() {
+    use rbitcoin_ibd::ibd::header_walk::forget_sibling_rows;
+
+    let mut st = IbdWorkState::new(Vec::new(), None, Some(3));
+    let planted = h(0x91);
+    let unplanted = h(0x92);
+    st.record_height(planted, 4);
+    st.known_headers.insert(planted);
+    st.header_fks.insert(planted, rbitcoin_primitives::Fk(7));
+    st.hash_height.insert(unplanted, 4);
+    st.known_headers.insert(unplanted);
+    st.header_fks.insert(unplanted, rbitcoin_primitives::Fk(8));
+
+    forget_sibling_rows(&mut st, planted);
+    assert_eq!(st.hash_height.get(&planted), Some(&4));
+    assert_eq!(st.height_to_hash.get(&4), Some(&planted));
+    assert!(st.known_headers.contains(&planted));
+    assert_eq!(
+        st.header_fks.get(&planted),
+        Some(&rbitcoin_primitives::Fk(7))
+    );
+
+    forget_sibling_rows(&mut st, unplanted);
+    assert!(!st.hash_height.contains_key(&unplanted));
+    assert!(!st.known_headers.contains(&unplanted));
+    assert!(!st.header_fks.contains_key(&unplanted));
+}
+
+/// A copy whose sender slot is gone is a stale answer from a peer that is no
+/// longer kept, so it must not count toward the abandon bound.
+#[test]
+fn a_gone_sender_slot_is_not_a_kept_peer() {
+    use rbitcoin_ibd::ibd::events::punish_mutated_sender;
+
+    let mut st = IbdWorkState::new(Vec::new(), None, Some(3));
+    assert!(
+        punish_mutated_sender(&mut st, 9, h(0x93)),
+        "a missing slot is not a kept peer"
+    );
+}
+
+/// The mutation counter is capped: a peer cannot grow it without bound, and a
+/// dropped count only costs that hash more retries.
+#[test]
+fn mutated_copy_tracking_is_capped() {
+    use rbitcoin_ibd::ibd::events::{note_mutated_copy, MUTATED_COPIES_BEFORE_ABANDON};
+
+    let mut st = IbdWorkState::new(Vec::new(), None, Some(3));
+    for n in 0..300u32 {
+        let mut raw = [0u8; 32];
+        raw[..4].copy_from_slice(&n.to_le_bytes());
+        note_mutated_copy(&mut st, BlockHash::from_byte_array(raw));
+    }
+    assert!(
+        st.mutated_copies.len() <= 256,
+        "the counter map must stay bounded: {}",
+        st.mutated_copies.len()
+    );
+    let fresh = BlockHash::from_byte_array([0xab; 32]);
+    for _ in 0..MUTATED_COPIES_BEFORE_ABANDON {
+        note_mutated_copy(&mut st, fresh);
+    }
+    assert_eq!(
+        st.mutated_copies.get(&fresh),
+        Some(&MUTATED_COPIES_BEFORE_ABANDON),
+        "a fresh hash still reaches the abandon bound"
+    );
+}
+
+/// Abandoning a planted sibling (the path occupant at tip+1 while the walk tip
+/// is its parent) must fall through to `seed_work_path_from_store` and
+/// `plant_valid_tip_child`, so the next recorded sibling becomes the target.
+/// Pre-fix the planted case returned early and the second sibling was never
+/// planted.
+#[test]
+fn abandoning_a_planted_sibling_plants_the_next_recorded_one() {
+    use bitcoin::Network;
+    use rbitcoin_ibd::ibd::header_walk::retire_unservable;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("plant-next-sibling");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let t = hub.tip_height().unwrap();
+    let height = t + 1;
+    let time = bitcoin::blockdata::constants::genesis_block(Network::Regtest)
+        .header
+        .time
+        .saturating_add(600);
+    let planted = rbitcoin_consensus::mine_empty_regtest(tip, time, height);
+    let next = rbitcoin_consensus::mine_empty_regtest(tip, time + 1, height);
+    assert_eq!(planted.header.work(), next.header.work());
+    let fks = hub.ensure_headers_batch(&[planted.header]).unwrap();
+
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
+    st.header_walk.origin = true;
+    let planted_hash = planted.block_hash();
+    let next_hash = next.block_hash();
+    st.record_height(planted_hash, height);
+    st.known_headers.insert(planted_hash);
+    st.header_fks.insert(planted_hash, fks[0]);
+    st.ordered.push_back(planted_hash);
+    st.ordered_set.insert(planted_hash);
+    st.hash_height.insert(next_hash, height);
+    st.known_headers.insert(next_hash);
+    st.note_path_prev(next_hash, tip);
+    st.tip_siblings.push(next_hash);
+    // The caller (finish_deferred_archived_clear) marks the hash before the
+    // walk cut, so the store reseed does not resurrect it.
+    st.unservable.insert(planted_hash);
+
+    retire_unservable(&mut st, &hub, planted_hash, height);
+
+    assert_eq!(
+        st.height_to_hash.get(&height),
+        Some(&next_hash),
+        "the next recorded sibling must be planted at the freed height"
+    );
+    assert!(
+        st.ordered_set.contains(&next_hash),
+        "the planted sibling must be queued for getdata"
+    );
+    assert!(!st.tip_siblings.contains(&next_hash));
+    assert!(st.unservable.contains(&planted_hash));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The confirmed tip retires the siblings it reached and keeps the ones above
+/// it: a planted sibling at the confirmed height keeps its rows (it is the path
+/// occupant), a recorded sibling above it is still the next target, and one the
+/// confirmed tip passed loses its rows.
+#[test]
+fn forgetting_tip_siblings_keeps_a_sibling_above_the_confirmed_tip() {
+    use rbitcoin_ibd::ibd::header_walk::forget_tip_siblings;
+
+    let mut st = IbdWorkState::new(Vec::new(), None, Some(3));
+    let planted = h(0xb1);
+    let above = h(0xb2);
+    let passed = h(0xb3);
+    st.record_height(planted, 4);
+    st.known_headers.insert(planted);
+    st.header_fks.insert(planted, rbitcoin_primitives::Fk(11));
+    st.hash_height.insert(above, 5);
+    st.known_headers.insert(above);
+    st.header_fks.insert(above, rbitcoin_primitives::Fk(12));
+    st.hash_height.insert(passed, 2);
+    st.known_headers.insert(passed);
+    st.header_fks.insert(passed, rbitcoin_primitives::Fk(13));
+    st.tip_siblings.push(planted);
+    st.tip_siblings.push(above);
+    st.tip_siblings.push(passed);
+
+    forget_tip_siblings(&mut st, 4);
+
+    assert_eq!(st.tip_siblings, vec![above]);
+    assert_eq!(st.height_to_hash.get(&4), Some(&planted));
+    assert_eq!(
+        st.header_fks.get(&planted),
+        Some(&rbitcoin_primitives::Fk(11))
+    );
+    assert_eq!(
+        st.header_fks.get(&above),
+        Some(&rbitcoin_primitives::Fk(12)),
+        "a recorded sibling above the confirmed tip stays the next target"
+    );
+    assert!(!st.hash_height.contains_key(&passed));
+    assert!(!st.header_fks.contains_key(&passed));
+}
+
+/// Recording past the cap evicts the oldest sibling and forgets its rows, so a
+/// late body for it cannot pass the fk/height gates.
+#[test]
+fn recording_past_the_sibling_cap_evicts_and_forgets_the_oldest() {
+    use rbitcoin_ibd::ibd::header_walk::{record_tip_sibling, TIP_SIBLINGS_CAP};
+
+    let mut st = IbdWorkState::new(Vec::new(), None, Some(3));
+    let mut hashes = Vec::new();
+    for n in 0..TIP_SIBLINGS_CAP + 1 {
+        let hash = BlockHash::from_byte_array([n as u8 + 1; 32]);
+        st.hash_height.insert(hash, 4);
+        st.known_headers.insert(hash);
+        st.header_fks
+            .insert(hash, rbitcoin_primitives::Fk(n as u64));
+        record_tip_sibling(&mut st, hash);
+        hashes.push(hash);
+    }
+
+    assert_eq!(st.tip_siblings.len(), TIP_SIBLINGS_CAP);
+    assert!(!st.tip_siblings.contains(&hashes[0]));
+    assert!(!st.hash_height.contains_key(&hashes[0]));
+    assert!(!st.header_fks.contains_key(&hashes[0]));
+    assert!(st.tip_siblings.contains(&hashes[TIP_SIBLINGS_CAP]));
+}
+
+/// A store that keeps refusing a sibling header is bounded: the miss count
+/// stops at the limit, and the tracking map stays capped under a burst.
+#[test]
+fn sibling_header_write_misses_are_capped_and_bounded() {
+    use rbitcoin_ibd::ibd::events::{note_header_write_miss, SIBLING_HEADER_WRITE_TRIES};
+
+    let mut st = IbdWorkState::new(Vec::new(), None, Some(3));
+    let hash = h(0xc1);
+    for _ in 1..SIBLING_HEADER_WRITE_TRIES {
+        assert!(!note_header_write_miss(&mut st, hash));
+    }
+    assert!(note_header_write_miss(&mut st, hash));
+
+    for n in 0..300u32 {
+        let mut raw = [0u8; 32];
+        raw[..4].copy_from_slice(&n.to_le_bytes());
+        note_header_write_miss(&mut st, BlockHash::from_byte_array(raw));
+    }
+    assert!(
+        st.header_write_misses.len() <= 256,
+        "the miss map must stay bounded: {}",
+        st.header_write_misses.len()
+    );
+}
+
+/// A planted sibling whose header was never written (the store refused it) must
+/// still leave the path: its parent comes from `path_prev`, not the store, and
+/// the next recorded sibling is planted at the freed height.
+#[test]
+fn abandoning_an_unwritable_planted_sibling_clears_the_path_and_plants_the_next() {
+    use bitcoin::Network;
+    use rbitcoin_ibd::ibd::events::abandon_unwritable_sibling;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("unwritable-sibling");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let t = hub.tip_height().unwrap();
+    let height = t + 1;
+    let time = bitcoin::blockdata::constants::genesis_block(Network::Regtest)
+        .header
+        .time
+        .saturating_add(600);
+    let planted = rbitcoin_consensus::mine_empty_regtest(tip, time, height);
+    let next = rbitcoin_consensus::mine_empty_regtest(tip, time + 1, height);
+    // The store refused the planted header: no row, no fk.
+    assert!(hub.header_of(&planted.block_hash()).is_none());
+
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
+    st.header_walk.origin = true;
+    let planted_hash = planted.block_hash();
+    let next_hash = next.block_hash();
+    st.record_height(planted_hash, height);
+    st.note_path_prev(planted_hash, tip);
+    st.known_headers.insert(planted_hash);
+    st.ordered.push_back(planted_hash);
+    st.ordered_set.insert(planted_hash);
+    st.hash_height.insert(next_hash, height);
+    st.known_headers.insert(next_hash);
+    st.note_path_prev(next_hash, tip);
+    st.tip_siblings.push(next_hash);
+
+    abandon_unwritable_sibling(&mut st, &hub, planted_hash, height);
+
+    assert!(st.unservable.contains(&planted_hash));
+    assert!(
+        !st.ordered_set.contains(&planted_hash),
+        "the abandoned path occupant must leave the queue"
+    );
+    assert_eq!(
+        st.height_to_hash.get(&height),
+        Some(&next_hash),
+        "the next recorded sibling must be planted at the freed height"
+    );
+    assert!(st.ordered_set.contains(&next_hash));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A resume path loaded outside the lock can contain a hash abandoned while it
+/// loaded. Installation must refuse it, and the explore tip must stay inside
+/// the installed prefix: a tip past the refused entry is a rewind candidate
+/// whose path needs a body IBD will not request.
+#[test]
+fn resume_installation_refuses_an_unservable_entry_and_bounds_the_explore_tip() {
+    use bitcoin::Network;
+    use rbitcoin_ibd::ibd::path::install_resume;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("resume-unservable");
+    hub.ensure_genesis().unwrap();
+    let time = bitcoin::blockdata::constants::genesis_block(Network::Regtest)
+        .header
+        .time
+        .saturating_add(600);
+    let mut prev = hub.tip_hash().unwrap();
+    let mut blocks = Vec::new();
+    for height in 1..=3u32 {
+        let block = rbitcoin_consensus::mine_empty_regtest(prev, time + 100 * height, height);
+        hub.accept_block(block.clone()).unwrap();
+        prev = block.block_hash();
+        blocks.push(block);
+    }
+    let tip = hub.tip_hash().unwrap();
+    let t = hub.tip_height().unwrap();
+    let mut entries = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        let fk = hub.ensure_headers_batch(&[block.header]).unwrap()[0];
+        let prev_hash = if i == 0 {
+            bitcoin::blockdata::constants::genesis_block(Network::Regtest).block_hash()
+        } else {
+            blocks[i - 1].block_hash()
+        };
+        entries.push(rbitcoin_query::ResumeWorkEntry {
+            height: i as u32 + 1,
+            hash: block.block_hash().to_byte_array(),
+            prev_hash: prev_hash.to_byte_array(),
+            header_fk: fk,
+            has_body: true,
+        });
+    }
+    let middle = blocks[1].block_hash();
+    let last = blocks[2].block_hash();
+    let first = blocks[0].block_hash();
+
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
+    st.unservable.insert(middle);
+    install_resume(&mut st, &hub, &entries, false);
+
+    assert!(
+        !st.ordered_set.contains(&last),
+        "an abandoned header must stop installation before the entries above it"
+    );
+    assert_eq!(
+        st.reorg.explore_tips(),
+        &[first],
+        "the explore tip stops at the installed prefix, not the last entry"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
