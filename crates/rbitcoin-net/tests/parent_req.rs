@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 
 use rbitcoin_net::tx_relay::parent_req::*;
 use rbitcoin_net::tx_relay::{
-    GETDATA_TX_INTERVAL_SECS, MAX_PEER_TX_REQUEST_IN_FLIGHT, NONPREF_PEER_TX_DELAY_SECS,
-    OVERLOADED_PEER_TX_DELAY_SECS, TXID_RELAY_DELAY_SECS,
+    GETDATA_TX_INTERVAL_SECS, MAX_PARENTS_PER_PARK, MAX_PEER_TX_REQUEST_IN_FLIGHT,
+    NONPREF_PEER_TX_DELAY_SECS, OVERLOADED_PEER_TX_DELAY_SECS, TXID_RELAY_DELAY_SECS,
 };
 
 #[test]
@@ -224,7 +224,7 @@ fn work_on_shared_hashes_is_linear_in_rows() {
     let got = t.take_due(1, 1_002, |_, _| false);
     assert_eq!(
         got.len(),
-        MAX_PEER_TX_REQUEST_IN_FLIGHT,
+        MAX_PARENTS_PER_PARK,
         "a waiter is asked once the holder is gone"
     );
     for p in 2..peers {
@@ -253,7 +253,7 @@ fn work_on_shared_hashes_is_linear_in_rows() {
     );
     assert_eq!(
         t.take_due(1, 1_002, |_, _| false).len(),
-        MAX_PEER_TX_REQUEST_IN_FLIGHT,
+        MAX_PARENTS_PER_PARK,
         "a waiter is asked after the notfound"
     );
 }

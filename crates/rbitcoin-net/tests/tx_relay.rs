@@ -3435,7 +3435,7 @@ fn take_due_parent_getdata_caps_per_flush() {
     hub.schedule_orphan_parents(&missing, 1, false, t0);
     let due = t0 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
     let first = hub.take_due_parent_getdata(1, due);
-    assert_eq!(first.len(), MAX_PEER_TX_REQUEST_IN_FLIGHT);
+    assert_eq!(first.len(), MAX_PARENTS_PER_PARK);
     let rest = hub.take_due_parent_getdata(1, due);
     assert_eq!(rest.len(), 20);
     let _ = std::fs::remove_dir_all(&dir);

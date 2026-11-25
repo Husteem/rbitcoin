@@ -926,10 +926,12 @@ pub const OVERLOADED_PEER_TX_DELAY_SECS: u64 = 2;
 /// Core `GETDATA_TX_INTERVAL` (in-flight parent request expiry).
 pub const GETDATA_TX_INTERVAL_SECS: u64 = 60;
 /// Core `MAX_PEER_TX_REQUEST_IN_FLIGHT`. A peer with this many requests
-/// outstanding and no relay permission is overloaded, and one flush asks
-/// for at most this many parents.
+/// outstanding and no relay permission is overloaded.
 #[doc(hidden)]
 pub const MAX_PEER_TX_REQUEST_IN_FLIGHT: usize = 100;
+/// Most parent GETDATA items one flush issues to a peer.
+#[doc(hidden)]
+pub const MAX_PARENTS_PER_PARK: usize = 100;
 /// Most released INV rows one session tick reads. A long log resumes from
 /// the session's cursor on the next tick.
 pub const RELEASED_INV_SCAN_MAX: usize = 1024;

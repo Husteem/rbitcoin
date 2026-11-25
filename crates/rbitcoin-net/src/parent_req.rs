@@ -16,8 +16,8 @@ use std::num::NonZeroU64;
 use std::ops::Bound;
 
 use super::{
-    GETDATA_TX_INTERVAL_SECS, MAX_PEER_TX_REQUEST_IN_FLIGHT, NONPREF_PEER_TX_DELAY_SECS,
-    OVERLOADED_PEER_TX_DELAY_SECS, TXID_RELAY_DELAY_SECS,
+    GETDATA_TX_INTERVAL_SECS, MAX_PARENTS_PER_PARK, MAX_PEER_TX_REQUEST_IN_FLIGHT,
+    NONPREF_PEER_TX_DELAY_SECS, OVERLOADED_PEER_TX_DELAY_SECS, TXID_RELAY_DELAY_SECS,
 };
 
 /// Announcements one peer may add. Past this the map does not grow.
@@ -235,8 +235,10 @@ impl ParentTracker {
     /// preferred, [`TXID_RELAY_DELAY_SECS`] for a txid announcement while a
     /// wtxid-relay peer is connected, and [`OVERLOADED_PEER_TX_DELAY_SECS`]
     /// when it has no relay permission and [`MAX_PEER_TX_REQUEST_IN_FLIGHT`]
-    /// requests outstanding. A preferred announcer that arrives in that time
-    /// is asked instead (Core `TxRequestTracker`).
+    /// requests outstanding. Only an announcer whose own wait has passed is
+    /// asked, and a due preferred announcer goes before a due non-preferred
+    /// one. Due announcers are not ranked by deadline, so a non-preferred
+    /// announcer with a shorter wait can be asked before a preferred one.
     pub fn note_inv(
         &mut self,
         from: InvSource,
@@ -465,7 +467,7 @@ impl ParentTracker {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for hash in due_hashes {
-            if out.len() >= MAX_PEER_TX_REQUEST_IN_FLIGHT {
+            if out.len() >= MAX_PARENTS_PER_PARK {
                 break;
             }
             // A request that has not ended blocks every row of this hash,
