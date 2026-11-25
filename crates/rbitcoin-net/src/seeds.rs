@@ -369,6 +369,21 @@ pub fn row_reply_time(last_seen: u32, now: u64) -> u32 {
     last_seen.min(now)
 }
 
+/// Same network host, ignoring the port. Core compares an address to the peer
+/// that sent it with `CNetAddr` equality, so an inbound peer's self-announce
+/// (listen port) matches its source (TCP port) and takes no gossip penalty.
+#[doc(hidden)]
+pub fn same_host(a: NetAddr, b: NetAddr) -> bool {
+    match (a, b) {
+        (NetAddr::Ip(x), NetAddr::Ip(y)) => x.ip().to_canonical() == y.ip().to_canonical(),
+        (NetAddr::Onion { pk: x, .. }, NetAddr::Onion { pk: y, .. }) => x == y,
+        (NetAddr::I2p { dest: x, .. }, NetAddr::I2p { dest: y, .. }) => x == y,
+        (NetAddr::Cjdns { ip: x, .. }, NetAddr::Cjdns { ip: y, .. }) => x == y,
+        (NetAddr::Name { id: x, .. }, NetAddr::Name { id: y, .. }) => x == y,
+        _ => false,
+    }
+}
+
 /// Hard cap for learned / `peers` file / addrv2 (not `--connect` / DNS inject).
 ///
 /// Ours, not a Core constant (Core uses new/tried buckets). Must stay
@@ -1000,16 +1015,9 @@ impl AddrMan {
         }
     }
 
-    /// Fix a backdated time for every row no peer taught one, once. The row
+    /// Fix a backdated time for the rows one reply returns, once. The row
     /// then ages from that point instead of looking five days old on every
     /// serve, as Core fixes the backdate when it ingests the address.
-    #[doc(hidden)]
-    pub fn stamp_missing_seen(&mut self, now: u64) {
-        let addrs = self.order.clone();
-        self.stamp_missing_seen_for(&addrs, now);
-    }
-
-    /// [`Self::stamp_missing_seen`] for the rows one request returns.
     #[doc(hidden)]
     pub fn stamp_missing_seen_for(&mut self, addrs: &[NetAddr], now: u64) {
         let backdated = backdated_seen(now);

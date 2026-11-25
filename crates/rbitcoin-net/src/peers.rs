@@ -3029,8 +3029,9 @@ impl PeerHub {
                 // Core charges a source's gossip two hours; a row a peer
                 // announces as itself keeps the full time. The interval that
                 // decides whether a held row updates uses the claim, not the
-                // discounted time.
-                let penalty = if addr == source {
+                // discounted time. Core compares the host, so an inbound
+                // peer's listen port still matches its TCP source port.
+                let penalty = if crate::seeds::same_host(addr, source) {
                     0
                 } else {
                     crate::seeds::GOSSIP_TIME_PENALTY_SECS
@@ -3118,18 +3119,17 @@ impl PeerHub {
             return Vec::new();
         };
         let entries = {
-            let mut g = am.lock().unwrap_or_else(|e| e.into_inner());
-            g.stamp_missing_seen(now);
+            let g = am.lock().unwrap_or_else(|e| e.into_inner());
             g.entries()
         };
-        let rows: Vec<(u32, crate::NetAddr)> = entries
+        let addrs: Vec<crate::NetAddr> = entries
             .iter()
-            .map(|e| (crate::seeds::row_reply_time(e.last_seen, now), e.addr))
-            .filter(|(_, a)| v2 || matches!(a, crate::NetAddr::Ip(_)))
-            .filter(|(_, a)| !crate::netaddr::netaddr_unroutable_gossip(*a))
-            .filter(|(_, a)| !own.contains(*a))
+            .map(|e| e.addr)
+            .filter(|a| v2 || matches!(a, crate::NetAddr::Ip(_)))
+            .filter(|a| !crate::netaddr::netaddr_unroutable_gossip(*a))
+            .filter(|a| !own.contains(*a))
             .collect();
-        let n = rows.len();
+        let n = addrs.len();
         let pct_cap = (n * crate::peer::MAX_PCT_ADDR_TO_SEND / 100).max(1);
         let cap = crate::peer::MAX_ADDR_TO_SEND.min(pct_cap).min(n);
         if cap == 0 {
@@ -3142,9 +3142,15 @@ impl PeerHub {
             let j = (state as usize) % (i + 1);
             idxs.swap(i, j);
         }
+        let sampled: Vec<crate::NetAddr> = idxs.iter().take(cap).map(|&i| addrs[i]).collect();
         let mut out = Vec::with_capacity(cap);
-        for &i in idxs.iter().take(cap) {
-            out.push(rows[i]);
+        {
+            let mut g = am.lock().unwrap_or_else(|e| e.into_inner());
+            g.stamp_missing_seen_for(&sampled, now);
+            for addr in sampled {
+                let last_seen = g.last_seen_of(&addr);
+                out.push((crate::seeds::row_reply_time(last_seen, now), addr));
+            }
         }
         cache.insert(key, (now, out.clone()));
         out
