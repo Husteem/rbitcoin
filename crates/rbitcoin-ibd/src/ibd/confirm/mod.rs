@@ -2263,6 +2263,8 @@ pub fn settle_failed_write(
     loop_stats: &LoopStats,
     accepted: &AtomicU32,
 ) {
+    let mut written = Vec::new();
+    let mut unwritten = Vec::new();
     for (index, &(height, raw)) in heights_hashes.iter().enumerate() {
         let hash = BlockHash::from_byte_array(raw);
         if hub.has_block(&hash) {
@@ -2273,11 +2275,13 @@ pub fn settle_failed_write(
                 height,
                 wire_bytes: accepted_block_wire(wire_sizes, index),
             });
+            written.push(height);
         } else {
-            feed.release_lead_reserve(height);
+            unwritten.push(height);
         }
     }
-    feed.finish(heights_hashes.iter().map(|(h, _)| *h));
+    feed.finish_stale_plan(unwritten);
+    feed.finish(written);
 }
 
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
@@ -2385,11 +2389,24 @@ pub fn spawn_confirm_engine(
                 let first_h = batch.heights_hashes().first().map(|(h, _)| *h).unwrap_or(0);
                 let t0 = Instant::now();
                 let heights_hashes = batch.heights_hashes();
+                let wire_sizes: Vec<u64> = batch
+                    .wire_blocks()
+                    .iter()
+                    .map(|b| b.total_size() as u64)
+                    .collect();
                 if write_batch_is_stale_plan(&hub_wb, &feed_wb, first_h) {
                     debug!(Ibd,
                         "confirm write drop stale batch first={first_h} (tip moved)"
                     );
-                    feed_wb.finish_stale_plan(heights_hashes.iter().map(|(h, _)| *h));
+                    settle_failed_write(
+                        &hub_wb,
+                        &feed_wb,
+                        &event_tx_wb,
+                        &heights_hashes,
+                        &wire_sizes,
+                        &loop_stats_wb,
+                        &accepted_wb,
+                    );
                     continue;
                 }
                 let headers = match batch.wire_headers() {
@@ -2403,11 +2420,6 @@ pub fn spawn_confirm_engine(
                 let meta: Vec<(u32, BlockHash)> = heights_hashes
                     .iter()
                     .map(|&(h, raw)| (h, BlockHash::from_byte_array(raw)))
-                    .collect();
-                let wire_sizes: Vec<u64> = batch
-                    .wire_blocks()
-                    .iter()
-                    .map(|b| b.total_size() as u64)
                     .collect();
                 // Same lock as a block connect. The chain tip must not move
                 // while the relay-on purge is choosing the tip it stripped.
