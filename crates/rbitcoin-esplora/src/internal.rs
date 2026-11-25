@@ -609,7 +609,10 @@ pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Res
                     },
                     Err(e) => return store_err(e),
                 },
-                _ => from_mempool(id),
+                Ok(None) => from_mempool(id),
+                // A failed lookup is not an unknown txid: `[]` would say
+                // nothing spends its outputs.
+                Err(e) => return store_err(e),
             },
         };
         total += u64::from(nout);

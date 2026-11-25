@@ -464,6 +464,14 @@ async fn outspends_bounds_total_entries() {
     assert_eq!(st, 400, "{}", &resp[..resp.len().min(200)]);
     assert_eq!(resp, "Too many txids requested");
 
+    // A failed txid lookup is a store error, not a tx with no outputs.
+    #[cfg(debug_assertions)]
+    {
+        pad.q.fail_next_txid_lookup();
+        let (st, resp) = http_get_unix(&sock, &format!("/txs/outspends?txids={fan}")).await;
+        assert_eq!(st, 500, "a failed lookup answered {st} {resp}");
+    }
+
     handle.shutdown().await;
     let _ = pad.dir;
 }
