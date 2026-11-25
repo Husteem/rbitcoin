@@ -467,9 +467,18 @@ async fn outspends_bounds_total_entries() {
     // A failed txid lookup is a store error, not a tx with no outputs.
     #[cfg(debug_assertions)]
     {
-        pad.q.fail_next_txid_lookup();
-        let (st, resp) = http_get_unix(&sock, &format!("/txs/outspends?txids={fan}")).await;
-        assert_eq!(st, 500, "a failed lookup answered {st} {resp}");
+        let sh = rbitcoin_primitives::hex_encode(rbitcoin_store::script_hash(&[0x51]));
+        for path in [
+            format!("/txs/outspends?txids={fan}"),
+            format!("/tx/{fan}/merkle-proof"),
+            format!("/tx/{fan}/merkleblock-proof"),
+            format!("/scripthash/{sh}/txs?after_txid={fan}"),
+            format!("/scripthash/{sh}/txs/summary?after_txid={fan}"),
+        ] {
+            pad.q.fail_next_txid_lookup();
+            let (st, resp) = http_get_unix(&sock, &path).await;
+            assert_eq!(st, 500, "{path}: a failed lookup answered {st} {resp}");
+        }
     }
 
     handle.shutdown().await;
