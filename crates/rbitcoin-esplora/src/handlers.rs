@@ -450,16 +450,20 @@ pub fn tx_merkle_proof_sync(st: AppState, txid_hex: String) -> Response {
     let Ok(txid) = parse_hash32(&txid_hex) else {
         return not_found();
     };
-    let Ok(Some(fk)) = st.query.tx_fk_by_txid(&txid) else {
-        return not_found();
+    let fk = match st.query.tx_fk_by_txid(&txid) {
+        Ok(Some(fk)) => fk,
+        Ok(None) => return not_found(),
+        Err(e) => return store_err(e),
     };
     let height = match st.query.store().tx_height_get(fk) {
         Ok(Some(h)) => h,
         Ok(None) => return not_found(),
         Err(e) => return store_err(e),
     };
-    if !matches!(st.query.store().is_confirmed_strong(fk), Ok(true)) {
-        return not_found();
+    match st.query.store().is_confirmed_strong(fk) {
+        Ok(true) => {}
+        Ok(false) => return not_found(),
+        Err(e) => return store_err(e),
     }
     match st.query.merkle_proof(Height(height), &txid) {
         Ok(proof) => {
@@ -512,16 +516,20 @@ pub fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
     let Ok(txid) = parse_hash32(&txid_hex) else {
         return not_found();
     };
-    let Ok(Some(fk)) = st.query.tx_fk_by_txid(&txid) else {
-        return not_found();
+    let fk = match st.query.tx_fk_by_txid(&txid) {
+        Ok(Some(fk)) => fk,
+        Ok(None) => return not_found(),
+        Err(e) => return store_err(e),
     };
     let height = match st.query.store().tx_height_get(fk) {
         Ok(Some(h)) => h,
         Ok(None) => return not_found(),
         Err(e) => return store_err(e),
     };
-    if !matches!(st.query.store().is_confirmed_strong(fk), Ok(true)) {
-        return not_found();
+    match st.query.store().is_confirmed_strong(fk) {
+        Ok(true) => {}
+        Ok(false) => return not_found(),
+        Err(e) => return store_err(e),
     }
     let ids = match st.query.block_txids(Height(height)) {
         Ok(v) => v,
@@ -1516,8 +1524,10 @@ pub fn summary_page_sh(
     client: Option<&str>,
 ) -> Response {
     if let Some(id) = after {
-        if !txid_is_known(st, &id) {
-            return after_txid_not_found();
+        match txid_is_known(st, &id) {
+            Ok(true) => {}
+            Ok(false) => return after_txid_not_found(),
+            Err(e) => return store_err(e),
         }
     }
     let filter = HistoryFilter::esplora_chain_page(after);
@@ -1630,8 +1640,10 @@ pub fn combined_txs(
     client: Option<&str>,
 ) -> Response {
     if let Some(id) = after {
-        if !txid_is_known(st, &id) {
-            return after_txid_not_found();
+        match txid_is_known(st, &id) {
+            Ok(true) => {}
+            Ok(false) => return after_txid_not_found(),
+            Err(e) => return store_err(e),
         }
     }
     // A confirmed cursor is absent from this script's mempool index, so the
@@ -1640,7 +1652,10 @@ pub fn combined_txs(
     // that page is not a chain cursor. A tx in the pool for some other script
     // must not restart this script's first page.
     let mempool = if asof.is_none() {
-        mempool_page_json(st, sh, after)
+        match mempool_page_json(st, sh, after) {
+            Ok(page) => page,
+            Err(e) => return store_err(e),
+        }
     } else {
         MempoolPage::Absent
     };
@@ -1651,8 +1666,12 @@ pub fn combined_txs(
             None
         }
         MempoolPage::PastPage => match after {
-            Some(id) if !txid_on_chain(st, &id) => None,
-            other => other,
+            Some(id) => match txid_on_chain(st, &id) {
+                Ok(true) => after,
+                Ok(false) => None,
+                Err(e) => return store_err(e),
+            },
+            None => None,
         },
         MempoolPage::Absent => after,
     };
@@ -1885,8 +1904,10 @@ pub fn multi_txs(
     client: Option<&str>,
 ) -> Response {
     if let Some(id) = after {
-        if !txid_is_known(st, &id) {
-            return after_txid_not_found();
+        match txid_is_known(st, &id) {
+            Ok(true) => {}
+            Ok(false) => return after_txid_not_found(),
+            Err(e) => return store_err(e),
         }
     }
     let mut bag = JoinBag::new();
@@ -1894,7 +1915,10 @@ pub fn multi_txs(
     let mut mempool_rows = Vec::new();
     if asof.is_none() {
         for sh in &scripts {
-            mempool_rows.extend(mempool_txs_json(st, sh));
+            match mempool_txs_json(st, sh) {
+                Ok(rows) => mempool_rows.extend(rows),
+                Err(e) => return store_err(e),
+            }
         }
         mempool_rows = dedup_txid(mempool_rows);
         sort_txs_newest_first(&mut mempool_rows);
@@ -1903,11 +1927,15 @@ pub fn multi_txs(
         let hex = block_hash_hex(&id);
         mempool_rows.iter().any(|v| v["txid"] == hex)
     });
-    let past_unconfirmed = after.is_some_and(|id| {
-        !after_in_mempool
-            && scripts.iter().any(|sh| mempool_indexes(st, sh, &id))
-            && !txid_on_chain(st, &id)
-    });
+    let past_unconfirmed = match after {
+        Some(id) if !after_in_mempool && scripts.iter().any(|sh| mempool_indexes(st, sh, &id)) => {
+            match txid_on_chain(st, &id) {
+                Ok(on_chain) => !on_chain,
+                Err(e) => return store_err(e),
+            }
+        }
+        _ => false,
+    };
     let chain_after = if after_in_mempool || past_unconfirmed {
         None
     } else {
@@ -1966,8 +1994,10 @@ pub fn multi_summary(
     client: Option<&str>,
 ) -> Response {
     if let Some(id) = after {
-        if !txid_is_known(st, &id) {
-            return after_txid_not_found();
+        match txid_is_known(st, &id) {
+            Ok(true) => {}
+            Ok(false) => return after_txid_not_found(),
+            Err(e) => return store_err(e),
         }
     }
     let mut bag = JoinBag::new();
@@ -2275,11 +2305,14 @@ pub async fn address_txs_mempool(
 }
 
 #[doc(hidden)]
-pub fn mempool_txs_json(st: &AppState, sh: &[u8; 32]) -> Vec<Value> {
-    match mempool_page_json(st, sh, None) {
+pub fn mempool_txs_json(
+    st: &AppState,
+    sh: &[u8; 32],
+) -> Result<Vec<Value>, rbitcoin_query::QueryError> {
+    Ok(match mempool_page_json(st, sh, None)? {
         MempoolPage::OnPage(rows) => rows,
         MempoolPage::Absent | MempoolPage::PastPage => Vec::new(),
-    }
+    })
 }
 
 /// Where `after` sits in this script's mempool index.
@@ -2301,9 +2334,11 @@ pub fn mempool_indexes(st: &AppState, sh: &[u8; 32], id: &[u8; 32]) -> bool {
     mp.scripthash_indexes_tx(sh, &Txid::from_byte_array(*id))
 }
 
+/// Whether the store holds `id`. A failed lookup is an error, not `false`:
+/// a cursor read as unknown would restart a page.
 #[doc(hidden)]
-pub fn txid_on_chain(st: &AppState, id: &[u8; 32]) -> bool {
-    st.query.tx_fk_by_txid(id).ok().flatten().is_some()
+pub fn txid_on_chain(st: &AppState, id: &[u8; 32]) -> Result<bool, rbitcoin_query::QueryError> {
+    Ok(st.query.tx_fk_by_txid(id)?.is_some())
 }
 
 /// Mempool JSON that stays on this `/txs` page.
@@ -2312,56 +2347,67 @@ pub fn txid_on_chain(st: &AppState, id: &[u8; 32]) -> bool {
 /// keeps the tail. A cursor past that page loads nothing and is [`MempoolPage::PastPage`],
 /// so a mempool-only tx is not mistaken for a chain cursor.
 #[doc(hidden)]
-pub fn mempool_page_json(st: &AppState, sh: &[u8; 32], after: Option<[u8; 32]>) -> MempoolPage {
+pub fn mempool_page_json(
+    st: &AppState,
+    sh: &[u8; 32],
+    after: Option<[u8; 32]>,
+) -> Result<MempoolPage, rbitcoin_query::QueryError> {
     let Some(mp) = st.mempool.as_ref() else {
-        return MempoolPage::Absent;
+        return Ok(MempoolPage::Absent);
     };
     if let Some(id) = after {
         if !mempool_indexes(st, sh, &id) {
-            return MempoolPage::Absent;
+            return Ok(MempoolPage::Absent);
         }
     }
     let mut rows = mp.scripthash_mempool_fees(sh);
     rows.truncate(MEMPOOL_TX_PAGE);
     if let Some(id) = after {
         let Some(i) = rows.iter().position(|(txid, _)| *txid == id) else {
-            return MempoolPage::PastPage;
+            return Ok(MempoolPage::PastPage);
         };
         rows.drain(..=i);
     }
     let mut out = Vec::new();
     for (txid, fee) in rows {
-        push_mempool_tx_json(st, mp, txid, fee, &mut out);
+        push_mempool_tx_json(st, mp, txid, fee, &mut out)?;
     }
-    MempoolPage::OnPage(out)
+    Ok(MempoolPage::OnPage(out))
 }
 
 #[doc(hidden)]
+/// The stored row's JSON when the store holds `txid`, else the mempool
+/// copy's. A failed lookup is an error: dropping the row, or showing the
+/// mempool copy of a confirmed tx, would answer a wrong page.
 pub fn push_mempool_tx_json(
     st: &AppState,
     mp: &MempoolHub,
     txid: [u8; 32],
     fee: i64,
     out: &mut Vec<Value>,
-) {
-    if let Ok(Some(fk)) = st.query.tx_fk_by_txid(&txid) {
+) -> Result<(), rbitcoin_query::QueryError> {
+    if let Some(fk) = st.query.tx_fk_by_txid(&txid)? {
         if let Ok(v) = build_tx_json(&st.query, fk, st.network, None) {
             out.push(v);
-            return;
+            return Ok(());
         }
     }
     let id = Txid::from_byte_array(txid);
     let Some(tx) = mp.get_tx(&id) else {
-        return;
+        return Ok(());
     };
     if let Ok(v) = build_tx_json_from_tx(&st.query, &tx, st.network, Some(fee), Some(mp)) {
         out.push(v);
     }
+    Ok(())
 }
 
 #[doc(hidden)]
 pub fn mempool_txs_for_sh(st: &AppState, sh: &[u8; 32]) -> Response {
-    json_reply_here(mempool_txs_json(st, sh))
+    match mempool_txs_json(st, sh) {
+        Ok(rows) => json_reply_here(rows),
+        Err(e) => store_err(e),
+    }
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -2386,11 +2432,15 @@ pub fn parse_after_txid_query(q: AfterTxidQuery) -> Result<Option<[u8; 32]>, Res
     }
 }
 
+/// In the mempool or the store. A failed lookup is an error, not unknown:
+/// 422 would tell the client its cursor is gone.
 #[doc(hidden)]
-pub fn txid_is_known(st: &AppState, id: &[u8; 32]) -> bool {
+pub fn txid_is_known(st: &AppState, id: &[u8; 32]) -> Result<bool, rbitcoin_query::QueryError> {
     let tid = Txid::from_byte_array(*id);
-    st.mempool.as_ref().is_some_and(|m| m.contains(&tid))
-        || st.query.tx_fk_by_txid(id).ok().flatten().is_some()
+    if st.mempool.as_ref().is_some_and(|m| m.contains(&tid)) {
+        return Ok(true);
+    }
+    txid_on_chain(st, id)
 }
 
 #[derive(Deserialize)]

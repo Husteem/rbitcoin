@@ -514,6 +514,80 @@ async fn outspends_bounds_total_entries() {
     assert_eq!(st, 400, "{}", &resp[..resp.len().min(200)]);
     assert_eq!(resp, "Too many txids requested");
 
+    // A failed txid lookup is a store error, not a tx with no outputs.
+    #[cfg(debug_assertions)]
+    {
+        let sh = rbitcoin_primitives::hex_encode(rbitcoin_store::script_hash(&[0x51]));
+        // Pool txs for this script, one more than two mempool pages, so the
+        // mempool route reads their rows and a cursor can sit past the first
+        // page.
+        use bitcoin::hashes::Hash;
+        let fan_id: Txid = fan.parse().unwrap();
+        let mut pooled = Vec::new();
+        for vout in 0..=rbitcoin_esplora::handlers::MEMPOOL_TX_PAGE as u32 + 1 {
+            let tx = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint { txid: fan_id, vout },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(9_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            pad.hub
+                .admit(&tx)
+                .expect("a spend of the fan enters the pool");
+            pooled.push(tx.compute_txid());
+        }
+        let (st, page) = http_get_unix(&sock, &format!("/scripthash/{sh}/txs/mempool")).await;
+        assert_eq!(st, 200, "{page}");
+        let page: Vec<Value> = serde_json::from_str(&page).unwrap();
+        let on_page: Vec<String> = page
+            .iter()
+            .map(|v| v["txid"].as_str().unwrap().to_string())
+            .collect();
+        let past = pooled
+            .iter()
+            .find(|t| !on_page.contains(&t.to_string()))
+            .expect("a pool tx past the first mempool page");
+        let first: Txid = on_page[0].parse().unwrap();
+        let fan_raw = fan_id.to_byte_array();
+        for (path, fail) in [
+            (
+                format!("/scripthash/{sh}/txs/mempool"),
+                first.to_byte_array(),
+            ),
+            (format!("/txs/outspends?txids={fan}"), fan_raw),
+            (format!("/tx/{fan}/merkle-proof"), fan_raw),
+            (format!("/tx/{fan}/merkleblock-proof"), fan_raw),
+            (format!("/scripthash/{sh}/txs?after_txid={fan}"), fan_raw),
+            (
+                format!("/scripthash/{sh}/txs/summary?after_txid={fan}"),
+                fan_raw,
+            ),
+            // A pool cursor past the first page: `txid_is_known` answers from
+            // the pool, so the lookup that fails is the chain-cursor check.
+            (
+                format!("/scripthash/{sh}/txs?after_txid={past}"),
+                past.to_byte_array(),
+            ),
+        ] {
+            pad.q.fail_next_txid_lookup(fail);
+            let (st, resp) = http_get_unix(&sock, &path).await;
+            assert_eq!(st, 500, "{path}: a failed lookup answered {st} {resp}");
+        }
+        pad.q.fail_next_txid_lookup(past.to_byte_array());
+        let body = serde_json::to_vec(&[&sh]).unwrap();
+        let path = format!("/scripthashes/txs?after_txid={past}");
+        let (st, resp) = http_post_unix(&sock, &path, &body).await;
+        assert_eq!(st, 500, "{path}: a failed lookup answered {st} {resp}");
+    }
+
     handle.shutdown().await;
     let _ = pad.dir;
 }

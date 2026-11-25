@@ -143,7 +143,9 @@ pub fn confirmed_or_mempool_tx(
     let settle0 = pool_settle(st.mempool.as_deref());
     if let Some(fk) = st.query.tx_fk_by_txid(id)? {
         match stored_tx_listing(st, fk, id, settle0)? {
-            Listing::Confirmed => return Ok(build_tx_json(&st.query, fk, st.network, None).ok()),
+            // A confirmed row that cannot be built is a store error, not a
+            // tx the batch leaves out.
+            Listing::Confirmed => return build_tx_json(&st.query, fk, st.network, None).map(Some),
             Listing::Mempool => {}
             Listing::Gone => return Ok(None),
         }
@@ -616,7 +618,10 @@ pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Res
                     },
                     Err(e) => return store_err(e),
                 },
-                _ => from_mempool(id),
+                Ok(None) => from_mempool(id),
+                // A failed lookup is not an unknown txid: `[]` would say
+                // nothing spends its outputs.
+                Err(e) => return store_err(e),
             },
         };
         total += u64::from(nout);

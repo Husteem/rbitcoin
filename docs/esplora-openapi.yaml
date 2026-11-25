@@ -505,6 +505,8 @@ paths:
                 type: array
                 items: { type: array, items: { $ref: "#/components/schemas/Outspend" } }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "500": { $ref: "#/components/responses/StoreError" }
 
   /address/{address}:
     get:
@@ -1021,6 +1023,8 @@ paths:
                 type: array
                 items: { type: array, items: { $ref: "#/components/schemas/Outspend" } }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "500": { $ref: "#/components/responses/StoreError" }
   /internal/txs/outspends/by-outpoint:
     post:
       tags: [internal]
@@ -1038,6 +1042,8 @@ paths:
             application/json:
               schema: { type: array, items: { $ref: "#/components/schemas/Outspend" } }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+        "500": { $ref: "#/components/responses/StoreError" }
   /internal/address/{address}:
     get:
       tags: [internal]
@@ -1241,6 +1247,10 @@ components:
       description: |
         No tip, mempool unavailable, scripthash index disabled, `--max-sh-creates` exceeded, or `chain view moved`.
         Address and scripthash routes also answer `scripthash index rebuilding` while the index is rebuilt after a fault (every script, until the replacement is published) and `scripthash index updating` while a reorg's disconnect rewrites it (once per disconnected block, briefly, and for a request that was already running when it began). Both mean retry; neither is a reason to rescan.
+      headers: { X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
+      content: { text/plain: { schema: { type: string } } }
+    StoreError:
+      description: A store read failed. The request was not answered from partial data; retry, and check the node log if it persists.
       headers: { X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
       content: { text/plain: { schema: { type: string } } }
     TxList:
