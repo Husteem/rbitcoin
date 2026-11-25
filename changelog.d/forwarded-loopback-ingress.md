@@ -1,7 +1,8 @@
 Security
 
 - **Forwarded I2P and unmarked onion peers no longer lock each other out.**
-  With `--i2p-accept-incoming`, or `--listen-onion` without its own bind,
+  With `--i2p-accept-incoming`, `--listen-onion` without its own bind, or
+  an onion `--external-ip` served by an operator's own Tor,
   every overlay peer reaches the P2P listener from the forwarder's
   loopback address. Eight unfinished handshakes there refused every later
   I2P or onion inbound, and one evicted overlay peer refused all of them

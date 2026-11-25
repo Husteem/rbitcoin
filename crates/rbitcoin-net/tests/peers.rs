@@ -2608,3 +2608,47 @@ fn forwarded_loopback_skips_the_address_budget_and_group_cooldown() {
         );
     }
 }
+
+/// Forwarding is also an operator's hidden service with no marked bind: the
+/// node only knows its onion from `--external-ip`. The exemption stays off
+/// a clearnet source and off a `v1` wallet bind, which forwarders never
+/// reach.
+#[test]
+fn forwarded_loopback_exemption_follows_the_forwarder_only() {
+    use rbitcoin_net::net_permissions::{parse_whitebind, NetPermTable};
+    use rbitcoin_net::peers::MAX_INCOMPLETE_INBOUND_PER_ADDR;
+    let ordinary: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let wallet: SocketAddr = "127.0.0.1:8335".parse().unwrap();
+    let lo = std::net::IpAddr::from([127, 0, 0, 1]);
+    let clear = std::net::IpAddr::from([10, 0, 3, 1]);
+    let hub = PeerHub::new();
+    let mut t = NetPermTable::default();
+    t.whitebind
+        .push(parse_whitebind("v1,noban@127.0.0.1:8335").unwrap());
+    hub.set_net_perms(t);
+    hub.set_external_endpoints(vec![
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
+            .parse()
+            .unwrap(),
+    ]);
+    let capped = |ip, bind| {
+        let held: Vec<_> = (0..MAX_INCOMPLETE_INBOUND_PER_ADDR)
+            .map(|_| hub.try_reserve_incomplete(ip, bind).unwrap())
+            .collect();
+        let over = hub.try_reserve_incomplete(ip, bind).is_none();
+        drop(held);
+        over
+    };
+    assert!(
+        !capped(lo, ordinary),
+        "an external onion forwards from loopback"
+    );
+    assert!(capped(lo, wallet), "the v1 wallet bind keeps its cap");
+    assert!(capped(clear, ordinary), "a clearnet source keeps its cap");
+    hub.set_overlay_loopback_forward(true);
+    assert!(capped(lo, wallet), "forwarding does not reach the v1 bind");
+    assert!(
+        capped(clear, ordinary),
+        "forwarding does not exempt clearnet"
+    );
+}

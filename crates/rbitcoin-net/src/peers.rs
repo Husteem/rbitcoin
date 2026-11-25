@@ -2556,13 +2556,29 @@ impl PeerHub {
         })
     }
 
+    /// Loopback inbound may be a forwarded overlay peer: `--i2p-accept-incoming`,
+    /// an unmarked `--listen-onion`, or an operator's hidden service named
+    /// only by `--external-ip`.
+    fn loopback_forwarded(&self, table: &crate::net_permissions::NetPermTable, ip: IpAddr) -> bool {
+        ip.is_loopback()
+            && (self.overlay_loopback_forward.load(Ordering::Relaxed)
+                || (table.onion_bind.is_none() && self.external_onion().is_some()))
+    }
+
     /// Inbound that a Tor or I2P forwarder delivers: the marked onion bind,
-    /// or loopback on a shared listen with `--i2p-accept-incoming` or an
-    /// unmarked `--listen-onion`. Every such peer shares the forwarder's
+    /// or [`Self::loopback_forwarded`] on any bind but a `v1` wallet bind,
+    /// which forwarders never reach. Every such peer shares the forwarder's
     /// address and netgroup.
     fn forwarded_ingress(&self, ip: IpAddr, bind: SocketAddr) -> bool {
-        self.onion_bind() == Some(bind)
-            || (ip.is_loopback() && self.overlay_loopback_forward.load(Ordering::Relaxed))
+        let table = self.net_perms.lock().unwrap_or_else(|e| e.into_inner());
+        if table.onion_bind == Some(bind) {
+            return true;
+        }
+        let v1_bind = table
+            .whitebind
+            .iter()
+            .any(|g| g.addr == bind && g.flags.has(crate::net_permissions::NetPermissionFlags::V1));
+        !v1_bind && self.loopback_forwarded(&table, ip)
     }
 
     /// Reserve an unfinished TCP handshake, or return `None` at the source cap.
@@ -2620,10 +2636,7 @@ impl PeerHub {
     ) -> crate::net_permissions::NetPermissionFlags {
         let table = self.net_perms.lock().unwrap_or_else(|e| e.into_inner());
         let apply_whitelist = !(inbound
-            && (table.onion_bind == Some(bind)
-                || (addr.ip().is_loopback()
-                    && (self.overlay_loopback_forward.load(Ordering::Relaxed)
-                        || (table.onion_bind.is_none() && self.external_onion().is_some())))));
+            && (table.onion_bind == Some(bind) || self.loopback_forwarded(&table, addr.ip())));
         table.flags_for_matched(addr.ip(), inbound, bind, apply_whitelist)
     }
 
