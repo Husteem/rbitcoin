@@ -8,3 +8,7 @@ Security
   sessions are not touched, and the refusal logs at most once a second.
   A fifth client from one `/16`, such as miners behind one NAT or one
   tunnel endpoint on IPv4 loopback, is refused too.
+- **An SV2 client cannot make the node re-serialize a template's
+  transactions without end.** Each `RequestTransactionData` reply
+  serializes every template transaction. A session gets one template's
+  data at most twice; a third request for it closes the session.

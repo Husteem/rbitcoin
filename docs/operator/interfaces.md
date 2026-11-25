@@ -353,7 +353,8 @@ stay silent indefinitely unless `--sv2-tp-idle-timeout` is set. A client that st
 once a write to it makes no progress for 30 s.
 A changed `CoinbaseOutputConstraints` within 1 s of the last template waits
 out the rest of that second; a client that keeps replacing a queued budget
-(more than 8 times before it is built) is closed.
+(more than 8 times before it is built) is closed, and so is one that asks
+for the same template's transaction data a third time.
 Each session keeps every template on the current tip, up to 64, so a miner
 still on an older job after fee pushes can submit its solution; templates
 on a replaced tip retire after `--sv2-tp-stale-grace`. The templates share
