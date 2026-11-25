@@ -948,6 +948,9 @@ impl Query {
             }),
             Err(_) => {
                 HEAVY_TURN_REFUSED.with(|c| c.set(true));
+                #[cfg(debug_assertions)]
+                self.heavy_turn_refusals
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(StoreError::Rejected("heavy scripthash join busy"))
             }
         }

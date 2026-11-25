@@ -1329,7 +1329,18 @@ fn heavy_turn_wait_holds_no_thread_or_permit() {
         line.push('\n');
         use tokio::io::AsyncWriteExt;
         waiting.write_all(line.as_bytes()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The heavy request has refused and gone to wait for the turn.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while q
+                .heavy_turn_refusals
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the heavy request refuses while the turn is held");
 
         let mut other = TcpStream::connect(handle.local_addr).await.unwrap();
         let bal = tokio::time::timeout(

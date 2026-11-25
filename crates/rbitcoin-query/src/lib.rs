@@ -725,6 +725,10 @@ pub struct Query {
     /// takes it without waiting; a caller waits for it on its task
     /// ([`scripthash::heavy_turn_job`]).
     pub heavy_sh_join: Arc<tokio::sync::Semaphore>,
+    /// Heavy joins that found the turn taken and refused. Debug builds only:
+    /// tests wait on it.
+    #[cfg(debug_assertions)]
+    pub heavy_turn_refusals: AtomicU64,
     /// Unpaged SH join overlap by kind. Tests only.
     #[cfg(debug_assertions)]
     pub sh_join_probe: crate::scripthash::ShJoinProbe,
@@ -1094,6 +1098,8 @@ impl Query {
                 tokio::sync::Semaphore::MAX_PERMITS,
             ),
             heavy_sh_join: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(debug_assertions)]
+            heavy_turn_refusals: AtomicU64::new(0),
             #[cfg(debug_assertions)]
             sh_join_probe: crate::scripthash::ShJoinProbe::default(),
             #[cfg(debug_assertions)]
