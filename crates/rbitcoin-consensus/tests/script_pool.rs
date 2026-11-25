@@ -1269,5 +1269,6 @@ mod pair_tests {
             rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
             "a re-published wave must let wait_done finish"
         );
+        unpublish_fg(&wave);
     }
 }
