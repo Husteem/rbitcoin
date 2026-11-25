@@ -678,6 +678,41 @@ fn a_populated_schema_29_log_becomes_a_delta_generation() {
     assert_eq!(s.spend_directory_slot(16).unwrap(), Some(meta));
 }
 
+/// An upgrade that died after the first schema-30 open created
+/// `spent.delta/` but before the adoption published: `meta` is still 29, so
+/// the next open adopts the dense body's spends again.
+#[test]
+fn an_upgrade_killed_before_the_adoption_adopts_again() {
+    let d = dir();
+    schema_29_store(&d);
+    let slot =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk(9), 0).unwrap();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join("spent.body"))
+            .unwrap();
+        f.seek(SeekFrom::Start(16)).unwrap();
+        f.write_all(&slot).unwrap();
+    }
+    // An open that fails before the adoption leaves `meta` at 29: a
+    // `spent.delta` that is a file stops it there.
+    std::fs::write(delta_dir(&d), b"x").unwrap();
+    assert!(rbitcoin_store::Store::open_tiny(&d).is_err());
+    assert_eq!(
+        rbitcoin_store::store::check_meta(&d).unwrap(),
+        29,
+        "meta moved to 30 before the adoption published"
+    );
+    std::fs::remove_file(delta_dir(&d)).unwrap();
+    drop(SpendPageLog::create(&d).unwrap());
+    let s = rbitcoin_store::Store::open_tiny(&d).unwrap();
+    assert_eq!(s.spend_directory_slot(16).unwrap(), Some(slot));
+    drop(s);
+    assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+}
+
 /// A schema-30 datadir that lost `spent.delta/` refuses to open, even when
 /// its sparse `spent.body` reaches the published end on disk: that length
 /// cannot tell it from a body an older schema's Class A filled, and adopting

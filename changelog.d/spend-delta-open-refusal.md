@@ -6,4 +6,5 @@ Fixed
   body whose last written page reached that end passed as a 0.9.x body
   and was adopted, leaving every spend the delta held unspent. Open now
   decides by the schema `meta` held when it started: only a datadir from
-  before schema 30 adopts its body.
+  before schema 30 adopts its body. An upgrade moves `meta` to 30 only
+  after that adoption is durable, so one killed partway adopts again.

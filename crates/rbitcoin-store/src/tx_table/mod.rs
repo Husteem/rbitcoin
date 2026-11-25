@@ -1376,9 +1376,10 @@ impl crate::spend_delta::SpentBody for SpentFold<'_> {
 /// again at the next open. A populated schema-30 body with no `spent.delta/`
 /// refuses: its spends were only there. A sparse body can reach its published
 /// end on disk, so the length cannot tell the two apart; `opened_schema` (the
-/// `meta` schema before this open, `None` for a table opened alone) can. The
-/// first schema-30 open creates `spent.delta/`, so a crash before the
-/// adoption commit still finds it and adopts again.
+/// `meta` schema before this open) can. `Store` moves `meta` to 30 only after
+/// this open returns, so a crash before the adoption publishes still opens
+/// as pre-30 and adopts again. A table opened alone (`None`, the suite's bare
+/// `TxTable` opens) keeps the length rule.
 fn open_spend_delta(
     dir: &Path,
     spent: &VarTable,
@@ -1532,6 +1533,7 @@ impl TxTable {
 }
 
 /// What a [`crate::Store`] knows when it opens its [`TxTable`].
+#[doc(hidden)]
 #[derive(Clone, Copy, Debug)]
 pub struct OpenedFromStore {
     /// The highest create a durable `header_txs` range names.
