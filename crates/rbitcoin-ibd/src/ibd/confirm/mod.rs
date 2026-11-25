@@ -3270,6 +3270,7 @@ pub fn spawn_confirm_engine(
                 };
                 confirm_thr_stats::add_lookup_other(&stats, t_sel.elapsed());
                 if hub.query.lookup_taken_gen() != taken_gen {
+                    feed.finish_stale_plan(wave_h.iter().copied());
                     continue;
                 }
                 let mut did = false;
@@ -3288,6 +3289,7 @@ pub fn spawn_confirm_engine(
                     match wave {
                         Ok(wave) if wave.items.is_empty() && wave.undecodable.is_none() => {
                             lookup_faults.on_success();
+                            feed.finish_stale_plan(wave_h.iter().copied());
                         }
                         Ok(wave) => {
                             lookup_faults.on_success();
@@ -3310,8 +3312,10 @@ pub fn spawn_confirm_engine(
                                 )
                                 .is_err()
                                 {
+                                    feed.finish_stale_plan(wave_h.iter().copied());
                                     break;
                                 }
+                                feed.finish_stale_plan([h]);
                             }
                             let counts: Vec<u32> = wave
                                 .items
@@ -3329,6 +3333,7 @@ pub fn spawn_confirm_engine(
                                 Err(e) => {
                                     warn!("ibd: load-batch has_body probe: {e}");
                                     confirm_thr_stats::add_lookup_other(&stats, t_kind.elapsed());
+                                    feed.finish_stale_plan(wave_h.iter().copied());
                                     continue;
                                 }
                             };
@@ -3351,9 +3356,12 @@ pub fn spawn_confirm_engine(
                                 batch.epoch = epoch;
                                 batch.gen = taken_gen;
                             }
-                            for batch in batches {
+                            let mut batches = batches.into_iter();
+                            while let Some(batch) = batches.next() {
                                 let t_send = Instant::now();
                                 let n = batch.items.len();
+                                let claim_heights: Vec<u32> =
+                                    batch.items.iter().map(|(h, _, _)| *h).collect();
                                 let wire: usize = batch
                                     .items
                                     .iter()
@@ -3374,12 +3382,24 @@ pub fn spawn_confirm_engine(
                                     ),
                                     Ok(true)
                                 ) {
+                                    feed.finish_stale_plan(claim_heights);
+                                    for rest in batches {
+                                        feed.finish_stale_plan(
+                                            rest.items.iter().map(|(h, _, _)| *h),
+                                        );
+                                    }
                                     break;
                                 }
                                 if queues_lookup
                                     .send_load(n, wire, || load_tx.send(batch).map_err(drop))
                                     .is_err()
                                 {
+                                    feed.finish_stale_plan(claim_heights);
+                                    for rest in batches {
+                                        feed.finish_stale_plan(
+                                            rest.items.iter().map(|(h, _, _)| *h),
+                                        );
+                                    }
                                     break;
                                 }
                                 confirm_thr_stats::add_lookup_send_wait(&stats, t_send.elapsed());
@@ -3395,6 +3415,7 @@ pub fn spawn_confirm_engine(
                                 match lookup_faults.on_err(&e) {
                                     LookupFaultAction::Stop => {
                                         info!("ibd: confirm lookup cancelled mid-wave");
+                                        feed.finish_stale_plan(wave_h.iter().copied());
                                         break;
                                     }
                                     LookupFaultAction::Ignore => {
@@ -3431,6 +3452,7 @@ pub fn spawn_confirm_engine(
                                     }
                                 }
                             }
+                            feed.finish_stale_plan(wave_h.iter().copied());
                         }
                     }
                     confirm_thr_stats::add_lookup_stamp(&stats, t_wave.elapsed());
