@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use rbitcoin_net::tx_relay::parent_req::*;
 use rbitcoin_net::tx_relay::{
-    GETDATA_TX_INTERVAL_SECS, MAX_PARENTS_PER_PARK, NONPREF_PEER_TX_DELAY_SECS,
+    GETDATA_TX_INTERVAL_SECS, MAX_PEER_TX_REQUEST_IN_FLIGHT, NONPREF_PEER_TX_DELAY_SECS,
 };
 
 #[test]
@@ -11,10 +11,13 @@ fn txid_parent_already_have_does_not_follow_another_peers_wtxid() {
     let hash = [0xcd; 32];
     t.schedule(hash, 2, true, 1_000);
     assert_eq!(
-        t.note_inv(1, hash, true, 1_000, true),
+        t.note_inv(InvSource::new(1, true), hash, 1_000, true),
         ParentNote::RequestNow
     );
-    assert_eq!(t.note_inv(3, hash, true, 1_000, true), ParentNote::Deferred);
+    assert_eq!(
+        t.note_inv(InvSource::new(3, true), hash, 1_000, true),
+        ParentNote::Deferred
+    );
     let now = 1_000 + GETDATA_TX_INTERVAL_SECS;
     let mut saw_txid = false;
     let dropped = t.take_due(2, now, |h, wtxid| {
@@ -45,16 +48,16 @@ fn non_preferred_announcer_waits_for_a_preferred_one() {
     let mut t = ParentTracker::new();
     let hash = [0x77; 32];
     assert_eq!(
-        t.note_inv(1, hash, false, 1_000, true),
+        t.note_inv(InvSource::new(1, false), hash, 1_000, true),
         ParentNote::Deferred
     );
     assert_eq!(
-        t.note_inv(1, hash, false, 1_001, true),
+        t.note_inv(InvSource::new(1, false), hash, 1_001, true),
         ParentNote::Deferred
     );
     assert!(t.take_due(1, 1_001, |_, _| false).is_empty());
     assert_eq!(
-        t.note_inv(2, hash, true, 1_001, true),
+        t.note_inv(InvSource::new(2, true), hash, 1_001, true),
         ParentNote::RequestNow
     );
     assert!(
@@ -66,7 +69,7 @@ fn non_preferred_announcer_waits_for_a_preferred_one() {
     let mut t = ParentTracker::new();
     let alone = [0x78; 32];
     assert_eq!(
-        t.note_inv(1, alone, false, 2_000, true),
+        t.note_inv(InvSource::new(1, false), alone, 2_000, true),
         ParentNote::Deferred
     );
     assert!(t
@@ -84,7 +87,7 @@ fn inflight_wtxid_of_the_same_hash_is_not_requested_again_as_txid() {
     let inflight = [0x11; 32];
     let missing = [0x22; 32];
     assert_eq!(
-        t.note_inv(1, inflight, true, 1_000, true),
+        t.note_inv(InvSource::new(1, true), inflight, 1_000, true),
         ParentNote::RequestNow
     );
     t.schedule(inflight, 2, false, 1_000);
@@ -112,7 +115,12 @@ fn rows_are_bounded_per_live_peer() {
             let mut h = [0u8; 32];
             h[0] = p as u8;
             h[1..5].copy_from_slice(&i.to_le_bytes());
-            t.note_inv(p, h, true, 1_000 + u64::from(i / 1_000), true);
+            t.note_inv(
+                InvSource::new(p, true),
+                h,
+                1_000 + u64::from(i / 1_000),
+                true,
+            );
         }
     }
     assert_eq!(t.announcements, peers as usize * MAX_PARENT_ANN_PER_PEER);
@@ -137,8 +145,12 @@ fn shared_hash(i: u32) -> [u8; 32] {
 fn tracker_with_shared_hashes(peers: u64, hashes: u32) -> ParentTracker {
     let mut t = ParentTracker::new();
     for p in 0..peers {
+        let from = InvSource {
+            relay_perm: true,
+            ..InvSource::new(p, true)
+        };
         for i in 0..hashes {
-            let note = t.note_inv(p, shared_hash(i), true, 1_000 + p.min(1), true);
+            let note = t.note_inv(from, shared_hash(i), 1_000 + p.min(1), true);
             let want = if p == 0 {
                 ParentNote::RequestNow
             } else {
@@ -173,7 +185,7 @@ fn work_on_shared_hashes_is_linear_in_rows() {
     let got = t.take_due(1, 1_002, |_, _| false);
     assert_eq!(
         got.len(),
-        MAX_PARENTS_PER_PARK,
+        MAX_PEER_TX_REQUEST_IN_FLIGHT,
         "a waiter is asked once the holder is gone"
     );
     for p in 2..peers {
@@ -202,7 +214,7 @@ fn work_on_shared_hashes_is_linear_in_rows() {
     );
     assert_eq!(
         t.take_due(1, 1_002, |_, _| false).len(),
-        MAX_PARENTS_PER_PARK,
+        MAX_PEER_TX_REQUEST_IN_FLIGHT,
         "a waiter is asked after the notfound"
     );
 }
@@ -267,7 +279,7 @@ fn indexes_match_rows_after_every_call() {
         let (peer, h) = (next(6), hash(next(8)));
         match next(10) {
             0..=2 => {
-                t.note_inv(peer, h, next(2) == 0, now, next(2) == 0);
+                t.note_inv(InvSource::new(peer, next(2) == 0), h, now, next(2) == 0);
             }
             3 => t.schedule(h, peer, next(2) == 0, now + next(5)),
             4 => t.note_not_found(peer, h),

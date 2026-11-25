@@ -13,11 +13,40 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU64;
+use std::ops::Bound;
 
-use super::{GETDATA_TX_INTERVAL_SECS, MAX_PARENTS_PER_PARK, NONPREF_PEER_TX_DELAY_SECS};
+use super::{
+    GETDATA_TX_INTERVAL_SECS, MAX_PEER_TX_REQUEST_IN_FLIGHT, NONPREF_PEER_TX_DELAY_SECS,
+    OVERLOADED_PEER_TX_DELAY_SECS, TXID_RELAY_DELAY_SECS,
+};
 
 /// Announcements one peer may add. Past this the map does not grow.
 pub const MAX_PARENT_ANN_PER_PEER: usize = 5_000;
+
+/// An announcer, as Core's `TxDownloadConnectionInfo`, plus the one fact
+/// about the rest of the node that `TXID_RELAY_DELAY` reads.
+#[derive(Clone, Copy, Debug)]
+pub struct InvSource {
+    pub peer: u64,
+    /// Core `fPreferredDownload`: an outbound peer, or one with `noban`.
+    pub preferred: bool,
+    /// Core `m_relay_permissions`. A peer that has it is never overloaded.
+    pub relay_perm: bool,
+    /// Core `m_num_wtxid_peers > 0`: a wtxid-relay peer is connected.
+    pub wtxid_peers: bool,
+}
+
+impl InvSource {
+    /// A peer with no relay permission, on a node with no wtxid-relay peer.
+    pub fn new(peer: u64, preferred: bool) -> Self {
+        Self {
+            peer,
+            preferred,
+            relay_perm: false,
+            wtxid_peers: false,
+        }
+    }
+}
 
 /// One parent GETDATA the sweep should send.
 pub struct DueParent {
@@ -201,18 +230,22 @@ impl ParentTracker {
         self.ann_per_peer.get(&peer).copied().unwrap_or(0) >= MAX_PARENT_ANN_PER_PEER
     }
 
-    /// `preferred` is Core's preferred download peer (outbound, or noban).
-    /// A non-preferred announcer is first due after
-    /// [`NONPREF_PEER_TX_DELAY_SECS`], so a preferred announcer that arrives
-    /// in that time is asked instead (Core `TxRequestTracker`).
+    /// An announcer is first due after Core's delays, which add up
+    /// (`AddTxAnnouncement`): [`NONPREF_PEER_TX_DELAY_SECS`] when it is not
+    /// preferred, [`TXID_RELAY_DELAY_SECS`] for a txid announcement while a
+    /// wtxid-relay peer is connected, and [`OVERLOADED_PEER_TX_DELAY_SECS`]
+    /// when it has no relay permission and [`MAX_PEER_TX_REQUEST_IN_FLIGHT`]
+    /// requests outstanding. A preferred announcer that arrives in that time
+    /// is asked instead (Core `TxRequestTracker`).
     pub fn note_inv(
         &mut self,
-        peer: u64,
+        from: InvSource,
         hash: [u8; 32],
-        preferred: bool,
         now: u64,
         wtxid: bool,
     ) -> ParentNote {
+        let peer = from.peer;
+        let preferred = from.preferred;
         if let Some(note) = self.rearm_existing(peer, hash, now, wtxid) {
             return note;
         }
@@ -220,11 +253,7 @@ impl ParentTracker {
             return ParentNote::PeerCapped;
         }
         let exp = now.saturating_add(GETDATA_TX_INTERVAL_SECS);
-        let reqtime = if preferred {
-            now
-        } else {
-            now.saturating_add(NONPREF_PEER_TX_DELAY_SECS)
-        };
+        let reqtime = now.saturating_add(self.announce_delay(from, now, wtxid));
         // Same-kind in-flight stays the one request. This announcer waits
         // until that window ends and keeps its own getdata type.
         let (due_at, requested_until) = match self.kind_inflight_until(&hash, wtxid) {
@@ -250,6 +279,31 @@ impl ParentTracker {
             },
         );
         note
+    }
+
+    fn announce_delay(&self, from: InvSource, now: u64, wtxid: bool) -> u64 {
+        let mut delay = 0;
+        if !from.preferred {
+            delay += NONPREF_PEER_TX_DELAY_SECS;
+        }
+        if !wtxid && from.wtxid_peers {
+            delay += TXID_RELAY_DELAY_SECS;
+        }
+        if !from.relay_perm && self.peer_overloaded(from.peer, now) {
+            delay += OVERLOADED_PEER_TX_DELAY_SECS;
+        }
+        delay
+    }
+
+    /// Core `CountInFlight(peer) >= MAX_PEER_TX_REQUEST_IN_FLIGHT`. A request
+    /// past its expiry is not counted, though it stays indexed until swept.
+    /// The walk stops at the threshold, so it never reads a peer's whole index.
+    fn peer_overloaded(&self, peer: u64, now: u64) -> bool {
+        self.inflight_by_peer.get(&peer).is_some_and(|rows| {
+            rows.range((Bound::Excluded(through(now)), Bound::Unbounded))
+                .nth(MAX_PEER_TX_REQUEST_IN_FLIGHT - 1)
+                .is_some()
+        })
     }
 
     pub fn schedule(&mut self, hash: [u8; 32], peer: u64, preferred: bool, reqtime: u64) {
@@ -411,7 +465,7 @@ impl ParentTracker {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         for hash in due_hashes {
-            if out.len() >= MAX_PARENTS_PER_PARK {
+            if out.len() >= MAX_PEER_TX_REQUEST_IN_FLIGHT {
                 break;
             }
             // A request that has not ended blocks every row of this hash,

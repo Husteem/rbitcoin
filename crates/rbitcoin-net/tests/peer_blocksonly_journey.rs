@@ -679,6 +679,8 @@ async fn wtxid_relay_ignores_txid_inv(
         getdata_txs(&mut w_rx).is_empty(),
         "a wtxid-relay peer's txid inv is ignored for a tx this node does not have"
     );
+    // Core delays a txid announcement while a wtxid-relay peer is connected.
+    peers.unregister(wtxid_peer.id);
     let plain = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
     let (plain_out, mut plain_rx) = peer_out_channel();
     let mut plain_follow = PeerFollowState::new();
@@ -695,7 +697,6 @@ async fn wtxid_relay_ignores_txid_inv(
         vec![unknown_inv],
         "an ordinary peer's txid inv for an unknown tx is fetched"
     );
-    peers.unregister(wtxid_peer.id);
     peers.unregister(plain.id);
 }
 

@@ -9,7 +9,7 @@ use rbitcoin_mempool::{
 use rbitcoin_net::fee_history::HistoricalFeeBlock;
 use rbitcoin_net::fee_history_file;
 use rbitcoin_net::send_queue::peer_out_channel;
-use rbitcoin_net::tx_relay::parent_req::ParentNote;
+use rbitcoin_net::tx_relay::parent_req::{InvSource, ParentNote};
 use rbitcoin_net::tx_relay::*;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
@@ -3435,7 +3435,7 @@ fn take_due_parent_getdata_caps_per_flush() {
     hub.schedule_orphan_parents(&missing, 1, false, t0);
     let due = t0 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
     let first = hub.take_due_parent_getdata(1, due);
-    assert_eq!(first.len(), MAX_PARENTS_PER_PARK);
+    assert_eq!(first.len(), MAX_PEER_TX_REQUEST_IN_FLIGHT);
     let rest = hub.take_due_parent_getdata(1, due);
     assert_eq!(rest.len(), 20);
     let _ = std::fs::remove_dir_all(&dir);
@@ -3455,8 +3455,12 @@ fn parent_req_stops_at_per_peer_cap() {
     let q = Query::open_or_create_tiny(&store_dir).unwrap();
     let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
     let cap = parent_req::MAX_PARENT_ANN_PER_PEER;
+    let from = InvSource {
+        relay_perm: true,
+        ..InvSource::new(7, true)
+    };
     for i in 0..(cap as u32 + 10) {
-        let accepted = hub.note_inv_tx_requested(7, parent_hash(i), true, 1_000, false);
+        let accepted = hub.note_inv_tx_requested(from, parent_hash(i), 1_000, false);
         if i < cap as u32 {
             assert_eq!(
                 accepted,
@@ -3485,7 +3489,7 @@ fn second_peer_take_due_does_not_drop_other_peers_keys() {
     let txid = Txid::from_byte_array(hash);
     let wtxid = Wtxid::from_byte_array(hash);
     assert_eq!(
-        hub.note_inv_tx_requested(1, hash, true, 1_000, false),
+        hub.note_inv_tx_requested(InvSource::new(1, true), hash, 1_000, false),
         ParentNote::RequestNow
     );
     hub.note_recent_reject(wtxid);
@@ -3509,11 +3513,11 @@ fn disconnect_makes_the_waiting_wtxid_peer_due() {
     let hash = [0xde; 32];
     let now = 1_000u64;
     assert_eq!(
-        hub.note_inv_tx_requested(1, hash, true, now, true),
+        hub.note_inv_tx_requested(InvSource::new(1, true), hash, now, true),
         ParentNote::RequestNow
     );
     assert_eq!(
-        hub.note_inv_tx_requested(3, hash, true, now, true),
+        hub.note_inv_tx_requested(InvSource::new(3, true), hash, now, true),
         ParentNote::Deferred
     );
     assert!(
@@ -3543,19 +3547,19 @@ fn rejected_wtxid_is_not_requested() {
     let rejected = [0x11u8; 32];
     let fresh = [0x22u8; 32];
     assert_eq!(
-        hub.note_inv_tx_requested(1, rejected, true, now, true),
+        hub.note_inv_tx_requested(InvSource::new(1, true), rejected, now, true),
         ParentNote::RequestNow
     );
     assert_eq!(
-        hub.note_inv_tx_requested(3, rejected, true, now, true),
+        hub.note_inv_tx_requested(InvSource::new(3, true), rejected, now, true),
         ParentNote::Deferred
     );
     assert_eq!(
-        hub.note_inv_tx_requested(1, fresh, true, now, true),
+        hub.note_inv_tx_requested(InvSource::new(1, true), fresh, now, true),
         ParentNote::RequestNow
     );
     assert_eq!(
-        hub.note_inv_tx_requested(3, fresh, true, now, true),
+        hub.note_inv_tx_requested(InvSource::new(3, true), fresh, now, true),
         ParentNote::Deferred
     );
     hub.note_recent_reject(Wtxid::from_byte_array(rejected));
@@ -3581,11 +3585,11 @@ fn wtxid_followup_is_requested_as_wtx() {
     let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
     let hash = [0xab; 32];
     assert_eq!(
-        hub.note_inv_tx_requested(1, hash, true, 1_000, true),
+        hub.note_inv_tx_requested(InvSource::new(1, true), hash, 1_000, true),
         ParentNote::RequestNow
     );
     assert_eq!(
-        hub.note_inv_tx_requested(3, hash, true, 1_000, true),
+        hub.note_inv_tx_requested(InvSource::new(3, true), hash, 1_000, true),
         ParentNote::Deferred,
         "the wtxid follow-up is its own row and is not a second getdata"
     );
@@ -3623,7 +3627,7 @@ fn same_peer_wtxid_inflight_expires_back_to_txid_parent() {
     let t0 = 1_000u64;
     hub.schedule_orphan_parents(&missing, 2, true, t0);
     assert_eq!(
-        hub.note_inv_tx_requested(2, hash, true, t0, true),
+        hub.note_inv_tx_requested(InvSource::new(2, true), hash, t0, true),
         ParentNote::RequestNow,
         "the same peer's wtxid inv is a second announcement"
     );
@@ -3696,7 +3700,7 @@ fn resolve_tx_request_lets_other_peer_fetch_after_reject() {
     let hash = [0x44; 32];
     let txid = Txid::from_byte_array(hash);
     let wtxid = Wtxid::from_byte_array(hash);
-    hub.note_inv_tx_requested(1, hash, true, 1_000, false);
+    hub.note_inv_tx_requested(InvSource::new(1, true), hash, 1_000, false);
     let missing = BTreeSet::from([txid]);
     hub.schedule_orphan_parents(&missing, 2, false, 1_000);
     let due = 1_000 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;

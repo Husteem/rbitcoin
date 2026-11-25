@@ -5370,10 +5370,10 @@ pub fn on_inv_txid(
         return None;
     }
     if let Some(s) = session {
+        let wtxid_peers = s.peer_hub().is_some_and(|h| h.has_wtxid_relay_peer());
         match mp.note_inv_tx_requested(
-            s.id,
+            tx_inv_source(s, wtxid_peers),
             txid.to_byte_array(),
-            tx_download_preferred(s),
             s.clock_now(),
             false,
         ) {
@@ -5394,6 +5394,17 @@ fn tx_download_preferred(s: &crate::peers::LivePeer) -> bool {
     (!s.inbound || s.session_noban())
         && s.conn_type != crate::peers::PeerConnType::AddrFetch
         && s.can_serve_blocks()
+}
+
+/// `wtxid_peers` matters only to a txid announcement, so a wtxid one passes
+/// `false` and skips the scan of the live peers.
+fn tx_inv_source(s: &crate::peers::LivePeer, wtxid_peers: bool) -> crate::tx_relay::InvSource {
+    crate::tx_relay::InvSource {
+        peer: s.id,
+        preferred: tx_download_preferred(s),
+        relay_perm: s.session_relay_perm(),
+        wtxid_peers,
+    }
 }
 
 fn asks_back_local_tx(
@@ -5426,9 +5437,8 @@ pub fn on_inv_wtxid(
     if ask_back || !mp.try_contains_wtxid(wtxid) {
         if let Some(s) = session {
             match mp.note_inv_tx_requested(
-                s.id,
+                tx_inv_source(s, false),
                 wtxid.to_byte_array(),
-                tx_download_preferred(s),
                 s.clock_now(),
                 true,
             ) {

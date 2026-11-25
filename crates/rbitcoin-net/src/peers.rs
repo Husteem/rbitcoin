@@ -3854,6 +3854,16 @@ impl PeerHub {
             .retain(|x| *x != id);
     }
 
+    /// Core `m_num_wtxid_peers > 0`: a peer past its handshake negotiated
+    /// wtxid relay. Stops at the first.
+    pub fn has_wtxid_relay_peer(&self) -> bool {
+        self.live
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|p| p.handshake_complete() && p.wtxid_relay())
+    }
+
     pub fn live_peers(&self) -> Vec<Arc<LivePeer>> {
         let g = self.live.read().unwrap_or_else(|e| e.into_inner());
         g.values().cloned().collect()

@@ -230,7 +230,7 @@ impl Drop for PromoteWalk {
 #[path = "parent_req.rs"]
 #[doc(hidden)]
 pub mod parent_req;
-pub use parent_req::{DueParent, ParentNote};
+pub use parent_req::{DueParent, InvSource, ParentNote};
 
 /// Max age of a published fee snapshot before refresh (request path is still Arc-load only
 /// after a concurrent refresh has finished; see [`MempoolHub::maybe_refresh_fee_snapshot`]).
@@ -921,12 +921,15 @@ pub const DEFAULT_MEMPOOL_EXPIRY_SECS: u64 = 336 * 3600;
 pub const NONPREF_PEER_TX_DELAY_SECS: u64 = 2;
 /// Core `TXID_RELAY_DELAY` (parent GETDATA is by txid, not wtxid).
 pub const TXID_RELAY_DELAY_SECS: u64 = 2;
+/// Core `OVERLOADED_PEER_TX_DELAY`.
+pub const OVERLOADED_PEER_TX_DELAY_SECS: u64 = 2;
 /// Core `GETDATA_TX_INTERVAL` (in-flight parent request expiry).
 pub const GETDATA_TX_INTERVAL_SECS: u64 = 60;
-/// Cap unique parent GETDATA items issued from one flush.
-/// Core `MAX_PEER_TX_REQUEST_IN_FLIGHT`.
+/// Core `MAX_PEER_TX_REQUEST_IN_FLIGHT`. A peer with this many requests
+/// outstanding and no relay permission is overloaded, and one flush asks
+/// for at most this many parents.
 #[doc(hidden)]
-pub const MAX_PARENTS_PER_PARK: usize = 100;
+pub const MAX_PEER_TX_REQUEST_IN_FLIGHT: usize = 100;
 /// Most released INV rows one session tick reads. A long log resumes from
 /// the session's cursor on the next tick.
 pub const RELEASED_INV_SCAN_MAX: usize = 1024;
@@ -6095,16 +6098,15 @@ impl MempoolHub {
     /// [`ParentNote::PeerCapped`] is this peer's own cap.
     pub fn note_inv_tx_requested(
         &self,
-        peer: u64,
+        from: InvSource,
         hash: [u8; 32],
-        preferred: bool,
         now: u64,
         wtxid: bool,
     ) -> ParentNote {
         self.parent_req
             .lock()
             .unwrap()
-            .note_inv(peer, hash, preferred, now, wtxid)
+            .note_inv(from, hash, now, wtxid)
     }
 
     pub fn forget_parent_anns_for_peer(&self, peer: u64) {
