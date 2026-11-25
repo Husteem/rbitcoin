@@ -1249,6 +1249,14 @@ mod pair_tests {
         assert!(Wave::claim_chunk(&b).is_some(), "unlinked is uncapped");
     }
 
+    struct UnpublishWave<'a>(&'a Arc<Wave>);
+
+    impl Drop for UnpublishWave<'_> {
+        fn drop(&mut self) {
+            unpublish_fg(self.0);
+        }
+    }
+
     /// A wave withheld for the winner's write must finish once a promotion
     /// re-publishes it; otherwise `wait_done` waits for chunks no worker can
     /// claim.
@@ -1256,6 +1264,7 @@ mod pair_tests {
     fn republish_lets_an_unpublished_wave_finish() {
         let _gate = steal_test_gate();
         let wave = test_wave(10_000);
+        let unpublish = UnpublishWave(&wave);
         publish_wave(&wave);
         unpublish_fg(&wave);
         publish_wave(&wave);
@@ -1268,6 +1277,11 @@ mod pair_tests {
         assert!(
             rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
             "a re-published wave must let wait_done finish"
+        );
+        drop(unpublish);
+        assert!(
+            !waves_snap().load().iter().any(|w| Arc::ptr_eq(w, &wave)),
+            "the republished wave must be removed before releasing the test gate"
         );
     }
 }
