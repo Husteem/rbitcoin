@@ -1232,10 +1232,11 @@ pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
 /// empties, and IBD never leaves catch-up (#1811).
 ///
 /// This is not an invalidity claim: the header breaks no rule, so it is not
-/// marked failed. It is taken off the download path and no IBD peer asks for
-/// it again this session; the path above its parent is re-seeded so an
-/// equal-work sibling at tip+1 can be asked for instead. After IBD,
-/// tip-follow can still connect a block a peer serves for it.
+/// marked failed. It is taken off the download path, and the path above its
+/// parent is re-seeded so an equal-work sibling at tip+1 can be asked for
+/// instead. A peer that sent none of the copies puts it back by announcing it
+/// (`events::reopen_for_announcer`). After IBD, tip-follow can still connect
+/// a block a peer serves for it.
 #[doc(hidden)]
 pub fn retire_unservable(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u32) {
     retire_undeliverable(

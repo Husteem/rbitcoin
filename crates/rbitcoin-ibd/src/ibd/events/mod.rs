@@ -340,6 +340,7 @@ pub fn on_headers_batch(
             batch_prev.and_then(|(ph, pht)| (ph == prev).then_some(pht.saturating_add(1)))
         });
         if let Some(h) = height {
+            reopen_for_announcer(st, peer, hash);
             note_header_path(st, hub, hash, h, prev);
             if !st.is_on_path(&hash, h) && super::header_walk::note_off_path(st, hub, peer, hash) {
                 disconnect_peer(st, peer);
@@ -1502,7 +1503,8 @@ pub(crate) fn note_archived_body_clear(
 
 /// Post-clear reject updates. Skips them when `height` changed hands while
 /// the coordinator lock was down, so the new occupant is not marked missing.
-pub(crate) fn finish_deferred_archived_clear(
+#[doc(hidden)]
+pub fn finish_deferred_archived_clear(
     st: &mut IbdWorkState,
     hub: Option<&rbitcoin_net::chain::ChainHub>,
     item: &DeferredArchivedClear,
@@ -1530,7 +1532,7 @@ pub(crate) fn finish_deferred_archived_clear(
             // `MUTATED_COPIES_BEFORE_ABANDON` copies no peer we keep can serve
             // it: stop the re-get and take the header off the path, or
             // `ordered` never empties and IBD never leaves catch-up (#1811).
-            if !dropped && note_mutated_copy(st, hash) {
+            if !dropped && note_mutated_copy(st, hash, sender) {
                 st.unservable.insert(hash);
                 st.body.stop_reget(hash);
                 // A tip+1 sibling is never on the path, so the walk cut below
@@ -1764,8 +1766,8 @@ pub fn abandon_unwritable_sibling(
 
 /// Mutated copies of one hash before its header is abandoned. Three matches
 /// `TIP_CHILD_HALT_AFTER`: one can be a fluke, two a peer still resending the
-/// same bad copy, three means the kept peers that answered cannot serve it
-/// (another kept peer may still have it; see #1992).
+/// same bad copy, three means the kept peers that answered cannot serve it.
+/// A peer that sent none of them reopens it ([`reopen_for_announcer`]).
 #[doc(hidden)]
 pub const MUTATED_COPIES_BEFORE_ABANDON: u8 = 3;
 
@@ -1775,7 +1777,7 @@ const MUTATED_TRACK_CAP: usize = 256;
 /// Make room for one more count without growing past `cap`: drop an arbitrary
 /// tracked hash. A dropped count only costs that hash more retries; it can
 /// never retire a hash that has not been copied that often.
-fn cap_tracked(counts: &mut crate::ibd::state::BlockHashMap<u8>, hash: BlockHash, cap: usize) {
+fn cap_tracked<V>(counts: &mut crate::ibd::state::BlockHashMap<V>, hash: BlockHash, cap: usize) {
     if counts.len() >= cap && !counts.contains_key(&hash) {
         if let Some(victim) = counts.keys().next().copied() {
             counts.remove(&victim);
@@ -1783,16 +1785,43 @@ fn cap_tracked(counts: &mut crate::ibd::state::BlockHashMap<u8>, hash: BlockHash
     }
 }
 
-/// Count one mutated body copy for `hash`. True once the abandon limit is
-/// reached (see [`MUTATED_COPIES_BEFORE_ABANDON`]).
+/// Count one mutated body copy for `hash` from slot `sender`. True once the
+/// abandon limit is reached (see [`MUTATED_COPIES_BEFORE_ABANDON`]).
 ///
 /// Dropping a count at the tracking cap only costs retries for that hash; it
 /// can never retire a hash that has not been copied that often.
-pub fn note_mutated_copy(st: &mut IbdWorkState, hash: BlockHash) -> bool {
+pub fn note_mutated_copy(st: &mut IbdWorkState, hash: BlockHash, sender: Option<usize>) -> bool {
+    let addr = sender.and_then(|id| st.slots.iter().find(|s| s.id == id).map(|s| s.addr));
     cap_tracked(&mut st.mutated_copies, hash, MUTATED_TRACK_CAP);
-    let copies = st.mutated_copies.entry(hash).or_insert(0);
-    *copies = copies.saturating_add(1);
-    *copies >= MUTATED_COPIES_BEFORE_ABANDON
+    let copies = st.mutated_copies.entry(hash).or_default();
+    copies.note(addr);
+    copies.copies >= MUTATED_COPIES_BEFORE_ABANDON
+}
+
+/// A header abandoned for mutated copies (#1811) goes back on the path when
+/// `peer` announces it and sent none of those copies (#1992). The peers that
+/// did are kept off it for a stall window (`PeerChain::lacks`), so the
+/// re-get goes to `peer`. The count stays: the next mutated copy abandons
+/// it again. A header abandoned for another reason, or one whose sender
+/// record is full, stays abandoned.
+pub fn reopen_for_announcer(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
+    if !st.unservable.contains(&hash) {
+        return;
+    }
+    let Some(addr) = st.slots.iter().find(|s| s.id == peer).map(|s| s.addr) else {
+        return;
+    };
+    let Some(copies) = st.mutated_copies.get(&hash).copied() else {
+        return;
+    };
+    if copies.full() || copies.sent_by(addr) {
+        return;
+    }
+    st.unservable.remove(&hash);
+    let now = super::peer_io::ibd_mono_ms();
+    for slot in st.slots.iter_mut().filter(|s| copies.sent_by(s.addr)) {
+        slot.chain.note_notfound(hash, now);
+    }
 }
 
 /// Core `MaybePunishNodeForBlock` (`BLOCK_MUTATED`): drop the sender and

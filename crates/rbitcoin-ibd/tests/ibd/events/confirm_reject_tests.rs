@@ -5239,12 +5239,12 @@ fn mutated_copies_are_bounded_and_abandoned_hashes_are_not_reseeded() {
     let hash = h(0x77);
     for _ in 1..MUTATED_COPIES_BEFORE_ABANDON {
         assert!(
-            !note_mutated_copy(&mut st, hash),
+            !note_mutated_copy(&mut st, hash, None),
             "a copy below the limit must keep the hash on the retry path"
         );
     }
     assert!(
-        note_mutated_copy(&mut st, hash),
+        note_mutated_copy(&mut st, hash, None),
         "the limit must report the hash as unservable"
     );
     assert!(
@@ -5314,7 +5314,7 @@ fn mutated_copy_tracking_is_capped() {
     for n in 0..300u32 {
         let mut raw = [0u8; 32];
         raw[..4].copy_from_slice(&n.to_le_bytes());
-        note_mutated_copy(&mut st, BlockHash::from_byte_array(raw));
+        note_mutated_copy(&mut st, BlockHash::from_byte_array(raw), None);
     }
     assert!(
         st.mutated_copies.len() <= 256,
@@ -5323,11 +5323,11 @@ fn mutated_copy_tracking_is_capped() {
     );
     let fresh = BlockHash::from_byte_array([0xab; 32]);
     for _ in 0..MUTATED_COPIES_BEFORE_ABANDON {
-        note_mutated_copy(&mut st, fresh);
+        note_mutated_copy(&mut st, fresh, None);
     }
     assert_eq!(
-        st.mutated_copies.get(&fresh),
-        Some(&MUTATED_COPIES_BEFORE_ABANDON),
+        st.mutated_copies.get(&fresh).map(|c| c.copies),
+        Some(MUTATED_COPIES_BEFORE_ABANDON),
         "a fresh hash still reaches the abandon bound"
     );
 }
@@ -5590,6 +5590,80 @@ fn resume_installation_refuses_an_unservable_entry_and_bounds_the_explore_tip() 
         st.reorg.explore_tips(),
         &[first],
         "the explore tip stops at the installed prefix, not the last entry"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// #1992: three mutated copies from one kept peer abandon a header, but not
+/// for every peer. When a peer that never sent a mutated copy announces it,
+/// the header goes back on the path and is asked of that peer; the peer that
+/// sent the copies is kept off it. The same peer re-announcing it does not
+/// reopen it.
+#[test]
+fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
+    use bitcoin::Network;
+    use rbitcoin_ibd::ibd::events::{
+        finish_deferred_archived_clear, on_headers_batch, BadPrevParent, DeferredArchivedClear,
+        MUTATED_COPIES_BEFORE_ABANDON,
+    };
+    use rbitcoin_ibd::ibd::header_walk::may_serve;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reopen-abandoned");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let t = hub.tip_height().unwrap();
+    let height = t + 1;
+    let time = bitcoin::blockdata::constants::genesis_block(Network::Regtest)
+        .header
+        .time
+        .saturating_add(600);
+    let a = rbitcoin_consensus::mine_empty_regtest(tip, time, height);
+    let fks = hub.ensure_headers_batch(&[a.header]).unwrap();
+    let hash = a.block_hash();
+
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
+    let (kept, other) = (1, 2);
+    for id in [kept, other] {
+        let mut slot = crate::ibd::assign::dummy_slot(id);
+        slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
+        st.slots.push(slot);
+    }
+    on_headers_batch(&mut st, &hub, kept, vec![a.header], &fks);
+    assert!(st.ordered_set.contains(&hash), "A is queued");
+    let copy = DeferredArchivedClear {
+        height,
+        hash,
+        err: "bad-txnmrklroot".into(),
+        sender: Some(kept),
+        parent: BadPrevParent::Tip,
+        retry_tip_child: false,
+        bad_prev: false,
+        was_occupant: true,
+    };
+    for _ in 0..MUTATED_COPIES_BEFORE_ABANDON {
+        finish_deferred_archived_clear(&mut st, Some(&hub), &copy);
+    }
+    assert!(
+        st.unservable.contains(&hash),
+        "the kept peer's copies abandon A"
+    );
+
+    on_headers_batch(&mut st, &hub, kept, vec![a.header], &fks);
+    assert!(
+        st.unservable.contains(&hash),
+        "the peer that sent the copies does not reopen A"
+    );
+
+    on_headers_batch(&mut st, &hub, other, vec![a.header], &fks);
+    assert!(
+        !st.unservable.contains(&hash),
+        "another peer's announcement reopens A"
+    );
+    assert!(st.ordered_set.contains(&hash), "A is queued again");
+    assert!(may_serve(&st, other, &hash), "A is asked of the announcer");
+    assert!(
+        !may_serve(&st, kept, &hash),
+        "not of the peer that sent the copies"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
