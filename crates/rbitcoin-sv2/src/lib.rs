@@ -251,20 +251,20 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
             // small buffer on the accepted socket.
             #[cfg(all(debug_assertions, target_os = "linux"))]
             test_send_buffer::apply(&stream);
+            let Ok(slot) = slots.clone().try_acquire_owned() else {
+                rbitcoin_log::warn_repeated(
+                    rbitcoin_log::RepeatedInfo::Sv2AtMaxSessions,
+                    format_args!("sv2: reject {peer} (at max_sessions={MAX_SESSIONS})"),
+                );
+                drop(stream);
+                continue;
+            };
             let Some(group) = GroupShare::take(&groups, peer) else {
                 rbitcoin_log::warn_repeated(
                     rbitcoin_log::RepeatedInfo::Sv2AtMaxSessions,
                     format_args!(
                         "sv2: reject {peer} (netgroup at {MAX_SESSIONS_PER_NETGROUP} sessions)"
                     ),
-                );
-                drop(stream);
-                continue;
-            };
-            let Ok(slot) = slots.clone().try_acquire_owned() else {
-                rbitcoin_log::warn_repeated(
-                    rbitcoin_log::RepeatedInfo::Sv2AtMaxSessions,
-                    format_args!("sv2: reject {peer} (at max_sessions={MAX_SESSIONS})"),
                 );
                 drop(stream);
                 continue;

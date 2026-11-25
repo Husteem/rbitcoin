@@ -89,9 +89,20 @@ async fn setup_connection_success_errors_and_session_cap() {
     for _ in 0..MAX_SESSIONS - share {
         live.push(setup_ok(v6, pk).await);
     }
+    // The global cap is checked first, so this refusal is the cap's own,
+    // not the IPv6 netgroup's share.
+    rbitcoin_log::reset_repeated_info();
+    rbitcoin_log::capture_logs(true);
+    let _ = rbitcoin_log::take_logs();
     assert!(
         TpClient::connect(v6, pk).await.is_err(),
         "session over the cap must close before the handshake"
+    );
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    assert!(
+        lines.iter().any(|(_, m)| m.contains("at max_sessions=")),
+        "the global cap refused it: {lines:?}"
     );
     for c in live.iter_mut().step_by(MAX_SESSIONS - 1) {
         let still_open = tokio::time::timeout(Duration::from_millis(200), c.recv()).await;
