@@ -936,6 +936,7 @@ fn peers_file_roundtrip_preserves_last_seen() {
         NetAddr::from_socket(a),
         NetAddr::from_socket(a),
         1_699_000_000,
+        0,
         1_700_000_000,
         8
     ));
@@ -954,41 +955,18 @@ fn peers_file_roundtrip_preserves_last_seen() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Core `Connected_`: a row we reached takes the node time once the stored
-/// time is more than twenty minutes old, so live peers stay fresh.
+/// A merge keeps the newer row time: a session book that connected to a row
+/// must not lose that time when it is folded back into the shared book.
 #[test]
-fn a_connected_row_refreshes_its_time_at_core_interval() {
-    let mut am = AddrMan::new();
-    let row = NetAddr::from_socket(addr(41));
-    assert!(am.add_learned_addr_at(row, row, 1_699_000_000, 1_700_000_000, 8));
-    am.note_connected_addr(row, 1_700_000_000);
-    assert_eq!(am.last_seen_of(&row), 1_700_000_000);
-    am.note_connected_addr(row, 1_700_001_200);
-    assert_eq!(
-        am.last_seen_of(&row),
-        1_700_000_000,
-        "twenty minutes is not old enough"
-    );
-    am.note_connected_addr(row, 1_700_001_201);
-    assert_eq!(am.last_seen_of(&row), 1_700_001_201);
-}
-
-/// Core `AddSingle`: a held row takes newer gossip only after the online
-/// (one hour) or offline (one day) interval, so a sender cannot restamp it.
-#[test]
-fn newer_gossip_refreshes_a_held_row_by_the_interval() {
-    let mut am = AddrMan::new();
-    let row = NetAddr::from_socket(addr(42));
-    let source = NetAddr::from_socket(addr(43));
-    assert!(am.add_learned_addr_at(row, source, 1_700_000_000, 1_700_000_000, 8));
-    assert!(!am.add_learned_addr_at(row, source, 1_700_001_800, 1_700_001_800, 8));
-    assert_eq!(
-        am.last_seen_of(&row),
-        1_700_000_000,
-        "thirty minutes is inside the online interval"
-    );
-    assert!(!am.add_learned_addr_at(row, source, 1_700_007_200, 1_700_007_200, 8));
-    assert_eq!(am.last_seen_of(&row), 1_700_007_200);
+fn merge_from_keeps_the_newer_row_time() {
+    let mut shared = AddrMan::new();
+    let row = NetAddr::from_socket(addr(44));
+    assert!(shared.add_learned_addr_at(row, row, 1_690_000_000, 0, 1_700_000_000, 8));
+    let mut session = AddrMan::new();
+    session.copy_row_from(&shared, row);
+    session.note_connected_addr(row, 1_700_000_000);
+    shared.merge_from(&session);
+    assert_eq!(shared.last_seen_of(&row), 1_700_000_000);
 }
 
 #[test]

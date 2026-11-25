@@ -3025,15 +3025,24 @@ impl PeerHub {
                 if crate::netaddr::netaddr_unroutable_gossip(addr) {
                     continue;
                 }
-                let seen = crate::seeds::learned_addr_time(a.time, now);
+                let claimed = crate::seeds::learned_addr_time(a.time, now);
                 // Core charges a source's gossip two hours; a row a peer
-                // announces as itself keeps the full time.
-                let seen = if addr == source {
-                    seen
+                // announces as itself keeps the full time. The interval that
+                // decides whether a held row updates uses the claim, not the
+                // discounted time.
+                let penalty = if addr == source {
+                    0
                 } else {
-                    seen.saturating_sub(crate::seeds::GOSSIP_TIME_PENALTY_SECS)
+                    crate::seeds::GOSSIP_TIME_PENALTY_SECS
                 };
-                book.add_learned_addr_at(addr, source, seen, now, crate::seeds::MAX_ADDR_MAN);
+                book.add_learned_addr_at(
+                    addr,
+                    source,
+                    claimed,
+                    penalty,
+                    now,
+                    crate::seeds::MAX_ADDR_MAN,
+                );
             }
         }
     }

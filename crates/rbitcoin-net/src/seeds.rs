@@ -707,27 +707,34 @@ impl AddrMan {
     }
 
     pub fn add_learned_addr(&mut self, addr: NetAddr, source: NetAddr, cap: usize) -> bool {
-        self.add_learned_addr_at(addr, source, 0, 0, cap)
+        self.add_learned_addr_at(addr, source, 0, 0, 0, cap)
     }
 
-    /// [`Self::add_learned_addr`] for a row a peer said it saw at `last_seen`
-    /// (Unix seconds, already inside Core's window). `now` is the node clock.
-    /// A held row takes the new time only when it is at least an hour (or a
-    /// day, for a claim older than a day) newer, as Core's `AddSingle` does,
-    /// so one gossip stream cannot hold a row fresh.
+    /// [`Self::add_learned_addr`] for a row a peer claimed at `claimed`
+    /// (Unix seconds, already inside Core's window). `penalty` is Core's
+    /// discount on that claim (`0` for a row a peer announces as itself).
+    /// `now` is the node clock.
+    ///
+    /// Core selects the refresh interval from the sanitized but unpenalized
+    /// `addr.nTime`, then stores `addr.nTime - time_penalty`
+    /// (`AddrManImpl::AddSingle`). A held row takes the new time only when it
+    /// is at least an hour (or a day, for a claim older than a day) newer, so
+    /// one gossip stream cannot hold a row fresh.
     pub fn add_learned_addr_at(
         &mut self,
         addr: NetAddr,
         source: NetAddr,
-        last_seen: u32,
+        claimed: u32,
+        penalty: u32,
         now: u64,
         cap: usize,
     ) -> bool {
+        let last_seen = claimed.saturating_sub(penalty);
         if !self.dialable(addr) {
             return false;
         }
         if self.by_addr.contains_key(&addr) {
-            self.refresh_seen(addr, last_seen, now);
+            self.refresh_seen(addr, claimed, last_seen, now);
             return false;
         }
         if cap == 0 {
@@ -756,13 +763,13 @@ impl AddrMan {
     const SEEN_UPDATE_OFFLINE_SECS: u64 = 24 * 60 * 60;
 
     /// Take `last_seen` for a held row when it is newer than what the book
-    /// has by Core's interval for that row's age.
-    fn refresh_seen(&mut self, addr: NetAddr, last_seen: u32, now: u64) {
+    /// has by Core's interval for the claim's age.
+    fn refresh_seen(&mut self, addr: NetAddr, claimed: u32, last_seen: u32, now: u64) {
         if last_seen == 0 {
             return;
         }
         let stored = self.seen.get(&addr).copied().unwrap_or(0);
-        let online = now.saturating_sub(u64::from(last_seen)) < Self::SEEN_UPDATE_OFFLINE_SECS;
+        let online = now.saturating_sub(u64::from(claimed)) < Self::SEEN_UPDATE_OFFLINE_SECS;
         let interval = if online {
             Self::SEEN_UPDATE_ONLINE_SECS
         } else {
@@ -787,11 +794,11 @@ impl AddrMan {
     /// Copy `other`'s row `addr` with its flags and learned time. A row this
     /// book lacks also takes `other`'s source, so a copy between live books
     /// keeps each group's share. A row both books hold keeps this book's
-    /// source and time. A full book takes no new untried row from a group at
-    /// its share, as [`Self::add_learned_addr`] refuses it: a group that
-    /// taught its share in each of two live books does not hold both after
-    /// they are reconciled. A row `other` connected to is always taken: a peer
-    /// that answered a dial is not gossip.
+    /// source and takes the newer time. A full book takes no new untried row
+    /// from a group at its share, as [`Self::add_learned_addr`] refuses it: a
+    /// group that taught its share in each of two live books does not hold
+    /// both after they are reconciled. A row `other` connected to is always
+    /// taken: a peer that answered a dial is not gossip.
     pub fn copy_row_from(&mut self, other: &AddrMan, addr: NetAddr) {
         let held = self.by_addr.contains_key(&addr);
         let group = other.learned_from.get(&addr).copied();
@@ -804,12 +811,15 @@ impl AddrMan {
             return;
         }
         self.add_with_flags_addr(addr, flags);
+        let other_seen = other.last_seen_of(&addr);
+        if other_seen != 0
+            && self.by_addr.contains_key(&addr)
+            && (self.last_seen_of(&addr) == 0 || other_seen > self.last_seen_of(&addr))
+        {
+            self.seen.insert(addr, other_seen);
+        }
         if held || !self.by_addr.contains_key(&addr) {
             return;
-        }
-        let last_seen = other.last_seen_of(&addr);
-        if last_seen != 0 {
-            self.seen.insert(addr, last_seen);
         }
         if let Some(group) = group {
             self.charge(addr, group);
@@ -995,8 +1005,15 @@ impl AddrMan {
     /// serve, as Core fixes the backdate when it ingests the address.
     #[doc(hidden)]
     pub fn stamp_missing_seen(&mut self, now: u64) {
+        let addrs = self.order.clone();
+        self.stamp_missing_seen_for(&addrs, now);
+    }
+
+    /// [`Self::stamp_missing_seen`] for the rows one request returns.
+    #[doc(hidden)]
+    pub fn stamp_missing_seen_for(&mut self, addrs: &[NetAddr], now: u64) {
         let backdated = backdated_seen(now);
-        for addr in &self.order {
+        for addr in addrs {
             self.seen.entry(*addr).or_insert(backdated);
         }
     }

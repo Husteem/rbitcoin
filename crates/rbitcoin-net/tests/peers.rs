@@ -1963,6 +1963,31 @@ fn getaddr_reply_refreshes_a_held_row_after_the_interval() {
     assert_eq!(later[0].0, 1_700_021_600 - 2 * 60 * 60);
 }
 
+/// The refresh interval uses the peer's claim, not the two-hour discounted
+/// time: a 23-hour-old third-party claim is still inside Core's one-hour
+/// band, even though the stored time is 27 hours old.
+#[test]
+fn getaddr_reply_selects_the_interval_before_the_gossip_penalty() {
+    let now = 1_700_000_000u64;
+    let hub = PeerHub::new();
+    hub.set_mock_now(now);
+    hub.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+    let source = rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333)));
+    let row = |time: u32| AddrV2Message {
+        time,
+        services: ServiceFlags::NETWORK,
+        addr: rbitcoin_net::NetAddr::Ip(SocketAddr::from(([9, 9, 9, 9], 8333))).to_addrv2(),
+        port: 8333,
+    };
+    // Claim now-25h: stored now-27h after the penalty.
+    hub.learn_addrv2(source, &[row((now - 25 * 3_600) as u32)], now);
+    // Claim now-23h: online, discounted to now-25h, one hour past stored+1h.
+    hub.learn_addrv2(source, &[row((now - 23 * 3_600) as u32)], now);
+    let got = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, (now - 25 * 3_600) as u32);
+}
+
 /// A row no peer taught a time is backdated once, on its first serve, and
 /// ages from there instead of looking five days old on every reply.
 #[test]
