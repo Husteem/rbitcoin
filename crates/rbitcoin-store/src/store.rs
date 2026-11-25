@@ -1320,9 +1320,8 @@ impl Store {
         Ok(self.get_fk_by_txid_tip_height(txid)?.map(|(fk, _)| fk))
     }
 
-    /// The connected instance and its fence height: verifies each head
-    /// candidate's body txid and does one batched fence read, no body decode.
-    /// A prevout reader that needs the create height takes this once.
+    /// The newest connected instance and its fence height. Skips older head
+    /// segments after a verified match. Reads identity without decoding the body.
     pub fn get_fk_by_txid_tip_height(
         &self,
         txid: &[u8; 32],
@@ -1330,12 +1329,34 @@ impl Store {
         #[cfg(debug_assertions)]
         self.tip_txid_lookups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let fks = self.txs.fks_by_txid(txid)?;
-        let heights = self.tx_height_get_batch(&fks)?;
-        Ok(fks
-            .into_iter()
-            .zip(heights)
-            .find_map(|(fk, h)| Some((fk, h?))))
+        let connected = |matches: &[Fk], next| {
+            let fence = self.fence();
+            matches
+                .iter()
+                .copied()
+                .chain(next)
+                .find_map(|fk| Some((fk, fence.height_of(fk)?)))
+        };
+        let mut unconnected = Vec::new();
+        let mixed = self.txs.secret.mix_txid(txid);
+        let hit = self.txs.head.find_candidate(&mixed, |fk| {
+            if self.txs.body_txid(fk)? != *txid {
+                return Ok(None);
+            }
+            let hit = connected(&unconnected, Some(fk));
+            if hit.is_none() {
+                unconnected.push(fk);
+            }
+            Ok(hit)
+        })?;
+        // A newer exact match may have connected while an older probe was in IO.
+        Ok(hit.or_else(|| {
+            if unconnected.is_empty() {
+                None
+            } else {
+                connected(&unconnected, None)
+            }
+        }))
     }
 
     /// Batch head resolve for plan stamp: txid → (fk, body_range).

@@ -1899,6 +1899,7 @@ fn tip_then_any_connected_in_cold_beats_unconnected_hot() {
     use rbitcoin_store::address_head::HeadLayout;
     use rbitcoin_store::head_resolve_stats::sealed_age_for_fk;
     use rbitcoin_store::tx_table::OutputRecord;
+    use std::sync::Arc;
 
     fn put_one(s: &Store, txid: [u8; 32], lock: u32) -> Fk {
         let rec = TxRecord {
@@ -1915,8 +1916,8 @@ fn tip_then_any_connected_in_cold_beats_unconnected_hot() {
 
     let dir = tmp();
     // bits=8 → 256 slots, seal ~204 keys. Five segments ⇒ oldest age ≥4.
-    let s = Store::create_layout_with_head(StoreLayout::tiny(&dir), HeadLayout::new(8).unwrap())
-        .unwrap();
+    let layout = HeadLayout::new(8).unwrap();
+    let s = Arc::new(Store::create_layout_with_head(StoreLayout::tiny(&dir), layout).unwrap());
     let txid = [0xCDu8; 32];
     let old = put_one(&s, txid, 1);
     let n = 204u32.saturating_mul(5);
@@ -1947,14 +1948,23 @@ fn tip_then_any_connected_in_cold_beats_unconnected_hot() {
         s.txs.head.segment_count(),
         s.txs.head.sealed_segment_count()
     );
-    let new = put_one(&s, txid, 2);
+    let sealed = put_one(&s, txid, 2);
+    items.truncate(rbitcoin_store::segmented_head::max_keys_for_layout(layout) as usize);
+    for (record, _, _) in &mut items {
+        record.txid[15] = 0xef;
+    }
+    s.put_tx_full_batch_indexed(&items, true).unwrap();
+    s.txs.flush_head().unwrap();
+    let new = put_one(&s, txid, 3);
     assert_ne!(old, new);
     let first = s.txs.head.first_fks_snapshot();
     let age_old = sealed_age_for_fk(&first, old.0).unwrap();
     let age_new = sealed_age_for_fk(&first, new.0).unwrap();
+    let age_sealed = sealed_age_for_fk(&first, sealed.0).unwrap();
+    assert_eq!(age_new, 0, "newest row must be in the open tail");
     assert!(
-        age_old > age_new,
-        "old fk must be older than the new row age_old={age_old} age_new={age_new}"
+        age_old > age_sealed && age_sealed > age_new,
+        "the middle row must be in a newer sealed segment"
     );
 
     // Neither connected yet: newest unconnected row for TipThenAny.
@@ -2000,7 +2010,77 @@ fn tip_then_any_connected_in_cold_beats_unconnected_hot() {
         Some(old),
         "TipThenAny must take connected cold sibling over newer unconnected hot"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(s.get_fk_by_txid_tip_height(&[0; 32]).unwrap(), None);
+
+    #[cfg(debug_assertions)]
+    {
+        use rbitcoin_store::segmented_head::arm_sealed_tip_probe;
+
+        let arm_connect = |fk| {
+            let store = Arc::clone(&s);
+            arm_sealed_tip_probe(0, move || {
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| {
+                            store
+                                .height_fence
+                                .try_write()
+                                .expect("lookup must release the fence before probing the index")
+                                .extend(1, fk, 1);
+                        })
+                        .join()
+                        .unwrap();
+                });
+            });
+        };
+        arm_connect(new);
+        assert_eq!(
+            s.get_fk_by_txid_tip_height(&txid).unwrap(),
+            Some((new, 1)),
+            "a newly connected newer row must beat an already connected older row"
+        );
+        s.height_fence_pop_tip(Height(1));
+
+        let tail_only_txid = [0xCE; 32];
+        let tail_only = put_one(&s, tail_only_txid, 4);
+        arm_connect(tail_only);
+        assert_eq!(
+            s.get_fk_by_txid_tip_height(&tail_only_txid).unwrap(),
+            Some((tail_only, 1)),
+            "the final miss must recheck a newer row that connected during the lookup"
+        );
+        s.height_fence_pop_tip(Height(1));
+    }
+
+    // Connect all three rows. A hit in either the open tail or the newer
+    // sealed segment must skip the oldest pack, which is unreadable.
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    s.header_txs.put_range(&write, Fk(2), sealed, 1).unwrap();
+    s.header_txs.put_range(&write, Fk(3), new, 1).unwrap();
+    s.confirmed
+        .set_many(&write, &[(Height(1), Fk(2)), (Height(2), Fk(3))])
+        .unwrap();
+    s.rebuild_height_fence().unwrap();
+    let old_pack = dir.join("tx.head").join("000000.mphf");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&old_pack)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    assert_eq!(s.get_fk_by_txid_tip_height(&txid).unwrap(), Some((new, 2)));
+
+    s.height_fence_pop_tip(Height(2));
+    assert_eq!(
+        s.get_fk_by_txid_tip_height(&txid).unwrap(),
+        Some((sealed, 1)),
+        "a verified hit in a newer sealed segment must skip the unreadable oldest pack"
+    );
+    s.height_fence_pop_tip(Height(1));
+    assert!(matches!(
+        s.get_fk_by_txid_tip_height(&txid),
+        Err(StoreError::Corrupt("bdz mphf: short pread"))
+    ));
 }
 
 #[test]
