@@ -1575,6 +1575,9 @@ pub async fn run_feeler_inner(
     write_v2_msg(&mut writer, NetworkMessage::Version(version)).await?;
     loop {
         let frame = read_v2_frame(&mut reader, magic).await?;
+        if command_str(&frame.command) != "version" {
+            continue;
+        }
         let msg = frame.try_decode()?;
         if matches!(msg.payload(), NetworkMessage::Version(_)) {
             break;
@@ -1747,6 +1750,27 @@ pub async fn application_handshake<R: FrameRead, W: FrameWrite>(
     Ok(their_version)
 }
 
+fn is_pre_verack_command(cmd: &str) -> bool {
+    matches!(
+        cmd,
+        "version" | "verack" | "wtxidrelay" | "sendaddrv2" | "sendtxrcncl" | "ping"
+    )
+}
+
+fn log_non_version_before_handshake(
+    policy: &HandshakePolicy<'_>,
+    cmd12: &[u8; 12],
+) -> Result<(), NetError> {
+    if let Some(s) = policy.session {
+        rbitcoin_log::debug!(
+            P2p,
+            "{}",
+            non_version_before_handshake_log(command_str(cmd12), s.id)
+        );
+    }
+    fail_if_handshake_timed_out(policy)
+}
+
 pub async fn read_peer_version<R: FrameRead>(
     reader: &mut R,
     magic: Magic,
@@ -1754,7 +1778,11 @@ pub async fn read_peer_version<R: FrameRead>(
 ) -> Result<VersionMessage, NetError> {
     loop {
         let frame = read_handshake_frame(reader, magic, policy).await?;
-        let cmd = command_label(&frame.command);
+        let cmd12 = frame.command;
+        if !matches!(command_str(&cmd12), "version" | "verack") {
+            log_non_version_before_handshake(policy, &cmd12)?;
+            continue;
+        }
         let payload_len = frame.payload_len();
         let msg = frame.try_decode()?;
         match msg.payload() {
@@ -1778,13 +1806,7 @@ pub async fn read_peer_version<R: FrameRead>(
                 return Ok(v.clone());
             }
             NetworkMessage::Verack => return Err(NetError::Protocol("verack before version")),
-            other => {
-                if let Some(s) = policy.session {
-                    rbitcoin_log::debug!(P2p, "{}", non_version_before_handshake_log(&cmd, s.id));
-                }
-                let _ = other;
-                fail_if_handshake_timed_out(policy)?;
-            }
+            _ => log_non_version_before_handshake(policy, &cmd12)?,
         }
     }
 }
@@ -1798,9 +1820,16 @@ pub async fn wait_peer_verack<R: FrameRead>(
 ) -> Result<(), NetError> {
     loop {
         let frame = read_handshake_frame(reader, magic, policy).await?;
-        let cmd = command_label(&frame.command);
+        let cmd12 = frame.command;
+        let cmd = command_str(&cmd12);
+        if !is_pre_verack_command(cmd) {
+            if let Some(s) = policy.session {
+                rbitcoin_log::debug!(P2p, "{}", unsupported_before_verack_log(cmd, s.id));
+            }
+            continue;
+        }
         let msg = frame.try_decode()?;
-        if apply_pre_verack(policy.session, peer_version, msg.payload(), &cmd) {
+        if apply_pre_verack(policy.session, peer_version, msg.payload(), cmd) {
             return Ok(());
         }
         // The read already applied the handshake deadline. Repeating it
