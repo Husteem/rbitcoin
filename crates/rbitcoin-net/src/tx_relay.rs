@@ -1695,20 +1695,31 @@ pub struct IsolatedLapCounts {
     pub no_targets: u64,
 }
 
+/// Policy rejects that script verification raises, in the order asked.
+const UNCONFIRMED_SCRIPT_POLICIES: [&str; 3] = [
+    "legacy sighash work",
+    "OP_CODESEPARATOR",
+    "SIG_FINDANDDELETE",
+];
+
 /// Constant-scriptCode and the legacy sighash cap are policy. A consensus
 /// script failure still uses [`AcceptError::Script`].
 fn unconfirmed_script_policy(e: &rbitcoin_consensus::ConsensusError) -> Option<&'static str> {
     let rbitcoin_consensus::ConsensusError::Script(s) = e else {
         return None;
     };
-    if s.contains("legacy sighash work") {
-        Some("legacy sighash work")
-    } else if s.contains("OP_CODESEPARATOR") {
-        Some("OP_CODESEPARATOR")
-    } else if s.contains("SIG_FINDANDDELETE") {
-        Some("SIG_FINDANDDELETE")
-    } else {
-        None
+    UNCONFIRMED_SCRIPT_POLICIES
+        .into_iter()
+        .find(|policy| s.contains(policy))
+}
+
+/// The admit failed in script verification, so every earlier check passed
+/// (Core `PolicyScriptChecks`, after `PreChecks`).
+pub(crate) fn failed_in_scripts(e: &AcceptError) -> bool {
+    match e {
+        AcceptError::Script(_) => true,
+        AcceptError::Policy(p) => UNCONFIRMED_SCRIPT_POLICIES.contains(p),
+        _ => false,
     }
 }
 
@@ -7004,7 +7015,7 @@ impl MempoolHub {
     /// the pool that exceeds the count or size cap. Members share a cluster
     /// through a spend inside `txs` or a pool cluster both spend from. A
     /// member that touches neither is a cluster of its own. `txs` are the
-    /// package members that passed their own checks. One a real admit has
+    /// package members that passed their checks before scripts. One a real admit has
     /// pooled since is asked under the same read lock and counts once,
     /// through its pool cluster, so it is never reported.
     pub fn package_clusters_over_cap(&self, txs: &[bitcoin::Transaction]) -> BTreeSet<usize> {

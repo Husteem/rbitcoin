@@ -5086,8 +5086,8 @@ fn testmempoolaccept_package_applies_truc_to_an_untested_parent() {
 /// one, and both are allowed. Two children of the pooled tx make one cluster
 /// of three, and so does a chain of three that spends only a confirmed coin.
 /// Beside the two children, the unrelated tx is still allowed. As in Core,
-/// which checks the cluster only after every member's own checks, a member
-/// that fails its own check reports that and is not counted, and a member
+/// which checks the cluster after every member's checks before scripts, a
+/// member that fails such a check reports that and is not counted, and a member
 /// refused only for its cluster is still a parent: a grandchild paying more
 /// than it spends is `bad-txns-in-belowout`, not `missing-inputs`. A member
 /// already in the pool is not counted either, but the pool cluster it is in
@@ -5159,8 +5159,8 @@ fn testmempoolaccept_package_counts_each_cluster_alone() {
     let rows = test(&[&unrelated, &child, &grand, &child_of(&grand, 1_000)]);
     assert!(rows.as_array().unwrap().iter().all(over_cap), "{rows}");
     // A member whose pool parent's cluster is already at the cap is still a
-    // parent for a later member. Over `maxfeerate` it is not, as Core asks
-    // that before the cluster.
+    // parent for a later member. Over `maxfeerate` too: Core's RPC asks
+    // that only after validation, which checks the cluster first.
     let pooled_child = spend(0);
     dispatch(&ctx, "sendrawtransaction", vec![json!(hex(&pooled_child))]).unwrap();
     let member = child_of(&pooled_child, 1_000);
@@ -5169,14 +5169,75 @@ fn testmempoolaccept_package_counts_each_cluster_alone() {
     assert!(rows.as_array().unwrap().iter().all(over_cap), "{rows}");
     let hexes = json!([hex(&member), hex(&member_child)]);
     let rows = dispatch(&ctx, "testmempoolaccept", vec![hexes, json!(0.00001)]).unwrap();
-    assert_eq!(rows[0]["reject-reason"], "max-fee-exceeded", "{rows}");
-    assert_eq!(rows[1]["reject-reason"], "missing-inputs", "{rows}");
+    assert!(rows.as_array().unwrap().iter().all(over_cap), "{rows}");
     // `pooled` and `pooled_child` fill the cluster, so `spend(1)` is over
     // it alone and beside `pooled`, which is already in the pool.
     assert!(over_cap(&test(&[&spend(1)])[0]));
     let rows = test(&[&pooled, &spend(1)]);
     assert_eq!(rows[0]["reject-reason"], "txn-already-in-mempool", "{rows}");
     assert!(over_cap(&rows[1]), "{rows}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core checks a package's cluster after every member's pre-script checks
+/// and before scripts, and `testmempoolaccept` asks `maxfeerate` only after
+/// validation. So a member that fails its scripts, or is over `maxfeerate`,
+/// still fills its cluster, and every member of an over-cap cluster is
+/// `too-large-cluster`. A member that fails a pre-script check is not
+/// counted and keeps its reason. Under the cap, a member that fails its
+/// scripts says so and is no parent: its child is `missing-inputs`.
+#[test]
+fn testmempoolaccept_package_asks_the_cluster_before_scripts_and_maxfeerate() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let hex = |tx: &Transaction| rbitcoin_primitives::hex_encode(serialize(tx));
+    let (_, parent) = spend_generated_coinbase(
+        &ctx,
+        1,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let child = child_of(&parent, 1_000);
+    let grand = child_of(&child, 1_000);
+    // A spend of an `OP_0` output ends with a false top stack item, so it
+    // fails in script verification, after every earlier check.
+    let mut falsy_child = child.clone();
+    falsy_child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x00]);
+    let bad = child_of(&falsy_child, 1_000);
+    let test = |txs: &[&Transaction], params: &[Value]| {
+        let hexes: Vec<String> = txs.iter().map(|tx| hex(tx)).collect();
+        let mut all = vec![json!(hexes)];
+        all.extend_from_slice(params);
+        dispatch(&ctx, "testmempoolaccept", all).unwrap()
+    };
+    let reasons = |rows: &Value| -> Vec<String> {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["reject-reason"].as_str().unwrap_or("allowed").to_string())
+            .collect()
+    };
+    let rows = test(&[&parent, &falsy_child, &bad, &child_of(&bad, 1_000)], &[]);
+    let got = reasons(&rows);
+    assert_eq!(got[..2], ["allowed", "allowed"], "{rows}");
+    assert!(
+        got[2].starts_with("mempool-script-verify-flag-failed"),
+        "{rows}"
+    );
+    assert_eq!(got[3], "missing-inputs", "{rows}");
+    ctx.mempool
+        .as_ref()
+        .unwrap()
+        .set_cluster_limits(Some(2), None);
+    let over = vec!["too-large-cluster".to_string(); 3];
+    assert_eq!(reasons(&test(&[&parent, &falsy_child, &bad], &[])), over);
+    let low_cap = [json!(0.00001)];
+    assert_eq!(reasons(&test(&[&parent, &child, &grand], &low_cap)), over);
+    let mut overpaid = child_of(&grand, 1_000);
+    overpaid.output[0].value = grand.output[0].value + Amount::from_sat(1);
+    let got = reasons(&test(&[&parent, &child, &grand, &overpaid], &[]));
+    assert_eq!(got[..3], over[..], "{got:?}");
+    assert_eq!(got[3], "bad-txns-in-belowout", "{got:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

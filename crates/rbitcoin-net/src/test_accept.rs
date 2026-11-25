@@ -8,6 +8,7 @@ use bitcoin::{Transaction, Txid, Wtxid};
 use rbitcoin_consensus::policy::fee_exceeds_max;
 use rbitcoin_mempool::{ActiveMempool, TestedMembers, MAX_PACKAGE_WEIGHT};
 
+use crate::tx_relay::failed_in_scripts;
 use crate::{AcceptError, AcceptResult, MempoolHub};
 
 pub struct TestAcceptRow {
@@ -50,8 +51,7 @@ impl TestAcceptRow {
         )
     }
 
-    /// Whether the member passed its own checks and `maxfeerate`. Only such a
-    /// member is a parent for a later one.
+    /// Whether the row says `allowed: true`.
     fn is_allowed(&self) -> bool {
         matches!(self.verdict, TestAcceptVerdict::Allowed { .. })
     }
@@ -231,14 +231,18 @@ impl MempoolHub {
         vec![row]
     }
 
-    /// The members that pass their own checks and `maxfeerate` are the
-    /// package, and each cluster they make with the pool is checked once the
-    /// walk is done, under one read lock, as Core checks the cluster after
-    /// every member's own checks. A member of an over-cap cluster is then
-    /// `too-large-cluster`. It was still a parent for a later member, which
-    /// is in the same cluster if it spends one. A member that fails, such as
-    /// one already in the pool, is not counted; a later member that spends a
-    /// pooled one joins its pool cluster.
+    /// Core's package order, member by member. A member that passes every
+    /// check before scripts joins [`TestedMembers`], so a later member sees
+    /// it as a parent, and it counts toward its cluster even if its scripts
+    /// or `maxfeerate` then fail. Once the walk is done, each cluster those
+    /// members make with the pool is checked under one read lock, and every
+    /// member of an over-cap cluster is `too-large-cluster`: Core asks the
+    /// cluster before scripts, and `testmempoolaccept` asks `maxfeerate` only
+    /// after validation. Outside such a cluster, a member that spends one
+    /// whose row is not allowed is `missing-inputs`, as that parent would not
+    /// enter. A member that fails before scripts, such as one already in the
+    /// pool, keeps its reason and is not counted; a later member that spends
+    /// a pooled one joins its pool cluster.
     async fn test_accept_package_rows_async(
         self: &Arc<Self>,
         txs: Vec<Transaction>,
@@ -246,8 +250,8 @@ impl MempoolHub {
     ) -> Vec<TestAcceptRow> {
         let mut tested = Arc::new(TestedMembers::default());
         let mut out = Vec::with_capacity(txs.len());
-        let mut passed = Vec::new();
-        let mut passed_txs = Vec::new();
+        let mut counted = Vec::new();
+        let mut counted_txs = Vec::new();
         for (i, tx) in txs.into_iter().enumerate() {
             if submit_tx_version_nonstandard(&tx) {
                 out.push(TestAcceptRow::rejected(&tx, "version"));
@@ -256,27 +260,44 @@ impl MempoolHub {
             let outcome = self
                 .test_accept_async(tx.clone(), Some(Arc::clone(&tested)))
                 .await;
-            let row = match outcome {
+            let passed_prechecks = match &outcome {
+                Ok(_) => true,
+                Err(e) => failed_in_scripts(e),
+            };
+            out.push(match outcome {
                 Ok(r) => TestAcceptRow::admitted(&tx, &r, max_feerate_sat_kvb),
                 Err(e) => TestAcceptRow::refused(&tx, &e),
-            };
-            if row.is_allowed() {
+            });
+            if passed_prechecks {
                 Arc::make_mut(&mut tested).push(Arc::new(tx.clone()));
-                passed.push(i);
-                passed_txs.push(tx);
+                counted.push(i);
+                counted_txs.push(tx);
             }
-            out.push(row);
         }
-        if passed_txs.is_empty() {
+        if counted_txs.is_empty() {
             return out;
         }
         let hub = Arc::clone(self);
-        let (over_cap, passed_txs) = crate::reactor::off_pool(move || {
-            (hub.package_clusters_over_cap(&passed_txs), passed_txs)
+        let (over_cap, counted_txs) = crate::reactor::off_pool(move || {
+            (hub.package_clusters_over_cap(&counted_txs), counted_txs)
         })
         .await;
-        for k in over_cap {
-            out[passed[k]] = TestAcceptRow::rejected(&passed_txs[k], "too-large-cluster");
+        let mut refused: HashSet<Txid> = HashSet::new();
+        for (k, (&i, tx)) in counted.iter().zip(&counted_txs).enumerate() {
+            if over_cap.contains(&k) {
+                out[i] = TestAcceptRow::rejected(tx, "too-large-cluster");
+                continue;
+            }
+            if tx
+                .input
+                .iter()
+                .any(|inp| refused.contains(&inp.previous_output.txid))
+            {
+                out[i] = TestAcceptRow::rejected(tx, "missing-inputs");
+            }
+            if !out[i].is_allowed() {
+                refused.insert(out[i].txid);
+            }
         }
         out
     }

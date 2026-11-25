@@ -30,9 +30,12 @@ Fixed
   The cluster cap holds for each cluster a package would make with the
   mempool, and only that cluster's members are refused, with
   `reject-reason` `too-large-cluster` as a single transaction over the cap
-  gets, once that member passes its own checks, as Core asks the cluster
-  last. Only the members that pass are counted, and a member already in
-  the mempool brings its pool cluster to a later member that spends it.
+  gets, once that member passes its checks before scripts. As in Core, the
+  cluster comes before scripts and `maxfeerate`, so a member that fails
+  its scripts or is over `maxfeerate` still counts, and its over-cap
+  cluster is `too-large-cluster`. A member that fails earlier is not
+  counted, and a member already in the mempool brings its pool cluster to
+  a later member that spends it.
   It used to add every member onto every pool parent's cluster and
   give every row `package-error`, so a member that touches none of them
   failed too. Core gives every row `package-error`.

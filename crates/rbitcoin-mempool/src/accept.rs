@@ -603,13 +603,14 @@ pub struct PreparedAdmit {
     pub tested: Option<Arc<TestedMembers>>,
 }
 
-/// The members of a multi-tx `testmempoolaccept` that have passed so far.
+/// The members of a multi-tx `testmempoolaccept` so far that passed every
+/// check before scripts.
 /// A later member spends their outputs as unconfirmed parents, and none of
 /// them enters the pool, so the dry run publishes nothing and has nothing to
 /// remove.
 ///
 /// The admit leaves the cluster limit to the check after the walk, which
-/// bounds each cluster the members that passed make with the pool.
+/// bounds each cluster these members make with the pool.
 #[derive(Debug, Clone, Default)]
 pub struct TestedMembers {
     members: BTreeMap<Txid, TestedMember>,
@@ -2193,8 +2194,8 @@ impl ActiveMempool {
         // Cluster limits count raw weight (Libre): at 20 B/sigop an adjusted
         // cap would reject any tx above ~20,200 sigop cost. A package dry run
         // (tested members present) leaves the cap to the check after its
-        // walk, which counts every member that passed and asks after the
-        // member's own checks and `maxfeerate`, as Core does.
+        // walk, which counts every member that passed its checks before
+        // scripts and asks before scripts and `maxfeerate`, as Core does.
         if prep.tested.is_none() {
             let (n_members, base_w) = self
                 .graph
