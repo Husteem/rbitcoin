@@ -4,5 +4,6 @@ Security
   pool.** Esplora, Electrum, BlindBit and RPC transaction tests,
   broadcasts and packages ran their script checks on the pool block
   validation uses, with no limit beyond the listeners' request caps. They
-  now share one lane of half the script workers, so block validation
-  always keeps the rest. Peer-relayed transactions are not affected.
+  now share one lane of half the script workers, at least one, so on a
+  pool of two or more workers block validation keeps the rest.
+  Peer-relayed transactions are not affected.
