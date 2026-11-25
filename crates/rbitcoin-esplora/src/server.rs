@@ -319,11 +319,14 @@ pub fn powered_by_header() -> HeaderValue {
     .clone()
 }
 
-/// Arm the process store-read budget for this request. `spawn_join` and
-/// mempool admit then take one permit on the async task.
+/// Arm the process store-read budget and the heavy scripthash turn for this
+/// request. `spawn_join` and mempool admit then take one permit on the async
+/// task, and a heavy join waits for its turn there.
 pub async fn arm_store_budget(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let budget = st.query.api_read_budget();
-    rbitcoin_net::with_store_budget(budget, next.run(req)).await
+    let turn = std::sync::Arc::clone(&st.query.heavy_sh_join);
+    rbitcoin_net::with_heavy_turn(turn, rbitcoin_net::with_store_budget(budget, next.run(req)))
+        .await
 }
 
 pub async fn stamp_powered_by_mw(req: Request, next: Next) -> Response {
@@ -382,7 +385,7 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
         None
     } else if sh_view {
         let q = std::sync::Arc::clone(&st.query);
-        match crate::handlers::store_blocking(move || q.pin_sh_chain_view()).await {
+        match crate::handlers::store_blocking(move |_| q.pin_sh_chain_view()).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return store_err(e),
             Err(e) => {
@@ -391,7 +394,7 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
         }
     } else {
         let q = std::sync::Arc::clone(&st.query);
-        match crate::handlers::store_blocking(move || q.pin_chain_view()).await {
+        match crate::handlers::store_blocking(move |_| q.pin_chain_view()).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return store_err(e),
             Err(e) => {
@@ -417,7 +420,7 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
         return resp;
     };
     let q = std::sync::Arc::clone(&st.query);
-    match crate::handlers::store_blocking(move || view.still_live(&q)).await {
+    match crate::handlers::store_blocking(move |_| view.still_live(&q)).await {
         Ok(Ok(true)) => {
             stamp_chain_view_headers(&mut resp, &view);
             resp

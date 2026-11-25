@@ -874,8 +874,9 @@ async fn from_height_ignores_a_spend_of_another_output() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[tokio::test]
-pub async fn electrum_sh_join() {
+/// Regtest store whose OP_TRUE script has several creates (the heavy one in
+/// [`heavy_joins_take_turns`]), plus the mature coinbases it padded with.
+fn sh_join_store() -> (rbitcoin_query::testutil::TempDir, Query, Vec<bitcoin::Txid>) {
     let (dir, q) = tmp_store();
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -898,6 +899,12 @@ pub async fn electrum_sh_join() {
         prev = q.tip_header_fk().unwrap().unwrap();
     }
     stamp_follows_pending(&q, base + 3, prev, parent);
+    (dir, q, coinbase_txids)
+}
+
+#[tokio::test]
+pub async fn electrum_sh_join() {
+    let (dir, q, coinbase_txids) = sh_join_store();
     casa_cap_then_balance_history_unspent(&q);
 
     let q = Arc::new(q);
@@ -1284,5 +1291,86 @@ async fn pooled_unspendable_output_is_not_unspent() {
     assert_eq!(stats.tx_count, 1);
     assert_eq!((stats.funded_txo_count, stats.funded_txo_sum), (0, 0));
     handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A heavy join waiting for the node's one heavy turn holds neither a
+/// blocking-pool thread nor a store-read permit, so with one of each a light
+/// read from another client still answers. The heavy join answers once the
+/// turn is free.
+#[test]
+fn heavy_turn_wait_holds_no_thread_or_permit() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (dir, q, _) = sh_join_store();
+    q.set_api_read_budget(1);
+    q.set_heavy_sh_creates(1);
+    q.set_max_sh_creates(0);
+    let q = Arc::new(q);
+    rt.block_on(async {
+        let params = ChainParams::regtest();
+        let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+        let (tip_tx, _) = broadcast::channel(4);
+        let handle = run_electrum(cfg, Arc::clone(&q), params, tip_tx, None)
+            .await
+            .expect("listen");
+        let heavy = electrum_scripthash_hex(&[0x51]);
+        let light = format!("{:064x}", 0x11);
+        let turn = Arc::clone(&q.heavy_sh_join).try_acquire_owned().unwrap();
+
+        let mut waiting = TcpStream::connect(handle.local_addr).await.unwrap();
+        let mut line = serde_json::to_string(&json!({"jsonrpc":"2.0","id":1,
+            "method":"blockchain.scripthash.get_balance","params":[heavy]}))
+        .unwrap();
+        line.push('\n');
+        use tokio::io::AsyncWriteExt;
+        waiting.write_all(line.as_bytes()).await.unwrap();
+        // The heavy request has refused and gone to wait for the turn.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while q
+                .heavy_turn_refusals
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the heavy request refuses while the turn is held");
+
+        let mut other = TcpStream::connect(handle.local_addr).await.unwrap();
+        let bal = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            electrum_tcp_rpc(
+                &mut other,
+                2,
+                "blockchain.scripthash.get_balance",
+                json!([light]),
+            ),
+        )
+        .await
+        .expect("a light read must not wait behind the heavy turn");
+        assert_eq!(bal["result"]["confirmed"], 0, "{bal}");
+
+        drop(turn);
+        let mut answer = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            BufReader::new(&mut waiting).read_line(&mut answer),
+        )
+        .await
+        .expect("the heavy join answers once the turn is free")
+        .unwrap();
+        let answer: Value = serde_json::from_str(&answer).unwrap();
+        assert!(
+            answer["result"]["confirmed"].as_u64().unwrap() > 0,
+            "{answer}"
+        );
+        handle.shutdown().await;
+    });
     let _ = std::fs::remove_dir_all(&dir);
 }

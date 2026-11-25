@@ -1021,6 +1021,49 @@ async fn internal_totals_take_heavy_turns(
     );
     assert_eq!(q.sh_join_probe.peaks().1, 1, "heavy joins take turns");
     q.sh_join_probe.disarm();
+
+    // With the turn taken, each route refuses and waits on its task, then
+    // answers what it answered above: the history walk is handed back to
+    // its rerun.
+    let turn = std::sync::Arc::clone(&q.heavy_sh_join)
+        .try_acquire_owned()
+        .expect("turn free");
+    let mut waiting = Vec::new();
+    for path in [&totals, &listed] {
+        let refused = q
+            .heavy_turn_refusals
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (sock, route) = (sock.to_path_buf(), path.clone());
+        let task = tokio::spawn(async move { http_get_unix(&sock, &route).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while q
+                .heavy_turn_refusals
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == refused
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("each route refuses while the turn is held");
+        assert!(!task.is_finished(), "{path} answered with the turn held");
+        waiting.push(task);
+    }
+    drop(turn);
+    let mut after = Vec::new();
+    for task in waiting {
+        after.push(
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("heavy joins answer once the turn is free")
+                .expect("join"),
+        );
+    }
+    assert_eq!(
+        after,
+        vec![a, b],
+        "a rerun answers what an unheld run answered"
+    );
     q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
 }
 

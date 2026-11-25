@@ -279,8 +279,10 @@ for the listener idle timeout ends the response, and its body fails.
 `--heavy-sh-creates N` (conf `heavy_sh_creates=`, default **10000**, **0** off)
 lets one unpaged join with more than N creates run at a time across the
 node. One join near a raised cap of 100000 was measured at 2.1 GiB peak RSS,
-so several at once can push a small box into swap. A waiting join holds a
-blocking-pool thread; lighter joins and paged history do not wait.
+so several at once can push a small box into swap. A waiting join holds no
+blocking-pool thread and no store-read permit: it waits on its request, then
+runs again holding the turn for that whole request. Lighter joins and paged
+history do not wait.
 
 Order-of-magnitude costs (mainnet-class SSD; not a warranty):
 

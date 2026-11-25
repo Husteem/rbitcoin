@@ -1394,25 +1394,36 @@ fn spawn_dispatch(
     let reads = method_reads_store(&method);
     // The permit wait stays on this task. The blocking pool is taken only
     // after a slot is free, so a budget of 1 serializes the reads.
+    // A heavy join that finds the turn taken hands `work` back in its
+    // refused answer; the rerun picks it up there.
     tokio::spawn(async move {
-        let permit = if reads {
-            Some(
-                q.api_read_budget()
-                    .acquire_owned()
-                    .await
-                    .expect("store budget"),
-            )
-        } else {
-            None
+        let turn = Arc::clone(&q.heavy_sh_join);
+        let budget = q.api_read_budget();
+        let permit = || {
+            let budget = Arc::clone(&budget);
+            async move {
+                if reads {
+                    Some(budget.acquire_owned().await.expect("store budget"))
+                } else {
+                    None
+                }
+            }
         };
-        let joined = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let _g = BlockingRegion::enter();
-            let t0 = Instant::now();
-            let (r, work, view) =
-                dispatch_off_worker(&q, &cfg, &p, mp.as_deref(), &method, &params, work);
-            (r, work, view, t0.elapsed())
-        })
+        let mut first = Some(work);
+        let joined = rbitcoin_net::blocking_heavy_turn(
+            Some(&turn),
+            permit,
+            move |refused: Option<Dispatched>| {
+                let work = match refused {
+                    Some((_, work, _, _)) => work,
+                    None => first.take().expect("first run takes the connection"),
+                };
+                let t0 = Instant::now();
+                let (r, work, view) =
+                    dispatch_off_worker(&q, &cfg, &p, mp.as_deref(), &method, &params, work);
+                (r, work, view, t0.elapsed())
+            },
+        )
         .await;
         rbitcoin_net::finish_join(joined, "electrum dispatch join")
     })
@@ -1420,22 +1431,18 @@ fn spawn_dispatch(
 
 /// Wait for one store-read permit on this task, then run `f` on the blocking
 /// pool. The permit stays inside `f` until the walk returns, so a waiter does
-/// not occupy a pool thread.
+/// not occupy a pool thread. A heavy join waits for its turn the same way
+/// ([`rbitcoin_net::blocking_heavy_turn`]), so `f` may run twice.
 async fn budgeted_blocking<T: Send + 'static>(
     query: &Query,
-    f: impl FnOnce() -> T + Send + 'static,
+    mut f: impl FnMut() -> T + Send + 'static,
 ) -> Result<T, tokio::task::JoinError> {
-    let permit = query
-        .api_read_budget()
-        .acquire_owned()
-        .await
-        .expect("store budget");
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let _g = BlockingRegion::enter();
-        f()
-    })
-    .await
+    let budget = query.api_read_budget();
+    let permit = || {
+        let budget = Arc::clone(&budget);
+        async move { Some(budget.acquire_owned().await.expect("store budget")) }
+    };
+    rbitcoin_net::blocking_heavy_turn(Some(&query.heavy_sh_join), permit, move |_| f()).await
 }
 
 /// The blocking half of a request, run with `work` moved in and handed back.
@@ -1884,7 +1891,7 @@ pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
     let q = Arc::clone(query);
     let looked = budgeted_blocking(query, move || {
         let mut out = Vec::with_capacity(outpoints.len());
-        for (txid, vout) in outpoints {
+        for &(txid, vout) in &outpoints {
             let params = json!([txid_hex(&txid), vout]);
             if let Ok(status) = outpoint_status(&q, mempool.as_deref(), &params) {
                 out.push((txid, vout, status));
@@ -1940,7 +1947,7 @@ async fn pool_spender_changed(
     }
     budgeted_blocking(query, move || {
         use bitcoin::hashes::Hash;
-        sent.into_iter()
+        sent.iter()
             .filter(|((txid, vout), was)| {
                 let now = mp.spending_txid(&bitcoin::OutPoint {
                     txid: bitcoin::Txid::from_byte_array(*txid),
@@ -1948,7 +1955,7 @@ async fn pool_spender_changed(
                 });
                 now.map(|t| t.to_string()) != *was
             })
-            .map(|(op, _)| op)
+            .map(|(op, _)| *op)
             .collect()
     })
     .await
@@ -2268,7 +2275,7 @@ async fn run_sp_scan(
         };
         let (q, c, piece) = (Arc::clone(&query), Arc::clone(&chain), sub.clone());
         let outcome = budgeted_blocking(&query, move || {
-            let _sp = permit;
+            let _sp = &permit;
             crate::silent_scan::scan_hits(&q, &c, &piece, from, end)
         })
         .await

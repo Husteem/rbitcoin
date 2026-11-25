@@ -117,9 +117,9 @@ pub use rbitcoin_mempool::{
     RemovalReason, RemovedRow, RemovedRows, SelectBudget, Selected, UtxoProvider,
 };
 pub use reactor::{
-    acquire_armed_store_budget, finish_join, hold_store_permit, is_join_error, off_pool,
-    off_pool_budgeted, release_store_permit, spawn_with_store_budget, with_store_budget,
-    BlockingRegion, StorePermitGuard,
+    acquire_armed_store_budget, armed_blocking, blocking_heavy_turn, finish_join,
+    hold_store_permit, is_join_error, off_pool, off_pool_budgeted, release_store_permit,
+    spawn_with_store_budget, with_heavy_turn, with_store_budget, BlockingRegion, StorePermitGuard,
 };
 #[cfg(debug_assertions)]
 pub use reactor::{with_store_budget_waiters, StoreBudgetWait};
