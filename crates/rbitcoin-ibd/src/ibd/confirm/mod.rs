@@ -2435,15 +2435,12 @@ pub fn spawn_confirm_engine(
                     debug!(Ibd,
                         "confirm write drop stale batch first={first_h} (tip moved)"
                     );
-                    settle_failed_write(
-                        &hub_wb,
-                        &feed_wb,
-                        &event_tx_wb,
-                        &heights_hashes,
-                        &wire_sizes,
-                        batch_epoch,
-                        &loop_stats_wb,
-                        &accepted_wb,
+                    // This batch never reached the write, so a connected
+                    // height was accepted by another batch that already sent
+                    // its event. Release the claim without a second Accepted.
+                    feed_wb.finish_stale_plan(
+                        heights_hashes.iter().map(|(h, _)| *h),
+                        Some(batch_epoch),
                     );
                     continue;
                 }
