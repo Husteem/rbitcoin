@@ -1583,6 +1583,7 @@ async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
         format!("/tx/{cb}/outspend/0"),
         format!("/tx/{cb}/outspends"),
         format!("/scripthash/{sh}/utxo"),
+        format!("/scripthash/{sh}"),
     ];
 
     let hold = pad.hub.template_hold();
@@ -1591,10 +1592,18 @@ async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
         assert_eq!((st, body.as_str()), (503, "chain view moved"), "{path}");
     }
     drop(hold);
-    for path in &routes {
-        let (st, body) = http_get(pad.addr, path).await;
-        assert_eq!(st, 200, "{path}: {body}");
-    }
+    let (st, body) = http_get(pad.addr, &routes[0]).await;
+    assert_eq!((st, body.as_str()), (200, r#"{"spent":false}"#));
+    let (st, body) = http_get(pad.addr, &routes[2]).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains(&cb), "the coin is back: {body}");
+
+    pad.hub.admit(&tx).expect("the spend re-enters the pool");
+    let (st, body) = http_get(pad.addr, &routes[0]).await;
+    assert_eq!(st, 200, "{body}");
+    let slot: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(slot["spent"], true, "{body}");
+    assert_eq!(slot["status"]["confirmed"], false, "{body}");
 
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

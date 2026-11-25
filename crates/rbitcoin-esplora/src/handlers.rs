@@ -1279,6 +1279,7 @@ pub fn sh_stats_json(
     asof: Option<[u8; 32]>,
     client: Option<&str>,
 ) -> Result<(Value, Option<rbitcoin_query::ChainView>), Response> {
+    let settle0 = crate::tx_json::pool_settle(st.mempool.as_deref());
     let (chain, view) = sh_at_view(
         st,
         sh,
@@ -1321,6 +1322,11 @@ pub fn sh_stats_json(
     } else {
         zeros
     };
+    // A funded script may hold a coin whose spend is re-entering the pool
+    // ([`crate::tx_json::require_settled`]).
+    if asof.is_none() && chain.funded_txo_count > 0 {
+        crate::tx_json::require_settled(st.mempool.as_deref(), settle0).map_err(store_err)?;
+    }
     let mut obj = json!({
         "chain_stats": chain_stats,
         "mempool_stats": mempool_stats,

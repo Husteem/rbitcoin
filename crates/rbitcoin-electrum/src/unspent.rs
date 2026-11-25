@@ -105,7 +105,8 @@ fn pays_coin_to(o: &bitcoin::TxOut, sh: &[u8; 32]) -> bool {
     script_hash(script) == *sh && !rbitcoin_consensus::policy::is_unspendable(script)
 }
 
-/// Esplora `mempool_stats` for a scripthash (same funding/spend loops as listunspent).
+/// Esplora `mempool_stats` for a scripthash (the funding/spend loops of
+/// [`overlay_mempool_utxos`]; the settle check is the caller's).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MempoolShStats {
     pub tx_count: u32,

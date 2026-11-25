@@ -3475,6 +3475,7 @@ fn dispatch_method(
                 take_trailing_asof(method, params)?
             };
             let sh = param_scripthash(&params, 0)?;
+            let settle0 = rbitcoin_net::pool_settle(mempool);
             let mut b = sh_at_view(
                 query,
                 pinned,
@@ -3499,6 +3500,11 @@ fn dispatch_method(
                     b.unconfirmed = mp
                         .scripthash_unconfirmed_delta(&sh)
                         .map_err(|e| e.to_string())?;
+                }
+                // A coin whose spend is re-entering the pool counts as
+                // confirmed and no delta takes it off.
+                if b.confirmed != 0 || b.unconfirmed != 0 {
+                    rbitcoin_net::require_settled(mempool, settle0).map_err(|e| e.to_string())?;
                 }
             }
             Ok(json!({"confirmed": b.confirmed, "unconfirmed": b.unconfirmed}))
@@ -3836,6 +3842,7 @@ pub fn outpoint_status(
     params: &Value,
 ) -> Result<Value, String> {
     let (txid, vout) = param_outpoint(params)?;
+    let settle0 = rbitcoin_net::pool_settle(mempool);
     outpoint_read_step(query, OutpointReadStep::StatusStart)?;
     // A confirmed spend reports the spending block's height, not the tip's:
     // the status then holds until a block touches the outpoint, which is
@@ -3881,6 +3888,8 @@ pub fn outpoint_status(
             }));
         }
     }
+    // A spend that a disconnect took out may not be back in the pool yet.
+    rbitcoin_net::require_settled(mempool, settle0).map_err(|e| e.to_string())?;
     Ok(json!({
         "txid": txid_hex(&txid),
         "vout": vout,
