@@ -2602,6 +2602,12 @@ async fn tip_after_a_lag_restatuses_every_outpoint() {
     );
     let push = pad.read().await;
     assert_eq!(push["params"][0]["height"], 2, "{push}");
+    // The queued events are below the tip the lag restatused at: they push
+    // their headers and nothing else.
+    for h in 3..=5 {
+        let push = pad.read().await;
+        assert_eq!(push["params"][0]["height"], h, "{push}");
+    }
     let _ = std::fs::remove_dir_all(&pad.dir);
 }
 

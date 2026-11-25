@@ -1822,7 +1822,10 @@ async fn on_tip_notes<W: AsyncWrite + Unpin>(
     // A status that could not be read keeps the watermark back: the next
     // tip restatuses everything.
     let mut read_all = true;
-    if !conn.outpoint_subs.is_empty() {
+    // A queued plain event at or below the height every outpoint was last
+    // restatused at (a lag already caught up past it) changes none of them.
+    let stale = t.reorg_from_height.is_none() && conn.outpoint_tip.is_some_and(|h| t.height <= h);
+    if !conn.outpoint_subs.is_empty() && !stale {
         // The next block: only the outpoints it creates or spends. A reorg,
         // a gap, or a block that cannot be read restatuses every
         // subscription.
@@ -1854,7 +1857,9 @@ async fn on_tip_notes<W: AsyncWrite + Unpin>(
                     .await?;
         }
     }
-    conn.outpoint_tip = read_all.then_some(t.height);
+    if !stale {
+        conn.outpoint_tip = read_all.then_some(t.height);
+    }
     restart_sp_scans_after_reorg(&mut conn.sp_scans, query, params, t);
     emit_sp_tips(writer, query, params, conn, t).await?;
     if !conn.sh_subs.is_empty() {
