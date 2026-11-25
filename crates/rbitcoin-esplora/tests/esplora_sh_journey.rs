@@ -368,6 +368,105 @@ async fn template_cached_until_tip_moves(q: Arc<Query>, prev: Fk, parent: [u8; 3
     handle.shutdown().await;
 }
 
+/// Core `getblocktemplate` reuse: a mempool change within 5 s keeps the
+/// cached template. Concurrent misses share one build instead of each
+/// running their own.
+async fn template_build_is_shared_and_keeps_through_pool_churn() {
+    let (dir, q) = temp_query("gbt-shared");
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let q = Arc::new(q);
+    let mp_dir = dir.join("mp");
+    let mp = Arc::new(rbitcoin_net::MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap());
+    let calls = Arc::new(AtomicU64::new(0));
+    let c = Arc::clone(&calls);
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.block_template = Some(BlockTemplateFn(Arc::new(move || {
+        let n = c.fetch_add(1, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        Ok(json!({"height": 1, "rules": ["segwit"], "gen": n}))
+    })));
+    let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&mp)))
+        .await
+        .expect("listen");
+    let addr = handle.local_addr;
+    let gets: Vec<_> = (0..8)
+        .map(|_| tokio::spawn(async move { http_get(addr, "/block-template").await }))
+        .collect();
+    for g in gets {
+        let (st, body) = g.await.unwrap();
+        assert_eq!(st, 200, "{body}");
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "concurrent misses share one build");
+    mp.note_template_update();
+    let (st, body) = http_get(addr, "/block-template").await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "a pool change within 5 s keeps the template"
+    );
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A miss that waits for another request's build holds no store permit,
+/// so a store read is served meanwhile. The builder drops its own permit
+/// before selection, as the node's does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn template_waiter_holds_no_store_permit() {
+    let (dir, q) = temp_query("gbt-waiter");
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    q.set_api_read_budget(1);
+    let q = Arc::new(q);
+    let mp = Arc::new(rbitcoin_net::MempoolHub::open(dir.join("mp"), Arc::clone(&q)).unwrap());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let (s, g) = (Arc::clone(&started), Arc::clone(&gate));
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.block_template = Some(BlockTemplateFn(Arc::new(move || {
+        rbitcoin_net::release_store_permit();
+        s.notify_one();
+        let (open, cv) = &*g;
+        let mut open = open.lock().unwrap();
+        while !*open {
+            open = cv.wait(open).unwrap();
+        }
+        Ok(json!({"height": 1}))
+    })));
+    let handle = run_esplora(cfg, Arc::clone(&q), Some(Arc::clone(&mp)))
+        .await
+        .expect("listen");
+    let addr = handle.local_addr;
+    let leader = tokio::spawn(async move { http_get(addr, "/block-template").await });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("the first request builds");
+    let waiter = tokio::spawn(async move { http_get(addr, "/block-template").await });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handle.admit.holding() < 2 {
+        assert!(Instant::now() < deadline, "the second request was not admitted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Let the waiter reach the build lock.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let read = tokio::time::timeout(Duration::from_secs(3), http_get(addr, "/blocks")).await;
+    {
+        let (open, cv) = &*gate;
+        *open.lock().unwrap() = true;
+        cv.notify_all();
+    }
+    let (st, body) = read.expect("a store read waited behind a template waiter");
+    assert_eq!(st, 200, "{body}");
+    for r in [leader, waiter] {
+        let (st, body) = r.await.unwrap();
+        assert_eq!(st, 200, "{body}");
+    }
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 async fn template_missing_tip_or_knob() {
     let (dir, empty) = temp_query("gbt-notip");
     let mut cfg = EsploraConfig::new("127.0.0.1:0".parse().unwrap());
@@ -578,5 +677,6 @@ async fn esplora_sh_join_and_template() {
     untrusted_header_is_ignored(Arc::clone(&q), sh1).await;
     template_cached_until_tip_moves(q, prev, h2.hash).await;
     template_missing_tip_or_knob().await;
+    template_build_is_shared_and_keeps_through_pool_churn().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

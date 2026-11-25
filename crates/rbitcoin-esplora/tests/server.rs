@@ -937,6 +937,7 @@ fn join_only_state(q: Arc<Query>, cache: Arc<Mutex<JoinCache>>) -> AppState {
         join_header_trusted: true,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(tokio::sync::Mutex::new(())),
         send_stall: Duration::from_secs(120),
     }
 }
@@ -1263,6 +1264,7 @@ fn app_with_join(q: Arc<Query>, cache: Arc<Mutex<JoinCache>>, trusted: bool) -> 
         join_header_trusted: trusted,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(tokio::sync::Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     Router::new()
@@ -1417,6 +1419,7 @@ async fn address_without_sh_index_is_503_disabled() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(tokio::sync::Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     let app = Router::new()
@@ -1463,6 +1466,7 @@ async fn http_503_chain_view_moved_omits_tip_header() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(tokio::sync::Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     async fn die_tip(State(st): State<AppState>) -> &'static str {
@@ -1520,6 +1524,7 @@ async fn asof_of_a_moved_view_is_404() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(tokio::sync::Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     async fn pin_then_move(State(st): State<AppState>, AsOf(asof): AsOf) -> Response {
@@ -1571,6 +1576,7 @@ async fn body_at_max_is_not_413_and_300_slots_fit() {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(tokio::sync::Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     let at = Bytes::new();
@@ -2338,6 +2344,56 @@ async fn esplora_blocks_waits_on_the_store_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core `getblocktemplate` reuse: on the same tip, a template at least 5 s
+/// old is rebuilt for a mempool change within the 15 s TTL. The journey
+/// `template_build_is_shared_and_keeps_through_pool_churn` covers the
+/// younger template that survives one.
+#[tokio::test]
+async fn block_template_rebuilds_for_pool_churn_after_5s() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("gbt-5s").expect("dir");
+    let q = Arc::new(Query::open_or_create_tiny(dir.path().join("store")).unwrap());
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let tip = q.header_at_height(Height(0)).unwrap().unwrap().1.hash;
+    let mp = rbitcoin_net::MempoolHub::open(dir.path().join("mempool"), Arc::clone(&q)).unwrap();
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_fn = Arc::clone(&calls);
+    let st = AppState {
+        query: Arc::clone(&q),
+        network: Network::Regtest,
+        mempool: Some(Arc::clone(&mp)),
+        max_body: 1 << 20,
+        sh_join: Arc::new(Mutex::new(JoinCache::default())),
+        join_header_trusted: false,
+        block_template: Some(BlockTemplateFn(Arc::new(move || {
+            calls_fn.fetch_add(1, Ordering::Relaxed);
+            Ok(json!({"height": 1}))
+        }))),
+        gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(tokio::sync::Mutex::new(())),
+        send_stall: Duration::from_secs(120),
+    };
+    let updates = mp.template_updates();
+    mp.note_template_update();
+    *st.gbt_cache.lock().unwrap() = Some(GbtCache {
+        at: std::time::Instant::now() - Duration::from_secs(6),
+        tip,
+        updates,
+        body: Arc::new(json!({"height": 1})),
+    });
+    let app = Router::new()
+        .route("/block-template", get(handlers::block_template))
+        .with_state(st);
+    let (status, body) = oneshot_http(&app, get_with_client("/block-template", "c1")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "a 6 s old template after a pool change"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The 15s cache mutex is not held while `template_prev` waits on connect.
 #[tokio::test]
 async fn block_template_does_not_lock_the_cache_across_template_prev() {
@@ -2381,6 +2437,7 @@ async fn block_template_does_not_lock_the_cache_across_template_prev() {
             Ok(json!({"height": 1}))
         }))),
         gbt_cache: Arc::new(Mutex::new(None)),
+        gbt_build: Arc::new(tokio::sync::Mutex::new(())),
         send_stall: Duration::from_secs(120),
     };
     let cache = Arc::clone(&st.gbt_cache);
