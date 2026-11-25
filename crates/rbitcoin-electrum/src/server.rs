@@ -653,8 +653,9 @@ where
                         // last tip this session handled is gone.
                         let q = Arc::clone(&query);
                         let fork_floor = sp_fork_floor(&conn);
+                        let sp_top = sp_scanned_top(&conn);
                         let last = conn.last_tip;
-                        let lagged = budgeted_blocking(&query, move || lagged_tip(&q, last, fork_floor))
+                        let lagged = budgeted_blocking(&query, move || lagged_tip(&q, last, fork_floor, sp_top))
                             .await
                             .ok()
                             .flatten();
@@ -1903,15 +1904,23 @@ fn sp_fork_floor(conn: &ElectrumConn) -> Option<u32> {
     live.chain(scans).min()
 }
 
+/// The highest height a live silent-payment subscription has scanned.
+fn sp_scanned_top(conn: &ElectrumConn) -> Option<u32> {
+    conn.sp_subs.iter().map(|l| l.through).max()
+}
+
 /// A tip event for the store's tip after the channel lagged. When `last`
 /// (the last tip this session handled) is still on the chain the lost events
-/// only extended it. Otherwise one was a reorg: the event forks
-/// [`LAG_REORG_DEPTH`] below the lowest silent-payment height (or the last
-/// tip), so those scans start again there. `None` without a tip.
+/// only extended it, unless a silent-payment scan already reached past it
+/// (`sp_top`): no handled event checked those heights, so the event forks at
+/// `last` and they are scanned again. Otherwise one was a reorg: the event
+/// forks [`LAG_REORG_DEPTH`] below the lowest silent-payment height (or the
+/// last tip), so those scans start again there. `None` without a tip.
 fn lagged_tip(
     query: &Query,
     last: Option<(u32, [u8; 32])>,
     sp_floor: Option<u32>,
+    sp_top: Option<u32>,
 ) -> Option<TipNotify> {
     use bitcoin::hashes::Hash;
     let tip = query.tip_height()?;
@@ -1922,16 +1931,21 @@ fn lagged_tip(
                 .wire_header_at_height(Height(height))
                 .is_ok_and(|h| h.block_hash().to_byte_array() == hash)
     });
-    let reorg_from_height = (!kept).then(|| {
-        let below = sp_floor
-            .or(last.map(|(h, _)| h))
-            .unwrap_or(tip.0)
-            .min(tip.0);
-        let fork = below.saturating_sub(LAG_REORG_DEPTH);
-        rbitcoin_log::info!(
+    let unchecked_above = last
+        .filter(|(height, _)| kept && sp_top.is_some_and(|top| top > *height))
+        .map(|(height, _)| height);
+    let reorg_from_height = unchecked_above.or_else(|| {
+        (!kept).then(|| {
+            let below = sp_floor
+                .or(last.map(|(h, _)| h))
+                .unwrap_or(tip.0)
+                .min(tip.0);
+            let fork = below.saturating_sub(LAG_REORG_DEPTH);
+            rbitcoin_log::info!(
             "electrum: tip events lagged past a replaced tip; treating it as a reorg from {fork}"
         );
-        fork
+            fork
+        })
     });
     Some(TipNotify {
         height: tip.0,

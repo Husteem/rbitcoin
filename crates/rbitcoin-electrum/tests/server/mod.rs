@@ -4792,6 +4792,40 @@ async fn sp_lagged_tip_events_rescan_below_a_replaced_tip() {
     );
 }
 
+/// A live subscription can scan past the last tip event the session handled
+/// (its history scan reads the store's tip). A lag whose last handled tip is
+/// still on the chain did not check the heights above it, so those are
+/// scanned again: a reorg there may be among the lost events.
+#[tokio::test]
+async fn sp_lag_rescans_above_the_last_handled_tip() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-lag-above", 10, &[9]);
+    let mut s = sp_session(&chain.q);
+    let reply = s.ask(&[sp_subscribe_line(1, chain.sub(json!(0)))]).await;
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(sp_heights(&history), [9]);
+
+    // The session handles a tip event for 5, below what the scan reached.
+    let at = |h: u32| TipNotify {
+        height: h,
+        header_hex: header_hex(&chain.q.wire_header_at_height(Height(h)).unwrap()),
+        reorg_from_height: None,
+    };
+    s.tip_tx.send(at(5)).unwrap();
+    s.assert_quiet(2).await;
+    for _ in 0..12 {
+        s.tip_tx.send(at(5)).unwrap();
+    }
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(
+        sp_heights(&history),
+        [9],
+        "heights above the last tip are scanned again"
+    );
+    s.assert_quiet(3).await;
+}
+
 /// A range scan cut short by a reorg ends at the new tip. Blocks that
 /// connect inside the range before that scan finishes had no live
 /// subscription to notify, so the finishing step reads them.
