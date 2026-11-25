@@ -3145,6 +3145,71 @@ fn a_stale_load_batch_releases_its_lead_reservation() {
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(40));
 }
 
+/// A failed write can leave a connected height in the batch. That height
+/// still sends Accepted and keeps its reservation; only the unwritten ones
+/// are released.
+#[test]
+fn a_failed_write_sends_accepted_for_committed_heights_only() {
+    use rbitcoin_ibd::ibd::confirm::{settle_failed_write, take_unproven_lead, ConfirmEvent};
+    use rbitcoin_ibd::ibd::status::LoopStats;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::mpsc;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("failed-write-settle");
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().unwrap();
+    let missing = BlockHash::from_byte_array([0x55; 32]);
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(80));
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[40, 40]), vec![2, 3]),
+        vec![2, 3]
+    );
+    {
+        let mut g = feed.inner.lock().unwrap();
+        g.inflight.insert(2);
+        g.inflight.insert(3);
+        g.claimed_epoch.insert(2, feed.epoch());
+        g.claimed_epoch.insert(3, feed.epoch());
+    }
+    let (tx, rx) = mpsc::channel();
+    let stats = LoopStats::default();
+    let accepted = AtomicU32::new(0);
+    settle_failed_write(
+        &hub,
+        &feed,
+        &tx,
+        &[(2, missing.to_byte_array()), (3, genesis.to_byte_array())],
+        &[12, 34],
+        &stats,
+        &accepted,
+    );
+    match rx.try_recv() {
+        Ok(ConfirmEvent::Accepted {
+            hash,
+            height,
+            wire_bytes,
+        }) => {
+            assert_eq!(hash, genesis);
+            assert_eq!(height, 3);
+            assert_eq!(wire_bytes, 34);
+        }
+        _ => panic!("expected Accepted for the committed height"),
+    }
+    assert!(rx.try_recv().is_err(), "the unwritten height has no event");
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let g = feed.inner.lock().unwrap();
+    assert!(
+        !g.lead_reserved.contains_key(&2),
+        "the unwritten height gives its bytes back"
+    );
+    assert!(
+        g.lead_reserved.contains_key(&3),
+        "the committed height keeps its reservation for Accepted"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A load failure can clear the feed before Accepted is drained. Bytes for a
 /// block already at the tip stay reserved. Bytes above the tip come back.
 #[test]

@@ -2238,6 +2238,36 @@ pub fn write_batch_is_stale_plan(hub: &ChainHub, feed: &ConfirmFeed, first_h: u3
     write_batch_is_stale(hub, first_h) || feed.plan_epoch_stale(first_h)
 }
 
+/// A failed write can have connected part of its batch. Send `Accepted` for a
+/// height already in the store so the walk charges it and the accept arm
+/// releases its reservation; release the rest now because no event follows.
+#[doc(hidden)]
+pub fn settle_failed_write(
+    hub: &ChainHub,
+    feed: &ConfirmFeed,
+    event_tx: &std::sync::mpsc::Sender<ConfirmEvent>,
+    heights_hashes: &[(u32, [u8; 32])],
+    wire_sizes: &[u64],
+    loop_stats: &LoopStats,
+    accepted: &AtomicU32,
+) {
+    for (index, &(height, raw)) in heights_hashes.iter().enumerate() {
+        let hash = BlockHash::from_byte_array(raw);
+        if hub.has_block(&hash) {
+            loop_stats.confirm_blocks.fetch_add(1, Ordering::Relaxed);
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let _ = event_tx.send(ConfirmEvent::Accepted {
+                hash,
+                height,
+                wire_bytes: accepted_block_wire(wire_sizes, index),
+            });
+        } else {
+            feed.release_lead_reserve(height);
+        }
+    }
+    feed.finish(heights_hashes.iter().map(|(h, _)| *h));
+}
+
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
 ///
 /// Lookup (BQ-ahead TipOnly `head_fk`) ∥ load (claim resolve-complete + stamp
@@ -2503,7 +2533,15 @@ pub fn spawn_confirm_engine(
                             debug!(Ibd,
                                 "confirm write drop stale batch first={height} ({msg})"
                             );
-                            feed_wb.finish_stale_plan(heights_hashes.iter().map(|(h, _)| *h));
+                            settle_failed_write(
+                                &hub_wb,
+                                &feed_wb,
+                                &event_tx_wb,
+                                &heights_hashes,
+                                &wire_sizes,
+                                &loop_stats_wb,
+                                &accepted_wb,
+                            );
                             continue;
                         }
                         let spent_connected = msg.contains("prevout already spent")
@@ -2515,24 +2553,15 @@ pub fn spawn_confirm_engine(
                             debug!(Ibd,
                                 "confirm write skip already-committed @{height} ({msg})"
                             );
-                            for (index, (ht, raw)) in heights_hashes.iter().enumerate() {
-                                let h = BlockHash::from_byte_array(*raw);
-                                if hub_wb.has_block(&h) {
-                                    loop_stats_wb
-                                        .confirm_blocks
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    accepted_wb.fetch_add(1, Ordering::SeqCst);
-                                    let _ = event_tx_wb.send(ConfirmEvent::Accepted {
-                                        hash: h,
-                                        height: *ht,
-                                        wire_bytes: accepted_block_wire(&wire_sizes, index),
-                                    });
-                                } else {
-                                    // No Accepted event will release this height.
-                                    feed_wb.release_lead_reserve(*ht);
-                                }
-                            }
-                            feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                            settle_failed_write(
+                                &hub_wb,
+                                &feed_wb,
+                                &event_tx_wb,
+                                &heights_hashes,
+                                &wire_sizes,
+                                &loop_stats_wb,
+                                &accepted_wb,
+                            );
                             continue;
                         }
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
