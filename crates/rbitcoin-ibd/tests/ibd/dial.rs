@@ -185,6 +185,7 @@ fn onion_dial_failure_is_excluded_until_cooldown_expires() {
         &mut cooldown,
         &mut strikes,
         now,
+        1_700_000_000,
     );
     assert!(dial_blocked_addrs(&[], &cooldown, now).contains(&onion));
     expire_addr_cooldown(
@@ -231,6 +232,7 @@ fn strike_history_is_reclaimed_after_addrman_eviction_and_cooldown_expiry() {
         &mut cooldown,
         &mut strikes,
         now,
+        1_700_000_000,
     );
     for identity in &identities[..2] {
         book.evict_one(*identity);
@@ -275,6 +277,7 @@ fn strike_history_is_reclaimed_after_addrman_eviction_and_cooldown_expiry() {
         &mut cooldown,
         &mut strikes,
         now + STALL_ADDR_COOLDOWN,
+        1_700_000_000,
     );
     assert_eq!(strikes.get(&identities[2]), Some(&2));
     assert!(!cooldown.contains_key(&identities[2]));
@@ -354,6 +357,7 @@ fn cooldown_selection_and_successful_redial_preserve_network_identity() {
             &mut cooldown,
             &mut strikes,
             now,
+            1_700_000_000,
         );
         assert_eq!(dial_blocked_addrs(&[], &cooldown, now), HashSet::from([a]));
         assert_eq!(
@@ -608,7 +612,7 @@ fn dial_blocked_and_cooldown_expiry() {
 fn handshake_then_die_is_failed_and_cooled() {
     let mut book = AddrMan::new();
     let lemon = addr(4);
-    book.note_connected_addr(rbitcoin_net::NetAddr::from_socket(lemon));
+    book.note_connected_addr(rbitcoin_net::NetAddr::from_socket(lemon), 1_700_000_000);
     let mut cooldown = HashMap::new();
     let now = Instant::now();
     note_dead_without_block_bytes(
@@ -628,7 +632,7 @@ fn handshake_then_die_is_failed_and_cooled() {
     assert!(blocked.contains(&rbitcoin_net::NetAddr::Ip(lemon)));
 
     let good = addr(5);
-    book.note_connected_addr(rbitcoin_net::NetAddr::from_socket(good));
+    book.note_connected_addr(rbitcoin_net::NetAddr::from_socket(good), 1_700_000_000);
     note_dead_without_block_bytes(
         &mut book,
         &mut cooldown,
@@ -647,7 +651,7 @@ fn handshake_then_die_is_failed_and_cooled() {
 fn misbehavior_dead_cools_after_a_block_body() {
     let mut book = AddrMan::new();
     let lemon = addr(6);
-    book.note_connected_addr(rbitcoin_net::NetAddr::from_socket(lemon));
+    book.note_connected_addr(rbitcoin_net::NetAddr::from_socket(lemon), 1_700_000_000);
     let mut cooldown = HashMap::new();
     let now = Instant::now();
     note_misbehavior_dead(
@@ -846,7 +850,14 @@ fn apply_dial_result_updates_book() {
     let now = Instant::now();
     let mut cooldown = HashMap::new();
     let mut strikes = HashMap::new();
-    apply_dial_result(&mut book, &result, &mut cooldown, &mut strikes, now);
+    apply_dial_result(
+        &mut book,
+        &result,
+        &mut cooldown,
+        &mut strikes,
+        now,
+        1_700_000_000,
+    );
     assert!(book.flags(&good).has_connected());
     assert!(book.flags(&bad).failed_last_connect());
     assert!(book.flags(&inc).is_incompatible());
@@ -861,7 +872,14 @@ fn apply_dial_result_updates_book() {
         !cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(inc)),
         "incompatible is last-resort, not a stall ban"
     );
-    apply_dial_result(&mut book, &result, &mut cooldown, &mut strikes, now);
+    apply_dial_result(
+        &mut book,
+        &result,
+        &mut cooldown,
+        &mut strikes,
+        now,
+        1_700_000_000,
+    );
     assert_eq!(
         cooldown
             .get(&rbitcoin_net::NetAddr::from_socket(bad))

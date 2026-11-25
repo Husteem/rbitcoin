@@ -666,6 +666,7 @@ pub async fn ibd_cancellable(
             &mut boot_cooldown,
             &mut boot_strikes,
             Instant::now(),
+            hub.clock.now_secs(),
         );
         tried.extend(wave.attempted.iter().copied());
         let mut slots = wave.slots;
@@ -1114,6 +1115,7 @@ pub async fn ibd_cancellable(
                         &mut st.addr_cooldown,
                         &mut st.addr_strikes,
                         Instant::now(),
+                        hub.clock.now_secs(),
                     );
                     let blocked = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
                     let mut n = 0usize;

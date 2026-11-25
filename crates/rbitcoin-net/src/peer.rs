@@ -4547,7 +4547,17 @@ pub fn on_addrv2(
             // Node time, as the bucket's start (`connected_at`) is.
             let now = s.clock_now();
             let allow = s.take_addr_tokens(list.len(), now.saturating_mul(1000));
-            ph.learn_addrv2(s.net, &list[..allow], now);
+            // One sanitized copy for the book and the relay, as Core
+            // `ProcessAddrs` rewrites an insane time before `RelayAddress`.
+            let rows: Vec<bitcoin::p2p::address::AddrV2Message> = list[..allow]
+                .iter()
+                .map(|a| {
+                    let mut a = a.clone();
+                    a.time = crate::seeds::learned_addr_time(a.time, now);
+                    a
+                })
+                .collect();
+            ph.learn_addrv2(s.net, &rows, now);
             let mut neighbors: Vec<_> = ph
                 .live_peers()
                 .into_iter()
@@ -4559,7 +4569,7 @@ pub fn on_addrv2(
             let own = ph.own_addrs();
             let mut batches: Vec<Vec<bitcoin::p2p::address::AddrV2Message>> =
                 vec![Vec::new(); neighbors.len()];
-            for addr in list.iter().take(allow) {
+            for addr in &rows {
                 if crate::netaddr::addrv2_skip_relay(addr) {
                     continue;
                 }

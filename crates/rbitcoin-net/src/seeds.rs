@@ -323,37 +323,49 @@ pub struct PeerEntry {
     pub addr: NetAddr,
     pub flags: PeerFlags,
     /// Unix seconds when a peer said it last saw this row. `0` means no peer
-    /// taught a time (a seed, `addnode`, or a row from a v1/v2 `peers` file).
+    /// taught a time yet (a seed, `addnode`, or a v1/v2 `peers` row before
+    /// its first serve).
     pub last_seen: u32,
 }
 
 /// Core's trust window for a gossiped address time: after 1973 and no more
-/// than ten minutes ahead. A row outside the window is kept with no time.
+/// than ten minutes ahead. A row outside the window takes
+/// [`UNKNOWN_SEEN_AGE_SECS`] back from the node clock.
 pub const ADDR_TIME_FLOOR: u32 = 100_000_000;
 
-/// Age [`PeerEntry::last_seen`] starts at when it is `0`: Core backdates an
-/// untrusted address time by five days.
+/// Age a row with no trusted time starts at: Core backdates an untrusted
+/// address time by five days.
 pub const UNKNOWN_SEEN_AGE_SECS: u64 = 5 * 24 * 60 * 60;
 
-/// Sanitize a gossiped address time. `0` means the row keeps no time.
+/// Core's `ProcessAddrs` penalty on a time a peer gossiped, so one source
+/// cannot hold a row fresher than two hours of its own claim.
+pub const GOSSIP_TIME_PENALTY_SECS: u32 = 2 * 60 * 60;
+
+fn backdated_seen(now: u64) -> u32 {
+    let now = now.min(u64::from(u32::MAX)) as u32;
+    now.saturating_sub(UNKNOWN_SEEN_AGE_SECS as u32)
+}
+
+/// The Unix time a gossiped address is taken to have been seen: its own time
+/// when it is inside Core's window, else five days back. Never `0`, so every
+/// gossiped row ages from a fixed point.
 #[doc(hidden)]
 pub fn learned_addr_time(time: u32, now: u64) -> u32 {
     if time <= ADDR_TIME_FLOOR || u64::from(time) > now.saturating_add(600) {
-        0
+        backdated_seen(now)
     } else {
         time
     }
 }
 
-/// The time a `getaddr` reply or `getnodeaddresses` row carries. A row with no
-/// learned time is backdated; a known time is never reported in the future.
+/// The time a `getaddr` reply or `getnodeaddresses` row carries. A row that
+/// no peer taught a time is backdated; a known time is never in the future.
 #[doc(hidden)]
 pub fn row_reply_time(last_seen: u32, now: u64) -> u32 {
+    let now = now.min(u64::from(u32::MAX)) as u32;
     if last_seen == 0 {
-        let now = now.min(u64::from(u32::MAX)) as u32;
         return now.saturating_sub(UNKNOWN_SEEN_AGE_SECS as u32);
     }
-    let now = now.min(u64::from(u32::MAX)) as u32;
     last_seen.min(now)
 }
 
@@ -695,23 +707,30 @@ impl AddrMan {
     }
 
     pub fn add_learned_addr(&mut self, addr: NetAddr, source: NetAddr, cap: usize) -> bool {
-        self.add_learned_addr_at(addr, source, 0, cap)
+        self.add_learned_addr_at(addr, source, 0, 0, cap)
     }
 
     /// [`Self::add_learned_addr`] for a row a peer said it saw at `last_seen`
-    /// (Unix seconds). An existing row keeps the time it already has: gossip
-    /// cannot hold a dead row fresh.
+    /// (Unix seconds, already inside Core's window). `now` is the node clock.
+    /// A held row takes the new time only when it is at least
+    /// [`Self::SEEN_UPDATE_ONLINE_SECS`] (or the offline interval) newer, as
+    /// Core's `AddSingle` does, so one gossip stream cannot hold a row fresh.
     pub fn add_learned_addr_at(
         &mut self,
         addr: NetAddr,
         source: NetAddr,
         last_seen: u32,
+        now: u64,
         cap: usize,
     ) -> bool {
         if !self.dialable(addr) {
             return false;
         }
-        if self.by_addr.contains_key(&addr) || cap == 0 {
+        if self.by_addr.contains_key(&addr) {
+            self.refresh_seen(addr, last_seen, now);
+            return false;
+        }
+        if cap == 0 {
             return false;
         }
         if self.order.len() > cap {
@@ -729,6 +748,29 @@ impl AddrMan {
         self.charge(addr, group);
         self.note_added();
         true
+    }
+
+    /// Core `AddSingle` refresh interval for a row seen within the last day.
+    const SEEN_UPDATE_ONLINE_SECS: u64 = 60 * 60;
+    /// Core `AddSingle` refresh interval for a row last seen a day or more ago.
+    const SEEN_UPDATE_OFFLINE_SECS: u64 = 24 * 60 * 60;
+
+    /// Take `last_seen` for a held row when it is newer than what the book
+    /// has by Core's interval for that row's age.
+    fn refresh_seen(&mut self, addr: NetAddr, last_seen: u32, now: u64) {
+        if last_seen == 0 {
+            return;
+        }
+        let stored = self.seen.get(&addr).copied().unwrap_or(0);
+        let online = now.saturating_sub(u64::from(last_seen)) < Self::SEEN_UPDATE_OFFLINE_SECS;
+        let interval = if online {
+            Self::SEEN_UPDATE_ONLINE_SECS
+        } else {
+            Self::SEEN_UPDATE_OFFLINE_SECS
+        };
+        if u64::from(stored) + interval < u64::from(last_seen) {
+            self.seen.insert(addr, last_seen);
+        }
     }
 
     /// `group` already taught its share of the rows.
@@ -932,13 +974,30 @@ impl AddrMan {
         self.order.is_empty()
     }
 
-    /// Successful BIP324 handshake.
-    pub fn note_connected_addr(&mut self, addr: NetAddr) {
+    /// Successful BIP324 handshake. Core `Connected_` refreshes the row's
+    /// time when the last one is more than twenty minutes old.
+    pub fn note_connected_addr(&mut self, addr: NetAddr, now: u32) {
         self.add_addr(addr);
         if let Some(f) = self.by_addr.get_mut(&addr) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.remove(PeerFlags::FAILED_LAST_CONNECT);
             f.remove(PeerFlags::INCOMPATIBLE);
+        }
+        const REFRESH_SECS: u32 = 20 * 60;
+        let stored = self.seen.get(&addr).copied().unwrap_or(0);
+        if now.saturating_sub(stored) > REFRESH_SECS {
+            self.seen.insert(addr, now);
+        }
+    }
+
+    /// Fix a backdated time for every row no peer taught one, once. The row
+    /// then ages from that point instead of looking five days old on every
+    /// serve, as Core fixes the backdate when it ingests the address.
+    #[doc(hidden)]
+    pub fn stamp_missing_seen(&mut self, now: u64) {
+        let backdated = backdated_seen(now);
+        for addr in &self.order {
+            self.seen.entry(*addr).or_insert(backdated);
         }
     }
 

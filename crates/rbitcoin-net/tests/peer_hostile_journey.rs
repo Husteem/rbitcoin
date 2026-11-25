@@ -41,57 +41,58 @@ async fn addrv2_gossip_drops_unroutable_clearnet() {
     dst.set_wants_addrv2();
     let (_dst_tx, mut dst_rx) = dst.open_out();
     peers.set_mock_now(peer.connected_at_secs() + 10_000);
+    let t = peers.now_secs() as u32 - 60;
 
     let public = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
         port: 8333,
     };
     let lan = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Ipv4(Ipv4Addr::new(10, 0, 0, 1)),
         port: 8333,
     };
     let cgnat = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Ipv4(Ipv4Addr::new(100, 64, 0, 1)),
         port: 8333,
     };
     let zero_port = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 8)),
         port: 0,
     };
     let i2p = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::I2p([0x11; 32]),
         port: 0,
     };
     let tor_v2 = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::TorV2([0xab; 10]),
         port: 8333,
     };
     let cjdns_bad = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Cjdns(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
         port: 8333,
     };
     let cjdns = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Cjdns(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)),
         port: 8333,
     };
     let unknown = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Unknown(0x99, vec![1, 2, 3, 4]),
         port: 8333,
@@ -134,6 +135,58 @@ async fn addrv2_gossip_drops_unroutable_clearnet() {
         book.entry_of(&rbitcoin_net::NetAddr::from_socket(lan_sock)).is_none(),
         "learn_addrv2 does not store RFC1918"
     );
+}
+
+/// Core `ProcessAddrs` rewrites an insane address time before
+/// `RelayAddress`, so a neighbor never receives a future or 1970 time.
+#[tokio::test]
+async fn addrv2_relay_sanitizes_an_insane_time() {
+    use bitcoin::p2p::message::NetworkMessage;
+    use std::sync::{Arc, Mutex};
+
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+    let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+    let ver = hostile_ver(src_addr);
+    let src = peers.register(
+        src_addr,
+        src_addr,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    src.set_wants_addrv2();
+    let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 8333);
+    let dst = peers.register(
+        dst_addr,
+        dst_addr,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    dst.set_wants_addrv2();
+    let (_, mut dst_rx) = dst.open_out();
+    let now = 1_700_000_000u64;
+    peers.set_mock_now(now);
+    while dst_rx.try_recv().is_ok() {}
+
+    let mut follow = PeerFollowState::new();
+    on_addrv2(
+        &mut follow,
+        Some(src.as_ref()),
+        &[AddrV2Message {
+            time: now as u32 + 3_600,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
+            port: 8333,
+        }],
+    )
+    .unwrap();
+    let got = dst_rx.try_recv().expect("relayed").expect_msg();
+    let NetworkMessage::AddrV2(rows) = got else {
+        panic!("expected addrv2, got {got:?}");
+    };
+    assert_eq!(rows[0].time, now as u32 - 5 * 24 * 60 * 60);
 }
 
 /// A peer gossips this node's own onion, I2P, CJDNS and external addresses
@@ -197,9 +250,10 @@ async fn addrv2_relay_drops_own_addresses() {
     onion_peer.set_wants_addrv2();
     let (_, mut onion_rx) = onion_peer.open_out();
     peers.set_mock_now(src.connected_at_secs() + 10_000);
+    let t = peers.now_secs() as u32 - 60;
 
     let row = |addr: AddrV2, port: u16| AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr,
         port,

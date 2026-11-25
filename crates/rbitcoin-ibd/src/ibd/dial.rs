@@ -393,12 +393,13 @@ pub fn apply_dial_result(
     addr_cooldown: &mut HashMap<NetAddr, Instant>,
     addr_strikes: &mut HashMap<NetAddr, u8>,
     now: Instant,
+    now_secs: u64,
 ) {
     for &addr in &result.attempted {
         book.note_attempt_addr(addr);
     }
     for s in &result.slots {
-        book.note_connected_addr(s.net);
+        book.note_connected_addr(s.net, now_secs.min(u64::from(u32::MAX)) as u32);
         addr_cooldown.remove(&s.net);
     }
     for &(addr, kind) in &result.failed {

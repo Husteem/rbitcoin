@@ -164,7 +164,7 @@ fn take_dial_prefers_untried_and_good_over_failed() {
     am.add(incompat);
     am.add(good);
     am.add(untried);
-    am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(good));
+    am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(good), 1_700_000_000);
     am.note_connect_failed_addr(rbitcoin_net::NetAddr::from_socket(failed), false);
     am.note_connect_failed_addr(rbitcoin_net::NetAddr::from_socket(incompat), true);
 
@@ -282,7 +282,7 @@ fn take_dial_occupied_group_tier0_loses_to_free_group_last_resort() {
     let lemon = slash16(9, 9, 1);
     am.add(good_same);
     am.add(lemon);
-    am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(good_same));
+    am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(good_same), 1_700_000_000);
     am.note_connect_failed_addr(rbitcoin_net::NetAddr::from_socket(lemon), false);
     let occupied = [slash16(1, 2, 9)];
     let got = am.take_dial_candidates(2, &HashSet::new(), &occupied);
@@ -473,7 +473,7 @@ fn add_learned_keeps_good_when_full() {
     let mut am = AddrMan::new();
     for i in 1..=3 {
         am.add(addr(i));
-        am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(addr(i)));
+        am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(addr(i)), 1_700_000_000);
     }
     assert!(!am.add_learned(addr(9), addr(9), 3));
     assert_eq!(am.len(), 3);
@@ -694,7 +694,7 @@ fn add_keeps_tried_and_may_exceed_cap() {
     for i in 0..MAX_ADDR_MAN {
         let a = addr_n(i as u32);
         am.add(a);
-        am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(a));
+        am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(a), 1_700_000_000);
     }
     let extra = addr_n(MAX_ADDR_MAN as u32);
     am.add(extra);
@@ -804,7 +804,7 @@ fn merge_keeps_a_connected_row_from_a_group_at_its_share() {
     assert!(live.add_learned(addr_n(100_000), other, MAX_ADDR_MAN));
     let connected = NetAddr::from_socket(addr_n(100_001));
     assert!(live.add_learned_addr(connected, NetAddr::from_socket(src), MAX_ADDR_MAN));
-    live.note_connected_addr(connected);
+    live.note_connected_addr(connected, 1_700_000_000);
     stale.merge_from(&live);
     assert!(stale.flags_of(&connected).has_connected());
     assert_eq!(stale.len(), MAX_ADDR_MAN);
@@ -816,7 +816,7 @@ fn merge_from_trims_to_cap_keeping_tried() {
     for i in 0..MAX_ADDR_MAN {
         let x = addr_n(i as u32);
         a.add(x);
-        a.note_connected_addr(rbitcoin_net::NetAddr::from_socket(x));
+        a.note_connected_addr(rbitcoin_net::NetAddr::from_socket(x), 1_700_000_000);
     }
     let mut b = AddrMan::new();
     for i in 0..8 {
@@ -895,7 +895,7 @@ fn peers_file_roundtrip_preserves_flags() {
     let a = addr(10);
     let b = addr(20);
     am.add(a);
-    am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(a));
+    am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(a), 1_700_000_000);
     am.note_speed_addr(
         rbitcoin_net::NetAddr::from_socket(a),
         40,
@@ -936,6 +936,7 @@ fn peers_file_roundtrip_preserves_last_seen() {
         NetAddr::from_socket(a),
         NetAddr::from_socket(a),
         1_699_000_000,
+        1_700_000_000,
         8
     ));
     am.save(&path).unwrap();
@@ -951,6 +952,43 @@ fn peers_file_roundtrip_preserves_last_seen() {
         "a restart must not forget when the row was learned"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `Connected_`: a row we reached takes the node time once the stored
+/// time is more than twenty minutes old, so live peers stay fresh.
+#[test]
+fn a_connected_row_refreshes_its_time_at_core_interval() {
+    let mut am = AddrMan::new();
+    let row = NetAddr::from_socket(addr(41));
+    assert!(am.add_learned_addr_at(row, row, 1_699_000_000, 1_700_000_000, 8));
+    am.note_connected_addr(row, 1_700_000_000);
+    assert_eq!(am.last_seen_of(&row), 1_700_000_000);
+    am.note_connected_addr(row, 1_700_001_200);
+    assert_eq!(
+        am.last_seen_of(&row),
+        1_700_000_000,
+        "twenty minutes is not old enough"
+    );
+    am.note_connected_addr(row, 1_700_001_201);
+    assert_eq!(am.last_seen_of(&row), 1_700_001_201);
+}
+
+/// Core `AddSingle`: a held row takes newer gossip only after the online
+/// (one hour) or offline (one day) interval, so a sender cannot restamp it.
+#[test]
+fn newer_gossip_refreshes_a_held_row_by_the_interval() {
+    let mut am = AddrMan::new();
+    let row = NetAddr::from_socket(addr(42));
+    let source = NetAddr::from_socket(addr(43));
+    assert!(am.add_learned_addr_at(row, source, 1_700_000_000, 1_700_000_000, 8));
+    assert!(!am.add_learned_addr_at(row, source, 1_700_001_800, 1_700_001_800, 8));
+    assert_eq!(
+        am.last_seen_of(&row),
+        1_700_000_000,
+        "thirty minutes is inside the online interval"
+    );
+    assert!(!am.add_learned_addr_at(row, source, 1_700_007_200, 1_700_007_200, 8));
+    assert_eq!(am.last_seen_of(&row), 1_700_007_200);
 }
 
 #[test]
@@ -1229,7 +1267,7 @@ fn peers_file_load_errors_and_empty() {
     am.add(addr(3));
     am.note_connect_failed_addr(rbitcoin_net::NetAddr::from_socket(addr(3)), true);
     assert!(am.flags(&addr(3)).is_incompatible());
-    am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(addr(3)));
+    am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(addr(3)), 1_700_000_000);
     assert!(am.flags(&addr(3)).has_connected());
     assert!(!am.flags(&addr(3)).is_incompatible());
     am.save(&nested).unwrap();

@@ -3025,8 +3025,15 @@ impl PeerHub {
                 if crate::netaddr::netaddr_unroutable_gossip(addr) {
                     continue;
                 }
-                let last_seen = crate::seeds::learned_addr_time(a.time, now);
-                book.add_learned_addr_at(addr, source, last_seen, crate::seeds::MAX_ADDR_MAN);
+                let seen = crate::seeds::learned_addr_time(a.time, now);
+                // Core charges a source's gossip two hours; a row a peer
+                // announces as itself keeps the full time.
+                let seen = if addr == source {
+                    seen
+                } else {
+                    seen.saturating_sub(crate::seeds::GOSSIP_TIME_PENALTY_SECS)
+                };
+                book.add_learned_addr_at(addr, source, seen, now, crate::seeds::MAX_ADDR_MAN);
             }
         }
     }
@@ -3102,7 +3109,8 @@ impl PeerHub {
             return Vec::new();
         };
         let entries = {
-            let g = am.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = am.lock().unwrap_or_else(|e| e.into_inner());
+            g.stamp_missing_seen(now);
             g.entries()
         };
         let rows: Vec<(u32, crate::NetAddr)> = entries
