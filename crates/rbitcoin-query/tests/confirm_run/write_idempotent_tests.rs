@@ -123,6 +123,17 @@ fn script_ok_append_contiguous_and_gap() {
     assert!(a.append_contiguous(c).is_ok());
     assert_eq!(a.len(), 3);
 
+    let mut other_epoch = batch_one(13);
+    other_epoch.epoch = 1;
+    let err = a
+        .append_contiguous(other_epoch)
+        .expect_err("a different claim epoch does not merge");
+    assert_eq!(err.epoch, 1);
+    assert_eq!(a.len(), 3, "the prefix is unchanged");
+    let next = batch_one(13);
+    assert!(a.append_contiguous(next).is_ok());
+    assert_eq!(a.len(), 4);
+
     assert!(a
         .append_contiguous(ScriptOkBatch {
             epoch: 0,
@@ -136,7 +147,7 @@ fn script_ok_append_contiguous_and_gap() {
             holds: Vec::new(),
         })
         .is_ok());
-    assert_eq!(a.len(), 3);
+    assert_eq!(a.len(), 4);
 
     let mut empty = ScriptOkBatch {
         epoch: 0,
