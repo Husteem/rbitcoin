@@ -3337,7 +3337,10 @@ pub fn spawn_confirm_engine(
                                 Err(e) => {
                                     warn!("ibd: load-batch has_body probe: {e}");
                                     confirm_thr_stats::add_lookup_other(&stats, t_kind.elapsed());
-                                    feed.finish_stale_plan(wave_h.iter().copied());
+                                    let undecoded = wave.undecodable.map(|(h, _)| h);
+                                    feed.finish_stale_plan(
+                                        wave_h.iter().copied().filter(|&h| Some(h) != undecoded),
+                                    );
                                     continue;
                                 }
                             };
