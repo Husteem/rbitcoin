@@ -7022,12 +7022,17 @@ impl MempoolHub {
         let mut group: Vec<usize> = (0..txs.len()).collect();
         let mut pool_parents = vec![BTreeSet::new(); txs.len()];
         let mut first_spender: HashMap<Txid, usize> = HashMap::new();
+        // One component walk per distinct pool parent, not per input.
+        let mut rep_of: HashMap<Txid, Option<Txid>> = HashMap::new();
         for (i, tx) in txs.iter().enumerate() {
             for inp in &tx.input {
                 let pid = inp.previous_output.txid;
                 let joined = if let Some(&j) = index.get(&pid) {
                     j
-                } else if let Some(rep) = g.graph.cluster_rep(&pid) {
+                } else if let Some(rep) = *rep_of
+                    .entry(pid)
+                    .or_insert_with(|| g.graph.cluster_rep(&pid))
+                {
                     pool_parents[i].insert(pid);
                     *first_spender.entry(rep).or_insert(i)
                 } else {

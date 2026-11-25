@@ -900,20 +900,15 @@ impl TxGraph {
     /// `seed` members would exceed cluster limits. `seed` = parent txids already
     /// in mempool that the new tx spends (+ the new tx itself counts as 1).
     /// Live members count at raw weight (Libre: sigops never shrink the cap).
+    /// One membership walk over the union; nothing is linearized.
     pub fn cluster_would_exceed(
         &self,
         parent_txids: &BTreeSet<Txid>,
         extra_count: usize,
         extra_weight: u64,
     ) -> bool {
-        let mut members = BTreeSet::new();
-        for p in parent_txids {
-            if let Some(c) = self.cluster_of(p) {
-                members.extend(c.members);
-            }
-        }
-        let base_weight = self.raw_weight_of(&members);
-        let count = members.len() + extra_count;
+        let (members, base_weight) = self.connected_weight(parent_txids);
+        let count = members + extra_count;
         let vsize = base_weight.saturating_add(extra_weight).saturating_add(3) / 4;
         count > self.cluster_count_limit || vsize > self.cluster_vsize_limit
     }

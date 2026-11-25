@@ -2183,18 +2183,19 @@ impl ActiveMempool {
         // (tested members present) leaves the cap to the check after its
         // walk, which counts every member that passed and asks after the
         // member's own checks and `maxfeerate`, as Core does.
-        let (n_members, base_w) = self
-            .graph
-            .connected_weight_except(&parent_txids, &conflict_set);
-        let combined_w = base_w.saturating_add(prep.weight);
-        if prep.tested.is_none()
-            && (n_members + 1 > self.graph.cluster_count_limit()
-                || combined_w.saturating_add(3) / 4 > self.graph.cluster_vsize_limit())
-        {
-            return Err(AcceptError::ClusterTooLarge {
-                count: n_members + 1,
-                weight: combined_w,
-            });
+        if prep.tested.is_none() {
+            let (n_members, base_w) = self
+                .graph
+                .connected_weight_except(&parent_txids, &conflict_set);
+            let combined_w = base_w.saturating_add(prep.weight);
+            if n_members + 1 > self.graph.cluster_count_limit()
+                || combined_w.saturating_add(3) / 4 > self.graph.cluster_vsize_limit()
+            {
+                return Err(AcceptError::ClusterTooLarge {
+                    count: n_members + 1,
+                    weight: combined_w,
+                });
+            }
         }
         // Parents of the direct conflicts only, not their ancestor closure.
         // After the cap, so an over-size cluster is `too-large-cluster`.
