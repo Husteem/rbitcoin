@@ -517,7 +517,19 @@ async fn rejects_past_the_share_log_fewer_lines_than_rejects() {
         );
         tokio::task::yield_now().await;
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Each refused socket reads EOF once the listener closed it, so every
+    // refusal was logged (or suppressed) before the capture is read.
+    {
+        use tokio::io::AsyncReadExt;
+        for s in &mut opened[MAX_SESSIONS_PER_NETGROUP..] {
+            let mut b = [0u8; 1];
+            let closed = tokio::time::timeout(Duration::from_secs(5), s.read(&mut b)).await;
+            assert!(
+                matches!(closed, Ok(Ok(0) | Err(_))),
+                "a socket past the share was not refused"
+            );
+        }
+    }
     let lines = rbitcoin_log::take_logs();
     rbitcoin_log::capture_logs(false);
     let rejects = lines
