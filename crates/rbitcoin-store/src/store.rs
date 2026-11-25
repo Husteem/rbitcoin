@@ -556,8 +556,15 @@ impl Store {
             refuse_cold_index_dirs(&path, &seqsigwit_dir)?;
         }
         let committed = committed_create_count(&header_txs)?;
-        let txs =
-            TxTable::open_seqsigwit(&path, &seqsigwit_dir, layout.open_opts(), Some(committed))?;
+        let txs = TxTable::open_seqsigwit(
+            &path,
+            &seqsigwit_dir,
+            layout.open_opts(),
+            Some(crate::tx_table::OpenedFromStore {
+                committed,
+                schema: meta_ver,
+            }),
+        )?;
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }

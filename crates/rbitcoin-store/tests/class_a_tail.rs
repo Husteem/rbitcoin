@@ -534,7 +534,10 @@ fn zeroed_cold_seqsigwit_page0_restores_from_the_hot_guard() {
         &hot,
         &cold,
         rbitcoin_store::HeadOpenOpts::TINY,
-        Some(1),
+        Some(rbitcoin_store::tx_table::OpenedFromStore {
+            committed: 1,
+            schema: rbitcoin_primitives::SCHEMA_VERSION,
+        }),
     )
     .unwrap();
     drop(table);

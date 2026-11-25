@@ -678,6 +678,35 @@ fn a_populated_schema_29_log_becomes_a_delta_generation() {
     assert_eq!(s.spend_directory_slot(16).unwrap(), Some(meta));
 }
 
+/// A schema-30 datadir that lost `spent.delta/` refuses to open, even when
+/// its sparse `spent.body` reaches the published end on disk: that length
+/// cannot tell it from a body an older schema's Class A filled, and adopting
+/// it would leave every spend the delta held unspent (#2038).
+#[test]
+fn a_schema_30_body_without_its_delta_refuses_whatever_its_length() {
+    let d = dir();
+    schema_29_store(&d);
+    {
+        // The upgrade: adopts the body, writes `meta` 30.
+        let s = rbitcoin_store::Store::open_tiny(&d).unwrap();
+        assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+        let end = s.txs.spent.body_published_len();
+        drop(s);
+        std::fs::remove_dir_all(delta_dir(&d)).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join("spent.body"))
+            .unwrap();
+        if f.metadata().unwrap().len() < end {
+            f.set_len(end).unwrap();
+        }
+    }
+    let err = rbitcoin_store::Store::open_tiny(&d)
+        .err()
+        .expect("a schema-30 body without spent.delta must refuse");
+    assert!(err.to_string().contains("spent.delta is missing"), "{err}");
+}
+
 /// A held schema-29 log is not refused: refusing after `meta` is 30 would
 /// leave no binary that opens the datadir. Its spends are sealed above any
 /// tip, so the open filter runs `keep` over them as 29 did before a fold.

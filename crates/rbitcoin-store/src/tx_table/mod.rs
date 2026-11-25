@@ -1374,10 +1374,15 @@ impl crate::spend_delta::SpentBody for SpentFold<'_> {
 /// there is one, become the delta's first generation, and the 29 files are
 /// removed once that commit is durable. A crash before that commit adopts
 /// again at the next open. A populated schema-30 body with no `spent.delta/`
-/// refuses: its spends were only there.
+/// refuses: its spends were only there. A sparse body can reach its published
+/// end on disk, so the length cannot tell the two apart; `opened_schema` (the
+/// `meta` schema before this open, `None` for a table opened alone) can. The
+/// first schema-30 open creates `spent.delta/`, so a crash before the
+/// adoption commit still finds it and adopts again.
 fn open_spend_delta(
     dir: &Path,
     spent: &VarTable,
+    opened_schema: Option<u16>,
 ) -> Result<crate::spend_delta::SpendPageLog, StoreError> {
     let body_end = spent.body_published_len();
     let path = spent.body_file_path();
@@ -1385,7 +1390,8 @@ fn open_spend_delta(
         .map_err(|e| StoreError::io(path, e))?
         .len();
     let populated = body_end > crate::file::FILE_HEADER_LEN as u64;
-    let filled_by_class_a = physical >= body_end;
+    let schema_30 = opened_schema.is_some_and(|v| v >= rbitcoin_primitives::SCHEMA_VERSION);
+    let filled_by_class_a = physical >= body_end && !schema_30;
     if populated && !filled_by_class_a && !dir.join(crate::spend_delta::SPEND_DELTA_DIR).exists() {
         return Err(StoreError::Corrupt(
             "spent.delta is missing beside a populated spent.body; wipe datadir and redo IBD",
@@ -1523,11 +1529,22 @@ impl TxTable {
     pub fn open_with_opts(dir: &Path, opts: HeadOpenOpts) -> Result<Self, StoreError> {
         Self::open_seqsigwit(dir, dir, opts, None)
     }
+}
 
+/// What a [`crate::Store`] knows when it opens its [`TxTable`].
+#[derive(Clone, Copy, Debug)]
+pub struct OpenedFromStore {
+    /// The highest create a durable `header_txs` range names.
+    pub committed: u64,
+    /// The schema `meta` held before this open rewrote it.
+    pub schema: u16,
+}
+
+impl TxTable {
     /// Open Class A stems; `seqsigwit` may live in a different directory.
     ///
-    /// `committed` is the highest create a durable `header_txs` range
-    /// names. A `Store` passes it; open keeps exactly the creates through it
+    /// `store` is what the opening [`crate::Store`] knows ([`OpenedFromStore`]).
+    /// Open keeps exactly the creates through its `committed`
     /// or [`CLASS_A_SYNCED_NAME`], whichever is higher. `None` (a table
     /// opened alone) keeps the prefix every file covers. See
     /// [`repair_class_a_count_skew`].
@@ -1535,7 +1552,7 @@ impl TxTable {
         dir: &Path,
         seqsigwit_dir: &Path,
         opts: HeadOpenOpts,
-        committed: Option<u64>,
+        store: Option<OpenedFromStore>,
     ) -> Result<Self, StoreError> {
         crate::class_a_pages::prepare_and_restore(dir, seqsigwit_dir)?;
         crate::store::rename_legacy_inwit_files(dir)?;
@@ -1554,7 +1571,7 @@ impl TxTable {
         let had_seqsigwit = seqsigwit_dir.join("seqsigwit.body").exists();
         let had_spent = dir.join("spent.body").exists();
         let synced_named = read_class_a_synced(dir)?;
-        let named = committed.map(|c| c.max(synced_named));
+        let named = store.map(|s| s.committed.max(synced_named));
         let at_least = named.unwrap_or(0);
         let create_loc = open_or_create_create_loc_above(dir, at_least)?;
         // A pruned witness locator is cut on purpose: no floor.
@@ -1722,7 +1739,7 @@ impl TxTable {
             }
         };
         let secret = crate::store_secret::StoreSecret::load_existing(dir)?;
-        let spend_pages = open_spend_delta(dir, &spent)?;
+        let spend_pages = open_spend_delta(dir, &spent, store.map(|s| s.schema))?;
         let t = Self {
             body,
             seqsigwit,
