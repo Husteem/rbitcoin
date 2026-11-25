@@ -2344,6 +2344,40 @@ async fn esplora_blocks_waits_on_the_store_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Esplora takes its own share of the store budget before a budget permit.
+/// With the share held, `/blocks` waits although the budget has room, so
+/// Esplora and BlindBit clients alone cannot hold every permit; it answers
+/// once the share is free.
+#[tokio::test]
+async fn esplora_blocks_waits_on_its_share_of_the_store_budget() {
+    let (dir, q) = temp_query("esplora-share");
+    q.set_api_read_budget(2);
+    let q = Arc::new(q);
+    let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
+        .await
+        .expect("listen");
+    let share = q.api_read_share(rbitcoin_query::ApiSurface::Esplora);
+    assert_eq!(share.available_permits(), 1, "half of a budget of two");
+    let hold = share.acquire_owned().await.expect("share permit");
+    let addr = handle.local_addr;
+    let stalled = tokio::spawn(async move { http_get(addr, "/blocks").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !stalled.is_finished(),
+        "GET /blocks ran while Esplora's share was held"
+    );
+    assert_eq!(q.api_read_budget().available_permits(), 2);
+    drop(hold);
+    let (st, body) = tokio::time::timeout(Duration::from_secs(5), stalled)
+        .await
+        .expect("GET finishes after the share")
+        .expect("join");
+    assert_eq!(st, 200, "{body}");
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `getblocktemplate` reuse: on the same tip, a template at least 5 s
 /// old is rebuilt for a mempool change within the 15 s TTL. The journey
 /// `template_build_is_shared_and_keeps_through_pool_churn` covers the
