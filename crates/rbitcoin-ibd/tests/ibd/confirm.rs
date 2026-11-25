@@ -3145,6 +3145,37 @@ fn a_stale_load_batch_releases_its_lead_reservation() {
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(40));
 }
 
+/// A plan rewind clears inflight, so a new lookup can take the same height
+/// and share its reservation. The old claim dropping must not take the charge
+/// the new claim still owns.
+#[test]
+fn a_stale_drop_keeps_a_reservation_a_new_claim_still_owns() {
+    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    {
+        let mut g = feed.inner.lock().unwrap();
+        g.inflight.insert(1);
+        g.claimed_epoch.insert(1, feed.epoch());
+    }
+    feed.drop_plan();
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[40]), vec![1]),
+        vec![1],
+        "the new claim reuses the reservation without a second charge"
+    );
+    feed.finish_stale_plan([1]);
+    assert!(
+        feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
+        "the new claim still owns the charge"
+    );
+    feed.finish_stale_plan([1]);
+    assert!(!feed.inner.lock().unwrap().lead_reserved.contains_key(&1));
+    feed.install_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(40));
+}
+
 /// A failed write can leave a connected height in the batch. That height
 /// still sends Accepted and keeps its reservation; only the unwritten ones
 /// are released.

@@ -250,6 +250,10 @@ pub struct ConfirmFeedInner {
     /// Cleared when that height is accepted or the match moves to or past it.
     /// [`ConfirmFeed::clear`] drops only heights above the confirmed tip.
     pub lead_reserved: std::collections::BTreeMap<u32, u64>,
+    /// Lookup claims sharing each reserved height. A rewind clears `inflight`,
+    /// so a later lookup can take the same height again without a second
+    /// charge. The reservation goes back only after every claim has dropped.
+    pub lead_claims: std::collections::BTreeMap<u32, u32>,
 }
 
 impl Default for ConfirmFeed {
@@ -288,6 +292,7 @@ impl ConfirmFeed {
                 lead_from: 0,
                 lead_bytes_left: None,
                 lead_reserved: std::collections::BTreeMap::new(),
+                lead_claims: std::collections::BTreeMap::new(),
             }),
             cv: std::sync::Condvar::new(),
             stop: AtomicBool::new(false),
@@ -334,10 +339,12 @@ impl ConfirmFeed {
         g.lead_from = lead_from;
         if moved {
             g.lead_reserved.retain(|&h, _| h > lead_from);
+            g.lead_claims.retain(|&h, _| h > lead_from);
         }
         g.lead_bytes_left = match bytes_left {
             None => {
                 g.lead_reserved.clear();
+                g.lead_claims.clear();
                 None
             }
             Some(n) => {
@@ -401,6 +408,7 @@ impl ConfirmFeed {
         if g.lead_bytes_left.is_none() {
             return;
         }
+        g.lead_claims.remove(&height);
         if g.lead_reserved.remove(&height).is_some() {
             self.lead_bounds_dirty.store(true, Ordering::Release);
         }
@@ -507,6 +515,30 @@ impl ConfirmFeed {
         self.cv.notify_one();
     }
 
+    fn finish_inner(&self, heights: impl IntoIterator<Item = u32>, release_stale: bool) {
+        let mut g = self.inner.lock().unwrap();
+        let mut released = false;
+        for h in heights {
+            g.inflight.remove(&h);
+            g.claimed_epoch.remove(&h);
+            let claims = g.lead_claims.get_mut(&h).map(|n| {
+                *n = (*n).saturating_sub(1);
+                *n
+            });
+            if claims == Some(0) {
+                g.lead_claims.remove(&h);
+                if release_stale && g.lead_reserved.remove(&h).is_some() {
+                    released = true;
+                }
+            }
+        }
+        drop(g);
+        if released {
+            self.lead_bounds_dirty.store(true, Ordering::Release);
+        }
+        self.cv.notify_one();
+    }
+
     /// Write (or permanent reject) finished — height may be re-offered only after
     /// tip moves past it (or a future requeue path).
     ///
@@ -514,34 +546,13 @@ impl ConfirmFeed {
     /// it. A stale plan that drops before writing uses
     /// [`Self::finish_stale_plan`], which returns the reservation.
     pub fn finish(&self, heights: impl IntoIterator<Item = u32>) {
-        let mut g = self.inner.lock().unwrap();
-        for h in heights {
-            g.inflight.remove(&h);
-            g.claimed_epoch.remove(&h);
-        }
-        drop(g);
-        self.cv.notify_one();
+        self.finish_inner(heights, false);
     }
 
     /// A stale plan batch will not write and sends no `Accepted`. Drop its
-    /// claim and return the lead reservation so a later body at the same
-    /// height is charged again. Release before `finish` while the height is
-    /// still in flight, so a lookup cannot claim it in between.
+    /// claim and return the lead reservation once no other claim shares it.
     pub fn finish_stale_plan(&self, heights: impl IntoIterator<Item = u32>) {
-        let heights: Vec<u32> = heights.into_iter().collect();
-        {
-            let mut g = self.inner.lock().unwrap();
-            let mut released = false;
-            for &h in &heights {
-                if g.lead_reserved.remove(&h).is_some() {
-                    released = true;
-                }
-            }
-            if released {
-                self.lead_bounds_dirty.store(true, Ordering::Release);
-            }
-        }
-        self.finish(heights);
+        self.finish_inner(heights, true);
     }
 
     /// Drop ready and inflight and bump the epoch. The lead stays reserved.
@@ -581,6 +592,7 @@ impl ConfirmFeed {
             .filter(|(&h, _)| h > confirmed_tip)
             .fold(0u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
         g.lead_reserved.retain(|&h, _| h <= confirmed_tip);
+        g.lead_claims.retain(|&h, _| h <= confirmed_tip);
         if let Some(current) = g.lead_bytes_left {
             let pending = g
                 .lead_reserved
@@ -3494,10 +3506,11 @@ pub fn offer_confirm_ready<S: std::hash::BuildHasher>(
 
 /// Heights lookup may claim. Above the matched height, a body spends
 /// `lead_bytes_left` once. A height already reserved is claimed again without
-/// a second charge. `wires` is each height's charge, copied with the
-/// unresolved-heights walk. A missing charge stops the run while a byte cap
-/// is set, so an unsized body cannot pass the budget. Both caps empty returns
-/// `heights` unchanged.
+/// a second charge, and each claim is counted so a stale drop releases the
+/// reservation only after the last one ends. `wires` is each height's charge,
+/// copied with the unresolved-heights walk. A missing charge stops the run
+/// while a byte cap is set, so an unsized body cannot pass the budget. Both
+/// caps empty returns `heights` unchanged.
 #[doc(hidden)]
 pub fn take_unproven_lead(
     feed: &ConfirmFeed,
@@ -3535,6 +3548,12 @@ pub fn take_unproven_lead(
         g.lead_bytes_left = bytes_left;
         for (ht, wire) in reserved {
             g.lead_reserved.insert(ht, wire);
+        }
+        for &ht in &out {
+            if ht > g.lead_from {
+                let claims = g.lead_claims.entry(ht).or_insert(0);
+                *claims = claims.saturating_add(1);
+            }
         }
     }
     out
