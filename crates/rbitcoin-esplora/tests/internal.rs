@@ -468,7 +468,32 @@ async fn outspends_bounds_total_entries() {
     #[cfg(debug_assertions)]
     {
         let sh = rbitcoin_primitives::hex_encode(rbitcoin_store::script_hash(&[0x51]));
+        // A pool tx for this script, so the mempool route reads its row.
+        {
+            let fan_id: Txid = fan.parse().unwrap();
+            let pooled = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: fan_id,
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(9_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            pad.hub
+                .admit(&pooled)
+                .expect("a spend of the fan enters the pool");
+        }
         for path in [
+            format!("/scripthash/{sh}/txs/mempool"),
             format!("/txs/outspends?txids={fan}"),
             format!("/tx/{fan}/merkle-proof"),
             format!("/tx/{fan}/merkleblock-proof"),

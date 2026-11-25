@@ -1649,7 +1649,10 @@ pub fn combined_txs(
     // that page is not a chain cursor. A tx in the pool for some other script
     // must not restart this script's first page.
     let mempool = if asof.is_none() {
-        mempool_page_json(st, sh, after)
+        match mempool_page_json(st, sh, after) {
+            Ok(page) => page,
+            Err(e) => return store_err(e),
+        }
     } else {
         MempoolPage::Absent
     };
@@ -1909,7 +1912,10 @@ pub fn multi_txs(
     let mut mempool_rows = Vec::new();
     if asof.is_none() {
         for sh in &scripts {
-            mempool_rows.extend(mempool_txs_json(st, sh));
+            match mempool_txs_json(st, sh) {
+                Ok(rows) => mempool_rows.extend(rows),
+                Err(e) => return store_err(e),
+            }
         }
         mempool_rows = dedup_txid(mempool_rows);
         sort_txs_newest_first(&mut mempool_rows);
@@ -2256,11 +2262,14 @@ pub async fn address_txs_mempool(
 }
 
 #[doc(hidden)]
-pub fn mempool_txs_json(st: &AppState, sh: &[u8; 32]) -> Vec<Value> {
-    match mempool_page_json(st, sh, None) {
+pub fn mempool_txs_json(
+    st: &AppState,
+    sh: &[u8; 32],
+) -> Result<Vec<Value>, rbitcoin_query::QueryError> {
+    Ok(match mempool_page_json(st, sh, None)? {
         MempoolPage::OnPage(rows) => rows,
         MempoolPage::Absent | MempoolPage::PastPage => Vec::new(),
-    }
+    })
 }
 
 /// Where `after` sits in this script's mempool index.
@@ -2295,56 +2304,67 @@ pub fn txid_on_chain(st: &AppState, id: &[u8; 32]) -> Result<bool, rbitcoin_quer
 /// keeps the tail. A cursor past that page loads nothing and is [`MempoolPage::PastPage`],
 /// so a mempool-only tx is not mistaken for a chain cursor.
 #[doc(hidden)]
-pub fn mempool_page_json(st: &AppState, sh: &[u8; 32], after: Option<[u8; 32]>) -> MempoolPage {
+pub fn mempool_page_json(
+    st: &AppState,
+    sh: &[u8; 32],
+    after: Option<[u8; 32]>,
+) -> Result<MempoolPage, rbitcoin_query::QueryError> {
     let Some(mp) = st.mempool.as_ref() else {
-        return MempoolPage::Absent;
+        return Ok(MempoolPage::Absent);
     };
     if let Some(id) = after {
         if !mempool_indexes(st, sh, &id) {
-            return MempoolPage::Absent;
+            return Ok(MempoolPage::Absent);
         }
     }
     let mut rows = mp.scripthash_mempool_fees(sh);
     rows.truncate(MEMPOOL_TX_PAGE);
     if let Some(id) = after {
         let Some(i) = rows.iter().position(|(txid, _)| *txid == id) else {
-            return MempoolPage::PastPage;
+            return Ok(MempoolPage::PastPage);
         };
         rows.drain(..=i);
     }
     let mut out = Vec::new();
     for (txid, fee) in rows {
-        push_mempool_tx_json(st, mp, txid, fee, &mut out);
+        push_mempool_tx_json(st, mp, txid, fee, &mut out)?;
     }
-    MempoolPage::OnPage(out)
+    Ok(MempoolPage::OnPage(out))
 }
 
 #[doc(hidden)]
+/// The stored row's JSON when the store holds `txid`, else the mempool
+/// copy's. A failed lookup is an error: dropping the row, or showing the
+/// mempool copy of a confirmed tx, would answer a wrong page.
 pub fn push_mempool_tx_json(
     st: &AppState,
     mp: &MempoolHub,
     txid: [u8; 32],
     fee: i64,
     out: &mut Vec<Value>,
-) {
-    if let Ok(Some(fk)) = st.query.tx_fk_by_txid(&txid) {
+) -> Result<(), rbitcoin_query::QueryError> {
+    if let Some(fk) = st.query.tx_fk_by_txid(&txid)? {
         if let Ok(v) = build_tx_json(&st.query, fk, st.network, None) {
             out.push(v);
-            return;
+            return Ok(());
         }
     }
     let id = Txid::from_byte_array(txid);
     let Some(tx) = mp.get_tx(&id) else {
-        return;
+        return Ok(());
     };
     if let Ok(v) = build_tx_json_from_tx(&st.query, &tx, st.network, Some(fee), Some(mp)) {
         out.push(v);
     }
+    Ok(())
 }
 
 #[doc(hidden)]
 pub fn mempool_txs_for_sh(st: &AppState, sh: &[u8; 32]) -> Response {
-    json_reply_here(mempool_txs_json(st, sh))
+    match mempool_txs_json(st, sh) {
+        Ok(rows) => json_reply_here(rows),
+        Err(e) => store_err(e),
+    }
 }
 
 #[derive(Deserialize, Default)]
