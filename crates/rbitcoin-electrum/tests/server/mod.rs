@@ -365,13 +365,42 @@ fn restatus_notes_scans_intermediate_tick_heights() {
     .unwrap();
     q.apply_sh_pending().unwrap();
     let sh = rbitcoin_store::script_hash(&[0x51]);
+    // The load and build meters are debug-only; release builds check the
+    // answers alone.
+    #[cfg(debug_assertions)]
+    {
+        let _ = q.sample_reset_sh_posting_loads();
+        let _ = q.sample_reset_block_touch_builds();
+    }
     let only_tip = restatus_notes(&q, None, &[sh], Some(&[1]));
     assert!(
         only_tip.is_empty(),
         "height 1 does not touch the OP_TRUE script"
     );
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        q.sample_reset_sh_posting_loads(),
+        0,
+        "an untouched subscription loads no posting list"
+    );
+    let again = restatus_notes(&q, None, &[sh], Some(&[1]));
+    assert!(again.is_empty());
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        q.sample_reset_block_touch_builds(),
+        1,
+        "every connection shares one touch set per block"
+    );
     let range = restatus_notes(&q, None, &[sh], Some(&[1, 0]));
     assert_eq!(range.len(), 1, "range must include the height-0 create");
+    // A height whose touch set cannot be read (no block at 7) could have
+    // touched any script, so every subscription is read again.
+    let unreadable = restatus_notes(&q, None, &[sh], Some(&[1, 7]));
+    assert_eq!(
+        unreadable.len(),
+        1,
+        "an unreadable touch set counted as untouched"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

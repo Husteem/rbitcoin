@@ -520,13 +520,14 @@ fn newest_page_gap_obeys_create_cap() {
         q.pending_sh_create_fks(&pending_only).len() == 1,
         "the pending output is not durable yet"
     );
+    let touch = q.block_touch(Height(2)).unwrap();
     assert!(
-        q.scripthash_has_postings(&pending_only).unwrap(),
-        "a pending-only scripthash still has postings"
+        touch.touches(&pending_only),
+        "a block touches a script it pays before that posting is durable"
     );
-    assert!(!q.scripthash_has_postings(&script_hash(&[0x00])).unwrap());
+    assert!(touch.touches(&sh), "the block spends an OP_TRUE output");
+    assert!(!touch.touches(&script_hash(&[0x00])));
     q.apply_sh_pending().unwrap();
-    assert!(q.scripthash_has_postings(&sh).unwrap());
     assert_eq!(q.scripthash_create_count(&sh).unwrap(), 3);
 
     let view = q.pin_sh_chain_view().unwrap().expect("sh view");
@@ -583,6 +584,94 @@ fn newest_page_gap_obeys_create_cap() {
         q.sh_join_probe.disarm();
         q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A block touches the script of each output it spends, not the scripts of
+/// that transaction's other outputs.
+#[test]
+fn block_touch_skips_unspent_siblings() {
+    let (dir, q) = temp_query("touch-siblings");
+    let (h0, mut cb0) = coinbase_block(0, Fk::NULL, None);
+    cb0.tx.output_count = 2;
+    cb0.outputs = vec![
+        OutputRecord::unspent(1, vec![0x56]),
+        OutputRecord::unspent(1, vec![0x55]),
+    ];
+    let parent_txid = cb0.tx.txid;
+    let prev = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let parent = q.block_tx_fks(Height(0)).unwrap()[0];
+    let (h1, cb1) = coinbase_block(1, prev, Some(h0.hash));
+    let mut spend = cb1.clone();
+    spend.tx.txid[31] = 0x5e;
+    spend.outputs = vec![OutputRecord::unspent(1, vec![0x54])];
+    spend.inputs = vec![InputRecord {
+        prev_txid: parent_txid,
+        parent: rbitcoin_store::InputParent::Prevout {
+            create_fk: parent,
+            vout: 0,
+        },
+        sequence: u32::MAX,
+        script_sig: vec![],
+        witness: vec![],
+    }];
+    q.commit_class_a_only(&h1, &[cb1, spend]).unwrap();
+    q.confirm_block(Height(1), &h1.hash).unwrap();
+    let touch = q.block_touch(Height(1)).unwrap();
+    assert!(touch.touches(&script_hash(&[0x56])), "the spent output");
+    assert!(touch.touches(&script_hash(&[0x54])), "a created output");
+    assert!(
+        !touch.touches(&script_hash(&[0x55])),
+        "the parent's unspent output"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static TOUCH_REPLACE: std::cell::RefCell<Option<(HeaderRecord, TxApply)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn replace_tip_during_touch(q: &Query) {
+    let (header, tx) = TOUCH_REPLACE
+        .with(|slot| slot.borrow_mut().take())
+        .expect("replacement block");
+    q.disconnect_tip().unwrap();
+    q.connect_block(Height(1), &header, &[tx]).unwrap();
+}
+
+/// A touch set is the block whose header was read, even when a same-height
+/// reorg lands before the set is built. Keyed by that header's hash, the
+/// replacement's set would hide the old block's scripts if it reconnects.
+#[cfg(debug_assertions)]
+#[test]
+fn block_touch_is_the_block_whose_header_was_read() {
+    let (dir, q) = temp_query("touch-reorg");
+    let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
+    let prev = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let (h1a, mut cb1a) = coinbase_block(1, prev, Some(h0.hash));
+    cb1a.outputs = vec![OutputRecord::unspent(1, vec![0x5a])];
+    q.connect_block(Height(1), &h1a, &[cb1a]).unwrap();
+    let (mut h1b, mut cb1b) = coinbase_block(1, prev, Some(h0.hash));
+    h1b.nonce = h1b.nonce.wrapping_add(1);
+    rehash_header(&mut h1b, &h0.hash);
+    cb1b.tx.txid[5] = 0xbb;
+    cb1b.outputs = vec![OutputRecord::unspent(1, vec![0x5b])];
+    TOUCH_REPLACE.with(|slot| *slot.borrow_mut() = Some((h1b.clone(), cb1b)));
+    rbitcoin_query::scripthash::set_block_touch_hook_for_test(Some(replace_tip_during_touch));
+    let touch = q.block_touch(Height(1)).unwrap();
+    assert!(
+        touch.touches(&script_hash(&[0x5a])),
+        "the block whose header was read"
+    );
+    assert!(
+        !touch.touches(&script_hash(&[0x5b])),
+        "the replacement's set under the old block's hash"
+    );
+    let touch = q.block_touch(Height(1)).unwrap();
+    assert!(touch.touches(&script_hash(&[0x5b])), "the replacement, read again");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
