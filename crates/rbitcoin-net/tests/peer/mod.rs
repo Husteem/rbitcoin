@@ -6851,6 +6851,181 @@ async fn handshake_timeout_after_silence() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn read_peer_version_v2_drops_non_handshake_by_command() {
+    use bitcoin::p2p::message::CommandString;
+    use rbitcoin_net::v2::{open_v2, read_v2_frame, write_v2_msg};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let bind_addr = listener.local_addr().expect("addr");
+    let peers = rbitcoin_net::peers::PeerHub::new();
+
+    let client_early = TcpStream::connect(bind_addr).await.expect("connect");
+    let (server_early, their_early) = listener.accept().await.expect("accept");
+    let peers_early = Arc::clone(&peers);
+    let server_task = tokio::spawn(async move {
+        inbound_connect_and_handshake(
+            server_early,
+            Magic::REGTEST,
+            bind_addr,
+            their_early,
+            0,
+            "/rbitcoin:test/",
+            &peers_early,
+            bind_addr,
+        )
+        .await
+    });
+    let (mut r_early, mut w_early, _, _) = open_v2(client_early, Magic::REGTEST, false)
+        .await
+        .expect("client open_v2");
+    write_v2_msg(&mut w_early, NetworkMessage::Verack)
+        .await
+        .expect("write early verack");
+    assert!(read_v2_frame(&mut r_early, Magic::REGTEST).await.is_err());
+    match server_task.await.expect("server join") {
+        Err(NetError::Protocol("verack before version")) => {}
+        Ok(_) => panic!("verack before version must fail"),
+        Err(e) => panic!("expected verack before version, got {e}"),
+    }
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let version = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 42,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let mut bogus_block = vec![0u8; 80];
+    bogus_block.push(0xff);
+    bogus_block.extend_from_slice(&u64::MAX.to_le_bytes());
+    let mut bogus_tx = vec![2, 0, 0, 0, 0xff];
+    bogus_tx.extend_from_slice(&u64::MAX.to_le_bytes());
+
+    let client = TcpStream::connect(bind_addr).await.expect("connect");
+    let (server, their) = listener.accept().await.expect("accept");
+    let peers_ok = Arc::clone(&peers);
+    let ok_task = tokio::spawn(async move {
+        inbound_connect_and_handshake(
+            server,
+            Magic::REGTEST,
+            bind_addr,
+            their,
+            0,
+            "/rbitcoin:test/",
+            &peers_ok,
+            bind_addr,
+        )
+        .await
+    });
+    let (mut r, mut w, _, _) = open_v2(client, Magic::REGTEST, false)
+        .await
+        .expect("client open_v2");
+    for (cmd, payload) in [("block", bogus_block), ("tx", bogus_tx), ("ping", vec![1])] {
+        write_v2_msg(
+            &mut w,
+            NetworkMessage::Unknown {
+                command: CommandString::try_from_static(cmd).expect(cmd),
+                payload,
+            },
+        )
+        .await
+        .expect("write pre-version frame");
+    }
+    write_v2_msg(&mut w, NetworkMessage::Version(version))
+        .await
+        .expect("write version");
+    loop {
+        let frame = read_v2_frame(&mut r, Magic::REGTEST)
+            .await
+            .expect("server handshake frame");
+        if framed_cmd(&frame) == "verack" {
+            break;
+        }
+    }
+    write_v2_msg(&mut w, NetworkMessage::Verack)
+        .await
+        .expect("write verack");
+    let (got_version, _, _, _, _) = ok_task
+        .await
+        .expect("server join")
+        .expect("handshake must succeed");
+    assert_eq!(got_version.nonce, 42);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn run_feeler_inner_drops_non_version_by_command() {
+    use bitcoin::p2p::message::CommandString;
+    use rbitcoin_net::v2::{open_v2, read_v2_frame, write_v2_msg};
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let version = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 42,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let mut bogus_block = vec![0u8; 80];
+    bogus_block.push(0xff);
+    bogus_block.extend_from_slice(&u64::MAX.to_le_bytes());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let bind_addr = listener.local_addr().expect("addr");
+    let client = TcpStream::connect(bind_addr).await.expect("connect");
+    let (server, _) = listener.accept().await.expect("accept");
+
+    let peer_task = tokio::spawn(async move {
+        let (mut r, mut w, _, _) = open_v2(server, Magic::REGTEST, true)
+            .await
+            .expect("server open_v2");
+        let frame = read_v2_frame(&mut r, Magic::REGTEST)
+            .await
+            .expect("feeler version");
+        assert_eq!(framed_cmd(&frame), "version");
+        write_v2_msg(
+            &mut w,
+            NetworkMessage::Unknown {
+                command: CommandString::try_from_static("block").expect("block"),
+                payload: bogus_block,
+            },
+        )
+        .await
+        .expect("write oversize-count block");
+        write_v2_msg(&mut w, NetworkMessage::Version(version))
+            .await
+            .expect("write version");
+        (r, w)
+    });
+
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let res = run_feeler_inner(
+        client,
+        Magic::REGTEST,
+        bind_addr,
+        bind_addr,
+        0,
+        "/rbitcoin:test/",
+        peers.as_ref(),
+    )
+    .await;
+    let _keep = peer_task.await.expect("peer task");
+    res.expect("feeler must ignore non-version frames by command");
+}
+
 /// GetData witness bytes must leave the writer before a queued header flood.
 #[test]
 fn outbound_write_batch_sends_getdata_before_headers() {

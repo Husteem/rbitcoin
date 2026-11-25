@@ -321,28 +321,67 @@ async fn p2p_v1_wallet_sync_listener() {
         let _ = flood.write_all(&burst).await;
         closed(&mut flood).await;
 
-        // Before verack, a `tx` whose input count cannot fit its payload is
-        // refused before decode allocates, as after the handshake.
+        let unknown_frame = |cmd: &'static str, payload: Vec<u8>| {
+            v1_frame(
+                Magic::REGTEST,
+                NetworkMessage::Unknown {
+                    command: bitcoin::p2p::message::CommandString::try_from_static(cmd).expect(cmd),
+                    payload,
+                },
+            )
+        };
+
+        // Before verack, non-handshake commands do not decode or close.
+        let mut huge_block = vec![0u8; 80];
+        huge_block.push(0xff);
+        huge_block.extend_from_slice(&u64::MAX.to_le_bytes());
+        let mut huge = vec![2, 0, 0, 0, 0xff];
+        huge.extend_from_slice(&u64::MAX.to_le_bytes());
         let mut early = TcpStream::connect(v1_bind).await.unwrap();
         let ours = early.local_addr().unwrap();
         early
             .write_all(&v1_frame(Magic::REGTEST, v1_version(v1_bind, ours, 70016)))
             .await
             .unwrap();
-        let mut huge = vec![2, 0, 0, 0, 0xff];
-        huge.extend_from_slice(&u64::MAX.to_le_bytes());
-        early
-            .write_all(&v1_frame(
-                Magic::REGTEST,
-                NetworkMessage::Unknown {
-                    command: bitcoin::p2p::message::CommandString::try_from_static("tx")
-                        .expect("tx"),
-                    payload: huge,
-                },
-            ))
-            .await
-            .unwrap();
-        closed(&mut early).await;
+        let (theirs, _) = v1_until(&mut early, |m| matches!(m, NetworkMessage::Version(_))).await;
+        assert!(matches!(theirs, NetworkMessage::Version(_)));
+        let (_, _) = v1_until(&mut early, |m| matches!(m, NetworkMessage::Verack)).await;
+        for (cmd, payload) in [
+            ("block", huge_block),
+            ("tx", huge.clone()),
+            ("addr", vec![0xff; 9]),
+            ("sendtxrcncl", vec![1, 2, 3, 4]),
+        ] {
+            early.write_all(&unknown_frame(cmd, payload)).await.unwrap();
+        }
+        for msg in [
+            NetworkMessage::WtxidRelay,
+            NetworkMessage::SendAddrV2,
+            NetworkMessage::Ping(9),
+            NetworkMessage::Verack,
+            NetworkMessage::Ping(77),
+        ] {
+            early
+                .write_all(&v1_frame(Magic::REGTEST, msg))
+                .await
+                .unwrap();
+        }
+        let (pong, _) = v1_until(&mut early, |m| matches!(m, NetworkMessage::Pong(_))).await;
+        assert_eq!(pong, NetworkMessage::Pong(77));
+        let early_peer = node
+            .peers
+            .live_peers()
+            .into_iter()
+            .find(|p| p.addr == ours)
+            .expect("early peer session");
+        assert!(early_peer.wtxid_relay());
+        assert!(early_peer.wants_addrv2());
+        drop(early);
+
+        // After verack, an oversize-count tx still closes the session.
+        let mut bad_tx = v1_handshake(v1_bind).await;
+        bad_tx.write_all(&unknown_frame("tx", huge)).await.unwrap();
+        closed(&mut bad_tx).await;
 
         // `--listen=0` starts the node outbound-only, and the v1 bind is its
         // only listener. A relaying wallet there must outlive the handshake.
