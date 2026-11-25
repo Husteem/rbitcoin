@@ -2569,8 +2569,8 @@ fn pad_tip(pad: &PoolPad, height: u32, reorg_from_height: Option<u32>) {
         .unwrap();
 }
 
-/// A lagged tip channel can hide a same-height reorg, so the next tip
-/// restatuses every subscription, even at the next height.
+/// A lagged tip channel can hide a same-height reorg, so the lag itself
+/// restatuses every subscription before the queued tips push their headers.
 #[tokio::test]
 async fn tip_after_a_lag_restatuses_every_outpoint() {
     let mut pad = pool_pad().await;
@@ -2596,12 +2596,12 @@ async fn tip_after_a_lag_restatuses_every_outpoint() {
     }
     drop(held);
     let push = pad.read().await;
-    assert_eq!(push["params"][0]["height"], 2, "{push}");
-    let push = pad.read().await;
     assert_eq!(
         push["method"], "blockchain.outpoint.subscribe",
-        "the tip after a lag skipped an untouched outpoint: {push}"
+        "the lag skipped an untouched outpoint: {push}"
     );
+    let push = pad.read().await;
+    assert_eq!(push["params"][0]["height"], 2, "{push}");
     let _ = std::fs::remove_dir_all(&pad.dir);
 }
 
@@ -4712,6 +4712,49 @@ async fn sp_reorg_to_a_lower_tip_rewinds_the_scan() {
     assert_eq!(progress, [1.0]);
     assert_eq!(sp_heights(&history), [9]);
     s.assert_quiet(3).await;
+}
+
+/// A lagged tip channel can drop a reorg. The last tip the session handled
+/// is no longer on the chain, so the session treats the lag as a reorg below
+/// its live subscriptions and scans again: height 9's payment, already sent,
+/// is sent again from the new chain.
+#[tokio::test]
+async fn sp_lagged_tip_events_rescan_below_a_replaced_tip() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-lag", 10, &[9]);
+    let mut s = sp_session(&chain.q);
+    let reply = s.ask(&[sp_subscribe_line(1, chain.sub(json!(0)))]).await;
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(sp_heights(&history), [9]);
+
+    // A tip at 10 whose block the chain no longer holds.
+    let mut gone = chain.q.wire_header_at_height(Height(10)).unwrap();
+    gone.nonce = gone.nonce.wrapping_add(1);
+    s.tip_tx
+        .send(TipNotify {
+            height: 10,
+            header_hex: header_hex(&gone),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    s.assert_quiet(2).await;
+
+    // More events than the channel holds: the reorg among them is lost.
+    let tip = TipNotify {
+        height: 10,
+        header_hex: header_hex(&chain.q.wire_header_at_height(Height(10)).unwrap()),
+        reorg_from_height: None,
+    };
+    for _ in 0..12 {
+        s.tip_tx.send(tip.clone()).unwrap();
+    }
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(
+        sp_heights(&history),
+        [9],
+        "the lag rescans below the lost tip"
+    );
 }
 
 /// A range scan cut short by a reorg ends at the new tip. Blocks that
