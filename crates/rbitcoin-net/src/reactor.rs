@@ -3,6 +3,7 @@
 //! Tokio names both multi-thread workers and `spawn_blocking` threads
 //! `tokio-rt-worker`. Blocking-pool work must enter [`BlockingRegion`].
 
+use rbitcoin_query::StorePermit;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -10,10 +11,12 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 tokio::task_local! {
     static API_STORE_BUDGET: Arc<Semaphore>;
+    /// The surface's share of [`API_STORE_BUDGET`] ([`with_store_share`]).
+    static API_STORE_SHARE: Arc<Semaphore>;
     /// [`rbitcoin_query::Query::heavy_sh_join`] for [`armed_blocking`].
     static API_HEAVY_TURN: Arc<Semaphore>;
     #[cfg(debug_assertions)]
@@ -22,7 +25,7 @@ tokio::task_local! {
 
 thread_local! {
     static BLOCKING_DEPTH: Cell<u32> = const { Cell::new(0) };
-    static HELD_STORE_PERMIT: RefCell<Option<OwnedSemaphorePermit>> = const { RefCell::new(None) };
+    static HELD_STORE_PERMIT: RefCell<Option<StorePermit>> = const { RefCell::new(None) };
 }
 
 /// Guard: this OS thread may take std locks / store IO (blocking pool or tests).
@@ -125,6 +128,13 @@ pub async fn with_store_budget<R>(budget: Arc<Semaphore>, fut: impl Future<Outpu
     API_STORE_BUDGET.scope(budget, fut).await
 }
 
+/// Run `fut` with its API surface's share of the armed budget
+/// ([`rbitcoin_query::Query::api_read_share`]): each armed permit takes a
+/// share permit first.
+pub async fn with_store_share<R>(share: Arc<Semaphore>, fut: impl Future<Output = R>) -> R {
+    API_STORE_SHARE.scope(share, fut).await
+}
+
 /// Run `fut` with the node's heavy scripthash turn armed for
 /// [`armed_blocking`].
 pub async fn with_heavy_turn<R>(turn: Arc<Semaphore>, fut: impl Future<Output = R>) -> R {
@@ -182,17 +192,25 @@ pub fn finish_join<T>(joined: Result<T, tokio::task::JoinError>, cancel: &'stati
     }
 }
 
-/// `tokio::spawn` does not keep the task-local budget or heavy turn. Copy
-/// them into the child so a detached admit still waits for a store permit.
+/// `tokio::spawn` does not keep the task-local budget, share or heavy turn.
+/// Copy them into the child so a detached admit still waits for a store
+/// permit.
 pub fn spawn_with_store_budget<T: Send + 'static>(
     fut: impl Future<Output = T> + Send + 'static,
 ) -> tokio::task::JoinHandle<T> {
     let budget = API_STORE_BUDGET.try_with(Arc::clone).ok();
+    let share = API_STORE_SHARE.try_with(Arc::clone).ok();
     let turn = API_HEAVY_TURN.try_with(Arc::clone).ok();
     tokio::spawn(async move {
         let fut = async move {
             match turn {
                 Some(turn) => with_heavy_turn(turn, fut).await,
+                None => fut.await,
+            }
+        };
+        let fut = async move {
+            match share {
+                Some(share) => with_store_share(share, fut).await,
                 None => fut.await,
             }
         };
@@ -221,7 +239,7 @@ where
     T: Send + 'static,
     F: FnMut(Option<T>) -> T + Send + 'static,
     P: FnMut() -> Fut,
-    Fut: Future<Output = Option<OwnedSemaphorePermit>>,
+    Fut: Future<Output = Option<StorePermit>>,
 {
     let mut prev = None;
     let mut grant = None;
@@ -253,24 +271,30 @@ pub async fn armed_blocking<T: Send + 'static>(
     blocking_heavy_turn(turn.as_ref(), acquire_armed_store_budget, f).await
 }
 
-/// One permit of the armed budget, or `None` when this task has no budget.
-/// The wait is async. The caller moves the permit into the read so a dropped
-/// request does not release it while the read still runs.
-pub async fn acquire_armed_store_budget() -> Option<OwnedSemaphorePermit> {
+/// One permit of the armed budget, after one of the armed share when the
+/// task has one, or `None` when this task has no budget. The waits are
+/// async. The caller moves the permit into the read so a dropped request
+/// does not release it while the read still runs.
+pub async fn acquire_armed_store_budget() -> Option<StorePermit> {
     let Ok(sem) = API_STORE_BUDGET.try_with(Arc::clone) else {
         return None;
     };
-    match Arc::clone(&sem).try_acquire_owned() {
-        Ok(permit) => Some(permit),
+    let share = match API_STORE_SHARE.try_with(Arc::clone) {
+        Ok(share) => Some(share.acquire_owned().await.expect("store share")),
+        Err(_) => None,
+    };
+    let budget = match Arc::clone(&sem).try_acquire_owned() {
+        Ok(permit) => permit,
         Err(_) => {
             #[cfg(debug_assertions)]
             let _waiting = STORE_BUDGET_WAITERS
                 .try_with(Arc::clone)
                 .ok()
                 .map(StoreBudgetWait::enter);
-            Some(sem.acquire_owned().await.expect("store budget"))
+            sem.acquire_owned().await.expect("store budget")
         }
-    }
+    };
+    Some(StorePermit::new(share, budget))
 }
 
 /// Park `permit` on this thread. [`release_store_permit`] drops it before
@@ -279,7 +303,7 @@ pub async fn acquire_armed_store_budget() -> Option<OwnedSemaphorePermit> {
 pub struct StorePermitGuard;
 
 #[doc(hidden)]
-pub fn hold_store_permit(permit: Option<OwnedSemaphorePermit>) -> StorePermitGuard {
+pub fn hold_store_permit(permit: Option<StorePermit>) -> StorePermitGuard {
     HELD_STORE_PERMIT.with(|slot| {
         *slot.borrow_mut() = permit;
     });

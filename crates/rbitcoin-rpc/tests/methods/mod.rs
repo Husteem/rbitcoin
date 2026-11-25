@@ -8843,7 +8843,6 @@ fn http_request_task_methods_mine_and_accept_a_package() {
         cookie: None,
         work_queue: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         rest_queue: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-        rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
         rest_reply_bytes: rbitcoin_rpc::server::ReplyBytes::new(
             rbitcoin_rpc::server::REST_REPLY_BYTES,
         ),
@@ -8999,7 +8998,6 @@ fn http_request_task_methods_mine_and_accept_a_package() {
                 cookie: None,
                 work_queue: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
                 rest_queue: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-                rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
                 rest_reply_bytes: rbitcoin_rpc::server::ReplyBytes::new(
                     rbitcoin_rpc::server::REST_REPLY_BYTES,
                 ),

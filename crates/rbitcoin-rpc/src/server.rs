@@ -42,7 +42,7 @@ use rbitcoin_log::info;
 use rbitcoin_log::warn;
 use rbitcoin_net::{BlockingRegion, MempoolHub};
 use rbitcoin_primitives::Network;
-use rbitcoin_query::Query;
+use rbitcoin_query::{ApiSurface, Query, StorePermit};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 #[cfg(debug_assertions)]
@@ -232,21 +232,10 @@ pub struct AppState {
     pub work_queue: Arc<tokio::sync::Semaphore>,
     /// Separate from [`Self::work_queue`]. REST must not take an RPC slot.
     pub rest_queue: Arc<tokio::sync::Semaphore>,
-    /// REST's share of the store-read budget, taken before a budget permit,
-    /// so REST alone can never hold every permit Electrum, Esplora and RPC
-    /// read through.
-    pub rest_store: Arc<tokio::sync::Semaphore>,
     /// Built REST reply bytes not yet written. [`REST_REPLY_BYTES`] in a server.
     pub rest_reply_bytes: ReplyBytes,
     pub rest: bool,
     pub require_auth: bool,
-}
-
-/// REST may hold at most half of the store-read budget (at least one
-/// permit), so Electrum, Esplora and RPC always keep the rest.
-#[doc(hidden)]
-pub fn rest_store_share(budget: usize) -> usize {
-    (budget / 2).max(1)
 }
 
 /// A byte budget shared by the replies it was built for. One permit is one
@@ -359,9 +348,6 @@ pub async fn run_rpc(
     let n = work_queue_permits(config.work_queue);
     let work_queue = Arc::new(tokio::sync::Semaphore::new(n));
     let rest_queue = Arc::new(tokio::sync::Semaphore::new(DEFAULT_RPC_WORK_QUEUE));
-    let rest_store = Arc::new(tokio::sync::Semaphore::new(rest_store_share(
-        ctx.query.api_read_budget_size(),
-    )));
     let rest_reply_bytes = ReplyBytes::new(REST_REPLY_BYTES);
     let shutdown = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, _) = tokio::sync::watch::channel(());
@@ -392,7 +378,6 @@ pub async fn run_rpc(
             cookie: cookie.clone(),
             work_queue: work_queue.clone(),
             rest_queue: rest_queue.clone(),
-            rest_store: rest_store.clone(),
             rest_reply_bytes: rest_reply_bytes.clone(),
             rest: config.rest,
             require_auth: true,
@@ -449,7 +434,6 @@ pub async fn run_rpc(
             cookie,
             work_queue,
             rest_queue,
-            rest_store,
             rest_reply_bytes,
             rest: config.rest,
             require_auth: false,
@@ -540,17 +524,10 @@ pub async fn rest_entry(State(state): State<AppState>, req: axum::extract::Reque
         return rest_queue_full();
     };
     let ctx = Arc::clone(&state.ctx);
-    // REST's share first, then a budget permit: REST alone cannot take every
-    // permit the other readers share.
-    let share = Arc::clone(&state.rest_store)
-        .acquire_owned()
-        .await
-        .expect("REST store share");
-    let store_permit = acquire_store_budget(&ctx).await;
+    let store_permit = acquire_store_budget(&ctx, ApiSurface::Rest).await;
     let reply = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         let _store = store_permit;
-        let _share = share;
         crate::methods::dispatch_rest(&ctx, &path, &query, &body)
     })
     .await
@@ -857,16 +834,25 @@ fn store_budget_waiters(ctx: &RpcContext) -> Arc<AtomicUsize> {
     )
 }
 
-async fn acquire_store_budget(ctx: &RpcContext) -> tokio::sync::OwnedSemaphorePermit {
+/// `surface`'s share permit, then a budget permit: one surface alone cannot
+/// take every permit the other readers share.
+async fn acquire_store_budget(ctx: &RpcContext, surface: ApiSurface) -> StorePermit {
+    let share = ctx
+        .query
+        .api_read_share(surface)
+        .acquire_owned()
+        .await
+        .expect("store share");
     let budget = ctx.query.api_read_budget();
-    match Arc::clone(&budget).try_acquire_owned() {
+    let budget = match Arc::clone(&budget).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             #[cfg(debug_assertions)]
             let _waiting = rbitcoin_net::StoreBudgetWait::enter(store_budget_waiters(ctx));
             budget.acquire_owned().await.expect("store budget")
         }
-    }
+    };
+    StorePermit::new(Some(share), budget)
 }
 
 async fn read_http_body(req: Request) -> Result<Bytes, Response> {
@@ -1007,12 +993,14 @@ pub async fn rpc_post(State(state): State<AppState>, req: Request) -> Response {
         || http_body_has_template(&parsed)
     {
         let budget = ctx.query.api_read_budget();
+        let share = ctx.query.api_read_share(ApiSurface::Rpc);
         #[cfg(debug_assertions)]
         let waiters = store_budget_waiters(&ctx);
         let rpc = exec_http_rpc_async(ctx, parsed, &state.work_queue);
         #[cfg(debug_assertions)]
         let rpc = rbitcoin_net::with_store_budget_waiters(waiters, rpc);
-        let out = rbitcoin_net::with_store_budget(budget, rpc).await;
+        let rpc = rbitcoin_net::with_store_budget(budget, rpc);
+        let out = rbitcoin_net::with_store_share(share, rpc).await;
         return match out {
             Err(()) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1037,7 +1025,7 @@ pub async fn rpc_post(State(state): State<AppState>, req: Request) -> Response {
     // never reads it does not wait, so a full disk budget still answers
     // `getblockcount`.
     let store_permit = if http_body_reads_store(&parsed) {
-        Some(acquire_store_budget(&ctx).await)
+        Some(acquire_store_budget(&ctx, ApiSurface::Rpc).await)
     } else {
         None
     };

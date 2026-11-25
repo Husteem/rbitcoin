@@ -2286,6 +2286,37 @@ async fn coin_reads_refuse_while_the_pool_is_held() {
     let _ = std::fs::remove_dir_all(&pad.dir);
 }
 
+/// Electrum reads take Electrum's share of the store-read budget before a
+/// budget permit. With the share held, a read waits although the budget has
+/// room, so Electrum clients alone never hold every permit; it answers once
+/// the share is free.
+#[tokio::test]
+async fn electrum_reads_wait_on_their_share_of_the_store_budget() {
+    let mut pad = pool_pad().await;
+    pad.q.set_api_read_budget(2);
+    let share = pad.q.api_read_share(rbitcoin_query::ApiSurface::Electrum);
+    assert_eq!(share.available_permits(), 1, "half of a budget of two");
+    let held = share.acquire_owned().await.unwrap();
+    let req = json!({"jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.get_balance",
+        "params":[pad.sh.clone()]});
+    let mut line = serde_json::to_string(&req).unwrap();
+    line.push('\n');
+    pad.client
+        .get_mut()
+        .write_all(line.as_bytes())
+        .await
+        .unwrap();
+    let mut early = String::new();
+    let waited =
+        tokio::time::timeout(Duration::from_millis(300), pad.client.read_line(&mut early)).await;
+    assert!(waited.is_err(), "answered with the share held: {early}");
+    assert_eq!(pad.q.api_read_budget().available_permits(), 2);
+    drop(held);
+    let bal = pad.read().await;
+    assert_eq!(bal["result"]["confirmed"], 1, "{bal}");
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
 /// A reorg holds the template mark until its disconnected txs are back in
 /// the pool. A tick that sees the watermark walk back in that hold pushes
 /// nothing.

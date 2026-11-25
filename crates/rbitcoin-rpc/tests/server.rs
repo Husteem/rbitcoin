@@ -1878,7 +1878,6 @@ async fn empty_work_queue_is_http_503() {
         cookie: None,
         work_queue: Arc::new(Semaphore::new(0)),
         rest_queue: Arc::new(Semaphore::new(1)),
-        rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
         rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: true,
@@ -2049,7 +2048,6 @@ async fn batch_waits_to_retake_the_queue_after_a_long_poll() {
         cookie: None,
         work_queue: Arc::clone(&work_queue),
         rest_queue: Arc::new(Semaphore::new(1)),
-        rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
         rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: true,
@@ -2117,7 +2115,6 @@ async fn full_work_queue_is_503_before_the_store_budget() {
         cookie: None,
         work_queue: Arc::new(Semaphore::new(0)),
         rest_queue: Arc::new(Semaphore::new(1)),
-        rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
         rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: true,
@@ -2149,7 +2146,6 @@ async fn long_poll_queue_full_is_503_before_the_store_budget() {
         cookie: None,
         work_queue: Arc::new(Semaphore::new(0)),
         rest_queue: Arc::new(Semaphore::new(1)),
-        rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
         rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: true,
@@ -2179,14 +2175,12 @@ async fn rest_waits_on_its_share_before_the_store_budget() {
     ctx.query.set_api_read_budget(2);
     let budget = ctx.query.api_read_budget();
     let hold = budget.clone().acquire_many_owned(2).await.expect("permits");
-    let rest_store = Arc::new(Semaphore::new(1));
     let state = || AppState {
         ctx: Arc::clone(&ctx),
         auth: RpcAuth::new("test-token"),
         cookie: None,
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(4)),
-        rest_store: Arc::clone(&rest_store),
         rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: true,
         require_auth: false,
@@ -2221,8 +2215,8 @@ async fn rest_waits_on_its_share_before_the_store_budget() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-    assert_eq!(rest_store_share(1), 1);
-    assert_eq!(rest_store_share(7), 3);
+    assert_eq!(rbitcoin_query::api_read_share_size(1), 1);
+    assert_eq!(rbitcoin_query::api_read_share_size(7), 3);
     // The share is sized from the configured budget, not from what happens
     // to be free when the listener binds.
     ctx.query.set_api_read_budget(8);
@@ -2233,8 +2227,62 @@ async fn rest_waits_on_its_share_before_the_store_budget() {
         .await
         .expect("permits");
     assert_eq!(ctx.query.api_read_budget_size(), 8);
-    assert_eq!(rest_store_share(ctx.query.api_read_budget_size()), 4);
+    assert_eq!(
+        rbitcoin_query::api_read_share_size(ctx.query.api_read_budget_size()),
+        4
+    );
     drop(busy);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// JSON-RPC takes its own share of the store-read budget first, as REST
+/// does: with a budget of two (a share of one), a second store-reading call
+/// waits on the share, not on the budget, so RPC can never hold every permit
+/// Electrum, Esplora and REST read through.
+#[tokio::test]
+async fn rpc_waits_on_its_share_before_the_store_budget() {
+    let (ctx, dir) = http_wait_ctx();
+    ctx.query.set_api_read_budget(2);
+    let budget = ctx.query.api_read_budget();
+    let hold = budget.clone().acquire_many_owned(2).await.expect("permits");
+    let state = || AppState {
+        ctx: Arc::clone(&ctx),
+        auth: RpcAuth::new("test-token"),
+        cookie: None,
+        work_queue: Arc::new(Semaphore::new(4)),
+        rest_queue: Arc::new(Semaphore::new(4)),
+        rest: false,
+        require_auth: false,
+    };
+    let post = |st: AppState| {
+        tokio::spawn(rpc_post(
+            State(st),
+            axum::extract::Request::new(Body::from(
+                br#"{"jsonrpc":"1.0","id":1,"method":"getblockhash","params":[0]}"#.as_slice(),
+            )),
+        ))
+    };
+    let a = post(state());
+    let b = post(state());
+    wait_for_store_budget(&ctx).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let waiters = {
+        let active = ctx.active.lock().unwrap_or_else(|err| err.into_inner());
+        Arc::clone(&active.store_budget_waiters)
+    };
+    assert_eq!(
+        waiters.load(Ordering::SeqCst),
+        1,
+        "only RPC's share waits on the store budget"
+    );
+    drop(hold);
+    for r in [a, b] {
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r)
+            .await
+            .expect("RPC finishes")
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2252,7 +2300,6 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         cookie: None,
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(1)),
-        rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
         rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
@@ -2275,7 +2322,6 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         cookie: None,
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(1)),
-        rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
         rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
@@ -2303,7 +2349,6 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         cookie: None,
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(1)),
-        rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
         rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
@@ -2360,7 +2405,6 @@ fn store_budget_wait_does_not_need_a_pool_thread() {
             cookie: None,
             work_queue: Arc::new(Semaphore::new(4)),
             rest_queue: Arc::new(Semaphore::new(1)),
-            rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
             rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
             rest: false,
             require_auth: false,
@@ -2622,7 +2666,6 @@ pub(crate) fn gbt_app(ctx: Arc<rbitcoin_rpc::methods::RpcContext>) -> AppState {
         cookie: None,
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(1)),
-        rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
         rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
@@ -3813,7 +3856,6 @@ async fn earlier_wait_reports_the_tip_from_when_it_finished() {
         cookie: None,
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(1)),
-        rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
         rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
