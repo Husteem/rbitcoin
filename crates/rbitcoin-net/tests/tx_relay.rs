@@ -8579,3 +8579,28 @@ async fn inv_size_bucket_stops_at_the_floor_and_resumes() {
     let _ = out_cursor;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A package member that a real admit put in the pool after its own test
+/// counts once, through its pool cluster. With `x` and `a` pooled, `[a, b]`
+/// makes a cluster of three, not four.
+#[test]
+fn package_cluster_check_counts_a_member_pooled_since_its_test_once() {
+    let (_store, q, cbs) = pad_cbs(3);
+    let mp_dir = tmp();
+    let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+    let spk = || ScriptBuf::from_bytes(vec![0x51]);
+    let x = spend_true(cbs[0], 1_000, spk());
+    let a = spend_true(x.compute_txid(), 2_000, spk());
+    let b = spend_true(a.compute_txid(), 3_000, spk());
+    hub.admit(&x).expect("admit x");
+    hub.admit(&a).expect("admit a");
+    hub.set_cluster_limits(Some(3), None);
+    let pkg = [a.clone(), b.clone()];
+    assert!(hub.package_clusters_over_cap(&pkg).is_empty());
+    hub.set_cluster_limits(Some(2), None);
+    assert_eq!(
+        hub.package_clusters_over_cap(&pkg),
+        std::collections::BTreeSet::from([1])
+    );
+    let _ = std::fs::remove_dir_all(&mp_dir);
+}

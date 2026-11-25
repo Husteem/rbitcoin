@@ -7004,7 +7004,9 @@ impl MempoolHub {
     /// the pool that exceeds the count or size cap. Members share a cluster
     /// through a spend inside `txs` or a pool cluster both spend from. A
     /// member that touches neither is a cluster of its own. `txs` are the
-    /// package members that passed their own checks, none of them pooled.
+    /// package members that passed their own checks. One a real admit has
+    /// pooled since is asked under the same read lock and counts once,
+    /// through its pool cluster, so it is never reported.
     pub fn package_clusters_over_cap(&self, txs: &[bitcoin::Transaction]) -> BTreeSet<usize> {
         fn root(group: &mut [usize], mut i: usize) -> usize {
             while group[i] != i {
@@ -7013,18 +7015,24 @@ impl MempoolHub {
             }
             i
         }
-        let index: HashMap<Txid, usize> = txs
+        let g = self.lock_read();
+        let ids: Vec<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
+        let pooled: Vec<bool> = ids.iter().map(|id| g.graph.contains(id)).collect();
+        let index: HashMap<Txid, usize> = ids
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.compute_txid(), i))
+            .filter(|(i, _)| !pooled[*i])
+            .map(|(i, id)| (*id, i))
             .collect();
-        let g = self.lock_read();
         let mut group: Vec<usize> = (0..txs.len()).collect();
         let mut pool_parents = vec![BTreeSet::new(); txs.len()];
         let mut first_spender: HashMap<Txid, usize> = HashMap::new();
         // One component walk per distinct pool parent, not per input.
         let mut rep_of: HashMap<Txid, Option<Txid>> = HashMap::new();
         for (i, tx) in txs.iter().enumerate() {
+            if pooled[i] {
+                continue;
+            }
             for inp in &tx.input {
                 let pid = inp.previous_output.txid;
                 let joined = if let Some(&j) = index.get(&pid) {
@@ -7044,6 +7052,9 @@ impl MempoolHub {
         }
         let mut clusters: BTreeMap<usize, (BTreeSet<Txid>, Vec<usize>, u64)> = BTreeMap::new();
         for (i, tx) in txs.iter().enumerate() {
+            if pooled[i] {
+                continue;
+            }
             let c = clusters.entry(root(&mut group, i)).or_default();
             c.0.append(&mut pool_parents[i]);
             c.1.push(i);

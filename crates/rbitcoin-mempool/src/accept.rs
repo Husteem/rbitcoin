@@ -2104,6 +2104,11 @@ impl ActiveMempool {
 
         let tested = TestedMembers::of(&prep.tested);
         let scan = self.scan_conflicts_and_parents(txid, tx, &prep.chain_coins, tested)?;
+        // A package dry run may not replace. Prepare asks before the coins;
+        // this asks again after scripts, when a conflict may have arrived.
+        if prep.tested.is_some() && !scan.direct_conflicts.is_empty() {
+            return Err(AcceptError::Policy("bip125-replacement-disallowed"));
+        }
 
         let fee_sat = prep.fee_sat;
         let weight =

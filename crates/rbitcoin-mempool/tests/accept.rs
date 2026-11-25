@@ -605,6 +605,42 @@ fn prepare_admit_refuses_a_vout_past_a_tested_member() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A package dry-run member may not replace. A conflict that enters the
+/// pool while the member's scripts run is refused after scripts too, not
+/// reported as a replacement.
+#[test]
+fn package_dry_run_member_refuses_a_conflict_that_arrives_during_scripts() {
+    let dir = tmp_dir();
+    let (op, _, utxos) = chain_utxo(100_000);
+    let low = spend_tx(op, 99_000);
+    let high = spend_tx(op, 50_000);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let prep = mp
+        .prepare_admit(
+            &high,
+            &utxos,
+            TIP_OK,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: true,
+                min_relay: None,
+                waive: false,
+                sibling_eviction: SiblingEviction::Off,
+                tested: Some(Arc::new(TestedMembers::default())),
+            },
+        )
+        .expect("no conflict yet");
+    mp.accept_tx(&low, &utxos, TIP_OK).unwrap();
+    let err = mp
+        .evaluate_after_script(&high, prep)
+        .expect_err("a dry-run member may not replace");
+    assert!(
+        err == AcceptError::Policy("bip125-replacement-disallowed"),
+        "got {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Consensus script check must reject spends of real templates with empty witness.
 /// (Regression: accept used to skip verify and only apply Libre policy.)
 #[test]
