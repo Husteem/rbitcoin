@@ -74,7 +74,7 @@ Timeout **45 minutes** (i2pd tunnel build on a tiny net is the long pole).
 3. **I2P SAM** — A/B `--i2p-sam --only-net i2p`; B `--i2p-accept-incoming`. B's `getnetworkinfo` address is the `.b32.i2p:0` hash of the public Destination in `p2p.priv` (not a private re-encode of the whole key file). A STREAM CONNECTs to that name. `getpeerinfo` is `i2p` / v2 and has received `addrv2`.
 4. **CJDNS TUN** — A/B `--cjdns-reachable` on real `fc00::/8`. `getpeerinfo.network=cjdns` on both sides. `getnetworkinfo.localaddresses` lists each TUN address without `--external-ip`. TUN create failure is a hard fail.
 5. **Ephemeral broadcast** — A `--proxy` (real Tor SOCKS); standing onion peer to B; `sendrawtransaction`; standing session must not INV that tx; a one-shot circuit delivers `tx`.
-6. **Tor restart** — B `--listen-onion --tor-control`; restart the client tor under B. B lists the same onion again, it is reachable over SOCKS, and A then syncs from it. B is not restarted.
+6. **Tor restart** — B `--listen-onion --tor-control`; restart the client tor under B. B lists the same onion again. The journey waits for `HS_DESC UPLOADED` on that service, then checks it over SOCKS, and A syncs from it. A SOCKS connect before the upload caches the descriptor from the tor that just exited. B is not restarted.
 7. **i2pd restart** — B `--i2p-accept-incoming` on SAM B; restart that i2pd router under B. B lists the same `.b32.i2p` again, a SAM stream reaches it, and A then syncs from it.
 8. **cjdroute restart** — B listens on its `fc00::/8` address; restart B's cjdroute. A then connects to B over cjdns and syncs. The listener is kept across the restart.
 

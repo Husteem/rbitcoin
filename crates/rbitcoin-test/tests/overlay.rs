@@ -12,8 +12,8 @@ use rbitcoin_test::mine::spend_anyone_can_spend;
 use rbitcoin_test::overlay::{
     base_node, ephemeral_addr, i2p_b32_from_dest, jsonrpc, jsonrpc_try, localaddresses,
     require_env, restart_daemon, socks_electrum_rpc, socks_http_get, spawn_node, wait_file,
-    wait_i2p_stream, wait_jsonrpc, wait_onion_port, wait_p2p_onion, wait_peer_network,
-    wait_socks_onion, OverlayEnv,
+    wait_hs_desc_uploaded, wait_i2p_stream, wait_jsonrpc, wait_onion_port, wait_p2p_onion,
+    wait_peer_network, wait_socks_onion, OverlayEnv,
 };
 use rbitcoin_test::TempDir;
 use serde_json::json;
@@ -323,6 +323,27 @@ async fn cjdns_tun_two_node() {
     b.stop().await;
 }
 
+#[test]
+fn hs_desc_uploaded_line_is_the_stored_event() {
+    let id = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv";
+    assert!(rbitcoin_test::overlay::hs_desc_uploaded(
+        &format!("650 HS_DESC UPLOADED {id} NO_AUTH $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        id
+    ));
+    assert!(!rbitcoin_test::overlay::hs_desc_uploaded(
+        &format!("650 HS_DESC UPLOAD {id} NO_AUTH $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        id
+    ));
+    assert!(!rbitcoin_test::overlay::hs_desc_uploaded(
+        &format!("650 HS_DESC FAILED {id} NO_AUTH $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        id
+    ));
+    assert!(!rbitcoin_test::overlay::hs_desc_uploaded(
+        "650 HS_DESC UPLOADED other NO_AUTH",
+        id
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tor_onion_comes_back_after_tor_restarts() {
     let env = require_env();
@@ -336,6 +357,23 @@ async fn tor_onion_comes_back_after_tor_restarts() {
     let (onion, port) = wait_p2p_onion(b_rpc, Duration::from_secs(90)).await;
     wait_socks_onion(env.tor_socks, &onion, port, Duration::from_secs(90)).await;
 
+    let service_id = onion.strip_suffix(".onion").unwrap_or(&onion).to_string();
+    let (control, cookie) = (env.tor_control, env.tor_cookie.clone());
+    let attached = std::sync::Arc::new(tokio::sync::Notify::new());
+    let attached_watch = std::sync::Arc::clone(&attached);
+    let uploaded = tokio::spawn(async move {
+        wait_hs_desc_uploaded(
+            control,
+            &cookie,
+            &service_id,
+            Duration::from_secs(90),
+            &attached_watch,
+        )
+        .await;
+    });
+    tokio::time::timeout(Duration::from_secs(30), attached.notified())
+        .await
+        .expect("HS_DESC watch on the tor about to restart");
     restart_daemon(&env.tor_restart).await;
     let again = wait_p2p_onion(b_rpc, Duration::from_secs(90)).await;
     assert_eq!(
@@ -343,6 +381,7 @@ async fn tor_onion_comes_back_after_tor_restarts() {
         (onion.clone(), port),
         "the same onion after the restart"
     );
+    uploaded.await.expect("HS_DESC upload watch");
     wait_socks_onion(env.tor_socks, &onion, port, Duration::from_secs(90)).await;
 
     let a = spawn_node(tor_a(&env, a_dir.path(), a_rpc, &onion, port), a_rpc).await;

@@ -210,6 +210,82 @@ pub async fn wait_p2p_onion(rpc: SocketAddr, wall: Duration) -> (String, u16) {
     panic!("p2p onion missing: {info}");
 }
 
+/// `650 HS_DESC UPLOADED <service_id> …` — not `UPLOAD`, which is only the attempt.
+pub fn hs_desc_uploaded(line: &str, service_id: &str) -> bool {
+    let mut parts = line.split_whitespace();
+    parts.next() == Some("650")
+        && parts.next() == Some("HS_DESC")
+        && parts.next() == Some("UPLOADED")
+        && parts.next() == Some(service_id)
+}
+
+/// Block until Tor reports `HS_DESC UPLOADED` for `service_id` on a control
+/// connection opened after the previous one dropped.
+///
+/// `attached` fires once `SETEVENTS HS_DESC` is live, so the caller can restart
+/// tor only after this watch is on the process it is about to kill. A SOCKS
+/// connect before the post-restart upload fetches the descriptor still stored
+/// from that process. Those introduction points are gone, and the client keeps
+/// them until it decides to refetch.
+pub async fn wait_hs_desc_uploaded(
+    addr: SocketAddr,
+    cookie: &Path,
+    service_id: &str,
+    wall: Duration,
+    attached: &tokio::sync::Notify,
+) {
+    use rbitcoin_node::tor_control::{TorAuth, TorControl};
+    let deadline = Instant::now() + wall;
+    let attempt = Duration::from_millis(250);
+    let mut saw_drop = false;
+    let mut told_attached = false;
+    loop {
+        if Instant::now() >= deadline {
+            panic!("HS_DESC UPLOADED {service_id} wall {wall:?}");
+        }
+        let mut ctl = match tokio::time::timeout(
+            attempt,
+            TorControl::connect_and_auth(addr, TorAuth::Cookie(cookie.to_path_buf()), attempt),
+        )
+        .await
+        {
+            Ok(Ok(ctl)) => ctl,
+            _ => {
+                saw_drop = true;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        if ctl.command("SETEVENTS HS_DESC").await.is_err() {
+            saw_drop = true;
+            continue;
+        }
+        if !told_attached {
+            attached.notify_one();
+            told_attached = true;
+        }
+        let mut lines = ctl.reader.lines();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                panic!("HS_DESC UPLOADED {service_id} wall {wall:?}");
+            }
+            match tokio::time::timeout(left, lines.next_line()).await {
+                Ok(Ok(Some(line))) => {
+                    if saw_drop && hs_desc_uploaded(line.trim(), service_id) {
+                        return;
+                    }
+                }
+                Ok(Ok(None)) | Ok(Err(_)) => {
+                    saw_drop = true;
+                    break;
+                }
+                Err(_) => panic!("HS_DESC UPLOADED {service_id} wall {wall:?}"),
+            }
+        }
+    }
+}
+
 /// SOCKS domain CONNECT until the onion TCP port accepts (HSDir / ADD_ONION ready).
 pub async fn wait_socks_onion(proxy: SocketAddr, host: &str, port: u16, wall: Duration) {
     let deadline = Instant::now() + wall;
