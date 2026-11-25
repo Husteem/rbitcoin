@@ -8,5 +8,4 @@ Security
   Core, each of these adds 2 seconds to the wait before the node asks: a
   peer with 100 or more requests outstanding and no relay permission, and a
   txid announcement while a wtxid-relay peer is connected. They add to each
-  other and to the 2 seconds a non-preferred peer already waits. A peer
-  whose own wait ends sooner is asked first.
+  other and to the 2 seconds a non-preferred peer already waits.
