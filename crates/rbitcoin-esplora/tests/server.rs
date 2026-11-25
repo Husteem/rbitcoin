@@ -2405,6 +2405,168 @@ async fn block_template_does_not_lock_the_cache_across_template_prev() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
+/// A POST keeps its upload permit until it is answered, not just while
+/// its body is read, so bodies waiting for a slot stay under
+/// `max_conn * max_body`. The POST takes the only slot and waits on the
+/// store permit the test holds.
+#[cfg(debug_assertions)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answered_upload_holds_its_permit_until_the_response() {
+    let (_dir, q) = temp_query("upload-held");
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.max_connections = 1;
+    q.set_api_read_budget(1);
+    let q = Arc::new(q);
+    let store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
+        .await
+        .expect("listen");
+    let body = br#"{"addresses":[]}"#;
+    let mut post = TcpStream::connect(handle.local_addr).await.unwrap();
+    post.write_all(
+        format!(
+            "POST /addresses/txs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    post.write_all(body).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let notified = handle.admit.notified();
+        if handle.admit.holding() >= 1 {
+            break;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "the POST did not take the listener slot");
+        if tokio::time::timeout(left, notified).await.is_err() {
+            panic!("the POST did not take the listener slot");
+        }
+    }
+    assert_eq!(
+        handle.uploads.held(),
+        1,
+        "a read body gave its upload permit back before its answer"
+    );
+    drop(store);
+    drop(post);
+    handle.shutdown().await;
+}
+
+/// A POST whose body has not arrived holds an upload permit, not a
+/// listener slot. With every slot's worth of stalled uploads open, a
+/// bodiless request is still served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_request_bodies_do_not_hold_listener_slots() {
+    const SLOTS: usize = 2;
+    let (_dir, q) = temp_query("stalled-bodies");
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.max_connections = SLOTS;
+    let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+    let addr = handle.local_addr;
+    let mut held = Vec::new();
+    for _ in 0..SLOTS {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 64\r\n\r\n")
+            .await
+            .unwrap();
+        held.push(stream);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut get = TcpStream::connect(addr).await.unwrap();
+    get.write_all(b"GET /no-such-route HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), get.read_to_end(&mut reply))
+        .await
+        .expect("a bodiless request is served while uploads stall")
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 404"),
+        "{}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert_eq!(handle.admit.holding(), 0, "stalled uploads hold no slot");
+    drop(held);
+    handle.shutdown().await;
+}
+
+/// POST `head` plus `body` and read the reply, which must come within 3 s.
+async fn post_raw(addr: SocketAddr, head: &str, body: &[u8]) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut reply = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut reply))
+        .await
+        .unwrap_or_else(|_| panic!("no answer within 3 s to {head:?}"))
+        .unwrap();
+    String::from_utf8_lossy(&reply).into_owned()
+}
+
+/// The body read before admission keeps `max_request_bytes`, while every
+/// listener slot is held: a declared length past it is `413` before any
+/// byte is read, and so is a chunked body once it passes it. After the
+/// slot frees, a body at the limit reaches the handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn body_read_before_admission_keeps_the_size_limit() {
+    const MAX: usize = 64;
+    let (_dir, q) = temp_query("body-limit-wire");
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    q.set_api_read_budget(1);
+    let q = Arc::new(q);
+    let store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.max_request_bytes = MAX;
+    cfg.limits.max_connections = 1;
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
+        .await
+        .expect("listen");
+    let addr = handle.local_addr;
+    let mut held = TcpStream::connect(addr).await.unwrap();
+    held.write_all(b"GET /blocks HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while handle.admit.holding() < 1 {
+        assert!(Instant::now() < deadline, "the GET did not take the slot");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let declared = format!(
+        "POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        MAX + 1
+    );
+    let reply = post_raw(addr, &declared, b"").await;
+    assert!(
+        reply.starts_with("HTTP/1.1 413"),
+        "declared, unsent: {reply}"
+    );
+    let reply = post_raw(addr, &declared, &[b'0'; MAX + 1]).await;
+    assert!(reply.starts_with("HTTP/1.1 413"), "declared, sent: {reply}");
+    let chunk = format!("{:x}\r\n{}\r\n0\r\n\r\n", MAX + 1, "0".repeat(MAX + 1));
+    let reply = post_raw(
+        addr,
+        "POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n",
+        chunk.as_bytes(),
+    )
+    .await;
+    assert!(reply.starts_with("HTTP/1.1 413"), "chunked: {reply}");
+    assert_eq!(handle.admit.holding(), 1, "the GET still holds the slot");
+    drop(store);
+    drop(held);
+    let at_limit = format!(
+        "POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {MAX}\r\n\r\n"
+    );
+    let reply = post_raw(addr, &at_limit, &[b'0'; MAX]).await;
+    assert!(!reply.starts_with("HTTP/1.1 413"), "at the limit: {reply}");
+    handle.shutdown().await;
+}
+
 include!("esplora_sh_journey.rs");
 include!("esplora_http_journey.rs");
 include!("blindbit_journey.rs");

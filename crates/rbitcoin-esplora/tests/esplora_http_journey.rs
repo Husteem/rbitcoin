@@ -954,20 +954,25 @@ async fn esplora_max_connections_spans_every_route() {
     q.connect_block(Height(0), &h0, &[cb0]).unwrap();
     let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
     cfg.limits.max_connections = MAX;
-    let handle = run_esplora(cfg, Arc::new(q), None)
+    // A GET /blocks takes a listener slot, then waits on the one store
+    // permit the test holds. A stalled body no longer holds a slot: it is
+    // read before the request is admitted.
+    q.set_api_read_budget(1);
+    let q = Arc::new(q);
+    let store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
     let addr = handle.local_addr;
 
-    // A POST /tx whose body never arrives holds its slot in the extractor.
     let mut held = Vec::new();
     for _ in 0..MAX {
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let req = "POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 64\r\n\r\n";
+        let req = "GET /blocks HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         stream.write_all(req.as_bytes()).await.unwrap();
         held.push(stream);
     }
-    // Every held POST has a slot before the GET starts. A late POST must
+    // Every held GET has a slot before the probe starts. A late holder must
     // not be the request that bumps `waiting`.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -976,9 +981,9 @@ async fn esplora_max_connections_spans_every_route() {
             break;
         }
         let left = deadline.saturating_duration_since(Instant::now());
-        assert!(!left.is_zero(), "stalled POSTs did not fill the listener");
+        assert!(!left.is_zero(), "held GETs did not fill the listener");
         if tokio::time::timeout(left, notified).await.is_err() {
-            panic!("stalled POSTs did not fill the listener");
+            panic!("held GETs did not fill the listener");
         }
     }
     let before = handle.admit.waiting();
@@ -1002,8 +1007,9 @@ async fn esplora_max_connections_spans_every_route() {
         }
     }
     let tip = get;
-    // Freeing one slot serves that same request.
-    drop(held.pop());
+    // Releasing the store permit lets the held requests finish, and a freed
+    // slot serves that same request.
+    drop(store);
     let (st, body) = tokio::time::timeout(Duration::from_secs(10), tip)
         .await
         .expect("a freed slot serves the waiting request")
@@ -1022,17 +1028,23 @@ async fn esplora_request_timeout_covers_the_wait_for_a_slot() {
     let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
     cfg.limits.max_connections = 1;
     cfg.limits.idle_timeout = Duration::from_secs(1);
-    let handle = run_esplora(cfg, Arc::new(q), None)
+    // A GET /blocks takes a listener slot, then waits on the one store
+    // permit the test holds. A stalled body no longer holds a slot: it is
+    // read before the request is admitted.
+    q.set_api_read_budget(1);
+    let q = Arc::new(q);
+    let _store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
     let addr = handle.local_addr;
 
-    // Five POST /tx whose bodies never arrive queue for the one slot; each
-    // holds it until the timeout once admitted.
+    // Five GET /blocks queue for the one slot; each holds it until the
+    // timeout once admitted.
     let mut held = Vec::new();
     for _ in 0..5 {
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let req = "POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 64\r\n\r\n";
+        let req = "GET /blocks HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
         stream.write_all(req.as_bytes()).await.unwrap();
         held.push(stream);
         let want = held.len();
@@ -1089,13 +1101,19 @@ async fn dropped_admit_waiter_clears_waiting() {
     q.connect_block(Height(0), &h0, &[cb0]).unwrap();
     let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
     cfg.limits.max_connections = 1;
-    let handle = run_esplora(cfg, Arc::new(q), None)
+    // A GET /blocks takes a listener slot, then waits on the one store
+    // permit the test holds. A stalled body no longer holds a slot: it is
+    // read before the request is admitted.
+    q.set_api_read_budget(1);
+    let q = Arc::new(q);
+    let _store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
     let addr = handle.local_addr;
 
     let mut held = TcpStream::connect(addr).await.unwrap();
-    held.write_all(b"POST /tx HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 64\r\n\r\n")
+    held.write_all(b"GET /blocks HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
         .await
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1105,9 +1123,9 @@ async fn dropped_admit_waiter_clears_waiting() {
             break;
         }
         let left = deadline.saturating_duration_since(Instant::now());
-        assert!(!left.is_zero(), "stalled POST did not take the listener slot");
+        assert!(!left.is_zero(), "held GET did not take the listener slot");
         if tokio::time::timeout(left, notified).await.is_err() {
-            panic!("stalled POST did not take the listener slot");
+            panic!("held GET did not take the listener slot");
         }
     }
     let before = handle.admit.waiting();

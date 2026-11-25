@@ -2282,7 +2282,7 @@ async fn dns_seeds_wait_for_known_peers_first() {
 }
 
 /// `--esplora-max-inflight` reaches the listener: with a limit of one, a
-/// request whose body never arrives makes the next request wait.
+/// request held in its handler makes the next request wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_esplora_applies_max_inflight() {
     use rbitcoin_consensus::{ChainParams, Milestone};
@@ -2299,6 +2299,15 @@ async fn start_esplora_applies_max_inflight() {
         Milestone::NONE,
     ));
     let mp = MempoolHub::open(dir.join("mempool"), Arc::clone(&hub.query)).unwrap();
+    // The stalled request takes the slot, then waits on the one store
+    // permit held here. A stalled body would not: it is read first.
+    hub.query.set_api_read_budget(1);
+    let store = hub
+        .query
+        .api_read_budget()
+        .acquire_owned()
+        .await
+        .expect("permit");
     let shutdown = Shutdown::new();
     let handles = start_esplora_if_ready(
         true,
@@ -2327,7 +2336,7 @@ async fn start_esplora_applies_max_inflight() {
     };
     let mut stall = TcpStream::connect(addr).await.unwrap();
     stall
-        .write_all(b"POST /tx HTTP/1.1\r\nHost: x\r\nContent-Length: 64\r\n\r\n")
+        .write_all(b"GET /blocks HTTP/1.1\r\nHost: x\r\n\r\n")
         .await
         .unwrap();
     // The stall may not hold the slot yet. Wait until this GET is counted
@@ -2357,7 +2366,7 @@ async fn start_esplora_applies_max_inflight() {
         }
     }
     let waiting = waiting.expect("a limit of one makes the second request wait");
-    drop(stall);
+    drop(store);
     let out = tokio::time::timeout(Duration::from_secs(10), waiting)
         .await
         .expect("the freed slot serves the waiting GET")

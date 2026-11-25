@@ -670,6 +670,86 @@ async fn admit_connection(
     next.run(req).await
 }
 
+/// A request body must arrive within this time. It is read before the
+/// request takes a listener slot, as the RPC server reads its bodies.
+pub const ESPLORA_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upload permits for [`read_body_first`], held from the body read until the
+/// request is answered. As many as listener slots, so bodies read or
+/// waiting for a slot stay under `max_conn * max_body` bytes.
+#[derive(Clone)]
+#[doc(hidden)]
+pub struct BodyGate {
+    sem: Arc<Semaphore>,
+    max_body: usize,
+    #[cfg(debug_assertions)]
+    permits: usize,
+}
+
+#[cfg(debug_assertions)]
+impl BodyGate {
+    /// Upload permits taken. Debug builds only, for tests.
+    #[doc(hidden)]
+    pub fn held(&self) -> usize {
+        self.permits - self.sem.available_permits()
+    }
+}
+
+/// Read a request body before [`admit_connection`], under an upload permit
+/// and [`ESPLORA_BODY_READ_TIMEOUT`]. A slow upload then holds an upload
+/// permit, not a listener slot, so it cannot keep bodiless requests out.
+async fn read_body_first(State(gate): State<BodyGate>, req: Request, next: Next) -> Response {
+    let hint = hyper::body::Body::size_hint(req.body());
+    if hint.exact() == Some(0) {
+        return next.run(req).await;
+    }
+    // A declared length past the limit is refused before it can hold an
+    // upload permit. `read_limited` still counts the bytes of a chunked body.
+    if hint.lower() > gate.max_body as u64 {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    let Ok(permit) = gate.sem.clone().acquire_owned().await else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let (parts, body) = req.into_parts();
+    let bytes =
+        match tokio::time::timeout(ESPLORA_BODY_READ_TIMEOUT, read_limited(body, gate.max_body))
+            .await
+        {
+            Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+            Ok(Err(status)) => return status.into_response(),
+            Ok(Ok(bytes)) => bytes,
+        };
+    // Held until the request is answered, so bodies waiting for a slot
+    // stay under `max_conn * max_body`.
+    let resp = next
+        .run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await;
+    drop(permit);
+    resp
+}
+
+/// The whole body, or `413` past `max` bytes, or `400` on a read error.
+async fn read_limited(
+    mut body: axum::body::Body,
+    max: usize,
+) -> Result<axum::body::Bytes, StatusCode> {
+    use hyper::body::Body as _;
+    let mut out = Vec::new();
+    while let Some(frame) =
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+    {
+        let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if let Ok(data) = frame.into_data() {
+            if out.len().saturating_add(data.len()) > max {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(axum::body::Bytes::from(out))
+}
+
 pub struct EsploraHandle {
     /// Bound TCP address. Unix listen leaves this as `127.0.0.1:0`.
     pub local_addr: SocketAddr,
@@ -678,6 +758,9 @@ pub struct EsploraHandle {
     /// Listener slot gate. Tests wait on `waiting` instead of a settle sleep.
     #[doc(hidden)]
     pub admit: Arc<AdmitGate>,
+    /// Upload permit gate for request bodies.
+    #[doc(hidden)]
+    pub uploads: BodyGate,
     /// `/blindbit/v1/` permit gate, mounted only while tweaks are on.
     #[doc(hidden)]
     pub blindbit: Arc<crate::blindbit::BlindbitLimit>,
@@ -1445,10 +1528,17 @@ pub async fn run_esplora(
     } else {
         rest
     };
-    // Outer → inner: timeout → concurrency → body → meter → chain-view stamp
-    // → heavy JSON encode. The timeout goes on last, outside the limit, so
-    // the wait for a slot counts against it.
+    // Outer → inner: timeout → body read → (BlindBit permit) → concurrency
+    // → body limit → meter → chain-view stamp → heavy JSON encode. The
+    // timeout goes on last, outside the limit, so the wait for a slot counts
+    // against it.
     let admit = AdmitGate::new(max_conn);
+    let body_gate = BodyGate {
+        sem: Arc::new(Semaphore::new(max_conn)),
+        max_body,
+        #[cfg(debug_assertions)]
+        permits: max_conn,
+    };
     let blindbit_limit = crate::blindbit::BlindbitLimit::new(config.blindbit_max_inflight.max(1));
     let listener_layers = |r: Router<AppState>| {
         r.layer(middleware::from_fn(finish_heavy_json))
@@ -1464,8 +1554,13 @@ pub async fn run_esplora(
                 admit_connection,
             ))
     };
+    // Outside every other permit, so a slow upload holds only its upload
+    // permit, not a listener slot or a BlindBit permit.
+    let body_first = || middleware::from_fn_with_state(body_gate.clone(), read_body_first);
     let request_timeout = || TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout);
-    let rest = listener_layers(rest.fallback(fallback_404)).layer(request_timeout());
+    let rest = listener_layers(rest.fallback(fallback_404))
+        .layer(body_first())
+        .layer(request_timeout());
     // BlindBit takes its own permit before a listener slot, so a scan queued
     // on it holds no slot. One timeout covers both waits. Merged after the
     // listener layers, so they wrap these routes once.
@@ -1475,6 +1570,7 @@ pub async fn run_esplora(
                 Arc::clone(&blindbit_limit),
                 crate::blindbit::blindbit_permit_mw,
             ))
+            .layer(body_first())
             .layer(request_timeout());
         rest.merge(blindbit)
     } else {
@@ -1507,6 +1603,7 @@ pub async fn run_esplora(
                 socket_path: None,
                 shutdown,
                 admit: Arc::clone(&admit),
+                uploads: body_gate.clone(),
                 blindbit: Arc::clone(&blindbit_limit),
                 task,
             })
@@ -1532,6 +1629,7 @@ pub async fn run_esplora(
                 socket_path: Some(path),
                 shutdown,
                 admit: Arc::clone(&admit),
+                uploads: body_gate.clone(),
                 blindbit: Arc::clone(&blindbit_limit),
                 task,
             })
