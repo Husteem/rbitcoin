@@ -690,7 +690,7 @@ pub struct Query {
     pub header_read_cancel: std::sync::atomic::AtomicBool,
     /// Opt-in: the next [`Self::lookup_tx_fk`] fails. Debug builds only.
     #[cfg(debug_assertions)]
-    txid_lookup_fail: std::sync::atomic::AtomicBool,
+    txid_lookup_fail: std::sync::Mutex<Option<[u8; 32]>>,
     /// Confirmed best-chain `hash → height` (kept for process life; ~74 MiB at a ~962k tip).
     ///
     /// Avoids O(tip) header walks on Esplora/P2P `height_of_hash`.
@@ -1077,7 +1077,7 @@ impl Query {
             #[cfg(debug_assertions)]
             header_read_cancel: std::sync::atomic::AtomicBool::new(false),
             #[cfg(debug_assertions)]
-            txid_lookup_fail: std::sync::atomic::AtomicBool::new(false),
+            txid_lookup_fail: std::sync::Mutex::new(None),
             height_by_hash: std::sync::RwLock::new(HeightByHashIndex::default()),
             #[cfg(debug_assertions)]
             reconstruct_archived: AtomicU64::new(0),
@@ -2147,12 +2147,15 @@ impl Query {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// The next [`Self::lookup_tx_fk`] returns [`StoreError::Corrupt`].
+    /// The next [`Self::lookup_tx_fk`] of `txid` returns
+    /// [`StoreError::Corrupt`]; lookups of other txids are untouched.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
-    pub fn fail_next_txid_lookup(&self) {
-        self.txid_lookup_fail
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+    pub fn fail_next_txid_lookup(&self, txid: [u8; 32]) {
+        *self
+            .txid_lookup_fail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(txid);
     }
 
     /// Last height with SH creates applied (after tip). `None` if empty chain.
@@ -2189,11 +2192,15 @@ impl Query {
     #[doc(hidden)]
     pub fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         #[cfg(debug_assertions)]
-        if self
-            .txid_lookup_fail
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Err(StoreError::Corrupt("injected txid lookup failure"));
+            let mut armed = self
+                .txid_lookup_fail
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if armed.as_ref() == Some(txid) {
+                *armed = None;
+                return Err(StoreError::Corrupt("injected txid lookup failure"));
+            }
         }
         if !self.tx_index_enabled() {
             return Ok(None);
