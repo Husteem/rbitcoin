@@ -4,10 +4,7 @@ static SH_PAGE_SCAN_HELD: std::sync::atomic::AtomicBool =
 
 #[cfg(debug_assertions)]
 fn note_sh_page_scan_heavy_held(q: &Query) {
-    let held = matches!(
-        q.heavy_sh_join.try_lock(),
-        Err(std::sync::TryLockError::WouldBlock)
-    );
+    let held = q.heavy_sh_join.available_permits() == 0;
     SH_PAGE_SCAN_HELD.store(held, std::sync::atomic::Ordering::SeqCst);
 }
 

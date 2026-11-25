@@ -10,6 +10,38 @@ use std::sync::Arc;
 
 thread_local! {
     static MAX_SH_CREATES_LIFTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The [`heavy_turn_job`] on this thread holds the heavy turn.
+    static HEAVY_TURN_GRANTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A heavy join in the [`heavy_turn_job`] on this thread found the turn
+    /// taken and refused.
+    static HEAVY_TURN_REFUSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f`, one blocking job of an API read, and report whether a heavy join
+/// inside it refused. `grant` is a permit of [`Query::heavy_sh_join`] the
+/// caller awaited on its task. With it, every heavy join in `f` runs under
+/// that turn. Without it, a heavy join that finds the turn taken returns
+/// [`StoreError::Rejected`] at once instead of waiting on this thread. The
+/// caller then drops the value, awaits the turn with no blocking thread and
+/// no store permit, and runs `f` again with the grant. A waiter therefore
+/// holds neither.
+pub fn heavy_turn_job<T>(
+    grant: Option<tokio::sync::OwnedSemaphorePermit>,
+    f: impl FnOnce() -> T,
+) -> (T, bool) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HEAVY_TURN_GRANTED.with(|c| c.set(false));
+            HEAVY_TURN_REFUSED.with(|c| c.set(false));
+        }
+    }
+    let _reset = Reset;
+    HEAVY_TURN_GRANTED.with(|c| c.set(grant.is_some()));
+    HEAVY_TURN_REFUSED.with(|c| c.set(false));
+    let value = f();
+    drop(grant);
+    (value, HEAVY_TURN_REFUSED.with(std::cell::Cell::get))
 }
 
 #[cfg(debug_assertions)]
@@ -857,13 +889,9 @@ impl Query {
     }
 
     /// Refuse an unpaged join above `--max-sh-creates` unless this thread
-    /// holds [`MaxShCreatesLifted`], then hand back the heavy-join guard when
-    /// the create count is above `--heavy-sh-creates`.
-    /// The guard is a blocking lock taken on the blocking pool. Its holder
-    /// only reads the store and never waits on a client, so a waiter (even
-    /// one in the same connection's batch window) always gets it once that
-    /// join returns, on success or error.
-    fn unpaged_join_admit(&self, scripthash: &[u8; 32]) -> Result<JoinAdmit<'_>, QueryError> {
+    /// holds [`MaxShCreatesLifted`], then take the heavy turn when the create
+    /// count is above `--heavy-sh-creates` ([`Self::heavy_turn`]).
+    fn unpaged_join_admit(&self, scripthash: &[u8; 32]) -> Result<JoinAdmit, QueryError> {
         let light = JoinAdmit {
             heavy: false,
             _turn: None,
@@ -881,7 +909,7 @@ impl Query {
     }
 
     /// [`Self::unpaged_join_admit`] for a create count the caller read.
-    fn creates_admit(&self, creates: u32) -> Result<JoinAdmit<'_>, QueryError> {
+    fn creates_admit(&self, creates: u32) -> Result<JoinAdmit, QueryError> {
         let cap = if MAX_SH_CREATES_LIFTED.with(std::cell::Cell::get) {
             0
         } else {
@@ -890,26 +918,37 @@ impl Query {
         if cap > 0 && creates > cap {
             return Err(StoreError::ShCreatesCap { creates, cap });
         }
-        Ok(self.heavy_turn(creates))
+        self.heavy_turn(creates)
     }
 
     /// The node's single heavy turn when `creates` is above
-    /// `--heavy-sh-creates`, else a light admit that waits on nothing.
-    fn heavy_turn(&self, creates: u32) -> JoinAdmit<'_> {
+    /// `--heavy-sh-creates`, else a light admit that waits on nothing. The
+    /// turn is never waited for on this thread: the [`heavy_turn_job`] that
+    /// holds it admits, a free turn is taken, and a taken one refuses so the
+    /// job's caller can wait on its task.
+    fn heavy_turn(&self, creates: u32) -> Result<JoinAdmit, QueryError> {
         let heavy = self.heavy_sh_creates();
         if heavy == 0 || creates <= heavy {
-            return JoinAdmit {
+            return Ok(JoinAdmit {
                 heavy: false,
                 _turn: None,
-            };
+            });
         }
-        JoinAdmit {
-            heavy: true,
-            _turn: Some(
-                self.heavy_sh_join
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            ),
+        if HEAVY_TURN_GRANTED.with(std::cell::Cell::get) {
+            return Ok(JoinAdmit {
+                heavy: true,
+                _turn: None,
+            });
+        }
+        match Arc::clone(&self.heavy_sh_join).try_acquire_owned() {
+            Ok(turn) => Ok(JoinAdmit {
+                heavy: true,
+                _turn: Some(turn),
+            }),
+            Err(_) => {
+                HEAVY_TURN_REFUSED.with(|c| c.set(true));
+                Err(StoreError::Rejected("heavy scripthash join busy"))
+            }
         }
     }
 
@@ -2491,7 +2530,7 @@ impl ShHistoryWalk {
         if self.done {
             return Ok(None);
         }
-        let admit = q.heavy_turn(q.scripthash_create_count(&self.scripthash)?);
+        let admit = q.heavy_turn(q.scripthash_create_count(&self.scripthash)?)?;
         #[cfg(debug_assertions)]
         let _probe = q.sh_join_probe.enter(admit.heavy);
         #[cfg(not(debug_assertions))]
@@ -2561,10 +2600,10 @@ impl ShHistoryWalk {
 }
 
 /// An admitted unpaged join. A heavy one holds the node's single heavy turn
-/// until this drops.
-pub struct JoinAdmit<'a> {
+/// until this drops, unless its [`heavy_turn_job`] already holds it.
+pub struct JoinAdmit {
     pub heavy: bool,
-    _turn: Option<std::sync::MutexGuard<'a, ()>>,
+    _turn: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Unpaged scripthash joins running now and their peak, light and heavy

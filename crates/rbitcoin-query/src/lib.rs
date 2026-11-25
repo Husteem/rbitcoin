@@ -721,8 +721,10 @@ pub struct Query {
     /// is held at the moment.
     api_read_budget_size: std::sync::atomic::AtomicUsize,
     /// One heavy unpaged SH join at a time across every Electrum and Esplora
-    /// client: one near the cap can peak above 2 GiB.
-    pub heavy_sh_join: Mutex<()>,
+    /// client: one near the cap can peak above 2 GiB. One permit. A join
+    /// takes it without waiting; a caller waits for it on its task
+    /// ([`scripthash::heavy_turn_job`]).
+    pub heavy_sh_join: Arc<tokio::sync::Semaphore>,
     /// Unpaged SH join overlap by kind. Tests only.
     #[cfg(debug_assertions)]
     pub sh_join_probe: crate::scripthash::ShJoinProbe,
@@ -1091,7 +1093,7 @@ impl Query {
             api_read_budget_size: std::sync::atomic::AtomicUsize::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
             ),
-            heavy_sh_join: Mutex::new(()),
+            heavy_sh_join: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(debug_assertions)]
             sh_join_probe: crate::scripthash::ShJoinProbe::default(),
             #[cfg(debug_assertions)]

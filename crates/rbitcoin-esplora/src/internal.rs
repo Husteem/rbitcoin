@@ -417,7 +417,7 @@ async fn sh_history_stream(st: AppState, sh: [u8; 32], asof: Option<[u8; 32]>) -
     let q = std::sync::Arc::clone(&st.query);
     let stall = st.send_stall;
     let started =
-        crate::handlers::store_blocking(move || match crate::handlers::sh_pin(&st, asof) {
+        crate::handlers::store_blocking(move |_| match crate::handlers::sh_pin(&st, asof) {
             Ok(Some(view)) => HistoryStart::Pinned(view),
             Ok(None) => HistoryStart::Reply(json_reply_here(Vec::<Value>::new())),
             Err(resp) => HistoryStart::Reply(resp),
@@ -469,7 +469,14 @@ pub async fn write_history(
     let mut open = Some(b'[');
     loop {
         let q = std::sync::Arc::clone(&q);
-        let step = crate::handlers::store_blocking(move || {
+        // `next_rows` refuses a taken turn before it moves the walk, so the
+        // rerun takes the walk back from the refused step.
+        let mut first = Some(walk);
+        let step = crate::handlers::store_blocking(move |refused| {
+            let mut walk = match refused {
+                Some((walk, _)) => walk,
+                None => first.take().expect("first run takes the walk"),
+            };
             let rows = walk.next_rows(&q);
             (walk, rows)
         })

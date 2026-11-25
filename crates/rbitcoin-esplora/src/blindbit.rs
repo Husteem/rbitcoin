@@ -162,9 +162,12 @@ pub async fn blindbit_permit_mw(
 }
 
 /// [`spawn_join`] that holds `permit` until `f` returns.
-async fn held(permit: BlindbitPermit, f: impl FnOnce() -> Response + Send + 'static) -> Response {
+async fn held(
+    permit: BlindbitPermit,
+    mut f: impl FnMut() -> Response + Send + 'static,
+) -> Response {
     spawn_join(move || {
-        let _permit = permit;
+        let _permit = &permit;
         f()
     })
     .await

@@ -272,16 +272,16 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
     .await
 }
 
+/// `f` on the blocking pool with one armed store permit
+/// ([`rbitcoin_net::armed_blocking`]). A heavy join that found the turn
+/// taken runs `f` again once the turn is free, handed the refused value.
 pub(crate) async fn store_blocking<T: Send + 'static>(
-    f: impl FnOnce() -> T + Send + 'static,
+    mut f: impl FnMut(Option<T>) -> T + Send + 'static,
 ) -> Result<T, tokio::task::JoinError> {
-    let store_permit = rbitcoin_net::acquire_armed_store_budget().await;
     let sh_hold = crate::server::sh_read_hold();
-    tokio::task::spawn_blocking(move || {
-        let _g = rbitcoin_net::BlockingRegion::enter();
-        let _store = store_permit;
-        let _sh_hold = sh_hold;
-        f()
+    rbitcoin_net::armed_blocking(move |refused| {
+        let _sh_hold = sh_hold.clone();
+        f(refused)
     })
     .await
 }
@@ -403,11 +403,11 @@ pub async fn block_txs_start(
     State(st): State<AppState>,
     Path((hash_hex, start)): Path<(String, u32)>,
 ) -> Response {
-    spawn_join(move || block_txs_impl(st, &hash_hex, start)).await
+    spawn_join(move || block_txs_impl(st.clone(), &hash_hex, start)).await
 }
 
 pub async fn block_txs_0(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
-    spawn_join(move || block_txs_impl(st, &hash_hex, 0)).await
+    spawn_join(move || block_txs_impl(st.clone(), &hash_hex, 0)).await
 }
 
 #[doc(hidden)]
@@ -442,7 +442,7 @@ pub fn block_txs_impl(st: AppState, hash_hex: &str, start: u32) -> Response {
 }
 
 pub async fn tx_merkle_proof(State(st): State<AppState>, Path(txid_hex): Path<String>) -> Response {
-    spawn_join(move || tx_merkle_proof_sync(st, txid_hex)).await
+    spawn_join(move || tx_merkle_proof_sync(st.clone(), txid_hex.clone())).await
 }
 
 #[doc(hidden)]
@@ -504,7 +504,7 @@ pub async fn tx_merkleblock_proof(
     State(st): State<AppState>,
     Path(txid_hex): Path<String>,
 ) -> Response {
-    spawn_join(move || tx_merkleblock_proof_sync(st, txid_hex)).await
+    spawn_join(move || tx_merkleblock_proof_sync(st.clone(), txid_hex.clone())).await
 }
 
 #[doc(hidden)]
@@ -1079,17 +1079,8 @@ pub fn gbt_json(body: &Arc<Value>) -> Response {
     resp
 }
 
-pub async fn spawn_join(f: impl FnOnce() -> Response + Send + 'static) -> Response {
-    let store_permit = rbitcoin_net::acquire_armed_store_budget().await;
-    let sh_hold = crate::server::sh_read_hold();
-    match tokio::task::spawn_blocking(move || {
-        let _g = rbitcoin_net::BlockingRegion::enter();
-        let _store = store_permit;
-        let _sh_hold = sh_hold;
-        f()
-    })
-    .await
-    {
+pub async fn spawn_join(mut f: impl FnMut() -> Response + Send + 'static) -> Response {
+    match store_blocking(move |_| f()).await {
         Ok(r) => crate::server::ensure_json(r).await,
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -2042,7 +2033,17 @@ pub async fn post_addresses_txs(
     AxumQuery(q): AxumQuery<AfterTxidQuery>,
     body: Bytes,
 ) -> Response {
-    spawn_join(move || post_multi_body(st, MultiKind::Address, q, body, false, client)).await
+    spawn_join(move || {
+        post_multi_body(
+            st.clone(),
+            MultiKind::Address,
+            q.clone(),
+            body.clone(),
+            false,
+            client.clone(),
+        )
+    })
+    .await
 }
 
 pub async fn post_scripthashes_txs(
@@ -2051,7 +2052,17 @@ pub async fn post_scripthashes_txs(
     AxumQuery(q): AxumQuery<AfterTxidQuery>,
     body: Bytes,
 ) -> Response {
-    spawn_join(move || post_multi_body(st, MultiKind::Scripthash, q, body, false, client)).await
+    spawn_join(move || {
+        post_multi_body(
+            st.clone(),
+            MultiKind::Scripthash,
+            q.clone(),
+            body.clone(),
+            false,
+            client.clone(),
+        )
+    })
+    .await
 }
 
 pub async fn post_addresses_txs_summary(
@@ -2060,7 +2071,17 @@ pub async fn post_addresses_txs_summary(
     AxumQuery(q): AxumQuery<AfterTxidQuery>,
     body: Bytes,
 ) -> Response {
-    spawn_join(move || post_multi_body(st, MultiKind::Address, q, body, true, client)).await
+    spawn_join(move || {
+        post_multi_body(
+            st.clone(),
+            MultiKind::Address,
+            q.clone(),
+            body.clone(),
+            true,
+            client.clone(),
+        )
+    })
+    .await
 }
 
 pub async fn post_scripthashes_txs_summary(
@@ -2069,7 +2090,17 @@ pub async fn post_scripthashes_txs_summary(
     AxumQuery(q): AxumQuery<AfterTxidQuery>,
     body: Bytes,
 ) -> Response {
-    spawn_join(move || post_multi_body(st, MultiKind::Scripthash, q, body, true, client)).await
+    spawn_join(move || {
+        post_multi_body(
+            st.clone(),
+            MultiKind::Scripthash,
+            q.clone(),
+            body.clone(),
+            true,
+            client.clone(),
+        )
+    })
+    .await
 }
 
 pub async fn mempool_info(State(st): State<AppState>) -> Response {
@@ -2321,7 +2352,7 @@ pub fn mempool_txs_for_sh(st: &AppState, sh: &[u8; 32]) -> Response {
     json_reply_here(mempool_txs_json(st, sh))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub struct AfterTxidQuery {
     pub after_txid: Option<String>,
 }

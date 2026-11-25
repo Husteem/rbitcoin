@@ -14,6 +14,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 tokio::task_local! {
     static API_STORE_BUDGET: Arc<Semaphore>;
+    /// [`rbitcoin_query::Query::heavy_sh_join`] for [`armed_blocking`].
+    static API_HEAVY_TURN: Arc<Semaphore>;
     #[cfg(debug_assertions)]
     static STORE_BUDGET_WAITERS: Arc<AtomicUsize>;
 }
@@ -123,6 +125,12 @@ pub async fn with_store_budget<R>(budget: Arc<Semaphore>, fut: impl Future<Outpu
     API_STORE_BUDGET.scope(budget, fut).await
 }
 
+/// Run `fut` with the node's heavy scripthash turn armed for
+/// [`armed_blocking`].
+pub async fn with_heavy_turn<R>(turn: Arc<Semaphore>, fut: impl Future<Output = R>) -> R {
+    API_HEAVY_TURN.scope(turn, fut).await
+}
+
 /// Same task as [`with_store_budget`]. [`acquire_armed_store_budget`] counts a
 /// caller that found the budget empty. Debug builds only: tests wait on it.
 #[cfg(debug_assertions)]
@@ -174,19 +182,74 @@ pub fn finish_join<T>(joined: Result<T, tokio::task::JoinError>, cancel: &'stati
     }
 }
 
-/// `tokio::spawn` does not keep the task-local budget. Copy it into the
-/// child so a detached admit still waits for a store permit.
+/// `tokio::spawn` does not keep the task-local budget or heavy turn. Copy
+/// them into the child so a detached admit still waits for a store permit.
 pub fn spawn_with_store_budget<T: Send + 'static>(
     fut: impl Future<Output = T> + Send + 'static,
 ) -> tokio::task::JoinHandle<T> {
     let budget = API_STORE_BUDGET.try_with(Arc::clone).ok();
+    let turn = API_HEAVY_TURN.try_with(Arc::clone).ok();
     tokio::spawn(async move {
-        if let Some(budget) = budget {
-            with_store_budget(budget, fut).await
-        } else {
-            fut.await
+        let fut = async move {
+            match turn {
+                Some(turn) => with_heavy_turn(turn, fut).await,
+                None => fut.await,
+            }
+        };
+        match budget {
+            Some(budget) => with_store_budget(budget, fut).await,
+            None => fut.await,
         }
     })
+}
+
+/// Run `f` on the blocking pool, one store permit from `permit` per run.
+///
+/// A heavy scripthash join in `f` that finds `turn` taken refuses at once
+/// ([`rbitcoin_query::scripthash::heavy_turn_job`]). That run's thread and
+/// permit go back, the turn is awaited on this task, and `f` runs once more
+/// holding it, taking the turn before its store permit. The rerun is handed
+/// the refused run's value, so state moved through `f` comes back. With no
+/// `turn`, a refused run's value is the answer.
+pub async fn blocking_heavy_turn<T, F, P, Fut>(
+    turn: Option<&Arc<Semaphore>>,
+    mut permit: P,
+    mut f: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnMut(Option<T>) -> T + Send + 'static,
+    P: FnMut() -> Fut,
+    Fut: Future<Output = Option<OwnedSemaphorePermit>>,
+{
+    let mut prev = None;
+    let mut grant = None;
+    loop {
+        let store = permit().await;
+        let held = grant.take();
+        let (back, value, refused) = tokio::task::spawn_blocking(move || {
+            let _store = store;
+            let _g = BlockingRegion::enter();
+            let (value, refused) = rbitcoin_query::scripthash::heavy_turn_job(held, || f(prev));
+            (f, value, refused)
+        })
+        .await?;
+        let Some(turn) = turn.filter(|_| refused) else {
+            return Ok(value);
+        };
+        f = back;
+        prev = Some(value);
+        grant = Some(Arc::clone(turn).acquire_owned().await.expect("heavy turn"));
+    }
+}
+
+/// [`blocking_heavy_turn`] with this task's armed store budget and heavy
+/// turn ([`with_store_budget`], [`with_heavy_turn`]).
+pub async fn armed_blocking<T: Send + 'static>(
+    f: impl FnMut(Option<T>) -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    let turn = API_HEAVY_TURN.try_with(Arc::clone).ok();
+    blocking_heavy_turn(turn.as_ref(), acquire_armed_store_budget, f).await
 }
 
 /// One permit of the armed budget, or `None` when this task has no budget.
