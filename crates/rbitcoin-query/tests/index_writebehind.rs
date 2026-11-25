@@ -58,6 +58,8 @@ fn io_loop_lines(
 /// Seal from the current watermarks through the released tip.
 /// `hold_first` parks the first offer. This function opens that gate
 /// after `progress_every` has elapsed, so a later window in the pass logs.
+/// If the first offer does not park within 2 s, it opens the gate before
+/// it panics, so a late hook does not block the scope join forever.
 fn drive_index_pass(query: &Query, hold_first: bool, progress_every: Duration) -> Vec<String> {
     let stop = AtomicBool::new(false);
     let resync = AtomicBool::new(false);
@@ -125,22 +127,27 @@ fn drive_index_pass(query: &Query, hold_first: bool, progress_every: Duration) -
             let _ = done_tx.send((result, logs));
         });
         if hold_first {
+            let fail = || -> ! {
+                stop.store(true, Ordering::Relaxed);
+                let (lock, cv) = &*open;
+                *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                cv.notify_all();
+                panic!("first window was not queued");
+            };
             let (lock, cv) = &*parked;
             let mut seen = lock.lock().unwrap_or_else(|e| e.into_inner());
             let deadline = Instant::now() + Duration::from_secs(2);
             while !*seen {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    stop.store(true, Ordering::Relaxed);
-                    panic!("first window was not queued");
+                    fail();
                 }
                 let (guard, status) = cv
                     .wait_timeout(seen, left)
                     .unwrap_or_else(|e| e.into_inner());
                 seen = guard;
                 if status.timed_out() && !*seen {
-                    stop.store(true, Ordering::Relaxed);
-                    panic!("first window was not queued");
+                    fail();
                 }
             }
             drop(seen);
