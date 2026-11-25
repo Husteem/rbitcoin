@@ -737,6 +737,12 @@ impl RecentRejects {
     }
 }
 
+/// API admits and tests at once: half the script workers, at least one.
+#[doc(hidden)]
+pub fn api_script_lane_permits() -> usize {
+    (rbitcoin_consensus::script_pool::script_workers() / 2).max(1)
+}
+
 /// One recently accepted mempool tx (for explorer "recent" strips).
 #[derive(Clone, Debug)]
 pub struct RecentAccept {
@@ -1330,6 +1336,10 @@ pub struct MempoolHub {
     pub recent_confirmed: Mutex<RecentConfirmed>,
     /// Core `m_lazy_recent_rejects` (wtxid). Forcerelay second-send skips ATMP.
     pub recent_rejects: Mutex<RecentRejects>,
+    /// Lane for this node's own API clients' admits and tests (Esplora,
+    /// Electrum, BlindBit, RPC): half the script workers, at least one, so
+    /// their script work cannot fill the pool block validation shares.
+    api_script_lane: Arc<tokio::sync::Semaphore>,
     /// Own feerates (sat/kvB) of the 64 newest confirmed entries, for the N=1 floor.
     pub confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
     /// Per-block vsize-weighted p10 hurdle, bounded by txstat body bytes.
@@ -1722,6 +1732,7 @@ impl MempoolHub {
             )),
             recent_confirmed: Mutex::new(RecentConfirmed::new()),
             recent_rejects: Mutex::new(RecentRejects::default()),
+            api_script_lane: Arc::new(tokio::sync::Semaphore::new(api_script_lane_permits())),
             confirm_feerate_memory: Mutex::new(std::collections::VecDeque::with_capacity(64)),
             block_p10_history: Mutex::new(FeeHistory::new(
                 FEE_HISTORY_TXSTAT_BYTE_BUDGET,
@@ -4499,6 +4510,7 @@ impl MempoolHub {
         let hub = Arc::clone(self);
         crate::reactor::finish_join(
             crate::reactor::spawn_with_store_budget(async move {
+                let _lane = hub.api_lane().await;
                 hub.accept_with_utxo_async(
                     tx,
                     TxOrigin::Relay(None),
@@ -4524,6 +4536,12 @@ impl MempoolHub {
         let hub = Arc::clone(self);
         crate::reactor::finish_join(
             crate::reactor::spawn_with_store_budget(async move {
+                // On the task, so a dropped request does not free the lane
+                // while its scripts still run.
+                let _lane = match origin {
+                    TxOrigin::Local => hub.api_lane().await,
+                    TxOrigin::Relay(_) => None,
+                };
                 hub.accept_tx_from_work(tx, origin).await
             })
             .await,
@@ -5084,6 +5102,7 @@ impl MempoolHub {
     ) -> Result<Vec<AcceptResult>, AcceptError> {
         let hub = Arc::clone(self);
         crate::reactor::spawn_with_store_budget(async move {
+            let _lane = hub.api_lane().await;
             let guard = hub.begin_tentative_guard();
             let accepted = hub.admit_package_work(txs, guard.admit()).await;
             guard.settle_async().await;
@@ -5225,8 +5244,36 @@ impl MempoolHub {
         }
     }
 
-    /// Prepare + scripts + RBF checks, with scripts awaited on the caller.
+    /// The API script lane. Hidden: tests hold it.
+    #[doc(hidden)]
+    pub fn api_script_lane(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.api_script_lane)
+    }
+
+    /// Held for one API admit or test, scripts included.
+    async fn api_lane(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.api_script_lane).acquire_owned().await.ok()
+    }
+
+    /// Prepare + scripts + RBF checks, on a task the request cannot cancel:
+    /// its API lane permit is held until the scripts end, not until the
+    /// caller drops.
     pub async fn test_accept_async(
+        self: &Arc<Self>,
+        tx: Transaction,
+    ) -> Result<AcceptResult, AcceptError> {
+        let hub = Arc::clone(self);
+        crate::reactor::finish_join(
+            crate::reactor::spawn_with_store_budget(async move {
+                let _lane = hub.api_lane().await;
+                hub.test_accept_work(tx).await
+            })
+            .await,
+            "tx test",
+        )
+    }
+
+    async fn test_accept_work(
         self: &Arc<Self>,
         tx: Transaction,
     ) -> Result<AcceptResult, AcceptError> {
@@ -7069,6 +7116,7 @@ impl MempoolHub {
         txs: Vec<Transaction>,
         package_eval: bool,
     ) -> SubmitPackage {
+        let _lane = self.api_lane().await;
         self.submit_package_rpc_eval_work(txs, package_eval).await
     }
 

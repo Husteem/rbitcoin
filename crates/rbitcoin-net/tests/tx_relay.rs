@@ -3908,6 +3908,13 @@ fn broadcast_replaces_the_conflict_a_failed_package_restores() {
     };
     bad_child.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
 
+    // As on a runner with one API script lane permit (macOS CI): the parked
+    // package takes that one. One more lets the broadcast reach the
+    // tentative wait instead of waiting on the lane, which this test pins.
+    let lane = hub.api_script_lane();
+    let spare = lane.available_permits().saturating_sub(1) as u32;
+    let _held = (spare > 0).then(|| lane.clone().try_acquire_many_owned(spare).unwrap());
+    lane.add_permits(1);
     hub.pause_after_tentative_commit
         .store(true, Ordering::Release);
     let hub_pkg = Arc::clone(&hub);
@@ -6474,6 +6481,153 @@ async fn try_contains_does_not_panic_on_tokio_worker() {
     assert!(!hit);
     let _ = std::fs::remove_dir_all(&mp_dir);
     let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// This node's API clients run their admits and tests in one lane: with
+/// every lane permit held, a test, a broadcast, a package and a multi-tx
+/// `testmempoolaccept` member wait; relay admits do not take the lane. The
+/// lane leaves script workers to blocks.
+#[test]
+fn api_admits_wait_on_their_script_lane() {
+    let (_store, q, cbs) = pad_cbs(5);
+    let mp_dir = tmp();
+    let hub = Arc::new(MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap());
+    hub.set_relay_enabled(true);
+    let relayed = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let probed = spend_true(cbs[1], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let local = spend_true(cbs[2], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let pkg = spend_true(cbs[3], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let member_tx = spend_true(cbs[4], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let lane = hub.api_script_lane();
+        let all = u32::try_from(rbitcoin_net::tx_relay::api_script_lane_permits()).unwrap();
+        let held = lane.acquire_many_owned(all).await.expect("hold the lane");
+        tokio::time::timeout(Duration::from_secs(10), hub.accept_tx_async(relayed))
+            .await
+            .expect("a relay admit does not take the API lane")
+            .expect("relay admit");
+        let h = Arc::clone(&hub);
+        let test = tokio::spawn(async move { h.test_accept_async(probed).await });
+        let h = Arc::clone(&hub);
+        let bcast = tokio::spawn(async move { h.broadcast_local_async(local).await });
+        let h = Arc::clone(&hub);
+        let package = tokio::spawn(async move { h.accept_package_async(vec![pkg]).await });
+        let h = Arc::clone(&hub);
+        let member = tokio::spawn(async move {
+            let guard = h.begin_tentative_guard();
+            let r = h
+                .accept_test_package_member_async(member_tx, guard.admit())
+                .await;
+            guard.settle_async().await;
+            r
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!test.is_finished(), "a test waits on the API lane");
+        assert!(!bcast.is_finished(), "a broadcast waits on the API lane");
+        assert!(!package.is_finished(), "a package waits on the API lane");
+        assert!(
+            !member.is_finished(),
+            "a multi-tx testmempoolaccept member waits on the API lane"
+        );
+        drop(held);
+        for done in [
+            tokio::time::timeout(Duration::from_secs(10), test)
+                .await
+                .map(|r| r.unwrap().map(|_| ())),
+            tokio::time::timeout(Duration::from_secs(10), bcast)
+                .await
+                .map(|r| r.unwrap().map(|_| ())),
+            tokio::time::timeout(Duration::from_secs(10), package)
+                .await
+                .map(|r| r.unwrap().map(|_| ())),
+            tokio::time::timeout(Duration::from_secs(10), member)
+                .await
+                .map(|r| r.unwrap().map(|_| ())),
+        ] {
+            done.expect("finishes once the lane frees")
+                .expect("api admit");
+        }
+    });
+}
+
+/// A dropped API test keeps its lane permit until its work ends: the work
+/// runs on a task the request cannot cancel, so cancelled requests cannot
+/// run more API script work than the lane allows. Every script worker is
+/// held briefly, so the test's scripts wait while it holds its lane.
+#[test]
+fn dropped_test_accept_keeps_its_lane() {
+    use rbitcoin_consensus::script_pool;
+    use std::sync::{Condvar, Mutex};
+
+    let (_store, q, cbs) = pad_cbs(1);
+    let mp_dir = tmp();
+    let hub = Arc::new(MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap());
+    hub.set_relay_enabled(true);
+    let probed = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let gate = Arc::new((Mutex::new((0usize, false)), Condvar::new()));
+    let workers = script_pool::script_workers();
+    for _ in 0..workers {
+        let gate = Arc::clone(&gate);
+        script_pool::spawn_detached(move || {
+            let (lock, cv) = &*gate;
+            let mut g = lock.lock().unwrap();
+            g.0 += 1;
+            cv.notify_all();
+            while !g.1 {
+                g = cv.wait(g).unwrap();
+            }
+        });
+    }
+    let release = || {
+        let (lock, cv) = &*gate;
+        lock.lock().unwrap().1 = true;
+        cv.notify_all();
+    };
+    {
+        let (lock, cv) = &*gate;
+        let g = lock.lock().unwrap();
+        let (g, timeout) = cv
+            .wait_timeout_while(g, Duration::from_secs(5), |g| g.0 < workers)
+            .unwrap();
+        drop(g);
+        if timeout.timed_out() {
+            release();
+            panic!("the script workers were not all held");
+        }
+    }
+    let lane = hub.api_script_lane();
+    let all = lane.available_permits();
+    let held = rt.block_on(async {
+        let h = Arc::clone(&hub);
+        let request = tokio::spawn(async move { h.test_accept_async(probed).await });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lane.available_permits() == all && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        request.abort();
+        let _ = request.await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        lane.available_permits()
+    });
+    release();
+    assert_eq!(held, all - 1, "the dropped test still holds its lane");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while lane.available_permits() < all {
+        assert!(Instant::now() < deadline, "the test's work never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = std::fs::remove_dir_all(&mp_dir);
 }
 
 /// A script-bearing admit must finish while the one blocking thread is parked.

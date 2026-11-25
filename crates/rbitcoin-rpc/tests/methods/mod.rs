@@ -8068,6 +8068,13 @@ fn sendraw_while_tentative(
     send_hex: String,
 ) -> Result<Value, Value> {
     let mp = Arc::clone(ctx.mempool.as_ref().unwrap());
+    // As on a runner with one API script lane permit (macOS CI): the parked
+    // call takes that one. One more lets the broadcast reach the tentative
+    // window instead of waiting on the lane, as these journeys need.
+    let lane = mp.api_script_lane();
+    let spare = lane.available_permits().saturating_sub(1) as u32;
+    let _held = (spare > 0).then(|| lane.clone().try_acquire_many_owned(spare).unwrap());
+    lane.add_permits(1);
     mp.pause_after_tentative_commit
         .store(true, Ordering::Release);
     let ctx = Arc::clone(ctx);
