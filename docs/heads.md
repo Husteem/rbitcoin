@@ -41,7 +41,10 @@ spk hash    ──► scripthash.head/NN.mphf+.val  sealed BDZ3 main (2-bit g + 
 3. Still unfinished: each **sealed** segment, newest first. Fuse + one MPHF batch (or the sealed OA), then the same two-shot identity, then retire. A fence-connected hit skips every older segment. An unconnected body match does not.
 
 `TipThenAny` / `TipOnly` still walk older segments after an unconnected earlier
-hit so a connected sibling can win.
+hit so a connected sibling can win. A single confirmed lookup uses the same
+segment order with one 32-byte identity read per candidate visited. It checks
+the current height fence after verifying a candidate's identity and skips
+remaining segments once a connected match is found.
 
 ## Sealed-age probe split (not page-cache)
 

@@ -88,6 +88,30 @@ pub struct SegmentedTxHead {
     pub seal_rx: Mutex<Option<Receiver<Result<SealPublish, StoreError>>>>,
 }
 
+#[cfg(debug_assertions)]
+struct SealedTipProbeHook {
+    file_id: u32,
+    run: Box<dyn FnOnce()>,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SEALED_TIP_PROBE: std::cell::RefCell<Option<SealedTipProbeHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run a one-shot hook on this thread before the named sealed segment's tip probe.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_sealed_tip_probe(file_id: u32, hook: impl FnOnce() + 'static) {
+    SEALED_TIP_PROBE.with(|slot| {
+        *slot.borrow_mut() = Some(SealedTipProbeHook {
+            file_id,
+            run: Box::new(hook),
+        });
+    });
+}
+
 impl SegmentedTxHead {
     pub fn create(dir: &Path, layout: HeadLayout) -> Result<Self, StoreError> {
         let dir = dir.to_path_buf();
@@ -589,6 +613,62 @@ impl SegmentedTxHead {
         Ok(out)
     }
 
+    /// Visit candidates newest first on one segment snapshot, returning the
+    /// first match. A seal publishing during the walk cannot move a segment
+    /// from the open wave to the sealed wave of the same lookup.
+    pub(crate) fn find_candidate<T>(
+        &self,
+        mixed: &[u8; 32],
+        mut accept: impl FnMut(Fk) -> Result<Option<T>, StoreError>,
+    ) -> Result<Option<T>, StoreError> {
+        let mut find = |candidates: Vec<Fk>| {
+            for fk in candidates {
+                if let Some(hit) = accept(fk)? {
+                    return Ok(Some(hit));
+                }
+            }
+            Ok::<_, StoreError>(None)
+        };
+
+        let segments = self.segments_snapshot();
+        let keys = std::slice::from_ref(mixed);
+        let mut open = [Vec::new()];
+        Self::probe_unsealed_segments(&segments, keys, None, &mut open);
+        let [open] = open;
+        if let Some(hit) = find(open)? {
+            return Ok(Some(hit));
+        }
+
+        let mut ctx = crate::IoCtx::none();
+        for segment in segments.iter().rev() {
+            #[cfg(debug_assertions)]
+            if segment.sealed {
+                let hook = SEALED_TIP_PROBE.with(|slot| {
+                    let mut slot = slot.borrow_mut();
+                    if slot
+                        .as_ref()
+                        .is_some_and(|hook| hook.file_id == segment.file_id)
+                    {
+                        slot.take()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(hook) = hook {
+                    (hook.run)();
+                }
+            }
+            for (_, candidates) in
+                Self::sealed_segment_cands(segment, keys, [0].into_iter(), &mut ctx)?
+            {
+                if let Some(hit) = find(candidates)? {
+                    return Ok(Some(hit));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// One sealed segment for the `active` key indices (ascending): each key
     /// with candidates, with them. Unsealed `si` returns none (the open wave
     /// already probed those OAs). The cost follows `active`, not the wave.
@@ -603,10 +683,10 @@ impl SegmentedTxHead {
             return Ok(Vec::new());
         }
         let segs = self.segments_snapshot();
-        if si >= segs.len() {
+        let Some(segment) = segs.get(si) else {
             return Ok(Vec::new());
-        }
-        self.sealed_segment_cands(&segs, si, mixed, active.iter().copied(), ctx)
+        };
+        Self::sealed_segment_cands(segment, mixed, active.iter().copied(), ctx)
     }
 
     #[doc(hidden)]
@@ -616,7 +696,15 @@ impl SegmentedTxHead {
         active: Option<&[bool]>,
         out: &mut [Vec<Fk>],
     ) {
-        let segs = self.segments_snapshot();
+        Self::probe_unsealed_segments(&self.segments_snapshot(), mixed, active, out);
+    }
+
+    fn probe_unsealed_segments(
+        segs: &[Arc<Segment>],
+        mixed: &[[u8; 32]],
+        active: Option<&[bool]>,
+        out: &mut [Vec<Fk>],
+    ) {
         let key_on = |i: usize| active.map(|a| a[i]).unwrap_or(true);
         for seg in segs.iter().rev() {
             if seg.sealed {
@@ -658,9 +746,9 @@ impl SegmentedTxHead {
     ) -> Result<(), StoreError> {
         let segs = self.segments_snapshot();
         let key_on = |i: usize| active.map(|a| a[i]).unwrap_or(true);
-        for si in (0..segs.len()).rev() {
+        for segment in segs.iter().rev() {
             let keys = (0..mixed.len()).filter(|&i| key_on(i));
-            for (i, cands) in self.sealed_segment_cands(&segs, si, mixed, keys, ctx)? {
+            for (i, cands) in Self::sealed_segment_cands(segment, mixed, keys, ctx)? {
                 out[i].extend(cands);
             }
         }
@@ -670,14 +758,11 @@ impl SegmentedTxHead {
     /// Fuse-filter `keys`, then one MPHF batch (or the sealed OA). Returns
     /// each key with candidates, in `keys` order.
     fn sealed_segment_cands(
-        &self,
-        segs: &[Arc<Segment>],
-        si: usize,
+        seg: &Segment,
         mixed: &[[u8; 32]],
         keys: impl Iterator<Item = usize>,
         ctx: &mut crate::IoCtx<'_>,
     ) -> Result<Vec<(usize, Vec<Fk>)>, StoreError> {
-        let seg = &segs[si];
         if !seg.sealed {
             return Ok(Vec::new());
         }
