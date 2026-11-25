@@ -3241,6 +3241,51 @@ fn a_failed_write_sends_accepted_for_committed_heights_only() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A body in the RAM cache can be a side branch. A failed write must not call
+/// it accepted or keep its reservation just because `has_block` sees it.
+#[test]
+fn a_failed_write_does_not_accept_a_cache_only_body() {
+    use rbitcoin_consensus::mine_empty_regtest;
+    use rbitcoin_ibd::ibd::confirm::{settle_failed_write, take_unproven_lead};
+    use rbitcoin_ibd::ibd::status::LoopStats;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::mpsc;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("failed-write-cache-only");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+        .header
+        .time;
+    let block = mine_empty_regtest(tip, time + 600, 1);
+    let hash = block.block_hash();
+    hub.cache.inner.write().unwrap().by_hash.insert(hash, block);
+    assert!(hub.has_block(&hash));
+    assert!(!hub.is_connected(&hash));
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    let (tx, rx) = mpsc::channel();
+    let stats = LoopStats::default();
+    let accepted = AtomicU32::new(0);
+    settle_failed_write(
+        &hub,
+        &feed,
+        &tx,
+        &[(1, hash.to_byte_array())],
+        &[40],
+        &stats,
+        &accepted,
+    );
+    assert!(rx.try_recv().is_err(), "a cache-only body is not Accepted");
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        !feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
+        "an unconfirmed height gives its bytes back"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A load failure can clear the feed before Accepted is drained. Bytes for a
 /// block already at the tip stay reserved. Bytes above the tip come back.
 #[test]

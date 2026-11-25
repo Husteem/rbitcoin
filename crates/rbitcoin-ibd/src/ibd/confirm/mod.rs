@@ -2267,7 +2267,7 @@ pub fn settle_failed_write(
     let mut unwritten = Vec::new();
     for (index, &(height, raw)) in heights_hashes.iter().enumerate() {
         let hash = BlockHash::from_byte_array(raw);
-        if hub.has_block(&hash) {
+        if hub.is_connected(&hash) {
             loop_stats.confirm_blocks.fetch_add(1, Ordering::Relaxed);
             accepted.fetch_add(1, Ordering::SeqCst);
             let _ = event_tx.send(ConfirmEvent::Accepted {
@@ -2570,9 +2570,13 @@ pub fn spawn_confirm_engine(
                         }
                         let spent_connected = msg.contains("prevout already spent")
                             && heights_hashes.iter().all(|(_, raw)| {
-                                hub_wb.has_block(&BlockHash::from_byte_array(*raw))
+                                hub_wb.is_connected(&BlockHash::from_byte_array(*raw))
                             });
-                        if write_already_committed(skip_stale, hub_wb.has_block(&hash), spent_connected)
+                        if write_already_committed(
+                            skip_stale,
+                            hub_wb.is_connected(&hash),
+                            spent_connected,
+                        )
                         {
                             debug!(Ibd,
                                 "confirm write skip already-committed @{height} ({msg})"
