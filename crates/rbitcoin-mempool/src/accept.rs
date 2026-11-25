@@ -358,8 +358,9 @@ fn kept_trust_structural(
 }
 
 /// Core `CheckTransaction`: the shape and output values, then repeated
-/// inputs before any value sum (Finding 011: phantom fee), then null
-/// prevouts. A coinbase passes the last.
+/// inputs before any value sum (Finding 011: phantom fee), then a
+/// coinbase's scriptSig length (2 to 100 bytes) or, for any other tx, null
+/// prevouts.
 pub fn check_transaction(tx: &Transaction, waive: bool) -> Result<(), AcceptError> {
     let check_tx = |r: Result<(), rbitcoin_consensus::ConsensusError>| {
         r.map_err(|e| AcceptError::CheckTransaction(rbitcoin_consensus::block_reject_reason(&e)))
@@ -373,6 +374,12 @@ pub fn check_transaction(tx: &Transaction, waive: bool) -> Result<(), AcceptErro
         let mut seen = BTreeSet::new();
         if !tx.input.iter().all(|inp| seen.insert(inp.previous_output)) {
             return Err(duplicate_inputs(waive, tx.compute_txid()));
+        }
+    }
+    if tx.is_coinbase() {
+        let len = tx.input[0].script_sig.len();
+        if !(2..=100).contains(&len) {
+            return Err(AcceptError::CheckTransaction("bad-cb-length".into()));
         }
     }
     check_tx(rbitcoin_consensus::block::reject_null_prevouts(tx))

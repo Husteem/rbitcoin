@@ -10,3 +10,7 @@ Fixed
   transaction reports that, not `bip125-replacement-disallowed`. A spend
   that fails both BIP68 and coinbase maturity is `non-BIP68-final`. On
   testnet5 a 64-byte coinbase is `coinbase`, not `txn-size-64`.
+  A loose coinbase is `coinbase`, Core's reason, not `bad-txns-is-coinbase`,
+  from `sendrawtransaction`, `testmempoolaccept` and Esplora, and one whose
+  scriptSig is not 2 to 100 bytes is `bad-cb-length`, as Core's
+  `CheckTransaction` asks.

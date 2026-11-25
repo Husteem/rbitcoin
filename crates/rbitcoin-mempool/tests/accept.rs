@@ -1608,7 +1608,7 @@ fn accept_error_display_and_reject_paths() {
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint::null(),
-            script_sig: ScriptBuf::new(),
+            script_sig: ScriptBuf::from_bytes(vec![0x51; 2]),
             sequence: Sequence::MAX,
             witness: Witness::new(),
         }],
@@ -1621,6 +1621,14 @@ fn accept_error_display_and_reject_paths() {
         mp.accept_tx(&cb, &utxos, TIP_OK),
         Err(AcceptError::Coinbase)
     ));
+    // Core `CheckTransaction` asks a coinbase's scriptSig length first.
+    let mut short_cb = cb.clone();
+    short_cb.input[0].script_sig = ScriptBuf::new();
+    let err = mp.accept_tx(&short_cb, &utxos, TIP_OK).unwrap_err();
+    assert!(
+        matches!(&err, AcceptError::CheckTransaction(r) if r == "bad-cb-length"),
+        "{err}"
+    );
 
     assert!(matches!(
         mp.accept_package(&[], &utxos, TIP_OK),

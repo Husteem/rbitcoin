@@ -109,9 +109,6 @@ pub fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
     if s == "coinbase immature" {
         return "bad-txns-premature-spend-of-coinbase".into();
     }
-    if s == "coinbase" {
-        return "bad-txns-is-coinbase".into();
-    }
     if s.starts_with("missing prevout") || s.starts_with("orphaned ") {
         return "missing-inputs".into();
     }

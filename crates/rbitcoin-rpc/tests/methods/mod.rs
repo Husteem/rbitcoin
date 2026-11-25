@@ -3681,6 +3681,27 @@ fn gettxout_leftover_is_connected_not_unconfirmed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A loose coinbase is Core's `coinbase`. Core `CheckTransaction` asks a
+/// coinbase's scriptSig length (2 to 100 bytes) first, so a short one is
+/// `bad-cb-length` (`mempool_accept.py`).
+#[test]
+fn testmempoolaccept_loose_coinbase_reasons_match_core() {
+    use bitcoin::consensus::encode::serialize;
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let test = |tx: &Transaction| {
+        let hexes = json!([rbitcoin_primitives::hex_encode(serialize(tx))]);
+        dispatch(&ctx, "testmempoolaccept", vec![hexes]).unwrap()
+    };
+    let rows = test(&genesis.txdata[0]);
+    assert_eq!(rows[0]["reject-reason"], "coinbase", "{rows}");
+    let mut short = genesis.txdata[0].clone();
+    short.input[0].script_sig = ScriptBuf::from_bytes(vec![0x51]);
+    let rows = test(&short);
+    assert_eq!(rows[0]["reject-reason"], "bad-cb-length", "{rows}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `BroadcastTransaction` returns `-27` when any of the submitted
 /// transaction's own outputs is still a coin. A confirmed transaction whose
 /// outputs are all spent is `txn-already-known`, as `testmempoolaccept` says.
@@ -3752,10 +3773,7 @@ fn sendrawtransaction_confirmed_output_is_already_in_utxo_set() {
         rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&genesis.txdata[0]));
     let genesis_err = dispatch(&ctx, "sendrawtransaction", vec![json!(genesis_hex)]).unwrap_err();
     assert_eq!(genesis_err["code"], ERR_VERIFY_REJECTED, "{genesis_err}");
-    assert_eq!(
-        genesis_err["message"], "bad-txns-is-coinbase",
-        "{genesis_err}"
-    );
+    assert_eq!(genesis_err["message"], "coinbase", "{genesis_err}");
 
     let child = child_of(&spend, 1_000);
     dispatch(
