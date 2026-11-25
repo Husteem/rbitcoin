@@ -2568,3 +2568,43 @@ fn pong_reads_eight_byte_nonce_and_rejects_short() {
     let mismatch = p.on_pong(&wrong, 10_201).expect("mismatched pong");
     assert!(mismatch.contains("Nonce mismatch"), "{mismatch}");
 }
+
+/// `--i2p-accept-incoming`, and `--listen-onion` without its own bind,
+/// forward overlay peers from loopback onto the ordinary listen. They share
+/// the forwarder's address, so as on the marked onion bind they skip the
+/// per-address handshake budget and the slot-eviction group cooldown there.
+/// Without forwarding, loopback is an ordinary source and keeps both.
+#[test]
+fn forwarded_loopback_skips_the_address_budget_and_group_cooldown() {
+    use rbitcoin_net::peers::MAX_INCOMPLETE_INBOUND_PER_ADDR;
+    let ordinary: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let lo = std::net::IpAddr::from([127, 0, 0, 1]);
+    for forward in [true, false] {
+        let hub = PeerHub::new();
+        hub.set_overlay_loopback_forward(forward);
+        let held: Vec<_> = (0..MAX_INCOMPLETE_INBOUND_PER_ADDR)
+            .map(|_| hub.try_reserve_incomplete(lo, ordinary).unwrap())
+            .collect();
+        assert_eq!(
+            hub.try_reserve_incomplete(lo, ordinary).is_some(),
+            forward,
+            "a further unfinished loopback handshake, forward={forward}"
+        );
+        drop(held);
+
+        for port in 40000..40030 {
+            hub.register_connecting(
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                ordinary,
+                true,
+                PeerConnType::Inbound,
+            );
+        }
+        assert!(hub.try_evict_inbound(), "an inbound session is evicted");
+        assert_eq!(
+            hub.inbound_discouraged(SocketAddr::from(([127, 0, 0, 1], 40030)), ordinary),
+            !forward,
+            "loopback group cooldown, forward={forward}"
+        );
+    }
+}

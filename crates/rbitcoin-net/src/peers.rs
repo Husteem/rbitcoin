@@ -2556,16 +2556,26 @@ impl PeerHub {
         })
     }
 
+    /// Inbound that a Tor or I2P forwarder delivers: the marked onion bind,
+    /// or loopback on a shared listen with `--i2p-accept-incoming` or an
+    /// unmarked `--listen-onion`. Every such peer shares the forwarder's
+    /// address and netgroup.
+    fn forwarded_ingress(&self, ip: IpAddr, bind: SocketAddr) -> bool {
+        self.onion_bind() == Some(bind)
+            || (ip.is_loopback() && self.overlay_loopback_forward.load(Ordering::Relaxed))
+    }
+
     /// Reserve an unfinished TCP handshake, or return `None` at the source cap.
-    /// The marked onion bind uses the shared inbound slots because Tor peers
-    /// share the forwarder's IP. The guard releases any source reservation.
+    /// [`Self::forwarded_ingress`] uses the shared inbound slots only, because
+    /// those peers share the forwarder's IP. The guard releases any source
+    /// reservation.
     #[doc(hidden)]
     pub fn try_reserve_incomplete(
         self: &Arc<Self>,
         ip: IpAddr,
         bind: SocketAddr,
     ) -> Option<IncompleteInbound> {
-        if self.onion_bind() == Some(bind) {
+        if self.forwarded_ingress(ip, bind) {
             return Some(IncompleteInbound { reservation: None });
         }
         let mut map = self
@@ -3488,15 +3498,16 @@ impl PeerHub {
             .contains_key(&key)
     }
 
-    /// Exact-IP refusals apply to every listener. The marked onion listener
-    /// skips eviction group cooldowns at admission.
+    /// Exact-IP refusals apply to every listener.
+    /// [`Self::forwarded_ingress`] skips eviction group cooldowns at
+    /// admission: one evicted overlay peer would refuse every other.
     #[doc(hidden)]
     pub fn inbound_discouraged(&self, addr: SocketAddr, bind: SocketAddr) -> bool {
         // `key_refused` drops expired rows.
         if self.key_refused(DiscourageKey::Ip(addr.ip())) {
             return true;
         }
-        if self.onion_bind() == Some(bind) {
+        if self.forwarded_ingress(addr.ip(), bind) {
             return false;
         }
         let group = crate::netgroup::slot_pause_group(addr);
