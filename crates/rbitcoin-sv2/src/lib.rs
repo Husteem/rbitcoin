@@ -13,6 +13,7 @@ pub mod transport;
 
 use bitcoin::secp256k1::{Keypair, Secp256k1};
 use rbitcoin_net::{ChainHub, RequestMeter};
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -29,6 +30,12 @@ pub use transport::Frame;
 /// txs were replaced, ~2 GB across the cap, which costs the replacer
 /// replacement fees on every interval.
 pub const MAX_SESSIONS: usize = 8;
+
+/// Sessions one netgroup (IPv4 `/16`, IPv6 `/32`, as Core's `GetGroup`
+/// without asmap) may hold at once. A silent SRI pool and a silent attacker
+/// look the same, so no idle deadline can tell them apart; a share keeps
+/// one network from taking the whole table. Loopback is one netgroup.
+pub const MAX_SESSIONS_PER_NETGROUP: usize = MAX_SESSIONS / 2;
 
 /// Default [`Sv2TpConfig::setup_timeout`]. A session holds a slot from TCP
 /// accept, so without it `MAX_SESSIONS` silent sockets lock clients out.
@@ -164,7 +171,8 @@ pub fn log_disconnect(peer: SocketAddr, how: &io::Result<()>) {
 
 /// Bind the listener and serve TDP sessions until [`Sv2TpHandle::shutdown`].
 ///
-/// At `MAX_SESSIONS` the next connection is closed before the handshake;
+/// At `MAX_SESSIONS`, or at [`MAX_SESSIONS_PER_NETGROUP`] from the
+/// newcomer's netgroup, the next connection is closed before the handshake;
 /// existing sessions are not touched.
 pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
     // noise_sv2 casts `cert_validity.as_secs()` to u32; a larger value wraps.
@@ -220,6 +228,7 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
     let local_addr = listener.local_addr()?;
     let stats = Arc::new(Sv2TpStats::default());
     let slots = Arc::new(Semaphore::new(MAX_SESSIONS));
+    let groups = Arc::new(Mutex::new(HashMap::new()));
     let flight = Arc::new(template::TemplateFlight::new());
     let sessions: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let sessions_c = sessions.clone();
@@ -241,6 +250,13 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
             // small buffer on the accepted socket.
             #[cfg(all(debug_assertions, target_os = "linux"))]
             test_send_buffer::apply(&stream);
+            let Some(group) = GroupShare::take(&groups, peer) else {
+                rbitcoin_log::warn!(
+                    "sv2: reject {peer} (netgroup at {MAX_SESSIONS_PER_NETGROUP} sessions)"
+                );
+                drop(stream);
+                continue;
+            };
             let Ok(slot) = slots.clone().try_acquire_owned() else {
                 rbitcoin_log::warn!("sv2: reject {peer} (at max_sessions={MAX_SESSIONS})");
                 drop(stream);
@@ -262,7 +278,7 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
             let stats = Arc::clone(&stats_c);
             let flight = Arc::clone(&flight);
             let h = tokio::spawn(async move {
-                let _slot = slot;
+                let _slot = (slot, group);
                 let how = session::serve(
                     stream,
                     responder,
@@ -292,6 +308,42 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
         task,
         sessions,
     })
+}
+
+/// One session's place in its netgroup's [`MAX_SESSIONS_PER_NETGROUP`]
+/// share, returned on drop.
+struct GroupShare {
+    groups: Arc<Mutex<HashMap<u64, usize>>>,
+    key: u64,
+}
+
+impl GroupShare {
+    /// `None`: `peer`'s netgroup already holds its share.
+    fn take(groups: &Arc<Mutex<HashMap<u64, usize>>>, peer: SocketAddr) -> Option<Self> {
+        let key = rbitcoin_net::netgroup(peer, None);
+        let mut g = groups.lock().unwrap_or_else(|e| e.into_inner());
+        let n = g.entry(key).or_default();
+        if *n >= MAX_SESSIONS_PER_NETGROUP {
+            return None;
+        }
+        *n += 1;
+        Some(Self {
+            groups: Arc::clone(groups),
+            key,
+        })
+    }
+}
+
+impl Drop for GroupShare {
+    fn drop(&mut self) {
+        let mut g = self.groups.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = g.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                g.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// Accepted-socket `SO_SNDBUF` pin for the write-deadline test.

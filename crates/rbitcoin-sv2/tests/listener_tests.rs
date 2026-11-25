@@ -5,11 +5,11 @@ use common_messages_sv2::{
 };
 use rbitcoin_sv2::testutil::TpClient;
 use rbitcoin_sv2::{
-    run_sv2_tp, MAX_IDLE_TIMEOUT, MAX_SESSIONS, MAX_STALE_GRACE, MAX_TEMPLATE_INTERVAL,
-    MIN_TEMPLATE_INTERVAL, TEMPLATE_INTERVAL,
+    run_sv2_tp, MAX_IDLE_TIMEOUT, MAX_SESSIONS, MAX_SESSIONS_PER_NETGROUP, MAX_STALE_GRACE,
+    MAX_TEMPLATE_INTERVAL, MIN_TEMPLATE_INTERVAL, TEMPLATE_INTERVAL,
 };
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,29 +42,55 @@ async fn expect_error(c: &mut TpClient, flags: u32, code: &str) {
     );
 }
 
+/// The listener on every address, and one source address in each of two
+/// netgroups: loopback IPv4 (`127/16`) and loopback IPv6 (`::/32`).
+fn dual_stack_sources(listen: SocketAddr) -> [SocketAddr; 2] {
+    let v4 = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), listen.port());
+    let v6 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), listen.port());
+    [v4, v6]
+}
+
+async fn setup_ok(addr: SocketAddr, pk: [u8; 32]) -> TpClient {
+    let mut c = TpClient::connect(addr, pk).await.expect("handshake");
+    c.setup_connection(TDP, 2, 2, 0).await.unwrap();
+    let mut f = c.recv().await.expect("setup reply");
+    assert_eq!(f.msg_type, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS);
+    let ok: SetupConnectionSuccess = binary_sv2::from_bytes(&mut f.payload).expect("decode");
+    assert_eq!((ok.used_version, ok.flags), (2, 0));
+    c
+}
+
+/// One netgroup takes at most half the table, so idle clients from one
+/// network cannot lock out a miner from another. The newcomer is refused;
+/// existing sessions are not touched.
 #[tokio::test]
 async fn setup_connection_success_errors_and_session_cap() {
     let tc = shared_regtest(0);
     let chain = Arc::clone(&tc.chain);
-    let tp = run_sv2_tp(test_tp_config(chain, [7; 32]))
-        .await
-        .expect("listen");
-    let (addr, pk) = (tp.local_addr, tp.authority_pubkey);
+    let tp = run_sv2_tp({
+        let mut cfg = test_tp_config(chain, [7; 32]);
+        cfg.listen = "[::]:0".parse().unwrap();
+        cfg
+    })
+    .await
+    .expect("listen");
+    let pk = tp.authority_pubkey;
+    let [v4, v6] = dual_stack_sources(tp.local_addr);
+    let share = MAX_SESSIONS_PER_NETGROUP;
 
     let mut live = Vec::new();
-    for _ in 0..MAX_SESSIONS {
-        let mut c = TpClient::connect(addr, pk).await.expect("handshake");
-        c.setup_connection(TDP, 2, 2, 0).await.unwrap();
-        let mut f = c.recv().await.expect("setup reply");
-        assert_eq!(f.msg_type, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS);
-        let ok: SetupConnectionSuccess = binary_sv2::from_bytes(&mut f.payload).expect("decode");
-        assert_eq!((ok.used_version, ok.flags), (2, 0));
-        live.push(c);
+    for _ in 0..share {
+        live.push(setup_ok(v4, pk).await);
     }
-
-    let extra = TpClient::connect(addr, pk).await;
     assert!(
-        extra.is_err(),
+        TpClient::connect(v4, pk).await.is_err(),
+        "one netgroup over its share must close before the handshake"
+    );
+    for _ in 0..MAX_SESSIONS - share {
+        live.push(setup_ok(v6, pk).await);
+    }
+    assert!(
+        TpClient::connect(v6, pk).await.is_err(),
         "session over the cap must close before the handshake"
     );
     for c in live.iter_mut().step_by(MAX_SESSIONS - 1) {
@@ -74,17 +100,20 @@ async fn setup_connection_success_errors_and_session_cap() {
             "existing session must stay up at the cap"
         );
     }
+    // A closed session returns its netgroup's share.
+    live.truncate(MAX_SESSIONS - 1);
+    drop(connect_when_free(v6, pk).await);
     drop(live);
 
-    let mut c = connect_when_free(addr, pk).await;
+    let mut c = connect_when_free(v4, pk).await;
     c.setup_connection(TDP, 2, 2, 0b101).await.unwrap();
     expect_error(&mut c, 0b101, "unsupported-feature-flags").await;
 
-    let mut c = connect_when_free(addr, pk).await;
+    let mut c = connect_when_free(v4, pk).await;
     c.setup_connection(0, 2, 2, 0).await.unwrap();
     expect_error(&mut c, 0, "unsupported-protocol").await;
 
-    let mut c = connect_when_free(addr, pk).await;
+    let mut c = connect_when_free(v4, pk).await;
     c.setup_connection(TDP, 3, 4, 0).await.unwrap();
     expect_error(&mut c, 0, "protocol-version-mismatch").await;
 
@@ -120,8 +149,8 @@ async fn authority_key_prints_in_key_utils_base58check() {
     tp.shutdown().await;
 }
 
-/// Silent sockets take every slot at accept; the setup deadline must close
-/// them so a real client gets in.
+/// Silent sockets from two netgroups take every slot at accept; the setup
+/// deadline must close them so a real client gets in.
 #[tokio::test]
 async fn silent_sockets_are_dropped_at_the_setup_deadline() {
     let tc = shared_regtest(0);
@@ -131,16 +160,18 @@ async fn silent_sockets_are_dropped_at_the_setup_deadline() {
     let setup_timeout = Duration::from_millis(300);
     let tp = run_sv2_tp({
         let mut cfg = test_tp_config(chain, [7; 32]);
+        cfg.listen = "[::]:0".parse().unwrap();
         cfg.setup_timeout = setup_timeout;
         cfg
     })
     .await
     .expect("listen");
-    let (addr, pk) = (tp.local_addr, tp.authority_pubkey);
+    let pk = tp.authority_pubkey;
+    let [addr, v6] = dual_stack_sources(tp.local_addr);
 
     let mut silent = Vec::new();
-    for _ in 0..MAX_SESSIONS {
-        silent.push(tokio::net::TcpStream::connect(addr).await.expect("tcp"));
+    for to in [addr, v6].into_iter().cycle().take(MAX_SESSIONS) {
+        silent.push(tokio::net::TcpStream::connect(to).await.expect("tcp"));
     }
     for s in &mut silent {
         let mut b = [0u8; 1];

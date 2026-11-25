@@ -341,7 +341,9 @@ target spacings needs the minimum-difficulty bits. Those bits are inside
 the header hash, so the session drops the solution before `accept_block`
 (`submit_solution_past_the_min_diff_gap_is_dropped`). Mainnet and signet
 bits depend only on the previous hash.
-At most 8 sessions run at once. A connection that has not finished the
+At most 8 sessions run at once, and at most 4 from one netgroup (IPv4
+`/16`, IPv6 `/32`; loopback is one). Over either cap the new connection is
+closed before the handshake. A connection that has not finished the
 Noise handshake and `SetupConnection` and sent its first
 `CoinbaseOutputConstraints` within 10 s is closed; after that a client may
 stay silent indefinitely unless `--sv2-tp-idle-timeout` is set. A client that stops reading is closed
