@@ -678,6 +678,29 @@ fn a_populated_schema_29_log_becomes_a_delta_generation() {
     assert_eq!(s.spend_directory_slot(16).unwrap(), Some(meta));
 }
 
+/// An upgrade whose open fails after the spend delta adopted the schema-29
+/// log keeps `meta` at 29 and the 29 files beside it: a schema-29 binary
+/// that opens the datadir then still reads the log's spends, which it
+/// would miss if the files were gone while `meta` still let it in.
+#[test]
+fn a_failed_upgrade_open_keeps_the_schema_29_log() {
+    let d = dir();
+    schema_29_store(&d);
+    let meta =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 7).unwrap();
+    write_schema_29_log(&d, &[(0, page_zero_image(meta))], 0, false);
+    // The header table opens after the tx table: its refusal fails the open
+    // once the adoption published.
+    let path = d.join("header.body");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[..4].copy_from_slice(b"XXXX");
+    std::fs::write(&path, bytes).unwrap();
+    assert!(rbitcoin_store::Store::open_tiny(&d).is_err());
+    assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 29);
+    assert!(d.join("spend.pages.commit").exists());
+    assert!(d.join("spend.pages").exists());
+}
+
 /// An upgrade that died after the first schema-30 open created
 /// `spent.delta/` but before the adoption published: `meta` is still 29, so
 /// the next open adopts the dense body's spends again.

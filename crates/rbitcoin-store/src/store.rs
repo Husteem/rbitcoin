@@ -565,9 +565,6 @@ impl Store {
                 schema: meta_ver,
             }),
         )?;
-        // After the spend delta adopted a pre-30 `spent.body`: until `meta`
-        // says 30, a crash leaves an open that adopts again (#2038).
-        open_layout_rewrite_current(&path, meta_ver)?;
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }
@@ -599,6 +596,12 @@ impl Store {
         };
         store.drop_confirmed_past_creates()?;
         store.rebuild_mtp_ring()?;
+        // Last, once the whole open succeeded and the spend delta adopted a
+        // pre-30 `spent.body`: until `meta` says 30 a crash opens as pre-30
+        // and adopts again, and a schema-29 binary still finds its page log
+        // (#2038). The 29 files go only after `meta` 30 is durable.
+        open_layout_rewrite_current(&store.path, meta_ver)?;
+        crate::spend_pages_v29::remove(&store.path)?;
         Ok(store)
     }
 
