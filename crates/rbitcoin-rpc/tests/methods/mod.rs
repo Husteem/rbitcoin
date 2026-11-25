@@ -4989,7 +4989,10 @@ fn testmempoolaccept_package_keeps_the_truc_sibling() {
 /// rules there too: one version-3 child is allowed, and a second child, a
 /// grandchild, a version-2 child, or a child over 1,000 vB is
 /// `TRUC-violation`. Once the parent is pooled, two of its children tested
-/// together are still one too many (Core `PackageTRUCChecks`).
+/// together are still one too many, a tested child of it has no room for a
+/// child of its own, and a member with a pooled and a tested parent has two
+/// unconfirmed parents. Core stops there and reports every row's
+/// `package-error` (`PackageTRUCChecks`); here the offending row says it.
 #[test]
 fn testmempoolaccept_package_applies_truc_to_an_untested_parent() {
     use bitcoin::consensus::encode::serialize;
@@ -5055,6 +5058,25 @@ fn testmempoolaccept_package_applies_truc_to_an_untested_parent() {
     assert_eq!(rows[0]["allowed"], true, "{rows}");
     assert_eq!(rows[1]["reject-reason"], "TRUC-violation", "{rows}");
     assert!(!mp.contains(&first.compute_txid()));
+    // A tested member whose own parent is pooled is a TRUC child, so a
+    // grandchild of the pooled parent is one generation too many.
+    let rows = test(&[&first, &grandchild]);
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["reject-reason"], "TRUC-violation", "{rows}");
+    // One pooled parent and one tested parent are two unconfirmed parents.
+    let (_, mut other) = spend_generated_coinbase(&ctx, 2, 50_0000_0000 - 1_000, op_true());
+    other.version = TxVersion::non_standard(3);
+    let mut two_parents = spend(3, &parent, 1, half - 1_500);
+    two_parents.input.push(TxIn {
+        previous_output: OutPoint::new(other.compute_txid(), 0),
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    });
+    two_parents.output[0].value = Amount::from_sat(half + 50_0000_0000 - 3_500);
+    let rows = test(&[&other, &two_parents]);
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["reject-reason"], "TRUC-violation", "{rows}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
