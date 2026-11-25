@@ -868,6 +868,7 @@ pub fn write_outspends(
     nout: u32,
     view: Option<&rbitcoin_query::ChainView>,
 ) -> Result<(), rbitcoin_query::QueryError> {
+    let settle0 = crate::tx_json::pool_settle(mempool);
     // An empty slot list reads nothing.
     let create = if nout == 0 {
         None
@@ -879,7 +880,7 @@ pub fn write_outspends(
         if vout > 0 {
             out.push(b',');
         }
-        let slot = outspend_slot(query, mempool, txid, create, vout, view)?;
+        let slot = outspend_slot(query, mempool, txid, create, vout, view, settle0)?;
         serde_json::to_writer(&mut *out, &slot).expect("Value encodes into a Vec");
     }
     out.push(b']');
@@ -893,8 +894,9 @@ pub fn outspend_json(
     vout: u32,
     view: Option<&rbitcoin_query::ChainView>,
 ) -> Result<Value, rbitcoin_query::QueryError> {
+    let settle0 = crate::tx_json::pool_settle(mempool);
     let create = spend_create(query, txid, view)?;
-    outspend_slot(query, mempool, txid, create, vout, view)
+    outspend_slot(query, mempool, txid, create, vout, view, settle0)
 }
 
 /// The confirmed create of `txid` whose spends a view reads, looked up once
@@ -912,7 +914,9 @@ fn spend_create(
     query.store().get_fk_by_txid_tip(txid)
 }
 
-/// [`outspend_json`] for the create [`spend_create`] resolved.
+/// [`outspend_json`] for the create [`spend_create`] resolved. Unspent is
+/// answered only once the pool has settled since `settle0`
+/// ([`crate::tx_json::require_settled`]).
 fn outspend_slot(
     query: &Query,
     mempool: Option<&MempoolHub>,
@@ -920,6 +924,7 @@ fn outspend_slot(
     create: Option<Fk>,
     vout: u32,
     view: Option<&rbitcoin_query::ChainView>,
+    settle0: u64,
 ) -> Result<Value, rbitcoin_query::QueryError> {
     if let (Some(view), Some(create)) = (view, create) {
         let spenders = query.spenders_at_fk(txid, create, vout, Some(view.height.0))?;
@@ -955,6 +960,7 @@ fn outspend_slot(
             }));
         }
     }
+    crate::tx_json::require_settled(mempool, settle0)?;
     Ok(json!({ "spent": false }))
 }
 

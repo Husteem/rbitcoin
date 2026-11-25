@@ -9,14 +9,18 @@ use rbitcoin_store::script_hash;
 use std::sync::Arc;
 
 /// Confirmed SH UTXOs plus mempool funding, minus mempool spends (Electrum rules).
+/// A non-empty list is refused while the pool is not settled
+/// ([`rbitcoin_net::require_settled`]): a coin whose spend was disconnected
+/// and is not back in the mempool would read unspent.
 pub fn scripthash_utxos_with_mempool_slot(
     query: &Query,
     mempool: Option<&MempoolHub>,
     sh: &[u8; 32],
     slot: &mut Option<Arc<ShJoinSlot>>,
 ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
+    let settle0 = rbitcoin_net::pool_settle(mempool);
     let mut out = query.scripthash_listunspent_slot(sh, slot)?;
-    overlay_mempool_utxos(&mut out, mempool, sh);
+    settled_overlay(&mut out, mempool, sh, settle0)?;
     Ok(out)
 }
 
@@ -28,9 +32,25 @@ pub fn scripthash_utxos_with_mempool_slot_in(
     slot: &mut Option<Arc<ShJoinSlot>>,
     view: &ChainView,
 ) -> Result<Vec<ScriptHashUtxo>, QueryError> {
+    let settle0 = rbitcoin_net::pool_settle(mempool);
     let mut out = query.scripthash_listunspent_slot_in(sh, slot, view)?;
-    overlay_mempool_utxos(&mut out, mempool, sh);
+    settled_overlay(&mut out, mempool, sh, settle0)?;
     Ok(out)
+}
+
+/// [`overlay_mempool_utxos`], then refuse a non-empty list the pool has not
+/// settled for since `settle0`.
+fn settled_overlay(
+    out: &mut Vec<ScriptHashUtxo>,
+    mempool: Option<&MempoolHub>,
+    sh: &[u8; 32],
+    settle0: u64,
+) -> Result<(), QueryError> {
+    overlay_mempool_utxos(out, mempool, sh);
+    if out.is_empty() {
+        return Ok(());
+    }
+    rbitcoin_net::require_settled(mempool, settle0)
 }
 
 #[doc(hidden)]

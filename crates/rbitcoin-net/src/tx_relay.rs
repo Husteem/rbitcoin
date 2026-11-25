@@ -1709,6 +1709,35 @@ fn unconfirmed_script_policy(e: &rbitcoin_consensus::ConsensusError) -> Option<&
     }
 }
 
+/// The mempool's settle generation. Read it before the reads that decide a
+/// listing or a spend and hand it to [`require_settled`]. 0 without a mempool.
+pub fn pool_settle(mempool: Option<&MempoolHub>) -> u64 {
+    mempool.map_or(0, MempoolHub::pool_settle_gen)
+}
+
+/// Refuse to call a tx gone, or a coin unspent, while the chain tip may be
+/// moving.
+///
+/// A connect, disconnect or reorg holds the settle generation odd from before
+/// the tip moves until the mempool has re-accepted what the disconnected
+/// blocks held (`accept_branch_prefix`). In that window a transaction of a
+/// disconnected block is neither confirmed nor in the mempool yet, and a 404
+/// would tell a client it was dropped. A coin that transaction spent reads
+/// unspent, and a client could spend it again. A generation that is odd, or has moved
+/// since `settle0`, means the reads may straddle a tip change: 503, as for a
+/// pinned view that moved. Without a mempool there is nothing to wait for.
+pub fn require_settled(
+    mempool: Option<&MempoolHub>,
+    settle0: u64,
+) -> Result<(), rbitcoin_store::StoreError> {
+    match mempool {
+        Some(m) if settle0 % 2 == 1 || m.pool_settle_gen() != settle0 => {
+            Err(rbitcoin_store::StoreError::Stale("chain view moved"))
+        }
+        _ => Ok(()),
+    }
+}
+
 impl MempoolHub {
     #[doc(hidden)]
     pub fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, ActiveMempool> {

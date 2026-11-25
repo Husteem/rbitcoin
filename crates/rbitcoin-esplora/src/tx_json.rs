@@ -4,6 +4,7 @@ use crate::script_fields::esplora_script_fields;
 use bitcoin::hashes::Hash;
 use bitcoin::{Network, Transaction, Txid};
 use rbitcoin_net::MempoolHub;
+pub use rbitcoin_net::{pool_settle, require_settled};
 
 use rbitcoin_primitives::{Fk, Height};
 
@@ -32,30 +33,6 @@ pub enum Listing {
     /// Neither: the row was reorged out and is not back in the mempool, or it
     /// lost its inputs to a conflicting tx.
     Gone,
-}
-
-/// The mempool's settle generation. Read it before the reads that decide a
-/// listing and hand it to [`require_settled`]. 0 without a mempool.
-pub fn pool_settle(mempool: Option<&MempoolHub>) -> u64 {
-    mempool.map_or(0, MempoolHub::pool_settle_gen)
-}
-
-/// Refuse to call a tx gone while the chain tip may be moving.
-///
-/// A connect, disconnect or reorg holds the settle generation odd from before
-/// the tip moves until the mempool has re-accepted what the disconnected
-/// blocks held (`accept_branch_prefix`). In that window a transaction of a
-/// disconnected block is neither confirmed nor in the mempool yet, and a 404
-/// would tell a client it was dropped. A generation that is odd, or has moved
-/// since `settle0`, means the reads may straddle a tip change: 503, as for a
-/// pinned view that moved. Without a mempool there is nothing to wait for.
-pub fn require_settled(mempool: Option<&MempoolHub>, settle0: u64) -> Result<(), QueryError> {
-    match mempool {
-        Some(m) if settle0 % 2 == 1 || m.pool_settle_gen() != settle0 => {
-            Err(rbitcoin_store::StoreError::Stale("chain view moved"))
-        }
-        _ => Ok(()),
-    }
 }
 
 /// Whether the node serves a stored tx row, and from where.
