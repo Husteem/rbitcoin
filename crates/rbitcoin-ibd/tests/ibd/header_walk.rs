@@ -9201,3 +9201,39 @@ fn hw_pin_the_first_stored_header_is_noted_on_the_path() {
         Some(child.block_hash().to_byte_array())
     );
 }
+
+/// A walk move past a recorded sibling's height must keep it: the header at the
+/// old tip can still be abandoned after the walk stepped past it, and the
+/// sibling is then the next target. Only a confirmed block at or above the
+/// sibling's height makes it moot.
+#[test]
+fn a_walk_move_past_a_sibling_keeps_it_recorded() {
+    use rbitcoin_ibd::ibd::header_walk::{extend_tip, forget_tip_siblings};
+
+    let (_dir, hub, mut st, _gen_hdr) = opened("sibling-walk-past", false);
+    let gen = hub.tip_hash().unwrap();
+    let sibling = BlockHash::from_byte_array([0xb7; 32]);
+    st.hash_height.insert(sibling, 1);
+    st.known_headers.insert(sibling);
+    st.note_path_prev(sibling, gen);
+    st.tip_siblings.push(sibling);
+
+    let a = mine(gen, 1);
+    assert!(extend_tip(&mut st, &hub, &[a], None));
+    assert_eq!(st.header_walk.tip_height(), 1);
+    assert_eq!(st.tip_siblings, vec![sibling]);
+
+    let a2 = mine(a.block_hash(), 2);
+    assert!(extend_tip(&mut st, &hub, &[a2], None));
+    assert_eq!(st.header_walk.tip_height(), 2);
+    assert_eq!(
+        st.tip_siblings,
+        vec![sibling],
+        "the walk moved past the sibling's height while the body at the old tip \
+         was still outstanding; the sibling must stay the next target"
+    );
+
+    forget_tip_siblings(&mut st, 1);
+    assert!(st.tip_siblings.is_empty());
+    assert!(!st.hash_height.contains_key(&sibling));
+}

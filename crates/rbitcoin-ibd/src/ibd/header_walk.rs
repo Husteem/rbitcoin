@@ -1149,15 +1149,20 @@ pub fn refuse_invalid_linked(
     true
 }
 
-/// Forget the recorded equal-work siblings the walk has passed: those below
-/// `tip_height`. A sibling at or above it is still a competitor of a header
-/// the walk holds, so it stays the next target if that header is abandoned.
-/// Rows only: a sibling still recorded keeps its height and parent.
+/// Forget the recorded equal-work siblings the confirmed tip has reached.
+/// A walk move alone does not retire a sibling: the walk can step past its
+/// height while the body at the old tip is still outstanding, and that body
+/// can still be abandoned, which makes the sibling the next target. Only a
+/// confirmed block at or above the sibling's height makes it moot.
 #[doc(hidden)]
-pub fn forget_tip_siblings(st: &mut IbdWorkState, tip_height: u32) {
+pub fn forget_tip_siblings(st: &mut IbdWorkState, confirmed_tip: u32) {
     let siblings = std::mem::take(&mut st.tip_siblings);
     for h in siblings {
-        if st.hash_height.get(&h).is_some_and(|ht| *ht < tip_height) {
+        if st
+            .hash_height
+            .get(&h)
+            .is_some_and(|ht| *ht <= confirmed_tip)
+        {
             forget_sibling_rows(st, h);
         } else {
             st.tip_siblings.push(h);
@@ -1272,9 +1277,10 @@ fn retire_undeliverable(
     );
     publish_work(st, hub);
     save_adopt(st, hub);
-    // An equal-work sibling recorded at tip+1 stays askable: it keeps its
-    // height and its `tip_siblings` entry across the walk cut.
-    super::path::seed_work_path_from_store(st, hub);
+    // The recorded sibling at tip+1 keeps its height and parent across the
+    // walk cut, so the plant does not need the store reseed (`resume_index_children`
+    // scans every stored header, and this runs while the drain holds
+    // `shared`). `HeaderCmd::Reseed` loads the same path off the lock.
     super::path::plant_valid_tip_child(st, hub);
 }
 
@@ -1809,7 +1815,6 @@ fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
     let Some(mut ch) = st.header_walk.challenger.take() else {
         return;
     };
-    forget_tip_siblings(st, ch.tip.height);
     if ch
         .checkpoints
         .last()
@@ -2174,7 +2179,6 @@ pub fn adopt_heavier(
         tip.work = work;
     }
     st.header_walk.tip = tip;
-    forget_tip_siblings(st, st.header_walk.tip_height());
     let supplier = peer.and_then(|id| peer_net(st, id));
     st.header_walk
         .checkpoints
@@ -2869,7 +2873,6 @@ fn extend_connected(
     }
     st.header_walk.emptied.clear();
     st.header_walk.restored_unproved = false;
-    forget_tip_siblings(st, st.header_walk.tip_height());
     publish_work(st, hub);
     if adopt_checkpoint_due(
         st.header_walk.proven,

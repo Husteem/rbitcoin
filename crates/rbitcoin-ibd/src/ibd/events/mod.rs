@@ -1315,6 +1315,9 @@ pub fn take_confirm_events(
                 st.mutated_copies.remove(&hash);
                 st.tip_siblings.retain(|h| *h != hash);
                 let tip = hub.tip_height().unwrap_or(0);
+                // A confirmed block at or above a recorded sibling's height
+                // makes that sibling moot; a walk move does not.
+                super::header_walk::forget_tip_siblings(st, tip);
                 // The write recorded this height. Do not look it up: a fork
                 // promotion can drop `hash_height` first, and a header read
                 // here runs while the coordinator holds `shared`. A rewind

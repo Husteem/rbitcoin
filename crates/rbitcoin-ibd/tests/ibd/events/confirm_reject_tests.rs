@@ -5389,43 +5389,43 @@ fn abandoning_a_planted_sibling_plants_the_next_recorded_one() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A forward walk move forgets the siblings it passed and keeps the ones at
-/// its new tip height: a recorded sibling at the tip height is still the next
-/// target if that tip is abandoned, while a planted one keeps its rows because
-/// it is the path occupant.
+/// The confirmed tip retires the siblings it reached and keeps the ones above
+/// it: a planted sibling at the confirmed height keeps its rows (it is the path
+/// occupant), a recorded sibling above it is still the next target, and one the
+/// confirmed tip passed loses its rows.
 #[test]
-fn forgetting_tip_siblings_keeps_a_sibling_at_the_new_tip_height() {
+fn forgetting_tip_siblings_keeps_a_sibling_above_the_confirmed_tip() {
     use rbitcoin_ibd::ibd::header_walk::forget_tip_siblings;
 
     let mut st = IbdWorkState::new(Vec::new(), None, Some(3));
     let planted = h(0xb1);
-    let at_tip = h(0xb2);
+    let above = h(0xb2);
     let passed = h(0xb3);
     st.record_height(planted, 4);
     st.known_headers.insert(planted);
     st.header_fks.insert(planted, rbitcoin_primitives::Fk(11));
-    st.hash_height.insert(at_tip, 4);
-    st.known_headers.insert(at_tip);
-    st.header_fks.insert(at_tip, rbitcoin_primitives::Fk(12));
+    st.hash_height.insert(above, 5);
+    st.known_headers.insert(above);
+    st.header_fks.insert(above, rbitcoin_primitives::Fk(12));
     st.hash_height.insert(passed, 2);
     st.known_headers.insert(passed);
     st.header_fks.insert(passed, rbitcoin_primitives::Fk(13));
     st.tip_siblings.push(planted);
-    st.tip_siblings.push(at_tip);
+    st.tip_siblings.push(above);
     st.tip_siblings.push(passed);
 
     forget_tip_siblings(&mut st, 4);
 
-    assert_eq!(st.tip_siblings, vec![planted, at_tip]);
+    assert_eq!(st.tip_siblings, vec![above]);
     assert_eq!(st.height_to_hash.get(&4), Some(&planted));
     assert_eq!(
         st.header_fks.get(&planted),
         Some(&rbitcoin_primitives::Fk(11))
     );
     assert_eq!(
-        st.header_fks.get(&at_tip),
+        st.header_fks.get(&above),
         Some(&rbitcoin_primitives::Fk(12)),
-        "a recorded sibling at the new tip height stays the next target"
+        "a recorded sibling above the confirmed tip stays the next target"
     );
     assert!(!st.hash_height.contains_key(&passed));
     assert!(!st.header_fks.contains_key(&passed));
