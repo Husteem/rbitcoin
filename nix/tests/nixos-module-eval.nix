@@ -345,6 +345,12 @@ let
       hiddenService = false;
     };
   };
+  testnet5Opts = {
+    network = "testnet5";
+    rpc.enable = true;
+  };
+  testnet5Cfg = (moduleOnly testnet5Opts).config.services.rbitcoin;
+  testnet5Exec = execOf testnet5Opts;
   signetExec = execOf {
     network = "signet";
     signet = {
@@ -881,6 +887,11 @@ assert unixSystem.config.networking.firewall.allowedTCPPorts == [ ];
 assert unixSystem.config.systemd.tmpfiles.settings."10-rbitcoin"."/run/rbitcoin".d.mode == "0750";
 assert builtins.elem "/run/rbitcoin" unixSystem.config.systemd.services.rbitcoin.serviceConfig.ReadWritePaths;
 assert builtins.match ".*--esplora-onion.*" onionOffExec == null;
+assert testnet5Cfg.p2p.port == 18353;
+assert testnet5Cfg.rpc.port == 18352;
+assert builtins.match ".*--network testnet5.*" testnet5Exec != null;
+assert builtins.match ".*--listen 0.0.0.0:18353.*" testnet5Exec != null;
+assert builtins.match ".*--rpc-listen 127.0.0.1:18352.*" testnet5Exec != null;
 assert builtins.match ".*--network signet.*" signetExec != null;
 assert builtins.match ".*--signet-challenge 51.*" signetExec != null;
 assert builtins.match ".*--signet-block-time 120.*" signetExec != null;
