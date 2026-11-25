@@ -2008,6 +2008,107 @@ fn a_row_with_no_time_ages_from_its_first_reply() {
     );
 }
 
+/// Core `Connected_` runs for every successful full outbound connection,
+/// tip mode included. A handshake-complete outbound session refreshes its
+/// row; an inbound session leaves it alone.
+#[test]
+fn a_handshaken_outbound_refreshes_its_row() {
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    let mut am = rbitcoin_net::seeds::AddrMan::new();
+    let out_addr = SocketAddr::from(([9, 9, 9, 9], 8333));
+    let out_net = rbitcoin_net::NetAddr::from_socket(out_addr);
+    assert!(am.add_learned_addr_at(out_net, out_net, 1_690_000_000, 0, 1_700_000_000, 8));
+    let book = Arc::new(Mutex::new(am));
+    hub.set_addrman(Arc::clone(&book));
+    let ver = ver("/rbitcoin:test/");
+    let from = hub.register_connecting_net(
+        out_addr,
+        out_net,
+        SocketAddr::from(([127, 0, 0, 1], 40000)),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    hub.register_handshaken_net(
+        &from,
+        PeerEndpoint {
+            addr: out_addr,
+            net: out_net,
+            addrbind: SocketAddr::from(([127, 0, 0, 1], 40000)),
+        },
+        &ver,
+        PeerConnType::OutboundFullRelay,
+        rbitcoin_net::v2::WireBytes::new(),
+    );
+    assert_eq!(
+        book.lock().unwrap().last_seen_of(&out_net),
+        1_700_000_000,
+        "a successful full outbound refreshes the row"
+    );
+
+    let in_addr = SocketAddr::from(([198, 51, 100, 9], 8333));
+    let in_net = rbitcoin_net::NetAddr::from_socket(in_addr);
+    assert!(book.lock().unwrap().add_learned_addr_at(
+        in_net,
+        in_net,
+        1_690_000_000,
+        0,
+        1_700_000_000,
+        8
+    ));
+    let from = hub.register_connecting_net(
+        in_addr,
+        in_net,
+        SocketAddr::from(([0, 0, 0, 0], 8333)),
+        true,
+        PeerConnType::Inbound,
+    );
+    hub.register_handshaken_net(
+        &from,
+        PeerEndpoint {
+            addr: in_addr,
+            net: in_net,
+            addrbind: SocketAddr::from(([0, 0, 0, 0], 8333)),
+        },
+        &ver,
+        PeerConnType::Inbound,
+        rbitcoin_net::v2::WireBytes::new(),
+    );
+    assert_eq!(
+        book.lock().unwrap().last_seen_of(&in_net),
+        1_690_000_000,
+        "an inbound session does not refresh a row"
+    );
+}
+
+/// A `peers` file written on a fast clock must not restamp a row as seen
+/// now: a time more than ten minutes ahead is backdated like an untrusted
+/// gossip time.
+#[test]
+fn a_future_peers_time_is_backdated() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-peers-future-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("peers");
+    std::fs::write(&path, "rbitcoin-peers-v3\n9.9.9.9:8333 0x00 1700003600\n").unwrap();
+    let book = rbitcoin_net::seeds::AddrMan::load(&path).unwrap();
+    let row = rbitcoin_net::NetAddr::Ip(SocketAddr::from(([9, 9, 9, 9], 8333)));
+    assert_eq!(book.last_seen_of(&row), 1_700_003_600);
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    hub.set_addrman(Arc::new(Mutex::new(book)));
+    let got = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, 1_700_000_000 - 5 * 24 * 60 * 60);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 include!("overlay_addrman_journey.rs");
 
 #[test]

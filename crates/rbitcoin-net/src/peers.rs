@@ -3025,25 +3025,7 @@ impl PeerHub {
                 if crate::netaddr::netaddr_unroutable_gossip(addr) {
                     continue;
                 }
-                let claimed = crate::seeds::learned_addr_time(a.time, now);
-                // Core charges a source's gossip two hours; a row a peer
-                // announces as itself keeps the full time. The interval that
-                // decides whether a held row updates uses the claim, not the
-                // discounted time. Core compares the host, so an inbound
-                // peer's listen port still matches its TCP source port.
-                let penalty = if crate::seeds::same_host(addr, source) {
-                    0
-                } else {
-                    crate::seeds::GOSSIP_TIME_PENALTY_SECS
-                };
-                book.add_learned_addr_at(
-                    addr,
-                    source,
-                    claimed,
-                    penalty,
-                    now,
-                    crate::seeds::MAX_ADDR_MAN,
-                );
+                book.add_gossiped_addr(addr, source, a.time, now, crate::seeds::MAX_ADDR_MAN);
             }
         }
     }
@@ -3774,8 +3756,34 @@ impl PeerHub {
         }
         peer.attach_wire(wire);
         peer.mark_handshake_complete();
+        self.note_connected_outbound(&peer);
         self.unregister(from.id);
         self.insert_live(peer)
+    }
+
+    /// Core `FinalizeNode` calls `AddrMan::Connected` for a full outbound
+    /// connection. Refresh its row at the node clock so a tip-mode peer we
+    /// reached is not advertised at its first gossip time.
+    fn note_connected_outbound(&self, peer: &LivePeer) {
+        if peer.inbound
+            || !matches!(
+                peer.conn_type,
+                PeerConnType::OutboundFullRelay | PeerConnType::Manual
+            )
+        {
+            return;
+        }
+        let am = {
+            let g = self.addrman.lock().unwrap_or_else(|e| e.into_inner());
+            g.clone()
+        };
+        let Some(am) = am else {
+            return;
+        };
+        let now = self.now_secs().min(u64::from(u32::MAX)) as u32;
+        am.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_connected_addr(peer.net, now);
     }
 
     fn new_live(

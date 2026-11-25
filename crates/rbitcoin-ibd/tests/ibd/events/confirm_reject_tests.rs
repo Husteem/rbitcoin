@@ -896,14 +896,17 @@ fn apply_peer_event_body_and_control_surface() {
             Some(0),
         );
         let mut full = AddrMan::new();
-        let rows: Vec<rbitcoin_net::NetAddr> = (0..rbitcoin_ibd::ibd::MAX_PEER_POOL as u32)
+        let rows: Vec<(u32, rbitcoin_net::NetAddr)> = (0..rbitcoin_ibd::ibd::MAX_PEER_POOL as u32)
             .map(|i| {
                 let [_, b, c, d] = i.to_be_bytes();
-                rbitcoin_net::NetAddr::Ip(SocketAddr::from(([11, b, c, d], 8333)))
+                (
+                    1_700_000_000,
+                    rbitcoin_net::NetAddr::Ip(SocketAddr::from(([11, b, c, d], 8333))),
+                )
             })
             .collect();
         let teacher_net = rbitcoin_net::NetAddr::Ip(teacher);
-        inject_learned_addrs(&mut full, &rows, local, teacher_net, 1);
+        inject_learned_addrs(&mut full, &rows, local, teacher_net, 1, 1_700_000_000);
         assert_eq!(full.len(), rbitcoin_ibd::ibd::MAX_PEER_POOL);
         // Peer 7 has no slot yet and shares the teacher's /16; peer 8 has
         // no slot and its own group.
@@ -919,7 +922,7 @@ fn apply_peer_event_body_and_control_surface() {
             let ev = PeerEvent::Addrs {
                 peer,
                 from: rbitcoin_net::NetAddr::Ip(from),
-                addrs: vec![fresh],
+                addrs: vec![(1_700_000_000, fresh)],
             };
             apply_peer_event(&mut addr_st, hub, ev, write_next, &mut full, local, None);
             assert_eq!(full.entry_of(&fresh).is_some(), want, "peer {peer}");
@@ -941,7 +944,7 @@ fn apply_peer_event_body_and_control_surface() {
         let ev = PeerEvent::Addrs {
             peer: 9,
             from: rbitcoin_net::NetAddr::Ip(SocketAddr::from(([10, 5, 0, 1], 18444))),
-            addrs: vec![fresh],
+            addrs: vec![(1_700_000_000, fresh)],
         };
         apply_peer_event(
             &mut pending_st,
@@ -1141,19 +1144,30 @@ fn apply_peer_event_body_and_control_surface() {
         "notfound hash is below the densify cursor"
     );
 
-    inject_learned_addrs(&mut book, &[], local, rbitcoin_net::NetAddr::Ip(local), 1);
+    inject_learned_addrs(
+        &mut book,
+        &[],
+        local,
+        rbitcoin_net::NetAddr::Ip(local),
+        1,
+        1_700_000_000,
+    );
     let routable = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
     inject_learned_addrs(
         &mut book,
         &[
-            rbitcoin_net::NetAddr::Ip(addr(2)),
-            rbitcoin_net::NetAddr::Ip(routable),
-            rbitcoin_net::NetAddr::Ip(local),
-            rbitcoin_net::NetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)),
+            (1_700_000_000, rbitcoin_net::NetAddr::Ip(addr(2))),
+            (1_700_000_000, rbitcoin_net::NetAddr::Ip(routable)),
+            (1_700_000_000, rbitcoin_net::NetAddr::Ip(local)),
+            (
+                1_700_000_000,
+                rbitcoin_net::NetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)),
+            ),
         ],
         local,
         rbitcoin_net::NetAddr::Ip(local),
         1,
+        1_700_000_000,
     );
     assert!(
         book.entry_of(&rbitcoin_net::NetAddr::from_socket(addr(2)))
@@ -1171,10 +1185,11 @@ fn apply_peer_event_body_and_control_surface() {
             .unwrap();
     inject_learned_addrs(
         &mut book,
-        &[onion],
+        &[(1_700_000_000, onion)],
         local,
         rbitcoin_net::NetAddr::Ip(local),
         1,
+        1_700_000_000,
     );
     assert!(
         book.entries().iter().all(|e| e.addr != onion),
@@ -1183,10 +1198,11 @@ fn apply_peer_event_body_and_control_surface() {
     book.set_onion_reachable(true);
     inject_learned_addrs(
         &mut book,
-        &[onion],
+        &[(1_700_000_000, onion)],
         local,
         rbitcoin_net::NetAddr::Ip(local),
         1,
+        1_700_000_000,
     );
     assert!(
         book.entries().iter().any(|e| e.addr == onion),
@@ -1499,13 +1515,14 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     let n0 = book.len();
     inject_learned_addrs(
         &mut book,
-        &[rbitcoin_net::NetAddr::Ip(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
-            8333,
-        ))],
+        &[(
+            1_700_000_000,
+            rbitcoin_net::NetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 8333)),
+        )],
         local,
         rbitcoin_net::NetAddr::Ip(local),
         1,
+        1_700_000_000,
     );
     assert_eq!(book.len(), n0);
 
@@ -1521,10 +1538,13 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
         .send(PeerEvent::Addrs {
             peer: 1,
             from: rbitcoin_net::NetAddr::Ip(local),
-            addrs: vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-                8333,
-            ))],
+            addrs: vec![(
+                1_700_000_000,
+                rbitcoin_net::NetAddr::Ip(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                    8333,
+                )),
+            )],
         })
         .unwrap();
     let stats = rbitcoin_ibd::ibd::status::LoopStats::default();

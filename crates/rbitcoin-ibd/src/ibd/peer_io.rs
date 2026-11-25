@@ -80,7 +80,8 @@ pub enum PeerEvent {
     Addrs {
         peer: usize,
         from: rbitcoin_net::NetAddr,
-        addrs: Vec<rbitcoin_net::NetAddr>,
+        /// `(claimed time, address)` as gossiped; the time is untrusted.
+        addrs: Vec<(u32, rbitcoin_net::NetAddr)>,
     },
     /// Peer failed or closed.
     Dead {
@@ -1368,14 +1369,14 @@ pub async fn spawn_peer(
     })
 }
 
-/// IPv4/IPv6 sockets that advertise full/limited network **and** `P2P_V2`.
+/// IPv4/IPv6 rows that advertise full/limited network **and** `P2P_V2`.
 #[doc(hidden)]
 pub fn net_addrs_from_addr(
     list: &[(u32, bitcoin::p2p::address::Address)],
-) -> Vec<rbitcoin_net::NetAddr> {
+) -> Vec<(u32, rbitcoin_net::NetAddr)> {
     socket_addrs_from_addr(list)
         .into_iter()
-        .map(rbitcoin_net::NetAddr::from_socket)
+        .map(|(time, sa)| (time, rbitcoin_net::NetAddr::from_socket(sa)))
         .collect()
 }
 
@@ -1383,7 +1384,7 @@ pub fn net_addrs_from_addr(
 #[doc(hidden)]
 pub fn net_addrs_from_addrv2(
     list: &[bitcoin::p2p::address::AddrV2Message],
-) -> Vec<rbitcoin_net::NetAddr> {
+) -> Vec<(u32, rbitcoin_net::NetAddr)> {
     let mut out = Vec::with_capacity(list.len().min(32));
     for a in list {
         if !services_useful_for_ibd(a.services) {
@@ -1394,23 +1395,26 @@ pub fn net_addrs_from_addrv2(
         };
         match addr {
             rbitcoin_net::NetAddr::Ip(sa) if !usable_dial_addr(&sa) => {}
-            ok => out.push(ok),
+            ok => out.push((a.time, ok)),
         }
     }
     out
 }
 
-/// IPv4/IPv6 sockets that advertise full/limited network **and** `P2P_V2`.
+/// IPv4/IPv6 sockets that advertise full/limited network **and** `P2P_V2`,
+/// with the time each row claimed.
 #[doc(hidden)]
-pub fn socket_addrs_from_addr(list: &[(u32, bitcoin::p2p::address::Address)]) -> Vec<SocketAddr> {
+pub fn socket_addrs_from_addr(
+    list: &[(u32, bitcoin::p2p::address::Address)],
+) -> Vec<(u32, SocketAddr)> {
     let mut out = Vec::with_capacity(list.len().min(32));
-    for (_ts, a) in list {
+    for (ts, a) in list {
         if !services_useful_for_ibd(a.services) {
             continue;
         }
         if let Ok(sa) = a.socket_addr() {
             if usable_dial_addr(&sa) {
-                out.push(sa);
+                out.push((*ts, sa));
             }
         }
     }

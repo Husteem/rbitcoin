@@ -359,14 +359,15 @@ pub fn learned_addr_time(time: u32, now: u64) -> u32 {
 }
 
 /// The time a `getaddr` reply or `getnodeaddresses` row carries. A row that
-/// no peer taught a time is backdated; a known time is never in the future.
+/// no peer taught a time, or whose stored time is more than ten minutes in
+/// the future, is backdated as Core's `ProcessAddrs` does.
 #[doc(hidden)]
 pub fn row_reply_time(last_seen: u32, now: u64) -> u32 {
     let now = now.min(u64::from(u32::MAX)) as u32;
-    if last_seen == 0 {
+    if last_seen == 0 || u64::from(last_seen) > u64::from(now).saturating_add(600) {
         return now.saturating_sub(UNKNOWN_SEEN_AGE_SECS as u32);
     }
-    last_seen.min(now)
+    last_seen
 }
 
 /// Same network host, ignoring the port. Core compares an address to the peer
@@ -793,6 +794,29 @@ impl AddrMan {
         if u64::from(stored) + interval < u64::from(last_seen) {
             self.seen.insert(addr, last_seen);
         }
+    }
+
+    /// Store a row a peer gossiped at `time` (untrusted Unix seconds).
+    ///
+    /// Sanitizes the time to Core's window, charges the source two hours
+    /// unless the row is that peer's own host, and applies the held-row
+    /// refresh interval. The one ingest for `addrv2`, `addr`, and a catch-up
+    /// `getaddr` reply.
+    pub fn add_gossiped_addr(
+        &mut self,
+        addr: NetAddr,
+        source: NetAddr,
+        time: u32,
+        now: u64,
+        cap: usize,
+    ) -> bool {
+        let claimed = learned_addr_time(time, now);
+        let penalty = if same_host(addr, source) {
+            0
+        } else {
+            GOSSIP_TIME_PENALTY_SECS
+        };
+        self.add_learned_addr_at(addr, source, claimed, penalty, now, cap)
     }
 
     /// `group` already taught its share of the rows.
