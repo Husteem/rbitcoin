@@ -267,8 +267,13 @@ loopback peers skip source-IP grants and self-announcements.
 Explicit bind grants still apply.
 
 Unfinished handshakes on the marked listener use the shared `--max-inbound`
-limit and the normal handshake timeout. Ordinary TCP listeners allow up to
-eight unfinished handshakes per source IP.
+limit and the normal handshake timeout. So do loopback handshakes on the
+other P2P listeners with `--i2p-accept-incoming`, with `--listen-onion` and
+no marked listener, or with an onion `--external-ip` and no marked listener:
+every forwarded peer arrives from the forwarder's address. A `v1` wallet
+bind keeps the per-IP limit. Those peers also skip the ten-minute netgroup wait after an
+inbound eviction, as on the marked listener. Other TCP sources allow up to
+eight unfinished handshakes per IP.
 
 On NixOS, append the Tor listener alongside the module-managed P2P listener:
 
