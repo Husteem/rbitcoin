@@ -6912,18 +6912,41 @@ fn getnodeaddresses_reports_the_row_time() {
     ctx.addrman = Some(Arc::clone(&am));
     let hub = rbitcoin_net::peers::PeerHub::new();
     hub.set_mock_now(1_700_000_000);
-    ctx.peers = Some(hub);
+    ctx.peers = Some(Arc::clone(&hub));
     let known: SocketAddr = "128.1.2.3:8333".parse().unwrap();
     assert!(am.lock().unwrap().add_learned_addr_at(
         NetAddr::from_socket(known),
         NetAddr::from_socket(known),
         1_699_000_000,
+        0,
         1_700_000_000,
         rbitcoin_net::MAX_ADDR_MAN,
     ));
+    let v6: SocketAddr = "[2606:4700:4700::1111]:8333".parse().unwrap();
+    am.lock().unwrap().add(v6);
 
     let got = dispatch(&ctx, "getnodeaddresses", vec![json!(1)]).unwrap();
     assert_eq!(got[0]["time"], json!(1_699_000_000));
+    let v4_only = dispatch(&ctx, "getnodeaddresses", vec![json!(1), json!("ipv4")]).unwrap();
+    assert_eq!(v4_only.as_array().unwrap().len(), 1);
+    assert_eq!(
+        am.lock().unwrap().last_seen_of(&NetAddr::from_socket(v6)),
+        0,
+        "a row the request filtered out is not stamped"
+    );
+
+    // Ten days later the IPv6 row is first returned; its backdate starts
+    // now, not when the IPv4-only request ran.
+    let later = 1_700_000_000 + 10 * 24 * 60 * 60;
+    hub.set_mock_now(later);
+    let all = dispatch(&ctx, "getnodeaddresses", vec![json!(0)]).unwrap();
+    let v6_row = all
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["address"] == json!("2606:4700:4700::1111"))
+        .expect("ipv6 row");
+    assert_eq!(v6_row["time"], json!(later - 5 * 24 * 60 * 60));
 
     dispatch(&ctx, "addpeeraddress", vec![json!("9.9.9.9"), json!(8333)]).unwrap();
     let all = dispatch(&ctx, "getnodeaddresses", vec![json!(0)]).unwrap();
@@ -6935,7 +6958,7 @@ fn getnodeaddresses_reports_the_row_time() {
         .expect("added row");
     assert_eq!(
         added["time"],
-        json!(1_700_000_000),
+        json!(later),
         "addpeeraddress stamps the node clock"
     );
     let _ = std::fs::remove_dir_all(&dir);

@@ -289,7 +289,7 @@ pub fn addpeeraddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     let added = am
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .add_learned_addr_at(net, net, last_seen, now, rbitcoin_net::MAX_ADDR_MAN);
+        .add_learned_addr_at(net, net, last_seen, 0, now, rbitcoin_net::MAX_ADDR_MAN);
     Ok(json!({ "success": added }))
 }
 
@@ -325,8 +325,7 @@ pub fn getnodeaddresses(ctx: &RpcContext, params: &RpcParams) -> Result<Value, V
     };
     let now = node_now_secs(ctx);
     let mut g = am.lock().unwrap_or_else(|e| e.into_inner());
-    g.stamp_missing_seen(now);
-    let mut out = Vec::new();
+    let mut rows = Vec::new();
     for e in g.entries() {
         let net = e.addr.network_label();
         if let Some(want) = network {
@@ -334,20 +333,27 @@ pub fn getnodeaddresses(ctx: &RpcContext, params: &RpcParams) -> Result<Value, V
                 continue;
             }
         }
+        rows.push(e);
+        if count > 0 && (rows.len() as u64) >= count {
+            break;
+        }
+    }
+    let returned: Vec<rbitcoin_net::NetAddr> = rows.iter().map(|e| e.addr).collect();
+    g.stamp_missing_seen_for(&returned, now);
+    let services =
+        rbitcoin_net::local_service_flags(ctx.query.prune_seqsigwit(), ctx.peers.as_deref())
+            .to_u64();
+    let mut out = Vec::with_capacity(rows.len());
+    for e in rows {
+        let net = e.addr.network_label();
+        let last_seen = g.last_seen_of(&e.addr);
         out.push(json!({
-            "time": rbitcoin_net::seeds::row_reply_time(e.last_seen, now),
-            "services": rbitcoin_net::local_service_flags(
-                ctx.query.prune_seqsigwit(),
-                ctx.peers.as_deref(),
-            )
-            .to_u64(),
+            "time": rbitcoin_net::seeds::row_reply_time(last_seen, now),
+            "services": services,
             "address": e.addr.host_str(),
             "port": e.addr.port(),
             "network": net,
         }));
-        if count > 0 && (out.len() as u64) >= count {
-            break;
-        }
     }
     Ok(Value::Array(out))
 }
