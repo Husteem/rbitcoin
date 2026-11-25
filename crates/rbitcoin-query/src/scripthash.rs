@@ -69,6 +69,30 @@ fn note_sh_page_scan(query: &Query) {
 #[cfg(not(debug_assertions))]
 fn note_sh_page_scan(_query: &Query) {}
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static BLOCK_TOUCH_READ: std::cell::Cell<Option<ShPageScanHook>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One-shot hook in [`Query::block_touch`] after the header read, before
+/// the set is built. Tests use it to reorg inside that window.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_block_touch_hook_for_test(hook: Option<ShPageScanHook>) {
+    BLOCK_TOUCH_READ.with(|slot| slot.set(hook));
+}
+
+#[cfg(debug_assertions)]
+fn note_block_touch_read(query: &Query) {
+    if let Some(hook) = BLOCK_TOUCH_READ.with(|slot| slot.take()) {
+        hook(query);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn note_block_touch_read(_query: &Query) {}
+
 /// While held, an unpaged join on this thread skips `--max-sh-creates`.
 /// `--heavy-sh-creates` still applies. The Esplora unix socket's
 /// `/internal/{address,scripthash}` totals hold one for the request: the
@@ -2133,9 +2157,10 @@ impl Query {
     /// subscription. The set grows with the block, not with the output count
     /// of the txs it spends from.
     pub fn block_touch(&self, height: Height) -> Result<Arc<BlockTouch>, QueryError> {
-        let Some((_, rec)) = self.header_at_height(height)? else {
+        let Some((header_fk, rec)) = self.header_at_height(height)? else {
             return Err(StoreError::NotFound);
         };
+        note_block_touch_read(self);
         let mut cache = self
             .block_touch_cache
             .lock()
@@ -2146,7 +2171,9 @@ impl Query {
         {
             return Ok(Arc::clone(touch));
         }
-        let touch = Arc::new(self.build_block_touch(height)?);
+        // Built from the header read above, not the height again: a reorg
+        // since then must not put another block's set under this hash.
+        let touch = Arc::new(self.build_block_touch(header_fk)?);
         if cache.len() >= BLOCK_TOUCH_KEEP {
             cache.pop_front();
         }
@@ -2154,11 +2181,13 @@ impl Query {
         Ok(touch)
     }
 
-    fn build_block_touch(&self, height: Height) -> Result<BlockTouch, QueryError> {
+    fn build_block_touch(&self, header_fk: Fk) -> Result<BlockTouch, QueryError> {
         #[cfg(debug_assertions)]
         self.block_touch_builds
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let fks = self.block_tx_fks(height)?;
+        let fks = self
+            .header_tx_fks(header_fk, None)?
+            .ok_or(StoreError::Corrupt("confirmed header missing body list"))?;
         let mut spent: std::collections::HashMap<Fk, Vec<u32>> = Default::default();
         for fk in &fks {
             for (create_fk, vout) in self.tx_prevouts_for_fk(*fk)? {

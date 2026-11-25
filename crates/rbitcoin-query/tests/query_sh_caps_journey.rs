@@ -627,6 +627,54 @@ fn block_touch_skips_unspent_siblings() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static TOUCH_REPLACE: std::cell::RefCell<Option<(HeaderRecord, TxApply)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn replace_tip_during_touch(q: &Query) {
+    let (header, tx) = TOUCH_REPLACE
+        .with(|slot| slot.borrow_mut().take())
+        .expect("replacement block");
+    q.disconnect_tip().unwrap();
+    q.connect_block(Height(1), &header, &[tx]).unwrap();
+}
+
+/// A touch set is the block whose header was read, even when a same-height
+/// reorg lands before the set is built. Keyed by that header's hash, the
+/// replacement's set would hide the old block's scripts if it reconnects.
+#[cfg(debug_assertions)]
+#[test]
+fn block_touch_is_the_block_whose_header_was_read() {
+    let (dir, q) = temp_query("touch-reorg");
+    let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
+    let prev = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let (h1a, mut cb1a) = coinbase_block(1, prev, Some(h0.hash));
+    cb1a.outputs = vec![OutputRecord::unspent(1, vec![0x5a])];
+    q.connect_block(Height(1), &h1a, &[cb1a]).unwrap();
+    let (mut h1b, mut cb1b) = coinbase_block(1, prev, Some(h0.hash));
+    h1b.nonce = h1b.nonce.wrapping_add(1);
+    rehash_header(&mut h1b, &h0.hash);
+    cb1b.tx.txid[5] = 0xbb;
+    cb1b.outputs = vec![OutputRecord::unspent(1, vec![0x5b])];
+    TOUCH_REPLACE.with(|slot| *slot.borrow_mut() = Some((h1b.clone(), cb1b)));
+    rbitcoin_query::scripthash::set_block_touch_hook_for_test(Some(replace_tip_during_touch));
+    let touch = q.block_touch(Height(1)).unwrap();
+    assert!(
+        touch.touches(&script_hash(&[0x5a])),
+        "the block whose header was read"
+    );
+    assert!(
+        !touch.touches(&script_hash(&[0x5b])),
+        "the replacement's set under the old block's hash"
+    );
+    let touch = q.block_touch(Height(1)).unwrap();
+    assert!(touch.touches(&script_hash(&[0x5b])), "the replacement, read again");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Newest-first pages stay on the page path above, at, and below the cap.
 /// Same-height order is txid, a sibling output's spend is not a row, and the
 /// page after the tip creates is the spend of an older coin.
