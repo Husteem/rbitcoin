@@ -227,8 +227,19 @@ pub struct AppState {
     pub work_queue: Arc<tokio::sync::Semaphore>,
     /// Separate from [`Self::work_queue`]. REST must not take an RPC slot.
     pub rest_queue: Arc<tokio::sync::Semaphore>,
+    /// REST's share of the store-read budget, taken before a budget permit,
+    /// so REST alone can never hold every permit Electrum, Esplora and RPC
+    /// read through.
+    pub rest_store: Arc<tokio::sync::Semaphore>,
     pub rest: bool,
     pub require_auth: bool,
+}
+
+/// REST may hold at most half of the store-read budget (at least one
+/// permit), so Electrum, Esplora and RPC always keep the rest.
+#[doc(hidden)]
+pub fn rest_store_share(budget: usize) -> usize {
+    (budget / 2).max(1)
 }
 
 /// Omitted and `0` are [`DEFAULT_RPC_WORK_QUEUE`]. A positive `N` is `N`.
@@ -298,6 +309,9 @@ pub async fn run_rpc(
     let n = work_queue_permits(config.work_queue);
     let work_queue = Arc::new(tokio::sync::Semaphore::new(n));
     let rest_queue = Arc::new(tokio::sync::Semaphore::new(DEFAULT_RPC_WORK_QUEUE));
+    let rest_store = Arc::new(tokio::sync::Semaphore::new(rest_store_share(
+        ctx.query.api_read_budget_size(),
+    )));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, _) = tokio::sync::watch::channel(());
     let mut tasks = Vec::new();
@@ -327,6 +341,7 @@ pub async fn run_rpc(
             cookie: cookie.clone(),
             work_queue: work_queue.clone(),
             rest_queue: rest_queue.clone(),
+            rest_store: rest_store.clone(),
             rest: config.rest,
             require_auth: true,
         };
@@ -382,6 +397,7 @@ pub async fn run_rpc(
             cookie,
             work_queue,
             rest_queue,
+            rest_store,
             rest: config.rest,
             require_auth: false,
         };
@@ -473,10 +489,17 @@ pub async fn rest_entry(State(state): State<AppState>, req: axum::extract::Reque
         }
     };
     let ctx = Arc::clone(&state.ctx);
+    // REST's share first, then a budget permit: REST alone cannot take every
+    // permit the other readers share.
+    let share = Arc::clone(&state.rest_store)
+        .acquire_owned()
+        .await
+        .expect("REST store share");
     let store_permit = acquire_store_budget(&ctx).await;
     let reply = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         let _store = store_permit;
+        let _share = share;
         crate::methods::dispatch_rest(&ctx, &path, &query, &body)
     })
     .await

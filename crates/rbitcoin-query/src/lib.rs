@@ -708,6 +708,9 @@ pub struct Query {
     /// Shared API store-read slots. Tests leave this at `tokio::sync::Semaphore::MAX_PERMITS`.
     /// The node replaces it once at listen from `--store-read-budget`.
     pub api_read_budget: std::sync::Mutex<Arc<tokio::sync::Semaphore>>,
+    /// The permit count [`Self::api_read_budget`] was built with, whatever
+    /// is held at the moment.
+    api_read_budget_size: std::sync::atomic::AtomicUsize,
     /// One heavy unpaged SH join at a time across every Electrum and Esplora
     /// client: one near the cap can peak above 2 GiB.
     pub heavy_sh_join: Mutex<()>,
@@ -1071,6 +1074,9 @@ impl Query {
             api_read_budget: std::sync::Mutex::new(Arc::new(tokio::sync::Semaphore::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
             ))),
+            api_read_budget_size: std::sync::atomic::AtomicUsize::new(
+                tokio::sync::Semaphore::MAX_PERMITS,
+            ),
             heavy_sh_join: Mutex::new(()),
             #[cfg(debug_assertions)]
             sh_join_probe: crate::scripthash::ShJoinProbe::default(),
@@ -2259,10 +2265,19 @@ impl Query {
     /// Replace the API store-read semaphore. `0` waits forever. The node
     /// passes a count of at least 1.
     pub fn set_api_read_budget(&self, n: usize) {
-        *self
+        let mut g = self
             .api_read_budget
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Arc::new(tokio::sync::Semaphore::new(n));
+            .unwrap_or_else(|e| e.into_inner());
+        *g = Arc::new(tokio::sync::Semaphore::new(n));
+        self.api_read_budget_size
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The configured store-read permit count, held or not.
+    pub fn api_read_budget_size(&self) -> usize {
+        self.api_read_budget_size
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(debug_assertions)]
