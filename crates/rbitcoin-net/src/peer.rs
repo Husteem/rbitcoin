@@ -1693,6 +1693,7 @@ pub async fn read_peer_version<R: FrameRead>(
     loop {
         let frame = read_handshake_frame(reader, magic, policy).await?;
         let cmd = command_label(&frame.command);
+        let payload_len = frame.payload_len();
         let msg = frame.try_decode()?;
         match msg.payload() {
             NetworkMessage::Version(v) => {
@@ -1708,6 +1709,9 @@ pub async fn read_peer_version<R: FrameRead>(
                         }
                     }
                     return Err(NetError::Protocol("obsolete version"));
+                }
+                if let Some(s) = policy.session {
+                    s.set_version_payload_len(payload_len);
                 }
                 return Ok(v.clone());
             }
@@ -1863,7 +1867,9 @@ pub fn requeue_later_pong(session: &crate::peers::LivePeer, written: u64) {
 }
 
 /// Write v2 `contents` and, once the write succeeded, count them in
-/// `bytessent_per_msg`. Every frame the session sends goes through here.
+/// `bytessent_per_msg`: contents plus the cipher expansion on a v2 writer,
+/// payload plus the v1 header on a v1 writer. Every frame the session sends
+/// goes through here.
 async fn write_counted(
     writer: &mut PeerWriter,
     session: Option<&crate::peers::LivePeer>,
@@ -1871,10 +1877,15 @@ async fn write_counted(
 ) -> Result<(), NetError> {
     let sent = crate::v2::v2_command(&contents)
         .ok()
-        .map(|(cmd, prefix)| (cmd, contents.len().saturating_sub(prefix)));
+        .map(|(cmd, prefix)| (cmd, contents.len(), prefix));
     writer.write_contents(contents).await?;
-    if let (Some(s), Some((cmd, payload))) = (session, sent) {
-        s.note_sent(command_str(&cmd), payload as u64);
+    let (Some(s), Some((cmd, contents_len, prefix))) = (session, sent) else {
+        return Ok(());
+    };
+    let cmd = command_str(&cmd);
+    match writer {
+        PeerWriter::V2(_) => s.note_sent_v2(cmd, contents_len),
+        PeerWriter::V1(_) => s.note_sent(cmd, contents_len.saturating_sub(prefix) as u64),
     }
     Ok(())
 }
@@ -2460,6 +2471,7 @@ pub async fn peer_session_with(
     let mut rate = PeerRateLimiter::default_limits();
     let decoy_score = AtomicU32::new(0);
     let mut logged_invalid_v2 = false;
+    let mut frame_contents_len: Option<usize> = None;
     let mut tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
     let mut inv_flush_rx = hub.mempool().map(|m| m.subscribe_inv_flush());
     let mut headers_poll = tokio::time::interval(Duration::from_secs(HEADERS_POLL_SECS));
@@ -2595,7 +2607,7 @@ pub async fn peer_session_with(
                 }
                 // Inbound before local tip announce so GetData during a
                 // generate burst is not queued behind hundreds of cmpctblocks.
-                frame = reader.read_frame_with_progress(magic, |_, _| {}, |n| {
+                frame = reader.read_frame_with_progress(magic, |_, len| frame_contents_len = Some(len), |n| {
                     let mut score = decoy_score.load(Ordering::Relaxed);
                     let keep = crate::peer_dos::decoy_stays(
                         &mut rate,
@@ -2669,10 +2681,7 @@ pub async fn peer_session_with(
                                 rbitcoin_log::debug!(P2p, "{}", crate::v2::v2_invalid_message_type_log());
                             }
                             if let Some(ref sess) = session {
-                                sess.note_recv_raw(
-                                    "*other*",
-                                    crate::v2::v2_other_recv_bytes(contents_len),
-                                );
+                                sess.note_recv_v2("*other*", contents_len);
                             }
                             if !rate.note(contents_len) {
                                 follow.ban_score =
@@ -2712,7 +2721,11 @@ pub async fn peer_session_with(
                         }
                     };
                     if let Some(ref sess) = session {
-                        sess.note_recv(&framed_cmd(&frame), frame.payload_len() as u64);
+                        let cmd = framed_cmd(&frame);
+                        match frame_contents_len.take() {
+                            Some(contents_len) => sess.note_recv_v2(&cmd, contents_len),
+                            None => sess.note_recv(&cmd, frame.payload_len() as u64),
+                        }
                     }
                     if !note_frame_rate(&mut rate, follow, &frame) {
                         follow.ban_score = follow.ban_score.saturating_add(RATE_LIMIT_BAN_SCORE);

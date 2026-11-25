@@ -392,7 +392,7 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
                 seed.peers.snapshot().into_iter().any(|p| {
                     p.inbound
                         && !p.subver.is_empty()
-                        && p.bytesrecv_per_msg.get("ping").copied().unwrap_or(0) == 32
+                        && p.bytesrecv_per_msg.get("ping").copied().unwrap_or(0) == 29
                 })
             },
             || {
@@ -429,8 +429,8 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
             .expect("seed inbound after handshake");
         let ping = inbound.bytesrecv_per_msg.get("ping").copied().unwrap_or(0);
         assert_eq!(
-            ping, 32,
-            "one 8-byte ping (acct +24), not a second interval ping: {ping}"
+            ping, 29,
+            "one 8-byte ping (short id + 20 cipher expansion), not a second interval ping: {ping}"
         );
         let outbound = peer
             .peers

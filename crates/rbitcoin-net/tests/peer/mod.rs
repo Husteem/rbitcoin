@@ -5964,7 +5964,7 @@ async fn unknown_v2_short_id_counts_other_and_stays() {
     let unknown = [99u8, 1, b'd'];
     raw.write_contents(&unknown).await.unwrap();
     raw.write_contents(&unknown).await.unwrap();
-    let want = rbitcoin_net::v2::v2_other_recv_bytes(unknown.len()) * 2;
+    let want = rbitcoin_net::v2::v2_msg_bytes(unknown.len()) * 2;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let other = loop {
         let snap = t.node.peers.snapshot();
@@ -5995,6 +5995,76 @@ async fn unknown_v2_short_id_counts_other_and_stays() {
     .expect("session stays up after an unknown short id");
     assert_eq!(pong, 9);
     assert!(t.node.peers.snapshot().iter().any(|p| p.id == id));
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// Wait until the node's row for peer `id` counts exactly `want` bytes of
+/// `cmd` in `bytesrecv_per_msg`.
+async fn wait_bytes_recv(node: &rbitcoin_net::P2PNode, id: u64, cmd: &str, want: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = node
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.bytesrecv_per_msg.get(cmd).copied());
+        if got == Some(want) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bytesrecv_per_msg[{cmd}] want {want}, last {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A v2 peer's `bytesrecv_per_msg` counts each message as its decrypted
+/// contents plus the 20-byte cipher expansion, as Core does, not payload
+/// plus the v1 24-byte header. A short id is one byte of type and the long
+/// form is `0x00` and a 12-byte command. A ping sent in the long form counts
+/// its 13 type bytes: the count follows the contents on the wire, not the
+/// short-id table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_messages_count_contents_plus_cipher_expansion() {
+    let mut t = paused_serve("v2-recv-bytes", 0, &["/rbitcoin:test(v2bytes)/"]).await;
+    let (raw, sess) = &mut t.clients[0];
+    let id = sess.id;
+    wait_bytes_recv(&t.node, id, "verack", 13 + 20).await;
+
+    write_peer_msg(raw, NetworkMessage::Ping(7)).await;
+    wait_bytes_recv(&t.node, id, "ping", 1 + 8 + 20).await;
+
+    write_peer_msg(raw, NetworkMessage::SendHeaders).await;
+    wait_bytes_recv(&t.node, id, "sendheaders", 13 + 20).await;
+
+    let mut long_ping = vec![0u8];
+    long_ping.extend_from_slice(b"ping\0\0\0\0\0\0\0\0");
+    long_ping.extend_from_slice(&8u64.to_le_bytes());
+    raw.write_contents(&long_ping).await.unwrap();
+    wait_bytes_recv(&t.node, id, "ping", (1 + 8 + 20) + (13 + 8 + 20)).await;
+
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// The `version` a v2 peer sent counts at its own length, so two peers with
+/// different user agents read different sizes. The payload is 85 fixed bytes,
+/// the length byte of the user agent, and the user agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v2_version_counts_the_length_the_peer_sent() {
+    let agents = [
+        "/rbitcoin:test(v2a)/",
+        "/rbitcoin:test(v2-longer-agent-string)/",
+    ];
+    let t = paused_serve("v2-version-bytes", 0, &agents).await;
+    for (agent, (_, sess)) in agents.iter().zip(&t.clients) {
+        let want = (13 + 85 + 1 + agent.len() + 20) as u64;
+        wait_bytes_recv(&t.node, sess.id, "version", want).await;
+    }
+
     t.node.shutdown().await;
     let _ = std::fs::remove_dir_all(&t.dir);
 }
@@ -6043,7 +6113,7 @@ async fn unknown_commands_share_one_other_key() {
     }
     assert_eq!(
         row.bytesrecv_per_msg.get("*other*").copied(),
-        Some(3 * (24 + 2))
+        Some(3 * (13 + 2 + 20))
     );
     t.node.shutdown().await;
     let _ = std::fs::remove_dir_all(&t.dir);
@@ -10991,8 +11061,9 @@ fn wire_pongs(wire: &[NetworkMessage]) -> Vec<u64> {
 }
 
 /// `getpeerinfo.bytessent_per_msg` counts what the writer put on the wire,
-/// per command, as payload plus Core's 24-byte header (the same rule as
-/// `bytesrecv_per_msg`). A pre-encoded getdata block counts as `block`.
+/// per command. A v1 writer counts payload plus Core's 24-byte header; the v2
+/// rule is `session_start_messages_count_in_bytes_sent`. A pre-encoded
+/// getdata block counts as `block`.
 #[tokio::test(flavor = "current_thread")]
 async fn writer_counts_bytes_sent_per_message() {
     let peer = addrfetch_peer();
@@ -11153,7 +11224,9 @@ async fn getheaders_written_ahead_keeps_a_queued_reply_charged() {
 
 /// The session start writes `sendheaders`, `sendcmpct`, the first `ping`
 /// and, when relay is on or IBD runs, `feefilter` before the writer task
-/// runs. Those count in `bytessent_per_msg` too.
+/// runs. Those count in `bytessent_per_msg` too, as a v2 peer's contents
+/// plus the 20-byte cipher expansion: `sendheaders` has no short id, so it
+/// is a 13-byte type and no payload.
 #[tokio::test]
 async fn session_start_messages_count_in_bytes_sent() {
     use rbitcoin_net::v2::read_v2_frame;
@@ -11187,11 +11260,11 @@ async fn session_start_messages_count_in_bytes_sent() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(sent.get("sendheaders"), Some(&24), "{sent:?}");
-    assert_eq!(sent.get("sendcmpct"), Some(&(9 + 24)), "{sent:?}");
-    assert_eq!(sent.get("ping"), Some(&(8 + 24)), "{sent:?}");
+    assert_eq!(sent.get("sendheaders"), Some(&(13 + 20)), "{sent:?}");
+    assert_eq!(sent.get("sendcmpct"), Some(&(1 + 9 + 20)), "{sent:?}");
+    assert_eq!(sent.get("ping"), Some(&(1 + 8 + 20)), "{sent:?}");
     if seen.contains("feefilter") {
-        assert_eq!(sent.get("feefilter"), Some(&(8 + 24)), "{sent:?}");
+        assert_eq!(sent.get("feefilter"), Some(&(1 + 8 + 20)), "{sent:?}");
     }
     sess.session.abort();
     let _ = std::fs::remove_dir_all(dir);

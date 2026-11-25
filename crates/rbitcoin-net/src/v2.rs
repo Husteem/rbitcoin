@@ -226,11 +226,16 @@ pub const IBD_CIPHERTEXT_BUF_LEN: usize = 4 * 1024 * 1024;
 const _: () = assert!(MAX_V2_CONTENTS_LEN + V2_PACKET_REST_OVERHEAD <= IBD_CIPHERTEXT_BUF_LEN);
 
 /// Core `BIP324Cipher::EXPANSION`: 3-byte length + header + Poly1305 tag.
-/// `bytesrecv_per_msg['*other*']` = contents + this (test_msgtype expects 23).
 pub const V2_CIPHER_EXPANSION: usize = 3 + V2_PACKET_REST_OVERHEAD;
 
-/// Raw `getpeerinfo` bytes for a rejected v2 type (`*other*`).
-pub fn v2_other_recv_bytes(contents_len: usize) -> u64 {
+/// The `0x00` type byte and the 12-byte command that open a long-form message.
+pub(crate) const V2_LONG_TYPE_LEN: usize = 1 + 12;
+
+/// What `getpeerinfo` counts for one v2 message in `bytesrecv_per_msg` and
+/// `bytessent_per_msg`: its BIP324 contents plus [`V2_CIPHER_EXPANSION`], as
+/// Core's `m_raw_message_size`. A rejected type (`*other*`) counts the same
+/// way, so `test_msgtype` expects 23 for 3 bytes of contents.
+pub fn v2_msg_bytes(contents_len: usize) -> u64 {
     (contents_len + V2_CIPHER_EXPANSION) as u64
 }
 
