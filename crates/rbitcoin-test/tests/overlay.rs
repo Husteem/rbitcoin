@@ -344,6 +344,36 @@ fn hs_desc_uploaded_line_is_the_stored_event() {
     ));
 }
 
+#[test]
+fn hs_desc_watch_ignores_upload_until_the_subscription_drops() {
+    use rbitcoin_test::overlay::{
+        hs_desc_uploaded, hs_desc_watch_advance, HsDescWatch, HsDescWatchEvent,
+    };
+    let id = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv";
+    let uploaded =
+        format!("650 HS_DESC UPLOADED {id} NO_AUTH $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let accepts = |phase, line: &str| phase == HsDescWatch::Dropped && hs_desc_uploaded(line, id);
+
+    let mut phase = HsDescWatch::Attaching;
+    phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Miss);
+    phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Miss);
+    assert_eq!(phase, HsDescWatch::Attaching);
+    assert!(!accepts(phase, &uploaded));
+
+    phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Subscribed);
+    assert_eq!(phase, HsDescWatch::Subscribed);
+    assert!(!accepts(phase, &uploaded));
+
+    phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Closed);
+    assert_eq!(phase, HsDescWatch::Dropped);
+    assert!(accepts(phase, &uploaded));
+
+    phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Miss);
+    phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Subscribed);
+    assert_eq!(phase, HsDescWatch::Dropped);
+    assert!(accepts(phase, &uploaded));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tor_onion_comes_back_after_tor_restarts() {
     let env = require_env();

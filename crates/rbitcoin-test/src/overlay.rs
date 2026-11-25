@@ -219,6 +219,38 @@ pub fn hs_desc_uploaded(line: &str, service_id: &str) -> bool {
         && parts.next() == Some(service_id)
 }
 
+/// Where the HS_DESC watch is relative to the tor the caller is about to kill.
+///
+/// A connect or `SETEVENTS` miss while `Attaching` is not that kill. Only the
+/// close of the subscription moves to `Dropped`, and only then does `UPLOADED`
+/// count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum HsDescWatch {
+    Attaching,
+    Subscribed,
+    Dropped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum HsDescWatchEvent {
+    /// Auth or `SETEVENTS` failed before this connection was subscribed.
+    Miss,
+    Subscribed,
+    /// The subscribed control connection closed.
+    Closed,
+}
+
+#[doc(hidden)]
+pub fn hs_desc_watch_advance(phase: HsDescWatch, event: HsDescWatchEvent) -> HsDescWatch {
+    match (phase, event) {
+        (HsDescWatch::Attaching, HsDescWatchEvent::Subscribed) => HsDescWatch::Subscribed,
+        (HsDescWatch::Subscribed, HsDescWatchEvent::Closed) => HsDescWatch::Dropped,
+        (phase, _) => phase,
+    }
+}
+
 /// Block until Tor reports `HS_DESC UPLOADED` for `service_id` on a control
 /// connection opened after the previous one dropped.
 ///
@@ -237,7 +269,7 @@ pub async fn wait_hs_desc_uploaded(
     use rbitcoin_node::tor_control::{TorAuth, TorControl};
     let deadline = Instant::now() + wall;
     let attempt = Duration::from_millis(250);
-    let mut saw_drop = false;
+    let mut phase = HsDescWatch::Attaching;
     let mut told_attached = false;
     loop {
         if Instant::now() >= deadline {
@@ -251,15 +283,16 @@ pub async fn wait_hs_desc_uploaded(
         {
             Ok(Ok(ctl)) => ctl,
             _ => {
-                saw_drop = true;
+                phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Miss);
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
         };
         if ctl.command("SETEVENTS HS_DESC").await.is_err() {
-            saw_drop = true;
+            phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Miss);
             continue;
         }
+        phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Subscribed);
         if !told_attached {
             attached.notify_one();
             told_attached = true;
@@ -272,12 +305,12 @@ pub async fn wait_hs_desc_uploaded(
             }
             match tokio::time::timeout(left, lines.next_line()).await {
                 Ok(Ok(Some(line))) => {
-                    if saw_drop && hs_desc_uploaded(line.trim(), service_id) {
+                    if phase == HsDescWatch::Dropped && hs_desc_uploaded(line.trim(), service_id) {
                         return;
                     }
                 }
                 Ok(Ok(None)) | Ok(Err(_)) => {
-                    saw_drop = true;
+                    phase = hs_desc_watch_advance(phase, HsDescWatchEvent::Closed);
                     break;
                 }
                 Err(_) => panic!("HS_DESC UPLOADED {service_id} wall {wall:?}"),
