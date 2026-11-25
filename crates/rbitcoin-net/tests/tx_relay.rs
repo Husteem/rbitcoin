@@ -1763,7 +1763,13 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
         }],
     };
     let _ = q.store().txs.sample_reset_body_decodes();
+    let _ = q.store().sample_reset_tip_txid_lookups();
     hub.admit(&child).expect("non-coinbase chain spend");
+    assert_eq!(
+        q.store().sample_reset_tip_txid_lookups(),
+        2,
+        "resolve the confirmed parent once in prepare and once in the recheck"
+    );
     assert_eq!(
         hub.get_live_meta(&child.compute_txid()).map(|(fee, _)| fee),
         Some(1_000),

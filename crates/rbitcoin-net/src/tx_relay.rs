@@ -515,14 +515,19 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
         if create_height > tip {
             return ChainPrevout::Unknown;
         }
-        match self.query.is_outpoint_spent(&tid, op.vout) {
+        let Some((_, out)) = outs.into_iter().next() else {
+            return ChainPrevout::KnownUnavailable;
+        };
+        match self.query.store().has_confirmed_strong_spender_create_at(
+            fk,
+            op.vout,
+            None,
+            Some(tip),
+        ) {
             Ok(true) => return ChainPrevout::KnownUnavailable,
             Ok(false) => {}
             Err(_) => return ChainPrevout::KnownUnavailable,
         }
-        let Some((_, out)) = outs.into_iter().next() else {
-            return ChainPrevout::KnownUnavailable;
-        };
         // Core's coins view never stores an unspendable output.
         if rbitcoin_consensus::policy::is_unspendable(&out.script) {
             return ChainPrevout::KnownUnavailable;
