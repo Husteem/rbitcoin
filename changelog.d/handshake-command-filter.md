@@ -5,4 +5,4 @@ Security
   Before `verack`, only `version`, `verack`, `wtxidrelay`, `sendaddrv2`,
   `sendtxrcncl`, and `ping` are decoded (and feeler connections decode only
   `version`). Any other frame is dropped by its header command and logged
-  at debug level without parsing or allocating its payload (#1988).
+  at debug level without decoding its payload (#1988).

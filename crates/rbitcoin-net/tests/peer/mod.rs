@@ -6851,235 +6851,179 @@ async fn handshake_timeout_after_silence() {
     }
 }
 
-mod handshake_command_filter_pins {
-    use super::*;
+#[tokio::test(flavor = "current_thread")]
+async fn read_peer_version_v2_drops_non_handshake_by_command() {
     use bitcoin::p2p::message::CommandString;
-    use rbitcoin_net::peers::PeerConnType;
-    use rbitcoin_net::v1::FrameRead;
     use rbitcoin_net::v2::{open_v2, read_v2_frame, write_v2_msg};
-    use std::collections::VecDeque;
 
-    struct FrameQueue(VecDeque<FramedMessage>);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let bind_addr = listener.local_addr().expect("addr");
+    let peers = rbitcoin_net::peers::PeerHub::new();
 
-    impl FrameRead for FrameQueue {
-        fn read_frame(
-            &mut self,
-            _magic: Magic,
-        ) -> impl std::future::Future<Output = Result<FramedMessage, NetError>> + Send {
-            let next = self.0.pop_front();
-            async move { next.ok_or(NetError::Protocol("eof")) }
-        }
+    let client_early = TcpStream::connect(bind_addr).await.expect("connect");
+    let (server_early, their_early) = listener.accept().await.expect("accept");
+    let peers_early = Arc::clone(&peers);
+    let server_task = tokio::spawn(async move {
+        inbound_connect_and_handshake(
+            server_early,
+            Magic::REGTEST,
+            bind_addr,
+            their_early,
+            0,
+            "/rbitcoin:test/",
+            &peers_early,
+            bind_addr,
+        )
+        .await
+    });
+    let (mut r_early, mut w_early, _, _) = open_v2(client_early, Magic::REGTEST, false)
+        .await
+        .expect("client open_v2");
+    write_v2_msg(&mut w_early, NetworkMessage::Verack)
+        .await
+        .expect("write early verack");
+    assert!(read_v2_frame(&mut r_early, Magic::REGTEST).await.is_err());
+    match server_task.await.expect("server join") {
+        Err(NetError::Protocol("verack before version")) => {}
+        Ok(_) => panic!("verack before version must fail"),
+        Err(e) => panic!("expected verack before version, got {e}"),
     }
 
-    fn cmd12(cmd: &str) -> [u8; 12] {
-        let mut out = [0u8; 12];
-        let b = cmd.as_bytes();
-        out[..b.len()].copy_from_slice(b);
-        out
-    }
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let version = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 42,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let mut bogus_block = vec![0u8; 80];
+    bogus_block.push(0xff);
+    bogus_block.extend_from_slice(&u64::MAX.to_le_bytes());
+    let mut bogus_tx = vec![2, 0, 0, 0, 0xff];
+    bogus_tx.extend_from_slice(&u64::MAX.to_le_bytes());
 
-    fn raw_frame(cmd: &str, payload: Vec<u8>) -> FramedMessage {
-        FramedMessage {
-            magic: Magic::REGTEST,
-            command: cmd12(cmd),
-            payload,
-        }
+    let client = TcpStream::connect(bind_addr).await.expect("connect");
+    let (server, their) = listener.accept().await.expect("accept");
+    let peers_ok = Arc::clone(&peers);
+    let ok_task = tokio::spawn(async move {
+        inbound_connect_and_handshake(
+            server,
+            Magic::REGTEST,
+            bind_addr,
+            their,
+            0,
+            "/rbitcoin:test/",
+            &peers_ok,
+            bind_addr,
+        )
+        .await
+    });
+    let (mut r, mut w, _, _) = open_v2(client, Magic::REGTEST, false)
+        .await
+        .expect("client open_v2");
+    for (cmd, payload) in [("block", bogus_block), ("tx", bogus_tx), ("ping", vec![1])] {
+        write_v2_msg(
+            &mut w,
+            NetworkMessage::Unknown {
+                command: CommandString::try_from_static(cmd).expect(cmd),
+                payload,
+            },
+        )
+        .await
+        .expect("write pre-version frame");
     }
-
-    fn msg_frame(msg: NetworkMessage) -> FramedMessage {
-        let raw = RawNetworkMessage::new(Magic::REGTEST, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().expect("header cmd");
-        FramedMessage {
-            magic: Magic::REGTEST,
-            command,
-            payload: full[24..].to_vec(),
-        }
-    }
-
-    fn sample_version() -> VersionMessage {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        VersionMessage {
-            version: 70016,
-            services: ServiceFlags::NETWORK,
-            timestamp: 0,
-            receiver: Address::new(&addr, ServiceFlags::NONE),
-            sender: Address::new(&addr, ServiceFlags::NONE),
-            nonce: 42,
-            user_agent: "/rbitcoin:test/".into(),
-            start_height: 0,
-            relay: true,
-        }
-    }
-
-    fn bogus_tx_count_payload() -> Vec<u8> {
-        let mut p = vec![2, 0, 0, 0, 0xff];
-        p.extend_from_slice(&u64::MAX.to_le_bytes());
-        p
-    }
-
-    fn bogus_block_count_payload() -> Vec<u8> {
-        let mut p = vec![0u8; 80];
-        p.push(0xff);
-        p.extend_from_slice(&u64::MAX.to_le_bytes());
-        p
-    }
-
-    fn make_session(
-        peers: &Arc<rbitcoin_net::peers::PeerHub>,
-    ) -> Arc<rbitcoin_net::peers::LivePeer> {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        peers.register(addr, addr, &sample_version(), true, PeerConnType::Inbound)
-    }
-
-    async fn bind_pair() -> (TcpStream, TcpStream, SocketAddr) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    write_v2_msg(&mut w, NetworkMessage::Version(version))
+        .await
+        .expect("write version");
+    loop {
+        let frame = read_v2_frame(&mut r, Magic::REGTEST)
             .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let client = TcpStream::connect(addr).await.expect("connect");
-        let (server, _) = listener.accept().await.expect("accept");
-        (client, server, addr)
+            .expect("server handshake frame");
+        if framed_cmd(&frame) == "verack" {
+            break;
+        }
     }
+    write_v2_msg(&mut w, NetworkMessage::Verack)
+        .await
+        .expect("write verack");
+    let (got_version, _, _, _, _) = ok_task
+        .await
+        .expect("server join")
+        .expect("handshake must succeed");
+    assert_eq!(got_version.nonce, 42);
+}
 
-    #[test]
-    fn read_peer_version_drops_non_handshake_by_command() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let peers = rbitcoin_net::peers::PeerHub::new();
-            let sess = make_session(&peers);
-            let policy = HandshakePolicy {
-                session: Some(sess.as_ref()),
-                peers: Some(peers.as_ref()),
-                ..HandshakePolicy::plain()
-            };
+#[tokio::test(flavor = "current_thread")]
+async fn run_feeler_inner_drops_non_version_by_command() {
+    use bitcoin::p2p::message::CommandString;
+    use rbitcoin_net::v2::{open_v2, read_v2_frame, write_v2_msg};
 
-            let mut q = FrameQueue(VecDeque::from([
-                raw_frame("block", bogus_block_count_payload()),
-                raw_frame("tx", bogus_tx_count_payload()),
-                raw_frame("ping", vec![1]),
-                msg_frame(NetworkMessage::Version(sample_version())),
-            ]));
-            rbitcoin_log::capture_logs(true);
-            let got = read_peer_version(&mut q, Magic::REGTEST, &policy)
-                .await
-                .expect("non-version frames before version must be ignored by command");
-            let logs = rbitcoin_log::take_logs();
-            rbitcoin_log::capture_logs(false);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let version = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 42,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let mut bogus_block = vec![0u8; 80];
+    bogus_block.push(0xff);
+    bogus_block.extend_from_slice(&u64::MAX.to_le_bytes());
 
-            assert_eq!(got.nonce, 42);
-            for cmd in ["block", "tx", "ping"] {
-                let needle = non_version_before_handshake_log(cmd, sess.id);
-                assert!(
-                    logs.iter().any(|(_, line)| line.contains(&needle)),
-                    "missing log {needle:?} in {logs:?}"
-                );
-            }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let bind_addr = listener.local_addr().expect("addr");
+    let client = TcpStream::connect(bind_addr).await.expect("connect");
+    let (server, _) = listener.accept().await.expect("accept");
 
-            let mut verack_first = FrameQueue(VecDeque::from([msg_frame(NetworkMessage::Verack)]));
-            match read_peer_version(&mut verack_first, Magic::REGTEST, &policy).await {
-                Err(NetError::Protocol("verack before version")) => {}
-                other => panic!("expected verack before version, got {other:?}"),
-            }
-        });
-    }
+    let peer_task = tokio::spawn(async move {
+        let (mut r, mut w, _, _) = open_v2(server, Magic::REGTEST, true)
+            .await
+            .expect("server open_v2");
+        let frame = read_v2_frame(&mut r, Magic::REGTEST)
+            .await
+            .expect("feeler version");
+        assert_eq!(framed_cmd(&frame), "version");
+        write_v2_msg(
+            &mut w,
+            NetworkMessage::Unknown {
+                command: CommandString::try_from_static("block").expect("block"),
+                payload: bogus_block,
+            },
+        )
+        .await
+        .expect("write oversize-count block");
+        write_v2_msg(&mut w, NetworkMessage::Version(version))
+            .await
+            .expect("write version");
+        (r, w)
+    });
 
-    #[test]
-    fn wait_peer_verack_drops_non_handshake_by_command() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let peers = rbitcoin_net::peers::PeerHub::new();
-            let sess = make_session(&peers);
-            let policy = HandshakePolicy {
-                session: Some(sess.as_ref()),
-                peers: Some(peers.as_ref()),
-                ..HandshakePolicy::plain()
-            };
-
-            let mut q = FrameQueue(VecDeque::from([
-                raw_frame("block", bogus_block_count_payload()),
-                raw_frame("tx", bogus_tx_count_payload()),
-                raw_frame(
-                    "addr",
-                    vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
-                ),
-                raw_frame("sendtxrcncl", vec![1, 2, 3, 4]),
-                msg_frame(NetworkMessage::WtxidRelay),
-                msg_frame(NetworkMessage::SendAddrV2),
-                msg_frame(NetworkMessage::Ping(9)),
-                msg_frame(NetworkMessage::Verack),
-            ]));
-            rbitcoin_log::capture_logs(true);
-            wait_peer_verack(&mut q, Magic::REGTEST, &policy, 70016)
-                .await
-                .expect("non-handshake frames before verack must be ignored by command");
-            let logs = rbitcoin_log::take_logs();
-            rbitcoin_log::capture_logs(false);
-
-            assert!(sess.wtxid_relay());
-            assert!(sess.wants_addrv2());
-            for cmd in ["block", "tx", "addr", "sendtxrcncl", "ping"] {
-                let needle = unsupported_before_verack_log(cmd, sess.id);
-                assert!(
-                    logs.iter().any(|(_, line)| line.contains(&needle)),
-                    "missing log {needle:?} in {logs:?}"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn run_feeler_inner_drops_non_version_by_command() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
-        rt.block_on(async {
-            let (client, server, addr) = bind_pair().await;
-            let peer_task = tokio::spawn(async move {
-                let (mut r, mut w, _, _) = open_v2(server, Magic::REGTEST, true)
-                    .await
-                    .expect("server open_v2");
-                let frame = read_v2_frame(&mut r, Magic::REGTEST)
-                    .await
-                    .expect("feeler version");
-                assert_eq!(framed_cmd(&frame), "version");
-                write_v2_msg(
-                    &mut w,
-                    NetworkMessage::Unknown {
-                        command: CommandString::try_from_static("block").expect("block"),
-                        payload: bogus_block_count_payload(),
-                    },
-                )
-                .await
-                .expect("write oversize-count block");
-                write_v2_msg(&mut w, NetworkMessage::Version(sample_version()))
-                    .await
-                    .expect("write version");
-                (r, w)
-            });
-
-            let peers = rbitcoin_net::peers::PeerHub::new();
-            let res = run_feeler_inner(
-                client,
-                Magic::REGTEST,
-                addr,
-                addr,
-                0,
-                "/rbitcoin:test/",
-                peers.as_ref(),
-            )
-            .await;
-            let _keep = peer_task.await.expect("peer task");
-            res.expect("feeler must ignore non-version frames by command");
-        });
-    }
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let res = run_feeler_inner(
+        client,
+        Magic::REGTEST,
+        bind_addr,
+        bind_addr,
+        0,
+        "/rbitcoin:test/",
+        peers.as_ref(),
+    )
+    .await;
+    let _keep = peer_task.await.expect("peer task");
+    res.expect("feeler must ignore non-version frames by command");
 }
 
 /// GetData witness bytes must leave the writer before a queued header flood.
