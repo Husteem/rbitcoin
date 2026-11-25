@@ -2252,6 +2252,40 @@ async fn ping_then_null_push(pad: &mut PoolPad, hold: rbitcoin_net::tx_relay::Te
     assert_eq!(push["params"][1], Value::Null, "{push}");
 }
 
+/// While a connect, disconnect or reorg holds the pool, a coin whose spend
+/// is re-entering it would read unspent. Listunspent, balance and outpoint
+/// status refuse until the pool settles, then answer.
+#[tokio::test]
+async fn coin_reads_refuse_while_the_pool_is_held() {
+    let mut pad = pool_pad().await;
+    let sh = pad.sh.clone();
+    let mut txid = [0u8; 32];
+    txid[31] = 0xce;
+    let op = json!([rbitcoin_primitives::display_hash_hex(txid), 0]);
+    let calls = [
+        ("blockchain.scripthash.listunspent", json!([sh])),
+        ("blockchain.scripthash.get_balance", json!([sh])),
+        ("blockchain.outpoint.get_status", op),
+    ];
+    let mp = Arc::clone(&pad.mp);
+    let hold = mp.template_hold();
+    for (i, (method, params)) in calls.iter().enumerate() {
+        let r = pad.call(i as u32, method, params.clone()).await;
+        assert_eq!(
+            r["error"]["message"], "chain view moved",
+            "{method} while held: {r}"
+        );
+    }
+    drop(hold);
+    let unspent = pad.call(10, calls[0].0, calls[0].1.clone()).await;
+    assert_eq!(unspent["result"][0]["value"], 1, "{unspent}");
+    let bal = pad.call(11, calls[1].0, calls[1].1.clone()).await;
+    assert_eq!(bal["result"]["confirmed"], 1, "{bal}");
+    let status = pad.call(12, calls[2].0, calls[2].1.clone()).await;
+    assert_eq!(status["result"]["spent"], false, "{status}");
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
 /// A reorg holds the template mark until its disconnected txs are back in
 /// the pool. A tick that sees the watermark walk back in that hold pushes
 /// nothing.

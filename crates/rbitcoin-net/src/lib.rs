@@ -137,9 +137,10 @@ pub use test_accept::{
     TestAcceptVerdict,
 };
 pub use tx_relay::{
-    arm_template_prev_sample, sample_template_prev_for_build, CoreDatImport, ElectrumMempoolItem,
-    FeeHistoryBackfillStats, LocalBroadcast, MempoolAnnounce, MempoolHub, MempoolPerfSample,
-    MempoolTxSnapEntry, MempoolTxSnapshot, QueryUtxoProvider, TemplateBuildSample, TxOrigin,
+    arm_template_prev_sample, pool_settle, require_settled, sample_template_prev_for_build,
+    CoreDatImport, ElectrumMempoolItem, FeeHistoryBackfillStats, LocalBroadcast, MempoolAnnounce,
+    MempoolHub, MempoolPerfSample, MempoolTxSnapEntry, MempoolTxSnapshot, QueryUtxoProvider,
+    TemplateBuildSample, TxOrigin,
 };
 pub use v2::{encode_v2_contents, parse_v2_regtest, parse_v2_regtest_named, WireBytes};
 pub use versionbits_warn::{trust_warning_line, versionbit_warning_strings};

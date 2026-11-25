@@ -1567,6 +1567,48 @@ async fn unlisted_tx_is_503_while_a_reorg_holds_the_pool() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// In the same window the disconnected spend of a coin is neither confirmed
+/// nor back in the mempool. Outspends and the script's UTXO list answer 503
+/// instead of calling the coin unspent, and answer once the pool settles.
+#[tokio::test(flavor = "current_thread")]
+async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
+    let (dir, mut pad, handle) = reorg_pad("reorg-window-spends").await;
+    let tx = spend_tx(&pad, 0);
+    use bitcoin::hashes::Hash;
+    let cb = display_txid(bitcoin::Txid::from_byte_array(pad.cbs[0]));
+    let sh = hex_encode(script_hash(&[0x51]));
+    pad.connect(vec![stored_spend(&tx, pad.cbs[0])]);
+    pad.q.disconnect_tip().unwrap();
+    let routes = [
+        format!("/tx/{cb}/outspend/0"),
+        format!("/tx/{cb}/outspends"),
+        format!("/scripthash/{sh}/utxo"),
+        format!("/scripthash/{sh}"),
+    ];
+
+    let hold = pad.hub.template_hold();
+    for path in &routes {
+        let (st, body) = http_get(pad.addr, path).await;
+        assert_eq!((st, body.as_str()), (503, "chain view moved"), "{path}");
+    }
+    drop(hold);
+    let (st, body) = http_get(pad.addr, &routes[0]).await;
+    assert_eq!((st, body.as_str()), (200, r#"{"spent":false}"#));
+    let (st, body) = http_get(pad.addr, &routes[2]).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains(&cb), "the coin is back: {body}");
+
+    pad.hub.admit(&tx).expect("the spend re-enters the pool");
+    let (st, body) = http_get(pad.addr, &routes[0]).await;
+    assert_eq!(st, 200, "{body}");
+    let slot: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(slot["spent"], true, "{body}");
+    assert_eq!(slot["status"]["confirmed"], false, "{body}");
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `tx_status` reads the status on the view it pinned and asks the mempool
 /// only for an unconfirmed answer. A tip change after the row was found must
 /// not turn into `200 {"confirmed":false}` for a tx the mempool lacks: it is a
