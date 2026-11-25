@@ -701,8 +701,14 @@ impl BodyGate {
 /// and [`ESPLORA_BODY_READ_TIMEOUT`]. A slow upload then holds an upload
 /// permit, not a listener slot, so it cannot keep bodiless requests out.
 async fn read_body_first(State(gate): State<BodyGate>, req: Request, next: Next) -> Response {
-    if hyper::body::Body::size_hint(req.body()).exact() == Some(0) {
+    let hint = hyper::body::Body::size_hint(req.body());
+    if hint.exact() == Some(0) {
         return next.run(req).await;
+    }
+    // A declared length past the limit is refused before it can hold an
+    // upload permit. `read_limited` still counts the bytes of a chunked body.
+    if hint.lower() > gate.max_body as u64 {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     }
     let Ok(permit) = gate.sem.clone().acquire_owned().await else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
