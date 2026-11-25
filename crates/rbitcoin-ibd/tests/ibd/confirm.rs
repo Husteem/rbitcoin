@@ -3121,50 +3121,12 @@ fn clear_returns_bytes_reserved_and_not_yet_accepted() {
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(100));
 }
 
-/// A header-walk plan rewind keeps the reservation while the in-channel write
-/// may still commit. When that write is dropped stale it sends no Accepted, so
-/// finishing it must give the reservation back; otherwise a later body at the
-/// same height skips the byte charge even with the lead spent.
-#[test]
-fn a_dropped_stale_plan_releases_its_lead_reservation() {
-    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
-    let feed = ConfirmFeed::new();
-    feed.set_unproven_bounds(Some(10), 0, Some(40));
-    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
-    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(0));
-    {
-        let mut g = feed.inner.lock().unwrap();
-        g.inflight.insert(1);
-        g.claimed_epoch.insert(1, feed.epoch());
-    }
-    feed.drop_plan();
-    assert!(feed.plan_epoch_stale(1), "the claimed plan is stale");
-    assert!(
-        feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
-        "the rewind itself keeps the reservation"
-    );
-    // The write stage drops the stale batch and finishes it. No Accepted
-    // event follows, so finish owns the refund.
-    feed.finish([1]);
-    assert!(
-        !feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
-        "a dropped stale plan gives its bytes back"
-    );
-    feed.install_unproven_bounds(Some(10), 0, Some(40));
-    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(40));
-    assert_eq!(
-        take_unproven_lead(&feed, Some(&[40]), vec![2]),
-        vec![2],
-        "the next body is charged against the restored lead"
-    );
-}
-
 /// Load can drop a stale batch before it records a claim. Lookup already
-/// reserved those heights and no Accepted follows, so finishing that batch
+/// reserved those heights and no Accepted follows, so dropping that batch
 /// must give the reservation back too.
 #[test]
 fn a_stale_load_batch_releases_its_lead_reservation() {
-    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    use rbitcoin_ibd::ibd::confirm::{take_unproven_lead, ConfirmFeed};
     let feed = ConfirmFeed::new();
     feed.set_unproven_bounds(Some(10), 0, Some(40));
     assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
@@ -3173,8 +3135,8 @@ fn a_stale_load_batch_releases_its_lead_reservation() {
         feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
         "the rewind itself keeps the reservation"
     );
-    // Load drops the stale batch before claiming it, then finishes the batch.
-    feed.finish([1]);
+    // Load drops the stale batch before claiming it, then reoffers the body.
+    feed.finish_stale_plan([1]);
     assert!(
         !feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
         "a stale load batch gives its bytes back"

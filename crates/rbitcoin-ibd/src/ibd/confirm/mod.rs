@@ -510,34 +510,45 @@ impl ConfirmFeed {
     /// Write (or permanent reject) finished — height may be re-offered only after
     /// tip moves past it (or a future requeue path).
     ///
-    /// A claim from before a plan rewind is stale and never sends `Accepted`.
-    /// Load can also drop a stale batch before it records a claim. Both give
-    /// their lead reservation back here; a live claim keeps it until the
-    /// accept arm releases it.
+    /// A live claim keeps its lead reservation until the accept arm releases
+    /// it. A stale plan that drops before writing uses
+    /// [`Self::finish_stale_plan`], which returns the reservation.
     pub fn finish(&self, heights: impl IntoIterator<Item = u32>) {
-        let live = self.epoch();
         let mut g = self.inner.lock().unwrap();
-        let mut released = false;
         for h in heights {
             g.inflight.remove(&h);
-            if g.claimed_epoch.remove(&h).is_none_or(|e| e != live)
-                && g.lead_reserved.remove(&h).is_some()
-            {
-                released = true;
-            }
+            g.claimed_epoch.remove(&h);
         }
         drop(g);
-        if released {
-            self.lead_bounds_dirty.store(true, Ordering::Release);
-        }
         self.cv.notify_one();
+    }
+
+    /// A stale plan batch will not write and sends no `Accepted`. Drop its
+    /// claim and return the lead reservation so a later body at the same
+    /// height is charged again. Release before `finish` while the height is
+    /// still in flight, so a lookup cannot claim it in between.
+    pub fn finish_stale_plan(&self, heights: impl IntoIterator<Item = u32>) {
+        let heights: Vec<u32> = heights.into_iter().collect();
+        {
+            let mut g = self.inner.lock().unwrap();
+            let mut released = false;
+            for &h in &heights {
+                if g.lead_reserved.remove(&h).is_some() {
+                    released = true;
+                }
+            }
+            if released {
+                self.lead_bounds_dirty.store(true, Ordering::Release);
+            }
+        }
+        self.finish(heights);
     }
 
     /// Drop ready and inflight and bump the epoch. The lead stays reserved.
     /// A header-walk rewind uses this: the confirmed tip did not move, and
     /// giving the bytes back lets lookup spend them while the old write
     /// still commits. A stale in-channel batch that drops before writing
-    /// returns its reservation in [`Self::finish`].
+    /// returns its reservation in [`Self::finish_stale_plan`].
     pub fn drop_plan(&self) {
         {
             let mut g = self.inner.lock().unwrap();
@@ -2336,7 +2347,7 @@ pub fn spawn_confirm_engine(
                     debug!(Ibd,
                         "confirm write drop stale batch first={first_h} (tip moved)"
                     );
-                    feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                    feed_wb.finish_stale_plan(heights_hashes.iter().map(|(h, _)| *h));
                     continue;
                 }
                 let headers = match batch.wire_headers() {
@@ -2492,7 +2503,7 @@ pub fn spawn_confirm_engine(
                             debug!(Ibd,
                                 "confirm write drop stale batch first={height} ({msg})"
                             );
-                            feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                            feed_wb.finish_stale_plan(heights_hashes.iter().map(|(h, _)| *h));
                             continue;
                         }
                         let spent_connected = msg.contains("prevout already spent")
@@ -2516,6 +2527,9 @@ pub fn spawn_confirm_engine(
                                         height: *ht,
                                         wire_bytes: accepted_block_wire(&wire_sizes, index),
                                     });
+                                } else {
+                                    // No Accepted event will release this height.
+                                    feed_wb.release_lead_reserve(*ht);
                                 }
                             }
                             feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
@@ -2736,6 +2750,10 @@ pub fn spawn_confirm_engine(
                         "confirm load drop stale plan epoch={claim_epoch} live={}",
                         feed_load.epoch()
                     );
+                    // Clear the stale claim and its reservation before the
+                    // bodies are selectable again. A reoffered height must
+                    // charge the lead when lookup takes it anew.
+                    feed_load.finish_stale_plan(lb.items.iter().map(|(h, _, _)| *h));
                     reoffer_blocks_to_body_queue(
                         &hub_load,
                         lb.items.iter().map(|(h, raw, w)| {
@@ -2743,7 +2761,7 @@ pub fn spawn_confirm_engine(
                             (*h, hash, w.block.as_ref(), w.sender)
                         }),
                     );
-                    feed_load.finish(lb.items.iter().map(|(h, _, _)| *h));
+                    feed_load.notify();
                     continue;
                 }
                 let batch: Vec<(u32, BlockHash, rbitcoin_query::ResolvedWire)> = {

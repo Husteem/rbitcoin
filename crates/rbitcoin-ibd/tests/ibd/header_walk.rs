@@ -7962,6 +7962,78 @@ fn a_header_rewind_does_not_give_the_lead_back() {
     assert!(feed.epoch.load(Ordering::Acquire) > epoch);
 }
 
+/// The stale write for a rewound plan drops. A live claim keeps its
+/// reservation through finish, but dropping a stale plan returns it, and the
+/// next body above the same match is charged again.
+#[test]
+fn a_dropped_stale_plan_returns_the_lead_for_the_next_body() {
+    use rbitcoin_ibd::ibd::confirm::{take_unproven_lead, ConfirmFeed};
+    use rbitcoin_ibd::ibd::events::take_confirm_events;
+    use std::sync::atomic::AtomicU32;
+    use std::time::Instant;
+
+    let (_dir, hub, mut st, gen) = opened("unproven-stale-plan-lead", true);
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10_000), 0, Some(80));
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[40, 40]), vec![5, 6]),
+        vec![5, 6]
+    );
+    {
+        let mut g = feed.inner.lock().unwrap();
+        g.inflight.insert(5);
+        g.inflight.insert(6);
+        g.claimed_epoch.insert(5, feed.epoch());
+        g.claimed_epoch.insert(6, feed.epoch());
+    }
+    // Height 6 is a live write. Finish keeps its reservation for Accepted.
+    feed.finish([6]);
+    assert!(feed.inner.lock().unwrap().lead_reserved.contains_key(&6));
+
+    feed.note(5, mine(gen.block_hash(), 9).block_hash());
+    rewind_to(&mut st, &hub, 0, None);
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    let write_next = AtomicU32::new(0);
+    let max_ready = AtomicU32::new(0);
+    let mut progress = Instant::now();
+    let _ = take_confirm_events(
+        &mut st,
+        &hub,
+        &rx,
+        &write_next,
+        &max_ready,
+        &mut progress,
+        Some(&feed),
+    );
+    {
+        let g = feed.inner.lock().unwrap();
+        assert!(
+            g.lead_reserved.contains_key(&5),
+            "the rewind keeps the stale plan's reservation"
+        );
+        assert!(
+            g.lead_reserved.contains_key(&6),
+            "a live write keeps its reservation"
+        );
+    }
+    // Height 5 drops stale before writing; height 6's Accepted has not arrived.
+    feed.finish_stale_plan([5]);
+    assert!(!feed.inner.lock().unwrap().lead_reserved.contains_key(&5));
+    assert!(feed.inner.lock().unwrap().lead_reserved.contains_key(&6));
+    feed.install_unproven_bounds(Some(10_000), 0, Some(80));
+    assert_eq!(
+        feed.inner.lock().unwrap().lead_bytes_left,
+        Some(40),
+        "the live claim still holds its 40 bytes"
+    );
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[40]), vec![7]),
+        vec![7],
+        "the dropped plan's bytes pay for the next body"
+    );
+}
+
 /// The confirmed tip moved. Reservations above it come back so the new
 /// chain can spend the lead. The plan is still dropped.
 #[test]
