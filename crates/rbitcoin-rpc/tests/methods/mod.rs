@@ -5047,9 +5047,11 @@ fn testmempoolaccept_package_applies_truc_to_an_untested_parent() {
 /// of three, and so does a chain of three that spends only a confirmed coin.
 /// Beside the two children, the unrelated tx is still allowed. As in Core,
 /// which checks the cluster only after every member's own checks, a member
-/// that fails its own check reports that, and a member refused only for its
-/// cluster is still a parent: a grandchild paying more than it spends is
-/// `bad-txns-in-belowout`, not `missing-inputs`.
+/// that fails its own check reports that and is not counted, and a member
+/// refused only for its cluster is still a parent: a grandchild paying more
+/// than it spends is `bad-txns-in-belowout`, not `missing-inputs`. A member
+/// already in the pool is not counted either, but the pool cluster it is in
+/// is, for a later member that spends it.
 #[test]
 fn testmempoolaccept_package_counts_each_cluster_alone() {
     use bitcoin::consensus::encode::serialize;
@@ -5105,12 +5107,13 @@ fn testmempoolaccept_package_counts_each_cluster_alone() {
     let mut odd = spend(1);
     odd.version = TxVersion(4);
     let rows = test(&[&spend(0), &odd]);
-    assert!(over_cap(&rows[0]), "{rows}");
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
     assert_eq!(rows[1]["reject-reason"], "version", "{rows}");
     let mut overpaid = child_of(&child, 1_000);
     overpaid.output[0].value = child.output[0].value + Amount::from_sat(1);
     let rows = test(&[&unrelated, &child, &overpaid]);
-    assert!(over_cap(&rows[0]) && over_cap(&rows[1]), "{rows}");
+    assert_eq!(rows[0]["allowed"], true, "{rows}");
+    assert_eq!(rows[1]["allowed"], true, "{rows}");
     assert_eq!(rows[2]["reject-reason"], "bad-txns-in-belowout", "{rows}");
     let grand = child_of(&child, 1_000);
     let rows = test(&[&unrelated, &child, &grand, &child_of(&grand, 1_000)]);
@@ -5128,6 +5131,12 @@ fn testmempoolaccept_package_counts_each_cluster_alone() {
     let rows = dispatch(&ctx, "testmempoolaccept", vec![hexes, json!(0.00001)]).unwrap();
     assert_eq!(rows[0]["reject-reason"], "max-fee-exceeded", "{rows}");
     assert_eq!(rows[1]["reject-reason"], "missing-inputs", "{rows}");
+    // `pooled` and `pooled_child` fill the cluster, so `spend(1)` is over
+    // it alone and beside `pooled`, which is already in the pool.
+    assert!(over_cap(&test(&[&spend(1)])[0]));
+    let rows = test(&[&pooled, &spend(1)]);
+    assert_eq!(rows[0]["reject-reason"], "txn-already-in-mempool", "{rows}");
+    assert!(over_cap(&rows[1]), "{rows}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

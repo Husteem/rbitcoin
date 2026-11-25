@@ -31,7 +31,9 @@ Fixed
   mempool, and only that cluster's members are refused, with
   `reject-reason` `too-large-cluster` as a single transaction over the cap
   gets, once that member passes its own checks, as Core asks the cluster
-  last. It used to add every member onto every pool parent's cluster and
+  last. Only the members that pass are counted, and a member already in
+  the mempool brings its pool cluster to a later member that spends it.
+  It used to add every member onto every pool parent's cluster and
   give every row `package-error`, so a member that touches none of them
   failed too. Core gives every row `package-error`.
   Unlike Core, a multi-transaction call does not stop at the first failed

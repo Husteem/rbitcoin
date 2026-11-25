@@ -1,7 +1,7 @@
 //! `testmempoolaccept`: one row per submitted transaction, in submission
 //! order. JSON-RPC and Esplora render the same rows.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bitcoin::{Transaction, Txid, Wtxid};
@@ -184,34 +184,25 @@ fn package_error(txs: &[Transaction], msg: &'static str) -> Vec<TestAcceptRow> {
         .collect()
 }
 
-impl MempoolHub {
-    /// Core `IsWellFormedPackage`, in Core's order. A failure there is the
-    /// whole package's. Otherwise the positions of the members of each
-    /// cluster over the cap, which only their own rows report. Every surface
-    /// caps the count at 25 before the walk.
-    fn test_accept_precheck(
-        &self,
-        txs: &[Transaction],
-    ) -> Result<BTreeSet<usize>, Vec<TestAcceptRow>> {
-        if txs.len() < 2 {
-            return Ok(BTreeSet::new());
-        }
-        let weight: u64 = txs.iter().map(|tx| tx.weight().to_wu()).sum();
-        let mut ids = HashSet::new();
-        let error = if weight > MAX_PACKAGE_WEIGHT {
-            "package-too-large"
-        } else if txs.iter().any(|tx| !ids.insert(tx.compute_txid())) {
-            "package-contains-duplicates"
-        } else if !ActiveMempool::package_is_sorted(txs) {
-            "package-not-sorted"
-        } else if package_has_conflicts(txs) {
-            "conflict-in-package"
-        } else {
-            return Ok(self.package_clusters_over_cap(txs));
-        };
-        Err(package_error(txs, error))
+/// Core `IsWellFormedPackage`, in Core's order. A failure there is the
+/// whole package's. Every surface caps the count at 25 before the walk.
+fn package_precheck(txs: &[Transaction]) -> Option<&'static str> {
+    let weight: u64 = txs.iter().map(|tx| tx.weight().to_wu()).sum();
+    let mut ids = HashSet::new();
+    if weight > MAX_PACKAGE_WEIGHT {
+        Some("package-too-large")
+    } else if txs.iter().any(|tx| !ids.insert(tx.compute_txid())) {
+        Some("package-contains-duplicates")
+    } else if !ActiveMempool::package_is_sorted(txs) {
+        Some("package-not-sorted")
+    } else if package_has_conflicts(txs) {
+        Some("conflict-in-package")
+    } else {
+        None
     }
+}
 
+impl MempoolHub {
     /// Test-accept `txs` without touching the pool, with script verify
     /// awaited on the caller. Two or more are a package: each member that
     /// passes joins [`TestedMembers`], so a later child sees its parent
@@ -221,16 +212,12 @@ impl MempoolHub {
         txs: Vec<Transaction>,
         max_feerate_sat_kvb: u64,
     ) -> Vec<TestAcceptRow> {
-        let hub = Arc::clone(self);
-        let txs_c = txs.clone();
-        let over_cap =
-            match crate::reactor::off_pool(move || hub.test_accept_precheck(&txs_c)).await {
-                Ok(over_cap) => over_cap,
-                Err(rows) => return rows,
-            };
         if txs.len() >= 2 {
+            if let Some(error) = package_precheck(&txs) {
+                return package_error(&txs, error);
+            }
             return self
-                .test_accept_package_rows_async(txs, &over_cap, max_feerate_sat_kvb)
+                .test_accept_package_rows_async(txs, max_feerate_sat_kvb)
                 .await;
         }
         let Some(tx) = txs.into_iter().next() else {
@@ -247,18 +234,23 @@ impl MempoolHub {
         vec![row]
     }
 
-    /// A member of an over-cap cluster that passes its own checks is
-    /// `too-large-cluster`, as Core checks the cluster after every member's
-    /// own checks and `maxfeerate`. It is still a parent for a later member,
-    /// which is in the same cluster if it spends one.
+    /// The members that pass their own checks and `maxfeerate` are the
+    /// package, and each cluster they make with the pool is checked once the
+    /// walk is done, under one read lock, as Core checks the cluster after
+    /// every member's own checks. A member of an over-cap cluster is then
+    /// `too-large-cluster`. It was still a parent for a later member, which
+    /// is in the same cluster if it spends one. A member that fails, such as
+    /// one already in the pool, is not counted; a later member that spends a
+    /// pooled one joins its pool cluster.
     async fn test_accept_package_rows_async(
         self: &Arc<Self>,
         txs: Vec<Transaction>,
-        over_cap: &BTreeSet<usize>,
         max_feerate_sat_kvb: u64,
     ) -> Vec<TestAcceptRow> {
         let mut tested = Arc::new(TestedMembers::default());
         let mut out = Vec::with_capacity(txs.len());
+        let mut passed = Vec::new();
+        let mut passed_txs = Vec::new();
         for (i, tx) in txs.into_iter().enumerate() {
             if submit_tx_version_nonstandard(&tx) {
                 out.push(TestAcceptRow::rejected(&tx, "version"));
@@ -267,17 +259,27 @@ impl MempoolHub {
             let outcome = self
                 .test_accept_async(tx.clone(), Some(Arc::clone(&tested)))
                 .await;
-            let mut row = match outcome {
+            let row = match outcome {
                 Ok(r) => TestAcceptRow::admitted(&tx, &r, max_feerate_sat_kvb),
                 Err(e) => TestAcceptRow::refused(&tx, &e),
             };
             if row.is_allowed() {
-                if over_cap.contains(&i) {
-                    row = TestAcceptRow::rejected(&tx, "too-large-cluster");
-                }
-                Arc::make_mut(&mut tested).push(Arc::new(tx));
+                Arc::make_mut(&mut tested).push(Arc::new(tx.clone()));
+                passed.push(i);
+                passed_txs.push(tx);
             }
             out.push(row);
+        }
+        if passed_txs.is_empty() {
+            return out;
+        }
+        let hub = Arc::clone(self);
+        let (over_cap, passed_txs) = crate::reactor::off_pool(move || {
+            (hub.package_clusters_over_cap(&passed_txs), passed_txs)
+        })
+        .await;
+        for k in over_cap {
+            out[passed[k]] = TestAcceptRow::rejected(&passed_txs[k], "too-large-cluster");
         }
         out
     }

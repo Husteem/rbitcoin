@@ -7002,8 +7002,9 @@ impl MempoolHub {
 
     /// Positions in `txs` of the members of each cluster they would make with
     /// the pool that exceeds the count or size cap. Members share a cluster
-    /// through a spend inside the package or a pool cluster both spend from.
-    /// A member that touches neither is a cluster of its own.
+    /// through a spend inside `txs` or a pool cluster both spend from. A
+    /// member that touches neither is a cluster of its own. `txs` are the
+    /// package members that passed their own checks, none of them pooled.
     pub fn package_clusters_over_cap(&self, txs: &[bitcoin::Transaction]) -> BTreeSet<usize> {
         fn root(group: &mut [usize], mut i: usize) -> usize {
             while group[i] != i {

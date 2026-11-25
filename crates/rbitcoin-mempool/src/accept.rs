@@ -601,9 +601,8 @@ pub struct PreparedAdmit {
 /// them enters the pool, so the dry run publishes nothing and has nothing to
 /// remove.
 ///
-/// The cluster limit counts only a member's pool parents. The package
-/// precheck already bounds each cluster the members make with the pool,
-/// which holds any one member's cluster.
+/// The admit leaves the cluster limit to the check after the walk, which
+/// bounds each cluster the members that passed make with the pool.
 #[derive(Debug, Clone, Default)]
 pub struct TestedMembers {
     members: BTreeMap<Txid, TestedMember>,
@@ -2181,9 +2180,9 @@ impl ActiveMempool {
         let parent_txids = scan.parent_txids;
         // Cluster limits count raw weight (Libre): at 20 B/sigop an adjusted
         // cap would reject any tx above ~20,200 sigop cost. A package dry run
-        // (tested members present) leaves the cap to its package precheck,
-        // which counts every member and asks after the member's own checks
-        // and `maxfeerate`, as Core does.
+        // (tested members present) leaves the cap to the check after its
+        // walk, which counts every member that passed and asks after the
+        // member's own checks and `maxfeerate`, as Core does.
         let (n_members, base_w) = self
             .graph
             .connected_weight_except(&parent_txids, &conflict_set);
