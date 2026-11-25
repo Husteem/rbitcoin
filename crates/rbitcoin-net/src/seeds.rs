@@ -323,7 +323,7 @@ pub struct PeerEntry {
     pub addr: NetAddr,
     pub flags: PeerFlags,
     /// Unix seconds when a peer said it last saw this row. `0` means no peer
-    /// taught a time (seed, `peers` file, `addnode`).
+    /// taught a time (a seed, `addnode`, or a row from a v1/v2 `peers` file).
     pub last_seen: u32,
 }
 
@@ -742,14 +742,14 @@ impl AddrMan {
         *self.taught_by_group.entry(group).or_insert(0) += 1;
     }
 
-    /// Copy `other`'s row `addr` with its flags. A row this book lacks also
-    /// takes `other`'s source, so a copy between live books keeps each
-    /// group's share. A row both books hold keeps this book's source. A full
-    /// book takes no new untried row from a group at its share, as
-    /// [`Self::add_learned_addr`] refuses it: a group that taught its share
-    /// in each of two live books does not hold both after they are
-    /// reconciled. A row `other` connected to is always taken: a peer that
-    /// answered a dial is not gossip.
+    /// Copy `other`'s row `addr` with its flags and learned time. A row this
+    /// book lacks also takes `other`'s source, so a copy between live books
+    /// keeps each group's share. A row both books hold keeps this book's
+    /// source and time. A full book takes no new untried row from a group at
+    /// its share, as [`Self::add_learned_addr`] refuses it: a group that
+    /// taught its share in each of two live books does not hold both after
+    /// they are reconciled. A row `other` connected to is always taken: a peer
+    /// that answered a dial is not gossip.
     pub fn copy_row_from(&mut self, other: &AddrMan, addr: NetAddr) {
         let held = self.by_addr.contains_key(&addr);
         let group = other.learned_from.get(&addr).copied();

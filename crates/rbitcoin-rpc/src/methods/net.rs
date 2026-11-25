@@ -270,12 +270,17 @@ pub fn addpeeraddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     };
     // RAM-only: do not rewrite peers on every call (p2p_getaddr_caching fills
     // via this RPC). The node still persists addrman on shutdown / catch-up.
-    // The address is its own source, as in Core.
-    let added = am.lock().unwrap_or_else(|e| e.into_inner()).add_learned(
-        addr,
-        addr,
-        rbitcoin_net::MAX_ADDR_MAN,
-    );
+    // The address is its own source, as in Core, and carries the call time.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last_seen = now.min(u64::from(u32::MAX)) as u32;
+    let net = rbitcoin_net::NetAddr::from_socket(addr);
+    let added = am
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add_learned_addr_at(net, net, last_seen, rbitcoin_net::MAX_ADDR_MAN);
     Ok(json!({ "success": added }))
 }
 
@@ -323,7 +328,7 @@ pub fn getnodeaddresses(ctx: &RpcContext, params: &RpcParams) -> Result<Value, V
             }
         }
         out.push(json!({
-            "time": now,
+            "time": rbitcoin_net::seeds::row_reply_time(e.last_seen, now),
             "services": rbitcoin_net::local_service_flags(
                 ctx.query.prune_seqsigwit(),
                 ctx.peers.as_deref(),
