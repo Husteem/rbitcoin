@@ -1168,6 +1168,8 @@ impl AddrMan {
     /// On-disk format magic line (text, one peer per line).
     pub const PEERS_FILE_MAGIC: &'static str = "rbitcoin-peers-v1";
     pub const PEERS_FILE_MAGIC_V2: &'static str = "rbitcoin-peers-v2";
+    /// Adds the row's last-seen Unix seconds as the third field.
+    pub const PEERS_FILE_MAGIC_V3: &'static str = "rbitcoin-peers-v3";
 
     /// Load peers + flags from `path`. Missing file → empty book (not an error).
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -1185,15 +1187,19 @@ impl AddrMan {
                 continue;
             }
             if !saw_magic {
-                if line != Self::PEERS_FILE_MAGIC && line != Self::PEERS_FILE_MAGIC_V2 {
+                if line != Self::PEERS_FILE_MAGIC
+                    && line != Self::PEERS_FILE_MAGIC_V2
+                    && line != Self::PEERS_FILE_MAGIC_V3
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "peers file {}:{}: expected magic `{}` or `{}`",
+                            "peers file {}:{}: expected magic `{}`, `{}`, or `{}`",
                             path.display(),
                             lineno + 1,
                             Self::PEERS_FILE_MAGIC,
-                            Self::PEERS_FILE_MAGIC_V2
+                            Self::PEERS_FILE_MAGIC_V2,
+                            Self::PEERS_FILE_MAGIC_V3
                         ),
                     ));
                 }
@@ -1244,7 +1250,23 @@ impl AddrMan {
             if crate::netaddr::netaddr_unroutable_gossip(addr) {
                 continue;
             }
+            let last_seen: u32 = match parts.next() {
+                None => 0,
+                Some(s) => s.parse().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "peers file {}:{}: bad time: {e}",
+                            path.display(),
+                            lineno + 1
+                        ),
+                    )
+                })?,
+            };
             am.remember(addr, PeerFlags(flags_u));
+            if last_seen != 0 {
+                am.seen.insert(addr, last_seen);
+            }
         }
         if !saw_magic && am.is_empty() {
             // Empty or comment-only without magic — treat as empty book.
@@ -1255,7 +1277,8 @@ impl AddrMan {
         Ok(am)
     }
 
-    /// Atomic save of peers + flags to `path` (`path.tmp` then rename).
+    /// Atomic save of peers, flags, and row times to `path` (`path.tmp` then
+    /// rename).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1263,13 +1286,13 @@ impl AddrMan {
         let tmp = path.with_extension("tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
-            writeln!(f, "{}", Self::PEERS_FILE_MAGIC_V2)?;
+            writeln!(f, "{}", Self::PEERS_FILE_MAGIC_V3)?;
             writeln!(
                 f,
-                "# addr flags  (flags: bit0=connected bit1=fast bit2=slow bit3=incompat bit4=fail)"
+                "# addr flags seen  (flags: bit0=connected bit1=fast bit2=slow bit3=incompat bit4=fail)"
             )?;
             for e in self.entries() {
-                writeln!(f, "{} 0x{:02x}", e.addr, e.flags.0)?;
+                writeln!(f, "{} 0x{:02x} {}", e.addr, e.flags.0, e.last_seen)?;
             }
             f.durable_sync_all()?;
         }

@@ -290,7 +290,7 @@ fn only_net_dials_and_peers_file(am: &Mutex<rbitcoin_net::seeds::AddrMan>, overl
     let path = dir.join("peers");
     book.save(&path).unwrap();
     let body = std::fs::read_to_string(&path).unwrap();
-    assert!(body.starts_with("rbitcoin-peers-v2"), "{body}");
+    assert!(body.starts_with("rbitcoin-peers-v3"), "{body}");
     assert!(
         body.contains(".b32.i2p:8333") && body.contains("fc00:"),
         "{body}"
