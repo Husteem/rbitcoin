@@ -1477,7 +1477,7 @@ fn app_state(pad: &HttpPad) -> AppState {
         join_header_trusted: false,
         block_template: None,
         gbt_cache: Arc::new(Mutex::new(None)),
-        gbt_build: Arc::new(Mutex::new(())),
+        gbt_build: Arc::new(tokio::sync::Mutex::new(())),
         send_stall: Duration::from_secs(120),
     }
 }

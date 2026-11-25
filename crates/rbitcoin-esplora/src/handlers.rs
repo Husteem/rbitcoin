@@ -962,27 +962,41 @@ pub async fn block_template(State(st): State<AppState>) -> Response {
     if st.block_template.is_none() {
         return not_found();
     }
-    // Confirm the tip after one store permit, before `gbt_cache`. The helper
-    // already took that permit. A second acquire here would deadlock a budget
-    // of 1. The 15s cache TTL is unchanged.
-    // A build that waited on another one past a tip change samples again.
-    loop {
-        let sample =
-            rbitcoin_net::sample_template_prev_for_build(st.mempool.as_ref().map(Arc::clone)).await;
-        let st = st.clone();
-        match tokio::task::spawn_blocking(move || {
-            let _g = rbitcoin_net::BlockingRegion::enter();
-            let _store = rbitcoin_net::hold_store_permit(sample.permit);
-            let settle = sample.armed.map(|_| sample.settle);
-            let _prev = sample.armed.map(rbitcoin_net::arm_template_prev_sample);
-            block_template_sync(&st, settle)
-        })
+    // A hit is answered under one store permit. A miss drops that permit,
+    // waits for the build in progress with none, then samples again and
+    // builds unless that build filled the cache.
+    if let Some(r) = block_template_step(&st, None).await {
+        return r;
+    }
+    let build = Arc::clone(&st.gbt_build).lock_owned().await;
+    block_template_step(&st, Some(build))
         .await
-        {
-            Ok(Some(r)) => return crate::server::ensure_json(r).await,
-            Ok(None) => tokio::task::yield_now().await,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
+        .unwrap_or_else(not_found)
+}
+
+/// One cache check, and with `build` one build, on a fresh template-tip
+/// sample and its store permit. The sample is taken only after the build
+/// lock, so it is never older than the wait. The guard moves into the
+/// blocking task, so a dropped request still holds it until the build ends.
+async fn block_template_step(
+    st: &AppState,
+    build: Option<tokio::sync::OwnedMutexGuard<()>>,
+) -> Option<Response> {
+    let sample =
+        rbitcoin_net::sample_template_prev_for_build(st.mempool.as_ref().map(Arc::clone)).await;
+    let st = st.clone();
+    match tokio::task::spawn_blocking(move || {
+        let _g = rbitcoin_net::BlockingRegion::enter();
+        let _store = rbitcoin_net::hold_store_permit(sample.permit);
+        let _prev = sample.armed.map(rbitcoin_net::arm_template_prev_sample);
+        let _build = build.as_ref();
+        block_template_sync(&st, build.is_some())
+    })
+    .await
+    {
+        Ok(Some(r)) => Some(crate::server::ensure_json(r).await),
+        Ok(None) => None,
+        Err(e) => Some((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
     }
 }
 
@@ -1000,71 +1014,36 @@ fn gbt_cache_hit(c: &GbtCache, tip: &[u8; 32], updates: u64) -> bool {
     c.tip == *tip && gbt_cache_fresh(age) && (c.updates == updates || age < Duration::from_secs(5))
 }
 
-/// `settle` is the pool settle generation the armed template prev was read
-/// at, `None` when nothing is armed. `None` back means that prev went stale
-/// while this waited on another build: release the permit and sample again.
-#[doc(hidden)]
-pub fn block_template_sync(st: &AppState, settle: Option<u64>) -> Option<Response> {
+/// The cached template for the current tip, or with `build` a new one.
+/// `None` is a miss without `build`. A caller that builds holds
+/// [`AppState::gbt_build`], so concurrent misses share one build.
+fn block_template_sync(st: &AppState, build: bool) -> Option<Response> {
     let Some(fun) = st.block_template.as_ref() else {
         return Some(not_found());
     };
     // The tip and pool generation the cache is checked against.
-    let sample = || -> Result<([u8; 32], u64), Box<Response>> {
-        let Some(h) = st.query.tip_height() else {
-            return Err(Box::new(
-                (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response(),
-            ));
-        };
-        let tip = match st.query.header_at_height(h) {
-            Ok(Some((_, rec))) => rec.hash,
-            Ok(None) => {
-                return Err(Box::new(
-                    (StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response(),
-                ))
-            }
-            Err(e) => return Err(Box::new(store_err(e))),
-        };
-        let updates = st
-            .mempool
-            .as_ref()
-            .map(|m| m.template_updates())
-            .unwrap_or(0);
-        Ok((tip, updates))
+    let Some(h) = st.query.tip_height() else {
+        return Some((StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response());
     };
-    let cached = |tip: &[u8; 32], updates: u64| {
+    let tip = match st.query.header_at_height(h) {
+        Ok(Some((_, rec))) => rec.hash,
+        Ok(None) => return Some((StatusCode::SERVICE_UNAVAILABLE, "no tip").into_response()),
+        Err(e) => return Some(store_err(e)),
+    };
+    let updates = st
+        .mempool
+        .as_ref()
+        .map(|m| m.template_updates())
+        .unwrap_or(0);
+    {
+        // Not held across selection, so a hit never waits on a build.
         let cache = st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner());
-        cache
-            .as_ref()
-            .filter(|c| gbt_cache_hit(c, tip, updates))
-            .map(|c| Arc::clone(&c.body))
-    };
-    let (tip, updates) = match sample() {
-        Ok(v) => v,
-        Err(r) => return Some(*r),
-    };
-    if let Some(body) = cached(&tip, updates) {
-        return Some(gbt_json(&body));
-    }
-    // One build at a time: a concurrent miss waits for the build in progress
-    // and then reads its result. The cache lock itself is not held across
-    // selection, so a hit never waits on a build. The tip is read again
-    // after the wait: a block that connected during it must not be answered
-    // with the template the wait started on.
-    let _build = st.gbt_build.lock().unwrap_or_else(|p| p.into_inner());
-    let (tip, updates) = match sample() {
-        Ok(v) => v,
-        Err(r) => return Some(*r),
-    };
-    if let Some(body) = cached(&tip, updates) {
-        return Some(gbt_json(&body));
-    }
-    // The armed prev is the pool's tip when it was sampled. A connect,
-    // disconnect, or reorg since then moves the settle generation; building
-    // on that prev would answer one block behind.
-    if let (Some(at), Some(mp)) = (settle, st.mempool.as_ref()) {
-        if mp.pool_settle_gen() != at {
-            return None;
+        if let Some(c) = cache.as_ref().filter(|c| gbt_cache_hit(c, &tip, updates)) {
+            return Some(gbt_json(&c.body));
         }
+    }
+    if !build {
+        return None;
     }
     Some(match (fun.0)() {
         Ok(body) => {

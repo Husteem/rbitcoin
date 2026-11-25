@@ -73,9 +73,6 @@ pub struct TemplateBuildSample {
     /// sample. `Some` is armed, including `Some(None)` when the pool has no
     /// stripped tip.
     pub armed: Option<Option<[u8; 32]>>,
-    /// [`MempoolHub::pool_settle_gen`] when `armed` was read. A build that
-    /// starts after it moved must sample again. `0` with no mempool.
-    pub settle: u64,
     pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -91,7 +88,6 @@ pub async fn sample_template_prev_for_build(mp: Option<Arc<MempoolHub>>) -> Temp
     let Some(mp) = mp else {
         return TemplateBuildSample {
             armed: None,
-            settle: 0,
             permit: crate::reactor::acquire_armed_store_budget().await,
         };
     };
@@ -120,7 +116,6 @@ pub async fn sample_template_prev_for_build(mp: Option<Arc<MempoolHub>>) -> Temp
         if peek == Some(sample) && settle_now == settle && settle_now % 2 == 0 {
             return TemplateBuildSample {
                 armed: Some(sample),
-                settle,
                 permit,
             };
         }

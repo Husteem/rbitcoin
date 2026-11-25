@@ -787,9 +787,10 @@ pub struct AppState {
     pub join_header_trusted: bool,
     pub block_template: Option<BlockTemplateFn>,
     pub gbt_cache: Arc<Mutex<Option<GbtCache>>>,
-    /// Held for one `/block-template` build. Concurrent misses wait on it and
-    /// then read the cache, so they share that build.
-    pub gbt_build: Arc<Mutex<()>>,
+    /// Held for one `/block-template` build. Concurrent misses wait on it,
+    /// with no store permit, and then read the cache, so they share that
+    /// build.
+    pub gbt_build: Arc<tokio::sync::Mutex<()>>,
     /// How long a streamed body waits on a reader that leaves its next
     /// chunk unread before it fails the body (the listener idle timeout).
     pub send_stall: Duration,
@@ -1405,7 +1406,7 @@ pub async fn run_esplora(
         },
         block_template: config.block_template,
         gbt_cache: Arc::new(Mutex::new(None)),
-        gbt_build: Arc::new(Mutex::new(())),
+        gbt_build: Arc::new(tokio::sync::Mutex::new(())),
         send_stall: timeout,
     };
 
