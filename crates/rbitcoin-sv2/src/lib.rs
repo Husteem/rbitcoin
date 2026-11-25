@@ -34,8 +34,8 @@ pub const MAX_SESSIONS: usize = 8;
 /// Sessions one netgroup (IPv4 `/16`, IPv6 `/32`, as Core's `GetGroup`
 /// without asmap, also under `--asmap`) may hold at once. A silent SRI pool
 /// and a silent attacker look the same, so no idle deadline can tell them
-/// apart; a share keeps one network from taking the whole table. IPv4 and
-/// IPv6 loopback are two netgroups.
+/// apart; a share keeps one network from taking the whole table.
+/// `127.0.0.1` and `::1` are two netgroups.
 pub const MAX_SESSIONS_PER_NETGROUP: usize = MAX_SESSIONS / 2;
 
 /// Default [`Sv2TpConfig::setup_timeout`]. A session holds a slot from TCP
