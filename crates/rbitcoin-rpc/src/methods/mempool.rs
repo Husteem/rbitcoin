@@ -972,20 +972,20 @@ pub fn package_tx_fee_exceeds_max(
         .iter()
         .map(|inp| prevout_txout_in_package(ctx, &inp.previous_output, package))
         .collect::<Option<Vec<_>>>()?;
-    Some(
-        match fold_tx_fee_sat(
-            prevouts.iter().map(|o| Some(o.value.to_sat())),
-            tx_output_sum_sat(tx),
-        ) {
-            TxFeeLook::Fee(fee) => feerate_exceeds_max(
-                fee.saturating_add_signed(mp.fee_delta(&tx.compute_txid())),
-                mp.sigops_adjusted_weight(tx, &prevouts),
-                max_sat_kvb,
-            ),
-            TxFeeLook::Overflow => max_sat_kvb != 0,
-            TxFeeLook::MissingPrevout => false,
-        },
-    )
+    let fee = prevouts
+        .iter()
+        .try_fold(0u64, |a, o| a.checked_add(o.value.to_sat()))
+        .zip(tx_output_sum_sat(tx))
+        .and_then(|(in_sum, out_sum)| in_sum.checked_sub(out_sum));
+    // An overflowing or negative fee is over any cap but zero.
+    Some(match fee {
+        Some(fee) => feerate_exceeds_max(
+            fee.saturating_add_signed(mp.fee_delta(&tx.compute_txid())),
+            mp.sigops_adjusted_weight(tx, &prevouts),
+            max_sat_kvb,
+        ),
+        None => max_sat_kvb != 0,
+    })
 }
 
 /// RPC-submit `maxburnamount` (BTC). Omitted → 0.
