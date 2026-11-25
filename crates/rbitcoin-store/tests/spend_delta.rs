@@ -14,6 +14,23 @@ fn dir() -> PathBuf {
     p
 }
 
+/// A [`dir`] removed when the test ends, on success or panic.
+struct CleanDir(PathBuf);
+
+impl CleanDir {
+    /// The guard and its path.
+    fn new() -> (Self, PathBuf) {
+        let d = dir();
+        (Self(d.clone()), d)
+    }
+}
+
+impl Drop for CleanDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn delta_dir(d: &std::path::Path) -> PathBuf {
     d.join(SPEND_DELTA_DIR)
 }
@@ -684,7 +701,7 @@ fn a_populated_schema_29_log_becomes_a_delta_generation() {
 /// never read.
 #[test]
 fn an_upgrade_open_that_fails_after_the_adoption_is_already_30() {
-    let d = dir();
+    let (_clean, d) = CleanDir::new();
     schema_29_store(&d);
     let meta =
         rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 7).unwrap();
@@ -706,7 +723,7 @@ fn an_upgrade_open_that_fails_after_the_adoption_is_already_30() {
 /// the next open adopts the dense body's spends again.
 #[test]
 fn an_upgrade_killed_before_the_adoption_adopts_again() {
-    let d = dir();
+    let (_clean, d) = CleanDir::new();
     schema_29_store(&d);
     let slot =
         rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk(9), 0).unwrap();
@@ -742,7 +759,7 @@ fn an_upgrade_killed_before_the_adoption_adopts_again() {
 /// it would leave every spend the delta held unspent (#2038).
 #[test]
 fn a_schema_30_body_without_its_delta_refuses_whatever_its_length() {
-    let d = dir();
+    let (_clean, d) = CleanDir::new();
     schema_29_store(&d);
     {
         // The upgrade: adopts the body, writes `meta` 30.
