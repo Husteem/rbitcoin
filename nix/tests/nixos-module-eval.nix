@@ -909,9 +909,9 @@ assert builtins.elem "/run/rbitcoin" unixSystem.config.systemd.services.rbitcoin
 assert builtins.match ".*--esplora-onion.*" onionOffExec == null;
 assert testnet5Cfg.p2p.port == 18353;
 assert testnet5Cfg.rpc.port == 18352;
-assert builtins.match ".*--network testnet5.*" testnet5Exec != null;
-assert builtins.match ".*--listen 0.0.0.0:18353.*" testnet5Exec != null;
-assert builtins.match ".*--rpc-listen 127.0.0.1:18352.*" testnet5Exec != null;
+assert builtins.match ".*--network testnet5( .*|$)" testnet5Exec != null;
+assert builtins.match ".*--listen 0\\.0\\.0\\.0:18353( .*|$)" testnet5Exec != null;
+assert builtins.match ".*--rpc-listen 127\\.0\\.0\\.1:18352( .*|$)" testnet5Exec != null;
 assert builtins.match ".*--network signet.*" signetExec != null;
 assert builtins.match ".*--signet-challenge 51.*" signetExec != null;
 assert builtins.match ".*--signet-block-time 120.*" signetExec != null;
@@ -964,9 +964,9 @@ assert !builtins.elem v1PortMsg (rbitcoinFailures (moduleOnly {
 }));
 # p2p.onionListen marks the Tor forwarding listener after the primary bind,
 # so a --no-listen earlier in argv does not clear it.
-assert builtins.match ".*--listen 0.0.0.0:8333 .*--listen '?127.0.0.1:8334=onion'?( .*|$)" onionListenExec != null;
+assert builtins.match ".*--listen 0\\.0\\.0\\.0:8333 .*--listen '?127\\.0\\.0\\.1:8334=onion'?( .*|$)" onionListenExec != null;
 assert builtins.match ".*--listen-onion.*" onionListenExec != null;
-assert builtins.match ".*--no-listen .*--listen '?127.0.0.1:8334=onion'?( .*|$)" onionOnlyExec != null;
+assert builtins.match ".*--no-listen .*--listen '?127\\.0\\.0\\.1:8334=onion'?( .*|$)" onionOnlyExec != null;
 assert builtins.match ".*=onion.*" (execOf { p2p.listenOnion = true; }) == null;
 assert rbitcoinFailures (moduleOnly onionListenOpts) == [ ];
 assert rbitcoinFailures (moduleOnly {
@@ -993,6 +993,41 @@ assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
 assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
   p2p = onionListenOpts.p2p // { onionListen = "127.0.0.1"; };
 }));
+assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "not-an-ip:8334"; };
+}));
+assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "[0::0]:8334"; };
+}));
+assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "[::ffff:0.0.0.0]:8334"; };
+}));
+assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "256.0.0.1:8334"; };
+}));
+assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "127.0.0.1:65536"; };
+}));
+assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = "[::1]"; };
+}));
+# Valid endpoints stay accepted.
+assert rbitcoinFailures (moduleOnly {
+  p2p = onionListenOpts.p2p // { onionListen = "10.0.3.2:8334"; };
+}) == [ ];
+assert rbitcoinFailures (moduleOnly {
+  p2p = onionListenOpts.p2p // { onionListen = "[fd00::2]:8334"; };
+}) == [ ];
+# A grant on the marked listener's own address is a bind grant on that listener
+# (the node accepts it); the firewall still leaves the onion port closed.
+assert
+  let
+    sys = moduleOnly (onionListenOpts // {
+      p2p = onionListenOpts.p2p // { openFirewall = true; };
+      netPermissionBind = [ "noban@127.0.0.1:8334" ];
+    });
+  in
+  rbitcoinFailures sys == [ ] && sys.config.networking.firewall.allowedTCPPorts == [ 8333 ];
 assert builtins.elem onionListenInboundMsg (failedAssertions (badSystem {
   p2p = {
     externalIp = [ "${"a" + builtins.substring 0 55 (builtins.hashString "sha512" "x")}d.onion" ];

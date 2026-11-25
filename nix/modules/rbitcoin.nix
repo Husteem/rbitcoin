@@ -77,15 +77,36 @@ let
       lib.removePrefix "[" (lib.head (lib.splitString "]" a))
     else
       lib.head (lib.splitString ":" a);
+  onionListenBracketed = cfg.p2p.onionListen != null && lib.hasPrefix "[" cfg.p2p.onionListen;
+  # Rust's Ipv4Addr: four decimal octets, no leading zeros.
+  ipv4Literal =
+    h:
+    let
+      m = builtins.match "(0|[1-9][0-9]{0,2})\\.(0|[1-9][0-9]{0,2})\\.(0|[1-9][0-9]{0,2})\\.(0|[1-9][0-9]{0,2})" h;
+    in
+    m != null && lib.all (o: lib.toInt o <= 255) m;
+  # Hex groups, an optional dotted tail, at most one `::`, an optional numeric
+  # scope. Group counts are left to the node's SocketAddr parse.
+  ipv6Literal =
+    h:
+    builtins.match "[0-9a-fA-F:.]+(%[0-9]+)?" h != null
+    && lib.hasInfix ":" h
+    && builtins.length (lib.splitString "::" h) <= 2;
+  # The node rejects `to_canonical().is_unspecified()`: all-zero IPv6, and an
+  # IPv4-mapped 0.0.0.0, in any spelling.
+  unspecifiedIp =
+    h:
+    let
+      bare = lib.head (lib.splitString "%" (lib.toLower h));
+      v4 = if lib.hasPrefix "::ffff:" bare && lib.hasInfix "." bare then lib.removePrefix "::ffff:" bare else bare;
+    in
+    builtins.match "[0:.]+" v4 != null;
   onionListenValid =
     onionListenPort != null
     && onionListenPort > 0
-    && !builtins.elem onionListenHost [
-      ""
-      "0.0.0.0"
-      "::"
-      "0:0:0:0:0:0:0:0"
-    ];
+    && onionListenPort <= 65535
+    && (if onionListenBracketed then ipv6Literal onionListenHost else ipv4Literal onionListenHost)
+    && !unspecifiedIp onionListenHost;
   # Port after the last @. IPv6 is `[addr]:port`. A grant with no port is left out;
   # the node rejects it at start.
   whitebindPort = spec:
@@ -1807,7 +1828,9 @@ in
 
     networking.firewall.allowedTCPPorts = lib.unique (
       optional (cfg.p2p.openFirewall && cfg.p2p.listen) cfg.p2p.port
-      ++ lib.optionals (cfg.p2p.openFirewall && cfg.p2p.listen) (lib.subtractLists v1BindPorts whitebindPorts)
+      ++ lib.optionals (cfg.p2p.openFirewall && cfg.p2p.listen) (
+        lib.subtractLists (v1BindPorts ++ optional (onionListenPort != null) onionListenPort) whitebindPorts
+      )
       ++ optional (cfg.electrum.enable && cfg.electrum.openFirewall) cfg.electrum.port
       ++ optional (
         cfg.esplora.enable && cfg.esplora.openFirewall && cfg.esplora.socketPath == null
