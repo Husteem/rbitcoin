@@ -26,7 +26,7 @@ pub mod unspent;
 pub use json_cpu::{encode_json_body, json_is_cpu_heavy, JSON_CPU_MIN};
 pub use server::{
     batch_window, electrum_scripthash_hex, parse_electrum_request_line, perf_totals, run_electrum,
-    sample_reset_perf, ElectrumConfig, ElectrumHandle, ServeLimits, TipNotify,
+    sample_reset_perf, ElectrumConfig, ElectrumHandle, RequestLine, ServeLimits, TipNotify,
     DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_SCRIPTHASH_SUBS, DEFAULT_MAX_SP_SUBS, LISTEN_DOWN,
     LISTEN_OFF, LISTEN_UP, MIN_BLOCKING_POOL,
 };

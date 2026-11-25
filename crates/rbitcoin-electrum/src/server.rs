@@ -39,9 +39,62 @@ pub const PROTOCOL_ASOF: &str = "1.4.2-asof";
 pub const SERVER_VERSION: &str =
     concat!("rbitcoin-electrs ", env!("CARGO_PKG_VERSION"), " electrumx");
 
-/// One JSON-RPC request line. Junk is `None`; must not panic.
-pub fn parse_electrum_request_line(line: &str) -> Option<Value> {
-    serde_json::from_str(line).ok()
+/// Whether the top-level array in `line` has more than `max` items. Each
+/// item is skipped with [`serde::de::IgnoredAny`], so nothing is built, and
+/// the walk stops at item `max + 1`. Items are counted as they complete, so
+/// a line cut off after item `max + 1` is too large, not a parse error; one
+/// that fails earlier answers `false` and fails the full parse.
+fn batch_exceeds(line: &str, max: usize) -> bool {
+    use serde::de::{Deserializer as _, IgnoredAny, SeqAccess, Visitor};
+    struct Count<'a> {
+        max: usize,
+        over: &'a std::cell::Cell<bool>,
+    }
+    impl<'de> Visitor<'de> for Count<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON-RPC batch")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            let mut n = 0usize;
+            while seq.next_element::<IgnoredAny>()?.is_some() {
+                n += 1;
+                if n > self.max {
+                    self.over.set(true);
+                    // Stop here; the rest of the line is never read.
+                    return Err(serde::de::Error::custom("batch too large"));
+                }
+            }
+            Ok(())
+        }
+    }
+    let over = std::cell::Cell::new(false);
+    let mut de = serde_json::Deserializer::from_str(line);
+    let _ = de.deserialize_seq(Count { max, over: &over });
+    over.get()
+}
+
+/// One request line, parsed.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum RequestLine {
+    Value(Value),
+    /// A batch of more than [`MAX_BATCH_ITEMS`] items, refused before any
+    /// item is parsed into a [`Value`].
+    BatchTooLarge,
+    Invalid,
+}
+
+/// One JSON-RPC request line. Must not panic on any input.
+#[doc(hidden)]
+pub fn parse_electrum_request_line(line: &str) -> RequestLine {
+    if line.trim_start().starts_with('[') && batch_exceeds(line, MAX_BATCH_ITEMS) {
+        return RequestLine::BatchTooLarge;
+    }
+    match serde_json::from_str(line) {
+        Ok(v) => RequestLine::Value(v),
+        Err(_) => RequestLine::Invalid,
+    }
 }
 
 /// Electrum JSON-RPC requests: the `tip: perf` window and the `/metrics` totals.
@@ -751,8 +804,12 @@ where
                 }
                 read_deadline = None;
                 let req: Value = match parse_electrum_request_line(&line) {
-                    Some(v) => v,
-                    None => {
+                    RequestLine::Value(v) => v,
+                    RequestLine::BatchTooLarge => {
+                        writer.line(invalid_request(Value::Null, "batch too large")).await?;
+                        continue;
+                    }
+                    RequestLine::Invalid => {
                         writer.line(json!({
                             "jsonrpc":"2.0","id":null,
                             "error":{"code":-32700,"message":"parse error"}
@@ -1119,11 +1176,6 @@ async fn answer_batch<W: AsyncWrite + Unpin>(
     if items.is_empty() {
         return writer
             .line(invalid_request(Value::Null, "empty batch"))
-            .await;
-    }
-    if items.len() > MAX_BATCH_ITEMS {
-        return writer
-            .line(invalid_request(Value::Null, "batch too large"))
             .await;
     }
     let mut out = BatchOut {
@@ -2398,7 +2450,9 @@ where
             match line {
                 Ok(Ok(Some(l))) => {
                     if !l.trim().is_empty() {
-                        if let Ok(req) = serde_json::from_str::<Value>(&l) {
+                        // The same parse as a request line, so a batch past
+                        // the cap is refused before it is built here too.
+                        if let RequestLine::Value(req) = parse_electrum_request_line(&l) {
                             let ping_id = req.get("id").cloned().unwrap_or(Value::Null);
                             if req.get("method").and_then(|m| m.as_str()) == Some("server.ping") {
                                 writer
