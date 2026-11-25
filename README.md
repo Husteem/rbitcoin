@@ -41,7 +41,7 @@ consensus/script** path.
 | **Security** | [`SECURITY.md`](./SECURITY.md) — **0.9.x** is the published line; support window and signed binaries are 1.0 |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
 | **Develop** | rustup 1.95, no Nix — [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
-| **Coverage** | Production-file line coverage floor is 91% (`LH*100 >= LF*91`). [`TESTING.md`](./TESTING.md) |
+| **Coverage** | Production-file line coverage floor is 92% (`LH*100 >= LF*92`). [`TESTING.md`](./TESTING.md) |
 
 ## Why this node is different
 
