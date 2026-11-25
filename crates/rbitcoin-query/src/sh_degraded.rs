@@ -568,9 +568,9 @@ impl Query {
     ///
     /// Waits for every in-flight reader, wipes the SH tables under the
     /// appender lock, runs the Class A collect + pack (SH enqueue is off while
-    /// degraded), syncs the new head's SEAL and `include_hwm`, then re-arms
-    /// write-behind from the new `include_hwm` exactly as a restart does and
-    /// removes the marker. Returns `Ok(false)` when there was nothing to do.
+    /// degraded), syncs the new head's SEAL and `include_hwm`, re-arms
+    /// write-behind from the new `include_hwm` as a restart does, and only
+    /// then clears the flag and removes the marker. Returns `Ok(false)` when there was nothing to do.
     /// On error the node stays degraded and the caller may retry. Cancel
     /// leaves it degraded.
     pub fn rebuild_sh_if_degraded(&self, cancel: Option<&AtomicBool>) -> Result<bool, QueryError> {
@@ -605,16 +605,19 @@ impl Query {
             self.sh_run.refresh_seal();
             self.sync_sh_seal_from_include_hwm()?;
             self.sync_sh_publish()?;
-            let through = self.recover_sh_indexed_through()?;
-            self.set_sh_indexed_through_height(through);
-            self.sh_bump_generation();
-            self.sh_degraded.flag.store(false, Ordering::Release);
-            drop(appender);
-            if let Err(e) = self.recover_sh_writebehind() {
-                // Re-arm failed: serve nothing and let the next pass retry.
+            // Re-arm while still degraded: readers are admitted only once
+            // the heights after the collect are in the RAM head, and the
+            // held appender cannot drop those jobs as degraded first.
+            if let Err(e) = self.requeue_sh_writebehind() {
+                drop(appender);
                 self.mark_sh_degraded(&format!("rebuild re-arm failed: {e}"));
                 return Err(e);
             }
+            self.sh_bump_generation();
+            self.sh_degraded.flag.store(false, Ordering::Release);
+            drop(appender);
+            #[cfg(debug_assertions)]
+            sh_stage_hook("serving", self);
             if let Err(e) = self.clear_sh_degraded_marker() {
                 // Kept: the next open wipes a healthy index, which is safe.
                 rbitcoin_log::warn!("scripthash degraded marker not removed: {e}");
@@ -662,7 +665,8 @@ fn rebuild_test_hook(stage: &str, q: &Query) -> Result<(), QueryError> {
 /// about to wait for it), `"build_wait"` (another thread owns the SH build and
 /// this one is about to wait for it) and `"unlink_frozen"` (a disconnect froze readers
 /// and is about to run its unlink batch). `"before_unstrong"` (the tip has shrunk,
-/// the strong bits are not yet cleared) also ignores it.
+/// the strong bits are not yet cleared) also ignores it, and so does
+/// `"serving"` (the rebuild has just admitted readers again).
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn set_sh_rebuild_hook_for_test(hook: Option<RebuildHook>) {

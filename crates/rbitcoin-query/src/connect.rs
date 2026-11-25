@@ -950,6 +950,16 @@ impl Query {
         if !self.enqueues_sh_writebehind() {
             return Ok(());
         }
+        self.enqueue_sh_jobs(items, create_pins)
+    }
+
+    /// [`Self::enqueue_sh_pending`] without the degraded gate, for the
+    /// rebuild's re-arm, which runs before it lets readers back in.
+    fn enqueue_sh_jobs(
+        &self,
+        items: &[ConfirmPrepared],
+        create_pins: Option<&crate::FkMap<CreatePin>>,
+    ) -> Result<(), QueryError> {
         let through = self.sh_indexed_through_height();
         let mut jobs = Vec::new();
         for item in items {
@@ -1293,6 +1303,14 @@ impl Query {
         if self.sh_degraded() {
             return Ok(());
         }
+        self.requeue_sh_writebehind()
+    }
+
+    /// [`Self::recover_sh_writebehind`] while the index may still be
+    /// degraded. The rebuild runs it under the appender lock before it
+    /// clears the flag, so the first reader it admits already sees the
+    /// heights connected after its Class A collect in the RAM head.
+    pub(crate) fn requeue_sh_writebehind(&self) -> Result<(), QueryError> {
         let recovered = self.recover_sh_indexed_through()?;
         self.set_sh_indexed_through_height(recovered);
         if !self.store.scripthash.has_durable_index() {
@@ -1342,8 +1360,8 @@ impl Query {
                 hash,
             });
         }
-        if !items.is_empty() {
-            self.enqueue_sh_pending(&items, None)?;
+        if !items.is_empty() && self.sh_writebehind_wanted() {
+            self.enqueue_sh_jobs(&items, None)?;
             if let Some(last) = items.last() {
                 self.release_index_writebehind(last.height);
             }

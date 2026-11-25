@@ -257,6 +257,45 @@ fn unique(v: &[[u8; 32]]) -> bool {
     w.len() == v.len()
 }
 
+/// A block that connects after the rebuild's Class A collect is left to the
+/// write-behind re-arm. It is in history from the moment the rebuild admits
+/// readers again (`"serving"`), not only after that re-arm.
+#[test]
+fn rebuild_admits_readers_with_the_degraded_gap_indexed() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let (_dir, q, mut c, key) = heavy_chain("sh-degraded-gap");
+    tear_extent_head(&q, &key);
+    c.block(&q, 2, 3);
+    assert!(q.sh_degraded());
+    let (h, gap) = c.make(3, 4);
+    let seen: Rc<RefCell<Option<Vec<[u8; 32]>>>> = Rc::new(RefCell::new(None));
+    let seen_c = seen.clone();
+    let mut pending = Some((c, h, gap.clone()));
+    rbitcoin_query::set_sh_rebuild_hook_for_test(Some(Box::new(move |s, q| {
+        if s == "after_collect" {
+            if let Some((mut c, h, gap)) = pending.take() {
+                c.apply(q, &h, &gap);
+            }
+        }
+        if s == "serving" {
+            assert!(q.sh_history_available(), "readers admitted at serving");
+            *seen_c.borrow_mut() = Some(history_txids(q, &key));
+        }
+        Ok(())
+    })));
+    assert!(q.rebuild_sh_if_degraded(None).unwrap());
+    rbitcoin_query::set_sh_rebuild_hook_for_test(None);
+    let first = seen.borrow_mut().take().expect("the serving stage ran");
+    for t in txids(&gap) {
+        assert!(
+            first.contains(&t),
+            "a degraded-window tx is missing at serving"
+        );
+    }
+    assert_eq!(first, history_txids(&q, &key), "serving history is final");
+}
+
 /// Gap 3: a block disconnected while degraded leaves its creates in the
 /// rebuilt index (Class A keeps the orphan tx). Readers must not see them, and
 /// reconnecting the same block must not double them.
