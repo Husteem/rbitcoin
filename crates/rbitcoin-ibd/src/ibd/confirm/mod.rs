@@ -509,20 +509,35 @@ impl ConfirmFeed {
 
     /// Write (or permanent reject) finished — height may be re-offered only after
     /// tip moves past it (or a future requeue path).
+    ///
+    /// A claim from before a plan rewind is stale and never sends `Accepted`.
+    /// Load can also drop a stale batch before it records a claim. Both give
+    /// their lead reservation back here; a live claim keeps it until the
+    /// accept arm releases it.
     pub fn finish(&self, heights: impl IntoIterator<Item = u32>) {
+        let live = self.epoch();
         let mut g = self.inner.lock().unwrap();
+        let mut released = false;
         for h in heights {
             g.inflight.remove(&h);
-            g.claimed_epoch.remove(&h);
+            if g.claimed_epoch.remove(&h).is_none_or(|e| e != live)
+                && g.lead_reserved.remove(&h).is_some()
+            {
+                released = true;
+            }
         }
         drop(g);
+        if released {
+            self.lead_bounds_dirty.store(true, Ordering::Release);
+        }
         self.cv.notify_one();
     }
 
     /// Drop ready and inflight and bump the epoch. The lead stays reserved.
     /// A header-walk rewind uses this: the confirmed tip did not move, and
     /// giving the bytes back lets lookup spend them while the old write
-    /// still commits.
+    /// still commits. A stale in-channel batch that drops before writing
+    /// returns its reservation in [`Self::finish`].
     pub fn drop_plan(&self) {
         {
             let mut g = self.inner.lock().unwrap();
