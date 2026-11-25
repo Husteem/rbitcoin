@@ -665,6 +665,9 @@ where
                                 on_tip_notes(&mut writer, &query, &params, &mempool, &mut conn, &mut last_sent_status, &mut sh_rescan, &t).await?;
                             }
                             None => {
+                                rbitcoin_log::warn!(
+                                    "electrum: tip events lagged and the tip could not be read; only scripthash statuses are sent again"
+                                );
                                 conn.outpoint_tip = None;
                                 if !conn.sh_subs.is_empty() {
                                     sh_rescan |= !emit_sh_notes(
@@ -1917,7 +1920,11 @@ fn lagged_tip(
             .or(last.map(|(h, _)| h))
             .unwrap_or(tip.0)
             .min(tip.0);
-        below.saturating_sub(LAG_REORG_DEPTH)
+        let fork = below.saturating_sub(LAG_REORG_DEPTH);
+        rbitcoin_log::info!(
+            "electrum: tip events lagged past a replaced tip; treating it as a reorg from {fork}"
+        );
+        fork
     });
     Some(TipNotify {
         height: tip.0,

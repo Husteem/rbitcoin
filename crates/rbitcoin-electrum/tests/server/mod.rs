@@ -4740,7 +4740,8 @@ async fn sp_lagged_tip_events_rescan_below_a_replaced_tip() {
         .unwrap();
     s.assert_quiet(2).await;
 
-    // More events than the channel holds: the reorg among them is lost.
+    // More events than the channel holds, all at the real tip. The session
+    // only sees the lag, and its last tip is no longer on the chain.
     let tip = TipNotify {
         height: 10,
         header_hex: header_hex(&chain.q.wire_header_at_height(Height(10)).unwrap()),
@@ -4755,6 +4756,14 @@ async fn sp_lagged_tip_events_rescan_below_a_replaced_tip() {
         [9],
         "the lag rescans below the lost tip"
     );
+    s.assert_quiet(2).await;
+
+    // The last tip handled is the real one now: another lag only extended
+    // it, and nothing is scanned again.
+    for _ in 0..12 {
+        s.tip_tx.send(tip.clone()).unwrap();
+    }
+    s.assert_quiet(3).await;
 }
 
 /// A range scan cut short by a reorg ends at the new tip. Blocks that
