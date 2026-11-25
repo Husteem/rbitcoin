@@ -322,6 +322,39 @@ impl PeerFlags {
 pub struct PeerEntry {
     pub addr: NetAddr,
     pub flags: PeerFlags,
+    /// Unix seconds when a peer said it last saw this row. `0` means no peer
+    /// taught a time (seed, `peers` file, `addnode`).
+    pub last_seen: u32,
+}
+
+/// Core's trust window for a gossiped address time: after 1973 and no more
+/// than ten minutes ahead. A row outside the window is kept with no time.
+pub const ADDR_TIME_FLOOR: u32 = 100_000_000;
+
+/// Age [`PeerEntry::last_seen`] starts at when it is `0`: Core backdates an
+/// untrusted address time by five days.
+pub const UNKNOWN_SEEN_AGE_SECS: u64 = 5 * 24 * 60 * 60;
+
+/// Sanitize a gossiped address time. `0` means the row keeps no time.
+#[doc(hidden)]
+pub fn learned_addr_time(time: u32, now: u64) -> u32 {
+    if time <= ADDR_TIME_FLOOR || u64::from(time) > now.saturating_add(600) {
+        0
+    } else {
+        time
+    }
+}
+
+/// The time a `getaddr` reply or `getnodeaddresses` row carries. A row with no
+/// learned time is backdated; a known time is never reported in the future.
+#[doc(hidden)]
+pub fn row_reply_time(last_seen: u32, now: u64) -> u32 {
+    if last_seen == 0 {
+        let now = now.min(u64::from(u32::MAX)) as u32;
+        return now.saturating_sub(UNKNOWN_SEEN_AGE_SECS as u32);
+    }
+    let now = now.min(u64::from(u32::MAX)) as u32;
+    last_seen.min(now)
 }
 
 /// Hard cap for learned / `peers` file / addrv2 (not `--connect` / DNS inject).
@@ -363,6 +396,9 @@ pub struct AddrMan {
     /// Insertion-order keys (IPv4 preferred on inject).
     pub order: Vec<NetAddr>,
     pub by_addr: HashMap<NetAddr, PeerFlags>,
+    /// Unix seconds a peer last said it saw the row. A row with no entry has
+    /// no learned time; see [`row_reply_time`].
+    seen: HashMap<NetAddr, u32>,
     pub asmap: Option<Arc<AsMap>>,
     pub last_attempt: HashMap<NetAddr, Instant>,
     pub only_net: Vec<OnlyNet>,
@@ -659,6 +695,19 @@ impl AddrMan {
     }
 
     pub fn add_learned_addr(&mut self, addr: NetAddr, source: NetAddr, cap: usize) -> bool {
+        self.add_learned_addr_at(addr, source, 0, cap)
+    }
+
+    /// [`Self::add_learned_addr`] for a row a peer said it saw at `last_seen`
+    /// (Unix seconds). An existing row keeps the time it already has: gossip
+    /// cannot hold a dead row fresh.
+    pub fn add_learned_addr_at(
+        &mut self,
+        addr: NetAddr,
+        source: NetAddr,
+        last_seen: u32,
+        cap: usize,
+    ) -> bool {
         if !self.dialable(addr) {
             return false;
         }
@@ -673,6 +722,9 @@ impl AddrMan {
             return false;
         }
         self.by_addr.insert(addr, PeerFlags::empty());
+        if last_seen != 0 {
+            self.seen.insert(addr, last_seen);
+        }
         self.order.push(addr);
         self.charge(addr, group);
         self.note_added();
@@ -713,6 +765,10 @@ impl AddrMan {
         if held || !self.by_addr.contains_key(&addr) {
             return;
         }
+        let last_seen = other.last_seen_of(&addr);
+        if last_seen != 0 {
+            self.seen.insert(addr, last_seen);
+        }
         if let Some(group) = group {
             self.charge(addr, group);
         }
@@ -733,6 +789,7 @@ impl AddrMan {
     #[doc(hidden)]
     pub fn evict_one(&mut self, addr: NetAddr) {
         self.by_addr.remove(&addr);
+        self.seen.remove(&addr);
         self.last_attempt.remove(&addr);
         if let Some(group) = self.learned_from.remove(&addr) {
             if let Entry::Occupied(mut n) = self.taught_by_group.entry(group) {
@@ -800,6 +857,7 @@ impl AddrMan {
         let keep_set: HashSet<NetAddr> = keep.iter().copied().collect();
         self.order = keep;
         self.by_addr.retain(|a, _| keep_set.contains(a));
+        self.seen.retain(|a, _| keep_set.contains(a));
         self.last_attempt.retain(|a, _| keep_set.contains(a));
         self.learned_from.retain(|a, _| keep_set.contains(a));
         self.taught_by_group.clear();
@@ -854,9 +912,16 @@ impl AddrMan {
 
     #[doc(hidden)]
     pub fn entry_of(&self, addr: &NetAddr) -> Option<PeerEntry> {
-        self.by_addr
-            .get(addr)
-            .map(|&flags| PeerEntry { addr: *addr, flags })
+        self.by_addr.get(addr).map(|&flags| PeerEntry {
+            addr: *addr,
+            flags,
+            last_seen: self.last_seen_of(addr),
+        })
+    }
+
+    /// Unix seconds a peer last said it saw `addr`; `0` when none did.
+    pub fn last_seen_of(&self, addr: &NetAddr) -> u32 {
+        self.seen.get(addr).copied().unwrap_or(0)
     }
 
     pub fn len(&self) -> usize {

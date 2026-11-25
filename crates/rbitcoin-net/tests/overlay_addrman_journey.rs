@@ -34,14 +34,17 @@ fn dial_targets_roundtrip() {
 }
 
 fn learn_overlay(hub: &Arc<PeerHub>, addr: AddrV2, port: u16, time: u32) {
-    hub.learn_addrv2(
-        rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333))),
-        &[AddrV2Message {
+    let msg = AddrV2Message {
         time,
         services: ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2,
         addr,
         port,
-    }]);
+    };
+    hub.learn_addrv2(
+        rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333))),
+        &[msg],
+        1_700_000_000,
+    );
 }
 
 fn book_has(am: &Mutex<rbitcoin_net::seeds::AddrMan>, want: rbitcoin_net::NetAddr) -> bool {

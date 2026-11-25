@@ -3007,11 +3007,13 @@ impl PeerHub {
     /// Rows for a net this process cannot dial are not stored. Unroutable
     /// clearnet is not stored. Relaying is separate and drops the same rows.
     /// `source` is the sending peer; its netgroup bounds how much of a full
-    /// book it may replace.
+    /// book it may replace. `now` is the node clock, used to reject a
+    /// gossiped time outside Core's window.
     pub fn learn_addrv2(
         &self,
         source: crate::NetAddr,
         list: &[bitcoin::p2p::address::AddrV2Message],
+        now: u64,
     ) {
         let g = self.addrman.lock().unwrap_or_else(|e| e.into_inner());
         let Some(am) = g.as_ref() else {
@@ -3023,7 +3025,8 @@ impl PeerHub {
                 if crate::netaddr::netaddr_unroutable_gossip(addr) {
                     continue;
                 }
-                book.add_learned_addr(addr, source, crate::seeds::MAX_ADDR_MAN);
+                let last_seen = crate::seeds::learned_addr_time(a.time, now);
+                book.add_learned_addr_at(addr, source, last_seen, crate::seeds::MAX_ADDR_MAN);
             }
         }
     }
@@ -3102,14 +3105,14 @@ impl PeerHub {
             let g = am.lock().unwrap_or_else(|e| e.into_inner());
             g.entries()
         };
-        let addrs: Vec<crate::NetAddr> = entries
+        let rows: Vec<(u32, crate::NetAddr)> = entries
             .iter()
-            .map(|e| e.addr)
-            .filter(|a| v2 || matches!(a, crate::NetAddr::Ip(_)))
-            .filter(|a| !crate::netaddr::netaddr_unroutable_gossip(*a))
-            .filter(|a| !own.contains(*a))
+            .map(|e| (crate::seeds::row_reply_time(e.last_seen, now), e.addr))
+            .filter(|(_, a)| v2 || matches!(a, crate::NetAddr::Ip(_)))
+            .filter(|(_, a)| !crate::netaddr::netaddr_unroutable_gossip(*a))
+            .filter(|(_, a)| !own.contains(*a))
             .collect();
-        let n = addrs.len();
+        let n = rows.len();
         let pct_cap = (n * crate::peer::MAX_PCT_ADDR_TO_SEND / 100).max(1);
         let cap = crate::peer::MAX_ADDR_TO_SEND.min(pct_cap).min(n);
         if cap == 0 {
@@ -3124,7 +3127,7 @@ impl PeerHub {
         }
         let mut out = Vec::with_capacity(cap);
         for &i in idxs.iter().take(cap) {
-            out.push((now as u32, addrs[i]));
+            out.push(rows[i]);
         }
         cache.insert(key, (now, out.clone()));
         out
