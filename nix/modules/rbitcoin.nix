@@ -748,7 +748,10 @@ in
         Repeatable `--net-permission-bind` grants. Requires `p2p.listen`.
         Refused with `trustPeer`: the node turns a whitebind into a listen socket,
         and trust-peer then rejects that socket.
-        When `p2p.openFirewall` is set, the firewall also opens each grant's port.
+        When `p2p.openFirewall` is set, the firewall also opens each grant's port,
+        except a `v1` grant's: that listener is plaintext P2P for a local wallet indexer.
+        For an indexer on another LAN host, open the port on that interface only
+        (`networking.firewall.interfaces.<name>.allowedTCPPorts`).
       '';
     };
 
@@ -1040,7 +1043,7 @@ in
       openFirewall = mkOption {
         type = types.bool;
         default = false;
-        description = "Open the P2P listen port, and any netPermissionBind port, in the NixOS firewall. Ignored when listen is false.";
+        description = "Open the P2P listen port, and any netPermissionBind port except a `v1` one, in the NixOS firewall. Ignored when listen is false.";
       };
     };
 
@@ -1733,7 +1736,7 @@ in
 
     networking.firewall.allowedTCPPorts = lib.unique (
       optional (cfg.p2p.openFirewall && cfg.p2p.listen) cfg.p2p.port
-      ++ lib.optionals (cfg.p2p.openFirewall && cfg.p2p.listen) whitebindPorts
+      ++ lib.optionals (cfg.p2p.openFirewall && cfg.p2p.listen) (lib.subtractLists v1BindPorts whitebindPorts)
       ++ optional (cfg.electrum.enable && cfg.electrum.openFirewall) cfg.electrum.port
       ++ optional (
         cfg.esplora.enable && cfg.esplora.openFirewall && cfg.esplora.socketPath == null

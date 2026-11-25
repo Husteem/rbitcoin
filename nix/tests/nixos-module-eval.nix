@@ -1022,6 +1022,18 @@ assert builtins.match ".*--check-blocks 4294967296.*" (execOf { checkBlocks = 42
 assert builtins.elem 18444 bindFwSystem.config.networking.firewall.allowedTCPPorts;
 assert builtins.elem 8334 bindFwSystem.config.networking.firewall.allowedTCPPorts;
 assert builtins.elem 9444 bindFwSystem.config.networking.firewall.allowedTCPPorts;
+# A v1 listener is plaintext P2P for a local indexer; openFirewall leaves it closed.
+assert
+  (moduleOnly {
+    p2p.openFirewall = true;
+    netPermissionBind = [
+      "v1,noban@192.168.1.5:8335"
+      "noban@0.0.0.0:8334"
+    ];
+  }).config.networking.firewall.allowedTCPPorts == [
+    8333
+    8334
+  ];
 assert builtins.elem tokenNeedsRpcMsg (failedAssertions (badSystem {
   rpc.tokenFile = "/var/log/rbitcoin-token/rpc.token";
 }));
