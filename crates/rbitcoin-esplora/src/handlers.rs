@@ -969,9 +969,11 @@ pub async fn block_template(State(st): State<AppState>) -> Response {
         return r;
     }
     let build = Arc::clone(&st.gbt_build).lock_owned().await;
+    // A step that holds the build lock always answers: a hit, an error, or
+    // the template it built.
     block_template_step(&st, Some(build))
         .await
-        .unwrap_or_else(not_found)
+        .expect("a build step answers")
 }
 
 /// One cache check, and with `build` one build, on a fresh template-tip
