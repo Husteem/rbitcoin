@@ -4764,6 +4764,32 @@ async fn sp_lagged_tip_events_rescan_below_a_replaced_tip() {
         s.tip_tx.send(tip.clone()).unwrap();
     }
     s.assert_quiet(3).await;
+
+    // An older event does not lower the mark. The tip at 10 is replaced
+    // again, then a late event for 5 (still on the chain) arrives: the next
+    // lag still tests 10 and rescans.
+    s.tip_tx
+        .send(TipNotify {
+            height: 10,
+            header_hex: header_hex(&gone),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    s.assert_quiet(4).await;
+    let mut lower = tip.clone();
+    lower.height = 5;
+    lower.header_hex = header_hex(&chain.q.wire_header_at_height(Height(5)).unwrap());
+    s.tip_tx.send(lower).unwrap();
+    s.assert_quiet(5).await;
+    for _ in 0..12 {
+        s.tip_tx.send(tip.clone()).unwrap();
+    }
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(
+        sp_heights(&history),
+        [9],
+        "a lag after an older event rescans"
+    );
 }
 
 /// A range scan cut short by a reorg ends at the new tip. Blocks that

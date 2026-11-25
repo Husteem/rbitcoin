@@ -1872,7 +1872,14 @@ async fn on_tip_notes<W: AsyncWrite + Unpin>(
         )
         .await?;
     }
-    conn.last_tip = tip_block_hash(&t.header_hex).map(|hash| (t.height, hash));
+    // A queued event older than the tip a lag recovered to must not lower
+    // the mark: a later lag would test a block below what was scanned. A
+    // reorg event replaces it.
+    let behind =
+        t.reorg_from_height.is_none() && conn.last_tip.is_some_and(|(height, _)| t.height < height);
+    if !behind {
+        conn.last_tip = tip_block_hash(&t.header_hex).map(|hash| (t.height, hash));
+    }
     Ok(())
 }
 
