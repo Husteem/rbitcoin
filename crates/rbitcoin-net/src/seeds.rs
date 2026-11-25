@@ -712,9 +712,9 @@ impl AddrMan {
 
     /// [`Self::add_learned_addr`] for a row a peer said it saw at `last_seen`
     /// (Unix seconds, already inside Core's window). `now` is the node clock.
-    /// A held row takes the new time only when it is at least
-    /// [`Self::SEEN_UPDATE_ONLINE_SECS`] (or the offline interval) newer, as
-    /// Core's `AddSingle` does, so one gossip stream cannot hold a row fresh.
+    /// A held row takes the new time only when it is at least an hour (or a
+    /// day, for a claim older than a day) newer, as Core's `AddSingle` does,
+    /// so one gossip stream cannot hold a row fresh.
     pub fn add_learned_addr_at(
         &mut self,
         addr: NetAddr,
