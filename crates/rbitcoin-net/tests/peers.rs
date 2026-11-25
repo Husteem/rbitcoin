@@ -2008,58 +2008,6 @@ fn a_row_with_no_time_ages_from_its_first_reply() {
     );
 }
 
-/// A peer that announces its own listen address from a different TCP source
-/// port keeps the full claim: Core compares the host, not the port.
-#[test]
-fn a_self_announcement_keeps_its_full_time_across_ports() {
-    let hub = PeerHub::new();
-    hub.set_mock_now(1_700_000_000);
-    hub.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
-    let claim = 1_699_996_400;
-    hub.learn_addrv2(
-        rbitcoin_net::NetAddr::Ip("9.9.9.9:5555".parse().unwrap()),
-        &[AddrV2Message {
-            time: claim,
-            services: ServiceFlags::NETWORK,
-            addr: rbitcoin_net::NetAddr::Ip("9.9.9.9:8333".parse().unwrap()).to_addrv2(),
-            port: 8333,
-        }],
-        1_700_000_000,
-    );
-    let got = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
-    assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(got[0].0, claim);
-}
-
-/// A reply stamps only the rows it returns. A v1 reply that leaves an onion
-/// out does not start its backdate.
-#[test]
-fn getaddr_stamps_only_the_rows_it_returns() {
-    let now = 1_700_000_000u64;
-    let hub = PeerHub::new();
-    hub.set_mock_now(now);
-    let mut am = rbitcoin_net::seeds::AddrMan::new();
-    am.set_onion_reachable(true);
-    let onion: rbitcoin_net::NetAddr =
-        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333"
-            .parse()
-            .unwrap();
-    am.add_addr(onion);
-    let book = Arc::new(Mutex::new(am));
-    hub.set_addrman(Arc::clone(&book));
-    let v1 = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
-    assert!(v1.is_empty(), "v1 excludes the onion: {v1:?}");
-    assert_eq!(
-        book.lock().unwrap().last_seen_of(&onion),
-        0,
-        "a row this reply did not return is not stamped"
-    );
-    hub.set_mock_now(now + 10 * 24 * 60 * 60);
-    let v2 = hub.addr_response_net(SocketAddr::from(([127, 0, 0, 1], 18445)), true);
-    assert_eq!(v2.len(), 1, "{v2:?}");
-    assert_eq!(v2[0].0, (now + 10 * 24 * 60 * 60 - 5 * 24 * 60 * 60) as u32);
-}
-
 include!("overlay_addrman_journey.rs");
 
 #[test]

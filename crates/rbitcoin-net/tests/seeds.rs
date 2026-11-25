@@ -969,6 +969,16 @@ fn merge_from_keeps_the_newer_row_time() {
     assert_eq!(shared.last_seen_of(&row), 1_700_000_000);
 }
 
+/// A stamped address that the book lost between the reply's sample and the
+/// write takes no entry, so a later reinsert starts from its own serve.
+#[test]
+fn stamp_missing_seen_skips_a_row_the_book_lost() {
+    let mut am = AddrMan::new();
+    let gone = NetAddr::from_socket(addr(45));
+    am.stamp_missing_seen_for(&[gone], 1_700_000_000);
+    assert_eq!(am.last_seen_of(&gone), 0);
+}
+
 #[test]
 fn seed_lookup_names_x_filter_before_unfiltered() {
     let names = seed_lookup_names(Network::Mainnet);

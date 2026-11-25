@@ -1017,12 +1017,16 @@ impl AddrMan {
 
     /// Fix a backdated time for the rows one reply returns, once. The row
     /// then ages from that point instead of looking five days old on every
-    /// serve, as Core fixes the backdate when it ingests the address.
+    /// serve, as Core fixes the backdate when it ingests the address. An
+    /// address the book no longer holds takes no entry, even if it was in the
+    /// reply's sample.
     #[doc(hidden)]
     pub fn stamp_missing_seen_for(&mut self, addrs: &[NetAddr], now: u64) {
         let backdated = backdated_seen(now);
         for addr in addrs {
-            self.seen.entry(*addr).or_insert(backdated);
+            if self.by_addr.contains_key(addr) {
+                self.seen.entry(*addr).or_insert(backdated);
+            }
         }
     }
 
