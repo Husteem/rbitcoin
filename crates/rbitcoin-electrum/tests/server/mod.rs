@@ -2364,6 +2364,311 @@ async fn announce_pushes_only_subscribed_outpoints() {
     let _ = std::fs::remove_dir_all(&pad.dir);
 }
 
+/// A new block restatuses only the subscribed outpoints it creates or
+/// spends. An outpoint the block does not touch gets no lookup and no push.
+#[tokio::test]
+async fn tip_pushes_only_outpoints_the_block_touches() {
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let mut pad = pool_pad().await;
+    let untouched = "11".repeat(32);
+    let mut cb1 = [0u8; 32];
+    cb1[0] = 0x71;
+    cb1[31] = 0xd1;
+    let created = {
+        let mut r = cb1;
+        r.reverse();
+        rbitcoin_primitives::hex_encode(r)
+    };
+    for (id, (hex, vout)) in [(untouched.clone(), 1), (created.clone(), 0)]
+        .into_iter()
+        .enumerate()
+    {
+        let sub = pad
+            .call(
+                id as u32 + 1,
+                "blockchain.outpoint.subscribe",
+                json!([hex, vout]),
+            )
+            .await;
+        assert_eq!(sub["result"]["spent"], false, "{sub}");
+    }
+    let (fk0, rec0) = pad.q.header_at_height(Height(0)).unwrap().unwrap();
+    let merkle = rbitcoin_store::merkle_root_from_txids(&[cb1]);
+    let hash = rbitcoin_store::block_header_hash(1, &rec0.hash, &merkle, 2, 0x207fffff, 0);
+    let header = HeaderRecord {
+        prev_fk: fk0,
+        version: 1,
+        timestamp: 2,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: merkle,
+        hash,
+        size: 0,
+        weight: 0,
+    };
+    let ta = TxApply {
+        tx: TxRecord {
+            txid: cb1,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: [0u8; 32],
+            parent: rbitcoin_store::InputParent::Coinbase,
+            sequence: u32::MAX,
+            script_sig: vec![1, 1],
+            witness: vec![],
+        }],
+        outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+    };
+    pad.q.connect_block(Height(1), &header, &[ta]).unwrap();
+    pad.tip_tx
+        .send(TipNotify {
+            height: 1,
+            header_hex: "00".repeat(80),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    let push = pad.read().await;
+    assert_eq!(push["method"], "blockchain.outpoint.subscribe", "{push}");
+    assert_eq!(push["params"][0], created, "{push}");
+    let ping = pad.call(9, "server.ping", json!([])).await;
+    assert_eq!(
+        ping["id"], 9,
+        "pushed an outpoint the block did not touch: {ping}"
+    );
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
+#[cfg(debug_assertions)]
+/// The pool pad's block-0 coinbase txid, display hex, and fk.
+fn pad_genesis(q: &Query) -> ([u8; 32], String, Fk) {
+    let mut txid = [0u8; 32];
+    txid[31] = 0xce;
+    let mut r = txid;
+    r.reverse();
+    let fk = q.block_tx_fks(Height(0)).unwrap()[0];
+    (txid, rbitcoin_primitives::hex_encode(r), fk)
+}
+
+/// A coinbase tagged by `height` and `tag`, paying `0x51`.
+fn pad_coinbase(height: u32, tag: u8) -> rbitcoin_query::TxApply {
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    let mut txid = [0u8; 32];
+    txid[0..4].copy_from_slice(&height.to_le_bytes());
+    txid[30] = tag;
+    txid[31] = 0xcb;
+    rbitcoin_query::TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: [0u8; 32],
+            parent: rbitcoin_store::InputParent::Coinbase,
+            sequence: u32::MAX,
+            script_sig: vec![1, tag],
+            witness: vec![],
+        }],
+        outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+    }
+}
+
+#[cfg(debug_assertions)]
+/// A spend of the pad's block-0 coinbase output 0.
+fn pad_genesis_spend(q: &Query) -> rbitcoin_query::TxApply {
+    use rbitcoin_store::{InputRecord, OutputRecord, TxRecord};
+    let (prev_txid, _, create_fk) = pad_genesis(q);
+    let mut txid = [0u8; 32];
+    txid[0] = 0x5e;
+    rbitcoin_query::TxApply {
+        tx: TxRecord {
+            txid,
+            version: 2,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid,
+            parent: rbitcoin_store::InputParent::Prevout { create_fk, vout: 0 },
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: vec![],
+        }],
+        outputs: vec![OutputRecord::unspent(1, vec![0x52])],
+    }
+}
+
+/// Connect `txs` at `height` on the current tip. `tag` sets the nonce, so
+/// two blocks at one height differ.
+fn pad_block(q: &Query, height: u32, tag: u8, txs: &[rbitcoin_query::TxApply]) {
+    let (prev_fk, prev) = q.header_at_height(Height(height - 1)).unwrap().unwrap();
+    let txids: Vec<[u8; 32]> = txs.iter().map(|t| t.tx.txid).collect();
+    let merkle = rbitcoin_store::merkle_root_from_txids(&txids);
+    let nonce = u32::from(tag);
+    let ts = height + 1;
+    let hash = rbitcoin_store::block_header_hash(1, &prev.hash, &merkle, ts, 0x207fffff, nonce);
+    let header = rbitcoin_store::HeaderRecord {
+        prev_fk,
+        version: 1,
+        timestamp: ts,
+        bits: 0x207fffff,
+        nonce,
+        merkle_root: merkle,
+        hash,
+        size: 0,
+        weight: 0,
+    };
+    q.connect_block(Height(height), &header, txs).unwrap();
+}
+
+fn pad_tip(pad: &PoolPad, height: u32, reorg_from_height: Option<u32>) {
+    pad.tip_tx
+        .send(TipNotify {
+            height,
+            header_hex: "00".repeat(80),
+            reorg_from_height,
+        })
+        .unwrap();
+}
+
+/// A lagged tip channel can hide a same-height reorg, so the next tip
+/// restatuses every subscription, even at the next height.
+#[tokio::test]
+async fn tip_after_a_lag_restatuses_every_outpoint() {
+    let mut pad = pool_pad().await;
+    let untouched = "11".repeat(32);
+    let sub = pad
+        .call(1, "blockchain.outpoint.subscribe", json!([untouched, 1]))
+        .await;
+    assert_eq!(sub["result"]["spent"], false, "{sub}");
+    pad.call(2, "blockchain.headers.subscribe", json!([])).await;
+    for h in 1..=5 {
+        pad_block(&pad.q, h, 0, &[pad_coinbase(h, 0)]);
+    }
+    pad.q.set_api_read_budget(1);
+    let held = pad.q.api_read_budget().acquire_owned().await.unwrap();
+    pad_tip(&pad, 1, None);
+    // The header push comes first; the touch read then waits on the permit.
+    let push = pad.read().await;
+    assert_eq!(push["params"][0]["height"], 1, "{push}");
+    // Five more than the handler has read: the lost one is the reorg.
+    pad_tip(&pad, 1, Some(1));
+    for h in 2..=5 {
+        pad_tip(&pad, h, None);
+    }
+    drop(held);
+    let push = pad.read().await;
+    assert_eq!(push["params"][0]["height"], 2, "{push}");
+    let push = pad.read().await;
+    assert_eq!(
+        push["method"], "blockchain.outpoint.subscribe",
+        "the tip after a lag skipped an untouched outpoint: {push}"
+    );
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
+#[cfg(debug_assertions)]
+fn fail_read(_: &Query) -> Result<(), String> {
+    Err("armed".into())
+}
+
+/// A status read that fails at one tip is read again at the next, though
+/// the next block does not touch the outpoint.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn failed_outpoint_read_is_retried_at_the_next_tip() {
+    let mut pad = pool_pad().await;
+    let (_, genesis, _) = pad_genesis(&pad.q);
+    let sub = pad
+        .call(
+            1,
+            "blockchain.outpoint.subscribe",
+            json!([genesis.clone(), 0]),
+        )
+        .await;
+    assert_eq!(sub["result"]["spent"], false, "{sub}");
+    let spend = pad_genesis_spend(&pad.q);
+    pad_block(&pad.q, 1, 0, &[pad_coinbase(1, 0), spend]);
+    set_outpoint_read_hook_for_test(&pad.q, OutpointReadStep::StatusStart, fail_read);
+    pad_tip(&pad, 1, None);
+    let ping = pad.call(2, "server.ping", json!([])).await;
+    assert_eq!(ping["id"], 2, "the failed read pushed: {ping}");
+    pad_block(&pad.q, 2, 0, &[pad_coinbase(2, 0)]);
+    pad_tip(&pad, 2, None);
+    let push = pad.call(3, "server.ping", json!([])).await;
+    assert_eq!(push["method"], "blockchain.outpoint.subscribe", "{push}");
+    assert_eq!(push["params"][2]["spent"], true, "{push}");
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
+#[cfg(debug_assertions)]
+fn replace_block_1(q: &Query) -> Result<(), String> {
+    q.disconnect_tip().map_err(|e| e.to_string())?;
+    pad_block(q, 1, 0xb0, &[pad_coinbase(1, 0xb0)]);
+    Ok(())
+}
+
+/// A touch set is the block whose header was read: its spends, not those of
+/// a block that replaced it before the set was built.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn touch_set_is_the_block_whose_header_was_read() {
+    let mut pad = pool_pad().await;
+    let (_, genesis, _) = pad_genesis(&pad.q);
+    let sub = pad
+        .call(
+            1,
+            "blockchain.outpoint.subscribe",
+            json!([genesis.clone(), 0]),
+        )
+        .await;
+    assert_eq!(sub["result"]["spent"], false, "{sub}");
+    let spend = pad_genesis_spend(&pad.q);
+    pad_block(&pad.q, 1, 0, &[pad_coinbase(1, 0), spend]);
+    set_outpoint_read_hook_for_test(&pad.q, OutpointReadStep::TouchHeader, replace_block_1);
+    pad_tip(&pad, 1, None);
+    let push = pad.call(2, "server.ping", json!([])).await;
+    assert_eq!(
+        push["method"], "blockchain.outpoint.subscribe",
+        "the block that spent the outpoint did not touch it: {push}"
+    );
+    assert_eq!(push["params"][0], genesis, "{push}");
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
+#[cfg(debug_assertions)]
+fn disconnect_spender(q: &Query) -> Result<(), String> {
+    q.disconnect_tip().map_err(|e| e.to_string())
+}
+
+/// A confirmed spender disconnected between the spender and height reads
+/// is not reported as a spend at height 0.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn spender_disconnected_mid_read_is_not_a_height_0_spend() {
+    let pad = pool_pad().await;
+    let (_, genesis, _) = pad_genesis(&pad.q);
+    let spend = pad_genesis_spend(&pad.q);
+    pad_block(&pad.q, 1, 0, &[pad_coinbase(1, 0), spend]);
+    set_outpoint_read_hook_for_test(&pad.q, OutpointReadStep::StatusSpender, disconnect_spender);
+    let status = outpoint_status(&pad.q, None, &json!([genesis.clone(), 0])).unwrap();
+    assert_eq!(
+        status,
+        json!({"txid": genesis, "vout": 0, "spent": false}),
+        "a spend the chain no longer has"
+    );
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
 #[tokio::test]
 async fn chain_view_reorg_notifies_dropped_scripthash() {
     use rbitcoin_query::TxApply;

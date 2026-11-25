@@ -829,15 +829,9 @@ async fn electrum_server_version_history_balance() {
         })
         .expect("scripthash tip push");
     {
+        // The subscribed all-zero outpoint is not touched by this empty
+        // block, so only the scripthash is pushed.
         let mut reader = BufReader::new(&mut stream);
-        let mut op_line = String::new();
-        read_line_timeout(&mut reader, &mut op_line, "outpoint notification").await;
-        let op_push: Value = serde_json::from_str(&op_line).unwrap();
-        assert_eq!(
-            op_push["method"].as_str(),
-            Some("blockchain.outpoint.subscribe"),
-            "{op_push}"
-        );
         let mut sh_line = String::new();
         read_line_timeout(&mut reader, &mut sh_line, "scripthash notification").await;
         let push: Value = serde_json::from_str(&sh_line).unwrap();
@@ -1355,6 +1349,217 @@ async fn electrum_mempool_notify_follows_funding_and_rbf_on() {
     assert_eq!(ping["id"], 4, "one push per sub per accepted tx: {ping}");
 
     handle.shutdown().await;
+}
+
+/// A tip restatuses the subscribed outpoints its block spends, and the ones
+/// whose pool spender changed without an announce: a spender expired, or a
+/// rollback put one back. Coin 0 is spent in the pool after its subscribe,
+/// coins 2 and 3 before theirs, and coin 3 is unsubscribed; every pool
+/// spender expires. Then a rollback silently restores a new spender of coin
+/// 0 and one of the unspent coin 4, and the next block spends coin 1. Coins
+/// 0, 1, 2 and 4 are pushed with their new status, and nothing else is.
+#[test]
+fn electrum_tip_restatuses_spent_and_freed_outpoints() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("tokio-rt-worker")
+        .build()
+        .expect("runtime");
+    rt.block_on(electrum_tip_restatuses_spent_and_freed_outpoints_on());
+}
+
+async fn electrum_tip_restatuses_spent_and_freed_outpoints_on() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::script::ScriptBuf;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use rbitcoin_net::MempoolHub;
+
+    let dir = TempDir::new().unwrap();
+    let params = ChainParams::regtest();
+    let (q, tip, tip_time, coinbase_txids) = open_electrum_maturity(&dir);
+    let q = Arc::new(q);
+    let spend = |op: OutPoint, outs: usize| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: op,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![
+            TxOut {
+                value: Amount::from_sat(if outs == 1 { 8_0000_0000 } else { 9_0000_0000 }),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            };
+            outs
+        ],
+    };
+    let connect = |prev: bitcoin::BlockHash, h: u32, txs: Vec<Transaction>| {
+        let block =
+            rbitcoin_test::mine::mine_regtest_block(prev, tip_time + 600 * (h - 101), h, txs);
+        rbitcoin_query::accept_and_connect_block(
+            q.as_ref(),
+            &params,
+            rbitcoin_primitives::Height(h),
+            &block,
+            Milestone::NONE,
+        )
+        .unwrap();
+        block
+    };
+    // Block 102 splits the mature coinbase into the watched outpoints.
+    let split = spend(
+        OutPoint {
+            txid: coinbase_txids[0],
+            vout: 0,
+        },
+        5,
+    );
+    let b102 = connect(tip, 102, vec![split.clone()]);
+    let coin = |vout: u32| OutPoint {
+        txid: split.compute_txid(),
+        vout,
+    };
+
+    let mp = Arc::new(MempoolHub::open(dir.path().join("mempool"), Arc::clone(&q)).unwrap());
+    mp.set_relay_enabled(true);
+    let (tip_tx, _) = broadcast::channel(4);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let handle = run_electrum(
+        cfg,
+        Arc::clone(&q),
+        params.clone(),
+        tip_tx.clone(),
+        Some(Arc::clone(&mp)),
+    )
+    .await
+    .expect("electrum listen");
+    let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+    let hex = split.compute_txid().to_string();
+    let subscribe = |vout: u32| json!([hex.clone(), vout]);
+    for vout in [0u32, 1, 4] {
+        let v = rpc(
+            &mut stream,
+            u64::from(vout) + 1,
+            "blockchain.outpoint.subscribe",
+            subscribe(vout),
+        )
+        .await;
+        assert_eq!(v["result"]["spent"], false, "{v}");
+    }
+    let spenders: Vec<Transaction> = [0, 2, 3].map(|v| spend(coin(v), 1)).into();
+    mp.admit(&spenders[0]).expect("accept the coin 0 spender");
+    let push = read_notify(&mut stream, "coin 0 mempool spend").await;
+    assert_eq!(
+        push["params"][2]["spending_txid"],
+        spenders[0].compute_txid().to_string(),
+        "{push}"
+    );
+    for (tx, vout) in spenders[1..].iter().zip([2u32, 3]) {
+        mp.admit(tx).expect("accept a pool spender");
+        let v = rpc(
+            &mut stream,
+            u64::from(vout) + 1,
+            "blockchain.outpoint.subscribe",
+            subscribe(vout),
+        )
+        .await;
+        assert_eq!(v["result"]["height"], 0, "{v}");
+    }
+    let v = rpc(
+        &mut stream,
+        6,
+        "blockchain.outpoint.unsubscribe",
+        subscribe(3),
+    )
+    .await;
+    assert_eq!(v["result"], true, "{v}");
+    let ids: Vec<_> = spenders.iter().map(Transaction::compute_txid).collect();
+    assert_eq!(mp.remove_expired_roots(&ids), 3);
+    // A rollback puts back a victim still in the relay index without an
+    // announce: a new spender of coin 0, and a first spender of coin 4.
+    let mut again = spend(coin(0), 1);
+    again.output[0].value = Amount::from_sat(7_0000_0000);
+    let silent = [again, spend(coin(4), 1)];
+    for tx in &silent {
+        mp.insert_relay_maps(tx.compute_txid(), tx.compute_wtxid(), 0, 0);
+    }
+    mp.restore_replaced(&silent);
+
+    let b103 = connect(b102.block_hash(), 103, vec![spend(coin(1), 1)]);
+    tip_tx
+        .send(TipNotify {
+            height: 103,
+            header_hex: bitcoin::consensus::encode::serialize_hex(&b103.header),
+            reorg_from_height: None,
+        })
+        .expect("tip push");
+    let mut pushes = Vec::new();
+    for label in ["coin push 1", "coin push 2", "coin push 3", "coin push 4"] {
+        let push = read_notify(&mut stream, label).await;
+        assert_eq!(push["method"], "blockchain.outpoint.subscribe", "{push}");
+        pushes.push(push["params"][2].clone());
+    }
+    pushes.sort_by_key(|s| s["vout"].as_u64());
+    assert_eq!(
+        pushes,
+        vec![
+            json!({"txid": hex, "vout": 0, "spent": true, "height": 0,
+                "spending_txid": silent[0].compute_txid().to_string()}),
+            json!({"txid": hex, "vout": 1, "spent": true, "height": 103}),
+            json!({"txid": hex, "vout": 2, "spent": false}),
+            json!({"txid": hex, "vout": 4, "spent": true, "height": 0,
+                "spending_txid": silent[1].compute_txid().to_string()}),
+        ]
+    );
+    let ping = rpc(&mut stream, 7, "server.ping", json!([])).await;
+    assert_eq!(ping["id"], 7, "one push per changed outpoint: {ping}");
+
+    // The next block touches nothing watched.
+    let b104 = connect(b103.block_hash(), 104, vec![]);
+    untouched_block_keeps_spend_height(&mut stream, &q, &tip_tx, &b104.header, &hex).await;
+
+    handle.shutdown().await;
+}
+
+/// A block that touches no watched outpoint pushes nothing. A confirmed
+/// spend's status is the spend's height (103), not the tip's, so the status
+/// coin 1 was sent stays true. The touch set reads the store, not a rebuilt
+/// block.
+async fn untouched_block_keeps_spend_height(
+    stream: &mut TcpStream,
+    q: &Query,
+    tip_tx: &broadcast::Sender<TipNotify>,
+    header: &bitcoin::block::Header,
+    hex: &str,
+) {
+    #[cfg(debug_assertions)]
+    let _ = q.sample_reset_reconstruct_archived();
+    #[cfg(not(debug_assertions))]
+    let _ = q;
+    tip_tx
+        .send(TipNotify {
+            height: 104,
+            header_hex: bitcoin::consensus::encode::serialize_hex(header),
+            reorg_from_height: None,
+        })
+        .expect("tip push");
+    let ping = rpc(stream, 8, "server.ping", json!([])).await;
+    assert_eq!(ping["id"], 8, "no push for an untouched block: {ping}");
+    let v = rpc(stream, 9, "blockchain.outpoint.get_status", json!([hex, 1])).await;
+    assert_eq!(
+        v["result"],
+        json!({"txid": hex, "vout": 1, "spent": true, "height": 103}),
+        "the spend's height, as pushed"
+    );
+    #[cfg(debug_assertions)]
+    assert_eq!(
+        q.sample_reset_reconstruct_archived(),
+        0,
+        "the touch set rebuilt a block"
+    );
 }
 
 /// Sparrow subscribes every receive and change address up to its gap limit on

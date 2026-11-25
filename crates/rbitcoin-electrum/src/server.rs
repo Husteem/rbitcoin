@@ -546,7 +546,15 @@ pub struct ElectrumConn {
     pub header_sub: bool,
     pub sh_subs: HashSet<[u8; 32]>,
     pub sh_join: Option<Arc<ShJoinSlot>>,
-    pub outpoint_subs: HashSet<([u8; 32], u32)>,
+    /// Subscribed outpoints, each with the pool spender (`spending_txid`) its
+    /// last status sent named. A spender can leave the pool, or a rollback
+    /// put one back, without an announce, so each block also restatuses the
+    /// outpoints whose pool spender is no longer the one sent.
+    pub outpoint_subs: HashMap<([u8; 32], u32), Option<String>>,
+    /// Height the outpoint statuses were last checked at. The next block
+    /// restatuses only the outpoints it touches; a gap or a reorg restatuses
+    /// all.
+    outpoint_tip: Option<u32>,
     /// Silent-payment subscriptions whose history has been sent.
     sp_subs: Vec<SpLive>,
     /// History scans of subscribes that have not reached the tip, at most
@@ -568,7 +576,8 @@ impl ElectrumConn {
             header_sub: false,
             sh_subs: HashSet::new(),
             sh_join: None,
-            outpoint_subs: HashSet::new(),
+            outpoint_subs: HashMap::new(),
+            outpoint_tip: None,
             sp_subs: Vec::new(),
             sp_scans: Vec::new(),
             sp_waiting: std::collections::VecDeque::new(),
@@ -632,15 +641,47 @@ where
                             });
                             writer.line(msg).await?;
                         }
+                        // A status that could not be read keeps the
+                        // watermark back: the next tip restatuses everything.
+                        let mut read_all = true;
                         if !conn.outpoint_subs.is_empty() {
-                            emit_outpoint_notes(
-                                &mut writer,
-                                &query,
-                                mempool.clone(),
-                                conn.outpoint_subs.iter().copied().collect(),
-                            )
-                            .await?;
+                            // The next block: only the outpoints it creates or
+                            // spends. A reorg, a gap, or a block that cannot
+                            // be read restatuses every subscription.
+                            let next = t.reorg_from_height.is_none()
+                                && conn.outpoint_tip.and_then(|h| h.checked_add(1)) == Some(t.height);
+                            let touch = if next {
+                                block_outpoint_touch(&query, t.height).await
+                            } else {
+                                None
+                            };
+                            let mut ops: Vec<([u8; 32], u32)> = conn
+                                .outpoint_subs
+                                .keys()
+                                .copied()
+                                .filter(|op| touch.as_ref().is_none_or(|t| t.touches(op)))
+                                .collect();
+                            if let Some(t) = &touch {
+                                let rest: Vec<_> = conn
+                                    .outpoint_subs
+                                    .iter()
+                                    .filter(|(op, _)| !t.touches(op))
+                                    .map(|(op, sent)| (*op, sent.clone()))
+                                    .collect();
+                                ops.extend(pool_spender_changed(&query, mempool.clone(), rest).await);
+                            }
+                            if !ops.is_empty() {
+                                read_all = emit_outpoint_notes(
+                                    &mut writer,
+                                    &query,
+                                    mempool.clone(),
+                                    ops,
+                                    &mut conn.outpoint_subs,
+                                )
+                                .await?;
+                            }
                         }
+                        conn.outpoint_tip = read_all.then_some(t.height);
                         restart_sp_scans_after_reorg(&mut conn.sp_scans, &query, &params, &t);
                         emit_sp_tips(&mut writer, &query, &params, &mut conn, &t).await?;
                         if !conn.sh_subs.is_empty() {
@@ -661,6 +702,9 @@ where
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // A lost tip can be a same-height reorg. The next
+                        // tip restatuses every outpoint, even at height + 1.
+                        conn.outpoint_tip = None;
                         if !conn.sh_subs.is_empty() {
                             sh_rescan |= !emit_sh_notes(
                                 &mut writer,
@@ -730,11 +774,17 @@ where
                             .outpoints
                             .iter()
                             .map(|op| (op.txid.to_byte_array(), op.vout))
-                            .filter(|op| conn.outpoint_subs.contains(op))
+                            .filter(|op| conn.outpoint_subs.contains_key(op))
                             .collect();
                         if !touched_ops.is_empty() {
-                            emit_outpoint_notes(&mut writer, &query, mempool.clone(), touched_ops)
-                                .await?;
+                            emit_outpoint_notes(
+                                &mut writer,
+                                &query,
+                                mempool.clone(),
+                                touched_ops,
+                                &mut conn.outpoint_subs,
+                            )
+                            .await?;
                         }
                         // Walk the tx's few scripthashes and probe the sub set,
                         // so the cost per accept does not grow with sub count.
@@ -1247,7 +1297,8 @@ fn read_conn(conn: &mut ElectrumConn, method: &str) -> ElectrumConn {
         } else {
             None
         },
-        outpoint_subs: HashSet::new(),
+        outpoint_subs: HashMap::new(),
+        outpoint_tip: None,
         sp_subs: Vec::new(),
         sp_scans: Vec::new(),
         sp_waiting: std::collections::VecDeque::new(),
@@ -1466,6 +1517,7 @@ async fn answer_one(
         sh_subs: std::mem::take(&mut conn.sh_subs),
         sh_join: conn.sh_join.take(),
         outpoint_subs: std::mem::take(&mut conn.outpoint_subs),
+        outpoint_tip: conn.outpoint_tip,
         sp_subs: std::mem::take(&mut conn.sp_subs),
         sp_scans: std::mem::take(&mut conn.sp_scans),
         sp_waiting: std::mem::take(&mut conn.sp_waiting),
@@ -1819,13 +1871,16 @@ async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     Ok(true)
 }
 
-/// Push the current status of each of `outpoints`.
+/// Push the current status of each of `outpoints`, and note in `subs` the
+/// pool spender each status names. `false` when a status could not be read.
 pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     mempool: Option<Arc<MempoolHub>>,
     outpoints: Vec<([u8; 32], u32)>,
-) -> Result<(), std::io::Error> {
+    subs: &mut HashMap<([u8; 32], u32), Option<String>>,
+) -> Result<bool, std::io::Error> {
+    let asked = outpoints.len();
     let q = Arc::clone(query);
     let looked = budgeted_blocking(query, move || {
         let mut out = Vec::with_capacity(outpoints.len());
@@ -1839,7 +1894,9 @@ pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
     })
     .await
     .unwrap_or_default();
+    let read_all = looked.len() == asked;
     for (txid, vout, status) in looked {
+        note_pool_spender(subs, (txid, vout), &status);
         let note = json!({
             "jsonrpc": "2.0",
             "method": "blockchain.outpoint.subscribe",
@@ -1847,7 +1904,171 @@ pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
         });
         writer.line(note).await?;
     }
+    Ok(read_all)
+}
+
+/// Record the pool spender `status` names for the subscribed `op`.
+fn note_pool_spender(
+    subs: &mut HashMap<([u8; 32], u32), Option<String>>,
+    op: ([u8; 32], u32),
+    status: &Value,
+) {
+    if let Some(sent) = subs.get_mut(&op) {
+        *sent = status
+            .get("spending_txid")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+}
+
+/// A subscribed outpoint and the pool spender its last status named.
+type SentSpender = (([u8; 32], u32), Option<String>);
+
+/// The outpoints of `sent` (each with the pool spender its last status
+/// named) that the pool now spends with another transaction or not at all.
+/// A pool lookup each, no store read.
+async fn pool_spender_changed(
+    query: &Arc<Query>,
+    mempool: Option<Arc<MempoolHub>>,
+    sent: Vec<SentSpender>,
+) -> Vec<([u8; 32], u32)> {
+    let Some(mp) = mempool else {
+        return Vec::new();
+    };
+    if sent.is_empty() {
+        return Vec::new();
+    }
+    budgeted_blocking(query, move || {
+        use bitcoin::hashes::Hash;
+        sent.into_iter()
+            .filter(|((txid, vout), was)| {
+                let now = mp.spending_txid(&bitcoin::OutPoint {
+                    txid: bitcoin::Txid::from_byte_array(*txid),
+                    vout: *vout,
+                });
+                now.map(|t| t.to_string()) != *was
+            })
+            .map(|(op, _)| op)
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Txids a block created and outpoints it spent: the outpoint
+/// subscriptions whose status that block can change.
+#[doc(hidden)]
+pub struct OutpointTouch {
+    created: HashSet<[u8; 32]>,
+    spent: HashSet<([u8; 32], u32)>,
+}
+
+impl OutpointTouch {
+    fn touches(&self, op: &([u8; 32], u32)) -> bool {
+        self.created.contains(&op.0) || self.spent.contains(op)
+    }
+}
+
+/// A point in an outpoint read where a test can act: reorg, or fail the read.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OutpointReadStep {
+    /// [`block_outpoint_touch`] after the header read.
+    TouchHeader,
+    /// The start of [`outpoint_status`].
+    StatusStart,
+    /// [`outpoint_status`] after the confirmed spender read.
+    StatusSpender,
+}
+
+#[cfg(debug_assertions)]
+type OutpointReadHook = fn(&Query) -> Result<(), String>;
+
+#[cfg(debug_assertions)]
+static OUTPOINT_READ_HOOKS: std::sync::Mutex<Vec<(usize, OutpointReadStep, OutpointReadHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run `hook` once, the next time `step` is reached on this store, on
+/// whichever thread reaches it. An `Err` fails that read. Debug builds only.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn set_outpoint_read_hook_for_test(
+    query: &Query,
+    step: OutpointReadStep,
+    hook: OutpointReadHook,
+) {
+    OUTPOINT_READ_HOOKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((std::ptr::from_ref(query) as usize, step, hook));
+}
+
+#[cfg(debug_assertions)]
+fn outpoint_read_step(query: &Query, step: OutpointReadStep) -> Result<(), String> {
+    let key = std::ptr::from_ref(query) as usize;
+    let hook = {
+        let mut hooks = OUTPOINT_READ_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        hooks
+            .iter()
+            .position(|(k, s, _)| *k == key && *s == step)
+            .map(|i| hooks.swap_remove(i).2)
+    };
+    hook.map_or(Ok(()), |hook| hook(query))
+}
+
+#[cfg(not(debug_assertions))]
+fn outpoint_read_step(_query: &Query, _step: OutpointReadStep) -> Result<(), String> {
     Ok(())
+}
+
+/// The touch set of the active block at `height`, built once per block for
+/// every connection: (store, height, block hash) → set. `None` when the
+/// block cannot be read (for example its bodies were pruned).
+async fn block_outpoint_touch(query: &Arc<Query>, height: u32) -> Option<Arc<OutpointTouch>> {
+    type Cached = Option<(usize, u32, [u8; 32], Arc<OutpointTouch>)>;
+    static LAST: std::sync::OnceLock<std::sync::Mutex<Cached>> = std::sync::OnceLock::new();
+    let q = Arc::clone(query);
+    budgeted_blocking(query, move || {
+        let (fk, rec) = q.header_at_height(Height(height)).ok()??;
+        outpoint_read_step(&q, OutpointReadStep::TouchHeader).ok()?;
+        let store = Arc::as_ptr(&q) as usize;
+        let last = LAST.get_or_init(|| std::sync::Mutex::new(None));
+        if let Some((s, h, hash, touch)) = last.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if *s == store && *h == height && *hash == rec.hash {
+                return Some(Arc::clone(touch));
+            }
+        }
+        let created = q.header_txids(fk).ok()?.into_iter().collect();
+        // Each input's parent and vout from the stored edges, and the
+        // parents' txids: no block rebuild, so a pruned witness window does
+        // not turn every tip into a full restatus.
+        let mut edges = Vec::new();
+        // By the header read above, not the height again: a reorg since
+        // then must not put another block's spends under this hash.
+        for tx in q.header_tx_fks(fk, None).ok()?? {
+            for (parent, vout) in q.tx_prevouts_for_fk(tx).ok()? {
+                if !parent.is_null() {
+                    edges.push((parent, vout));
+                }
+            }
+        }
+        let parents: Vec<Fk> = edges.iter().map(|(parent, _)| *parent).collect();
+        let txids = q.store().txids_get_many(&parents).ok()?;
+        let spent = edges
+            .iter()
+            .zip(txids)
+            .map(|((_, vout), txid)| txid.map(|t| (t, *vout)))
+            .collect::<Option<_>>()?;
+        let touch = Arc::new(OutpointTouch { created, spent });
+        *last.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((store, height, rec.hash, Arc::clone(&touch)));
+        Some(touch)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[doc(hidden)]
@@ -3476,11 +3697,16 @@ fn dispatch_method(
                 vout,
                 config.max_scripthash_subs,
             )?;
-            outpoint_status(query, mempool, params)
+            if conn.outpoint_tip.is_none() {
+                conn.outpoint_tip = query.tip_height().map(|h| h.0);
+            }
+            let status = outpoint_status(query, mempool, params)?;
+            note_pool_spender(&mut conn.outpoint_subs, (txid, vout), &status);
+            Ok(status)
         }
         "blockchain.outpoint.unsubscribe" => {
             let (txid, vout) = param_outpoint(params)?;
-            Ok(json!(conn.outpoint_subs.remove(&(txid, vout))))
+            Ok(json!(conn.outpoint_subs.remove(&(txid, vout)).is_some()))
         }
         "blockchain.silentpayments.unsubscribe" => {
             silentpayments_unsubscribe(conn, query, chain, params)
@@ -3589,16 +3815,16 @@ pub fn protocol_ge_1_6(protocol: &str) -> bool {
 
 #[doc(hidden)]
 pub fn admit_outpoint_sub(
-    subs: &mut HashSet<([u8; 32], u32)>,
+    subs: &mut HashMap<([u8; 32], u32), Option<String>>,
     txid: [u8; 32],
     vout: u32,
     cap: usize,
 ) -> Result<(), String> {
     let key = (txid, vout);
-    if !subs.contains(&key) && subs.len() >= cap {
+    if !subs.contains_key(&key) && subs.len() >= cap {
         return Err(format!("too many outpoint subscriptions (max {cap})"));
     }
-    subs.insert(key);
+    subs.entry(key).or_insert(None);
     Ok(())
 }
 
@@ -3616,15 +3842,33 @@ pub fn outpoint_status(
     params: &Value,
 ) -> Result<Value, String> {
     let (txid, vout) = param_outpoint(params)?;
-    if query
-        .is_outpoint_spent(&txid, vout)
-        .map_err(|e| e.to_string())?
-    {
+    outpoint_read_step(query, OutpointReadStep::StatusStart)?;
+    // A confirmed spend reports the spending block's height, not the tip's:
+    // the status then holds until a block touches the outpoint, which is
+    // when a tip pushes it.
+    let tip = query.tip_height().map(|h| h.0);
+    let spenders = query
+        .spenders_at(&txid, vout, tip)
+        .map_err(|e| e.to_string())?;
+    outpoint_read_step(query, OutpointReadStep::StatusSpender)?;
+    // A spender with no height was disconnected after the spender read: it
+    // is not a confirmed spend, so read on to the pool.
+    let height = match spenders.first() {
+        Some(spend) => query
+            .store()
+            .tx_height_get_batch(&[spend.spending_tx_fk])
+            .map_err(|e| e.to_string())?
+            .first()
+            .copied()
+            .flatten(),
+        None => None,
+    };
+    if let Some(height) = height {
         return Ok(json!({
             "txid": txid_hex(&txid),
             "vout": vout,
             "spent": true,
-            "height": query.tip_height().map(|h| h.0).unwrap_or(0),
+            "height": height,
         }));
     }
     if let Some(mp) = mempool {
