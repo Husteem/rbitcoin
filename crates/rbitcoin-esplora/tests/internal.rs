@@ -916,6 +916,26 @@ async fn internal_totals_take_heavy_turns(
     );
     assert_eq!(q.sh_join_probe.peaks().1, 1, "heavy joins take turns");
     q.sh_join_probe.disarm();
+
+    // With the turn taken, both wait on their tasks and then answer what
+    // they answered above: the history walk is handed back to its rerun.
+    let turn = std::sync::Arc::clone(&q.heavy_sh_join)
+        .try_acquire_owned()
+        .expect("turn free");
+    let waiting =
+        async { tokio::join!(http_get_unix(sock, &totals), http_get_unix(sock, &listed)) };
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut waiting)
+            .await
+            .is_err(),
+        "heavy joins wait for the held turn"
+    );
+    drop(turn);
+    let after = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("heavy joins answer once the turn is free");
+    assert_eq!(after, (a, b), "a rerun answers what an unheld run answered");
     q.set_heavy_sh_creates(rbitcoin_query::DEFAULT_HEAVY_SH_CREATES);
 }
 

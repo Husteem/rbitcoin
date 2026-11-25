@@ -22,9 +22,10 @@ thread_local! {
 /// caller awaited on its task. With it, every heavy join in `f` runs under
 /// that turn. Without it, a heavy join that finds the turn taken returns
 /// [`StoreError::Rejected`] at once instead of waiting on this thread. The
-/// caller then drops the value, awaits the turn with no blocking thread and
-/// no store permit, and runs `f` again with the grant. A waiter therefore
-/// holds neither.
+/// caller then awaits the turn with no blocking thread and no store permit
+/// and runs `f` again with the grant, handing it the refused value so state
+/// moved through `f` comes back (`rbitcoin_net::blocking_heavy_turn`). A
+/// waiter therefore holds neither.
 pub fn heavy_turn_job<T>(
     grant: Option<tokio::sync::OwnedSemaphorePermit>,
     f: impl FnOnce() -> T,

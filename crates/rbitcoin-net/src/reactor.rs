@@ -209,8 +209,9 @@ pub fn spawn_with_store_budget<T: Send + 'static>(
 /// ([`rbitcoin_query::scripthash::heavy_turn_job`]). That run's thread and
 /// permit go back, the turn is awaited on this task, and `f` runs once more
 /// holding it, taking the turn before its store permit. The rerun is handed
-/// the refused run's value, so state moved through `f` comes back. With no
-/// `turn`, a refused run's value is the answer.
+/// the refused run's value, so state moved through `f` comes back. That
+/// rerun holds the turn for all of `f`, not only its join. With no `turn`,
+/// a refused run's value is the answer.
 pub async fn blocking_heavy_turn<T, F, P, Fut>(
     turn: Option<&Arc<Semaphore>>,
     mut permit: P,
