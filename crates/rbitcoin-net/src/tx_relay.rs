@@ -21,7 +21,7 @@ use rbitcoin_mempool::{
     StockAbove, UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_query::Query;
+use rbitcoin_query::{ConnectedOutputs, Query};
 use rbitcoin_store::durability::Durable as _;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -500,21 +500,65 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
         if let Some(m) = self.meter_get_coin {
             m.fetch_add(1, Ordering::Relaxed);
         }
-        let tid = op.txid.to_byte_array();
-        let Some((fk, create_height, outs)) = self
+        let Some((resolved, tip)) = self.resolve_chain_prevout(op) else {
+            return ChainPrevout::Unknown;
+        };
+        self.chain_prevout_from_resolved(op, resolved, tip)
+    }
+}
+
+impl QueryUtxoProvider<'_> {
+    fn resolve_chain_prevout(&self, op: &OutPoint) -> Option<(ConnectedOutputs, u32)> {
+        let resolved = self
             .query
-            .connected_tx_outputs_at(&tid, &[op.vout])
-            .ok()
-            .flatten()
-        else {
-            return ChainPrevout::Unknown;
-        };
-        let Some(tip) = self.query.tip_height().map(|h| h.0) else {
-            return ChainPrevout::Unknown;
-        };
+            .connected_tx_outputs_at(&op.txid.to_byte_array(), &[op.vout])
+            .ok()??;
+        Some((resolved, self.query.tip_height()?.0))
+    }
+
+    /// Read the coin from the connected-output lookup. A row that left the
+    /// chain, or a tip that moved, during the read is looked up once more.
+    /// A second stale read is `Unknown`.
+    #[doc(hidden)]
+    pub fn chain_prevout_from_resolved(
+        &self,
+        op: &OutPoint,
+        resolved: ConnectedOutputs,
+        tip: u32,
+    ) -> ChainPrevout {
+        self.read_resolved_prevout(op, resolved, tip)
+            .or_else(|| {
+                let (resolved, tip) = self.resolve_chain_prevout(op)?;
+                self.read_resolved_prevout(op, resolved, tip)
+            })
+            .unwrap_or(ChainPrevout::Unknown)
+    }
+
+    /// `None` means the resolved row needs a fresh lookup.
+    fn read_resolved_prevout(
+        &self,
+        op: &OutPoint,
+        resolved: ConnectedOutputs,
+        tip: u32,
+    ) -> Option<ChainPrevout> {
+        let (fk, create_height) = (resolved.0, resolved.1);
         if create_height > tip {
-            return ChainPrevout::Unknown;
+            return None;
         }
+        let read = self.read_prevout(op, resolved, tip);
+        // Checked after every read: a disconnect pops the row's fence height
+        // (a later create may then take its fk) and a connect moves the tip.
+        (self.query.store().tx_height_get(fk).ok().flatten() == Some(create_height)
+            && self.query.tip_height() == Some(Height(tip)))
+        .then_some(read)
+    }
+
+    fn read_prevout(
+        &self,
+        op: &OutPoint,
+        (fk, create_height, outs): ConnectedOutputs,
+        tip: u32,
+    ) -> ChainPrevout {
         let Some((_, out)) = outs.into_iter().next() else {
             return ChainPrevout::KnownUnavailable;
         };

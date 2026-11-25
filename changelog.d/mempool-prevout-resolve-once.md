@@ -1,5 +1,4 @@
 Changed
 
-- **Mempool admission reuses the confirmed parent lookup.** The spentness
-  check uses the same archive row as the output read in both preparation
-  and the recheck after script verification.
+- **Mempool admission resolves a confirmed parent once per read and looks it
+  up again if a block connects or disconnects during that read.**
