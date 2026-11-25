@@ -262,44 +262,59 @@ pub type BlockHashMap<V> = HashMap<BlockHash, V, std::hash::BuildHasherDefault<B
 /// Block-hash keyed set with [`BlockHashHasher`].
 pub type BlockHashSet = HashSet<BlockHash, std::hash::BuildHasherDefault<BlockHashHasher>>;
 
-/// Kept peers recorded per hash in [`MutatedCopies`]. A ninth stops reopening.
+/// Peers recorded per hash in [`MutatedCopies`]. A ninth stops reopening.
 const MUTATED_SENDERS: usize = 8;
 
-/// Mutated body copies of one hash and the kept peers that sent them, held
-/// inline so the bounded map holds no heap.
+/// Reopens per hash before it stays abandoned for the session.
+const MUTATED_REOPENS: u8 = 3;
+
+/// Mutated body copies of one hash, the peers that sent them (by IP, so a
+/// reconnect from a new port is the same peer), and how often it was
+/// reopened. Held inline so the bounded map holds no heap. An entry the
+/// tracking cap evicts loses all three, which only costs that hash retries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MutatedCopies {
     pub copies: u8,
-    senders: [Option<std::net::SocketAddr>; MUTATED_SENDERS],
+    reopens: u8,
+    senders: [Option<std::net::IpAddr>; MUTATED_SENDERS],
 }
 
 impl MutatedCopies {
-    /// One more copy, from `sender` when it is still a slot.
-    pub fn note(&mut self, sender: Option<std::net::SocketAddr>) {
+    /// One more copy from a kept peer: counted, and its sender recorded.
+    pub fn note(&mut self, sender: Option<std::net::IpAddr>) {
         self.copies = self.copies.saturating_add(1);
-        let Some(addr) = sender else {
+        self.note_sender(sender);
+    }
+
+    /// Record a sender without counting its copy: a dropped peer's copy
+    /// does not count toward the abandon bound, but it must not reopen the
+    /// hash either.
+    pub fn note_sender(&mut self, sender: Option<std::net::IpAddr>) {
+        let Some(ip) = sender else {
             return;
         };
-        if self.sent_by(addr) {
+        if self.sent_by(ip) {
             return;
         }
         if let Some(free) = self.senders.iter_mut().find(|s| s.is_none()) {
-            *free = Some(addr);
+            *free = Some(ip);
         }
     }
 
-    pub fn sent_by(&self, addr: std::net::SocketAddr) -> bool {
-        self.senders.contains(&Some(addr))
+    pub fn sent_by(&self, ip: std::net::IpAddr) -> bool {
+        self.senders.contains(&Some(ip))
     }
 
-    /// Every slot is taken, so an unrecorded sender may be one of the
-    /// copies' senders too.
-    pub fn full(&self) -> bool {
-        self.senders.iter().all(Option::is_some)
-    }
-
-    pub fn senders(&self) -> impl Iterator<Item = std::net::SocketAddr> + '_ {
-        self.senders.iter().flatten().copied()
+    /// Whether `ip` may reopen the abandoned hash, and if so count it. Not a
+    /// sender, under [`MUTATED_REOPENS`], and the record not full (an
+    /// unrecorded sender could be one of the copies' senders).
+    pub fn take_reopen(&mut self, ip: std::net::IpAddr) -> bool {
+        let full = self.senders.iter().all(Option::is_some);
+        if full || self.sent_by(ip) || self.reopens >= MUTATED_REOPENS {
+            return false;
+        }
+        self.reopens += 1;
+        true
     }
 }
 

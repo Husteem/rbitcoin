@@ -1091,13 +1091,22 @@ fn answer_probe(
     true
 }
 
+/// A peer's own announcement does not lift its `lacks` for a hash it sent
+/// mutated copies of: its chain still holds that header, and lifting it would
+/// hand a reopened hash back to it ([`reopen_for_announcer`]).
 fn note_announcement(
     st: &mut IbdWorkState,
     peer: usize,
     hashes: impl IntoIterator<Item = BlockHash>,
 ) {
+    let copies = &st.mutated_copies;
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
-        s.chain.note_announcement(hashes);
+        let ip = s.addr.ip();
+        s.chain.note_announcement(
+            hashes
+                .into_iter()
+                .filter(|h| !copies.get(h).is_some_and(|c| c.sent_by(ip))),
+        );
     }
 }
 
@@ -1526,13 +1535,23 @@ pub fn finish_deferred_archived_clear(
         if !retry_tip_child && rbitcoin_net::chain::reject_is_mutated(err) {
             // A dropped sender is a different peer next round, so only the
             // copies from peers we keep count toward the abandon bound.
+            let sender_ip = sender
+                .and_then(|id| st.slots.iter().find(|s| s.id == id))
+                .map(|s| s.addr.ip());
             let dropped = sender.is_some_and(|peer| punish_mutated_sender(st, peer, hash));
+            if dropped {
+                cap_tracked(&mut st.mutated_copies, hash, MUTATED_TRACK_CAP);
+                st.mutated_copies
+                    .entry(hash)
+                    .or_default()
+                    .note_sender(sender_ip);
+            }
             // The sender is still connected (`-connect` / noban), so the hash
             // re-opens and is asked for again on every copy. Past
             // `MUTATED_COPIES_BEFORE_ABANDON` copies no peer we keep can serve
             // it: stop the re-get and take the header off the path, or
             // `ordered` never empties and IBD never leaves catch-up (#1811).
-            if !dropped && note_mutated_copy(st, hash, sender) {
+            if !dropped && note_mutated_copy(st, hash, sender_ip) {
                 st.unservable.insert(hash);
                 st.body.stop_reget(hash);
                 // A tip+1 sibling is never on the path, so the walk cut below
@@ -1785,41 +1804,46 @@ fn cap_tracked<V>(counts: &mut crate::ibd::state::BlockHashMap<V>, hash: BlockHa
     }
 }
 
-/// Count one mutated body copy for `hash` from slot `sender`. True once the
-/// abandon limit is reached (see [`MUTATED_COPIES_BEFORE_ABANDON`]).
+/// Count one mutated body copy for `hash` from a kept peer at `sender`. True
+/// once the abandon limit is reached (see [`MUTATED_COPIES_BEFORE_ABANDON`]).
 ///
 /// Dropping a count at the tracking cap only costs retries for that hash; it
 /// can never retire a hash that has not been copied that often.
-pub fn note_mutated_copy(st: &mut IbdWorkState, hash: BlockHash, sender: Option<usize>) -> bool {
-    let addr = sender.and_then(|id| st.slots.iter().find(|s| s.id == id).map(|s| s.addr));
+pub fn note_mutated_copy(
+    st: &mut IbdWorkState,
+    hash: BlockHash,
+    sender: Option<std::net::IpAddr>,
+) -> bool {
     cap_tracked(&mut st.mutated_copies, hash, MUTATED_TRACK_CAP);
     let copies = st.mutated_copies.entry(hash).or_default();
-    copies.note(addr);
+    copies.note(sender);
     copies.copies >= MUTATED_COPIES_BEFORE_ABANDON
 }
 
 /// A header abandoned for mutated copies (#1811) goes back on the path when
-/// `peer` announces it and sent none of those copies (#1992). The peers that
-/// did are kept off it for a stall window (`PeerChain::lacks`), so the
+/// `peer` announces it and sent none of those copies, kept or dropped
+/// (#1992). The peers that did are kept off it for a stall window
+/// (`PeerChain::lacks`, which their own announcements do not lift), so the
 /// re-get goes to `peer`. The count stays: the next mutated copy abandons
-/// it again. A header abandoned for another reason, or one whose sender
-/// record is full, stays abandoned.
+/// it again. At most `MUTATED_REOPENS` reopens per hash keep #1811 bounded.
+/// A header abandoned for another reason stays abandoned.
 pub fn reopen_for_announcer(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
     if !st.unservable.contains(&hash) {
         return;
     }
-    let Some(addr) = st.slots.iter().find(|s| s.id == peer).map(|s| s.addr) else {
+    let Some(ip) = st.slots.iter().find(|s| s.id == peer).map(|s| s.addr.ip()) else {
         return;
     };
-    let Some(copies) = st.mutated_copies.get(&hash).copied() else {
+    let Some(copies) = st.mutated_copies.get_mut(&hash) else {
         return;
     };
-    if copies.full() || copies.sent_by(addr) {
+    if !copies.take_reopen(ip) {
         return;
     }
+    let copies = *copies;
     st.unservable.remove(&hash);
     let now = super::peer_io::ibd_mono_ms();
-    for slot in st.slots.iter_mut().filter(|s| copies.sent_by(s.addr)) {
+    for slot in st.slots.iter_mut().filter(|s| copies.sent_by(s.addr.ip())) {
         slot.chain.note_notfound(hash, now);
     }
 }

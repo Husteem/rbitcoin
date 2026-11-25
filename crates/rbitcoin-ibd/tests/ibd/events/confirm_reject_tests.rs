@@ -5597,14 +5597,14 @@ fn resume_installation_refuses_an_unservable_entry_and_bounds_the_explore_tip() 
 /// #1992: three mutated copies from one kept peer abandon a header, but not
 /// for every peer. When a peer that never sent a mutated copy announces it,
 /// the header goes back on the path and is asked of that peer; the peer that
-/// sent the copies is kept off it. The same peer re-announcing it does not
-/// reopen it.
+/// sent the copies is kept off it, even when it announces it again. The next
+/// mutated copy abandons it again, and the reopens are bounded (#1811).
 #[test]
 fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
     use bitcoin::Network;
     use rbitcoin_ibd::ibd::events::{
-        finish_deferred_archived_clear, on_headers_batch, BadPrevParent, DeferredArchivedClear,
-        MUTATED_COPIES_BEFORE_ABANDON,
+        finish_deferred_archived_clear, on_headers_batch, plan_header_batch, BadPrevParent,
+        DeferredArchivedClear, MUTATED_COPIES_BEFORE_ABANDON,
     };
     use rbitcoin_ibd::ibd::header_walk::may_serve;
 
@@ -5622,26 +5622,28 @@ fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
     let hash = a.block_hash();
 
     let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
-    let (kept, other) = (1, 2);
-    for id in [kept, other] {
+    // Distinct IPs: a sender is recorded by IP, whatever its port.
+    let (kept, other, third, fourth, fifth) = (1, 2, 3, 4, 5);
+    for id in [kept, other, third, fourth, fifth] {
         let mut slot = crate::ibd::assign::dummy_slot(id);
+        slot.addr = std::net::SocketAddr::from(([127, 0, 0, id as u8], 18444));
         slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
         st.slots.push(slot);
     }
     on_headers_batch(&mut st, &hub, kept, vec![a.header], &fks);
     assert!(st.ordered_set.contains(&hash), "A is queued");
-    let copy = DeferredArchivedClear {
+    let copy = |sender| DeferredArchivedClear {
         height,
         hash,
         err: "bad-txnmrklroot".into(),
-        sender: Some(kept),
+        sender: Some(sender),
         parent: BadPrevParent::Tip,
         retry_tip_child: false,
         bad_prev: false,
         was_occupant: true,
     };
     for _ in 0..MUTATED_COPIES_BEFORE_ABANDON {
-        finish_deferred_archived_clear(&mut st, Some(&hub), &copy);
+        finish_deferred_archived_clear(&mut st, Some(&hub), &copy(kept));
     }
     assert!(
         st.unservable.contains(&hash),
@@ -5665,5 +5667,31 @@ fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
         !may_serve(&st, kept, &hash),
         "not of the peer that sent the copies"
     );
+    let _ = plan_header_batch(&mut st, &hub, kept, vec![a.header]);
+    assert!(
+        !may_serve(&st, kept, &hash),
+        "the sender's own announcement does not put it back on A"
+    );
+
+    // The announcer sends a mutated copy too: A is abandoned again at once,
+    // and neither sender reopens it.
+    finish_deferred_archived_clear(&mut st, Some(&hub), &copy(other));
+    assert!(
+        st.unservable.contains(&hash),
+        "the next copy abandons A again"
+    );
+    on_headers_batch(&mut st, &hub, other, vec![a.header], &fks);
+    assert!(st.unservable.contains(&hash), "a sender does not reopen A");
+
+    // Reopens are bounded: two more fresh announcers reopen A, a third does
+    // not.
+    for (n, peer) in [third, fourth].into_iter().enumerate() {
+        on_headers_batch(&mut st, &hub, peer, vec![a.header], &fks);
+        assert!(!st.unservable.contains(&hash), "reopen {}", n + 2);
+        finish_deferred_archived_clear(&mut st, Some(&hub), &copy(peer));
+        assert!(st.unservable.contains(&hash));
+    }
+    on_headers_batch(&mut st, &hub, fifth, vec![a.header], &fks);
+    assert!(st.unservable.contains(&hash), "the reopen bound is spent");
     let _ = std::fs::remove_dir_all(dir);
 }
