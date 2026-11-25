@@ -570,7 +570,8 @@ impl Query {
     /// appender lock, runs the Class A collect + pack (SH enqueue is off while
     /// degraded), syncs the new head's SEAL and `include_hwm`, re-arms
     /// write-behind from the new `include_hwm` as a restart does, and only
-    /// then clears the flag and removes the marker. Returns `Ok(false)` when there was nothing to do.
+    /// then clears the flag and removes the marker. Returns `Ok(false)` when
+    /// there was nothing to do.
     /// On error the node stays degraded and the caller may retry. Cancel
     /// leaves it degraded.
     pub fn rebuild_sh_if_degraded(&self, cancel: Option<&AtomicBool>) -> Result<bool, QueryError> {
@@ -610,7 +611,15 @@ impl Query {
             // held appender cannot drop those jobs as degraded first.
             if let Err(e) = self.requeue_sh_writebehind() {
                 drop(appender);
-                self.mark_sh_degraded(&format!("rebuild re-arm failed: {e}"));
+                // Still flagged: this drops what the walk queued. Name the
+                // re-arm, since the flag being set skips the reason update.
+                let reason = format!("rebuild re-arm failed: {e}");
+                self.mark_sh_degraded(&reason);
+                *self
+                    .sh_degraded
+                    .reason
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(reason);
                 return Err(e);
             }
             self.sh_bump_generation();
@@ -666,7 +675,8 @@ fn rebuild_test_hook(stage: &str, q: &Query) -> Result<(), QueryError> {
 /// this one is about to wait for it) and `"unlink_frozen"` (a disconnect froze readers
 /// and is about to run its unlink batch). `"before_unstrong"` (the tip has shrunk,
 /// the strong bits are not yet cleared) also ignores it, and so does
-/// `"serving"` (the rebuild has just admitted readers again).
+/// `"serving"` (the rebuild has just admitted readers again). It still holds
+/// the tip commit lock there, so that hook may only read.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn set_sh_rebuild_hook_for_test(hook: Option<RebuildHook>) {

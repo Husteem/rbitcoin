@@ -953,8 +953,10 @@ impl Query {
         self.enqueue_sh_jobs(items, create_pins)
     }
 
-    /// [`Self::enqueue_sh_pending`] without the degraded gate, for the
-    /// rebuild's re-arm, which runs before it lets readers back in.
+    /// [`Self::enqueue_sh_pending`] without the degraded gate, for
+    /// [`Self::requeue_sh_writebehind`]: the open-time recovery (behind its
+    /// own degraded check) and the rebuild's re-arm, which runs before it
+    /// lets readers back in.
     fn enqueue_sh_jobs(
         &self,
         items: &[ConfirmPrepared],

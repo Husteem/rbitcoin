@@ -294,6 +294,17 @@ fn rebuild_admits_readers_with_the_degraded_gap_indexed() {
         );
     }
     assert_eq!(first, history_txids(&q, &key), "serving history is final");
+    // The re-armed jobs then apply once.
+    q.release_queued_sh_writebehind();
+    q.apply_sh_pending().unwrap();
+    let applied = history_txids(&q, &key);
+    assert!(unique(&applied), "a re-armed job applied twice");
+    assert_eq!(applied, first, "history after the apply");
+    assert_eq!(
+        q.sh_indexed_through_height(),
+        q.tip_height().map(|h| h.0),
+        "applied through the tip"
+    );
 }
 
 /// Gap 3: a block disconnected while degraded leaves its creates in the
