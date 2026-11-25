@@ -678,12 +678,12 @@ fn a_populated_schema_29_log_becomes_a_delta_generation() {
     assert_eq!(s.spend_directory_slot(16).unwrap(), Some(meta));
 }
 
-/// An upgrade whose open fails after the spend delta adopted the schema-29
-/// log keeps `meta` at 29 and the 29 files beside it: a schema-29 binary
-/// that opens the datadir then still reads the log's spends, which it
-/// would miss if the files were gone while `meta` still let it in.
+/// An upgrade whose open fails after the spend delta published its
+/// adoption already says schema 30, and the 29 log is gone: no schema-29
+/// binary can open the datadir and write spends the published delta would
+/// never read.
 #[test]
-fn a_failed_upgrade_open_keeps_the_schema_29_log() {
+fn an_upgrade_open_that_fails_after_the_adoption_is_already_30() {
     let d = dir();
     schema_29_store(&d);
     let meta =
@@ -696,9 +696,9 @@ fn a_failed_upgrade_open_keeps_the_schema_29_log() {
     bytes[..4].copy_from_slice(b"XXXX");
     std::fs::write(&path, bytes).unwrap();
     assert!(rbitcoin_store::Store::open_tiny(&d).is_err());
-    assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 29);
-    assert!(d.join("spend.pages.commit").exists());
-    assert!(d.join("spend.pages").exists());
+    assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+    assert!(!d.join("spend.pages.commit").exists());
+    assert!(!d.join("spend.pages").exists());
 }
 
 /// An upgrade that died after the first schema-30 open created

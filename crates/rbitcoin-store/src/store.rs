@@ -565,6 +565,13 @@ impl Store {
                 schema: meta_ver,
             }),
         )?;
+        // Right after the spend delta published its adoption of a pre-30
+        // `spent.body` (#2038). Before it a crash opens as pre-30 and adopts
+        // again. After it no schema-29 binary may open the datadir: its spend
+        // writes would land in a page log the published delta ignores. The
+        // 29 files go once `meta` 30 is durable.
+        open_layout_rewrite_current(&path, meta_ver)?;
+        crate::spend_pages_v29::remove(&path)?;
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }
@@ -596,12 +603,6 @@ impl Store {
         };
         store.drop_confirmed_past_creates()?;
         store.rebuild_mtp_ring()?;
-        // Last, once the whole open succeeded and the spend delta adopted a
-        // pre-30 `spent.body`: until `meta` says 30 a crash opens as pre-30
-        // and adopts again, and a schema-29 binary still finds its page log
-        // (#2038). The 29 files go only after `meta` 30 is durable.
-        open_layout_rewrite_current(&store.path, meta_ver)?;
-        crate::spend_pages_v29::remove(&store.path)?;
         Ok(store)
     }
 

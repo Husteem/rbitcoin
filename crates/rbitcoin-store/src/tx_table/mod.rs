@@ -1549,6 +1549,7 @@ impl TxTable {
     /// or [`CLASS_A_SYNCED_NAME`], whichever is higher. `None` (a table
     /// opened alone) keeps the prefix every file covers. See
     /// [`repair_class_a_count_skew`].
+    #[doc(hidden)]
     pub fn open_seqsigwit(
         dir: &Path,
         seqsigwit_dir: &Path,
