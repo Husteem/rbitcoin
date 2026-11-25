@@ -3224,6 +3224,76 @@ fn an_old_writer_leaves_a_newer_load_claim_in_flight() {
     assert!(!feed.inner.lock().unwrap().lead_reserved.contains_key(&1));
 }
 
+/// A pre-write stale batch did not commit. A connected height belongs to
+/// another batch whose Accepted is still pending, so its reservation stays;
+/// an unconnected height has no event coming and returns its bytes now.
+#[test]
+fn a_pre_write_stale_batch_keeps_a_connected_heights_reservation() {
+    use rbitcoin_ibd::ibd::confirm::{finish_pre_write_stale, take_unproven_lead};
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pre-write-stale-claim");
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().unwrap();
+    let missing = BlockHash::from_byte_array([0x55; 32]);
+
+    let connected = ConfirmFeed::new();
+    connected.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(
+        take_unproven_lead(&connected, Some(&[40]), vec![1]),
+        vec![1]
+    );
+    let first = connected.epoch();
+    connected.drop_plan();
+    assert_eq!(
+        take_unproven_lead(&connected, Some(&[40]), vec![1]),
+        vec![1]
+    );
+    let second = connected.epoch();
+    connected.finish_claim([1], first);
+    finish_pre_write_stale(&hub, &connected, &[(1, genesis.to_byte_array())], second);
+    assert!(
+        connected
+            .inner
+            .lock()
+            .unwrap()
+            .lead_reserved
+            .contains_key(&1),
+        "the connected height waits for the first batch's Accepted"
+    );
+    connected.release_lead_reserve(1);
+    assert!(!connected
+        .inner
+        .lock()
+        .unwrap()
+        .lead_reserved
+        .contains_key(&1));
+
+    let unconnected = ConfirmFeed::new();
+    unconnected.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(
+        take_unproven_lead(&unconnected, Some(&[40]), vec![1]),
+        vec![1]
+    );
+    let first = unconnected.epoch();
+    unconnected.drop_plan();
+    assert_eq!(
+        take_unproven_lead(&unconnected, Some(&[40]), vec![1]),
+        vec![1]
+    );
+    let second = unconnected.epoch();
+    unconnected.finish_claim([1], first);
+    finish_pre_write_stale(&hub, &unconnected, &[(1, missing.to_byte_array())], second);
+    assert!(
+        !unconnected
+            .inner
+            .lock()
+            .unwrap()
+            .lead_reserved
+            .contains_key(&1),
+        "an unconnected height returns its bytes at once"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A replacement body at a height that still holds a reservation may be
 /// larger. The claim charges the increase so the reservation covers it.
 #[test]

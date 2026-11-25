@@ -2320,6 +2320,30 @@ pub fn settle_failed_write(
     feed.finish_claim(written, claim_epoch);
 }
 
+/// Drop a pre-write stale batch without a second `Accepted`. A connected
+/// height belongs to another batch that already sent its event, so drop only
+/// this claim and keep the reservation until that event lands. An unconnected
+/// height has no event coming, so return its reservation now.
+#[doc(hidden)]
+pub fn finish_pre_write_stale(
+    hub: &ChainHub,
+    feed: &ConfirmFeed,
+    heights_hashes: &[(u32, [u8; 32])],
+    claim_epoch: u64,
+) {
+    let mut connected = Vec::new();
+    let mut unconnected = Vec::new();
+    for &(height, raw) in heights_hashes {
+        if hub.is_connected(&BlockHash::from_byte_array(raw)) {
+            connected.push(height);
+        } else {
+            unconnected.push(height);
+        }
+    }
+    feed.finish_claim(connected, claim_epoch);
+    feed.finish_stale_plan(unconnected, Some(claim_epoch));
+}
+
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
 ///
 /// Lookup (BQ-ahead TipOnly `head_fk`) ∥ load (claim resolve-complete + stamp
@@ -2437,10 +2461,13 @@ pub fn spawn_confirm_engine(
                     );
                     // This batch never reached the write, so a connected
                     // height was accepted by another batch that already sent
-                    // its event. Release the claim without a second Accepted.
-                    feed_wb.finish_stale_plan(
-                        heights_hashes.iter().map(|(h, _)| *h),
-                        Some(batch_epoch),
+                    // its event. Release only an unconnected height; a
+                    // connected one waits for that existing event.
+                    finish_pre_write_stale(
+                        &hub_wb,
+                        &feed_wb,
+                        &heights_hashes,
+                        batch_epoch,
                     );
                     continue;
                 }
