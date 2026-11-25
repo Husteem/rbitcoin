@@ -636,11 +636,73 @@ pub fn admit_pending_header(
     pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
     hash: BlockHash,
     header: bitcoin::block::Header,
-) {
+) -> Option<Option<bitcoin::block::Header>> {
     if pending.len() >= MAX_PENDING_HEADERS && !pending.contains_key(&hash) {
-        return;
+        return None;
     }
-    pending.insert(hash, header);
+    Some(pending.insert(hash, header))
+}
+
+/// Changes made to a peer's pending map while one message is classified,
+/// so the map can be put back as it was without a copy of it.
+#[derive(Default)]
+struct PendingUndo(Vec<(BlockHash, Option<bitcoin::block::Header>)>);
+
+impl PendingUndo {
+    fn insert(
+        &mut self,
+        pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+        hash: BlockHash,
+        header: bitcoin::block::Header,
+    ) {
+        let prior = pending.insert(hash, header);
+        self.0.push((hash, prior));
+    }
+
+    fn admit(
+        &mut self,
+        pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+        hash: BlockHash,
+        header: bitcoin::block::Header,
+    ) {
+        if let Some(prior) = admit_pending_header(pending, hash, header) {
+            self.0.push((hash, prior));
+        }
+    }
+
+    fn removed(&mut self, gone: &[(BlockHash, bitcoin::block::Header)]) {
+        self.0
+            .extend(gone.iter().map(|(hash, hdr)| (*hash, Some(*hdr))));
+    }
+
+    /// Undo every change, newest first.
+    fn revert(self, pending: &mut HashMap<BlockHash, bitcoin::block::Header>) {
+        for (hash, prior) in self.0.into_iter().rev() {
+            match prior {
+                Some(hdr) => {
+                    pending.insert(hash, hdr);
+                }
+                None => {
+                    pending.remove(&hash);
+                }
+            }
+        }
+    }
+}
+
+/// `f` on `pending` with `headers` added, then the map as it was.
+fn with_batch<T>(
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    headers: &[bitcoin::block::Header],
+    f: impl FnOnce(&HashMap<BlockHash, bitcoin::block::Header>) -> T,
+) -> T {
+    let mut undo = PendingUndo::default();
+    for hdr in headers {
+        undo.insert(pending, hdr.block_hash(), *hdr);
+    }
+    let out = f(pending);
+    undo.revert(pending);
+    out
 }
 /// Cap on decoded bodies stashed per session (DoS / process RAM). Must be
 /// ≥99 so tip-follow can assemble a 99-block competing branch; apply is
@@ -5515,6 +5577,7 @@ fn evict_pending_for_room(
     prev: BlockHash,
     headers: &[bitcoin::block::Header],
     slots: usize,
+    gone: &mut Vec<(BlockHash, bitcoin::block::Header)>,
 ) {
     if !pending_over_cap(pending, slots) {
         return;
@@ -5525,7 +5588,7 @@ fn evict_pending_for_room(
         .filter(|(hash, hdr)| !protected.contains(*hash) && !hub.header_claimed_pow_ok(hdr))
         .map(|(hash, _)| *hash)
         .collect();
-    drop_hashes_until_fit(pending, slots, failed_pow);
+    drop_hashes_until_fit(pending, slots, failed_pow, gone);
     if !pending_over_cap(pending, slots) {
         return;
     }
@@ -5534,15 +5597,12 @@ fn evict_pending_for_room(
         .into_iter()
         .filter(|tip| memo.path_fails_claimed_pow(hub, pending, *tip))
         .collect();
-    drop_tips_until_fit(pending, &protected, slots, &failed_forks);
+    drop_tips_until_fit(pending, &protected, slots, &failed_forks, gone);
     if !pending_over_cap(pending, slots) {
         return;
     }
-    drop_hashes_until_fit(
-        pending,
-        slots,
-        disconnected_pending(hub, pending, &protected),
-    );
+    let disconnected = disconnected_pending(hub, pending, &protected);
+    drop_hashes_until_fit(pending, slots, disconnected, gone);
     let Some(incoming_work) = incoming_header_work(hub, pending, headers) else {
         return;
     };
@@ -5550,17 +5610,17 @@ fn evict_pending_for_room(
         hub,
         pending,
         &protected,
-        slots,
-        incoming_work,
+        (slots, incoming_work),
         std::cmp::Ordering::Less,
+        gone,
     );
     evict_forks_with_work(
         hub,
         pending,
         &protected,
-        slots,
-        incoming_work,
+        (slots, incoming_work),
         std::cmp::Ordering::Equal,
+        gone,
     );
 }
 
@@ -5572,12 +5632,15 @@ fn drop_hashes_until_fit(
     pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
     incoming: usize,
     hashes: impl IntoIterator<Item = BlockHash>,
+    gone: &mut Vec<(BlockHash, bitcoin::block::Header)>,
 ) {
     for hash in hashes {
         if !pending_over_cap(pending, incoming) {
             return;
         }
-        pending.remove(&hash);
+        if let Some(hdr) = pending.remove(&hash) {
+            gone.push((hash, hdr));
+        }
     }
 }
 
@@ -5586,6 +5649,7 @@ fn drop_tips_until_fit(
     protected: &HashSet<BlockHash>,
     incoming: usize,
     tips: &[BlockHash],
+    gone: &mut Vec<(BlockHash, bitcoin::block::Header)>,
 ) {
     for &tip in tips {
         let mut hash = tip;
@@ -5596,11 +5660,11 @@ fn drop_tips_until_fit(
             if protected.contains(&hash) {
                 break;
             }
-            let Some(parent) = pending.get(&hash).map(|hdr| hdr.prev_blockhash) else {
+            let Some(hdr) = pending.remove(&hash) else {
                 break;
             };
-            pending.remove(&hash);
-            hash = parent;
+            gone.push((hash, hdr));
+            hash = hdr.prev_blockhash;
         }
     }
 }
@@ -5749,24 +5813,20 @@ fn retarget_stored_header_asks(
 
 fn incoming_header_work(
     hub: &ChainHub,
-    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
     headers: &[bitcoin::block::Header],
 ) -> Option<bitcoin::Work> {
-    let last = headers.last()?;
-    let mut with_batch = pending.clone();
-    for hdr in headers {
-        with_batch.insert(hdr.block_hash(), *hdr);
-    }
-    work_of_header_path(hub, &with_batch, last.block_hash())
+    let last = headers.last()?.block_hash();
+    with_batch(pending, headers, |p| work_of_header_path(hub, p, last))
 }
 
 fn evict_forks_with_work(
     hub: &ChainHub,
     pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
     protected: &HashSet<BlockHash>,
-    incoming: usize,
-    incoming_work: bitcoin::Work,
+    (incoming, incoming_work): (usize, bitcoin::Work),
     want: std::cmp::Ordering,
+    gone: &mut Vec<(BlockHash, bitcoin::block::Header)>,
 ) {
     if !pending_over_cap(pending, incoming) {
         return;
@@ -5783,7 +5843,7 @@ fn evict_forks_with_work(
             _ => add_pending_ancestors(&mut keep, pending, tip),
         }
     }
-    drop_tips_until_fit(pending, &keep, incoming, &victims);
+    drop_tips_until_fit(pending, &keep, incoming, &victims, gone);
 }
 
 /// `start` and its ancestors that are in `pending`, walking at most
@@ -5842,16 +5902,42 @@ fn pending_root(
     root
 }
 
+/// Classify `headers` against the peer's `pending` map. The map comes back
+/// as it was: the staging below changes it in place and is undone here,
+/// so a message costs its own headers, not a copy of the map.
 fn classify_headers(
     hub: &ChainHub,
     headers: &[bitcoin::block::Header],
-    pending_before: &HashMap<BlockHash, bitcoin::block::Header>,
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    requested_before: &HashSet<BlockHash>,
+    have_bodies: &HashSet<BlockHash>,
+    noban: bool,
+) -> HeadersApply {
+    let mut undo = PendingUndo::default();
+    let apply = classify_staged(
+        hub,
+        headers,
+        pending,
+        &mut undo,
+        requested_before,
+        have_bodies,
+        noban,
+    );
+    undo.revert(pending);
+    apply
+}
+
+/// [`classify_headers`] with each change to `pending` logged in `undo`.
+fn classify_staged(
+    hub: &ChainHub,
+    headers: &[bitcoin::block::Header],
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    undo: &mut PendingUndo,
     requested_before: &HashSet<BlockHash>,
     have_bodies: &HashSet<BlockHash>,
     noban: bool,
 ) -> HeadersApply {
     let n = headers.len();
-    let mut pending = pending_before.clone();
     let mut apply = HeadersApply {
         from_peer: Vec::new(),
         best_known: Vec::new(),
@@ -5873,22 +5959,22 @@ fn classify_headers(
     let mut ask_from_tip = false;
     if n == 0 {
         // Empty headers is a failed getheaders response, not an announcement.
-    } else if !noban && headers_are_below_floor(hub, pending_before, headers) {
+    } else if !noban && headers_are_below_floor(hub, pending, headers) {
         // Work stays under the floor from the pending headers alone. Do not
         // read parent headers, do not move this peer's best-known tip, and
         // do not ask for the next page of a batch we refused.
+        // No header reads: the batch answers our getheaders when its pending
+        // path joins a best-chain block (Core: parent in the block index).
+        let (join, _) = pending_walk(pending, headers[0].prev_blockhash);
         for hdr in headers.iter().take(n) {
             let hash = hdr.block_hash();
             apply.from_peer.push(hash);
-            admit_pending_header(&mut pending, hash, *hdr);
+            undo.admit(pending, hash, *hdr);
             apply.admits.push((hash, *hdr));
         }
         let last = headers[n - 1].block_hash();
-        apply.ignore_height = Some(pending_announced_height(&pending, last));
+        apply.ignore_height = Some(pending_announced_height(pending, last));
         ignored_below_floor = true;
-        // No header reads: the batch answers our getheaders when its pending
-        // path joins a best-chain block (Core: parent in the block index).
-        let (join, _) = pending_walk(pending_before, headers[0].prev_blockhash);
         apply.answers_getheaders = is_genesis_hash(&join) || hub.is_connected(&join);
     } else if let Some(first) = headers.first() {
         let prev = first.prev_blockhash;
@@ -5905,12 +5991,12 @@ fn classify_headers(
         }
         // The all-zero hash is only genesis's parent. A header claiming it is
         // not a continuation of any chain we hold.
-        let connecting = prev != BlockHash::all_zeros()
-            && header_announcement_connects(hub, pending_before, prev);
+        let connecting =
+            prev != BlockHash::all_zeros() && header_announcement_connects(hub, pending, prev);
         apply.answers_getheaders = connecting;
         // Only a connecting batch is stored, so only it needs room.
         let slots = if connecting {
-            newly_stored_slot_count(hub, &pending, headers)
+            newly_stored_slot_count(hub, pending, headers)
         } else {
             0
         };
@@ -5925,23 +6011,21 @@ fn classify_headers(
             {
                 return apply;
             }
-            evict_pending_for_room(hub, &mut pending, prev, headers, slots);
+            let mut gone = Vec::new();
+            evict_pending_for_room(hub, pending, prev, headers, slots, &mut gone);
+            undo.removed(&gone);
             if pending.len().saturating_add(slots) > MAX_PENDING_HEADERS {
                 return apply;
             }
-            staged_evicts = pending_before
-                .keys()
-                .filter(|hash| !pending.contains_key(*hash))
-                .copied()
-                .collect();
+            staged_evicts = gone.into_iter().map(|(hash, _)| hash).collect();
         }
         for hdr in headers.iter().take(n) {
             let hash = hdr.block_hash();
             apply.from_peer.push(hash);
             apply.best_known.push(hash);
-            // The real map caps in `apply_headers`. This clone has to hold the
-            // whole message so the store walk can see the last header.
-            pending.insert(hash, *hdr);
+            // The real map caps in `apply_headers`. The staged map has to
+            // hold the whole message so the store walk can see the last header.
+            undo.insert(pending, hash, *hdr);
         }
         if !connecting {
             // These headers are not sent to the store. A later parent can
@@ -5954,8 +6038,8 @@ fn classify_headers(
             // Core `chain_start.nHeight + headers.size()`. One-header
             // tip announces still accumulate via `follow.pending_headers`
             // (`p2p_headers_sync_with_minchainwork` height=14).
-            let announced_h = announced_headers_height(hub, &pending, last);
-            let work_cmp = announced_work_cmp(hub, &pending, last);
+            let announced_h = announced_headers_height(hub, pending, last);
+            let work_cmp = announced_work_cmp(hub, pending, last);
             let our_tip = hub.tip_height().unwrap_or(0);
             if announced_tip_is_hopeless(our_tip, announced_h, work_cmp) && !noban {
                 queue_batch_admits(&mut apply, headers);
@@ -5963,12 +6047,12 @@ fn classify_headers(
                 return apply;
             }
             let mut stored = false;
-            if !header_path_meets_minwork(hub, &pending, last) {
+            if !header_path_meets_minwork(hub, pending, last) {
                 if noban {
                     stored = note_stored_header_path(
                         hub,
                         &mut apply,
-                        &pending,
+                        pending,
                         headers,
                         last,
                         work_cmp,
@@ -5988,7 +6072,7 @@ fn classify_headers(
                 stored = note_stored_header_path(
                     hub,
                     &mut apply,
-                    &pending,
+                    pending,
                     headers,
                     last,
                     work_cmp,
@@ -6000,7 +6084,7 @@ fn classify_headers(
                     retarget_stored_header_asks(
                         hub,
                         &mut apply,
-                        &pending,
+                        pending,
                         last,
                         requested_before,
                         have_bodies,
@@ -6020,7 +6104,7 @@ fn classify_headers(
     }
     if n > 0 {
         if let Some(last) = headers.last() {
-            apply.peer_below_floor = peer_headers_below_floor(hub, &pending, last.block_hash());
+            apply.peer_below_floor = peer_headers_below_floor(hub, pending, last.block_hash());
         }
     }
     apply
@@ -6326,18 +6410,25 @@ pub async fn on_headers(
     let noban = session.is_some_and(|s| s.session_noban());
     let apply = if headers.is_empty() {
         // An empty reply reads neither the store nor the peer's maps, so it
-        // takes no header permit and copies no pending headers.
+        // takes no header permit and touches no pending headers.
         let none = HashSet::new();
-        classify_headers(hub, &[], &HashMap::new(), &none, &none, noban)
+        classify_headers(hub, &[], &mut HashMap::new(), &none, &none, noban)
     } else {
-        let pending = follow.pending_headers.clone();
+        // The job borrows the map by moving it and hands it back: a copy per
+        // message cost the whole map (up to `MAX_PENDING_HEADERS`) each time.
+        // A job that fails drops the map; that error ends the session anyway.
+        let mut pending = std::mem::take(&mut follow.pending_headers);
         let requested = follow.requested_blocks.hashes().clone();
         let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
         let headers = headers.to_vec();
-        run_header_job(hub, move |hub| {
-            classify_headers(hub, &headers, &pending, &requested, &have_bodies, noban)
+        let (apply, pending) = run_header_job(hub, move |hub| {
+            let apply =
+                classify_headers(hub, &headers, &mut pending, &requested, &have_bodies, noban);
+            (apply, pending)
         })
-        .await?
+        .await?;
+        follow.pending_headers = pending;
+        apply
     };
     let accepted = !apply.misbehave;
     let stamp_block_announcement = apply.stamp_block_announcement;
@@ -6685,11 +6776,13 @@ pub async fn on_cmpctblock(
             .is_some_and(|(announced, tip)| announced > tip);
     let connects =
         header_announcement_connects(hub, &follow.pending_headers, hsi.header.prev_blockhash);
-    let pending = follow.pending_headers.clone();
-    let persisted = run_header_job(hub, move |hub| {
-        persist_pending_header_path(hub, &pending, hash)
+    let pending = std::mem::take(&mut follow.pending_headers);
+    let (persisted, pending) = run_header_job(hub, move |hub| {
+        let persisted = persist_pending_header_path(hub, &pending, hash);
+        (persisted, pending)
     })
     .await?;
+    follow.pending_headers = pending;
     // Core `invalid header via cmpctblock`: scored like a `headers` message.
     // A path that does not connect yet only waits for its parent.
     if connects && persisted.as_ref().is_err_and(header_reject_scores) {
@@ -7974,7 +8067,7 @@ pub fn is_genesis_hash(h: &BlockHash) -> bool {
 #[doc(hidden)]
 pub fn headers_are_below_floor(
     hub: &ChainHub,
-    pending_before: &HashMap<BlockHash, bitcoin::block::Header>,
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
     headers: &[bitcoin::block::Header],
 ) -> bool {
     let Some(min) = hub.min_chain_work_floor() else {
@@ -7983,14 +8076,10 @@ pub fn headers_are_below_floor(
     if hub.meets_minimum_chain_work() {
         return false;
     }
-    let mut pending = pending_before.clone();
-    for hdr in headers {
-        pending.insert(hdr.block_hash(), *hdr);
-    }
     let Some(last) = headers.last().map(|h| h.block_hash()) else {
         return false;
     };
-    match pending_path_work(hub, &pending, last) {
+    match with_batch(pending, headers, |p| pending_path_work(hub, p, last)) {
         Some(work) => work.to_be_bytes() < min,
         None => true,
     }
