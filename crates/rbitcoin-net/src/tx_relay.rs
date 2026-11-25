@@ -519,6 +519,11 @@ impl QueryUtxoProvider<'_> {
     /// Read the coin from the connected-output lookup. A row that left the
     /// chain, or a tip that moved, during the read is looked up once more.
     /// A second stale read is `Unknown`.
+    ///
+    /// A reorg that returns to the same tip during one read is not seen
+    /// here. A commit reads under the pool write lock. Each connect's
+    /// `remove_for_block_spent` and the reorg's `evict_after_reorg` take
+    /// that lock after the store writes, so they drop what such a read let in.
     #[doc(hidden)]
     pub fn chain_prevout_from_resolved(
         &self,
