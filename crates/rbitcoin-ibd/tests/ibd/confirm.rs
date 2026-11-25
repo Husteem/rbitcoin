@@ -3130,13 +3130,14 @@ fn a_stale_load_batch_releases_its_lead_reservation() {
     let feed = ConfirmFeed::new();
     feed.set_unproven_bounds(Some(10), 0, Some(40));
     assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    let claim_epoch = feed.epoch();
     feed.drop_plan();
     assert!(
         feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
         "the rewind itself keeps the reservation"
     );
     // Load drops the stale batch before claiming it, then reoffers the body.
-    feed.finish_stale_plan([1]);
+    feed.finish_stale_plan([1], Some(claim_epoch));
     assert!(
         !feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
         "a stale load batch gives its bytes back"
@@ -3154,10 +3155,11 @@ fn a_stale_drop_keeps_a_reservation_a_new_claim_still_owns() {
     let feed = ConfirmFeed::new();
     feed.set_unproven_bounds(Some(10), 0, Some(40));
     assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    let first_epoch = feed.epoch();
     {
         let mut g = feed.inner.lock().unwrap();
         g.inflight.insert(1);
-        g.claimed_epoch.insert(1, feed.epoch());
+        g.claimed_epoch.insert(1, first_epoch);
     }
     feed.drop_plan();
     assert_eq!(
@@ -3165,14 +3167,46 @@ fn a_stale_drop_keeps_a_reservation_a_new_claim_still_owns() {
         vec![1],
         "the new claim reuses the reservation without a second charge"
     );
-    feed.finish_stale_plan([1]);
+    let second_epoch = feed.epoch();
+    feed.finish_stale_plan([1], Some(first_epoch));
     assert!(
         feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
         "the new claim still owns the charge"
     );
-    feed.finish_stale_plan([1]);
+    feed.finish_stale_plan([1], Some(second_epoch));
     assert!(!feed.inner.lock().unwrap().lead_reserved.contains_key(&1));
     feed.install_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(40));
+}
+
+/// A replacement body at a height that still holds a reservation may be
+/// larger. The claim charges the increase so the reservation covers it.
+#[test]
+fn a_larger_replacement_body_charges_the_difference() {
+    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(100));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(60));
+    assert_eq!(feed.inner.lock().unwrap().lead_reserved[&1], 40);
+    assert_eq!(take_unproven_lead(&feed, Some(&[60]), vec![1]), vec![1]);
+    assert_eq!(
+        feed.inner.lock().unwrap().lead_bytes_left,
+        Some(40),
+        "the larger replacement charges 20 more"
+    );
+    assert_eq!(feed.inner.lock().unwrap().lead_reserved[&1], 60);
+    assert_eq!(take_unproven_lead(&feed, Some(&[30]), vec![1]), vec![1]);
+    assert_eq!(
+        feed.inner.lock().unwrap().lead_bytes_left,
+        Some(40),
+        "a smaller replacement does not refund"
+    );
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[110]), vec![1]),
+        Vec::<u32>::new(),
+        "an increase past the remainder stops the run"
+    );
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(40));
 }
 

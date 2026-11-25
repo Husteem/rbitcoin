@@ -250,10 +250,11 @@ pub struct ConfirmFeedInner {
     /// Cleared when that height is accepted or the match moves to or past it.
     /// [`ConfirmFeed::clear`] drops only heights above the confirmed tip.
     pub lead_reserved: std::collections::BTreeMap<u32, u64>,
-    /// Lookup claims sharing each reserved height. A rewind clears `inflight`,
+    /// Lookup epochs sharing each reserved height. A rewind clears `inflight`,
     /// so a later lookup can take the same height again without a second
-    /// charge. The reservation goes back only after every claim has dropped.
-    pub lead_claims: std::collections::BTreeMap<u32, u32>,
+    /// charge. The reservation goes back only after every claim has dropped;
+    /// an old stale batch removes only its own epoch.
+    pub lead_claims: std::collections::BTreeMap<u32, Vec<u64>>,
 }
 
 impl Default for ConfirmFeed {
@@ -515,17 +516,33 @@ impl ConfirmFeed {
         self.cv.notify_one();
     }
 
-    fn finish_inner(&self, heights: impl IntoIterator<Item = u32>, release_stale: bool) {
+    fn finish_inner(
+        &self,
+        heights: impl IntoIterator<Item = u32>,
+        release_stale: bool,
+        explicit_epoch: Option<u64>,
+    ) {
         let mut g = self.inner.lock().unwrap();
         let mut released = false;
         for h in heights {
             g.inflight.remove(&h);
-            g.claimed_epoch.remove(&h);
-            let claims = g.lead_claims.get_mut(&h).map(|n| {
-                *n = (*n).saturating_sub(1);
-                *n
-            });
-            if claims == Some(0) {
+            let claimed = g.claimed_epoch.remove(&h);
+            let epoch = explicit_epoch.or(claimed);
+            let mut empty = false;
+            if let Some(claims) = g.lead_claims.get_mut(&h) {
+                match epoch {
+                    Some(e) => {
+                        if let Some(pos) = claims.iter().position(|&c| c == e) {
+                            claims.remove(pos);
+                        }
+                    }
+                    None => {
+                        claims.pop();
+                    }
+                }
+                empty = claims.is_empty();
+            }
+            if empty {
                 g.lead_claims.remove(&h);
                 if release_stale && g.lead_reserved.remove(&h).is_some() {
                     released = true;
@@ -546,13 +563,18 @@ impl ConfirmFeed {
     /// it. A stale plan that drops before writing uses
     /// [`Self::finish_stale_plan`], which returns the reservation.
     pub fn finish(&self, heights: impl IntoIterator<Item = u32>) {
-        self.finish_inner(heights, false);
+        self.finish_inner(heights, false, None);
     }
 
-    /// A stale plan batch will not write and sends no `Accepted`. Drop its
-    /// claim and return the lead reservation once no other claim shares it.
-    pub fn finish_stale_plan(&self, heights: impl IntoIterator<Item = u32>) {
-        self.finish_inner(heights, true);
+    /// A stale plan batch will not write and sends no `Accepted`. Drop the
+    /// claim at `claim_epoch` (or the recorded load claim) and return the lead
+    /// reservation once no other claim shares it.
+    pub fn finish_stale_plan(
+        &self,
+        heights: impl IntoIterator<Item = u32>,
+        claim_epoch: Option<u64>,
+    ) {
+        self.finish_inner(heights, true, claim_epoch);
     }
 
     /// Drop ready and inflight and bump the epoch. The lead stays reserved.
@@ -2280,7 +2302,7 @@ pub fn settle_failed_write(
             unwritten.push(height);
         }
     }
-    feed.finish_stale_plan(unwritten);
+    feed.finish_stale_plan(unwritten, None);
     feed.finish(written);
 }
 
@@ -2810,7 +2832,10 @@ pub fn spawn_confirm_engine(
                     // Clear the stale claim and its reservation before the
                     // bodies are selectable again. A reoffered height must
                     // charge the lead when lookup takes it anew.
-                    feed_load.finish_stale_plan(lb.items.iter().map(|(h, _, _)| *h));
+                    feed_load.finish_stale_plan(
+                        lb.items.iter().map(|(h, _, _)| *h),
+                        Some(claim_epoch),
+                    );
                     reoffer_blocks_to_body_queue(
                         &hub_load,
                         lb.items.iter().map(|(h, raw, w)| {
@@ -3267,14 +3292,20 @@ pub fn spawn_confirm_engine(
                 // A cap that appears during the queue walk still applies. No
                 // copied size means a byte charge stops instead of overspending.
                 // Both caps clear leaves the wave as the queue returned it.
+                let claim_epoch = feed.epoch();
                 let wave_h = if feed.lead_charged_or_now(charge) {
-                    take_unproven_lead(&feed, charge.then_some(lens.as_slice()), wave_h)
+                    take_unproven_lead_at(
+                        &feed,
+                        charge.then_some(lens.as_slice()),
+                        wave_h,
+                        claim_epoch,
+                    )
                 } else {
                     wave_h
                 };
                 confirm_thr_stats::add_lookup_other(&stats, t_sel.elapsed());
                 if hub.query.lookup_taken_gen() != taken_gen {
-                    feed.finish_stale_plan(wave_h.iter().copied());
+                    feed.finish_stale_plan(wave_h.iter().copied(), Some(claim_epoch));
                     continue;
                 }
                 let mut did = false;
@@ -3293,7 +3324,7 @@ pub fn spawn_confirm_engine(
                     match wave {
                         Ok(wave) if wave.items.is_empty() && wave.undecodable.is_none() => {
                             lookup_faults.on_success();
-                            feed.finish_stale_plan(wave_h.iter().copied());
+                            feed.finish_stale_plan(wave_h.iter().copied(), Some(claim_epoch));
                         }
                         Ok(wave) => {
                             lookup_faults.on_success();
@@ -3316,10 +3347,10 @@ pub fn spawn_confirm_engine(
                                 )
                                 .is_err()
                                 {
-                                    feed.finish_stale_plan(wave_h.iter().copied());
+                                    feed.finish_stale_plan(wave_h.iter().copied(), Some(claim_epoch));
                                     break;
                                 }
-                                feed.finish_stale_plan([h]);
+                                feed.finish_stale_plan([h], Some(claim_epoch));
                             }
                             let counts: Vec<u32> = wave
                                 .items
@@ -3340,6 +3371,7 @@ pub fn spawn_confirm_engine(
                                     let undecoded = wave.undecodable.map(|(h, _)| h);
                                     feed.finish_stale_plan(
                                         wave_h.iter().copied().filter(|&h| Some(h) != undecoded),
+                                        Some(claim_epoch),
                                     );
                                     continue;
                                 }
@@ -3358,9 +3390,8 @@ pub fn spawn_confirm_engine(
                                 &wave.parent_ids,
                                 wave.drain_fence_hi,
                             );
-                            let epoch = feed.epoch();
                             for batch in &mut batches {
-                                batch.epoch = epoch;
+                                batch.epoch = claim_epoch;
                                 batch.gen = taken_gen;
                             }
                             let mut batches = batches.into_iter();
@@ -3389,10 +3420,14 @@ pub fn spawn_confirm_engine(
                                     ),
                                     Ok(true)
                                 ) {
-                                    feed.finish_stale_plan(claim_heights);
+                                    feed.finish_stale_plan(
+                                        claim_heights,
+                                        Some(claim_epoch),
+                                    );
                                     for rest in batches {
                                         feed.finish_stale_plan(
                                             rest.items.iter().map(|(h, _, _)| *h),
+                                            Some(claim_epoch),
                                         );
                                     }
                                     break;
@@ -3401,10 +3436,14 @@ pub fn spawn_confirm_engine(
                                     .send_load(n, wire, || load_tx.send(batch).map_err(drop))
                                     .is_err()
                                 {
-                                    feed.finish_stale_plan(claim_heights);
+                                    feed.finish_stale_plan(
+                                        claim_heights,
+                                        Some(claim_epoch),
+                                    );
                                     for rest in batches {
                                         feed.finish_stale_plan(
                                             rest.items.iter().map(|(h, _, _)| *h),
+                                            Some(claim_epoch),
                                         );
                                     }
                                     break;
@@ -3422,7 +3461,7 @@ pub fn spawn_confirm_engine(
                                 match lookup_faults.on_err(&e) {
                                     LookupFaultAction::Stop => {
                                         info!("ibd: confirm lookup cancelled mid-wave");
-                                        feed.finish_stale_plan(wave_h.iter().copied());
+                                        feed.finish_stale_plan(wave_h.iter().copied(), Some(claim_epoch));
                                         break;
                                     }
                                     LookupFaultAction::Ignore => {
@@ -3459,7 +3498,7 @@ pub fn spawn_confirm_engine(
                                     }
                                 }
                             }
-                            feed.finish_stale_plan(wave_h.iter().copied());
+                            feed.finish_stale_plan(wave_h.iter().copied(), Some(claim_epoch));
                         }
                     }
                     confirm_thr_stats::add_lookup_stamp(&stats, t_wave.elapsed());
@@ -3547,16 +3586,28 @@ pub fn offer_confirm_ready<S: std::hash::BuildHasher>(
 
 /// Heights lookup may claim. Above the matched height, a body spends
 /// `lead_bytes_left` once. A height already reserved is claimed again without
-/// a second charge, and each claim is counted so a stale drop releases the
-/// reservation only after the last one ends. `wires` is each height's charge,
-/// copied with the unresolved-heights walk. A missing charge stops the run
-/// while a byte cap is set, so an unsized body cannot pass the budget. Both
-/// caps empty returns `heights` unchanged.
+/// a second charge, but a larger replacement body charges the increase so the
+/// reservation still covers what the new claim loads. Each claim records its
+/// lookup epoch so a stale drop releases only its own claim. `wires` is each
+/// height's charge, copied with the unresolved-heights walk. A missing charge
+/// stops the run while a byte cap is set, so an unsized body cannot pass the
+/// budget. Both caps empty returns `heights` unchanged.
 #[doc(hidden)]
 pub fn take_unproven_lead(
     feed: &ConfirmFeed,
     wires: Option<&[u64]>,
     heights: Vec<u32>,
+) -> Vec<u32> {
+    take_unproven_lead_at(feed, wires, heights, feed.epoch())
+}
+
+/// [`take_unproven_lead`] with the lookup epoch that owns the new claims.
+#[doc(hidden)]
+pub fn take_unproven_lead_at(
+    feed: &ConfirmFeed,
+    wires: Option<&[u64]>,
+    heights: Vec<u32>,
+    claim_epoch: u64,
 ) -> Vec<u32> {
     let mut g = feed.inner.lock().unwrap();
     if g.height_limit.is_none() && g.lead_bytes_left.is_none() {
@@ -3570,17 +3621,30 @@ pub fn take_unproven_lead(
         if g.height_limit.is_some_and(|cap| ht > cap) {
             break;
         }
-        if let Some(left) =
-            bytes_left.filter(|_| ht > g.lead_from && !g.lead_reserved.contains_key(&ht))
-        {
-            let Some(wire) = wires.and_then(|w| w.get(i)).copied() else {
-                break;
-            };
-            if wire > left {
-                break;
+        if ht > g.lead_from {
+            if let Some(&held) = g.lead_reserved.get(&ht) {
+                let Some(wire) = wires.and_then(|w| w.get(i)).copied() else {
+                    break;
+                };
+                if wire > held {
+                    let Some(left) = bytes_left else { break };
+                    let extra = wire - held;
+                    if extra > left {
+                        break;
+                    }
+                    bytes_left = Some(left - extra);
+                    reserved.push((ht, wire));
+                }
+            } else if let Some(left) = bytes_left {
+                let Some(wire) = wires.and_then(|w| w.get(i)).copied() else {
+                    break;
+                };
+                if wire > left {
+                    break;
+                }
+                bytes_left = Some(left - wire);
+                reserved.push((ht, wire));
             }
-            bytes_left = Some(left - wire);
-            reserved.push((ht, wire));
         }
         out.push(ht);
     }
@@ -3592,8 +3656,7 @@ pub fn take_unproven_lead(
         }
         for &ht in &out {
             if ht > g.lead_from {
-                let claims = g.lead_claims.entry(ht).or_insert(0);
-                *claims = claims.saturating_add(1);
+                g.lead_claims.entry(ht).or_default().push(claim_epoch);
             }
         }
     }

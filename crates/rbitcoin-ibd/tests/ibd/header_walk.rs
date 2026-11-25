@@ -8018,7 +8018,7 @@ fn a_dropped_stale_plan_returns_the_lead_for_the_next_body() {
         );
     }
     // Height 5 drops stale before writing; height 6's Accepted has not arrived.
-    feed.finish_stale_plan([5]);
+    feed.finish_stale_plan([5], None);
     assert!(!feed.inner.lock().unwrap().lead_reserved.contains_key(&5));
     assert!(feed.inner.lock().unwrap().lead_reserved.contains_key(&6));
     feed.install_unproven_bounds(Some(10_000), 0, Some(80));
