@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use rbitcoin_net::tx_relay::parent_req::*;
 use rbitcoin_net::tx_relay::{
     GETDATA_TX_INTERVAL_SECS, MAX_PEER_TX_REQUEST_IN_FLIGHT, NONPREF_PEER_TX_DELAY_SECS,
+    OVERLOADED_PEER_TX_DELAY_SECS, TXID_RELAY_DELAY_SECS,
 };
 
 #[test]
@@ -79,6 +80,44 @@ fn non_preferred_announcer_waits_for_a_preferred_one() {
     assert_eq!(due.len(), 1);
     assert_eq!(due[0].hash, alone);
     assert!(due[0].wtxid);
+}
+
+/// Core `AddTxAnnouncement` adds its delays. A peer with a full request
+/// window and no relay permission that announces by txid while a
+/// wtxid-relay peer is connected waits for both, and for the
+/// non-preferred delay on top when it is not preferred.
+#[test]
+fn announcement_delays_add_up() {
+    for (preferred, wait) in [
+        (true, TXID_RELAY_DELAY_SECS + OVERLOADED_PEER_TX_DELAY_SECS),
+        (
+            false,
+            NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS + OVERLOADED_PEER_TX_DELAY_SECS,
+        ),
+    ] {
+        let mut t = ParentTracker::new();
+        let full = InvSource::new(1, true);
+        for i in 0..MAX_PEER_TX_REQUEST_IN_FLIGHT as u32 {
+            assert_eq!(
+                t.note_inv(full, shared_hash(i), 1_000, true),
+                ParentNote::RequestNow
+            );
+        }
+        let from = InvSource {
+            wtxid_peers: true,
+            ..InvSource::new(1, preferred)
+        };
+        let hash = [0x79; 32];
+        assert_eq!(t.note_inv(from, hash, 1_000, false), ParentNote::Deferred);
+        assert!(
+            t.take_due(1, 1_000 + wait - 1, |_, _| false).is_empty(),
+            "preferred={preferred}: asked before {wait}s"
+        );
+        let due = t.take_due(1, 1_000 + wait, |_, _| false);
+        assert_eq!(due.len(), 1, "preferred={preferred}: due at {wait}s");
+        assert_eq!(due[0].hash, hash);
+        assert!(!due[0].wtxid);
+    }
 }
 
 #[test]
