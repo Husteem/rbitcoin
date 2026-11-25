@@ -3121,6 +3121,325 @@ fn clear_returns_bytes_reserved_and_not_yet_accepted() {
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(100));
 }
 
+/// Load can drop a stale batch before it records a claim. Lookup already
+/// reserved those heights and no Accepted follows, so dropping that batch
+/// must give the reservation back too.
+#[test]
+fn a_stale_load_batch_releases_its_lead_reservation() {
+    use rbitcoin_ibd::ibd::confirm::{take_unproven_lead, ConfirmFeed};
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    let claim_epoch = feed.epoch();
+    feed.drop_plan();
+    assert!(
+        feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
+        "the rewind itself keeps the reservation"
+    );
+    // Load drops the stale batch before claiming it, then reoffers the body.
+    feed.finish_stale_plan([1], Some(claim_epoch));
+    assert!(
+        !feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
+        "a stale load batch gives its bytes back"
+    );
+    feed.install_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(40));
+}
+
+/// A plan rewind clears inflight, so a new lookup can take the same height
+/// and share its reservation. The old claim dropping must not take the charge
+/// the new claim still owns.
+#[test]
+fn a_stale_drop_keeps_a_reservation_a_new_claim_still_owns() {
+    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    let first_epoch = feed.epoch();
+    {
+        let mut g = feed.inner.lock().unwrap();
+        g.inflight.insert(1);
+        g.claimed_epoch.insert(1, first_epoch);
+    }
+    feed.drop_plan();
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[40]), vec![1]),
+        vec![1],
+        "the new claim reuses the reservation without a second charge"
+    );
+    let second_epoch = feed.epoch();
+    feed.finish_stale_plan([1], Some(first_epoch));
+    assert!(
+        feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
+        "the new claim still owns the charge"
+    );
+    feed.finish_stale_plan([1], Some(second_epoch));
+    assert!(!feed.inner.lock().unwrap().lead_reserved.contains_key(&1));
+    feed.install_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(40));
+}
+
+/// An old writer can finish after a rewind while a new load has already
+/// claimed the same height. The old finish must leave the new claim in flight
+/// and keep its reservation.
+#[test]
+fn an_old_writer_leaves_a_newer_load_claim_in_flight() {
+    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    let old_epoch = feed.epoch();
+    {
+        let mut g = feed.inner.lock().unwrap();
+        g.inflight.insert(1);
+        g.claimed_epoch.insert(1, old_epoch);
+    }
+    feed.drop_plan();
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    let new_epoch = feed.epoch();
+    {
+        let mut g = feed.inner.lock().unwrap();
+        g.inflight.insert(1);
+        g.claimed_epoch.insert(1, new_epoch);
+    }
+    feed.finish_claim([1], old_epoch);
+    {
+        let g = feed.inner.lock().unwrap();
+        assert!(
+            g.inflight.contains(&1),
+            "the new load claim stays in flight"
+        );
+        assert_eq!(
+            g.claimed_epoch.get(&1),
+            Some(&new_epoch),
+            "the old writer does not replace the new load epoch"
+        );
+        assert!(
+            g.lead_reserved.contains_key(&1),
+            "the new claim keeps its reservation"
+        );
+    }
+    feed.finish_stale_plan([1], Some(new_epoch));
+    assert!(!feed.holds(1));
+    assert!(!feed.inner.lock().unwrap().lead_reserved.contains_key(&1));
+}
+
+/// A pre-write stale batch did not commit. A connected height belongs to
+/// another batch whose Accepted is still pending, so its reservation stays;
+/// an unconnected height has no event coming and returns its bytes now.
+#[test]
+fn a_pre_write_stale_batch_keeps_a_connected_heights_reservation() {
+    use crate::Mine;
+    use rbitcoin_ibd::ibd::confirm::{finish_pre_write_stale, take_unproven_lead};
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pre-write-stale-claim");
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    hub.mine(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), Vec::new())
+        .unwrap();
+    let missing = BlockHash::from_byte_array([0x55; 32]);
+
+    let connected = ConfirmFeed::new();
+    connected.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(
+        take_unproven_lead(&connected, Some(&[40]), vec![1]),
+        vec![1]
+    );
+    let first = connected.epoch();
+    connected.drop_plan();
+    assert_eq!(
+        take_unproven_lead(&connected, Some(&[40]), vec![1]),
+        vec![1]
+    );
+    let second = connected.epoch();
+    connected.finish_claim([1], first);
+    finish_pre_write_stale(&hub, &connected, &[(1, missing.to_byte_array())], second);
+    assert!(
+        connected
+            .inner
+            .lock()
+            .unwrap()
+            .lead_reserved
+            .contains_key(&1),
+        "a different hash at the connected height still waits for Accepted"
+    );
+    connected.release_lead_reserve(1);
+    assert!(!connected
+        .inner
+        .lock()
+        .unwrap()
+        .lead_reserved
+        .contains_key(&1));
+
+    let unconnected = ConfirmFeed::new();
+    unconnected.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(
+        take_unproven_lead(&unconnected, Some(&[40]), vec![2]),
+        vec![2]
+    );
+    let first = unconnected.epoch();
+    unconnected.drop_plan();
+    assert_eq!(
+        take_unproven_lead(&unconnected, Some(&[40]), vec![2]),
+        vec![2]
+    );
+    let second = unconnected.epoch();
+    unconnected.finish_claim([2], first);
+    finish_pre_write_stale(&hub, &unconnected, &[(2, missing.to_byte_array())], second);
+    assert!(
+        !unconnected
+            .inner
+            .lock()
+            .unwrap()
+            .lead_reserved
+            .contains_key(&2),
+        "an unconnected height returns its bytes at once"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A replacement body at a height that still holds a reservation may be
+/// larger. The claim charges the increase so the reservation covers it.
+#[test]
+fn a_larger_replacement_body_charges_the_difference() {
+    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(100));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(60));
+    assert_eq!(feed.inner.lock().unwrap().lead_reserved[&1], 40);
+    assert_eq!(take_unproven_lead(&feed, Some(&[60]), vec![1]), vec![1]);
+    assert_eq!(
+        feed.inner.lock().unwrap().lead_bytes_left,
+        Some(40),
+        "the larger replacement charges 20 more"
+    );
+    assert_eq!(feed.inner.lock().unwrap().lead_reserved[&1], 60);
+    assert_eq!(take_unproven_lead(&feed, Some(&[30]), vec![1]), vec![1]);
+    assert_eq!(
+        feed.inner.lock().unwrap().lead_bytes_left,
+        Some(40),
+        "a smaller replacement does not refund"
+    );
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[110]), vec![1]),
+        Vec::<u32>::new(),
+        "an increase past the remainder stops the run"
+    );
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(40));
+}
+
+/// A failed write can leave a connected height in the batch. That height
+/// still sends Accepted and keeps its reservation; only the unwritten ones
+/// are released.
+#[test]
+fn a_failed_write_sends_accepted_for_committed_heights_only() {
+    use rbitcoin_ibd::ibd::confirm::{settle_failed_write, take_unproven_lead, ConfirmEvent};
+    use rbitcoin_ibd::ibd::status::LoopStats;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::mpsc;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("failed-write-settle");
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().unwrap();
+    let missing = BlockHash::from_byte_array([0x55; 32]);
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(80));
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[40, 40]), vec![2, 3]),
+        vec![2, 3]
+    );
+    {
+        let mut g = feed.inner.lock().unwrap();
+        g.inflight.insert(2);
+        g.inflight.insert(3);
+        g.claimed_epoch.insert(2, feed.epoch());
+        g.claimed_epoch.insert(3, feed.epoch());
+    }
+    let (tx, rx) = mpsc::channel();
+    let stats = LoopStats::default();
+    let accepted = AtomicU32::new(0);
+    settle_failed_write(
+        &hub,
+        &feed,
+        &tx,
+        &[(2, missing.to_byte_array()), (3, genesis.to_byte_array())],
+        &[12, 34],
+        feed.epoch(),
+        &stats,
+        &accepted,
+    );
+    match rx.try_recv() {
+        Ok(ConfirmEvent::Accepted {
+            hash,
+            height,
+            wire_bytes,
+        }) => {
+            assert_eq!(hash, genesis);
+            assert_eq!(height, 3);
+            assert_eq!(wire_bytes, 34);
+        }
+        _ => panic!("expected Accepted for the committed height"),
+    }
+    assert!(rx.try_recv().is_err(), "the unwritten height has no event");
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let g = feed.inner.lock().unwrap();
+    assert!(
+        !g.lead_reserved.contains_key(&2),
+        "the unwritten height gives its bytes back"
+    );
+    assert!(
+        g.lead_reserved.contains_key(&3),
+        "the committed height keeps its reservation for Accepted"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A body in the RAM cache can be a side branch. A failed write must not call
+/// it accepted or keep its reservation just because `has_block` sees it.
+#[test]
+fn a_failed_write_does_not_accept_a_cache_only_body() {
+    use rbitcoin_consensus::mine_empty_regtest;
+    use rbitcoin_ibd::ibd::confirm::{settle_failed_write, take_unproven_lead};
+    use rbitcoin_ibd::ibd::status::LoopStats;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::mpsc;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("failed-write-cache-only");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+        .header
+        .time;
+    let block = mine_empty_regtest(tip, time + 600, 1);
+    let hash = block.block_hash();
+    hub.cache.inner.write().unwrap().by_hash.insert(hash, block);
+    assert!(hub.has_block(&hash));
+    assert!(!hub.is_connected(&hash));
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(40));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    let (tx, rx) = mpsc::channel();
+    let stats = LoopStats::default();
+    let accepted = AtomicU32::new(0);
+    settle_failed_write(
+        &hub,
+        &feed,
+        &tx,
+        &[(1, hash.to_byte_array())],
+        &[40],
+        feed.epoch(),
+        &stats,
+        &accepted,
+    );
+    assert!(rx.try_recv().is_err(), "a cache-only body is not Accepted");
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        !feed.inner.lock().unwrap().lead_reserved.contains_key(&1),
+        "an unconfirmed height gives its bytes back"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A load failure can clear the feed before Accepted is drained. Bytes for a
 /// block already at the tip stay reserved. Bytes above the tip come back.
 #[test]

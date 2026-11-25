@@ -174,6 +174,9 @@ pub struct WireLoadPipeline<'a> {
 /// When `archive_plan` is `Some`, commit stage appends Class A before
 /// structural / annotate (single ordered commit era).
 pub struct LoadedBatch {
+    /// Confirm-feed epoch when this batch was claimed. IBD carries it through
+    /// scripts and write so late completion settles only its own claim.
+    pub epoch: u64,
     pub prepared: Vec<Prepared>,
     /// Shared wire (Arc) so load→scripts→write does not deep-clone full blocks.
     pub wire_blocks: Vec<Arc<Block>>,
@@ -205,6 +208,8 @@ pub struct LoadedBatch {
 ///
 /// `Send` so IBD can hand off scripts → write.
 pub struct ScriptOkBatch {
+    /// Confirm-feed epoch carried from [`LoadedBatch::epoch`].
+    pub epoch: u64,
     pub prepared: Vec<Prepared>,
     pub wire_blocks: Vec<Arc<Block>>,
     /// Wire bytes of `wire_blocks`, measured once at load for the queue
@@ -1001,9 +1006,9 @@ impl ScriptOkBatch {
     ///
     /// Scripts enqueue height-ordered tip extensions; write drains the channel
     /// and merges so Class A + Class C + annotate run once (fewer tip fsyncs).
-    /// Returns `Err(other)` if not a contiguous height extension **or** if
-    /// `archive_plan` polarity differs (`Some` vs `None`). Caller writes the
-    /// prefix then keeps `other` for the next meta-batch.
+    /// Returns `Err(other)` if not a contiguous height extension, the claim
+    /// epochs differ, or `archive_plan` polarity differs (`Some` vs `None`).
+    /// Caller writes the prefix then keeps `other` for the next meta-batch.
     pub fn append_contiguous(&mut self, mut other: Self) -> Result<(), Self> {
         if other.is_empty() {
             return Ok(());
@@ -1020,6 +1025,9 @@ impl ScriptOkBatch {
         if self.prepared.len() != self.wire_blocks.len()
             || other.prepared.len() != other.wire_blocks.len()
         {
+            return Err(other);
+        }
+        if self.epoch != other.epoch {
             return Err(other);
         }
         if self.archive_plan.is_some() != other.archive_plan.is_some() {

@@ -71,6 +71,7 @@ pub fn outcome_from(
     }
     ConfirmScriptOutcome {
         batch: ScriptOkBatch {
+            epoch: batch.epoch,
             prepared: batch.prepared,
             wire_blocks: batch.wire_blocks,
             wire_bytes: batch.wire_bytes,
@@ -115,6 +116,7 @@ pub struct Inflight {
 impl Inflight {
     /// Publish the script wave and the index wave together (IBD).
     #[doc(hidden)]
+    #[allow(clippy::result_large_err)] // the caller needs the batch back to offer its bodies
     pub fn start(
         batch: LoadedBatch,
         mat_ns: u64,
@@ -125,6 +127,7 @@ impl Inflight {
     /// Tip path: publish the script wave now and hold the index wave until
     /// the script wave passes, so a rejected block never runs index jobs.
     #[doc(hidden)]
+    #[allow(clippy::result_large_err)] // the caller needs the batch back to offer its bodies
     pub fn start_deferred_index(
         batch: LoadedBatch,
         mat_ns: u64,
@@ -135,6 +138,7 @@ impl Inflight {
     /// Tip pair: hold the script wave unpublished so both waves can be
     /// linked (and capped) before the first worker wake.
     #[doc(hidden)]
+    #[allow(clippy::result_large_err)] // the caller needs the batch back to offer its bodies
     pub fn start_deferred_index_held(
         batch: LoadedBatch,
         mat_ns: u64,
@@ -150,6 +154,7 @@ impl Inflight {
         }
     }
 
+    #[allow(clippy::result_large_err)] // the caller needs the batch back to offer its bodies
     fn start_impl(
         mut batch: LoadedBatch,
         mat_ns: u64,
@@ -626,6 +631,8 @@ pub fn drive_blocking_start(
 pub struct ScriptsBatchMeta {
     pub n: usize,
     pub first_h: u32,
+    /// Confirm-feed epoch of the batch.
+    pub epoch: u64,
     pub heights_hashes: Vec<(u32, [u8; 32])>,
     /// Arc clones of the batch's bodies (no copy), so a rejected wave can be
     /// offered back to the body queue.
@@ -641,6 +648,7 @@ impl ScriptsBatchMeta {
         Self {
             n: batch.len(),
             first_h,
+            epoch: batch.epoch,
             heights_hashes,
             wire_blocks: batch.wire_blocks.clone(),
             mat_ns,

@@ -250,6 +250,11 @@ pub struct ConfirmFeedInner {
     /// Cleared when that height is accepted or the match moves to or past it.
     /// [`ConfirmFeed::clear`] drops only heights above the confirmed tip.
     pub lead_reserved: std::collections::BTreeMap<u32, u64>,
+    /// Lookup epochs sharing each reserved height. A rewind clears `inflight`,
+    /// so a later lookup can take the same height again without a second
+    /// charge. The reservation goes back only after every claim has dropped;
+    /// an old stale batch removes only its own epoch.
+    pub lead_claims: std::collections::BTreeMap<u32, Vec<u64>>,
 }
 
 impl Default for ConfirmFeed {
@@ -288,6 +293,7 @@ impl ConfirmFeed {
                 lead_from: 0,
                 lead_bytes_left: None,
                 lead_reserved: std::collections::BTreeMap::new(),
+                lead_claims: std::collections::BTreeMap::new(),
             }),
             cv: std::sync::Condvar::new(),
             stop: AtomicBool::new(false),
@@ -334,10 +340,12 @@ impl ConfirmFeed {
         g.lead_from = lead_from;
         if moved {
             g.lead_reserved.retain(|&h, _| h > lead_from);
+            g.lead_claims.retain(|&h, _| h > lead_from);
         }
         g.lead_bytes_left = match bytes_left {
             None => {
                 g.lead_reserved.clear();
+                g.lead_claims.clear();
                 None
             }
             Some(n) => {
@@ -401,6 +409,7 @@ impl ConfirmFeed {
         if g.lead_bytes_left.is_none() {
             return;
         }
+        g.lead_claims.remove(&height);
         if g.lead_reserved.remove(&height).is_some() {
             self.lead_bounds_dirty.store(true, Ordering::Release);
         }
@@ -507,22 +516,84 @@ impl ConfirmFeed {
         self.cv.notify_one();
     }
 
-    /// Write (or permanent reject) finished — height may be re-offered only after
-    /// tip moves past it (or a future requeue path).
-    pub fn finish(&self, heights: impl IntoIterator<Item = u32>) {
+    fn finish_inner(
+        &self,
+        heights: impl IntoIterator<Item = u32>,
+        release_stale: bool,
+        explicit_epoch: Option<u64>,
+    ) {
         let mut g = self.inner.lock().unwrap();
+        let mut released = false;
         for h in heights {
-            g.inflight.remove(&h);
-            g.claimed_epoch.remove(&h);
+            let stored_claim = g.claimed_epoch.get(&h).copied();
+            let epoch = explicit_epoch.or(stored_claim);
+            let mut empty = false;
+            if let Some(claims) = g.lead_claims.get_mut(&h) {
+                match epoch {
+                    Some(e) => {
+                        if let Some(pos) = claims.iter().position(|&c| c == e) {
+                            claims.remove(pos);
+                        }
+                    }
+                    None => {
+                        claims.pop();
+                    }
+                }
+                empty = claims.is_empty();
+            }
+            if empty {
+                g.lead_claims.remove(&h);
+                if release_stale && g.lead_reserved.remove(&h).is_some() {
+                    released = true;
+                }
+            }
+            let owns_load = explicit_epoch.is_none()
+                || stored_claim.is_none()
+                || stored_claim == explicit_epoch;
+            if owns_load {
+                g.inflight.remove(&h);
+                g.claimed_epoch.remove(&h);
+            }
         }
         drop(g);
+        if released {
+            self.lead_bounds_dirty.store(true, Ordering::Release);
+        }
         self.cv.notify_one();
+    }
+
+    /// Write (or permanent reject) finished — height may be re-offered only after
+    /// tip moves past it (or a future requeue path).
+    ///
+    /// A live claim keeps its lead reservation until the accept arm releases
+    /// it. A stale plan that drops before writing uses
+    /// [`Self::finish_stale_plan`], which returns the reservation.
+    pub fn finish(&self, heights: impl IntoIterator<Item = u32>) {
+        self.finish_inner(heights, false, None);
+    }
+
+    /// Finish a batch that carries its own claim epoch. A newer load that
+    /// replaced the height's ownership is left in flight.
+    pub fn finish_claim(&self, heights: impl IntoIterator<Item = u32>, claim_epoch: u64) {
+        self.finish_inner(heights, false, Some(claim_epoch));
+    }
+
+    /// A stale plan batch will not write and sends no `Accepted`. Drop the
+    /// claim at `claim_epoch` (or the recorded load claim) and return the lead
+    /// reservation once no other claim shares it.
+    pub fn finish_stale_plan(
+        &self,
+        heights: impl IntoIterator<Item = u32>,
+        claim_epoch: Option<u64>,
+    ) {
+        self.finish_inner(heights, true, claim_epoch);
     }
 
     /// Drop ready and inflight and bump the epoch. The lead stays reserved.
     /// A header-walk rewind uses this: the confirmed tip did not move, and
     /// giving the bytes back lets lookup spend them while the old write
-    /// still commits.
+    /// still commits. A stale in-channel batch that drops before writing
+    /// returns its reservation in [`Self::finish_stale_plan`].
     pub fn drop_plan(&self) {
         {
             let mut g = self.inner.lock().unwrap();
@@ -555,6 +626,7 @@ impl ConfirmFeed {
             .filter(|(&h, _)| h > confirmed_tip)
             .fold(0u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
         g.lead_reserved.retain(|&h, _| h <= confirmed_tip);
+        g.lead_claims.retain(|&h, _| h <= confirmed_tip);
         if let Some(current) = g.lead_bytes_left {
             let pending = g
                 .lead_reserved
@@ -2212,6 +2284,75 @@ pub fn write_batch_is_stale_plan(hub: &ChainHub, feed: &ConfirmFeed, first_h: u3
     write_batch_is_stale(hub, first_h) || feed.plan_epoch_stale(first_h)
 }
 
+/// A failed write can have connected part of its batch. Send `Accepted` for a
+/// height already in the store so the walk charges it and the accept arm
+/// releases its reservation; release the rest now because no event follows.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
+pub fn settle_failed_write(
+    hub: &ChainHub,
+    feed: &ConfirmFeed,
+    event_tx: &std::sync::mpsc::Sender<ConfirmEvent>,
+    heights_hashes: &[(u32, [u8; 32])],
+    wire_sizes: &[u64],
+    claim_epoch: u64,
+    loop_stats: &LoopStats,
+    accepted: &AtomicU32,
+) {
+    let mut written = Vec::new();
+    let mut unwritten = Vec::new();
+    for (index, &(height, raw)) in heights_hashes.iter().enumerate() {
+        let hash = BlockHash::from_byte_array(raw);
+        if hub.is_connected(&hash) {
+            loop_stats.confirm_blocks.fetch_add(1, Ordering::Relaxed);
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let _ = event_tx.send(ConfirmEvent::Accepted {
+                hash,
+                height,
+                wire_bytes: accepted_block_wire(wire_sizes, index),
+            });
+            written.push(height);
+        } else {
+            unwritten.push(height);
+        }
+    }
+    feed.finish_stale_plan(unwritten, Some(claim_epoch));
+    feed.finish_claim(written, claim_epoch);
+}
+
+/// Drop a pre-write stale batch without a second `Accepted`. A connected
+/// height belongs to another batch that already sent its event, so drop only
+/// this claim and keep the reservation until that event lands. An unconnected
+/// height has no event coming, so return its reservation now.
+#[doc(hidden)]
+pub fn finish_pre_write_stale(
+    hub: &ChainHub,
+    feed: &ConfirmFeed,
+    heights_hashes: &[(u32, [u8; 32])],
+    claim_epoch: u64,
+) {
+    let mut connected = Vec::new();
+    let mut unconnected = Vec::new();
+    for &(height, raw) in heights_hashes {
+        let hash_connected = hub.is_connected(&BlockHash::from_byte_array(raw));
+        // A different hash can be the connected block at this height. Keep
+        // the reservation for any confirmed header at the height.
+        let height_connected = hub
+            .query
+            .header_at_height(rbitcoin_primitives::Height(height))
+            .ok()
+            .flatten()
+            .is_some();
+        if hash_connected || height_connected {
+            connected.push(height);
+        } else {
+            unconnected.push(height);
+        }
+    }
+    feed.finish_claim(connected, claim_epoch);
+    feed.finish_stale_plan(unconnected, Some(claim_epoch));
+}
+
 /// Spawn confirm **lookup** + **load** + **scripts** + **write** OS threads.
 ///
 /// Lookup (BQ-ahead TipOnly `head_fk`) ∥ load (claim resolve-complete + stamp
@@ -2317,29 +2458,39 @@ pub fn spawn_confirm_engine(
                 let first_h = batch.heights_hashes().first().map(|(h, _)| *h).unwrap_or(0);
                 let t0 = Instant::now();
                 let heights_hashes = batch.heights_hashes();
+                let wire_sizes: Vec<u64> = batch
+                    .wire_blocks()
+                    .iter()
+                    .map(|b| b.total_size() as u64)
+                    .collect();
+                let batch_epoch = batch.epoch;
                 if write_batch_is_stale_plan(&hub_wb, &feed_wb, first_h) {
                     debug!(Ibd,
                         "confirm write drop stale batch first={first_h} (tip moved)"
                     );
-                    feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                    // This batch never reached the write, so a connected
+                    // height was accepted by another batch that already sent
+                    // its event. Release only an unconnected height; a
+                    // connected one waits for that existing event.
+                    finish_pre_write_stale(
+                        &hub_wb,
+                        &feed_wb,
+                        &heights_hashes,
+                        batch_epoch,
+                    );
                     continue;
                 }
                 let headers = match batch.wire_headers() {
                     Ok(h) => h,
                     Err(e) => {
                         warn!("ibd: confirm write {e}");
-                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                        feed_wb.finish_claim(heights_hashes.iter().map(|(h, _)| *h), batch_epoch);
                         break;
                     }
                 };
                 let meta: Vec<(u32, BlockHash)> = heights_hashes
                     .iter()
                     .map(|&(h, raw)| (h, BlockHash::from_byte_array(raw)))
-                    .collect();
-                let wire_sizes: Vec<u64> = batch
-                    .wire_blocks()
-                    .iter()
-                    .map(|b| b.total_size() as u64)
                     .collect();
                 // Same lock as a block connect. The chain tip must not move
                 // while the relay-on purge is choosing the tip it stripped.
@@ -2373,11 +2524,11 @@ pub fn spawn_confirm_engine(
                                 })
                                 .is_err()
                             {
-                                feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                                feed_wb.finish_claim(heights_hashes.iter().map(|(h, _)| *h), batch_epoch);
                                 return;
                             }
                         }
-                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                        feed_wb.finish_claim(heights_hashes.iter().map(|(h, _)| *h), batch_epoch);
                         let deq_ns = t_deq.elapsed().as_nanos() as u64;
                         rbitcoin_query::note_confirm(&stats.write_dequeue_ns, deq_ns);
                         let elapsed = t0.elapsed();
@@ -2435,13 +2586,14 @@ pub fn spawn_confirm_engine(
                                                 })
                                                 .is_err()
                                             {
-                                                feed_wb.finish(
+                                                feed_wb.finish_claim(
                                                     heights_hashes.iter().map(|(hh, _)| *hh),
+                                                    batch_epoch,
                                                 );
                                                 return;
                                             }
                                         }
-                                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                                        feed_wb.finish_claim(heights_hashes.iter().map(|(h, _)| *h), batch_epoch);
                                         continue;
                                     }
                                     Err(e2) => {
@@ -2477,36 +2629,44 @@ pub fn spawn_confirm_engine(
                             debug!(Ibd,
                                 "confirm write drop stale batch first={height} ({msg})"
                             );
-                            feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                            settle_failed_write(
+                                &hub_wb,
+                                &feed_wb,
+                                &event_tx_wb,
+                                &heights_hashes,
+                                &wire_sizes,
+                                batch_epoch,
+                                &loop_stats_wb,
+                                &accepted_wb,
+                            );
                             continue;
                         }
                         let spent_connected = msg.contains("prevout already spent")
                             && heights_hashes.iter().all(|(_, raw)| {
-                                hub_wb.has_block(&BlockHash::from_byte_array(*raw))
+                                hub_wb.is_connected(&BlockHash::from_byte_array(*raw))
                             });
-                        if write_already_committed(skip_stale, hub_wb.has_block(&hash), spent_connected)
+                        if write_already_committed(
+                            skip_stale,
+                            hub_wb.is_connected(&hash),
+                            spent_connected,
+                        )
                         {
                             debug!(Ibd,
                                 "confirm write skip already-committed @{height} ({msg})"
                             );
-                            for (index, (ht, raw)) in heights_hashes.iter().enumerate() {
-                                let h = BlockHash::from_byte_array(*raw);
-                                if hub_wb.has_block(&h) {
-                                    loop_stats_wb
-                                        .confirm_blocks
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    accepted_wb.fetch_add(1, Ordering::SeqCst);
-                                    let _ = event_tx_wb.send(ConfirmEvent::Accepted {
-                                        hash: h,
-                                        height: *ht,
-                                        wire_bytes: accepted_block_wire(&wire_sizes, index),
-                                    });
-                                }
-                            }
-                            feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                            settle_failed_write(
+                                &hub_wb,
+                                &feed_wb,
+                                &event_tx_wb,
+                                &heights_hashes,
+                                &wire_sizes,
+                                batch_epoch,
+                                &loop_stats_wb,
+                                &accepted_wb,
+                            );
                             continue;
                         }
-                        feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
+                        feed_wb.finish_claim(heights_hashes.iter().map(|(h, _)| *h), batch_epoch);
                         loop_stats_wb
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
@@ -2629,9 +2789,9 @@ pub fn spawn_confirm_engine(
                         .first()
                         .map(|(h, raw)| (*h, BlockHash::from_byte_array(*raw)))
                         .unwrap_or((meta.first_h, BlockHash::from_byte_array([0u8; 32])));
-                    feed_sc.finish(meta.heights_hashes.iter().map(|(h, _)| *h));
+                    feed_sc.finish_claim(meta.heights_hashes.iter().map(|(h, _)| *h), meta.epoch);
                     for d in dropped {
-                        feed_sc.finish(d.heights_hashes.iter().map(|(h, _)| *h));
+                        feed_sc.finish_claim(d.heights_hashes.iter().map(|(h, _)| *h), d.epoch);
                     }
                     loop_stats_sc
                         .confirm_reject_stops
@@ -2721,6 +2881,13 @@ pub fn spawn_confirm_engine(
                         "confirm load drop stale plan epoch={claim_epoch} live={}",
                         feed_load.epoch()
                     );
+                    // Clear the stale claim and its reservation before the
+                    // bodies are selectable again. A reoffered height must
+                    // charge the lead when lookup takes it anew.
+                    feed_load.finish_stale_plan(
+                        lb.items.iter().map(|(h, _, _)| *h),
+                        Some(claim_epoch),
+                    );
                     reoffer_blocks_to_body_queue(
                         &hub_load,
                         lb.items.iter().map(|(h, raw, w)| {
@@ -2728,7 +2895,7 @@ pub fn spawn_confirm_engine(
                             (*h, hash, w.block.as_ref(), w.sender)
                         }),
                     );
-                    feed_load.finish(lb.items.iter().map(|(h, _, _)| *h));
+                    feed_load.notify();
                     continue;
                 }
                 let batch: Vec<(u32, BlockHash, rbitcoin_query::ResolvedWire)> = {
@@ -2987,6 +3154,7 @@ pub fn spawn_confirm_engine(
 
                 match mat_res {
                     Ok(mut outcome) => {
+                        outcome.batch.epoch = claim_epoch;
                         outcome.batch.holds = wire_batch
                             .iter()
                             .map(|(_, _, w)| Arc::clone(&w.heap))
@@ -3177,13 +3345,20 @@ pub fn spawn_confirm_engine(
                 // A cap that appears during the queue walk still applies. No
                 // copied size means a byte charge stops instead of overspending.
                 // Both caps clear leaves the wave as the queue returned it.
+                let claim_epoch = feed.epoch();
                 let wave_h = if feed.lead_charged_or_now(charge) {
-                    take_unproven_lead(&feed, charge.then_some(lens.as_slice()), wave_h)
+                    take_unproven_lead_at(
+                        &feed,
+                        charge.then_some(lens.as_slice()),
+                        wave_h,
+                        claim_epoch,
+                    )
                 } else {
                     wave_h
                 };
                 confirm_thr_stats::add_lookup_other(&stats, t_sel.elapsed());
                 if hub.query.lookup_taken_gen() != taken_gen {
+                    feed.finish_stale_plan(wave_h.iter().copied(), Some(claim_epoch));
                     continue;
                 }
                 let mut did = false;
@@ -3202,6 +3377,7 @@ pub fn spawn_confirm_engine(
                     match wave {
                         Ok(wave) if wave.items.is_empty() && wave.undecodable.is_none() => {
                             lookup_faults.on_success();
+                            feed.finish_stale_plan(wave_h.iter().copied(), Some(claim_epoch));
                         }
                         Ok(wave) => {
                             lookup_faults.on_success();
@@ -3224,8 +3400,10 @@ pub fn spawn_confirm_engine(
                                 )
                                 .is_err()
                                 {
+                                    feed.finish_stale_plan(wave_h.iter().copied(), Some(claim_epoch));
                                     break;
                                 }
+                                feed.finish_stale_plan([h], Some(claim_epoch));
                             }
                             let counts: Vec<u32> = wave
                                 .items
@@ -3243,6 +3421,11 @@ pub fn spawn_confirm_engine(
                                 Err(e) => {
                                     warn!("ibd: load-batch has_body probe: {e}");
                                     confirm_thr_stats::add_lookup_other(&stats, t_kind.elapsed());
+                                    let undecoded = wave.undecodable.map(|(h, _)| h);
+                                    feed.finish_stale_plan(
+                                        wave_h.iter().copied().filter(|&h| Some(h) != undecoded),
+                                        Some(claim_epoch),
+                                    );
                                     continue;
                                 }
                             };
@@ -3260,14 +3443,16 @@ pub fn spawn_confirm_engine(
                                 &wave.parent_ids,
                                 wave.drain_fence_hi,
                             );
-                            let epoch = feed.epoch();
                             for batch in &mut batches {
-                                batch.epoch = epoch;
+                                batch.epoch = claim_epoch;
                                 batch.gen = taken_gen;
                             }
-                            for batch in batches {
+                            let mut batches = batches.into_iter();
+                            while let Some(batch) = batches.next() {
                                 let t_send = Instant::now();
                                 let n = batch.items.len();
+                                let claim_heights: Vec<u32> =
+                                    batch.items.iter().map(|(h, _, _)| *h).collect();
                                 let wire: usize = batch
                                     .items
                                     .iter()
@@ -3288,12 +3473,32 @@ pub fn spawn_confirm_engine(
                                     ),
                                     Ok(true)
                                 ) {
+                                    feed.finish_stale_plan(
+                                        claim_heights,
+                                        Some(claim_epoch),
+                                    );
+                                    for rest in batches {
+                                        feed.finish_stale_plan(
+                                            rest.items.iter().map(|(h, _, _)| *h),
+                                            Some(claim_epoch),
+                                        );
+                                    }
                                     break;
                                 }
                                 if queues_lookup
                                     .send_load(n, wire, || load_tx.send(batch).map_err(drop))
                                     .is_err()
                                 {
+                                    feed.finish_stale_plan(
+                                        claim_heights,
+                                        Some(claim_epoch),
+                                    );
+                                    for rest in batches {
+                                        feed.finish_stale_plan(
+                                            rest.items.iter().map(|(h, _, _)| *h),
+                                            Some(claim_epoch),
+                                        );
+                                    }
                                     break;
                                 }
                                 confirm_thr_stats::add_lookup_send_wait(&stats, t_send.elapsed());
@@ -3309,6 +3514,7 @@ pub fn spawn_confirm_engine(
                                 match lookup_faults.on_err(&e) {
                                     LookupFaultAction::Stop => {
                                         info!("ibd: confirm lookup cancelled mid-wave");
+                                        feed.finish_stale_plan(wave_h.iter().copied(), Some(claim_epoch));
                                         break;
                                     }
                                     LookupFaultAction::Ignore => {
@@ -3345,6 +3551,7 @@ pub fn spawn_confirm_engine(
                                     }
                                 }
                             }
+                            feed.finish_stale_plan(wave_h.iter().copied(), Some(claim_epoch));
                         }
                     }
                     confirm_thr_stats::add_lookup_stamp(&stats, t_wave.elapsed());
@@ -3432,15 +3639,28 @@ pub fn offer_confirm_ready<S: std::hash::BuildHasher>(
 
 /// Heights lookup may claim. Above the matched height, a body spends
 /// `lead_bytes_left` once. A height already reserved is claimed again without
-/// a second charge. `wires` is each height's charge, copied with the
-/// unresolved-heights walk. A missing charge stops the run while a byte cap
-/// is set, so an unsized body cannot pass the budget. Both caps empty returns
-/// `heights` unchanged.
+/// a second charge, but a larger replacement body charges the increase so the
+/// reservation still covers what the new claim loads. Each claim records its
+/// lookup epoch so a stale drop releases only its own claim. `wires` is each
+/// height's charge, copied with the unresolved-heights walk. A missing charge
+/// stops the run while a byte cap is set, so an unsized body cannot pass the
+/// budget. Both caps empty returns `heights` unchanged.
 #[doc(hidden)]
 pub fn take_unproven_lead(
     feed: &ConfirmFeed,
     wires: Option<&[u64]>,
     heights: Vec<u32>,
+) -> Vec<u32> {
+    take_unproven_lead_at(feed, wires, heights, feed.epoch())
+}
+
+/// [`take_unproven_lead`] with the lookup epoch that owns the new claims.
+#[doc(hidden)]
+pub fn take_unproven_lead_at(
+    feed: &ConfirmFeed,
+    wires: Option<&[u64]>,
+    heights: Vec<u32>,
+    claim_epoch: u64,
 ) -> Vec<u32> {
     let mut g = feed.inner.lock().unwrap();
     if g.height_limit.is_none() && g.lead_bytes_left.is_none() {
@@ -3454,17 +3674,30 @@ pub fn take_unproven_lead(
         if g.height_limit.is_some_and(|cap| ht > cap) {
             break;
         }
-        if let Some(left) =
-            bytes_left.filter(|_| ht > g.lead_from && !g.lead_reserved.contains_key(&ht))
-        {
-            let Some(wire) = wires.and_then(|w| w.get(i)).copied() else {
-                break;
-            };
-            if wire > left {
-                break;
+        if ht > g.lead_from {
+            if let Some(&held) = g.lead_reserved.get(&ht) {
+                let Some(wire) = wires.and_then(|w| w.get(i)).copied() else {
+                    break;
+                };
+                if wire > held {
+                    let Some(left) = bytes_left else { break };
+                    let extra = wire - held;
+                    if extra > left {
+                        break;
+                    }
+                    bytes_left = Some(left - extra);
+                    reserved.push((ht, wire));
+                }
+            } else if let Some(left) = bytes_left {
+                let Some(wire) = wires.and_then(|w| w.get(i)).copied() else {
+                    break;
+                };
+                if wire > left {
+                    break;
+                }
+                bytes_left = Some(left - wire);
+                reserved.push((ht, wire));
             }
-            bytes_left = Some(left - wire);
-            reserved.push((ht, wire));
         }
         out.push(ht);
     }
@@ -3473,6 +3706,11 @@ pub fn take_unproven_lead(
         g.lead_bytes_left = bytes_left;
         for (ht, wire) in reserved {
             g.lead_reserved.insert(ht, wire);
+        }
+        for &ht in &out {
+            if ht > g.lead_from {
+                g.lead_claims.entry(ht).or_default().push(claim_epoch);
+            }
         }
     }
     out
