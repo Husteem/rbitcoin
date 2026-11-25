@@ -4792,6 +4792,63 @@ async fn sp_lagged_tip_events_rescan_below_a_replaced_tip() {
     );
 }
 
+/// When the replaced tip's header is still stored, a lag rescans from its
+/// real fork, not from a guess six blocks down: the payment at 5, below
+/// the fork at 7, is not sent again.
+#[tokio::test]
+async fn sp_lag_rescans_from_the_stored_fork_of_a_replaced_tip() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-lag-fork", 10, &[5, 9]);
+    let mut s = sp_session(&chain.q);
+    let reply = s.ask(&[sp_subscribe_line(1, chain.sub(json!(0)))]).await;
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(sp_heights(&history), [5, 9]);
+
+    // A stale tip at 8 on top of 7, stored as a disconnected block's header.
+    use bitcoin::hashes::Hash;
+    let (fk7, _) = chain.q.header_at_height(Height(7)).unwrap().unwrap();
+    let mut stale = chain.q.wire_header_at_height(Height(8)).unwrap();
+    stale.nonce = stale.nonce.wrapping_add(1);
+    chain
+        .q
+        .put_header(&rbitcoin_store::HeaderRecord {
+            prev_fk: fk7,
+            version: stale.version.to_consensus(),
+            timestamp: stale.time,
+            bits: stale.bits.to_consensus(),
+            nonce: stale.nonce,
+            merkle_root: stale.merkle_root.to_byte_array(),
+            hash: stale.block_hash().to_byte_array(),
+            size: 0,
+            weight: 0,
+        })
+        .unwrap();
+    s.tip_tx
+        .send(TipNotify {
+            height: 8,
+            header_hex: header_hex(&stale),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    s.assert_quiet(2).await;
+    let tip = TipNotify {
+        height: 10,
+        header_hex: header_hex(&chain.q.wire_header_at_height(Height(10)).unwrap()),
+        reorg_from_height: None,
+    };
+    for _ in 0..12 {
+        s.tip_tx.send(tip.clone()).unwrap();
+    }
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(
+        sp_heights(&history),
+        [9],
+        "the rescan starts above the fork at 7"
+    );
+    s.assert_quiet(3).await;
+}
+
 /// A live subscription can scan past the last tip event the session handled
 /// (its history scan reads the store's tip). A lag whose last handled tip is
 /// still on the chain did not check the heights above it, so those are

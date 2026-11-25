@@ -1892,8 +1892,9 @@ fn tip_block_hash(header_hex: &str) -> Option<[u8; 32]> {
     Some(header.block_hash().to_byte_array())
 }
 
-/// Blocks below the lowest silent-payment height a lagged reorg rescans.
-/// The lost event's fork is unknown; deeper reorgs are not expected.
+/// Blocks below the lowest silent-payment height a lagged reorg rescans when
+/// the replaced tip's header is not stored, so its fork cannot be walked
+/// ([`stored_fork`]). A deeper reorg then is missed.
 const LAG_REORG_DEPTH: u32 = 6;
 
 /// The lowest height this session's live silent-payment subscriptions and
@@ -1902,6 +1903,24 @@ fn sp_fork_floor(conn: &ElectrumConn) -> Option<u32> {
     let live = conn.sp_subs.iter().map(|l| l.through);
     let scans = conn.sp_scans.iter().map(|r| r.next.saturating_sub(1));
     live.chain(scans).min()
+}
+
+/// Steps [`stored_fork`] walks before it gives up on a replaced tip.
+const LAG_FORK_WALK: u32 = 2016;
+
+/// The active-chain height where the stored header `hash` (a replaced tip)
+/// leaves it, by its `prev` links. `None` when the header or an ancestor is
+/// not stored, or the walk passes [`LAG_FORK_WALK`] steps.
+fn stored_fork(query: &Query, hash: [u8; 32]) -> Option<u32> {
+    let (_, mut rec) = query.get_header_by_hash(&hash).ok()??;
+    for _ in 0..LAG_FORK_WALK {
+        let parent = query.get_header(rec.prev_fk).ok()?;
+        if let Some(h) = query.confirmed_height_of_hash(&parent.hash).ok()? {
+            return Some(h.0);
+        }
+        rec = parent;
+    }
+    None
 }
 
 /// The highest height a live silent-payment subscription has scanned.
@@ -1936,14 +1955,18 @@ fn lagged_tip(
         .map(|(height, _)| height);
     let reorg_from_height = unchecked_above.or_else(|| {
         (!kept).then(|| {
+            if let Some(fork) = last.and_then(|(_, hash)| stored_fork(query, hash)) {
+                return fork;
+            }
             let below = sp_floor
                 .or(last.map(|(h, _)| h))
                 .unwrap_or(tip.0)
                 .min(tip.0);
             let fork = below.saturating_sub(LAG_REORG_DEPTH);
             rbitcoin_log::info!(
-            "electrum: tip events lagged past a replaced tip; treating it as a reorg from {fork}"
-        );
+                "electrum: tip events lagged past a replaced tip whose header is not stored; \
+                 treating it as a reorg from {fork}"
+            );
             fork
         })
     });
