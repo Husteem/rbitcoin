@@ -32,9 +32,10 @@ pub use transport::Frame;
 pub const MAX_SESSIONS: usize = 8;
 
 /// Sessions one netgroup (IPv4 `/16`, IPv6 `/32`, as Core's `GetGroup`
-/// without asmap) may hold at once. A silent SRI pool and a silent attacker
-/// look the same, so no idle deadline can tell them apart; a share keeps
-/// one network from taking the whole table. Loopback is one netgroup.
+/// without asmap, also under `--asmap`) may hold at once. A silent SRI pool
+/// and a silent attacker look the same, so no idle deadline can tell them
+/// apart; a share keeps one network from taking the whole table. IPv4 and
+/// IPv6 loopback are two netgroups.
 pub const MAX_SESSIONS_PER_NETGROUP: usize = MAX_SESSIONS / 2;
 
 /// Default [`Sv2TpConfig::setup_timeout`]. A session holds a slot from TCP
@@ -251,14 +252,20 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
             #[cfg(all(debug_assertions, target_os = "linux"))]
             test_send_buffer::apply(&stream);
             let Some(group) = GroupShare::take(&groups, peer) else {
-                rbitcoin_log::warn!(
-                    "sv2: reject {peer} (netgroup at {MAX_SESSIONS_PER_NETGROUP} sessions)"
+                rbitcoin_log::warn_repeated(
+                    rbitcoin_log::RepeatedInfo::Sv2AtMaxSessions,
+                    format_args!(
+                        "sv2: reject {peer} (netgroup at {MAX_SESSIONS_PER_NETGROUP} sessions)"
+                    ),
                 );
                 drop(stream);
                 continue;
             };
             let Ok(slot) = slots.clone().try_acquire_owned() else {
-                rbitcoin_log::warn!("sv2: reject {peer} (at max_sessions={MAX_SESSIONS})");
+                rbitcoin_log::warn_repeated(
+                    rbitcoin_log::RepeatedInfo::Sv2AtMaxSessions,
+                    format_args!("sv2: reject {peer} (at max_sessions={MAX_SESSIONS})"),
+                );
                 drop(stream);
                 continue;
             };

@@ -493,3 +493,41 @@ async fn panicked_sv2_disconnect_logs_at_warn() {
     rbitcoin_log::capture_logs(false);
     assert_eq!(levels, [Level::Debug, Level::Debug, Level::Warn]);
 }
+
+/// A client that keeps connecting past its netgroup's share must not append
+/// one log line per refused socket: the port has no client auth. The accept
+/// loop runs on this thread, so the capture sees its lines.
+#[tokio::test(flavor = "current_thread")]
+async fn rejects_past_the_share_log_fewer_lines_than_rejects() {
+    const EXTRA: usize = 20;
+    let tc = shared_regtest(0);
+    let chain = Arc::clone(&tc.chain);
+    rbitcoin_log::reset_repeated_info();
+    rbitcoin_log::capture_logs(true);
+    let _ = rbitcoin_log::take_logs();
+    let tp = run_sv2_tp(test_tp_config(chain, [7; 32]))
+        .await
+        .expect("listen");
+    let mut opened = Vec::new();
+    for _ in 0..MAX_SESSIONS_PER_NETGROUP + EXTRA {
+        opened.push(
+            tokio::net::TcpStream::connect(tp.local_addr)
+                .await
+                .expect("tcp"),
+        );
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let rejects = lines
+        .iter()
+        .filter(|(_, msg)| msg.contains("sv2: reject"))
+        .count();
+    assert!(
+        (1..EXTRA).contains(&rejects),
+        "{rejects} reject lines for {EXTRA} refused sockets: {lines:?}"
+    );
+    drop(opened);
+    tp.shutdown().await;
+}
