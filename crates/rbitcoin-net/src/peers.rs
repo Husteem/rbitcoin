@@ -3118,10 +3118,10 @@ impl PeerHub {
         let Some(am) = am else {
             return Vec::new();
         };
-        let entries = {
-            let g = am.lock().unwrap_or_else(|e| e.into_inner());
-            g.entries()
-        };
+        // One lock for the snapshot, the sample, and the stamp: a concurrent
+        // eviction cannot remove a sampled row between two lock sections.
+        let mut g = am.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = g.entries();
         let addrs: Vec<crate::NetAddr> = entries
             .iter()
             .map(|e| e.addr)
@@ -3143,15 +3143,13 @@ impl PeerHub {
             idxs.swap(i, j);
         }
         let sampled: Vec<crate::NetAddr> = idxs.iter().take(cap).map(|&i| addrs[i]).collect();
+        g.stamp_missing_seen_for(&sampled, now);
         let mut out = Vec::with_capacity(cap);
-        {
-            let mut g = am.lock().unwrap_or_else(|e| e.into_inner());
-            g.stamp_missing_seen_for(&sampled, now);
-            for addr in sampled {
-                let last_seen = g.last_seen_of(&addr);
-                out.push((crate::seeds::row_reply_time(last_seen, now), addr));
-            }
+        for addr in sampled {
+            let last_seen = g.last_seen_of(&addr);
+            out.push((crate::seeds::row_reply_time(last_seen, now), addr));
         }
+        drop(g);
         cache.insert(key, (now, out.clone()));
         out
     }
