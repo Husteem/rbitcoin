@@ -6910,26 +6910,22 @@ fn getnodeaddresses_reports_the_row_time() {
     let (mut ctx, dir) = ctx_empty();
     let am = Arc::new(Mutex::new(AddrMan::new()));
     ctx.addrman = Some(Arc::clone(&am));
+    let hub = rbitcoin_net::peers::PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    ctx.peers = Some(hub);
     let known: SocketAddr = "128.1.2.3:8333".parse().unwrap();
     assert!(am.lock().unwrap().add_learned_addr_at(
         NetAddr::from_socket(known),
         NetAddr::from_socket(known),
         1_699_000_000,
+        1_700_000_000,
         rbitcoin_net::MAX_ADDR_MAN,
     ));
 
     let got = dispatch(&ctx, "getnodeaddresses", vec![json!(1)]).unwrap();
     assert_eq!(got[0]["time"], json!(1_699_000_000));
 
-    let before = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
     dispatch(&ctx, "addpeeraddress", vec![json!("9.9.9.9"), json!(8333)]).unwrap();
-    let after = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
     let all = dispatch(&ctx, "getnodeaddresses", vec![json!(0)]).unwrap();
     let added = all
         .as_array()
@@ -6937,10 +6933,10 @@ fn getnodeaddresses_reports_the_row_time() {
         .iter()
         .find(|row| row["address"] == json!("9.9.9.9"))
         .expect("added row");
-    let at = added["time"].as_u64().unwrap();
-    assert!(
-        (before..=after).contains(&at),
-        "addpeeraddress stamps now: {at} not in {before}..={after}"
+    assert_eq!(
+        added["time"],
+        json!(1_700_000_000),
+        "addpeeraddress stamps the node clock"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

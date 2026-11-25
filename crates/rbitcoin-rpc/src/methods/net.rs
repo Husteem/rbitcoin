@@ -252,6 +252,18 @@ pub fn addconnection(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
     }))
 }
 
+/// Node clock seconds: the live hub's (mock-aware) clock when attached, else
+/// the wall clock.
+fn node_now_secs(ctx: &RpcContext) -> u64 {
+    if let Some(hub) = ctx.peers.as_ref() {
+        return hub.now_secs();
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Core `addpeeraddress` (hidden): insert into addrman + durable peers file.
 pub fn addpeeraddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["address", "port", "tried"])?;
@@ -271,16 +283,13 @@ pub fn addpeeraddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     // RAM-only: do not rewrite peers on every call (p2p_getaddr_caching fills
     // via this RPC). The node still persists addrman on shutdown / catch-up.
     // The address is its own source, as in Core, and carries the call time.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = node_now_secs(ctx);
     let last_seen = now.min(u64::from(u32::MAX)) as u32;
     let net = rbitcoin_net::NetAddr::from_socket(addr);
     let added = am
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .add_learned_addr_at(net, net, last_seen, rbitcoin_net::MAX_ADDR_MAN);
+        .add_learned_addr_at(net, net, last_seen, now, rbitcoin_net::MAX_ADDR_MAN);
     Ok(json!({ "success": added }))
 }
 
@@ -314,12 +323,10 @@ pub fn getnodeaddresses(ctx: &RpcContext, params: &RpcParams) -> Result<Value, V
     let Some(am) = ctx.addrman.as_ref() else {
         return Ok(json!([]));
     };
-    let g = am.lock().unwrap_or_else(|e| e.into_inner());
+    let now = node_now_secs(ctx);
+    let mut g = am.lock().unwrap_or_else(|e| e.into_inner());
+    g.stamp_missing_seen(now);
     let mut out = Vec::new();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     for e in g.entries() {
         let net = e.addr.network_label();
         if let Some(want) = network {
