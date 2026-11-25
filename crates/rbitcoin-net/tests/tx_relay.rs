@@ -4,7 +4,7 @@ use bitcoin::absolute::LockTime;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
-    fee_at_target_sat_kvb, AcceptError, Coin, CoreDatTx, CoreMempoolDat, UtxoProvider,
+    fee_at_target_sat_kvb, AcceptError, ChainPrevout, Coin, CoreDatTx, CoreMempoolDat, UtxoProvider,
 };
 use rbitcoin_net::fee_history::HistoricalFeeBlock;
 use rbitcoin_net::fee_history_file;
@@ -1697,6 +1697,186 @@ fn coinbase_table_error_makes_the_prevout_unavailable() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The provider resolved a lone create, then its block disconnected. One
+/// fresh lookup finds no connected row, so the parent is missing.
+#[test]
+fn resolved_prevout_is_unavailable_after_its_block_disconnects() {
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("prevout-disconnect");
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let accept = |height, block: &bitcoin::Block| {
+        rbitcoin_query::accept_and_connect_block(
+            &q,
+            &params,
+            Height(height),
+            block,
+            rbitcoin_consensus::Milestone::NONE,
+        )
+        .unwrap();
+    };
+    accept(0, &genesis);
+    let block = rbitcoin_consensus::mine_regtest_paying(
+        genesis.block_hash(),
+        genesis.header.time + 600,
+        1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    accept(1, &block);
+    let op = OutPoint::new(block.txdata[0].compute_txid(), 0);
+    let resolved = q
+        .connected_tx_outputs_at(&op.txid.to_byte_array(), &[op.vout])
+        .unwrap()
+        .expect("connected output");
+    let tip = q.tip_height().unwrap().0;
+
+    q.disconnect_tip().unwrap();
+
+    let _ = q.store().sample_reset_tip_txid_lookups();
+    let result = QueryUtxoProvider::new(&q).chain_prevout_from_resolved(&op, resolved, tip);
+    assert!(matches!(result, ChainPrevout::Unknown), "got {result:?}");
+    assert_eq!(q.store().sample_reset_tip_txid_lookups(), 1);
+}
+
+/// A block connects after the provider resolved the parent. The read is
+/// taken again at the new tip: an empty block leaves the coin unspent, and
+/// a block that spends it makes it unavailable.
+#[test]
+fn resolved_prevout_is_read_again_after_a_block_connects() {
+    use rbitcoin_consensus::{mine_regtest_paying, ChainParams, Milestone};
+
+    let (store, q, cbs) = copy_maturity_pad(3);
+    let params = ChainParams::regtest();
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let op = OutPoint::new(cbs[0], 0);
+    let provider = QueryUtxoProvider::new(&q);
+    let capture = || {
+        let resolved = q
+            .connected_tx_outputs_at(&op.txid.to_byte_array(), &[op.vout])
+            .unwrap()
+            .expect("connected output");
+        (resolved, q.tip_height().unwrap().0)
+    };
+    let connect = |txs: Vec<Transaction>| {
+        let fk = q.tip_header_fk().unwrap().expect("tip header");
+        let rec = q.get_header(fk).unwrap();
+        let height = q.tip_height().unwrap().0 + 1;
+        let b = mine_regtest_paying(
+            bitcoin::BlockHash::from_byte_array(rec.hash),
+            rec.timestamp + 600,
+            height,
+            op_true.clone(),
+            txs,
+        );
+        rbitcoin_query::accept_and_connect_block(&q, &params, Height(height), &b, Milestone::NONE)
+            .unwrap();
+    };
+
+    let (resolved, tip) = capture();
+    connect(vec![]);
+    let _ = q.store().sample_reset_tip_txid_lookups();
+    let result = provider.chain_prevout_from_resolved(&op, resolved, tip);
+    let ChainPrevout::Unspent(coin) = result else {
+        panic!("got {result:?}");
+    };
+    assert_eq!(coin.create_height, 1);
+    assert_eq!(q.store().sample_reset_tip_txid_lookups(), 1);
+
+    let (resolved, tip) = capture();
+    connect(vec![spend_true(op.txid, 1_000, op_true.clone())]);
+    let _ = q.store().sample_reset_tip_txid_lookups();
+    let result = provider.chain_prevout_from_resolved(&op, resolved, tip);
+    assert!(
+        matches!(result, ChainPrevout::KnownUnavailable),
+        "got {result:?}"
+    );
+    assert_eq!(q.store().sample_reset_tip_txid_lookups(), 1);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// BIP30 repeat: the newer copy of a coinbase txid disconnects after the
+/// provider resolved it. The older copy is the connected row again, and a
+/// confirmed spend already used its output, so the coin stays unavailable.
+#[test]
+fn resolved_prevout_rereads_the_older_spent_copy_after_a_disconnect() {
+    use rbitcoin_consensus::{grind_regtest_pow, mine_regtest_paying, ChainParams, Milestone};
+
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("prevout-bip30");
+    let mut params = ChainParams::regtest();
+    // BIP34 off lets two blocks carry one coinbase; BIP30 stays on.
+    params.btc.bip34_height = u32::MAX;
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let accept = |height, block: &bitcoin::Block| {
+        rbitcoin_query::accept_and_connect_block(
+            &q,
+            &params,
+            Height(height),
+            block,
+            Milestone::NONE,
+        )
+        .unwrap();
+    };
+    let cb = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x51, 0x51]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![pay_true(50_0000_0000)],
+    };
+    let with_cb = |prev, time, height| {
+        let mut b = mine_regtest_paying(prev, time, height, op_true.clone(), vec![]);
+        b.txdata[0] = cb.clone();
+        b.header.merkle_root = b.compute_merkle_root().unwrap();
+        grind_regtest_pow(&mut b.header);
+        b
+    };
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept(0, &genesis);
+    let first = with_cb(genesis.block_hash(), genesis.header.time + 600, 1);
+    accept(1, &first);
+    let (tip, time, _) = rbitcoin_query::pad_empty_from(
+        &q,
+        &params,
+        first.block_hash(),
+        first.header.time,
+        2,
+        101,
+        0,
+    );
+    let op = OutPoint::new(cb.compute_txid(), 0);
+    let spend = spend_true(op.txid, 1_000, op_true.clone());
+    let spent = mine_regtest_paying(tip, time + 600, 102, op_true.clone(), vec![spend]);
+    accept(102, &spent);
+    let repeat = with_cb(spent.block_hash(), spent.header.time + 600, 103);
+    accept(103, &repeat);
+    let resolved = q
+        .connected_tx_outputs_at(&op.txid.to_byte_array(), &[op.vout])
+        .unwrap()
+        .expect("connected output");
+    assert_eq!(resolved.1, 103, "the newer copy is the connected row");
+    let tip = q.tip_height().unwrap().0;
+
+    q.disconnect_tip().unwrap();
+
+    let provider = QueryUtxoProvider::new(&q);
+    let _ = q.store().sample_reset_tip_txid_lookups();
+    let result = provider.chain_prevout_from_resolved(&op, resolved, tip);
+    assert!(
+        matches!(result, ChainPrevout::KnownUnavailable),
+        "got {result:?}"
+    );
+    assert_eq!(q.store().sample_reset_tip_txid_lookups(), 1);
+    let fresh = provider.chain_prevout(&op);
+    assert!(
+        matches!(fresh, ChainPrevout::KnownUnavailable),
+        "got {fresh:?}"
+    );
+}
+
 /// Non-coinbase, no BIP68 time-lock: one packed body decode per coin
 /// lookup and no create MTP. The parent has two outputs with distinct
 /// values and the child spends vout 1, so the fee pins the vout index.
@@ -1763,7 +1943,13 @@ fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
         }],
     };
     let _ = q.store().txs.sample_reset_body_decodes();
+    let _ = q.store().sample_reset_tip_txid_lookups();
     hub.admit(&child).expect("non-coinbase chain spend");
+    assert_eq!(
+        q.store().sample_reset_tip_txid_lookups(),
+        2,
+        "resolve the confirmed parent once in prepare and once in the recheck"
+    );
     assert_eq!(
         hub.get_live_meta(&child.compute_txid()).map(|(fee, _)| fee),
         Some(1_000),
