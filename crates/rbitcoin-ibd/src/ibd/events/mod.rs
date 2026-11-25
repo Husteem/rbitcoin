@@ -1065,12 +1065,22 @@ fn answer_probe(
                 linked,
             );
         }
+        // An abandoned header this peer may serve reopens here too. The walk
+        // then asks the peer again, and the batch path re-plants it.
+        let mut reopened = false;
+        for hdr in headers {
+            let hash = hdr.block_hash();
+            if st.unservable.contains(&hash) {
+                reopen_for_announcer(st, peer, hash);
+                reopened |= !st.unservable.contains(&hash);
+            }
+        }
         // A header this node has not seen: the peer's chain leaves this one
         // or runs past the path. The walk asks it, as after a block inv.
         let last = headers[headers.len() - 1].block_hash();
         let seen = st.hash_height.contains_key(&last)
             || matches!(hub.query.height_of_hash(&last.to_byte_array()), Ok(Some(_)));
-        if !seen {
+        if reopened || !seen {
             super::header_walk::note_block_inv(st, peer);
         }
     }

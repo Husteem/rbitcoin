@@ -5695,3 +5695,57 @@ fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
     assert!(st.unservable.contains(&hash), "the reopen bound is spent");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A fresh announcer's reply to an open probe reopens an abandoned header
+/// too, though that reply skips the batch path (#1992).
+#[test]
+fn a_probe_reply_reopens_an_abandoned_header() {
+    use bitcoin::Network;
+    use rbitcoin_ibd::ibd::events::{
+        finish_deferred_archived_clear, on_headers_batch, plan_header_batch, BadPrevParent,
+        DeferredArchivedClear, MUTATED_COPIES_BEFORE_ABANDON,
+    };
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reopen-probe");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let t = hub.tip_height().unwrap();
+    let time = bitcoin::blockdata::constants::genesis_block(Network::Regtest)
+        .header
+        .time
+        .saturating_add(600);
+    let a = rbitcoin_consensus::mine_empty_regtest(tip, time, t + 1);
+    let fks = hub.ensure_headers_batch(&[a.header]).unwrap();
+    let hash = a.block_hash();
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
+    let (kept, other) = (1, 2);
+    for id in [kept, other] {
+        let mut slot = crate::ibd::assign::dummy_slot(id);
+        slot.addr = std::net::SocketAddr::from(([127, 0, 0, id as u8], 18444));
+        slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
+        st.slots.push(slot);
+    }
+    on_headers_batch(&mut st, &hub, kept, vec![a.header], &fks);
+    for _ in 0..MUTATED_COPIES_BEFORE_ABANDON {
+        let copy = DeferredArchivedClear {
+            height: t + 1,
+            hash,
+            err: "bad-txnmrklroot".into(),
+            sender: Some(kept),
+            parent: BadPrevParent::Tip,
+            retry_tip_child: false,
+            bad_prev: false,
+            was_occupant: true,
+        };
+        finish_deferred_archived_clear(&mut st, Some(&hub), &copy);
+    }
+    assert!(st.unservable.contains(&hash));
+    st.header_walk.probe_open = Some(other);
+    let _ = plan_header_batch(&mut st, &hub, other, vec![a.header]);
+    assert_eq!(
+        st.header_walk.probe_open, None,
+        "the reply answered the probe"
+    );
+    assert!(!st.unservable.contains(&hash), "a probe reply reopens A");
+    let _ = std::fs::remove_dir_all(dir);
+}
