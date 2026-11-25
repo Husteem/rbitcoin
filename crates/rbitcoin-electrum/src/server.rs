@@ -2557,20 +2557,21 @@ pub fn restatus_notes(
     let mut out = Vec::new();
     // Each height's touch set is the block's scripthashes, kept for recent
     // blocks and shared by every connection ([`Query::block_touch`]); a sub
-    // is checked by a set lookup. A height whose set fails to load counts
-    // as untouched.
-    let mut touches: Option<Vec<Arc<rbitcoin_query::BlockTouch>>> = None;
+    // is checked by a set lookup. A height whose set cannot be read could
+    // have touched any script, so every sub is read again.
+    let mut touches: Option<Option<Vec<Arc<rbitcoin_query::BlockTouch>>>> = None;
     for sh in subs {
         let hit = match heights {
             None => true,
             Some(hs) => touches
                 .get_or_insert_with(|| {
                     hs.iter()
-                        .filter_map(|h| query.block_touch(Height(*h)).ok())
-                        .collect()
+                        .map(|h| query.block_touch(Height(*h)))
+                        .collect::<Result<Vec<_>, _>>()
+                        .ok()
                 })
-                .iter()
-                .any(|t| t.touches(sh)),
+                .as_ref()
+                .is_none_or(|ts| ts.iter().any(|t| t.touches(sh))),
         };
         if !hit {
             continue;

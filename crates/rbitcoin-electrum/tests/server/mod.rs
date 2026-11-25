@@ -393,6 +393,14 @@ fn restatus_notes_scans_intermediate_tick_heights() {
     );
     let range = restatus_notes(&q, None, &[sh], Some(&[1, 0]));
     assert_eq!(range.len(), 1, "range must include the height-0 create");
+    // A height whose touch set cannot be read (no block at 7) could have
+    // touched any script, so every subscription is read again.
+    let unreadable = restatus_notes(&q, None, &[sh], Some(&[1, 7]));
+    assert_eq!(
+        unreadable.len(),
+        1,
+        "an unreadable touch set counted as untouched"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
