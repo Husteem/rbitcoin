@@ -1373,8 +1373,8 @@ impl crate::spend_delta::SpentBody for SpentFold<'_> {
 /// commit no fold has extended it. Such a body, and a schema-29 page log if
 /// there is one, become the delta's first generation. `Store` removes the 29
 /// files only after `meta` 30 is durable. A crash before that adopts again at
-/// the next open, which skips a delta that already published. A populated schema-30 body with no `spent.delta/`
-/// refuses: its spends were only there. A sparse body can reach its published
+/// the next open, which skips a delta that already published. A populated
+/// schema-30 body with no `spent.delta/` refuses: its spends were only there. A sparse body can reach its published
 /// end on disk, so the length cannot tell the two apart; `opened_schema` (the
 /// `meta` schema before this open) can. `Store` moves `meta` to 30 only after
 /// this open returns, so a crash before the adoption publishes still opens
