@@ -48,10 +48,15 @@ pub const TDP_VERSION: u16 = 2;
 pub const MAX_RETAINED: usize = 64;
 
 /// Transaction-data replies one session gets for one template. Each reply
-/// re-serializes every template transaction; a JDC asks once per template,
-/// so past this many the session is closed, as a constraints flood is.
+/// re-serializes every template transaction; a JDC asks once per template.
+/// Past this many a request gets [`ERROR_CODE_TX_DATA_LIMIT`]. The session
+/// stays open: a JDC that retries keeps its template provider.
 #[doc(hidden)]
 pub const MAX_TX_DATA_REPLIES: u8 = 2;
+
+/// `RequestTransactionData.Error` code for a template already answered
+/// [`MAX_TX_DATA_REPLIES`] times. Not one of the spec's two codes.
+pub const ERROR_CODE_TX_DATA_LIMIT: &str = "request-limit-reached";
 
 /// Budgets that replace a still-queued one before it is built. A real client
 /// changes its budget minutes apart; past this many inside one cooldown the
@@ -365,8 +370,7 @@ impl Session {
                 }
             }
             MESSAGE_TYPE_REQUEST_TRANSACTION_DATA => {
-                return on_request_transaction_data(&mut self.conn, frame, &mut self.templates)
-                    .await;
+                on_request_transaction_data(&mut self.conn, frame, &mut self.templates).await?
             }
             MESSAGE_TYPE_SUBMIT_SOLUTION => self.on_submit_solution(frame).await?,
             t => rbitcoin_log::info!("sv2: ignoring message {t:#x}"),
@@ -700,27 +704,30 @@ pub async fn on_setup(conn: &mut NoiseConn, mut frame: Frame) -> io::Result<bool
 }
 
 /// An id this session was sent but no longer retains is stale; any other
-/// unknown id was never sent. `false`: a template asked for more than
-/// [`MAX_TX_DATA_REPLIES`] times; close the session.
+/// unknown id was never sent. A template already answered
+/// [`MAX_TX_DATA_REPLIES`] times gets [`ERROR_CODE_TX_DATA_LIMIT`].
 pub async fn on_request_transaction_data(
     conn: &mut NoiseWriter,
     mut frame: Frame,
     templates: &mut Templates,
-) -> io::Result<bool> {
+) -> io::Result<()> {
     let Ok(RequestTransactionData { template_id }) = binary_sv2::from_bytes(&mut frame.payload)
     else {
         rbitcoin_log::info!("sv2: undecodable RequestTransactionData");
-        return Ok(true);
+        return Ok(());
     };
+    let mut over_limit = false;
     if let Some(r) = templates.retained.iter_mut().find(|r| r.id == template_id) {
-        if r.data_replies >= MAX_TX_DATA_REPLIES {
-            rbitcoin_log::info!("sv2: RequestTransactionData repeated for one template, closing");
-            return Ok(false);
+        over_limit = r.data_replies >= MAX_TX_DATA_REPLIES;
+        if !over_limit {
+            r.data_replies += 1;
         }
-        r.data_replies += 1;
     }
-    let Some(Retained { t, .. }) = templates.get(template_id) else {
-        let code = if template_id <= templates.last_id {
+    let found = templates.get(template_id).filter(|_| !over_limit);
+    let Some(Retained { t, .. }) = found else {
+        let code = if over_limit {
+            ERROR_CODE_TX_DATA_LIMIT
+        } else if template_id <= templates.last_id {
             ERROR_CODE_REQUEST_TRANSACTION_DATA_STALE_TEMPLATE_ID
         } else {
             ERROR_CODE_REQUEST_TRANSACTION_DATA_TEMPLATE_ID_NOT_FOUND
@@ -732,7 +739,7 @@ pub async fn on_request_transaction_data(
         };
         conn.send(MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR, reply)
             .await?;
-        return Ok(true);
+        return Ok(());
     };
     let raw: Vec<Vec<u8>> = t
         .txs
@@ -755,5 +762,5 @@ pub async fn on_request_transaction_data(
     };
     conn.send(MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS, reply)
         .await?;
-    Ok(true)
+    Ok(())
 }
