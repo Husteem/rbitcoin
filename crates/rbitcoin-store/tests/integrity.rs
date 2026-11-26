@@ -392,6 +392,44 @@ fn seal_clamp_exposes_null_run_and_tip_drops_below_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A clamp down to the sealed height must still compare the sealed hash: a
+/// different header there is a block the barrier never sealed.
+#[test]
+fn seal_clamp_to_a_different_block_at_the_sealed_height_drops_it() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let mut parent_hash = [0u8; 32];
+    let mut prev = Fk::NULL;
+    let mut parent_at_10 = ([0u8; 32], Fk::NULL);
+    for h in 0u32..=10 {
+        if h == 10 {
+            parent_at_10 = (parent_hash, prev);
+        }
+        let rec = hdr(prev, parent_hash, h as u8);
+        parent_hash = rec.hash;
+        let fk = s.put_header(&rec).unwrap();
+        prev = fk;
+        s.confirmed.set(&write, Height(h), fk).unwrap();
+    }
+    s.headers.flush().unwrap();
+    s.flush_class_c_tip().unwrap();
+    let seal = TipSeal::load(s.path()).unwrap().expect("seal at 10");
+    let other = hdr(parent_at_10.1, parent_at_10.0, 200);
+    let other_fk = s.put_header(&other).unwrap();
+    s.confirmed.set(&write, Height(10), other_fk).unwrap();
+    for h in 11u32..=13 {
+        s.confirmed.set_raw_for_test(&write, Height(h), 0).unwrap();
+    }
+    s.headers.flush().unwrap();
+    s.confirmed.flush().unwrap();
+    seal.store(s.path()).unwrap();
+
+    let r = s.revalidate_tip_window_n(6).unwrap();
+    assert_eq!(s.confirmed.tip_height(), Some(Height(9)), "{r:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Heights `0..len` sealed at the tip, then `confirmed[hole]` nulled and
 /// flushed, with the spend marker three below the tip.
 fn sealed_chain_with_hole(dir: &std::path::Path, len: u32, hole: u32) {

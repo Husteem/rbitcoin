@@ -285,11 +285,16 @@ impl Store {
         let Some(seal) = TipSeal::load(self.path())? else {
             return Ok(());
         };
-        let Some(tip) = self.confirmed.tip_height() else {
+        let Some(mut tip) = self.confirmed.tip_height() else {
             return Ok(());
         };
         if tip.0 > seal.tip_height {
-            return self.shrink_tip_to(write, Some(seal.tip_height), report);
+            // Then compare the hash at the sealed height like any other tip.
+            self.shrink_tip_to(write, Some(seal.tip_height), report)?;
+            let Some(shrunk) = self.confirmed.tip_height() else {
+                return Ok(());
+            };
+            tip = shrunk;
         }
         if tip.0 < seal.tip_height {
             return Ok(());
