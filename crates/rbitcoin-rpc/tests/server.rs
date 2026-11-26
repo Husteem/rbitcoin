@@ -1963,6 +1963,56 @@ fn rest_budget_state(budget: usize) -> (AppState, rbitcoin_store::testutil::Temp
     (state, dir)
 }
 
+/// A reply larger than the budget waits for the replies still unwritten
+/// instead of being built and refused. While it waits, a new request is 503
+/// before anything is built, so smaller replies do not keep it out.
+#[tokio::test]
+async fn a_reply_over_the_budget_waits_for_unwritten_replies() {
+    const BUDGET: usize = 16;
+    let (state, dir) = rest_budget_state(BUDGET);
+    let rest_reply_bytes = state.rest_reply_bytes.clone();
+    let get = |state: AppState| {
+        rest_entry(
+            State(state),
+            axum::http::Request::get("/rest/chaininfo.json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+    };
+    let unwritten = rest_reply_bytes.body(vec![0]).await.expect("budget free");
+    let large = tokio::spawn(get(state.clone()));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while rest_reply_bytes.available() > 0 && !large.is_finished() {
+        assert!(tokio::time::Instant::now() < deadline, "reply never queued");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        !large.is_finished(),
+        "refused, not waiting: {:?}",
+        large.await
+    );
+    let refused = get(state.clone()).await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    drop(unwritten);
+    let large = large.await.expect("join");
+    assert_eq!(large.status(), StatusCode::OK);
+    drop(large);
+    assert_eq!(rest_reply_bytes.available(), BUDGET);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// A reply whose bytes stay held past the wait is dropped, and the bytes it
+/// had already taken go back to the budget.
+#[tokio::test(start_paused = true)]
+async fn a_reply_that_waits_too_long_is_dropped() {
+    let budget = ReplyBytes::new(16);
+    let unwritten = budget.body(vec![0; 4]).await.expect("budget free");
+    assert!(budget.body(vec![0; 32]).await.is_none(), "waited forever");
+    assert_eq!(budget.available(), 12);
+    drop(unwritten);
+    assert_eq!(budget.available(), 16);
+}
+
 /// Hyper drops the body once it has queued the last frame, and that frame
 /// can sit in its write queue while the client stops reading. The budget
 /// covers the reply's memory, so it comes back only when the last frame
@@ -2005,7 +2055,7 @@ async fn a_multi_slice_reply_keeps_its_bytes_while_any_slice_lives() {
     let budget = ReplyBytes::new(4 * REST_REPLY_CHUNK);
     let total = budget.available();
     let reply: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-    let mut body = budget.body(reply.clone()).expect("budget free");
+    let mut body = budget.body(reply.clone()).await.expect("budget free");
     assert_eq!(total - budget.available(), len);
     assert_eq!(body.size_hint().exact(), Some(len as u64));
     let mut slices = Vec::new();
