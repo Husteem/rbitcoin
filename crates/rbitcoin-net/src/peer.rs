@@ -8592,7 +8592,10 @@ fn unstored_header_path(
 
 /// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
 /// Store the pending headers from `tip` back to the last stored one. Headers
-/// already stored were checked when they were written.
+/// already stored were checked when they were written. A held body counts as
+/// pending: a side block held without a header row (a `submitblock` that lost
+/// a race) is the parent [`header_announcement_connects`] accepted, so its
+/// header is written before its child's.
 ///
 /// The store's error when a chunk is rejected. Chunks already written in this
 /// call stay.
@@ -8602,7 +8605,12 @@ pub fn persist_pending_header_path(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
 ) -> Result<(), NetError> {
-    let path = unstored_header_path(hub, tip, |hash| pending.get(&hash).copied());
+    let path = unstored_header_path(hub, tip, |hash| {
+        pending
+            .get(&hash)
+            .copied()
+            .or_else(|| hub.held_body(&hash).map(|b| b.header))
+    });
     // One store batch. Per-header ensure walks parent heights to genesis, so a
     // full below-floor chain (thousands of headers) is quadratic.
     for chunk in path.chunks(MAX_HEADERS_RESULTS) {

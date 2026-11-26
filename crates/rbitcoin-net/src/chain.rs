@@ -2282,7 +2282,7 @@ impl ChainHub {
                 })?;
             let parent_height = self
                 .sync_parent_height(&parent_hash, in_batch)
-                .ok_or_else(|| NetError::Consensus("header parent height unknown".into()))?;
+                .ok_or_else(|| NetError::store("header parent height unknown"))?;
             let mtp = self.mtp_off_tip(&parent, in_batch)?;
             let first = self.period_first_off_tip(&parent, parent_height, in_batch);
             let expected =

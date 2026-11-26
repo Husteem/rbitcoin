@@ -8298,3 +8298,73 @@ fn pair_winner_write_failure_promotes_an_unpublished_loser() {
     assert!(hub.held_body(&bad.block_hash()).is_none());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A side block held as a body (a `submitblock` that lost a race) has no
+/// header row. A peer that extends it sends a header whose parent is that
+/// body. The persist walk writes the held block's header first, so the
+/// child connects instead of failing "header parent unknown", which scored
+/// and disconnected the honest sender (#2090).
+#[test]
+fn header_on_a_held_body_writes_the_held_header_first() {
+    use rbitcoin_net::peer::{
+        header_announcement_connects, header_is_stored, persist_pending_header_path,
+    };
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = hub.tip_header().unwrap().time;
+    let a = mine(gen, t0.saturating_add(1), 1);
+    hub.accept_block(a.clone()).unwrap();
+    let b = mine_distinct(gen, t0.saturating_add(2), 1, &[a.block_hash()]);
+    hub.hold_body(Arc::new(b.clone()), false);
+    assert!(
+        !header_is_stored(&hub, &b.block_hash()),
+        "held without a header row"
+    );
+
+    let c = mine(b.block_hash(), t0.saturating_add(3), 2);
+    let pending: HashMap<BlockHash, Header> = [(c.block_hash(), c.header)].into();
+    assert!(header_announcement_connects(
+        &hub,
+        &pending,
+        c.header.prev_blockhash
+    ));
+    persist_pending_header_path(&hub, &pending, c.block_hash())
+        .expect("the child of a held body connects");
+    assert!(
+        header_is_stored(&hub, &b.block_hash()),
+        "held header written"
+    );
+    assert!(
+        header_is_stored(&hub, &c.block_hash()),
+        "child header written"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A batch parent whose height walk hit its cap has no height. That is this
+/// node's lookup failing, not the sender's header, so the error is a local
+/// fault and does not score the peer (#2090).
+#[test]
+fn header_parent_height_unknown_is_a_local_fault() {
+    let (_dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let mut parent = genesis_block(&hub.params).header;
+    parent.prev_blockhash = BlockHash::from_byte_array([0xab; 32]);
+    let mut child = parent;
+    child.prev_blockhash = parent.block_hash();
+    let mut in_batch = HashMap::new();
+    in_batch.insert(
+        parent.block_hash().to_byte_array(),
+        HeaderSyncNode {
+            fk: Fk(0),
+            header: parent,
+            height: None,
+            min_diff_walk: None,
+        },
+    );
+    let err = hub
+        .header_sync_contextual(&child, &in_batch)
+        .expect_err("no parent height");
+    assert!(err.is_local_fault(), "{err:?}");
+}
