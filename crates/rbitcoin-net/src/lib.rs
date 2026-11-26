@@ -136,8 +136,7 @@ pub use serve_perf::{
 pub use service::{P2PNode, REDIAL_INTERVAL, REDIAL_INTERVAL_TEST};
 pub use socks::{Dialer, NetProxies};
 pub use test_accept::{
-    accept_reject_reason, package_has_conflicts, submit_tx_version_nonstandard, TestAcceptRow,
-    TestAcceptVerdict,
+    package_has_conflicts, submit_tx_version_nonstandard, TestAcceptRow, TestAcceptVerdict,
 };
 pub use tx_relay::{
     arm_template_prev_sample, pool_settle, require_settled, sample_template_prev_for_build,

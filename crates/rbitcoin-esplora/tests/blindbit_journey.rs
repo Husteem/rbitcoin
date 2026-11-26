@@ -248,7 +248,12 @@ async fn blindbit_v1_routes_serve_the_thin_tweak_index() {
     let low_body = json!({ "data": bitcoin::consensus::encode::serialize_hex(&low) }).to_string();
     let (st, resp) = http_post(addr, "/blindbit/v1/forward-tx", low_body.as_bytes()).await;
     assert_eq!(st, 400, "{resp}");
-    assert!(serde_json::from_str::<Value>(&resp).unwrap()["error"].is_string(), "{resp}");
+    let err: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        err["error"],
+        json!(r#"sendrawtransaction RPC error: {"code":-26,"message":"insufficient fee"}"#),
+        "{resp}"
+    );
     assert!(!hub.contains(&low.compute_txid()));
     assert!(hub.contains(&fwd.compute_txid()));
     for bad in [&b"not json"[..], br#"{"data":"zz"}"#, br#"{"data":"00"}"#] {
