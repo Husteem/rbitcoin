@@ -3101,6 +3101,85 @@ fn a_challenger_can_extend_past_the_current_tip() {
     );
 }
 
+/// A batch that extends the challenger through a header this peer cannot
+/// reopen (it sent that header's copies) is refused, though its first header
+/// reopens: a challenger that then beat the candidate would move the walk
+/// onto a header no peer is asked for (#1992).
+#[test]
+fn a_challenger_extension_through_a_header_still_abandoned_is_refused() {
+    use rbitcoin_ibd::ibd::state::MutatedCopies;
+
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reopen-challenger");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let common = mine(gen, 1);
+    let current = mine(common.block_hash(), 2);
+    let current_tip = mine(current.block_hash(), 3);
+    let side = mine(common.block_hash(), 12);
+    let side_tip = mine(side.block_hash(), 13);
+    let x4 = mine(side_tip.block_hash(), 14);
+    let x5 = mine(x4.block_hash(), 15);
+    hub.milestone.height = 5;
+    let (first, mut first_rx) = slot(0);
+    let (second, mut second_rx) = slot(1);
+    let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+    fill_queue(&mut st);
+
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let _ = drain_getheaders(&mut first_rx);
+    apply(&mut st, &hub, 0, vec![common]);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let _ = drain_getheaders(&mut first_rx);
+    apply(&mut st, &hub, 0, vec![current, current_tip]);
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::BlocksInv {
+            peer: 1,
+            hashes: vec![side_tip.block_hash()],
+        },
+        &AtomicU32::new(0),
+        &mut AddrMan::new(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+        None,
+    );
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let _ = drain_getheaders(&mut second_rx);
+    apply(&mut st, &hub, 1, vec![side, side_tip]);
+    assert!(
+        st.header_walk.challenger.is_some(),
+        "the side chain challenges"
+    );
+
+    // x4 was abandoned for another peer's copies, x5 for peer 1's own.
+    let other = rbitcoin_net::NetAddr::from_socket(([10, 9, 9, 9], 0).into());
+    let me = st.slots.iter().find(|s| s.id == 1).unwrap().copy_sender();
+    for (h, sender) in [(x4, other), (x5, me)] {
+        let mut copies = MutatedCopies::default();
+        for _ in 0..3 {
+            copies.note(Some(sender));
+        }
+        st.mutated_copies.insert(h.block_hash(), copies);
+        st.unservable.insert(h.block_hash());
+    }
+    apply(&mut st, &hub, 1, vec![x4, x5]);
+    assert_ne!(
+        st.header_walk.tip_hash(),
+        Some(x5.block_hash()),
+        "the walk does not move onto a header still abandoned"
+    );
+    assert!(st
+        .header_walk
+        .challenger
+        .as_ref()
+        .is_none_or(|c| c.tip.hash != Some(x5.block_hash())));
+    assert!(st.unservable.contains(&x5.block_hash()));
+    assert!(
+        st.unservable.contains(&x4.block_hash()),
+        "the refused batch gives x4's reopen back"
+    );
+}
+
 /// Median time while the tip is still genesis, then that same hub confirms
 /// a stale ancestor and rewinds onto it. Retarget is a second hub: its
 /// period length is not regtest difficulty, and each checkpoint layout
@@ -9308,4 +9387,236 @@ fn a_walk_move_past_a_sibling_keeps_it_recorded() {
     forget_tip_siblings(&mut st, 1);
     assert!(st.tip_siblings.is_empty());
     assert!(!st.hash_height.contains_key(&sibling));
+}
+
+/// Header A (height 1) abandoned for three mutated copies from kept peer 0,
+/// then a sibling B made the candidate by peer 1. Peer 2 sent no copy.
+fn abandoned_a_under_b(
+    label: &str,
+) -> (
+    rbitcoin_query::testutil::TempDir,
+    ChainHub,
+    IbdWorkState,
+    Header,
+    Vec<mpsc::UnboundedReceiver<PeerCmd>>,
+) {
+    use rbitcoin_ibd::ibd::events::{
+        finish_deferred_archived_clear, BadPrevParent, DeferredArchivedClear,
+        MUTATED_COPIES_BEFORE_ABANDON,
+    };
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled(label);
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let (mut s0, rx0) = slot(0);
+    s0.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
+    let (s1, rx1) = slot(1);
+    let (s2, rx2) = slot(2);
+    let mut st = IbdWorkState::new(vec![s0, s1, s2], Some(gen), Some(0));
+    ensure_origin(&mut st, &hub);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let a = mine(gen, 1);
+    let hash = a.block_hash();
+    apply(&mut st, &hub, 0, vec![a]);
+    for _ in 0..MUTATED_COPIES_BEFORE_ABANDON {
+        let copy = DeferredArchivedClear {
+            height: 1,
+            hash,
+            err: "bad-txnmrklroot".into(),
+            sender: Some(0),
+            parent: BadPrevParent::Tip,
+            retry_tip_child: false,
+            bad_prev: false,
+            was_occupant: true,
+        };
+        finish_deferred_archived_clear(&mut st, Some(&hub), &copy);
+    }
+    assert!(st.unservable.contains(&hash), "peer 0's copies abandon A");
+    let b = mine(gen, 2);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    apply(&mut st, &hub, 1, vec![b]);
+    assert_eq!(
+        candidate_tip(&st),
+        Some(b.block_hash()),
+        "B is the candidate"
+    );
+    (dir, hub, st, a, vec![rx0, rx1, rx2])
+}
+
+/// After A is abandoned another chain becomes the candidate. A fresh peer's
+/// heavier chain through A must still reopen A: the fork is judged with A
+/// servable, so A goes back on the path and is asked of that peer (#1992).
+#[test]
+fn a_heavier_fork_through_an_abandoned_header_reopens_it() {
+    let (dir, hub, mut st, a, _rx) = abandoned_a_under_b("reopen-fork");
+    let hash = a.block_hash();
+    let a2 = mine(hash, 3);
+    apply(&mut st, &hub, 2, vec![a, a2]);
+    assert!(
+        !st.unservable.contains(&hash),
+        "the fresh peer's heavier chain reopens A"
+    );
+    assert_eq!(
+        candidate_tip(&st),
+        Some(a2.block_hash()),
+        "the heavier chain through A is the candidate"
+    );
+    assert!(st.ordered_set.contains(&hash), "A is queued again");
+    assert!(may_serve(&st, 2, &hash), "A is asked of the announcer");
+    let _ = dir;
+}
+
+/// At the soft cap the walk records a heavier fork as its candidate and
+/// stores nothing: the checkpoint is the record. A fork through an
+/// abandoned header that the walk adopts keeps the header reopened, or the
+/// candidate would rest on an abandoned header (#1992).
+#[test]
+fn a_heavier_fork_the_walk_adopts_at_the_cap_keeps_its_reopen() {
+    let (dir, hub, mut st, a, _rx) = abandoned_a_under_b("reopen-fork-cap");
+    let hash = a.block_hash();
+    let mut n = 0u32;
+    while st.ordered.len() < ORDERED_HEADERS_SOFT_CAP {
+        push_dummy(&mut st, n);
+        n += 1;
+    }
+    let a2 = mine(hash, 3);
+    apply(&mut st, &hub, 2, vec![a, a2]);
+    assert_eq!(
+        candidate_tip(&st),
+        Some(a2.block_hash()),
+        "the walk adopts the heavier chain through A"
+    );
+    assert!(
+        !st.unservable.contains(&hash),
+        "the candidate does not rest on an abandoned header"
+    );
+    let _ = dir;
+}
+
+/// At the soft cap a solicited reply that extends the walk is absorbed as
+/// its lookahead and stores nothing. When its first header was abandoned
+/// and this peer reopens it, the walk tip then rests on that header, so the
+/// header keeps its reopen (#1992).
+#[test]
+fn a_reopened_header_the_walk_absorbs_at_the_cap_keeps_its_reopen() {
+    use rbitcoin_ibd::ibd::state::MutatedCopies;
+
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reopen-absorb-cap");
+    hub.ensure_genesis().unwrap();
+    floor_unreachable(&mut hub);
+    let gen = hub.tip_hash().unwrap();
+    let h1 = mine(gen, 1);
+    let h2 = mine(h1.block_hash(), 2);
+    let h3 = mine(h2.block_hash(), 3);
+    let (s0, _rx0) = slot(0);
+    let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+    queue_at_cap_ending_on(&mut st, &hub, h1);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    // h2 was abandoned for copies another IP sent.
+    let mut copies = MutatedCopies::default();
+    for _ in 0..3 {
+        copies.note(Some(rbitcoin_net::NetAddr::from_socket(
+            ([10, 9, 9, 9], 0).into(),
+        )));
+    }
+    st.mutated_copies.insert(h2.block_hash(), copies);
+    st.unservable.insert(h2.block_hash());
+    apply(&mut st, &hub, 0, vec![h2, h3]);
+    assert_eq!(
+        st.header_walk.tip_hash(),
+        Some(h3.block_hash()),
+        "the walk absorbs the reply"
+    );
+    assert!(
+        !st.unservable.contains(&h2.block_hash()),
+        "the walk tip does not rest on an abandoned header"
+    );
+}
+
+/// A reply whose later header stays abandoned for this peer (it sent that
+/// header's copies) does not move the walk onto it: the walk would then rest
+/// on a header no peer is asked for. The first header keeps its reopen only
+/// where the reply puts it on the path (#1992).
+#[test]
+fn a_reply_through_a_header_still_abandoned_does_not_extend_the_walk() {
+    use rbitcoin_ibd::ibd::state::MutatedCopies;
+
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reopen-later-abandoned");
+    hub.ensure_genesis().unwrap();
+    floor_unreachable(&mut hub);
+    let gen = hub.tip_hash().unwrap();
+    let h1 = mine(gen, 1);
+    let h2 = mine(h1.block_hash(), 2);
+    let h3 = mine(h2.block_hash(), 3);
+    let (s0, _rx0) = slot(0);
+    let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+    queue_at_cap_ending_on(&mut st, &hub, h1);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    // h2 was abandoned for another peer's copies; h3 for this peer's.
+    let other = rbitcoin_net::NetAddr::from_socket(([10, 9, 9, 9], 0).into());
+    let me = st.slots[0].copy_sender();
+    for (h, sender) in [(h2, other), (h3, me)] {
+        let mut copies = MutatedCopies::default();
+        for _ in 0..3 {
+            copies.note(Some(sender));
+        }
+        st.mutated_copies.insert(h.block_hash(), copies);
+        st.unservable.insert(h.block_hash());
+    }
+    let h2_record = st.mutated_copies[&h2.block_hash()];
+    apply(&mut st, &hub, 0, vec![h2, h3]);
+    assert_ne!(
+        st.header_walk.tip_hash(),
+        Some(h3.block_hash()),
+        "the walk does not rest on a header still abandoned"
+    );
+    assert!(st.unservable.contains(&h3.block_hash()));
+    assert!(
+        !st.ordered_set.contains(&h3.block_hash()),
+        "h3 is not queued"
+    );
+    // h2 keeps its reopen only where the reply stored it on the path.
+    let kept = !st.unservable.contains(&h2.block_hash());
+    assert_eq!(
+        kept,
+        st.ordered_set.contains(&h2.block_hash()),
+        "h2 reopened iff queued"
+    );
+    assert_eq!(kept, st.mutated_copies[&h2.block_hash()] != h2_record);
+}
+
+/// A batch through an abandoned header that is then refused (here A alone,
+/// no heavier than the candidate B) does not reopen it: the header would
+/// leave the abandoned set without going back on the path, and the refused
+/// batch would spend one of the bounded reopens (#1992).
+#[test]
+fn a_refused_batch_through_an_abandoned_header_does_not_reopen_it() {
+    let (dir, hub, mut st, a, _rx) = abandoned_a_under_b("reopen-refused");
+    let hash = a.block_hash();
+    // More refused batches than there are reopens.
+    for _ in 0..4 {
+        apply(&mut st, &hub, 2, vec![a]);
+        assert!(!st.ordered_set.contains(&hash), "the batch is refused");
+        assert!(
+            st.unservable.contains(&hash),
+            "a refused batch leaves A abandoned"
+        );
+        assert!(
+            !st.tip_siblings.contains(&hash),
+            "a refused batch leaves no ask lane for A"
+        );
+        assert!(
+            st.header_walk
+                .challenger
+                .as_ref()
+                .is_none_or(|c| c.tip.hash != Some(hash)),
+            "a refused batch leaves no challenger through A"
+        );
+    }
+    // None of them spent a reopen: a heavier chain through A still reopens it.
+    let a2 = mine(hash, 3);
+    apply(&mut st, &hub, 2, vec![a, a2]);
+    assert!(!st.unservable.contains(&hash), "A reopens");
+    assert!(st.ordered_set.contains(&hash), "A is queued again");
+    let _ = dir;
 }

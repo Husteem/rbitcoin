@@ -885,7 +885,10 @@ pub fn may_serve(st: &IbdWorkState, peer: usize, hash: &BlockHash) -> bool {
     let height = st.hash_height.get(hash).copied();
     let now = super::peer_io::ibd_mono_ms();
     let path = &st.height_to_hash;
-    let askable = |s: &PeerSlot| s.may_take_block(hash, now);
+    let kept_off = st.mutated_copies.get(hash);
+    let askable = |s: &PeerSlot| {
+        s.may_take_block(hash, now) && !kept_off.is_some_and(|c| c.keeps_off(s.copy_sender(), now))
+    };
     let shows = |s: &PeerSlot| askable(s) && height.is_some_and(|ht| s.chain.shows(path, ht));
     let open =
         |s: &PeerSlot| askable(s) && !height.is_some_and(|ht| s.chain.left_path_by(path, ht));
@@ -1054,6 +1057,11 @@ pub fn suppress_competing_chain(
     // returns that before this function runs, so the length comparison is not
     // a second gate.
     if challenger_extends(st, prev) {
+        // The challenger can replace the candidate: it takes no header no
+        // peer is asked for, as the candidate does not.
+        if through_abandoned(st, headers) {
+            return true;
+        }
         return extend_challenger(st, hub, Some(peer), headers);
     }
     // A batch that has not met the next checkpoint is not a competing chain.
@@ -1232,10 +1240,11 @@ pub fn retire_invalid(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, he
 /// empties, and IBD never leaves catch-up (#1811).
 ///
 /// This is not an invalidity claim: the header breaks no rule, so it is not
-/// marked failed. It is taken off the download path and no IBD peer asks for
-/// it again this session; the path above its parent is re-seeded so an
-/// equal-work sibling at tip+1 can be asked for instead. After IBD,
-/// tip-follow can still connect a block a peer serves for it.
+/// marked failed. It is taken off the download path, and the path above its
+/// parent is re-seeded so an equal-work sibling at tip+1 can be asked for
+/// instead. A peer that sent none of the copies puts it back by announcing it
+/// (`events::reopen_for_announcer`). After IBD, tip-follow can still connect
+/// a block a peer serves for it.
 #[doc(hidden)]
 pub fn retire_unservable(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u32) {
     retire_undeliverable(
@@ -1492,7 +1501,9 @@ pub fn offer_alternate(
     if !pow_linked(headers) {
         return None;
     }
-    if st.unservable.contains(&headers[0].block_hash()) {
+    // A chain through an abandoned header, at its start or later, is not
+    // one the walk can download.
+    if through_abandoned(st, headers) {
         return Some(true);
     }
     if short_below_floor(st, hub, headers) {
@@ -2833,6 +2844,15 @@ pub fn extend_tip(
     extend_connected(st, hub, headers, peer)
 }
 
+/// Whether any of `headers` is abandoned (`unservable`). A batch that
+/// reopened its abandoned headers first ([`crate::ibd::events`]) holds only
+/// those this peer could not reopen.
+fn through_abandoned(st: &IbdWorkState, headers: &[Header]) -> bool {
+    headers
+        .iter()
+        .any(|h| st.unservable.contains(&h.block_hash()))
+}
+
 /// Record `headers` on the candidate. The caller already decided this batch
 /// is allowed to extend, including a stored prefix of a full reply.
 fn extend_connected(
@@ -2841,10 +2861,7 @@ fn extend_connected(
     headers: &[Header],
     peer: Option<usize>,
 ) -> bool {
-    if headers
-        .first()
-        .is_some_and(|h| st.unservable.contains(&h.block_hash()))
-    {
+    if through_abandoned(st, headers) {
         return false;
     }
     if over_length(st, headers.len()) {

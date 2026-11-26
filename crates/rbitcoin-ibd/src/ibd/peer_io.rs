@@ -400,6 +400,21 @@ impl PeerSlot {
         self.alive && self.block_download_paused_until.is_none()
     }
 
+    /// Who this peer is for mutated-copy records: its network address without
+    /// the port, so a reconnect from a new port is the same sender. An onion,
+    /// I2P or `--proxy` peer has no socket address (`addr` is `0.0.0.0`), so
+    /// its own address keeps it apart from every other overlay peer.
+    pub fn copy_sender(&self) -> rbitcoin_net::NetAddr {
+        use rbitcoin_net::NetAddr;
+        match self.net {
+            NetAddr::Ip(s) => NetAddr::Ip(SocketAddr::new(s.ip().to_canonical(), 0)),
+            NetAddr::Onion { pk, .. } => NetAddr::Onion { pk, port: 0 },
+            NetAddr::I2p { dest, .. } => NetAddr::I2p { dest, port: 0 },
+            NetAddr::Cjdns { ip, .. } => NetAddr::Cjdns { ip, port: 0 },
+            NetAddr::Name { id, .. } => NetAddr::Name { id, port: 0 },
+        }
+    }
+
     /// Assign may ask this peer for `hash`: it takes block requests and did
     /// not answer `notfound` for it recently.
     pub fn may_take_block(&self, hash: &BlockHash, now_ms: u64) -> bool {

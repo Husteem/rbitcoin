@@ -135,6 +135,7 @@ fn onion_stall_kicks_keep_independent_cooldowns_and_strikes() {
             Duration::from_secs(30),
             60_000,
             0,
+            &Default::default(),
         );
         assert_eq!(freed, vec![h]);
         assert!(!slot.alive);
@@ -1340,6 +1341,7 @@ fn disconnect_stalled_after_30s_without_rx() {
         Duration::from_secs(30),
         30_001,
         0,
+        &Default::default(),
     );
     assert!(cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(a)));
     assert!(inflight.is_empty());
@@ -1367,6 +1369,7 @@ fn disconnect_stalled_not_when_rx_recent() {
         Duration::from_secs(30),
         45_000,
         0,
+        &Default::default(),
     );
     assert!(!cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(a)));
     assert!(inflight.contains_key(&h));
@@ -1406,6 +1409,7 @@ fn disconnect_stalled_opening_write_starts_a_fresh_window() {
         Duration::from_secs(30),
         50_000,
         0,
+        &Default::default(),
     );
     assert!(
         !cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(a)),
@@ -1426,6 +1430,7 @@ fn disconnect_stalled_opening_write_starts_a_fresh_window() {
         Duration::from_secs(30),
         70_001,
         0,
+        &Default::default(),
     );
     assert!(
         cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(a)),
@@ -1463,6 +1468,7 @@ fn disconnect_stalled_rearms_after_the_window_drains() {
         Duration::from_secs(30),
         110_000,
         0,
+        &Default::default(),
     );
     assert!(
         !cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(a)),
@@ -1478,6 +1484,7 @@ fn disconnect_stalled_rearms_after_the_window_drains() {
         Duration::from_secs(30),
         130_001,
         0,
+        &Default::default(),
     );
     assert!(cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(a)));
     assert!(inflight.is_empty());
@@ -1505,6 +1512,7 @@ fn disconnect_stalled_skips_getdata_still_in_the_writer() {
         Duration::from_secs(30),
         90_000,
         0,
+        &Default::default(),
     );
     assert!(!cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(a)));
     assert!(inflight.contains_key(&h));
@@ -1537,6 +1545,7 @@ fn disconnect_stalled_drops_one_when_every_peer_is_quiet() {
         Duration::from_secs(30),
         60_000,
         0,
+        &Default::default(),
     );
     assert_eq!(
         cooldown.len(),
@@ -1574,6 +1583,7 @@ fn disconnect_stalled_ignores_silence_without_getdata() {
         Duration::from_secs(30),
         60_000,
         0,
+        &Default::default(),
     );
     assert!(
         !cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(idle_addr)),
@@ -1610,6 +1620,7 @@ fn disconnect_stalled_drops_only_the_quiet_peer() {
         Duration::from_secs(30),
         60_000,
         0,
+        &Default::default(),
     );
     assert!(cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(quiet_addr)));
     assert!(!cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(live_addr)));
@@ -1648,6 +1659,7 @@ fn disconnect_stalled_drops_one_when_every_peer_chats_without_blocks() {
         Duration::from_secs(30),
         60_000,
         0,
+        &Default::default(),
     );
     assert_eq!(cooldown.len(), 1);
     assert_eq!(inflight.len(), 1);
@@ -1682,6 +1694,7 @@ fn disconnect_stalled_keeps_a_chatter_beside_a_block_sender() {
         Duration::from_secs(30),
         60_000,
         0,
+        &Default::default(),
     );
     assert!(cooldown.is_empty());
     assert_eq!(inflight.len(), 2);
@@ -1723,6 +1736,7 @@ fn disconnect_stalled_keeps_a_peer_still_sending_a_block() {
         Duration::from_secs(30),
         60_000,
         0,
+        &Default::default(),
     );
     assert!(
         cooldown.is_empty(),
@@ -1746,6 +1760,7 @@ fn disconnect_stalled_keeps_a_peer_still_sending_a_block() {
         Duration::from_secs(30),
         60_000,
         0,
+        &Default::default(),
     );
     assert!(cooldown.is_empty());
     assert!(inflight.contains_key(&h));
@@ -1794,6 +1809,7 @@ fn disconnect_stalled_drops_a_peer_sending_only_unsolicited_bytes() {
         Duration::from_secs(30),
         60_000,
         0,
+        &Default::default(),
     );
     assert!(cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(a)));
     assert!(inflight.is_empty());
@@ -1813,6 +1829,7 @@ fn disconnect_stalled_releases_and_cools_addr() {
         now,
         Duration::from_secs(30),
         &rbitcoin_consensus::NodeClock::new(),
+        &Default::default(),
     );
     assert!(!cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(addr(13))));
 }

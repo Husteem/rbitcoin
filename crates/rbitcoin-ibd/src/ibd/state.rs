@@ -262,6 +262,80 @@ pub type BlockHashMap<V> = HashMap<BlockHash, V, std::hash::BuildHasherDefault<B
 /// Block-hash keyed set with [`BlockHashHasher`].
 pub type BlockHashSet = HashSet<BlockHash, std::hash::BuildHasherDefault<BlockHashHasher>>;
 
+/// Peers recorded per hash in [`MutatedCopies`]. A ninth stops reopening.
+const MUTATED_SENDERS: usize = 8;
+
+/// Reopens per hash before it stays abandoned for the session.
+const MUTATED_REOPENS: u8 = 3;
+
+/// Mutated body copies of one hash, the peers that sent them (by network
+/// address without the port, [`super::peer_io::PeerSlot::copy_sender`], so a
+/// reconnect from a new port is the same peer and onion peers stay apart), how often it was reopened,
+/// and until when its senders are kept off it. Held inline so the bounded
+/// map holds no heap. An entry the tracking cap evicts loses all of it: that
+/// hash takes the full bound of copies again, and a peer that sent its
+/// copies may reopen it again. Each takes 256 other tracked hashes first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MutatedCopies {
+    pub copies: u8,
+    reopens: u8,
+    senders: [Option<rbitcoin_net::NetAddr>; MUTATED_SENDERS],
+    /// Monotonic ms before which no sender may be asked for the hash.
+    kept_off_until_ms: u64,
+}
+
+impl MutatedCopies {
+    /// One more copy from a kept peer: counted, and its sender recorded.
+    pub fn note(&mut self, sender: Option<rbitcoin_net::NetAddr>) {
+        self.copies = self.copies.saturating_add(1);
+        self.note_sender(sender);
+    }
+
+    /// Record a sender without counting its copy: a dropped peer's copy
+    /// does not count toward the abandon bound, but it must not reopen the
+    /// hash either.
+    pub fn note_sender(&mut self, sender: Option<rbitcoin_net::NetAddr>) {
+        let Some(ip) = sender else {
+            return;
+        };
+        if self.sent_by(ip) {
+            return;
+        }
+        if let Some(free) = self.senders.iter_mut().find(|s| s.is_none()) {
+            *free = Some(ip);
+        }
+    }
+
+    pub fn sent_by(&self, ip: rbitcoin_net::NetAddr) -> bool {
+        self.senders.contains(&Some(ip))
+    }
+
+    /// Whether `ip` may reopen the abandoned hash, and if so count it and
+    /// keep the senders off it until `until_ms`. Not a sender, under
+    /// [`MUTATED_REOPENS`], and the record not full (an unrecorded sender
+    /// could be one of the copies' senders).
+    pub fn take_reopen(&mut self, ip: rbitcoin_net::NetAddr, until_ms: u64) -> bool {
+        if !self.may_reopen(ip) {
+            return false;
+        }
+        self.reopens += 1;
+        self.kept_off_until_ms = until_ms;
+        true
+    }
+
+    /// Whether `ip` may reopen the hash, without counting it.
+    pub fn may_reopen(&self, ip: rbitcoin_net::NetAddr) -> bool {
+        let full = self.senders.iter().all(Option::is_some);
+        !full && !self.sent_by(ip) && self.reopens < MUTATED_REOPENS
+    }
+
+    /// Whether a peer at `ip` sent copies of the hash and is still kept off
+    /// it at `now_ms`, on whatever connection it is.
+    pub fn keeps_off(&self, ip: rbitcoin_net::NetAddr, now_ms: u64) -> bool {
+        now_ms < self.kept_off_until_ms && self.sent_by(ip)
+    }
+}
+
 /// Core mutable state for the IBD event loop.
 pub struct IbdWorkState {
     pub slots: Vec<PeerSlot>,
@@ -315,18 +389,20 @@ pub struct IbdWorkState {
     pub assign_path_lo: u32,
     /// Hashes that already produced one [`super::confirm::ConfirmRejectClass::EngineFault`].
     pub engine_fault_seen: HashSet<BlockHash>,
-    /// Mutated body copies received per hash. Bounds re-getting a hash whose
-    /// sender cannot be punished (`-connect` / noban), which would otherwise
-    /// keep IBD open forever (#1811).
-    pub mutated_copies: BlockHashMap<u8>,
+    /// Mutated body copies received per hash, and the kept peers that sent
+    /// them. Bounds re-getting a hash whose sender cannot be punished
+    /// (`-connect` / noban), which would otherwise keep IBD open forever
+    /// (#1811), and lets another peer reopen it (#1992).
+    pub mutated_copies: BlockHashMap<MutatedCopies>,
     /// Bodies whose serialized header has not produced an fk yet (the drain
     /// writes it inline; see #1994). Bounded so a store that keeps refusing
     /// the header cannot re-ask for the same body forever.
     pub header_write_misses: BlockHashMap<u8>,
     /// Headers abandoned because every body copy arrived mutated. Retired from
-    /// the work path and never re-seeded from the store this session. The
-    /// header itself is still valid; after IBD, tip-follow can still connect a
-    /// block a peer serves for it, but no IBD peer asks for it again.
+    /// the work path and never re-seeded from the store this session. A peer
+    /// that sent none of those copies reopens one by announcing it
+    /// (`events::reopen_for_announcer`); after IBD, tip-follow can still
+    /// connect a block a peer serves for it.
     pub unservable: BlockHashSet,
     /// Equal-work siblings announced at tip+1, kept so the tip can be planted
     /// at that height once the header in the slot is abandoned. Bounded like
@@ -598,7 +674,7 @@ impl IbdWorkState {
             + self.body.heap_bytes()
             + hash_table_bytes::<BlockHash, Fk>(self.header_fks.capacity())
             + hash_table_bytes::<NetAddr, Instant>(self.addr_cooldown.capacity())
-            + hash_table_bytes::<BlockHash, u8>(self.mutated_copies.capacity())
+            + hash_table_bytes::<BlockHash, MutatedCopies>(self.mutated_copies.capacity())
             + hash_table_bytes::<BlockHash, u8>(self.header_write_misses.capacity())
             + hash_table_bytes::<BlockHash, ()>(self.unservable.capacity())
             + (self.tip_siblings.capacity() * std::mem::size_of::<BlockHash>()) as u64

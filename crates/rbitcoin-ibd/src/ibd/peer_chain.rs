@@ -17,7 +17,11 @@ use std::time::{Duration, Instant};
 const LACKS_CAP: usize = 1024;
 /// How long a `notfound` keeps a peer off that block: one stall window. A
 /// peer that answered `notfound` everywhere is asked again after it.
-const LACKS_TTL_MS: u64 = 30_000;
+const LACKS_TTL_MS: u64 = STALL_WINDOW_MS;
+
+/// One stall window: how long a `notfound`, or a reopened header's copy
+/// senders, keep a peer off a block.
+pub(crate) const STALL_WINDOW_MS: u64 = 30_000;
 
 /// Announced hashes kept per peer: one full `headers` reply.
 const ANNOUNCED_CAP: usize = rbitcoin_net::codec::MAX_HEADERS_RESULTS;
