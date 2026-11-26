@@ -346,6 +346,45 @@ fn trailing_null_confirmed_slots_trimmed_in_one_open() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A torn previous-tip block under a later page that landed: the seal clamp
+/// leaves the zeroed run on top, and the tip must drop below it, not onto it.
+#[test]
+fn seal_clamp_exposes_null_run_and_tip_drops_below_it() {
+    let dir = tmp();
+    let s = Store::create_tiny(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let mut parent_hash = [0u8; 32];
+    let mut prev = Fk::NULL;
+    for h in 0u32..20 {
+        let rec = hdr(prev, parent_hash, h as u8);
+        parent_hash = rec.hash;
+        let fk = s.put_header(&rec).unwrap();
+        prev = fk;
+        s.confirmed.set(&write, Height(h), fk).unwrap();
+        if h == 14 {
+            s.headers.flush().unwrap();
+            s.flush_class_c_tip().unwrap();
+        }
+    }
+    let seal = TipSeal::load(s.path()).unwrap().expect("seal at 14");
+    assert_eq!(seal.tip_height, 14);
+    for h in 5u32..=14 {
+        s.confirmed.set_raw_for_test(&write, Height(h), 0).unwrap();
+    }
+    s.headers.flush().unwrap();
+    s.confirmed.flush().unwrap();
+    seal.store(s.path()).unwrap();
+    rbitcoin_store::spend_durable::SpendDurable::new(12, 12)
+        .store(s.path())
+        .unwrap();
+
+    let r = s.revalidate_tip_window_n(6).unwrap();
+    let tip = s.confirmed.tip_height().expect("a tip below the null run");
+    assert_eq!(tip, Height(4), "{r:?}");
+    assert!(s.confirmed.get(tip).unwrap().is_some(), "tip is a null slot");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn revalidate_n_zero_and_empty_store() {
     let dir = tmp();

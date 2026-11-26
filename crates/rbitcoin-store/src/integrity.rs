@@ -283,6 +283,10 @@ impl Store {
         }
         let write = crate::array_table::ClassCWrite::new();
 
+        // Clamp first: a cut back to the sealed tip can leave a null run on
+        // top, and the trim below must see it.
+        self.clamp_to_tip_seal(&write, &mut report)?;
+
         // HWM can include a trailing run of null slots (crash mid-grow). Trim
         // the whole suffix in one shot so the 6-height window sees a real tip.
         let trimmed = self.confirmed.trim_trailing_nulls(&write)?;
@@ -293,8 +297,6 @@ impl Store {
             report.tip_shrunk = true;
             eprintln!("rbitcoin: trimmed {trimmed} trailing null confirmed[] slots");
         }
-
-        self.clamp_to_tip_seal(&write, &mut report)?;
 
         let Some(tip) = self.confirmed.tip_height() else {
             report.tip_before = report.tip_before.or(None);
