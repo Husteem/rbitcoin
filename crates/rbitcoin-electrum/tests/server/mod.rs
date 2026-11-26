@@ -3152,7 +3152,17 @@ fn serve_limits_public_proxy_defaults() {
     );
     let params = ChainParams::regtest();
     let cfg = ElectrumConfig::for_params("0.0.0.0:50001".parse().unwrap(), &params);
-    assert_eq!(cfg.limits, lim);
+    assert_eq!(
+        cfg.limits,
+        ServeLimits {
+            idle_timeout: Duration::from_secs(DEFAULT_ELECTRUM_IDLE_TIMEOUT_SECS),
+            ..lim
+        }
+    );
+    assert_eq!(
+        cfg.write_stall,
+        Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+    );
     assert_eq!(cfg.max_connections(), DEFAULT_MAX_CONNECTIONS);
     assert_eq!(cfg.max_line_bytes(), DEFAULT_MAX_LINE_BYTES);
 }
@@ -5217,7 +5227,7 @@ async fn stalled_scripthash_push_ends_the_connection() {
         },
     };
     let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    cfg.limits.idle_timeout = std::time::Duration::from_millis(80);
+    cfg.write_stall = std::time::Duration::from_millis(80);
     let (tip_tx, tip_rx) = tokio::sync::broadcast::channel(1);
     let stop = ElectrumStop::new(false);
     let task = tokio::spawn(handle_client(

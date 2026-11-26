@@ -157,6 +157,12 @@ pub const DEFAULT_MAX_SP_SCANS: usize = 32;
 pub const MAX_SP_SCANS_PER_CONN: usize = crate::silent_scan::SP_SCAN_PERMITS;
 /// Idle read timeout — disconnect quiet clients (DoS of FD/tasks).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
+/// Electrum's read idle window: a connection that sends no request for this
+/// long is closed. Wallets that subscribe and wait, or ping every few
+/// minutes, stay connected. ElectrumX closes at 600 s.
+pub const DEFAULT_ELECTRUM_IDLE_TIMEOUT_SECS: u64 = 600;
+/// Largest `--electrum-idle-timeout`.
+pub const MAX_ELECTRUM_IDLE_TIMEOUT_SECS: u64 = 86_400;
 /// Max raw tx hex chars for `transaction.broadcast` (~4 MiB wire → 8 MiB hex).
 pub const DEFAULT_MAX_BROADCAST_HEX: usize = 8_388_608;
 const RAW_TX_NOT_FOUND: &str =
@@ -206,8 +212,11 @@ pub struct ElectrumConfig {
     pub donation_address: String,
     /// Genesis hash (display order hex) for features.
     pub genesis_hash_hex: String,
-    /// Shared connection / request / idle bounds (also used by future Esplora).
+    /// Connection and request bounds. `idle_timeout` is the read idle
+    /// window ([`DEFAULT_ELECTRUM_IDLE_TIMEOUT_SECS`]).
     pub limits: ServeLimits,
+    /// How long one write may stall on a client that stops reading.
+    pub write_stall: Duration,
     /// Max `blockchain.scripthash.subscribe` entries per connection.
     pub max_scripthash_subs: usize,
     /// Silent-payment addresses one connection may subscribe (>= 1).
@@ -250,7 +259,11 @@ impl ElectrumConfig {
                 .into(),
             donation_address: String::new(),
             genesis_hash_hex: rbitcoin_primitives::display_hash_hex(genesis),
-            limits: ServeLimits::for_public_proxy(),
+            limits: ServeLimits {
+                idle_timeout: Duration::from_secs(DEFAULT_ELECTRUM_IDLE_TIMEOUT_SECS),
+                ..ServeLimits::for_public_proxy()
+            },
+            write_stall: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             max_scripthash_subs: DEFAULT_MAX_SCRIPTHASH_SUBS,
             max_sp_subs: DEFAULT_MAX_SP_SUBS,
             sp_scan_slots: Arc::new(Semaphore::new(DEFAULT_MAX_SP_SCANS)),
@@ -611,7 +624,7 @@ where
     let mut last_sent_status: HashMap<[u8; 32], String> = HashMap::new();
     let notify = Arc::new(Notify::new());
     let mut mempool_rx = mempool.as_ref().map(|m| m.subscribe_announces());
-    let mut writer = ConnWrite::new(writer, config.idle_timeout());
+    let mut writer = ConnWrite::new(writer, config.write_stall);
     let mut sh_seen = query.sh_indexed_through_height();
     // A status read overlapped a held pool, so the tick reads every sub again.
     let mut sh_rescan = false;
@@ -625,8 +638,8 @@ where
 
     loop {
         start_waiting_sp_scans(&mut conn, &query, &params, config.sp_scan_chunk);
-        let read_by =
-            *read_deadline.get_or_insert_with(|| tokio::time::Instant::now() + writer.idle());
+        let read_by = *read_deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + config.idle_timeout());
         let stop_wait = stop.notified();
         if stop.load() {
             break;

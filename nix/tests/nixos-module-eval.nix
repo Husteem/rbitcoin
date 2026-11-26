@@ -109,6 +109,7 @@ let
             i2p = true;
             maxSubs = 25000;
             maxSpSubs = 100;
+            idleTimeout = 3600;
           };
           esplora = {
             enable = true;
@@ -159,6 +160,7 @@ let
           package = fakePackage;
           electrum.maxSubs = 25000;
           electrum.maxSpSubs = 100;
+          electrum.idleTimeout = 3600;
           heavyShCreates = 0;
           esplora.maxInflight = 1024;
           esplora.minDrainRate = 8192;
@@ -631,6 +633,7 @@ assert defaultCfg.electrum.hiddenService == false;
 assert defaultCfg.electrum.i2p == false;
 assert defaultCfg.electrum.maxSubs == null;
 assert defaultCfg.electrum.maxSpSubs == null;
+assert defaultCfg.electrum.idleTimeout == null;
 assert defaultCfg.heavyShCreates == null;
 assert defaultCfg.storeReadBudget == null;
 assert defaultCfg.esplora.hiddenService == false;
@@ -747,6 +750,8 @@ assert builtins.match ".*--electrum-max-subs 25000.*" execStart != null;
 assert builtins.match ".*--electrum-max-subs.*" listenOffExec == null;
 assert builtins.match ".*--electrum-max-sp-subs 100.*" execStart != null;
 assert builtins.match ".*--electrum-max-sp-subs.*" listenOffExec == null;
+assert builtins.match ".*--electrum-idle-timeout 3600.*" execStart != null;
+assert builtins.match ".*--electrum-idle-timeout.*" listenOffExec == null;
 assert builtins.match ".*--heavy-sh-creates 20000.*" execStart != null;
 assert builtins.match ".*--heavy-sh-creates 0.*" listenOffExec != null;
 assert builtins.match ".*--heavy-sh-creates.*" (

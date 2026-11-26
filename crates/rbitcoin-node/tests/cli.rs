@@ -732,6 +732,31 @@ fn electrum_max_sp_subs_cli_conf_and_bounds() {
 }
 
 #[test]
+fn electrum_idle_timeout_cli_conf_and_bounds() {
+    use std::time::Duration;
+    assert_eq!(
+        ready_config(["rbitcoin-node"]).electrum_idle_timeout,
+        Duration::from_secs(600)
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--electrum-idle-timeout", "3600"]).electrum_idle_timeout,
+        Duration::from_secs(3600)
+    );
+    let mut c = NodeConfig::default();
+    c.apply_kv("electrum_idle_timeout", "86400").unwrap();
+    assert_eq!(c.electrum_idle_timeout, Duration::from_secs(86_400));
+    for bad in ["0", "86401", "nope"] {
+        let err = c.apply_kv("electrum_idle_timeout", bad).unwrap_err();
+        assert!(format!("{err}").contains("1 to 86400"), "{bad}: {err}");
+    }
+    assert_eq!(
+        c.electrum_idle_timeout,
+        Duration::from_secs(86_400),
+        "a refused value changes nothing"
+    );
+}
+
+#[test]
 fn electrum_max_subs_cli_conf_and_bounds() {
     assert_eq!(
         ready_config(["rbitcoin-node"]).electrum_max_subs,
