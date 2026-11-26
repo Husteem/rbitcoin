@@ -15,5 +15,7 @@ Fixed
   one-hour (online) or one-day (offline) interval. A stored time more than
   ten minutes ahead is backdated, never served as now. The relayed `addrv2` row carries the same sanitized time.
   The time survives a restart in `rbitcoin-peers-v3` (v1 and v2 still
-  load), and `getnodeaddresses` reports it instead of `now`.
+  load). A 0.9.x binary does not know the v3 header, starts with an empty
+  book, and its next save replaces `{datadir}/peers`. Copy that file before
+  rolling back. `getnodeaddresses` reports the stored time instead of `now`.
   `addpeeraddress` stamps the node clock, as Core does.

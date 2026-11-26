@@ -100,7 +100,7 @@ Clean smoke:
 | `--electrum-max-subs N` | `electrum_max_subs=` | **10000** — `blockchain.scripthash.subscribe` per Electrum connection (>= 1). Wallets subscribe every receive/change address up to their gap limit. |
 | `--electrum-idle-timeout SECS` | `electrum_idle_timeout=` | **600** — an Electrum connection that sends no request for SECS is closed (1 to 86400). Pushes to it do not count, so a wallet that subscribes and waits must ping within SECS. Writes to a client that stops reading still stall out at 120 s. NixOS `services.rbitcoin.electrum.idleTimeout` (null omits the flag) |
 | `--electrum-max-sp-subs N` | `electrum_max_sp_subs=` | **16** — `blockchain.silentpayments.subscribe` addresses per Electrum connection (>= 1). One address is one Silent Payments wallet. Each scans every new block, and each subscribe may scan the chain from its start. |
-| `--max-sh-creates N` | `max_sh_creates=` | **10000** — unpaged SH join above N is refused (503 / JSON-RPC error). **0** is unlimited. A height-ascending page that closes before reading every create still returns; a newest-first page of a script with more creates than the page limit, or a `from_height` window, takes the cap. |
+| `--max-sh-creates N` | `max_sh_creates=` | **10000** — unpaged SH join above N is refused (503 / JSON-RPC error). **0** is unlimited. A height-ascending page that closes before reading every create still returns, and so does a newest-first page of a script with no more creates than the page limit. Any other newest-first page, including the first page of a script above the cap, and a `from_height` window, take the cap and, above it, are refused. |
 | `--heavy-sh-creates N` | `heavy_sh_creates=` | **10000**: an unpaged SH join above N waits until no other such join runs, across every Electrum and Esplora client. **0** turns the wait off. Matters once `--max-sh-creates` is raised above it. NixOS `services.rbitcoin.heavyShCreates` (null omits the flag) |
 | `--sp-tweaks` | `sp_tweaks=` | **off** — thin BIP-352 tweak index (`sp_tweaks.*`). IBD seals it from the taproot origin when the flag is on from the start. A later enable still materializes after catch-up on `rbtc-idx-wb` (with block filters, one read of Class A). New tips are sealed on the confirm write thread once the watermark has caught the chain. Heights not yet sealed are served by the naive walk. With `--prune-seqsigwit`, a later enable is allowed before taproot, and after taproot once every height from that origin through the dropped range is sealed or still in the last 288 blocks. It is refused when the watermark does not already cover every height that has been dropped or will be dropped. Prune can be turned on after the index is built when that watermark already covers every height the cut will drop. Confirm then seals tweaks from the wire block even when the filter watermark is behind. Omitting this flag while the index files exist and `--prune-seqsigwit` is on logs how many blocks remain before the index cannot be enabled again. A caught-up index has 288. The error that refuses prune over a short index says to delete `store/sp_tweaks.idx` and `store/sp_tweaks.body`, or to catch the index up without `--prune-seqsigwit` and then turn prune on. An unpruned node logs a tweak enable failure and still starts. With prune on, a silent-payment scan and `blockchain.tweaks.subscribe` read the sealed index. An unsealed tip still in the keep window is built from that window. A height the index does not cover is an error. Neither falls through to the witness walk. Unpruned, a later enable still backfills on `rbtc-idx-wb` from `seqsigwit.body` |
 | `--sp-tweaks-dust SATS` | `sp_tweaks_dust=` | **1000** — omit served P2TR outs with `value <= SATS` (`0` = serve all; **545** matches Cake electrs at its 546 floor) |
@@ -214,8 +214,10 @@ sent again.
 `--onion HOST:PORT` stores a separate SOCKS endpoint for onion destinations.
 `--only-net onion` (repeatable with `ipv4`/`ipv6`/`i2p`/`cjdns`) filters dial and learn;
 onion requires `--proxy` or `--onion`. `--connect foo.onion:8333` is a start
-error when the v3 checksum is invalid. The peers file is `rbitcoin-peers-v3`
-(v1 and v2 still load).
+error when the v3 checksum is invalid. `{datadir}/peers` is written as
+`rbitcoin-peers-v3` (v1 and v2 still load). A 0.9.x binary does not know
+that header, starts with an empty book, and its next save replaces the
+file. Copy `peers` before rolling back.
 
 `--listen=0` / `--no-listen` disables the regular P2P bind. If both the regular
 and marked binds are absent, `--listen-onion` opens an ephemeral port on `127.0.0.1`.
@@ -263,9 +265,15 @@ keep their normal source-IP rules. Inbound peers on the marked listener do
 not trigger IP discouragement or eviction group cooldowns. Every listener
 enforces existing refusals for the exact TCP source IP. Only ordinary
 listeners enforce eviction group cooldowns at admission.
-If an external onion is configured without a marked listener, inbound
-loopback peers skip source-IP grants and self-announcements.
-Explicit bind grants still apply.
+Inbound loopback skips source-IP grants, including
+`noban,relay,download@127.0.0.1`, when `--listen-onion` has no `=onion`
+bind, when `--i2p-accept-incoming` is on, or when an onion `--external-ip`
+has no marked listener. v0.9.2 applied those grants. A
+`--net-permission-bind` on that loopback port keeps them, and it applies
+them to every inbound peer on that listener, including a forwarded onion
+or I2P peer. Put the wallet grant on a listener the forwarder does not
+use. An onion `--external-ip` with no marked listener also withholds
+self-announcements from that loopback peer.
 
 Unfinished handshakes on the marked listener use the shared `--max-inbound`
 limit and the normal handshake timeout. So do loopback handshakes on the

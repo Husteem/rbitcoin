@@ -443,7 +443,7 @@ Block filters: --block-filter-index (default off) builds BIP158 basic filters. I
     seqsigwit.body stays a header. Enabling the flag on an archive copies that window out and cuts the stem. Advertise NETWORK_LIMITED.\n\
     Unpruned nodes read seqsigwit.body. txout, input, txstat, and filters are not pruned.\n\
   --prune-seqsigwit-ram-threshold-bytes N RAM cap for that cache (default 268435456; 0 keeps nothing in RAM).\n\
-  --max-sh-creates N refuses an unpaged Electrum/Esplora join with more than N creates (default 10000; 0 = unlimited). A page that closes before reading every create is still served; a full newest-first page or a from_height window takes the cap.\n\
+  --max-sh-creates N refuses an unpaged Electrum/Esplora join with more than N creates (default 10000; 0 = unlimited). A height-ascending page that closes before reading every create is still served, and so is a newest-first page of a script with no more creates than the page limit. Any other newest-first page, including the first page of a script above the cap, and a from_height window, take the cap: above it, Esplora answers 503.\n\
   --heavy-sh-creates N runs unpaged Electrum/Esplora joins with more than N creates one at a time across the node (default 10000; 0 = no limit). Lighter joins stay parallel.\n\
   --electrum-max-subs N caps blockchain.scripthash.subscribe per Electrum connection (default 10000; >= 1). Wallets subscribe every address up to their gap limit.\n\
   --electrum-max-sp-subs N caps blockchain.silentpayments.subscribe addresses per Electrum connection (default 16; >= 1). Each address scans every new block.\n\
