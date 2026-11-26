@@ -924,6 +924,11 @@ fn network_names_are_recognized_and_reject_invalid() {
         assert_eq!(c.apply_kv(name, "0").unwrap(), ConfApply::Applied);
         assert_eq!(c.network, Network::Mainnet);
 
+        // `testnet4=` selects the network, as in 0.9.x and Core (#2141).
+        let mut c = NodeConfig::default();
+        assert_eq!(c.apply_kv(name, "").unwrap(), ConfApply::Applied);
+        assert_eq!(c.network, expected, "{name}= with an empty value");
+
         for bad in ["ture", "yess", "2", "-1", "maybe", "on1"] {
             let mut c = NodeConfig::default();
             let err = c.apply_kv(name, bad).unwrap_err().to_string();
