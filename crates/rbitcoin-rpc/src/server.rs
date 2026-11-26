@@ -36,6 +36,11 @@ pub const RPC_MAX_CONNECTIONS: usize = 256;
 /// this takes the whole budget, so one still goes out at a time.
 #[doc(hidden)]
 pub const REST_REPLY_BYTES: usize = 64 * 1024 * 1024;
+/// How long a built REST reply waits for its share of [`REST_REPLY_BYTES`]
+/// before it is dropped and answered 503. It is the fixed part of a reply's
+/// write deadline: a reply that stalls frees its bytes within it, but one
+/// draining at the minimum rate can hold them longer.
+const REST_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const RPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 use rbitcoin_log::info;
 #[cfg(unix)]
@@ -260,18 +265,24 @@ impl ReplyBytes {
         self.permits.available_permits()
     }
 
-    /// `len` bytes, or the whole budget when `len` is larger. `None` when
-    /// they are not free now.
-    fn try_take(&self, len: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    /// `len` bytes, or the whole budget when `len` is larger, once they are
+    /// free. A waiter takes the bytes as they come back, ahead of later
+    /// requests, so [`Self::available`] stays 0 while it waits. `None` after
+    /// [`REST_REPLY_WAIT`].
+    async fn take(&self, len: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let want = u32::try_from(len).map_or(self.total, |n| n.min(self.total));
-        Arc::clone(&self.permits).try_acquire_many_owned(want).ok()
+        let bytes = Arc::clone(&self.permits).acquire_many_owned(want);
+        tokio::time::timeout(REST_REPLY_WAIT, bytes)
+            .await
+            .ok()?
+            .ok()
     }
 
     /// A built reply as a body that holds its bytes of this budget until the
     /// body and every slice it handed out are dropped. `None` when they are
-    /// not free now.
-    pub fn body(&self, reply: Vec<u8>) -> Option<axum::body::Body> {
-        let bytes = self.try_take(reply.len())?;
+    /// not free within [`REST_REPLY_WAIT`].
+    pub async fn body(&self, reply: Vec<u8>) -> Option<axum::body::Body> {
+        let bytes = self.take(reply.len()).await?;
         Some(axum::body::Body::new(RestReplyBody {
             rest: Bytes::from_owner(BudgetedReply {
                 body: reply,
@@ -536,7 +547,7 @@ pub async fn rest_entry(State(state): State<AppState>, req: axum::extract::Reque
         content_type: "text/plain",
         body: b"rest failed\n".to_vec(),
     });
-    let Some(body) = state.rest_reply_bytes.body(reply.body) else {
+    let Some(body) = state.rest_reply_bytes.body(reply.body).await else {
         return rest_queue_full();
     };
     (
