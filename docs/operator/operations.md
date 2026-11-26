@@ -264,8 +264,12 @@ not trigger IP discouragement or eviction group cooldowns. Every listener
 enforces existing refusals for the exact TCP source IP. Only ordinary
 listeners enforce eviction group cooldowns at admission.
 If an external onion is configured without a marked listener, inbound
-loopback peers skip source-IP grants and self-announcements.
-Explicit bind grants still apply.
+loopback peers skip self-announcements. In that case, with
+`--i2p-accept-incoming`, or with `--listen-onion` and no marked listener,
+inbound loopback peers on the other P2P listeners also skip source-IP
+grants: a `--net-permission` rule for `127.0.0.1` does not apply there, and
+startup warns when one exists. Explicit bind grants still apply, so give a
+local client its own `--net-permission-bind` port.
 
 Unfinished handshakes on the marked listener use the shared `--max-inbound`
 limit and the normal handshake timeout. So do loopback handshakes on the

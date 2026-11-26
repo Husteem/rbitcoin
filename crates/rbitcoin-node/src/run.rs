@@ -788,6 +788,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     );
     node.peers
         .publish_local_endpoints(node.local_addr.port(), external, table.clone());
+    if node.peers.forwarded_loopback_drops_grants() {
+        warn!(
+            "--net-permission grants for loopback do not apply on the P2P listener {}: Tor or I2P peers arrive from loopback there. Give local clients their own --net-permission-bind=<perms>@127.0.0.1:<port>, or mark a separate Tor bind with --listen <addr>:<port>=onion",
+            node.local_addr
+        );
+    }
     if immediate_relay {
         node.peers.set_noban(true);
     }
