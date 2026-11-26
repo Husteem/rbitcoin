@@ -2698,7 +2698,8 @@ fn fail_read(_: &Query) -> Result<(), String> {
 }
 
 /// A status read that fails at one tip is read again at the next, though
-/// the next block does not touch the outpoint.
+/// the next block does not touch the outpoint and another outpoint was
+/// subscribed in between.
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn failed_outpoint_read_is_retried_at_the_next_tip() {
@@ -2718,9 +2719,25 @@ async fn failed_outpoint_read_is_retried_at_the_next_tip() {
     pad_tip(&pad, 1, None);
     let ping = pad.call(2, "server.ping", json!([])).await;
     assert_eq!(ping["id"], 2, "the failed read pushed: {ping}");
+    let other = pad
+        .call(
+            3,
+            "blockchain.outpoint.subscribe",
+            json!(["11".repeat(32), 1]),
+        )
+        .await;
+    assert_eq!(other["result"]["spent"], false, "{other}");
     pad_block(&pad.q, 2, 0, &[pad_coinbase(2, 0)]);
     pad_tip(&pad, 2, None);
-    let push = pad.call(3, "server.ping", json!([])).await;
+    // Both subscriptions are restatused, in no fixed order.
+    let mut lines = vec![pad.call(4, "server.ping", json!([])).await];
+    while lines.last().is_some_and(|l| l["id"] != 4) {
+        lines.push(pad.read().await);
+    }
+    let push = lines
+        .iter()
+        .find(|l| l["params"][0] == genesis)
+        .unwrap_or_else(|| panic!("no push for the failed read: {lines:?}"));
     assert_eq!(push["method"], "blockchain.outpoint.subscribe", "{push}");
     assert_eq!(push["params"][2]["spent"], true, "{push}");
     let _ = std::fs::remove_dir_all(&pad.dir);

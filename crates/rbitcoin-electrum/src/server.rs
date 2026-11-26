@@ -3841,13 +3841,16 @@ fn dispatch_method(
         "blockchain.outpoint.get_status" => outpoint_status(query, mempool, params),
         "blockchain.outpoint.subscribe" => {
             let (txid, vout) = param_outpoint(params)?;
+            let first = conn.outpoint_subs.is_empty();
             admit_outpoint_sub(
                 &mut conn.outpoint_subs,
                 txid,
                 vout,
                 config.max_scripthash_subs,
             )?;
-            if conn.outpoint_tip.is_none() {
+            // With other subscriptions, an unset watermark is a pending
+            // restatus of all of them, not a fresh connection.
+            if first {
                 conn.outpoint_tip = query.tip_height().map(|h| h.0);
             }
             let status = outpoint_status(query, mempool, params)?;
