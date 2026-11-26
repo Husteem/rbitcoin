@@ -1021,9 +1021,13 @@ impl Query {
                 reval.tip_shrunk
             );
         }
-        // One complement repair (holes + short suffix). Do not walk every strong bit.
-        let repaired = store.repair_class_c_above_tip()?;
-        if repaired > 0 {
+        // One complement repair (holes + short suffix), then set every fence
+        // bit a torn strong flush cleared. The clear makes the popcount fast
+        // path in restore_strong_from_fence meaningful: an off-fence hole bit
+        // can no longer stand in for a missing fence bit.
+        let cleared = store.repair_class_c_above_tip()?;
+        let restored = store.restore_strong_from_fence()?;
+        if cleared > 0 || restored > 0 {
             let _ = store.strong_tx.flush();
         }
         let store_path = store.path().to_path_buf();

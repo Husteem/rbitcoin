@@ -286,9 +286,12 @@ fn open_restores_strong_bits_from_fence() {
     }
 
     let s = Store::open_tiny(&dir).unwrap();
+    s.repair_strong_not_on_fence().unwrap();
+    assert!(s.restore_strong_from_fence().unwrap() > 0);
+    s.strong_tx.flush().unwrap();
     assert!(
         s.strong_tx.is_strong(first_tx).unwrap(),
-        "open must restore a fence bit a torn strong flush cleared"
+        "restore must set a fence bit a torn strong flush cleared"
     );
     assert!(s.is_confirmed_strong(first_tx).unwrap());
     let _ = std::fs::remove_dir_all(&dir);

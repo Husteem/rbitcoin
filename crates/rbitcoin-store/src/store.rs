@@ -603,11 +603,6 @@ impl Store {
         };
         store.drop_confirmed_past_creates()?;
         store.rebuild_mtp_ring()?;
-        let cleared = store.repair_strong_not_on_fence()?;
-        let restored = store.restore_strong_from_fence()?;
-        if cleared > 0 || restored > 0 {
-            store.strong_tx.flush()?;
-        }
         Ok(store)
     }
 
