@@ -4447,6 +4447,80 @@ async fn headers_message_does_not_copy_the_pending_map() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A chain of 8,000 parked headers is admitted by `headers` messages, not
+/// written straight into the map. One new header on its tip, and a resend
+/// of that tip, must cost the batch: a handful of path-work steps and no
+/// allocation on the scale of the parked map. That holds with no work
+/// floor, with a floor this chain meets, and with a floor it does not.
+#[tokio::test]
+async fn one_header_on_a_parked_chain_does_not_walk_it() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-chain-one");
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18626, 66, true);
+    let (out_tx, _rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let chain = regtest_header_chain(
+        BlockHash::from_byte_array([0x7a; 32]),
+        MAX_PENDING_HEADERS as u32,
+    );
+    for batch in chain.chunks(MAX_HEADERS_RESULTS) {
+        push(
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(peer.as_ref()),
+            NetworkMessage::Headers(batch.to_vec()),
+        )
+        .await;
+    }
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert!(peer.best_known().is_none(), "a parked chain is not best known");
+    let entries = pending_map_bytes();
+    let tip = *chain.last().unwrap();
+    let extension = regtest_headers_after(&tip, 1);
+    let floors = [
+        ("no floor", None),
+        ("floor met", Some([0u8; 32])),
+        ("floor not met", Some([0x7f; 32])),
+    ];
+    for (floor_name, floor) in floors {
+        hub.set_minimum_chain_work(floor);
+        for (kind, headers) in [
+            ("new header", extension.clone()),
+            ("parked tip", vec![tip]),
+        ] {
+            let _ = hub.take_path_work_steps();
+            let (largest, _) = asks_for(
+                &hub,
+                &out_tx,
+                &mut follow,
+                &peer,
+                entries,
+                NetworkMessage::Headers(headers),
+            )
+            .await;
+            let steps = hub.take_path_work_steps();
+            assert!(
+                steps <= 64,
+                "{floor_name} / {kind}: {steps} path-work steps"
+            );
+            assert!(
+                largest < entries / 8,
+                "{floor_name} / {kind}: largest ask {largest} B against a {entries} B map"
+            );
+            assert!(
+                peer.best_known().is_none(),
+                "{floor_name} / {kind}: a parked chain is not best known"
+            );
+        }
+    }
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A connecting batch at the cap stages its evictions in the map and puts
 /// them back when it still does not fit: 7,000 parked ancestors of its
 /// parent stay, 1,000 headers that fail proof of work go, and 2,000 more
