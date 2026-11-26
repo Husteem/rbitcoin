@@ -2218,7 +2218,8 @@ pub fn parse_authority_sec(key: &str, val: &str) -> Result<Sv2AuthoritySecret, N
 }
 
 /// A network key (`testnet4=`): an empty value selects the network, as Core's
-/// `InterpretBool` and 0.9.x read it. Otherwise [`conf_bool`].
+/// `InterpretBool` reads it and 0.9.x read the four keys it had. Otherwise
+/// [`conf_bool`].
 fn conf_network_bool(key: &str, val: &str) -> Result<bool, NodeError> {
     if val.is_empty() {
         return Ok(true);
