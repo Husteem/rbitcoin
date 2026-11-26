@@ -27,6 +27,7 @@ use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(debug_assertions)]
 use std::sync::Mutex;
 
 /// Bytes before first body cell (TableFile header 16 + pad to 32).
