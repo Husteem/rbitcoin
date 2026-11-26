@@ -23,6 +23,10 @@ Fixed
 - **A served block filter is checked against its index hash.** A torn body
   no longer returns filter bytes that do not match the stored
   `filter_hash`.
+- **Not 0.10.0 blockers:** the failed-write carry-over of outstanding
+  `*.ahead` pages ([#2108]) and a torn block-filter parent rebuild ([#2109])
+  are deferred to 0.10.x. Neither touches the archive or the tip commit;
+  affected derived state recovers by rebuilding the table/index.
 
 [#2071]: https://github.com/rbitcoin-org/rbitcoin/issues/2071
 [#2072]: https://github.com/rbitcoin-org/rbitcoin/issues/2072
