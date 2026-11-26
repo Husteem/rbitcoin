@@ -645,7 +645,8 @@ pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Res
         }
         // An unparseable id has `nout == 0`, so it writes `[]`.
         let id = id.as_ref().unwrap_or(&[0; 32]);
-        if let Err(e) = write_outspends(&mut body, &st.query, mp, id, nout, view.as_ref()) {
+        if let Err(e) = write_outspends(&mut body, &st.query, mp, id, nout, view.as_ref(), settle0)
+        {
             return store_err(e);
         }
     }
@@ -691,11 +692,14 @@ pub async fn post_outspends_by_outpoint(State(st): State<AppState>, body: Bytes)
         let Some(arr) = v.as_array() else {
             return bad_request("body must be a JSON array of txid:vout");
         };
+        let mp = st.mempool.as_deref();
+        let settle0 = pool_settle(mp);
         let view = match pin_or_reject(&st.query, ChainViewKind::Tip, None) {
             Ok(v) => v,
             Err(r) => return r,
         };
-        let mp = st.mempool.as_deref();
+        #[cfg(debug_assertions)]
+        outspends_pinned(&st.query);
         let mut out = Vec::with_capacity(arr.len());
         for x in arr {
             let Some(s) = x.as_str() else {
@@ -714,7 +718,7 @@ pub async fn post_outspends_by_outpoint(State(st): State<AppState>, body: Bytes)
                 out.push(json!({"spent": false}));
                 continue;
             };
-            match outspend_json(&st.query, mp, &txid, vout, view.as_ref()) {
+            match outspend_json(&st.query, mp, &txid, vout, view.as_ref(), settle0) {
                 Ok(v) => out.push(v),
                 Err(e) => return store_err(e),
             }
@@ -722,4 +726,39 @@ pub async fn post_outspends_by_outpoint(State(st): State<AppState>, body: Bytes)
         json_reply_here(out)
     })
     .await
+}
+
+#[cfg(all(unix, debug_assertions))]
+type PinHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(all(unix, debug_assertions))]
+static OUTSPENDS_PIN_HOOKS: std::sync::Mutex<Vec<(usize, PinHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run `hook` once, after the next by-outpoint outspends request on this
+/// store has pinned its view and before it reads a slot. Debug builds only.
+#[cfg(all(unix, debug_assertions))]
+#[doc(hidden)]
+pub fn set_outspends_pin_hook_for_test(query: &rbitcoin_query::Query, hook: PinHook) {
+    OUTSPENDS_PIN_HOOKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((std::ptr::from_ref(query) as usize, hook));
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn outspends_pinned(query: &rbitcoin_query::Query) {
+    let key = std::ptr::from_ref(query) as usize;
+    let hook = {
+        let mut hooks = OUTSPENDS_PIN_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        hooks
+            .iter()
+            .position(|(k, _)| *k == key)
+            .map(|i| hooks.swap_remove(i).1)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
 }
