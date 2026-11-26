@@ -1800,19 +1800,16 @@ fn chain_edges_pin_work_headers_and_reopen() {
         &[child.block_hash()],
     );
     hub.hold_body(Arc::new(parked.clone()), false);
-    assert!(hub
-        .query
-        .get_header_by_hash(&parked.block_hash().to_byte_array())
-        .unwrap()
-        .is_none());
-    let parked_child = mine(parked.block_hash(), parked.header.time.saturating_add(1), 2);
-    let parked_err = hub
-        .process_submitted_header(&parked_child.header)
-        .expect_err("the parked parent has no header row");
     assert!(
-        !parked_err.contains("Must submit previous header"),
-        "a held body is a known parent: {parked_err}"
+        hub.query
+            .get_header_by_hash(&parked.block_hash().to_byte_array())
+            .unwrap()
+            .is_some(),
+        "a parked body on a known parent has a header row (#2090)"
     );
+    let parked_child = mine(parked.block_hash(), parked.header.time.saturating_add(1), 2);
+    hub.process_submitted_header(&parked_child.header)
+        .expect("the parked parent is a known header");
     let missing = BlockHash::from_byte_array([0x44; 32]);
     let err = run_on_tip_accept(|| hub.reconsider_block_inner(missing)).unwrap_err();
     assert!(
@@ -8296,5 +8293,65 @@ fn pair_winner_write_failure_promotes_an_unpublished_loser() {
     assert_eq!(hub.tip_hash(), Some(good.block_hash()));
     assert!(hub.is_block_invalid(&bad.block_hash()));
     assert!(hub.held_body(&bad.block_hash()).is_none());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A side block held as a body (a `submitblock` that lost a race) gets its
+/// header row when its parent has one. A peer that extends it then sends a
+/// header that connects, instead of one the store refused as "header parent
+/// unknown", which scored and disconnected the honest sender (#2090). A held
+/// orphan has no row, so a header built on it is unconnecting, not scored.
+#[test]
+fn held_body_has_a_header_row_and_a_held_orphan_does_not() {
+    use rbitcoin_net::peer::{
+        header_announcement_connects, header_is_stored, persist_pending_header_path,
+    };
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let t0 = hub.tip_header().unwrap().time;
+    let a = mine(gen, t0.saturating_add(1), 1);
+    hub.accept_block(a.clone()).unwrap();
+    let b = mine_distinct(gen, t0.saturating_add(2), 1, &[a.block_hash()]);
+    hub.hold_body(Arc::new(b.clone()), false);
+    assert!(
+        header_is_stored(&hub, &b.block_hash()),
+        "held side block has a row"
+    );
+
+    let c = mine(b.block_hash(), t0.saturating_add(3), 2);
+    let pending: HashMap<BlockHash, Header> = [(c.block_hash(), c.header)].into();
+    assert!(header_announcement_connects(
+        &hub,
+        &pending,
+        c.header.prev_blockhash
+    ));
+    persist_pending_header_path(&hub, &pending, c.block_hash())
+        .expect("the child of a held body connects");
+    assert!(
+        header_is_stored(&hub, &c.block_hash()),
+        "child header written"
+    );
+
+    // An orphan: its parent has no row and is not held.
+    let missing = mine_distinct(
+        gen,
+        t0.saturating_add(4),
+        1,
+        &[a.block_hash(), b.block_hash()],
+    );
+    let orphan = mine(missing.block_hash(), t0.saturating_add(5), 2);
+    hub.hold_body(Arc::new(orphan.clone()), false);
+    assert!(hub.held_body(&orphan.block_hash()).is_some());
+    assert!(
+        !hub.knows_header(&orphan.block_hash()),
+        "a held orphan has no row"
+    );
+    let d = mine(orphan.block_hash(), t0.saturating_add(6), 3);
+    let pending: HashMap<BlockHash, Header> = [(d.block_hash(), d.header)].into();
+    assert!(
+        !header_announcement_connects(&hub, &pending, d.header.prev_blockhash),
+        "a header on a held orphan is unconnecting"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

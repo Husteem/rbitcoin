@@ -1983,8 +1983,13 @@ impl ChainHub {
         verdict
     }
 
-    /// True if we have a header row (best chain, header-only tip, or held body).
+    /// True if we have a header row (best chain or header-only tip).
     /// Used so we never `getdata` a block inv whose header we have not seen.
+    ///
+    /// A held body counts only through its row: [`Self::hold_body`] writes
+    /// the row when the parent has one. A held orphan has none, so a header
+    /// built on it is unconnecting (a `getheaders`), not a child of a known
+    /// header that the store then refuses and scores (#2090).
     pub fn knows_header(&self, hash: &BlockHash) -> bool {
         // A header tip is written only after its header row, so the row covers it.
         self.is_connected(hash)
@@ -1994,7 +1999,6 @@ impl ChainHub {
                 .ok()
                 .flatten()
                 .is_some()
-            || self.held_body(hash).is_some()
     }
 
     /// `ancestor` is `descendant` or lies on its prev walk (disconnected ok).
@@ -4524,8 +4528,31 @@ impl ChainHub {
         self.hold_body(Arc::new(block), false);
     }
 
+    /// Hold a body that is not on the active chain. Its header is written
+    /// first when its parent has a row, as Core stores a side block's header:
+    /// a `submitblock` that loses a race otherwise leaves a body that peers
+    /// build on with no header for their children to connect to. Store IO:
+    /// call it on the tip-accept lane or a blocking thread, never a Tokio
+    /// worker; [`Self::park_body`] is the in-RAM part.
     #[doc(hidden)]
     pub fn hold_body(&self, block: Arc<Block>, waive: bool) {
+        let hash = block.block_hash();
+        if !self.is_connected(&hash)
+            && !self.knows_header(&hash)
+            && self.knows_header(&block.header.prev_blockhash)
+        {
+            if let Err(e) = self.ensure_header(&block.header) {
+                rbitcoin_log::debug!(Tip, "hold {hash}: header not written ({e})");
+            }
+        }
+        self.park_body(block, waive);
+    }
+
+    /// Park a body in RAM without writing its header, so an equal-work
+    /// sibling can race it before the lane job runs. The lane job holds it
+    /// with [`Self::hold_body`] if it loses.
+    #[doc(hidden)]
+    pub fn park_body(&self, block: Arc<Block>, waive: bool) {
         let hash = block.block_hash();
         if self.is_connected(&hash) {
             return;

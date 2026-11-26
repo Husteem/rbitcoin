@@ -276,12 +276,14 @@ pub fn getblockheader(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     {
         return active_block_header(ctx, height, verbose);
     }
-    if let Some(loc) = off_chain_header(ctx, &hash)? {
-        return off_chain_header_value(ctx, &loc, verbose);
-    }
+    // A held side block also has a header row (`hold_body` writes it), but
+    // only the body knows `nTx`, so the body answers first.
     let typed = BlockHash::from_byte_array(hash);
     if let Some(block) = ctx.chain.as_ref().and_then(|c| c.held_body(&typed)) {
         return held_header_value(ctx, &block, verbose);
+    }
+    if let Some(loc) = off_chain_header(ctx, &hash)? {
+        return off_chain_header_value(ctx, &loc, verbose);
     }
     Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))
 }

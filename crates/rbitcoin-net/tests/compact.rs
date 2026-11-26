@@ -863,6 +863,10 @@ fn cmpct_wtxid_shortid_collision_held_fork_journey() {
         AcceptOutcome::IgnoredWeaker
     ));
     assert!(hub.held_body(&winner.block_hash()).is_some());
+    assert!(
+        rbitcoin_net::peer::header_is_stored(&hub, &winner.block_hash()),
+        "the accept path holds a losing block with its header row"
+    );
 
     let mp =
         rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
