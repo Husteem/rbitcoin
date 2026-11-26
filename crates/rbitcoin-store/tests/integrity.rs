@@ -256,6 +256,45 @@ fn merkle_mismatch_clears_body_and_shrinks() {
 }
 
 #[test]
+fn open_restores_strong_bits_from_fence() {
+    let dir = tmp();
+    let first_tx;
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        let mut parent_hash = [0u8; 32];
+        let mut prev = Fk::NULL;
+        let mut txs = Vec::new();
+        for h in 0u32..8 {
+            let tx_fk = put_coinbase(&s, h as u8 + 1);
+            let txid = s.txs.body_txid(tx_fk).unwrap();
+            let rec = hdr_merkle(prev, parent_hash, h as u8, txid);
+            parent_hash = rec.hash;
+            let hfk = s.put_header(&rec).unwrap();
+            s.header_txs.put_range(&write, hfk, tx_fk, 1).unwrap();
+            s.strong_tx.set_strong(&write, tx_fk, hfk).unwrap();
+            s.confirmed.set(&write, Height(h), hfk).unwrap();
+            prev = hfk;
+            txs.push(tx_fk);
+        }
+        s.rebuild_height_fence().unwrap();
+        s.flush_class_c_tip().unwrap();
+        first_tx = txs[0];
+        s.strong_tx.set_unstrong(&write, first_tx).unwrap();
+        s.strong_tx.flush().unwrap();
+        assert!(!s.strong_tx.is_strong(first_tx).unwrap());
+    }
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert!(
+        s.strong_tx.is_strong(first_tx).unwrap(),
+        "open must restore a fence bit a torn strong flush cleared"
+    );
+    assert!(s.is_confirmed_strong(first_tx).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn tip_window_missing_strong_shrinks() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();

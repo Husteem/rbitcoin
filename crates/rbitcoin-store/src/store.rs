@@ -603,6 +603,9 @@ impl Store {
         };
         store.drop_confirmed_past_creates()?;
         store.rebuild_mtp_ring()?;
+        if store.restore_strong_from_fence()? > 0 {
+            store.strong_tx.flush()?;
+        }
         Ok(store)
     }
 
@@ -1924,6 +1927,45 @@ impl Store {
     /// they remain invisible to [`Self::spenders`] until re-confirm.
     pub fn repair_class_c_above_tip(&self) -> Result<u64, StoreError> {
         self.repair_strong_not_on_fence()
+    }
+
+    /// Set every strong bit a fence run names but the bit image does not hold.
+    ///
+    /// A torn strong flush, a hole repair that rewrites a suffix, or a short
+    /// `strong_tx.body` header can clear a confirmed bit. The fence
+    /// (`confirmed[]` + `header_txs`) is the independent source; open sets the
+    /// missing bits before revalidation can mistake the create for unconfirmed.
+    /// The fast path is one popcount over the image; only a real shortfall
+    /// walks the runs.
+    #[doc(hidden)]
+    pub fn restore_strong_from_fence(&self) -> Result<u64, StoreError> {
+        let (runs, max_fk) = {
+            let fence = self.fence();
+            (std::sync::Arc::clone(&fence.runs), fence.max_connected_fk())
+        };
+        if max_fk == 0 {
+            return Ok(0);
+        }
+        let expected: u64 = runs.iter().map(|run| u64::from(run.count)).sum();
+        let actual = self
+            .strong_tx
+            .count_strong_in_fk_range(1, max_fk.saturating_add(1))?;
+        if actual == expected {
+            return Ok(0);
+        }
+        let write = crate::array_table::ClassCWrite::new();
+        let mut repaired = 0u64;
+        for run in runs.iter() {
+            let first = Fk(run.first_fk);
+            if self.strong_tx.all_strong_range(first, run.count)? {
+                continue;
+            }
+            let start = run.first_fk.saturating_sub(1);
+            let end = start.saturating_add(u64::from(run.count));
+            self.strong_tx.set_bits_range(&write, start, end, true)?;
+            repaired = repaired.saturating_add(1);
+        }
+        Ok(repaired)
     }
 
     #[doc(hidden)]
