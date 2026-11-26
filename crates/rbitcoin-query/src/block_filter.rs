@@ -168,6 +168,15 @@ fn golomb_rice_set(
     Ok(content)
 }
 
+fn check_filter_hash(body: &[u8], slot: &BlockFilterSlot) -> Result<(), StoreError> {
+    if FilterHash::hash(body).to_byte_array() != slot.filter_hash {
+        return Err(StoreError::Corrupt(
+            "invariant: blockfilter body does not match its index hash",
+        ));
+    }
+    Ok(())
+}
+
 impl Query {
     /// Confirmed heights `start..=end` as reads for [`Self::read_index_window`];
     /// heights at or above `tweaks_from` also read what tweaks need.
@@ -543,7 +552,11 @@ impl Query {
         };
         Ok(table
             .filter(Height(height))?
-            .map(|(body, slot)| (body, FilterHeader::from_byte_array(slot.filter_header))))
+            .map(|(body, slot)| {
+                check_filter_hash(&body, &slot)?;
+                Ok::<_, StoreError>((body, FilterHeader::from_byte_array(slot.filter_header)))
+            })
+            .transpose()?)
     }
 
     /// Filter bytes for `start..=end` in one idx and one body read per
@@ -554,7 +567,15 @@ impl Query {
         };
         Ok(table
             .filters(Height(start), Height(end))?
-            .map(|v| v.into_iter().map(|(body, _)| body).collect()))
+            .map(|v| {
+                v.into_iter()
+                    .map(|(body, slot)| {
+                        check_filter_hash(&body, &slot)?;
+                        Ok::<_, StoreError>(body)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?)
     }
 
     /// Filter headers at heights 1,000, 2,000, … through `stop`.
