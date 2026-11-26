@@ -611,7 +611,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &config.uacomments)
             .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
     // Inbound waits for `publish_local_endpoints` below: until then the
-    // node does not know which loopback peers Tor or I2P forwards.
+    // node does not know which loopback peers an operator's own hidden
+    // service forwards, nor its asmap or prune state.
     let mut node = P2PNode::start_inner(
         bind.filter(|_| config.listen.max_inbound > 0),
         query,
@@ -774,6 +775,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         node.local_addr,
         config.listen.cjdns_reachable && clearnet_listen,
     );
+    // Accepted inbound is grouped by asmap and told whether this node prunes,
+    // so both are set before the listeners open below.
+    let asmap = load_asmap(config.datadir.path(), config.asmap.as_deref());
+    node.peers.set_pruned(config.prune_seqsigwit);
+    node.peers.set_asmap(asmap.clone());
     node.peers
         .publish_local_endpoints(node.local_addr.port(), external, table.clone());
     if p2p_inbound && node.peers.forwarded_loopback_drops_grants() {
@@ -943,8 +949,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             AddrMan::new()
         }
     };
-    let asmap = load_asmap(config.datadir.path(), config.asmap.as_deref());
-    addrman.set_asmap(asmap.clone());
+    addrman.set_asmap(asmap);
     let len_before_reach = addrman.len();
     // Reachability before `--only-net`, so a sweep does not drop a net this
     // process can dial and then forget the rows.
@@ -959,8 +964,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         dialer: config.listen.dialer(),
         i2p_sam: config.listen.i2p_sam,
     });
-    node.peers.set_pruned(config.prune_seqsigwit);
-    node.peers.set_asmap(asmap);
     node.peers.set_connect_hosts(
         config.listen.connect_dns.clone(),
         config.network.default_p2p_port(),

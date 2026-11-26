@@ -811,7 +811,7 @@ async fn held_inbound_waits_for_the_forwarding_facts() {
     use tokio::net::TcpStream;
 
     let (_dir, query) = rbitcoin_query::testutil::tiny_query_labeled("held-inbound");
-    let node = P2PNode::start_inner(
+    let mut node = P2PNode::start_inner(
         Some("127.0.0.1:0".parse().unwrap()),
         query,
         ChainParams::regtest(),
@@ -824,10 +824,17 @@ async fn held_inbound_waits_for_the_forwarding_facts() {
     )
     .await
     .unwrap();
+    // An `add_listen` bind is held too: here the marked onion listener.
+    let onion = node
+        .add_listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
     let n = MAX_INCOMPLETE_INBOUND_PER_ADDR + 2;
     let mut early = Vec::new();
-    for _ in 0..n {
-        early.push(TcpStream::connect(node.local_addr).await.unwrap());
+    for target in [node.local_addr, onion] {
+        for _ in 0..n {
+            early.push(TcpStream::connect(target).await.unwrap());
+        }
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
@@ -836,20 +843,27 @@ async fn held_inbound_waits_for_the_forwarding_facts() {
     );
 
     node.peers.set_overlay_loopback_forward(true);
-    node.peers
-        .publish_local_endpoints(node.local_addr.port(), Vec::new(), NetPermTable::default());
+    node.peers.publish_local_endpoints(
+        node.local_addr.port(),
+        Vec::new(),
+        NetPermTable {
+            onion_bind: Some(onion),
+            ..Default::default()
+        },
+    );
     let mut inbound = 0;
     for _ in 0..200 {
         inbound = node.peers.snapshot().iter().filter(|p| p.inbound).count();
-        if inbound == n {
+        if inbound == 2 * n {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     node.shutdown().await;
     assert_eq!(
-        inbound, n,
-        "every early loopback inbound is admitted as forwarded"
+        inbound,
+        2 * n,
+        "every early loopback inbound on either listener is admitted as forwarded"
     );
 }
 
