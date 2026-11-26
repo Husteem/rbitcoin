@@ -9395,11 +9395,19 @@ fn a_heavier_fork_through_an_abandoned_header_reopens_it() {
 fn a_refused_batch_through_an_abandoned_header_does_not_reopen_it() {
     let (dir, hub, mut st, a, _rx) = abandoned_a_under_b("reopen-refused");
     let hash = a.block_hash();
-    apply(&mut st, &hub, 2, vec![a]);
-    assert!(!st.ordered_set.contains(&hash), "the batch is refused");
-    assert!(
-        st.unservable.contains(&hash),
-        "a refused batch leaves A abandoned"
-    );
+    // More refused batches than there are reopens.
+    for _ in 0..4 {
+        apply(&mut st, &hub, 2, vec![a]);
+        assert!(!st.ordered_set.contains(&hash), "the batch is refused");
+        assert!(
+            st.unservable.contains(&hash),
+            "a refused batch leaves A abandoned"
+        );
+    }
+    // None of them spent a reopen: a heavier chain through A still reopens it.
+    let a2 = mine(hash, 3);
+    apply(&mut st, &hub, 2, vec![a, a2]);
+    assert!(!st.unservable.contains(&hash), "A reopens");
+    assert!(st.ordered_set.contains(&hash), "A is queued again");
     let _ = dir;
 }

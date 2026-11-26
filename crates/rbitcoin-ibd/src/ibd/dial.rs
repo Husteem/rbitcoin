@@ -760,6 +760,7 @@ pub fn disconnect_stalled_block_peers<S: std::hash::BuildHasher>(
     now: Instant,
     stall: Duration,
     clock: &rbitcoin_consensus::NodeClock,
+    mutated: &super::state::BlockHashMap<super::state::MutatedCopies>,
 ) -> Vec<bitcoin::BlockHash> {
     disconnect_stalled_block_peers_at(
         slots,
@@ -771,6 +772,7 @@ pub fn disconnect_stalled_block_peers<S: std::hash::BuildHasher>(
         stall,
         ibd_mono_ms(),
         clock.now_secs(),
+        mutated,
     )
 }
 
@@ -786,6 +788,7 @@ pub fn disconnect_stalled_block_peers_at<S: std::hash::BuildHasher>(
     stall: Duration,
     now_ms: u64,
     now_secs: u64,
+    mutated: &super::state::BlockHashMap<super::state::MutatedCopies>,
 ) -> Vec<bitcoin::BlockHash> {
     let stall = stall.max(Duration::from_secs(30));
     let stall_ms = stall.as_millis() as u64;
@@ -831,14 +834,21 @@ pub fn disconnect_stalled_block_peers_at<S: std::hash::BuildHasher>(
         // trip this, and releasing its blocks with no taker would leave
         // nothing downloading for the whole cooldown. Another peer counts
         // when `may_serve` could hand it one of the owed blocks at all:
-        // alive, not paused itself, and no recent `notfound` for it. A dial
+        // alive, not paused itself, no recent `notfound` for it, and not a
+        // copy sender kept off a reopened block. A dial
         // still handshaking has no slot yet. Without one, the peer keeps its
         // requests and the window restarts, so the next check is a full
         // stall window away and can hand off to a peer that joined since.
         let owed = &slots[at].in_flight;
-        let handoff = slots
-            .iter()
-            .any(|o| o.id != id && owed.iter().any(|h| o.may_take_block(h, now_ms)));
+        let handoff = slots.iter().any(|o| {
+            o.id != id
+                && owed.iter().any(|h| {
+                    o.may_take_block(h, now_ms)
+                        && !mutated
+                            .get(h)
+                            .is_some_and(|c| c.keeps_off(o.addr.ip(), now_ms))
+                })
+        });
         if !handoff {
             slots[at].getdata_wire.restart_window(now_ms);
             debug!(Ibd,

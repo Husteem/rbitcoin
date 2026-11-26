@@ -269,16 +269,18 @@ const MUTATED_SENDERS: usize = 8;
 const MUTATED_REOPENS: u8 = 3;
 
 /// Mutated body copies of one hash, the peers that sent them (by IP, so a
-/// reconnect from a new port is the same peer), and how often it was
-/// reopened. Held inline so the bounded map holds no heap. An entry the
-/// tracking cap evicts loses all three: that hash takes the full bound of
-/// copies again, and a peer that sent its copies may reopen it again. Each
-/// takes 256 other tracked hashes first.
+/// reconnect from a new port is the same peer), how often it was reopened,
+/// and until when its senders are kept off it. Held inline so the bounded
+/// map holds no heap. An entry the tracking cap evicts loses all of it: that
+/// hash takes the full bound of copies again, and a peer that sent its
+/// copies may reopen it again. Each takes 256 other tracked hashes first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MutatedCopies {
     pub copies: u8,
     reopens: u8,
     senders: [Option<std::net::IpAddr>; MUTATED_SENDERS],
+    /// Monotonic ms before which no sender may be asked for the hash.
+    kept_off_until_ms: u64,
 }
 
 impl MutatedCopies {
@@ -307,17 +309,24 @@ impl MutatedCopies {
         self.senders.contains(&Some(ip))
     }
 
-    /// Whether `ip` may reopen the abandoned hash: not a sender, under
+    /// Whether `ip` may reopen the abandoned hash, and if so count it and
+    /// keep the senders off it until `until_ms`. Not a sender, under
     /// [`MUTATED_REOPENS`], and the record not full (an unrecorded sender
     /// could be one of the copies' senders).
-    pub fn may_reopen(&self, ip: std::net::IpAddr) -> bool {
+    pub fn take_reopen(&mut self, ip: std::net::IpAddr, until_ms: u64) -> bool {
         let full = self.senders.iter().all(Option::is_some);
-        !full && !self.sent_by(ip) && self.reopens < MUTATED_REOPENS
+        if full || self.sent_by(ip) || self.reopens >= MUTATED_REOPENS {
+            return false;
+        }
+        self.reopens += 1;
+        self.kept_off_until_ms = until_ms;
+        true
     }
 
-    /// Count one reopen toward [`MUTATED_REOPENS`].
-    pub fn count_reopen(&mut self) {
-        self.reopens = self.reopens.saturating_add(1);
+    /// Whether a peer at `ip` sent copies of the hash and is still kept off
+    /// it at `now_ms`, on whatever connection it is.
+    pub fn keeps_off(&self, ip: std::net::IpAddr, now_ms: u64) -> bool {
+        now_ms < self.kept_off_until_ms && self.sent_by(ip)
     }
 }
 

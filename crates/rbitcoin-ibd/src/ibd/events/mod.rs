@@ -1115,22 +1115,13 @@ fn answer_probe(
     true
 }
 
-/// A peer's own announcement does not lift its `lacks` for a hash it sent
-/// mutated copies of: its chain still holds that header, and lifting it would
-/// hand a reopened hash back to it ([`reopen_for_announcer`]).
 fn note_announcement(
     st: &mut IbdWorkState,
     peer: usize,
     hashes: impl IntoIterator<Item = BlockHash>,
 ) {
-    let copies = &st.mutated_copies;
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
-        let ip = s.addr.ip();
-        s.chain.note_announcement(
-            hashes
-                .into_iter()
-                .filter(|h| !copies.get(h).is_some_and(|c| c.sent_by(ip))),
-        );
+        s.chain.note_announcement(hashes);
     }
 }
 
@@ -1846,14 +1837,11 @@ pub fn note_mutated_copy(
 
 /// A header abandoned for mutated copies (#1811) goes back on the path when
 /// `peer` announces it and sent none of those copies, kept or dropped
-/// (#1992). The peers that did are kept off it for a stall window
-/// (`PeerChain::lacks`, which their own announcements do not lift), so the
-/// re-get goes to `peer`. The count stays: the next mutated copy abandons
-/// it again. At most `MUTATED_REOPENS` reopens per hash keep #1811 bounded.
-/// A header abandoned for another reason stays abandoned.
-///
-/// When a sender's record of hashes it lacks is full, that sender could take
-/// the header again, so it stays abandoned and the reopen is not counted.
+/// (#1992). The peers that did are kept off it by IP for one stall window,
+/// on any connection ([`super::header_walk::may_serve`]), so the re-get
+/// goes to `peer`. The count stays: the next mutated copy abandons it again.
+/// At most `MUTATED_REOPENS` reopens per hash keep #1811 bounded. A header
+/// abandoned for another reason stays abandoned.
 pub fn reopen_for_announcer(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
     if !st.unservable.contains(&hash) {
         return;
@@ -1861,24 +1849,13 @@ pub fn reopen_for_announcer(st: &mut IbdWorkState, peer: usize, hash: BlockHash)
     let Some(ip) = st.slots.iter().find(|s| s.id == peer).map(|s| s.addr.ip()) else {
         return;
     };
-    let Some(copies) = st.mutated_copies.get(&hash).copied() else {
+    let Some(copies) = st.mutated_copies.get_mut(&hash) else {
         return;
     };
-    if !copies.may_reopen(ip) {
-        return;
+    let until = super::peer_io::ibd_mono_ms().saturating_add(super::peer_chain::STALL_WINDOW_MS);
+    if copies.take_reopen(ip, until) {
+        st.unservable.remove(&hash);
     }
-    let now = super::peer_io::ibd_mono_ms();
-    let mut kept_off = true;
-    for slot in st.slots.iter_mut().filter(|s| copies.sent_by(s.addr.ip())) {
-        kept_off &= slot.chain.note_notfound(hash, now);
-    }
-    if !kept_off {
-        return;
-    }
-    if let Some(copies) = st.mutated_copies.get_mut(&hash) {
-        copies.count_reopen();
-    }
-    st.unservable.remove(&hash);
 }
 
 /// [`reopen_for_announcer`] for each header `peer` sent. Each reopened hash

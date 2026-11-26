@@ -1070,6 +1070,7 @@ pub async fn ibd_cancellable(
                     now,
                     cfg.stall,
                     &hub.clock,
+                    &st.mutated_copies,
                 ));
                 freed.extend(disconnect_relative_slow_block_peers(
                     &mut st.slots,

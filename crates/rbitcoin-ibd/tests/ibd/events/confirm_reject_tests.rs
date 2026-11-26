@@ -5801,36 +5801,32 @@ fn abandoned_a(
     (dir, hub, st, a)
 }
 
-/// A reopen keeps the copies' senders off the header first. When a sender's
-/// record of hashes it lacks is full, it could take the header again, so the
-/// header stays abandoned (#1992).
+/// The copy senders are kept off a reopened header by IP for one stall
+/// window, on any connection: a sender that reconnects from a new port gets
+/// a new slot with an empty record, and must not take the retry meant for
+/// another peer (#1992).
 #[test]
-fn an_abandoned_header_stays_closed_when_a_sender_cannot_be_kept_off_it() {
+fn a_copy_sender_that_reconnects_is_still_kept_off_a_reopened_header() {
     use rbitcoin_ibd::ibd::events::apply_headers_event;
+    use rbitcoin_ibd::ibd::header_walk::may_serve;
 
-    let (dir, hub, mut st, a) = abandoned_a("reopen-lacks-full");
+    let (dir, hub, mut st, a) = abandoned_a("reopen-reconnect");
     let hash = a.block_hash();
-    let now = rbitcoin_ibd::ibd::peer_io::ibd_mono_ms();
-    let sender = st.slots.iter_mut().find(|s| s.id == 1).unwrap();
-    let mut filled = false;
-    for n in 0u32..4096 {
-        let mut other = [0u8; 32];
-        other[..4].copy_from_slice(&n.to_le_bytes());
-        other[31] = 0xee;
-        if !sender
-            .chain
-            .note_notfound(BlockHash::from_byte_array(other), now)
-        {
-            filled = true;
-            break;
-        }
-    }
-    assert!(filled, "the sender's lacks record is full");
-
     apply_headers_event(&mut st, &hub, 2, vec![a.header]);
+    assert!(!st.unservable.contains(&hash), "peer 2 reopens A");
+    // The announcer drops; the copy sender (127.0.0.1) comes back on a new
+    // port as slot 9, and a new peer arrives as slot 10.
+    st.slots.retain(|s| s.id != 2);
+    for (id, ip) in [(9usize, 1u8), (10, 10)] {
+        let mut slot = crate::ibd::assign::dummy_slot(id);
+        slot.addr = std::net::SocketAddr::from(([127, 0, 0, ip], 18555));
+        slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
+        st.slots.push(slot);
+    }
     assert!(
-        st.unservable.contains(&hash),
-        "A is not reopened while its sender could take it"
+        !may_serve(&st, 9, &hash),
+        "the reconnected copy sender is kept off A"
     );
+    assert!(may_serve(&st, 10, &hash), "a new peer may take A");
     let _ = std::fs::remove_dir_all(dir);
 }

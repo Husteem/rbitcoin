@@ -69,6 +69,7 @@ fn stall_pass(st: &mut IbdWorkState, hub: &ChainHub, now_ms: u64) -> Vec<BlockHa
         Duration::from_secs(30),
         now_ms,
         hub.clock.now_secs(),
+        &st.mutated_copies,
     );
     st.reopen_for_densify(&freed);
     freed
@@ -746,6 +747,31 @@ fn manual_staller_keeps_a_block_the_other_peer_lacks() {
 
     let freed = stall_pass(&mut st, &hub, 30_001);
     assert!(freed.is_empty(), "peer 1 cannot take h(1)");
+    assert!(st.slots[0].takes_block_requests());
+    assert!(st.slots[0].in_flight.contains(&h(1)));
+    assert!(drain_wire(&mut wire).iter().all(|(_, shut)| !shut));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The other `--connect` peer sent mutated copies of the reopened block the
+/// staller owes, so it is kept off that block for a stall window: nobody
+/// could take it, and the staller keeps it (#1992).
+#[test]
+fn manual_staller_keeps_a_reopened_block_the_other_peer_is_kept_off() {
+    let (dir, hub) = tmp_hub();
+    let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::Manual);
+    owe_on_wire(&mut st, 0, h(1), 0);
+    st.slots[1].addr = std::net::SocketAddr::from(([192, 0, 2, 9], 8333));
+    let mut copies = rbitcoin_ibd::ibd::state::MutatedCopies::default();
+    for _ in 0..3 {
+        copies.note(Some(st.slots[1].addr.ip()));
+    }
+    let reopener = std::net::IpAddr::from([192, 0, 2, 1]);
+    assert!(copies.take_reopen(reopener, 60_000));
+    st.mutated_copies.insert(h(1), copies);
+
+    let freed = stall_pass(&mut st, &hub, 30_001);
+    assert!(freed.is_empty(), "peer 1 is kept off h(1)");
     assert!(st.slots[0].takes_block_requests());
     assert!(st.slots[0].in_flight.contains(&h(1)));
     assert!(drain_wire(&mut wire).iter().all(|(_, shut)| !shut));
