@@ -23,6 +23,7 @@ use rbitcoin_primitives::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Bytes before first body cell (TableFile header 16 + pad to 32).
 pub const TXSTAT_BODY_HEADER: u64 = 32;
@@ -226,6 +227,9 @@ pub struct TxStat {
     pub blk: TableFile,
     pub count: AtomicU64,
     pub ovf_len: AtomicU64,
+    /// Serialises [`Self::put_header_blob`]'s read of `ovf_len`, append and
+    /// store. Readers stamp blocks too, so appends run on several threads.
+    ovf_append: Mutex<()>,
 }
 
 impl TxStat {
@@ -261,6 +265,7 @@ impl TxStat {
             blk,
             count: AtomicU64::new(0),
             ovf_len: AtomicU64::new(0),
+            ovf_append: Mutex::new(()),
         })
     }
 
@@ -317,6 +322,7 @@ impl TxStat {
             blk,
             count: AtomicU64::new(count),
             ovf_len: AtomicU64::new(ovf_len),
+            ovf_append: Mutex::new(()),
         })
     }
 
@@ -567,6 +573,7 @@ impl TxStat {
         let (off, len, n) = if blob.is_empty() {
             (0u64, 0u32, 0u32)
         } else {
+            let _append = self.ovf_append.lock().unwrap_or_else(|e| e.into_inner());
             let at = FILE_HEADER_LEN as u64 + self.ovf_len.load(Ordering::Acquire);
             self.ovf.write_at_pwrite(at, blob)?;
             self.ovf_len.store(self.ovf.data_len(), Ordering::Release);
