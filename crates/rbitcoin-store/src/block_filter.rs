@@ -387,11 +387,16 @@ impl BlockFilterTable {
         Ok(self.filters(height, height)?.and_then(|mut v| v.pop()))
     }
 
-    /// Overwrite the body bytes at `height` when the length matches the idx slot.
+    /// Overwrite the body at `height` when `slot` is still that row and
+    /// `filter` has the row's length.
     ///
-    /// The idx slot stays. Callers must have checked that `filter` hashes to
-    /// `slot.filter_hash`.
-    pub fn repair_body(&self, height: Height, filter: &[u8]) -> Result<(), StoreError> {
+    /// `Ok(false)` means the idx slot moved and nothing was written.
+    pub fn repair_body(
+        &self,
+        height: Height,
+        slot: &BlockFilterSlot,
+        filter: &[u8],
+    ) -> Result<bool, StoreError> {
         let _writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
         let inner = self.read();
         let Some((si, local)) = inner.locate(height) else {
@@ -401,6 +406,9 @@ impl BlockFilterTable {
         let row = rows
             .first()
             .ok_or(StoreError::Corrupt("blockfilter repair slot missing"))?;
+        if row.slot != *slot {
+            return Ok(false);
+        }
         if filter.len() != row.len as usize {
             return Err(StoreError::Corrupt("blockfilter repair length"));
         }
@@ -408,7 +416,7 @@ impl BlockFilterTable {
             .body
             .write_at_pwrite(u64::from(row.off), filter)?;
         inner.segs[si].body.flush()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Append consecutive heights starting at [`Self::next_height`], durably.

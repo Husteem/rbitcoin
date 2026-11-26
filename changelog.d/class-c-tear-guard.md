@@ -32,7 +32,9 @@ Fixed
 - **A served block filter is checked against its index hash.** A torn body
   no longer returns filter bytes that do not match the stored
   `filter_hash`. A by-height read that sees that mismatch recomputes the
-  filter and writes it back when the hash matches the idx slot.
+  filter and writes it back when the hash matches the idx slot and that
+  slot is still the row. A slot that moved is left alone. The read takes
+  the replacement row, and errors if the row keeps moving.
 - A torn block-filter parent rebuild is still deferred ([#2109]).
 
 [#2071]: https://github.com/rbitcoin-org/rbitcoin/issues/2071

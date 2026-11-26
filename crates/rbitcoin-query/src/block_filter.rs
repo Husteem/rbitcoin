@@ -549,27 +549,44 @@ impl Query {
     fn repaired_filter_body(
         &self,
         height: u32,
-        body: Vec<u8>,
+        mut body: Vec<u8>,
         slot: &BlockFilterSlot,
-    ) -> Result<Vec<u8>, QueryError> {
-        if check_filter_hash(&body, slot).is_ok() {
-            return Ok(body);
+    ) -> Result<(Vec<u8>, BlockFilterSlot), QueryError> {
+        let mut slot = *slot;
+        for _ in 0..2 {
+            if check_filter_hash(&body, &slot).is_ok() {
+                return Ok((body, slot));
+            }
+            let Some(table) = self.block_filter_table() else {
+                return Err(StoreError::Corrupt(
+                    "invariant: blockfilter body does not match its index hash",
+                ));
+            };
+            let block = self.reconstruct_block_at_height(Height(height))?;
+            let spent = self.spent_scripts(&block)?;
+            let filter = self.basic_filter_content(&block, &spent)?;
+            if FilterHash::hash(&filter.content).to_byte_array() != slot.filter_hash {
+                return Err(StoreError::Corrupt(
+                    "invariant: blockfilter body does not match its index hash",
+                ));
+            }
+            if table.repair_body(Height(height), &slot, &filter.content)? {
+                return Ok((filter.content, slot));
+            }
+            match table.filter(Height(height))? {
+                Some((next, next_slot)) => {
+                    body = next;
+                    slot = next_slot;
+                }
+                None => return Err(StoreError::NotFound),
+            }
         }
-        let Some(table) = self.block_filter_table() else {
-            return Err(StoreError::Corrupt(
-                "invariant: blockfilter body does not match its index hash",
-            ));
-        };
-        let block = self.reconstruct_block_at_height(Height(height))?;
-        let spent = self.spent_scripts(&block)?;
-        let filter = self.basic_filter_content(&block, &spent)?;
-        if FilterHash::hash(&filter.content).to_byte_array() != slot.filter_hash {
-            return Err(StoreError::Corrupt(
-                "invariant: blockfilter body does not match its index hash",
-            ));
+        if check_filter_hash(&body, &slot).is_ok() {
+            return Ok((body, slot));
         }
-        table.repair_body(Height(height), &filter.content)?;
-        Ok(filter.content)
+        Err(StoreError::Corrupt(
+            "invariant: blockfilter repair slot moved",
+        ))
     }
 
     /// Filter bytes and header at `height`. `None` past the watermark.
@@ -583,7 +600,7 @@ impl Query {
         table
             .filter(Height(height))?
             .map(|(body, slot)| {
-                let body = self.repaired_filter_body(height, body, &slot)?;
+                let (body, slot) = self.repaired_filter_body(height, body, &slot)?;
                 Ok::<_, QueryError>((body, FilterHeader::from_byte_array(slot.filter_header)))
             })
             .transpose()
@@ -602,6 +619,7 @@ impl Query {
                     .enumerate()
                     .map(|(i, (body, slot))| {
                         self.repaired_filter_body(start.saturating_add(i as u32), body, &slot)
+                            .map(|(body, _slot)| body)
                     })
                     .collect::<Result<Vec<_>, _>>()
             })

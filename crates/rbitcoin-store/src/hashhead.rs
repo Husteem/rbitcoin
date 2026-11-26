@@ -20,6 +20,8 @@ use crate::file::{self, TableFile, FILE_HEADER_LEN};
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{bytes, le_u64, Fk, TableKind};
 use std::collections::BTreeMap;
+#[cfg(debug_assertions)]
+use std::collections::BTreeSet;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -344,44 +346,44 @@ const AHEAD_HEAD: usize = 12;
 const AHEAD_REC: usize = 8 + 32 + 4096;
 
 #[cfg(debug_assertions)]
-static FAIL_AHEAD: Mutex<Option<PathBuf>> = Mutex::new(None);
+static FAIL_AHEAD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 #[cfg(debug_assertions)]
-static FAIL_SECOND_WRITE: Mutex<Option<PathBuf>> = Mutex::new(None);
+static FAIL_SECOND_WRITE: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// Leave the next ahead image for `path` behind and fail before the pwrite.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn fail_next_hash_head_flush_after_ahead(path: &Path) {
-    *FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+    FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
 }
 
 /// Fail after the second dirty-chunk pwrite of the next flush of `path`.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn fail_next_hash_head_flush_on_second_write(path: &Path) {
-    *FAIL_SECOND_WRITE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+    FAIL_SECOND_WRITE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
 }
 
 #[cfg(debug_assertions)]
 fn take_fail_ahead(path: &Path) -> bool {
-    let mut fail = FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
-    if fail.as_deref() == Some(path) {
-        *fail = None;
-        true
-    } else {
-        false
-    }
+    FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
 }
 
 #[cfg(debug_assertions)]
 fn take_fail_second_write(path: &Path) -> bool {
-    let mut fail = FAIL_SECOND_WRITE.lock().unwrap_or_else(|e| e.into_inner());
-    if fail.as_deref() == Some(path) {
-        *fail = None;
-        true
-    } else {
-        false
-    }
+    FAIL_SECOND_WRITE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
 }
 
 fn ahead_path(path: &Path) -> PathBuf {

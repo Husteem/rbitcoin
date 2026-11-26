@@ -24,6 +24,8 @@ use rbitcoin_primitives::{
     le_u32, le_u64, read_uleb128, uleb128_len, write_uleb128, Fk, TableKind, STORE_MAGIC,
 };
 use std::collections::BTreeMap;
+#[cfg(debug_assertions)]
+use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,24 +48,24 @@ const AHEAD_HEAD: usize = 20;
 const AHEAD_REC: usize = 8 + 32 + 4096;
 
 #[cfg(debug_assertions)]
-static FAIL_AHEAD: Mutex<Option<PathBuf>> = Mutex::new(None);
+static FAIL_AHEAD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// Leave the next txstat page image behind and fail before the pwrite.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn fail_next_txstat_flush_after_ahead(path: &Path) {
-    *FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+    FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
 }
 
 #[cfg(debug_assertions)]
 fn take_fail_ahead(path: &Path) -> bool {
-    let mut fail = FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
-    if fail.as_deref() == Some(path) {
-        *fail = None;
-        true
-    } else {
-        false
-    }
+    FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
 }
 
 fn ahead_path(path: &Path) -> PathBuf {

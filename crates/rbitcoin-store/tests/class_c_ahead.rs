@@ -215,3 +215,27 @@ fn leftover_ahead_pages_survive_a_later_write() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn one_header_txs_failpoint_does_not_clear_another_path() {
+    let a = rbitcoin_store::testutil::TempDir::labeled("ahead-a").unwrap();
+    let b = rbitcoin_store::testutil::TempDir::labeled("ahead-b").unwrap();
+    let ta = rbitcoin_store::HeaderTxsTable::create(&a.path).unwrap();
+    let tb = rbitcoin_store::HeaderTxsTable::create(&b.path).unwrap();
+    let pa = a.path.join("header_txs_first.body");
+    let pb = b.path.join("header_txs_first.body");
+    rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&pa);
+    rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&pb);
+    assert!(tb.flush().is_err(), "path b was armed");
+    assert!(
+        ta.flush().is_err(),
+        "arming path b cleared the failpoint for path a"
+    );
+    rbitcoin_store::chain::fail_next_header_txs_flush_after_payload(&pa);
+    rbitcoin_store::chain::fail_next_header_txs_flush_after_payload(&pb);
+    assert!(tb.flush().is_err(), "path b payload failpoint was armed");
+    assert!(
+        ta.flush().is_err(),
+        "arming path b cleared the payload failpoint for path a"
+    );
+}

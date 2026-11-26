@@ -145,6 +145,17 @@ fn torn_filter_body_is_written_back() {
         .expect("height 1 is sealed")
         .0;
     assert_eq!(got, good, "the repaired body must match the index hash");
+    let stored = q
+        .block_filter_table()
+        .unwrap()
+        .filter(rbitcoin_primitives::Height(1))
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(
+        stored, good,
+        "repair_body must write the recomputed bytes back"
+    );
     let again = q.basic_filter_at(1).unwrap().unwrap().0;
     assert_eq!(
         again, good,

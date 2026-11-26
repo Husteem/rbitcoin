@@ -550,46 +550,47 @@ pub struct HeaderTxsTable {
 }
 
 #[cfg(debug_assertions)]
-static FAIL_AHEAD: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+static FAIL_AHEAD: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 #[cfg(debug_assertions)]
-static FAIL_AFTER_PAYLOAD: std::sync::Mutex<Option<std::path::PathBuf>> =
-    std::sync::Mutex::new(None);
+static FAIL_AFTER_PAYLOAD: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Leave the next `header_txs` write-ahead sidecars for `path` behind and fail
 /// before the payload flush, as a power cut would.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn fail_next_header_txs_flush_after_ahead(path: &Path) {
-    *FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+    FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
 }
 
 /// Fail after the payload flush of `path`, before the sidecars are removed.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn fail_next_header_txs_flush_after_payload(path: &Path) {
-    *FAIL_AFTER_PAYLOAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+    FAIL_AFTER_PAYLOAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
 }
 
 #[cfg(debug_assertions)]
 fn take_fail_ahead(path: &Path) -> bool {
-    let mut fail = FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
-    if fail.as_deref() == Some(path) {
-        *fail = None;
-        true
-    } else {
-        false
-    }
+    FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
 }
 
 #[cfg(debug_assertions)]
 fn take_fail_after_payload(path: &Path) -> bool {
-    let mut fail = FAIL_AFTER_PAYLOAD.lock().unwrap_or_else(|e| e.into_inner());
-    if fail.as_deref() == Some(path) {
-        *fail = None;
-        true
-    } else {
-        false
-    }
+    FAIL_AFTER_PAYLOAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
 }
 
 impl HeaderTxsTable {
