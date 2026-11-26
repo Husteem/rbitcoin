@@ -568,8 +568,9 @@ async fn bip54_template_timelocks_the_coinbase() {
 
 /// A template's transaction data is sent at most twice per session: each
 /// reply re-serializes every template transaction (#1944). A further request
-/// gets `RequestTransactionData.Error`, and the session stays open, so a JDC
-/// that asks again does not lose its template provider (#2085).
+/// gets `RequestTransactionData.Error` with `stale-template-id`, the code
+/// every SRI JDC release accepts, and the session stays open, so a JDC that
+/// asks again does not lose its template provider (#2085).
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_transaction_data_requests_get_an_error_and_keep_the_session() {
     let tc = shared_regtest(0);
@@ -599,11 +600,14 @@ async fn repeated_transaction_data_requests_get_an_error_and_keep_the_session() 
         let e: RequestTransactionDataError =
             binary_sv2::from_bytes(&mut f.payload).expect("decode");
         assert_eq!(e.template_id, template_id);
-        assert_eq!(
-            e.error_code.as_utf8_or_hex(),
-            rbitcoin_sv2::session::ERROR_CODE_TX_DATA_LIMIT
-        );
+        assert_eq!(e.error_code.as_utf8_or_hex(), "stale-template-id");
     }
+    // Other requests on the session keep their own answers.
+    c.request_transaction_data(template_id + 1).await.unwrap();
+    let mut f = recv_in_time(&mut c).await;
+    assert_eq!(f.msg_type, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR);
+    let e: RequestTransactionDataError = binary_sv2::from_bytes(&mut f.payload).expect("decode");
+    assert_eq!(e.error_code.as_utf8_or_hex(), "template-id-not-found");
     tp.shutdown().await;
 }
 

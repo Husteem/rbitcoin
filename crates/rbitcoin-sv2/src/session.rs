@@ -49,14 +49,11 @@ pub const MAX_RETAINED: usize = 64;
 
 /// Transaction-data replies one session gets for one template. Each reply
 /// re-serializes every template transaction; a JDC asks once per template.
-/// Past this many a request gets [`ERROR_CODE_TX_DATA_LIMIT`]. The session
-/// stays open: a JDC that retries keeps its template provider.
+/// Past this many a request is answered `stale-template-id` and the session
+/// stays open. That is the one error code every SRI JDC release accepts:
+/// stratum v1.4.0's jd-client exits on any other.
 #[doc(hidden)]
 pub const MAX_TX_DATA_REPLIES: u8 = 2;
-
-/// `RequestTransactionData.Error` code for a template already answered
-/// [`MAX_TX_DATA_REPLIES`] times. Not one of the spec's two codes.
-pub const ERROR_CODE_TX_DATA_LIMIT: &str = "request-limit-reached";
 
 /// Budgets that replace a still-queued one before it is built. A real client
 /// changes its budget minutes apart; past this many inside one cooldown the
@@ -705,7 +702,7 @@ pub async fn on_setup(conn: &mut NoiseConn, mut frame: Frame) -> io::Result<bool
 
 /// An id this session was sent but no longer retains is stale; any other
 /// unknown id was never sent. A template already answered
-/// [`MAX_TX_DATA_REPLIES`] times gets [`ERROR_CODE_TX_DATA_LIMIT`].
+/// [`MAX_TX_DATA_REPLIES`] times is answered stale too.
 pub async fn on_request_transaction_data(
     conn: &mut NoiseWriter,
     mut frame: Frame,
@@ -719,15 +716,18 @@ pub async fn on_request_transaction_data(
     let mut over_limit = false;
     if let Some(r) = templates.retained.iter_mut().find(|r| r.id == template_id) {
         over_limit = r.data_replies >= MAX_TX_DATA_REPLIES;
-        if !over_limit {
+        if over_limit {
+            rbitcoin_log::debug!(
+                Sv2,
+                "RequestTransactionData past {MAX_TX_DATA_REPLIES} replies for template {template_id}"
+            );
+        } else {
             r.data_replies += 1;
         }
     }
     let found = templates.get(template_id).filter(|_| !over_limit);
     let Some(Retained { t, .. }) = found else {
-        let code = if over_limit {
-            ERROR_CODE_TX_DATA_LIMIT
-        } else if template_id <= templates.last_id {
+        let code = if over_limit || template_id <= templates.last_id {
             ERROR_CODE_REQUEST_TRANSACTION_DATA_STALE_TEMPLATE_ID
         } else {
             ERROR_CODE_REQUEST_TRANSACTION_DATA_TEMPLATE_ID_NOT_FOUND

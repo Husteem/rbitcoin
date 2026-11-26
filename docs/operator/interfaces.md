@@ -355,8 +355,8 @@ A changed `CoinbaseOutputConstraints` within 1 s of the last template waits
 out the rest of that second; a client that keeps replacing a queued budget
 (more than 8 times before it is built) is closed. A request for the same
 template's transaction data after the second reply gets
-`RequestTransactionData.Error` with code `request-limit-reached`; the
-session stays open.
+`RequestTransactionData.Error` with code `stale-template-id`, which every
+SRI JDC release accepts; the session stays open.
 Each session keeps every template on the current tip, up to 64, so a miner
 still on an older job after fee pushes can submit its solution; templates
 on a replaced tip retire after `--sv2-tp-stale-grace`. The templates share
