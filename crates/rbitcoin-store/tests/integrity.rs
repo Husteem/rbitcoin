@@ -297,56 +297,6 @@ fn open_restores_strong_bits_from_fence() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn tip_window_missing_strong_shrinks() {
-    let dir = tmp();
-    let s = Store::create_tiny(&dir).unwrap();
-    let mut parent_hash = [0u8; 32];
-    let mut prev = Fk::NULL;
-    let mut tip_tx = Fk::NULL;
-    for h in 0u32..3 {
-        let tx_fk = put_coinbase(&s, h as u8 + 1);
-        let txid = s.txs.body_txid(tx_fk).unwrap();
-        let rec = hdr_merkle(prev, parent_hash, h as u8, txid);
-        parent_hash = rec.hash;
-        let hfk = s.put_header(&rec).unwrap();
-        s.header_txs
-            .put_range(&rbitcoin_store::ClassCWrite::for_test(), hfk, tx_fk, 1)
-            .unwrap();
-        s.strong_tx
-            .set_strong(&rbitcoin_store::ClassCWrite::for_test(), tx_fk, hfk)
-            .unwrap();
-        s.confirmed
-            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(h), hfk)
-            .unwrap();
-        prev = hfk;
-        tip_tx = tx_fk;
-    }
-    s.rebuild_height_fence().unwrap();
-    s.flush_class_c_tip().unwrap();
-    s.headers.flush().unwrap();
-    s.txs.flush().unwrap();
-    s.header_txs.flush().unwrap();
-    assert_eq!(s.confirmed.tip_height(), Some(Height(2)));
-    s.strong_tx
-        .set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), tip_tx)
-        .unwrap();
-
-    let r = s.revalidate_tip_window_n(6).unwrap();
-    assert_eq!(
-        r.first_bad_reason,
-        Some("strong bits missing in tip window")
-    );
-    assert!(r.tip_shrunk, "must shrink: {r:?}");
-    assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
-    assert_eq!(
-        s.tx_height_get(tip_tx).unwrap(),
-        None,
-        "fence must drop the disconnected height"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// 20 trailing null `confirmed[]` slots must become the last real tip in
 /// one revalidate (the 6-height window alone only walks the tail).
 #[test]

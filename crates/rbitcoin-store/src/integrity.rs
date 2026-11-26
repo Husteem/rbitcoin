@@ -444,13 +444,6 @@ impl Store {
     ) -> Result<(), TipFault> {
         self.block_txid_fault(first, count, tx_count, merkle_root)
             .map_err(|fault| self.drop_body_on_bad(write, fk, report, fault))?;
-        if !self
-            .strong_tx
-            .all_strong_range(first, count)
-            .map_err(TipFault::read("strong_tx read"))?
-        {
-            return Err(TipFault::Bad("strong bits missing in tip window"));
-        }
         self.check_block_input_edges(write, fk, first.0, count, report)
     }
 

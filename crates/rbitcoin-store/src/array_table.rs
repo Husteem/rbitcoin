@@ -165,6 +165,11 @@ const AHEAD_HEAD: usize = 28;
 const AHEAD_REC: usize = 8 + 4 + 32;
 const AHEAD_MAX_BYTES: u64 = 64 << 20;
 
+struct AheadImage {
+    header: Vec<u8>,
+    records: Vec<(u64, Vec<u8>)>,
+}
+
 /// Where a flush calls its test hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
@@ -1126,7 +1131,7 @@ impl ArrayTable {
         Self::restore_ahead_inner(path, remove)
     }
 
-    fn parse_ahead(raw: &[u8]) -> Result<(Vec<u8>, u64, Vec<(u64, Vec<u8>)>), StoreError> {
+    fn parse_ahead(raw: &[u8]) -> Result<AheadImage, StoreError> {
         if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
             return Err(StoreError::Corrupt("array ahead header"));
         }
@@ -1183,13 +1188,16 @@ impl ArrayTable {
         if at != raw.len() {
             return Err(StoreError::Corrupt("array ahead length"));
         }
-        Ok((header, logical, images))
+        Ok(AheadImage {
+            header,
+            records: images,
+        })
     }
 
     fn load_ahead_records(path: &Path) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
         let side = Self::ahead_path(path);
         match std::fs::read(&side) {
-            Ok(raw) => Self::parse_ahead(&raw).map(|(_, _, records)| records),
+            Ok(raw) => Self::parse_ahead(&raw).map(|image| image.records),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(StoreError::io(&side, e)),
         }
@@ -1263,7 +1271,10 @@ impl ArrayTable {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(StoreError::io(&side, e)),
         };
-        let (header, _logical, images) = Self::parse_ahead(&raw)?;
+        let AheadImage {
+            header,
+            records: images,
+        } = Self::parse_ahead(&raw)?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)

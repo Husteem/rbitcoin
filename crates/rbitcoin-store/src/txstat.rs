@@ -90,7 +90,12 @@ fn read_page(path: &Path, file: &TableFile, block: u64) -> Result<[u8; 4096], St
     Ok(image)
 }
 
-fn parse_ahead(raw: &[u8]) -> Result<(u64, BTreeMap<u64, [u8; 4096]>), StoreError> {
+struct AheadPages {
+    logical: u64,
+    pages: BTreeMap<u64, [u8; 4096]>,
+}
+
+fn parse_ahead(raw: &[u8]) -> Result<AheadPages, StoreError> {
     if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
         return Err(StoreError::Corrupt("txstat ahead header"));
     }
@@ -136,10 +141,13 @@ fn parse_ahead(raw: &[u8]) -> Result<(u64, BTreeMap<u64, [u8; 4096]>), StoreErro
     if at != raw.len() {
         return Err(StoreError::Corrupt("txstat ahead length"));
     }
-    Ok((logical, images))
+    Ok(AheadPages {
+        logical,
+        pages: images,
+    })
 }
 
-fn load_ahead(path: &Path) -> Result<Option<(u64, BTreeMap<u64, [u8; 4096]>)>, StoreError> {
+fn load_ahead(path: &Path) -> Result<Option<AheadPages>, StoreError> {
     let side = ahead_path(path);
     match std::fs::read(&side) {
         Ok(raw) => parse_ahead(&raw).map(Some),
@@ -174,7 +182,10 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(StoreError::io(&side, e)),
     };
-    let (logical, images) = parse_ahead(&raw)?;
+    let AheadPages {
+        logical,
+        pages: images,
+    } = parse_ahead(&raw)?;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -453,11 +464,11 @@ impl TxStat {
         let mut logical = self.body.logical_len().max(start + bytes.len() as u64);
         // A leftover sidecar from a failed write keeps pages this write does
         // not replace; new images win on pages they cover.
-        if let Some((old_logical, old_blocks)) = load_ahead(self.body.path())? {
-            let mut merged = old_blocks;
+        if let Some(old) = load_ahead(self.body.path())? {
+            let mut merged = old.pages;
             merged.extend(blocks);
             blocks = merged;
-            logical = logical.max(old_logical);
+            logical = logical.max(old.logical);
         }
         let buf = encode_ahead(logical, &blocks);
         let side = ahead_path(self.body.path());
@@ -740,14 +751,15 @@ impl TxStat {
         // tail; the barrier syncs txstat with the rest of the archive.
         // Drop leftover images this append supersedes so restore cannot
         // replay them over the new tail; keep pages it does not touch.
-        if let Some((old_logical, mut old_blocks)) = load_ahead(self.body.path())? {
+        if let Some(old) = load_ahead(self.body.path())? {
             let end = start + blob.len() as u64;
+            let mut old_blocks = old.pages;
             old_blocks.retain(|&off, _| off.saturating_add(4096) <= start || off >= end);
             let side = ahead_path(self.body.path());
             if old_blocks.is_empty() {
                 Self::remove_ahead(Some(side))?;
             } else {
-                let buf = encode_ahead(old_logical, &old_blocks);
+                let buf = encode_ahead(old.logical, &old_blocks);
                 file::write_synced_tmp_rename(&side, &buf)?;
             }
         }

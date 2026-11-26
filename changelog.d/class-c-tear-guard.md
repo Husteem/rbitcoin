@@ -19,15 +19,20 @@ Fixed
   touch. Restore will not shrink a durable length past the sidecar or replay
   bytes the append already published. The in-place `getblockstats` stamp
   still journals its page set.
-- **Scripthash free-list and allocator state are ordered and checked.** The
-  unlink batch syncs freed links before the allocator header that names
-  them, the header's `bump` and free heads must be in range, a popped link
-  must be in range, and a slab's decoded count must match its head's `used`.
-  A torn allocator or slab now fails into the degraded/rebuild path instead
-  of handing a live slab to another key ([#2074]).
+- **Header and scripthash ingest heads become durable after their bodies.**
+  `HeaderTable::ensure_batch` syncs `header.body` before `insert_many`.
+  Scripthash ingest syncs slabs and the alloc header before
+  `ingest_insert_many`.
+- **Scripthash free-list links become durable before the allocator header.**
+  Ingest, unlink, suffix free, and undo recovery sync the body after
+  `free_slab` before `write_alloc_header`. `bump` and free heads must be in
+  range, a popped link must be in range, and a slab's decoded count must
+  match its head's `used`. A same-class slab rewritten in place can still
+  pass that `used` check; copy-on-write is not in this change ([#2074]).
 - **A served block filter is checked against its index hash.** A torn body
   no longer returns filter bytes that do not match the stored
-  `filter_hash`.
+  `filter_hash`. A by-height read that sees that mismatch recomputes the
+  filter and writes it back when the hash matches the idx slot.
 - A torn block-filter parent rebuild is still deferred ([#2109]).
 
 [#2071]: https://github.com/rbitcoin-org/rbitcoin/issues/2071

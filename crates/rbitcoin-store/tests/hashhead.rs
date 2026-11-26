@@ -46,7 +46,7 @@ fn key_in_chunk(chunk: u64, slots: u64, skip: &[[u8; 32]]) -> [u8; 32] {
     for i in 0u64.. {
         let mut key = [0u8; 32];
         key[0..8].copy_from_slice(&i.to_le_bytes());
-        if skip.iter().any(|s| *s == key) {
+        if skip.contains(&key) {
             continue;
         }
         if HashHead::hash_slot(&head_key_prefix(&key), slots) / SLOTS_PER_CHUNK == chunk {

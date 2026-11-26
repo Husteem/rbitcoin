@@ -107,3 +107,47 @@ fn basic_filter_matches_rust_bitcoin_without_a_copy_per_element() {
         scripts.len()
     );
 }
+
+#[test]
+fn torn_filter_body_is_written_back() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("filter-repair");
+    q.set_block_filter_index(true).unwrap();
+    rbitcoin_query::prepare_live_indexes(&q).unwrap();
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let ms = rbitcoin_consensus::Milestone::height(u32::MAX);
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        ms,
+    )
+    .unwrap();
+    let b1 =
+        rbitcoin_consensus::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    rbitcoin_query::accept_and_connect_block(&q, &params, rbitcoin_primitives::Height(1), &b1, ms)
+        .unwrap();
+    let good = q.basic_filter_at(1).unwrap().unwrap().0;
+    assert!(!good.is_empty());
+
+    let body = rbitcoin_store::BlockFilterTable::seg_dirs(q.store().cold_files_dir()).body_path(0);
+    let mut raw = std::fs::read(&body).unwrap();
+    for b in raw.iter_mut().skip(rbitcoin_store::file::FILE_HEADER_LEN) {
+        *b ^= 0xff;
+    }
+    std::fs::write(&body, &raw).unwrap();
+
+    let got = q
+        .basic_filter_at(1)
+        .expect("a torn body must be repaired")
+        .expect("height 1 is sealed")
+        .0;
+    assert_eq!(got, good, "the repaired body must match the index hash");
+    let again = q.basic_filter_at(1).unwrap().unwrap().0;
+    assert_eq!(
+        again, good,
+        "a later by-height read must see the write-back"
+    );
+}

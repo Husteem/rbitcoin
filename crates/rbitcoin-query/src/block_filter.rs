@@ -546,6 +546,32 @@ impl Query {
         Ok(spent)
     }
 
+    fn repaired_filter_body(
+        &self,
+        height: u32,
+        body: Vec<u8>,
+        slot: &BlockFilterSlot,
+    ) -> Result<Vec<u8>, QueryError> {
+        if check_filter_hash(&body, slot).is_ok() {
+            return Ok(body);
+        }
+        let Some(table) = self.block_filter_table() else {
+            return Err(StoreError::Corrupt(
+                "invariant: blockfilter body does not match its index hash",
+            ));
+        };
+        let block = self.reconstruct_block_at_height(Height(height))?;
+        let spent = self.spent_scripts(&block)?;
+        let filter = self.basic_filter_content(&block, &spent)?;
+        if FilterHash::hash(&filter.content).to_byte_array() != slot.filter_hash {
+            return Err(StoreError::Corrupt(
+                "invariant: blockfilter body does not match its index hash",
+            ));
+        }
+        table.repair_body(Height(height), &filter.content)?;
+        Ok(filter.content)
+    }
+
     /// Filter bytes and header at `height`. `None` past the watermark.
     pub fn basic_filter_at(
         &self,
@@ -557,8 +583,8 @@ impl Query {
         table
             .filter(Height(height))?
             .map(|(body, slot)| {
-                check_filter_hash(&body, &slot)?;
-                Ok::<_, StoreError>((body, FilterHeader::from_byte_array(slot.filter_header)))
+                let body = self.repaired_filter_body(height, body, &slot)?;
+                Ok::<_, QueryError>((body, FilterHeader::from_byte_array(slot.filter_header)))
             })
             .transpose()
     }
@@ -573,9 +599,9 @@ impl Query {
             .filters(Height(start), Height(end))?
             .map(|v| {
                 v.into_iter()
-                    .map(|(body, slot)| {
-                        check_filter_hash(&body, &slot)?;
-                        Ok::<_, StoreError>(body)
+                    .enumerate()
+                    .map(|(i, (body, slot))| {
+                        self.repaired_filter_body(start.saturating_add(i as u32), body, &slot)
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
