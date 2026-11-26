@@ -65,6 +65,103 @@ let
     optional cfg.p2p.listen cfg.p2p.port
     ++ optional cfg.electrum.enable cfg.electrum.port
     ++ optional (cfg.esplora.enable && cfg.esplora.socketPath == null) cfg.esplora.port;
+  # Every TCP port the node binds for this module. A second bind there exits
+  # the node at start.
+  nodeListenPorts =
+    forwardedPorts
+    ++ optional cfg.rpc.enable cfg.rpc.port
+    ++ optional cfg.health.enable cfg.health.port
+    ++ optional cfg.sv2.tp.enable cfg.sv2.tp.port;
+  # The marked Tor listener's port; v1 binds may not share it.
+  onionListenPort = if cfg.p2p.onionListen == null then null else whitebindPort cfg.p2p.onionListen;
+  onionListenHost =
+    let
+      a = cfg.p2p.onionListen;
+    in
+    if a == null then
+      ""
+    else if lib.hasPrefix "[" a then
+      lib.removePrefix "[" (lib.head (lib.splitString "]" a))
+    else
+      lib.head (lib.splitString ":" a);
+  onionListenBracketed = cfg.p2p.onionListen != null && lib.hasPrefix "[" cfg.p2p.onionListen;
+  # Rust's Ipv4Addr: four decimal octets, no leading zeros. The octets, or null.
+  ipv4Octets =
+    h:
+    let
+      m = builtins.match "(0|[1-9][0-9]{0,2})\\.(0|[1-9][0-9]{0,2})\\.(0|[1-9][0-9]{0,2})\\.(0|[1-9][0-9]{0,2})" h;
+      octets = if m == null then [ ] else map lib.toInt m;
+    in
+    if m != null && lib.all (o: o <= 255) octets then octets else null;
+  # Rust's Ipv6Addr with SocketAddrV6's numeric scope: one to four hex digits
+  # per group, a dotted IPv4 tail as the last two groups, and at most one `::`
+  # standing for at least one zero group. The eight groups, or null.
+  ipv6Groups =
+    h:
+    let
+      m = builtins.match "([0-9a-fA-F:.]+)(%[0-9]+)?" h;
+      halves = lib.splitString "::" (lib.head m);
+      nHalves = builtins.length halves;
+      group =
+        t:
+        if builtins.match "[0-9a-fA-F]{1,4}" t != null then [ (lib.fromHexString t) ] else null;
+      dotted =
+        t:
+        let
+          o = ipv4Octets t;
+        in
+        if o == null then
+          null
+        else
+          [
+            (builtins.elemAt o 0 * 256 + builtins.elemAt o 1)
+            (builtins.elemAt o 2 * 256 + builtins.elemAt o 3)
+          ];
+      # `last`: this half ends the address, so its last token may be dotted.
+      side =
+        s: last:
+        let
+          toks = if s == "" then [ ] else lib.splitString ":" s;
+          n = builtins.length toks;
+          parsed = lib.imap0 (
+            i: t: if last && i == n - 1 && lib.hasInfix "." t then dotted t else group t
+          ) toks;
+        in
+        if lib.any (g: g == null) parsed then null else lib.concatLists parsed;
+      left = side (lib.head halves) (nHalves == 1);
+      right = if nHalves == 2 then side (lib.last halves) true else [ ];
+      nGiven = builtins.length left + builtins.length right;
+    in
+    if m == null || nHalves > 2 || left == null || right == null then
+      null
+    else if nHalves == 1 then
+      (if nGiven == 8 then left else null)
+    else if nGiven <= 7 then
+      left ++ lib.genList (_: 0) (8 - nGiven) ++ right
+    else
+      null;
+  # The node rejects `to_canonical().is_unspecified()`: all-zero IPv6 and the
+  # IPv4-mapped 0.0.0.0 (::ffff:0:0), however they are spelled.
+  unspecifiedIpv6 =
+    g:
+    lib.all (x: x == 0) g
+    || (
+      lib.all (x: x == 0) (lib.take 5 g)
+      && builtins.elemAt g 5 == 65535
+      && builtins.elemAt g 6 == 0
+      && builtins.elemAt g 7 == 0
+    );
+  onionListenGroups = ipv6Groups onionListenHost;
+  onionListenValid =
+    onionListenPort != null
+    && onionListenPort > 0
+    && onionListenPort <= 65535
+    && (
+      if onionListenBracketed then
+        onionListenGroups != null && !unspecifiedIpv6 onionListenGroups
+      else
+        ipv4Octets onionListenHost != null && onionListenHost != "0.0.0.0"
+    );
   # Port after the last @. IPv6 is `[addr]:port`. A grant with no port is left out;
   # the node rejects it at start.
   whitebindPort = spec:
@@ -79,7 +176,12 @@ let
           in
           if builtins.length parts == 2 then builtins.elemAt parts 1 else "";
     in
-    if builtins.match "[0-9]+" port != null then lib.toInt port else null;
+    # The node's SocketAddr parse accepts leading zeros (`:008334` is 8334).
+    # More than five digits after them is no port, and could overflow toInt.
+    let
+      m = builtins.match "0*([0-9]{1,5})" port;
+    in
+    if m != null then lib.toInt (lib.head m) else null;
   whitebindPorts = lib.filter (p: p != null) (map whitebindPort cfg.netPermissionBind);
   torControlAddr =
     if cfg.tor.control != null then
@@ -246,6 +348,11 @@ let
     else
       [ "--no-listen" ]
   )
+  # After --listen/--no-listen: a later --no-listen clears the marked listener.
+  ++ lib.optionals (cfg.p2p.onionListen != null) [
+    "--listen"
+    "${cfg.p2p.onionListen}=onion"
+  ]
   ++ [
     "--log-level"
     cfg.logLevel
@@ -748,7 +855,10 @@ in
         Repeatable `--net-permission-bind` grants. Requires `p2p.listen`.
         Refused with `trustPeer`: the node turns a whitebind into a listen socket,
         and trust-peer then rejects that socket.
-        When `p2p.openFirewall` is set, the firewall also opens each grant's port.
+        When `p2p.openFirewall` is set, the firewall also opens each grant's port,
+        except a `v1` grant's: that listener is plaintext P2P for a local wallet indexer.
+        For an indexer on another LAN host, open the port on that interface only
+        (`networking.firewall.interfaces.<name>.allowedTCPPorts`).
       '';
     };
 
@@ -1034,13 +1144,31 @@ in
           The unit joins group tor, and creates that group with the NixOS tor gid
           when it is missing, so it can read the cookie.
           Gossip the onion, not a home IPv4, when discover is off.
+          Set `onionListen` to give Tor its own listener, so source-IP grants on
+          the P2P listener do not reach Tor-forwarded peers.
+        '';
+      };
+
+      onionListen = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "127.0.0.1:8334";
+        description = ''
+          Pass `--listen ADDR:PORT=onion`: a separate P2P listener for Tor forwarding.
+          `listenOnion` publishes this listener instead of the P2P bind, and an operator's
+          own onion service (an onion `externalIp`) forwards to it. Source-IP permission
+          grants skip it and keep applying on the P2P listener.
+          Needs a specific IP and a nonzero port (`[ADDR]:PORT` for IPv6), its own port,
+          and `maxInbound` > 0. Works with `listen = false` for Tor-only inbound.
+          The firewall never opens it. On a non-loopback address, restrict it to the
+          Tor forwarder with a firewall or network policy.
         '';
       };
 
       openFirewall = mkOption {
         type = types.bool;
         default = false;
-        description = "Open the P2P listen port, and any netPermissionBind port, in the NixOS firewall. Ignored when listen is false.";
+        description = "Open the P2P listen port, and any netPermissionBind port except a `v1` one or the `onionListen` port, in the NixOS firewall. The firewall opens ports, not addresses, so a grant on another address at either port stays closed too. Ignored when listen is false.";
       };
     };
 
@@ -1517,8 +1645,35 @@ in
         message = "services.rbitcoin.netPermissionBind requires p2p.listen";
       }
       {
-        assertion = lib.all (p: !builtins.elem p forwardedPorts) v1BindPorts;
-        message = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, Electrum, or Esplora port";
+        assertion = lib.all (p: !builtins.elem p (nodeListenPorts ++ optional (onionListenPort != null) onionListenPort)) v1BindPorts;
+        message = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, onion, Electrum, Esplora, RPC, health, or SV2 port";
+      }
+      {
+        assertion =
+          cfg.p2p.onionListen == null
+          || cfg.p2p.listenOnion
+          || lib.any (a: lib.hasInfix ".onion" a) cfg.p2p.externalIp;
+        message = "services.rbitcoin.p2p.onionListen requires p2p.listenOnion or an onion p2p.externalIp";
+      }
+      {
+        assertion = cfg.p2p.onionListen == null || onionListenValid;
+        message = "services.rbitcoin.p2p.onionListen needs a specific IP and a nonzero port, as ADDR:PORT or [ADDR]:PORT";
+      }
+      {
+        assertion = cfg.p2p.onionListen == null || cfg.p2p.maxInbound > 0;
+        message = "services.rbitcoin.p2p.onionListen requires p2p.maxInbound > 0";
+      }
+      {
+        assertion = onionListenPort == null || !builtins.elem onionListenPort nodeListenPorts;
+        message = "services.rbitcoin.p2p.onionListen needs its own port, not the P2P, Electrum, Esplora, RPC, health, or SV2 port";
+      }
+      {
+        assertion = cfg.trustPeer == null || cfg.p2p.onionListen == null;
+        message = "services.rbitcoin.trustPeer cannot be combined with p2p.onionListen";
+      }
+      {
+        assertion = !cfg.i2p.acceptIncoming || cfg.p2p.onionListen == null || cfg.p2p.listen;
+        message = "services.rbitcoin.i2p.acceptIncoming with p2p.onionListen requires p2p.listen (the onion listener is reserved for Tor)";
       }
       {
         assertion = v1BindPorts == [ ] || cfg.p2p.maxInbound > 0;
@@ -1733,7 +1888,9 @@ in
 
     networking.firewall.allowedTCPPorts = lib.unique (
       optional (cfg.p2p.openFirewall && cfg.p2p.listen) cfg.p2p.port
-      ++ lib.optionals (cfg.p2p.openFirewall && cfg.p2p.listen) whitebindPorts
+      ++ lib.optionals (cfg.p2p.openFirewall && cfg.p2p.listen) (
+        lib.subtractLists (v1BindPorts ++ optional (onionListenPort != null) onionListenPort) whitebindPorts
+      )
       ++ optional (cfg.electrum.enable && cfg.electrum.openFirewall) cfg.electrum.port
       ++ optional (
         cfg.esplora.enable && cfg.esplora.openFirewall && cfg.esplora.socketPath == null
