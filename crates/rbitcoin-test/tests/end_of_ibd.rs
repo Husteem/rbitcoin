@@ -934,15 +934,17 @@ async fn contaminate_writebehind(dir: &Path, miner: &P2PNode, height: u32) {
     let udir = store.join("scripthash.unsorted");
     assert!(udir.join("DONE.keys").is_file());
     assert!(!udir.join("DONE.post").is_file());
+    // The lie is durable state a cleanly stopped process left, not a torn
+    // write: this session syncs it as the node's shutdown does, so
+    // `scripthash.dirty` does not refuse the resume (#2074).
+    let session = std::sync::Arc::clone(&node.query);
     node.shutdown().await;
+    session.flush_for_shutdown().unwrap();
+    drop(session);
+    assert!(!rbitcoin_store::scripthash::sh_dirty_marked(&store));
     let query = Query::open_or_create_tiny(&store).unwrap();
     assert!(!query.store().scripthash.has_durable_index());
     assert_eq!(query.store().scripthash.include_hwm(), count);
-    // The lie is durable state a cleanly stopped process left, not a torn
-    // write: sync it as the node's shutdown does, so `scripthash.dirty`
-    // does not refuse the resume (#2074).
-    query.flush_for_shutdown().unwrap();
-    assert!(!rbitcoin_store::scripthash::sh_dirty_marked(&store));
 }
 
 async fn sh_interrupt_journey() {

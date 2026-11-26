@@ -134,7 +134,9 @@ pub fn clear_sh_dirty(store_dir: &Path) -> Result<(), StoreError> {
 
 /// [`SH_DIRTY_NAME`] for one open table. A writer marks before it writes
 /// and holds `scope` for the write. [`ScriptHashTable::flush`] clears the
-/// mark only if no write started since its sync began (`gen` unchanged).
+/// mark only if no write started since its sync began (`gen` unchanged), and
+/// never while `held`: a mark found at open, or one a failed write left, is
+/// for bytes a sync does not repair, so only a wipe removes it.
 struct ShDirty {
     scope: RwLock<()>,
     state: Mutex<ShDirtyState>,
@@ -142,18 +144,26 @@ struct ShDirty {
 
 struct ShDirtyState {
     marked: bool,
+    held: bool,
     gen: u64,
 }
 
 impl ShDirty {
     fn open(store_dir: &Path) -> Self {
+        let marked = sh_dirty_marked(store_dir);
         Self {
             scope: RwLock::new(()),
             state: Mutex::new(ShDirtyState {
-                marked: sh_dirty_marked(store_dir),
+                marked,
+                held: marked,
                 gen: 0,
             }),
         }
+    }
+
+    /// A write returned an error partway: keep the mark until a wipe.
+    fn hold(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).held = true;
     }
 
     fn begin(&self, store_dir: &Path) -> Result<std::sync::RwLockReadGuard<'_, ()>, StoreError> {
@@ -181,14 +191,27 @@ impl ShDirty {
     fn clear_after_wipe(&self, store_dir: &Path) -> Result<(), StoreError> {
         let _quiet = self.scope.write().unwrap_or_else(|e| e.into_inner());
         clear_sh_dirty(store_dir)?;
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).marked = false;
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.marked = false;
+        s.held = false;
         Ok(())
     }
 
     fn clear_if_unchanged(&self, store_dir: &Path, gen: u64) -> Result<(), StoreError> {
         let _quiet = self.scope.write().unwrap_or_else(|e| e.into_inner());
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if s.marked && s.gen == gen {
+        if s.marked && !s.held && s.gen == gen {
+            // Files the writes created or removed (ingest seal, sealed heads,
+            // compaction) are durable only once their directories are.
+            for d in [
+                store_dir.join("scripthash.body"),
+                store_dir.join("scripthash.head"),
+                store_dir.join(crate::scripthash_overflow::OVERFLOW_DIR),
+            ] {
+                if d.is_dir() {
+                    crate::file::fsync_parent_dir(&d).map_err(|e| StoreError::io(&d, e))?;
+                }
+            }
             clear_sh_dirty(store_dir)?;
             s.marked = false;
         }
@@ -1733,11 +1756,17 @@ impl ScriptHashTable {
         &self,
         recs: &[ScriptHashRecord],
     ) -> Result<(usize, AppendTiming), StoreError> {
-        let mut timing = AppendTiming::default();
         if recs.is_empty() {
-            return Ok((0, timing));
+            return Ok((0, AppendTiming::default()));
         }
-        let _dirty = self.begin_dirty_write()?;
+        self.dirty_write(|| self.put_create_batch_append_marked(recs))
+    }
+
+    fn put_create_batch_append_marked(
+        &self,
+        recs: &[ScriptHashRecord],
+    ) -> Result<(usize, AppendTiming), StoreError> {
+        let mut timing = AppendTiming::default();
 
         let t_sort = std::time::Instant::now();
         let mut order: Vec<usize> = (0..recs.len()).collect();
@@ -2646,6 +2675,20 @@ impl ScriptHashTable {
     /// After a wipe for rebuild, drop [`SH_DIRTY_NAME`].
     pub fn clear_dirty_after_wipe(&self) -> Result<(), StoreError> {
         self.dirty.clear_after_wipe(&self.store_dir)
+    }
+
+    /// Run a write that can land in place with [`SH_DIRTY_NAME`] set for its
+    /// whole span. An error keeps the mark until a wipe.
+    pub(crate) fn dirty_write<T>(
+        &self,
+        write: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let _scope = self.begin_dirty_write()?;
+        let out = write();
+        if out.is_err() {
+            self.dirty.hold();
+        }
+        out
     }
 
     /// Mark [`SH_DIRTY_NAME`] before a write that can land in place. Hold the

@@ -1102,8 +1102,8 @@ fn a_head_that_fails_open_needs_the_documented_manual_wipe() {
 
 /// A stop with scripthash writes not yet synced leaves `scripthash.dirty`.
 /// The next start is refused with advice; it does not rebuild by itself. A
-/// clean shutdown syncs and clears the mark, and an asked-for rebuild wipes
-/// it with the index (#2074).
+/// session's own clean shutdown syncs and clears its mark, but a mark found
+/// at open stays until an asked-for rebuild wipes the index (#2074).
 #[test]
 fn unsynced_sh_writes_refuse_the_next_start_until_a_rebuild() {
     use rbitcoin_store::scripthash::{mark_sh_rebuild, sh_dirty_marked};
@@ -1111,6 +1111,11 @@ fn unsynced_sh_writes_refuse_the_next_start_until_a_rebuild() {
     q.store().scripthash.flush().unwrap();
     assert!(!sh_dirty_marked(dir.path()));
     assert_eq!(q.sh_dirty_refusal(true), None);
+
+    // A session's own write is cleared by its clean shutdown.
+    drop(q.store().scripthash.begin_dirty_write().unwrap());
+    q.flush_for_shutdown().unwrap();
+    assert!(!sh_dirty_marked(dir.path()));
 
     // A write that is never synced, then an unclean stop.
     drop(q.store().scripthash.begin_dirty_write().unwrap());
@@ -1124,18 +1129,31 @@ fn unsynced_sh_writes_refuse_the_next_start_until_a_rebuild() {
         None,
         "no index, nothing to distrust"
     );
-
-    // A clean shutdown of a dirty index syncs it and clears the mark.
+    // Running without the index and stopping cleanly does not clear it.
     q.flush_for_shutdown().unwrap();
-    assert!(!sh_dirty_marked(dir.path()));
-    drop(q.store().scripthash.begin_dirty_write().unwrap());
+    assert!(
+        sh_dirty_marked(dir.path()),
+        "a sync does not repair torn bytes"
+    );
     drop(q);
 
-    // An asked-for rebuild is allowed through and the wipe drops the mark.
+    // The env flag, the rebuild mark and the degraded mark each let the
+    // start through, and the wipe drops the mark.
     let q = Query::open_or_create_tiny(dir.path()).unwrap();
     assert!(q.sh_dirty_refusal(true).is_some());
+    q.set_sh_force_rebuild(true);
+    assert_eq!(q.sh_dirty_refusal(true), None);
+    q.set_sh_force_rebuild(false);
     mark_sh_rebuild(q.store().path()).unwrap();
     assert_eq!(q.sh_dirty_refusal(true), None);
     assert!(q.startup_sh_rebuild(true).unwrap());
     assert!(!sh_dirty_marked(dir.path()), "the wipe drops the mark");
+    drop(q);
+
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    drop(q.store().scripthash.begin_dirty_write().unwrap());
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    q.mark_sh_degraded("test");
+    assert_eq!(q.sh_dirty_refusal(true), None, "degraded wipes at open");
 }

@@ -4313,11 +4313,39 @@ fn writes_mark_the_index_dirty_until_a_full_flush() {
         t.flush_async().unwrap();
         assert!(marker.exists(), "an unsynced flush keeps the mark");
     }
-    // Dropped without a full flush: the mark survives the reopen.
+    // Dropped without a full flush: the mark survives the reopen, and a sync
+    // in the new session does not repair the bytes, so only a wipe clears it.
     let t = ScriptHashTable::open_tiny(&dir).unwrap();
     assert!(marker.exists(), "the mark outlives an unclean stop");
     assert!(rbitcoin_store::scripthash::sh_dirty_marked(&dir));
     t.flush().unwrap();
+    t.flush_for_close().unwrap();
+    assert!(marker.exists(), "a mark found at open is held until a wipe");
+    t.clear_dirty_after_wipe().unwrap();
     assert!(!marker.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A write that returns an error partway may have left half its bytes. Its
+/// mark is held until a wipe, even after a later write and flush succeed.
+#[test]
+fn a_failed_write_holds_the_dirty_mark() {
+    let dir = tmp();
+    let sh = script_hash(&[0x5b]);
+    let marker = dir.join(rbitcoin_store::scripthash::SH_DIRTY_NAME);
+    let n = 300u64;
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let many: Vec<_> = (1..=n).map(|i| rec(sh, i, 0)).collect();
+    t.put_create_batch_append(&many).unwrap();
+    t.unlink_creates_batch(&[(sh, (1..=n).map(Fk).collect())])
+        .unwrap();
+    t.flush().unwrap();
+    assert!(!marker.exists(), "nothing pending after a full flush");
+    ScriptHashTable::fail_next_deferred_free();
+    assert!(t.commit_deferred_empty_heads().is_err());
+    assert!(marker.exists(), "the failed commit marked first");
+    t.commit_deferred_empty_heads().unwrap();
+    t.flush().unwrap();
+    assert!(marker.exists(), "held after a failed write");
     let _ = std::fs::remove_dir_all(&dir);
 }
