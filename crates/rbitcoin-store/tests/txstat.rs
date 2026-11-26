@@ -113,3 +113,48 @@ fn range_reads_the_cell_and_header_blob_reads_the_slot() {
     assert_eq!(got[1], Some(fat));
     assert!(t.header_blob(Fk(2)).unwrap().is_empty());
 }
+
+/// Readers stamp unstamped blocks (Esplora block routes, `getblock`), so
+/// `put_header_blob` runs on several threads at once. Each header must read
+/// back its own blob. Equal-length blobs make a shared offset silent: the
+/// slot still decodes, with another block's tails.
+#[test]
+fn concurrent_header_blobs_keep_their_own_bytes() {
+    const THREADS: u64 = 8;
+    const PER: u64 = 400;
+    let dir = TempDir::labeled("txstat-ovf-race").unwrap();
+    let t = std::sync::Arc::new(TxStat::create(&dir).unwrap());
+    let blob_for = |fk: u64| {
+        let tail = fk.to_le_bytes().repeat(4);
+        encode_ovf_blob(&[(1, tail)]).unwrap()
+    };
+    let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS as usize));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|i| {
+            let t = std::sync::Arc::clone(&t);
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                for k in 0..PER {
+                    let fk = 1 + k * THREADS + i;
+                    t.put_header_blob(Fk(fk), &blob_for(fk)).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let total: u64 = (1..=THREADS * PER)
+        .map(|fk| blob_for(fk).len() as u64)
+        .sum();
+    assert_eq!(
+        t.ovf.data_len(),
+        total,
+        "appends neither overlap nor leave gaps"
+    );
+    let wrong: Vec<u64> = (1..=THREADS * PER)
+        .filter(|&fk| t.header_blob(Fk(fk)).unwrap() != blob_for(fk))
+        .collect();
+    assert!(wrong.is_empty(), "headers read another blob: {wrong:?}");
+}
