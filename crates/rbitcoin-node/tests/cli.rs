@@ -165,6 +165,7 @@ fn operator_conf_and_argv() {
         "--sv2-tp-idle-timeout",
         "--sv2-tp-fee-delta",
         "--sv2-tp-template-interval",
+        "--sv2-tp-netgroup-sessions",
         "--rpc",
         "--rpc-listen",
         "--rest",
@@ -696,6 +697,25 @@ fn sv2_tp_idle_timeout_argv_default_off() {
         assert!(
             operator_config_from_args(
                 ["rbitcoin-node", "--sv2-tp-idle-timeout", bad],
+                &NodeEnv::default()
+            )
+            .is_err(),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn sv2_tp_netgroup_sessions_argv() {
+    assert_eq!(ready_config(["rbitcoin-node"]).sv2_tp_netgroup_sessions, 4);
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--sv2-tp-netgroup-sessions", "8"]).sv2_tp_netgroup_sessions,
+        8
+    );
+    for bad in ["0", "9", "x"] {
+        assert!(
+            operator_config_from_args(
+                ["rbitcoin-node", "--sv2-tp-netgroup-sessions", bad],
                 &NodeEnv::default()
             )
             .is_err(),

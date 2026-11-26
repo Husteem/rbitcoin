@@ -525,6 +525,8 @@ let
     (toString cfg.sv2.tp.templateInterval)
     "--sv2-tp-idle-timeout"
     (toString cfg.sv2.tp.idleTimeout)
+    "--sv2-tp-netgroup-sessions"
+    (toString cfg.sv2.tp.netgroupSessions)
   ]
   ++ cfg.extraArgs;
 in
@@ -1525,6 +1527,15 @@ in
         description = ''
           Pass `--sv2-tp-idle-timeout` seconds after the first CoinbaseOutputConstraints with no client frame.
           0 never drops a quiet pool. Passed whenever `enable` is set.
+        '';
+      };
+
+      netgroupSessions = mkOption {
+        type = types.ints.between 1 8;
+        default = 4;
+        description = ''
+          Sessions one netgroup (IPv4 /16, IPv6 /32) may hold, of the 8.
+          8 turns the share off, for miners behind one NAT, LAN or loopback tunnel.
         '';
       };
 

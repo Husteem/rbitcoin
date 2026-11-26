@@ -3189,6 +3189,7 @@ pub async fn start_sv2_tp(
         fee_delta: config.sv2_tp_fee_delta,
         template_interval: config.sv2_tp_template_interval,
         constraints_cooldown: config.sv2_tp_constraints_cooldown,
+        netgroup_sessions: config.sv2_tp_netgroup_sessions,
     };
     let h = run_sv2_tp(cfg)
         .await
