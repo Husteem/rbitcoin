@@ -4353,7 +4353,8 @@ fn a_failed_write_holds_the_dirty_mark() {
 /// A wipe drops `scripthash.dirty` only once the wipe itself is durable: the
 /// reset bodies are synced and so are the directories whose files the wipe
 /// removed (`.packed` marks, ovf heads).
-#[cfg(debug_assertions)]
+// Windows has no directory fsync, so nothing is recorded there.
+#[cfg(all(debug_assertions, unix))]
 #[test]
 fn the_wipe_clear_syncs_the_index_directories_first() {
     let dir = tmp();
