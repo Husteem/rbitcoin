@@ -4363,6 +4363,18 @@ fn pending_map_bytes() -> usize {
     std::mem::size_of::<(bitcoin::BlockHash, bitcoin::block::Header)>() * MAX_PENDING_HEADERS
 }
 
+/// Compact block whose header is `header`. The coinbase is only there so
+/// the short-id encoding has a transaction; the header bytes are `header`.
+fn cmpct_of_header(header: &bitcoin::block::Header) -> NetworkMessage {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+
+    let mut block = orphan_body(header.prev_blockhash, header.nonce);
+    block.header = *header;
+    let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
+    NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi })
+}
+
 /// Send `msg` and return the largest allocation this thread asked for, and
 /// how many asks had the size of `table`, the pending map's own table: a
 /// copy of the map asks for exactly that. The header job runs on this
@@ -4518,6 +4530,87 @@ async fn one_header_on_a_parked_chain_does_not_walk_it() {
         }
     }
     assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    // A compact block on that tip is the same bound. No work floor still
+    // walks the chain today (`keep_pending_connecting_paths`, then the
+    // body fetch). A floor this node does not meet walks it from
+    // `any_header_path_meets_minwork`, which `block` uses as well.
+    follow.send_cmpct = true;
+    follow.cmpct_version = 2;
+    for (floor_name, floor) in [("no floor", None), ("floor not met", Some([0x7f; 32]))] {
+        hub.set_minimum_chain_work(floor);
+        let _ = hub.take_path_work_steps();
+        let (largest, _) = asks_for(
+            &hub,
+            &out_tx,
+            &mut follow,
+            &peer,
+            entries,
+            cmpct_of_header(&tip),
+        )
+        .await;
+        let steps = hub.take_path_work_steps();
+        assert!(
+            steps <= 64,
+            "{floor_name} / compact block: {steps} path-work steps"
+        );
+        assert!(
+            largest < entries / 8,
+            "{floor_name} / compact block: largest ask {largest} B against a {entries} B map"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Park the child before the page that connects its parent, under a work
+/// floor so that page is not stored. The child's mark is rooted at that
+/// parent, and the parent arrives with its own parent already parked, so
+/// the known-parent drop does not see it. One more header on the child
+/// still reaches this node's tip and answers getheaders.
+#[tokio::test]
+async fn a_later_connecting_page_clears_parked_marks() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-chain-join");
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
+    hub.set_minimum_chain_work(Some([0x7f; 32]));
+    assert!(!hub.meets_minimum_chain_work());
+    let tip = hub.tip_header().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18627, 67, true);
+    let (out_tx, _rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let chain = regtest_headers_after(&tip, 3);
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(vec![chain[2]]),
+    )
+    .await;
+    assert!(peer.best_known().is_none(), "the child does not connect yet");
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(vec![chain[0], chain[1]]),
+    )
+    .await;
+    let extension = regtest_headers_after(&chain[2], 1);
+    peer.note_awaiting_headers();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(extension),
+    )
+    .await;
+    assert!(
+        !peer.is_awaiting_headers(),
+        "a header on the parked child answers getheaders once its parent arrives"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

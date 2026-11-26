@@ -3811,6 +3811,9 @@ pub struct PeerFollowState {
     /// the unknown parent and the pending-walk length from this hash to that
     /// parent. A path walk stops at a marked hash.
     pending_no_base: Arc<NoBaseMap>,
+    /// Marks whose recorded parent is this hash. Admitting the hash rewrites
+    /// or drops them. The header job does not read this index.
+    pending_no_base_kids: HashMap<BlockHash, HashSet<BlockHash>>,
 }
 
 impl PeerFollowState {
@@ -3845,6 +3848,7 @@ impl PeerFollowState {
             parked_pong: None,
             continuation_block: None,
             pending_no_base: Arc::new(NoBaseMap::new()),
+            pending_no_base_kids: HashMap::new(),
         }
     }
 }
@@ -6392,7 +6396,9 @@ fn note_advanced_best_known(
 
 /// Record `hdr` after it is admitted. A header whose parent is already marked
 /// keeps that unknown parent and one more step. A header that reaches a
-/// header we have drops every mark waiting on it. A new orphan root is one step.
+/// header we have, including through a parked parent that already does,
+/// drops every mark waiting on it. Marks parked on this hash before it
+/// arrived take the same parent. A new orphan root is one step.
 fn remember_admitted(
     hub: &ChainHub,
     follow: &mut PeerFollowState,
@@ -6405,25 +6411,113 @@ fn remember_admitted(
     let prev = hdr.prev_blockhash;
     let parent = follow.pending_no_base.get(&prev).copied();
     let parent_parked = follow.pending_headers.contains_key(&prev);
+    let own = if let Some((root, depth)) = parent {
+        Some((root, depth.saturating_add(1)))
+    } else if is_genesis_hash(&prev) || hub.knows_header(&prev) || parent_parked {
+        None
+    } else {
+        Some((prev, 1))
+    };
     let no_base = Arc::make_mut(&mut follow.pending_no_base);
-    if let Some((root, depth)) = parent {
-        no_base.insert(hash, (root, depth.saturating_add(1)));
-        return;
+    retarget_no_base(no_base, &mut follow.pending_no_base_kids, hash, own);
+}
+
+/// Point `hash` at `root`, and move it off the previous root's child list.
+fn set_no_base(
+    no_base: &mut NoBaseMap,
+    kids: &mut HashMap<BlockHash, HashSet<BlockHash>>,
+    hash: BlockHash,
+    root: BlockHash,
+    depth: u32,
+) {
+    if let Some((old, _)) = no_base.insert(hash, (root, depth)) {
+        if old != root {
+            if let Some(set) = kids.get_mut(&old) {
+                set.remove(&hash);
+                if set.is_empty() {
+                    kids.remove(&old);
+                }
+            }
+        }
     }
-    if is_genesis_hash(&prev) || hub.knows_header(&prev) {
-        no_base.retain(|_, (root, _)| *root != hash);
+    kids.entry(root).or_default().insert(hash);
+}
+
+/// Drop `hash`'s mark. Child marks that name `hash` stay, so a later admit
+/// of this same header can still find them.
+fn unlink_no_base(
+    no_base: &mut NoBaseMap,
+    kids: &mut HashMap<BlockHash, HashSet<BlockHash>>,
+    hash: &BlockHash,
+) {
+    let Some((root, _)) = no_base.remove(hash) else {
         return;
+    };
+    if let Some(set) = kids.get_mut(&root) {
+        set.remove(hash);
+        if set.is_empty() {
+            kids.remove(&root);
+        }
     }
-    if parent_parked {
-        return;
+}
+
+/// `own` is where `hash` sits after this admit. `None` means it reaches a
+/// header this node has, so `hash` and every mark parked on it go away.
+/// `Some` rewrites those marks onto the same unknown parent.
+fn retarget_no_base(
+    no_base: &mut NoBaseMap,
+    kids: &mut HashMap<BlockHash, HashSet<BlockHash>>,
+    hash: BlockHash,
+    own: Option<(BlockHash, u32)>,
+) {
+    let mut batch = Vec::new();
+    let mut stack = vec![(hash, 0u32)];
+    let mut seen = HashSet::new();
+    seen.insert(hash);
+    while let Some((node, above)) = stack.pop() {
+        if batch.len() >= MAX_PENDING_HEADERS {
+            break;
+        }
+        let Some(childs) = kids.get(&node) else {
+            continue;
+        };
+        let childs: Vec<BlockHash> = childs.iter().copied().collect();
+        for kid in childs {
+            if !seen.insert(kid) {
+                continue;
+            }
+            let Some((_, extra)) = no_base.get(&kid).copied() else {
+                continue;
+            };
+            let kid_above = above.saturating_add(extra);
+            batch.push((kid, kid_above));
+            stack.push((kid, kid_above));
+        }
     }
-    no_base.insert(hash, (prev, 1));
+    match own {
+        Some((root, base)) => {
+            for (kid, above) in batch {
+                set_no_base(no_base, kids, kid, root, base.saturating_add(above));
+            }
+            set_no_base(no_base, kids, hash, root, base);
+        }
+        None => {
+            for (kid, _) in &batch {
+                unlink_no_base(no_base, kids, kid);
+                kids.remove(kid);
+            }
+            unlink_no_base(no_base, kids, &hash);
+            kids.remove(&hash);
+        }
+    }
 }
 
 fn forget_no_base(follow: &mut PeerFollowState, hash: &BlockHash) {
-    if follow.pending_no_base.contains_key(hash) {
-        Arc::make_mut(&mut follow.pending_no_base).remove(hash);
+    if !follow.pending_no_base.contains_key(hash) {
+        return;
     }
+    let no_base = Arc::make_mut(&mut follow.pending_no_base);
+    unlink_no_base(no_base, &mut follow.pending_no_base_kids, hash);
 }
 
 fn apply_headers(
@@ -6789,7 +6883,12 @@ pub async fn on_block(
     drop_pending_cmpct(follow, session, hash);
     let ask = follow.requested_blocks.remove(&hash);
     remember_admitted(hub, follow, hash, block.header);
-    if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
+    if !any_header_path_meets_minwork_in(
+        hub,
+        &follow.pending_headers,
+        hash,
+        &follow.pending_no_base,
+    ) {
         follow.pending_blocks.insert(hash, block.clone(), ask);
         return Ok(());
     }
@@ -6996,10 +7095,16 @@ pub async fn on_cmpctblock(
         let _ = queue_getheaders(out_tx, hub, session, true, None);
     }
     remember_admitted(hub, follow, hash, hsi.header);
-    if !any_header_path_meets_minwork(hub, &follow.pending_headers, hash) {
+    if !any_header_path_meets_minwork_in(
+        hub,
+        &follow.pending_headers,
+        hash,
+        &follow.pending_no_base,
+    ) {
         return Ok(());
     }
-    let keep = keep_pending_connecting_paths(hub, &follow.pending_headers);
+    let keep =
+        keep_pending_connecting_paths_in(hub, &follow.pending_headers, &follow.pending_no_base);
     release_asks_off_path(&mut follow.requested_blocks, &keep);
     on_cmpctblock_queue_ancestors(hub, out_tx, follow, session, hash)?;
     if hub.header_below_anti_dos(&hsi.header) && !follow.requested_blocks.contains(&hash) {
@@ -7027,9 +7132,10 @@ pub async fn on_cmpctblock(
         hsi.header.prev_blockhash,
         &follow.pending_no_base,
     );
+    let no_base = Arc::clone(&follow.pending_no_base);
     let pending = std::mem::take(&mut follow.pending_headers);
     let (persisted, pending) = run_header_job(hub, move |hub| {
-        let persisted = persist_pending_header_path(hub, &pending, hash);
+        let persisted = persist_pending_header_path_in(hub, &pending, hash, &no_base);
         (persisted, pending)
     })
     .await?;
@@ -7074,12 +7180,13 @@ async fn on_cmpctblock_header_announce(
     if session.is_some_and(|s| s.send_over_budget()) {
         return Ok(());
     }
-    let mut want = fetchable_header_path_bodies(
+    let mut want = fetchable_header_path_bodies_in(
         hub,
         &follow.pending_headers,
         hash,
         &follow.pending_blocks,
         follow.requested_blocks.hashes(),
+        &follow.pending_no_base,
     );
     want.truncate(MAX_SERVE_BLOCKS.saturating_sub(follow.requested_blocks.len()));
     queue_claimed_block_getdata(
@@ -7161,12 +7268,13 @@ pub fn on_cmpctblock_queue_ancestors(
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
 ) -> Result<(), NetError> {
-    let mut ancestors: Vec<BlockHash> = fetchable_header_path_bodies(
+    let mut ancestors: Vec<BlockHash> = fetchable_header_path_bodies_in(
         hub,
         &follow.pending_headers,
         hash,
         &follow.pending_blocks,
         follow.requested_blocks.hashes(),
+        &follow.pending_no_base,
     )
     .into_iter()
     .filter(|h| *h != hash)
@@ -8465,6 +8573,17 @@ impl PathWorkMemo {
         pending: &HashMap<BlockHash, bitcoin::block::Header>,
         tip: BlockHash,
     ) -> Option<bitcoin::Work> {
+        self.work_of_header_path_in(hub, pending, tip, empty_no_base())
+    }
+
+    /// [`Self::work_of_header_path`]. A live no-base mark ends the walk.
+    fn work_of_header_path_in(
+        &mut self,
+        hub: &ChainHub,
+        pending: &HashMap<BlockHash, bitcoin::block::Header>,
+        tip: BlockHash,
+        no_base: &NoBaseMap,
+    ) -> Option<bitcoin::Work> {
         let Self {
             header_path,
             header_stored,
@@ -8472,6 +8591,9 @@ impl PathWorkMemo {
             ..
         } = self;
         let step = |h: BlockHash| {
+            if no_base_depth(hub, no_base, &h).is_some() {
+                return WorkStep::Dead;
+            }
             if hub.is_connected(&h) {
                 return hub
                     .query
@@ -8504,13 +8626,23 @@ impl PathWorkMemo {
         pending: &HashMap<BlockHash, bitcoin::block::Header>,
         tip: BlockHash,
     ) -> bool {
+        self.header_path_meets_minwork_in(hub, pending, tip, empty_no_base())
+    }
+
+    fn header_path_meets_minwork_in(
+        &mut self,
+        hub: &ChainHub,
+        pending: &HashMap<BlockHash, bitcoin::block::Header>,
+        tip: BlockHash,
+        no_base: &NoBaseMap,
+    ) -> bool {
         let Some(min) = hub.min_chain_work_floor() else {
             return true;
         };
         if hub.meets_minimum_chain_work() {
             return true;
         }
-        let Some(work) = self.work_of_header_path(hub, pending, tip) else {
+        let Some(work) = self.work_of_header_path_in(hub, pending, tip, no_base) else {
             return false;
         };
         work.to_be_bytes() >= min
@@ -8523,8 +8655,20 @@ impl PathWorkMemo {
         pending: &HashMap<BlockHash, bitcoin::block::Header>,
         tip: BlockHash,
     ) -> bool {
-        self.header_path_meets_minwork(hub, pending, tip)
-            && self.work_of_header_path(hub, pending, tip).is_some()
+        self.path_connects_in(hub, pending, tip, empty_no_base())
+    }
+
+    fn path_connects_in(
+        &mut self,
+        hub: &ChainHub,
+        pending: &HashMap<BlockHash, bitcoin::block::Header>,
+        tip: BlockHash,
+        no_base: &NoBaseMap,
+    ) -> bool {
+        self.header_path_meets_minwork_in(hub, pending, tip, no_base)
+            && self
+                .work_of_header_path_in(hub, pending, tip, no_base)
+                .is_some()
     }
 
     /// A header on `tip`'s path fails its claimed proof of work before the
@@ -8579,11 +8723,21 @@ impl PathWorkMemo {
         pending: &HashMap<BlockHash, bitcoin::block::Header>,
         tip: BlockHash,
     ) -> bool {
+        self.better_path_connects_in(hub, pending, tip, empty_no_base())
+    }
+
+    fn better_path_connects_in(
+        &mut self,
+        hub: &ChainHub,
+        pending: &HashMap<BlockHash, bitcoin::block::Header>,
+        tip: BlockHash,
+        no_base: &NoBaseMap,
+    ) -> bool {
         let weaker = self
-            .work_of_header_path(hub, pending, tip)
+            .work_of_header_path_in(hub, pending, tip, no_base)
             .zip(hub.chain_work().ok())
             .is_some_and(|(announced, ours)| announced < ours);
-        !weaker && self.path_connects(hub, pending, tip)
+        !weaker && self.path_connects_in(hub, pending, tip, no_base)
     }
 }
 
@@ -8747,7 +8901,21 @@ pub fn persist_pending_header_path(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
 ) -> Result<(), NetError> {
-    let path = unstored_header_path(hub, tip, |hash| pending.get(&hash).copied());
+    persist_pending_header_path_in(hub, pending, tip, empty_no_base())
+}
+
+fn persist_pending_header_path_in(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+    no_base: &NoBaseMap,
+) -> Result<(), NetError> {
+    let path = unstored_header_path(hub, tip, |hash| {
+        if no_base_depth(hub, no_base, &hash).is_some() {
+            return None;
+        }
+        pending.get(&hash).copied()
+    });
     // One store batch. Per-header ensure walks parent heights to genesis, so a
     // full below-floor chain (thousands of headers) is quadratic.
     for chunk in path.chunks(MAX_HEADERS_RESULTS) {
@@ -8865,19 +9033,25 @@ pub fn header_path_meets_minwork(
     PathWorkMemo::default().header_path_meets_minwork(hub, pending, tip)
 }
 
-#[doc(hidden)]
-pub fn any_header_path_meets_minwork(
+fn any_header_path_meets_minwork_in(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     extra_tip: BlockHash,
+    no_base: &NoBaseMap,
 ) -> bool {
     let mut memo = PathWorkMemo::default();
-    if memo.header_path_meets_minwork(hub, pending, extra_tip) {
+    let meets = |memo: &mut PathWorkMemo, hash: BlockHash| {
+        if no_base_depth(hub, no_base, &hash).is_some() {
+            return false;
+        }
+        memo.header_path_meets_minwork_in(hub, pending, hash, no_base)
+    };
+    if meets(&mut memo, extra_tip) {
         return true;
     }
     pending
         .keys()
-        .any(|h| *h != extra_tip && memo.header_path_meets_minwork(hub, pending, *h))
+        .any(|h| *h != extra_tip && meets(&mut memo, *h))
 }
 
 #[doc(hidden)]
@@ -8946,7 +9120,25 @@ pub fn fetchable_header_path_bodies(
     pending_blocks: &PendingBlocks,
     requested: &HashSet<BlockHash>,
 ) -> Vec<BlockHash> {
-    if !PathWorkMemo::default().better_path_connects(hub, pending, tip) {
+    fetchable_header_path_bodies_in(
+        hub,
+        pending,
+        tip,
+        pending_blocks,
+        requested,
+        empty_no_base(),
+    )
+}
+
+fn fetchable_header_path_bodies_in(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+    pending_blocks: &PendingBlocks,
+    requested: &HashSet<BlockHash>,
+    no_base: &NoBaseMap,
+) -> Vec<BlockHash> {
+    if !PathWorkMemo::default().better_path_connects_in(hub, pending, tip, no_base) {
         return Vec::new();
     }
     let path = header_path_above(hub, pending, tip, &HashSet::new());
@@ -9129,7 +9321,17 @@ pub fn keep_pending_connecting_paths(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
 ) -> Vec<BlockHash> {
-    pending_leaf_paths(hub, pending, PathWorkMemo::path_connects)
+    keep_pending_connecting_paths_in(hub, pending, empty_no_base())
+}
+
+fn keep_pending_connecting_paths_in(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    no_base: &NoBaseMap,
+) -> Vec<BlockHash> {
+    pending_leaf_paths(hub, pending, |memo, hub, pending, tip| {
+        memo.path_connects_in(hub, pending, tip, no_base)
+    })
 }
 
 /// In-flight asks off `path`. An empty path keeps them all.
