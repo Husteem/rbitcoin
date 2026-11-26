@@ -5892,7 +5892,7 @@ fn a_reopened_header_the_stored_plan_drops_is_abandoned_again() {
         known: Vec::new(),
         inflight: InFlight::capture(&st),
     };
-    settle_reopens(&mut st, vec![(hash, before)], &plan);
+    settle_reopens(&mut st, vec![(hash, before)], &plan, &[]);
     assert!(st.unservable.contains(&hash), "A is abandoned again");
     assert_eq!(st.mutated_copies[&hash], before, "its reopen is given back");
     let _ = std::fs::remove_dir_all(dir);

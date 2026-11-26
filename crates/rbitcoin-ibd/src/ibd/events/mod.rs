@@ -728,19 +728,33 @@ pub fn plan_header_reply(
     // plan then does not store would be left off the path with a reopen
     // spent, so it is abandoned again.
     let reopened = reopen_announced(st, peer, &headers);
+    let hashes: Vec<BlockHash> = headers.iter().map(|h| h.block_hash()).collect();
+    let before = super::header_walk::candidate_tip(st);
     let plan = plan_linked(st, hub, peer, ask, headers, linked, inflight);
-    settle_reopens(st, reopened, &plan);
+    // A candidate that moved onto the batch holds it up to its new tip, at
+    // the soft cap with nothing stored.
+    let after = super::header_walk::candidate_tip(st);
+    let held = match after.filter(|_| after != before) {
+        Some(tip) => hashes
+            .iter()
+            .position(|h| *h == tip)
+            .map_or(&[][..], |at| &hashes[..=at]),
+        None => &[],
+    };
+    settle_reopens(st, reopened, &plan, held);
     plan
 }
 
-/// Abandon again each header [`reopen_announced`] reopened that `plan` does
-/// not store, with its record as it was.
+/// Abandon again each header [`reopen_announced`] reopened that neither
+/// `plan` stores nor the walk's candidate `held`, with its record as it was.
 #[doc(hidden)]
 pub fn settle_reopens(
     st: &mut IbdWorkState,
     mut reopened: Vec<(BlockHash, super::state::MutatedCopies)>,
     plan: &HeaderPlan,
+    held: &[BlockHash],
 ) {
+    reopened.retain(|(hash, _)| !held.contains(hash));
     // A stored plan can keep only a prefix of the batch (`proven_header_prefix`).
     if let HeaderPlan::Store { headers, .. } = plan {
         reopened.retain(|(hash, _)| !headers.iter().any(|h| h.block_hash() == *hash));

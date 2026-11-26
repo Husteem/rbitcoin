@@ -9414,6 +9414,44 @@ fn a_heavier_fork_the_walk_adopts_at_the_cap_keeps_its_reopen() {
     let _ = dir;
 }
 
+/// At the soft cap a solicited reply that extends the walk is absorbed as
+/// its lookahead and stores nothing. When its first header was abandoned
+/// and this peer reopens it, the walk tip then rests on that header, so the
+/// header keeps its reopen (#1992).
+#[test]
+fn a_reopened_header_the_walk_absorbs_at_the_cap_keeps_its_reopen() {
+    use rbitcoin_ibd::ibd::state::MutatedCopies;
+
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reopen-absorb-cap");
+    hub.ensure_genesis().unwrap();
+    floor_unreachable(&mut hub);
+    let gen = hub.tip_hash().unwrap();
+    let h1 = mine(gen, 1);
+    let h2 = mine(h1.block_hash(), 2);
+    let h3 = mine(h2.block_hash(), 3);
+    let (s0, _rx0) = slot(0);
+    let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+    queue_at_cap_ending_on(&mut st, &hub, h1);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    // h2 was abandoned for copies another IP sent.
+    let mut copies = MutatedCopies::default();
+    for _ in 0..3 {
+        copies.note(Some(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9))));
+    }
+    st.mutated_copies.insert(h2.block_hash(), copies);
+    st.unservable.insert(h2.block_hash());
+    apply(&mut st, &hub, 0, vec![h2, h3]);
+    assert_eq!(
+        st.header_walk.tip_hash(),
+        Some(h3.block_hash()),
+        "the walk absorbs the reply"
+    );
+    assert!(
+        !st.unservable.contains(&h2.block_hash()),
+        "the walk tip does not rest on an abandoned header"
+    );
+}
+
 /// A batch through an abandoned header that is then refused (here A alone,
 /// no heavier than the candidate B) does not reopen it: the header would
 /// leave the abandoned set without going back on the path, and the refused
