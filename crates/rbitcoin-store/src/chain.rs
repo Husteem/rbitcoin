@@ -7,7 +7,7 @@ use crate::array_table::{
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::HeadScale;
-use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rbitcoin_primitives::{Fk, Height, TableKind};
 use std::path::Path;
 
@@ -545,6 +545,22 @@ pub struct HeaderTxsTable {
     seq: AtomicU64,
 }
 
+#[cfg(debug_assertions)]
+static FAIL_AHEAD: AtomicBool = AtomicBool::new(false);
+
+/// Leave the next `header_txs` write-ahead sidecars behind and fail before the
+/// payload flush, as a power cut between the sidecar and the flush would.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_header_txs_flush_after_ahead() {
+    FAIL_AHEAD.store(true, Ordering::SeqCst);
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_ahead() -> bool {
+    FAIL_AHEAD.swap(false, Ordering::SeqCst)
+}
+
 impl HeaderTxsTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Ok(Self {
@@ -555,9 +571,13 @@ impl HeaderTxsTable {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        let first_path = dir.join("header_txs_first.body");
+        let count_path = dir.join("header_txs_count.body");
+        ArrayTable::restore_ahead(&first_path)?;
+        ArrayTable::restore_ahead(&count_path)?;
         Ok(Self {
-            first: ArrayTable::open(dir.join("header_txs_first.body"), TableKind::ArrayLink)?,
-            count: ArrayTable::open(dir.join("header_txs_count.body"), TableKind::ArrayLink)?,
+            first: ArrayTable::open(first_path, TableKind::ArrayLink)?,
+            count: ArrayTable::open(count_path, TableKind::ArrayLink)?,
             seq: AtomicU64::new(0),
         })
     }
@@ -751,14 +771,31 @@ impl HeaderTxsTable {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.first.flush()?;
-        self.count.flush()?;
+        let first_ahead = self.first.write_ahead()?;
+        let count_ahead = self.count.write_ahead()?;
+        #[cfg(debug_assertions)]
+        if take_fail_ahead() {
+            return Err(StoreError::io(
+                self.first.file.path(),
+                std::io::Error::other("injected header_txs ahead failure"),
+            ));
+        }
+        if let Err(e) = self.first.flush().and_then(|()| self.count.flush()) {
+            return Err(e);
+        }
+        ArrayTable::remove_ahead(first_ahead)?;
+        ArrayTable::remove_ahead(count_ahead)?;
         Ok(())
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.first.flush_async()?;
-        self.count.flush_async()?;
+        let first_ahead = self.first.write_ahead()?;
+        let count_ahead = self.count.write_ahead()?;
+        if let Err(e) = self.first.flush_async().and_then(|()| self.count.flush_async()) {
+            return Err(e);
+        }
+        ArrayTable::remove_ahead(first_ahead)?;
+        ArrayTable::remove_ahead(count_ahead)?;
         Ok(())
     }
 }

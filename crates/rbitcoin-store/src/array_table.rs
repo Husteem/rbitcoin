@@ -11,12 +11,13 @@
 //! Counter order is the Class C paragraph of `docs/concurrency.md`.
 
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{self, TableFile, FILE_HEADER_LEN};
 use crate::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{le_u64, TableKind};
 use std::cell::Cell;
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(debug_assertions)]
 use std::sync::Condvar;
 use std::sync::Mutex;
@@ -151,6 +152,16 @@ pub const ELEM: u64 = 8;
 pub const FLUSH_SCRATCH: usize = 4096;
 
 const CLEAN: u64 = u64::MAX;
+
+/// Write-ahead image of the dirty range, used by the Class C range tables.
+///
+/// A flush can rewrite the 4 KiB block that holds the previous tip's committed
+/// entries. The `*.ahead` file holds the intended post-write header and image,
+/// synced before the payload, so open can put them back after a tear.
+const AHEAD_MAGIC: &[u8; 4] = b"ATA1";
+const AHEAD_VERSION: u16 = 1;
+const AHEAD_HEAD: usize = 68;
+const AHEAD_MAX_BYTES: u64 = 64 << 20;
 
 /// Where a flush calls its test hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1080,6 +1091,154 @@ impl ArrayTable {
     #[doc(hidden)]
     pub fn poke_live_slot(&self, index: u64, value: u64) {
         self.slots.slots(Ordering::Acquire)[index as usize].store(value, Ordering::Relaxed);
+    }
+
+    /// Sidecar path for [`Self::write_ahead`].
+    pub(crate) fn ahead_path(path: &Path) -> PathBuf {
+        let mut name = path
+            .file_name()
+            .unwrap_or_else(|| std::ffi::OsStr::new("array"))
+            .to_os_string();
+        name.push(".ahead");
+        match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+            _ => PathBuf::from(name),
+        }
+    }
+
+    /// Put a synced write-ahead image back, if one is left.
+    ///
+    /// The image is the intended post-write header and payload, not the old
+    /// bytes. It is safe to apply twice: a crash after the payload, before the
+    /// sidecar is removed, restores the same state.
+    pub(crate) fn restore_ahead(path: &Path) -> Result<(), StoreError> {
+        use std::io::{Seek, SeekFrom, Write};
+        let side = Self::ahead_path(path);
+        let raw = match std::fs::read(&side) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(StoreError::io(&side, e)),
+        };
+        if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
+            return Err(StoreError::Corrupt("array ahead header"));
+        }
+        let version = u16::from_le_bytes([raw[4], raw[5]]);
+        if version != AHEAD_VERSION {
+            return Err(StoreError::Corrupt("array ahead version"));
+        }
+        let block_start = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let len = u32::from_le_bytes(raw[16..20].try_into().unwrap()) as usize;
+        let header = &raw[20..36];
+        let logical = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let image = &raw[AHEAD_HEAD..];
+        if len != image.len()
+            || block_start < FILE_HEADER_LEN as u64
+            || (len as u64) > AHEAD_MAX_BYTES
+            || block_start.checked_add(len as u64) != Some(logical)
+        {
+            return Err(StoreError::Corrupt("array ahead geometry"));
+        }
+        let mut eng = sha256::HashEngine::default();
+        eng.input(&raw[..36]);
+        eng.input(image);
+        if sha256::Hash::from_engine(eng).to_byte_array() != raw[36..68] {
+            return Err(StoreError::Corrupt("array ahead checksum"));
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)
+            .map_err(|e| StoreError::io(path, e))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| StoreError::io(path, e))?;
+        file.write_all(header)
+            .map_err(|e| StoreError::io(path, e))?;
+        file.seek(SeekFrom::Start(block_start))
+            .map_err(|e| StoreError::io(path, e))?;
+        file.write_all(image)
+            .map_err(|e| StoreError::io(path, e))?;
+        file.sync_all().map_err(|e| StoreError::io(path, e))?;
+        drop(file);
+        std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
+        if let Some(parent) = side.parent() {
+            file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+        }
+        Ok(())
+    }
+
+    /// Write the dirty range's intended post-write header and bytes to a
+    /// synced `*.ahead` sidecar. Only the in-RAM Class C range tables use it.
+    pub(crate) fn write_ahead(&self) -> Result<Option<PathBuf>, StoreError> {
+        if !self.in_ram || self.byte_body {
+            return Ok(None);
+        }
+        let from = self.unstored_from.load(Ordering::Acquire);
+        if from == CLEAN {
+            return Ok(None);
+        }
+        let n = self.len.load(Ordering::Acquire);
+        if n == 0 {
+            return Ok(None);
+        }
+        let disk = self.disk_len.load(Ordering::Acquire);
+        let start = from.min(disk);
+        let logical = FILE_HEADER_LEN as u64 + n * ELEM;
+        let payload_start = FILE_HEADER_LEN as u64 + start * ELEM;
+        let block_start = (payload_start & !(FLUSH_SCRATCH as u64 - 1))
+            .max(FILE_HEADER_LEN as u64);
+        if logical <= block_start {
+            return Ok(None);
+        }
+        let len = (logical - block_start) as usize;
+        if len as u64 > AHEAD_MAX_BYTES {
+            return Err(StoreError::Corrupt("array ahead image too large"));
+        }
+        let words = self.slots.slots(Ordering::Acquire);
+        let mut image = vec![0u8; len];
+        let first = ((block_start - FILE_HEADER_LEN as u64) / ELEM) as usize;
+        for (i, slot) in words.iter().enumerate().skip(first).take(n as usize - first) {
+            let at = i * ELEM as usize + FILE_HEADER_LEN - block_start as usize;
+            if at + ELEM as usize <= image.len() {
+                image[at..at + ELEM as usize]
+                    .copy_from_slice(&slot.load(Ordering::Relaxed).to_le_bytes());
+            }
+        }
+        let header = file::encode_leading_header(self.file.kind, logical);
+        let mut buf = Vec::with_capacity(AHEAD_HEAD + len);
+        buf.extend_from_slice(AHEAD_MAGIC);
+        buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&block_start.to_le_bytes());
+        buf.extend_from_slice(&(len as u32).to_le_bytes());
+        buf.extend_from_slice(&header);
+        let mut eng = sha256::HashEngine::default();
+        eng.input(&buf[..36]);
+        eng.input(&image);
+        let sum = sha256::Hash::from_engine(eng).to_byte_array();
+        buf.extend_from_slice(&sum);
+        buf.extend_from_slice(&image);
+        let side = Self::ahead_path(self.file.path());
+        file::write_synced_tmp_rename(&side, &buf)?;
+        Ok(Some(side))
+    }
+
+    /// Remove a sidecar a successful flush made unnecessary. A leftover one is
+    /// harmless: open restores the same image and removes it.
+    pub(crate) fn remove_ahead(side: Option<PathBuf>) -> Result<(), StoreError> {
+        let Some(side) = side else {
+            return Ok(());
+        };
+        match std::fs::remove_file(&side) {
+            Ok(()) => {
+                if let Some(parent) = side.parent() {
+                    file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StoreError::io(&side, e)),
+        }
     }
 
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
