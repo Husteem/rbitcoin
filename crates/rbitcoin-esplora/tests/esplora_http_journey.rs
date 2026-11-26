@@ -1612,36 +1612,38 @@ async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
 /// A block connected after the view was pinned spends the coin above the
 /// view, and its spend has already left the pool. An outspend read on that
 /// view once the pool has settled again is a 503, not unspent.
+#[cfg(unix)]
 #[tokio::test(flavor = "current_thread")]
 async fn outspend_after_a_connect_past_the_pinned_view_is_not_unspent() {
-    use rbitcoin_esplora::handlers::{outspend_json, write_outspends};
+    use bitcoin::hashes::Hash;
+    use rbitcoin_esplora::handlers::write_outspends;
     let (dir, mut pad, handle) = reorg_pad("outspend-after-pin").await;
+    let st = app_state(&pad);
     let tx = spend_tx(&pad, 0);
     let cb = pad.cbs[0];
     let settle0 = pad.hub.pool_settle_gen();
     let view = pad.q.pin_chain_view().unwrap().expect("tip");
     let hub = Arc::clone(&pad.hub);
-    let hold = hub.template_hold();
-    pad.connect(vec![stored_spend(&tx, cb)]);
-    drop(hold);
+    let outpoint = json!([format!("{}:0", display_txid(bitcoin::Txid::from_byte_array(cb)))]);
+    let resp = rbitcoin_esplora::internal::outspends_by_outpoint(
+        &st,
+        outpoint.as_array().unwrap(),
+        || {
+            let hold = hub.template_hold();
+            pad.connect(vec![stored_spend(&tx, cb)]);
+            drop(hold);
+        },
+    );
+    assert_eq!(resp.status(), 503);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"chain view moved");
 
-    let slot = outspend_json(&pad.q, Some(&pad.hub), &cb, 0, Some(&view), settle0);
-    assert!(slot.is_err(), "outspend: {slot:?}");
     let mut body = Vec::new();
-    let slots = write_outspends(
-        &mut body,
-        &pad.q,
-        Some(&pad.hub),
-        &cb,
-        1,
-        Some(&view),
-        settle0,
-    );
-    assert!(
-        slots.is_err(),
-        "outspends: {}",
-        String::from_utf8_lossy(&body)
-    );
+    let err = write_outspends(&mut body, &pad.q, Some(&pad.hub), &cb, 1, Some(&view), settle0)
+        .expect_err("outspends on the pinned view");
+    assert_eq!(err.to_string(), "chain view moved", "{err}");
 
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

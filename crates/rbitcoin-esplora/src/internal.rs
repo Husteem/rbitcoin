@@ -692,36 +692,45 @@ pub async fn post_outspends_by_outpoint(State(st): State<AppState>, body: Bytes)
         let Some(arr) = v.as_array() else {
             return bad_request("body must be a JSON array of txid:vout");
         };
-        let mp = st.mempool.as_deref();
-        let settle0 = pool_settle(mp);
-        let view = match pin_or_reject(&st.query, ChainViewKind::Tip, None) {
-            Ok(v) => v,
-            Err(r) => return r,
-        };
-        let mut out = Vec::with_capacity(arr.len());
-        for x in arr {
-            let Some(s) = x.as_str() else {
-                out.push(json!({"spent": false}));
-                continue;
-            };
-            let Some((tid_s, vout_s)) = s.rsplit_once(':') else {
-                out.push(json!({"spent": false}));
-                continue;
-            };
-            let Ok(txid) = parse_hash32(tid_s) else {
-                out.push(json!({"spent": false}));
-                continue;
-            };
-            let Ok(vout) = vout_s.parse::<u32>() else {
-                out.push(json!({"spent": false}));
-                continue;
-            };
-            match outspend_json(&st.query, mp, &txid, vout, view.as_ref(), settle0) {
-                Ok(v) => out.push(v),
-                Err(e) => return store_err(e),
-            }
-        }
-        json_reply_here(out)
+        outspends_by_outpoint(&st, arr, || {})
     })
     .await
+}
+
+/// One outspend slot per `txid:vout` entry, on one view. `after_pin` runs
+/// once the view is pinned, before any slot is read.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn outspends_by_outpoint(st: &AppState, arr: &[Value], after_pin: impl FnOnce()) -> Response {
+    let mp = st.mempool.as_deref();
+    let settle0 = pool_settle(mp);
+    let view = match pin_or_reject(&st.query, ChainViewKind::Tip, None) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    after_pin();
+    let mut out = Vec::with_capacity(arr.len());
+    for x in arr {
+        let Some(s) = x.as_str() else {
+            out.push(json!({"spent": false}));
+            continue;
+        };
+        let Some((tid_s, vout_s)) = s.rsplit_once(':') else {
+            out.push(json!({"spent": false}));
+            continue;
+        };
+        let Ok(txid) = parse_hash32(tid_s) else {
+            out.push(json!({"spent": false}));
+            continue;
+        };
+        let Ok(vout) = vout_s.parse::<u32>() else {
+            out.push(json!({"spent": false}));
+            continue;
+        };
+        match outspend_json(&st.query, mp, &txid, vout, view.as_ref(), settle0) {
+            Ok(v) => out.push(v),
+            Err(e) => return store_err(e),
+        }
+    }
+    json_reply_here(out)
 }
