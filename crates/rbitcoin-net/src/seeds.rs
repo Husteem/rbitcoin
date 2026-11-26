@@ -1039,16 +1039,23 @@ impl AddrMan {
         }
     }
 
-    /// Fix a backdated time for the rows one reply returns, once. The row
-    /// then ages from that point instead of looking five days old on every
-    /// serve, as Core fixes the backdate when it ingests the address. The
-    /// caller holds the book lock with its row selection, so every address is
-    /// live.
+    /// Fix a time for the rows one reply returns, once: a missing time takes
+    /// the five-day backdate, and a stored time more than ten minutes ahead
+    /// is rewritten to it, as `ProcessAddrs` would. The row then ages instead
+    /// of looking five days old on every serve. The caller holds the book
+    /// lock with its row selection, so every address is live.
     #[doc(hidden)]
     pub fn stamp_missing_seen_for(&mut self, addrs: &[NetAddr], now: u64) {
         let backdated = backdated_seen(now);
+        let now32 = now.min(u64::from(u32::MAX)) as u32;
         for addr in addrs {
-            self.seen.entry(*addr).or_insert(backdated);
+            let stale = match self.seen.get(addr).copied() {
+                None | Some(0) => true,
+                Some(t) => u64::from(t) > u64::from(now32).saturating_add(600),
+            };
+            if stale {
+                self.seen.insert(*addr, backdated);
+            }
         }
     }
 

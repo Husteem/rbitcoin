@@ -62,6 +62,31 @@ fn peer_book_session_injects_seeds_and_flushes_on_drop() {
     sess2.flush();
 }
 
+/// The flush into the shared (served) book keeps the time a catch-up peer
+/// taught the session book, so the transfer does not drop it back to the
+/// five-day backdate.
+#[test]
+fn a_flush_keeps_a_gossiped_row_time() {
+    let shared = Arc::new(Mutex::new(AddrMan::new()));
+    let mut sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[]);
+    let row = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 8333);
+    let now = 1_700_000_000;
+    rbitcoin_ibd::ibd::events::inject_learned_addrs(
+        sess.book_mut(),
+        &[(1_699_996_400, rbitcoin_net::NetAddr::Ip(row))],
+        SocketAddr::from(([127, 0, 0, 1], 18444)),
+        rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333))),
+        1,
+        now,
+    );
+    sess.flush();
+    let book = shared.lock().unwrap();
+    assert_eq!(
+        book.last_seen_of(&rbitcoin_net::NetAddr::Ip(row)),
+        1_699_996_400 - 2 * 60 * 60
+    );
+}
+
 /// Rows another writer adds to the shared book during catch-up (the
 /// deferred DNS seeds) reach this session and survive its flush. A row
 /// the session dropped is not pulled back in.

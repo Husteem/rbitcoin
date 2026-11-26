@@ -310,6 +310,88 @@ fn getaddr_stamps_only_the_rows_it_returns() {
     );
 }
 
+/// A peers file written on a fast clock is normalized once: the first v2
+/// reply backdates the row, and a later reply reports the same point, not a
+/// fresh five-days-old time.
+#[test]
+fn a_future_peers_time_is_backdated_once() {
+    use std::sync::Mutex;
+
+    let now = 1_700_000_000u64;
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-peers-future-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("peers");
+    std::fs::write(
+        &path,
+        "rbitcoin-peers-v3\n9.9.9.9:8333 0x00 1700003600\n",
+    )
+    .unwrap();
+    let book = Arc::new(Mutex::new(
+        rbitcoin_net::seeds::AddrMan::load(&path).unwrap(),
+    ));
+    let (_hub_dir, chain) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getaddr-future");
+    let chain = rbitcoin_net::ChainHub::into_arc(chain);
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(now);
+    peers.set_addrman(Arc::clone(&book));
+
+    let ask = peers.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21004),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21004),
+        &hostile_ver(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            21004,
+        )),
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    ask.set_wants_addrv2();
+    let (out_tx, mut out_rx) = ask.open_out();
+    on_getaddr(&chain, &out_tx, Some(ask.as_ref())).unwrap();
+    let rows = loop {
+        let out = out_rx.try_recv().expect("a getaddr reply");
+        if let NetworkMessage::AddrV2(rows) = out.expect_msg() {
+            break rows;
+        }
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].time, (now - 5 * 24 * 60 * 60) as u32);
+
+    peers.set_mock_now(now + 10 * 24 * 60 * 60);
+    let ask = peers.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21005),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21005),
+        &hostile_ver(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            21005,
+        )),
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    ask.set_wants_addrv2();
+    let (out_tx, mut out_rx) = ask.open_out();
+    on_getaddr(&chain, &out_tx, Some(ask.as_ref())).unwrap();
+    let rows = loop {
+        let out = out_rx.try_recv().expect("a getaddr reply");
+        if let NetworkMessage::AddrV2(rows) = out.expect_msg() {
+            break rows;
+        }
+    };
+    assert_eq!(
+        rows[0].time,
+        (now - 5 * 24 * 60 * 60) as u32,
+        "the backdate is fixed once, not recomputed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A peer gossips this node's own onion, I2P, CJDNS and external addresses
 /// back on a clearnet session. The relay fan-out passes none of them on, to
 /// a clearnet neighbor or to an onion one, and still relays a stranger's.
