@@ -1,7 +1,7 @@
 //! Domain query layer over [`rbitcoin_store::Store`].
 
-#[doc(hidden)]
 pub mod api_read_budget;
+#[doc(hidden)]
 pub mod archive;
 #[doc(hidden)]
 pub mod batch_parents;
