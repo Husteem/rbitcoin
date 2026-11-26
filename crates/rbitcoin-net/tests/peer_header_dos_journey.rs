@@ -4614,6 +4614,71 @@ async fn a_later_connecting_page_clears_parked_marks() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Another peer connects the root of a header this peer parked, so that
+/// header's mark goes stale. Under a work floor the child page is parked.
+/// The child must not inherit the stale root: the marks already waiting on
+/// it go, and one more header on the grandchild reaches this node's tip and
+/// answers getheaders.
+#[tokio::test]
+async fn a_child_of_a_stale_mark_clears_the_marks_waiting_on_it() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-stale-root");
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
+    let tip = hub.tip_header().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18628, 68, true);
+    let (out_tx, _rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let chain = regtest_headers_after(&tip, 4);
+    for page in [vec![chain[1]], vec![chain[3]]] {
+        push(
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(peer.as_ref()),
+            NetworkMessage::Headers(page),
+        )
+        .await;
+    }
+    let other = live_peer(&peers, 18629, 69, true);
+    let (other_tx, _other_rx) = peer_out_channel();
+    push(
+        &hub,
+        &other_tx,
+        &mut PeerFollowState::new(),
+        Some(other.as_ref()),
+        NetworkMessage::Headers(vec![chain[0]]),
+    )
+    .await;
+    assert!(hub.knows_header(&chain[0].block_hash()), "the root connects");
+    // Pages from here on are parked, not stored.
+    hub.set_minimum_chain_work(Some([0x7f; 32]));
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(vec![chain[2]]),
+    )
+    .await;
+    let extension = regtest_headers_after(&chain[3], 1);
+    peer.note_awaiting_headers();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(extension),
+    )
+    .await;
+    assert!(
+        !peer.is_awaiting_headers(),
+        "a header on the grandchild answers getheaders once the chain connects"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Newest-first, each message is the parent of the headers already parked.
 /// Rewriting every descendant on that admit copies the parked set. The last
 /// header of an 8,000-header chain must stay inside the one-batch bound,
