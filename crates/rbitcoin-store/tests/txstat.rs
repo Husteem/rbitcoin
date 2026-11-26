@@ -22,6 +22,43 @@ fn txstat_blob_longer_than_the_file_is_corrupt() {
 }
 
 #[test]
+fn torn_txstat_page_restores_from_ahead_image() {
+    let dir = TempDir::labeled("txstat-ahead").unwrap();
+    let path = dir.join("txstat.body");
+    let rows: Vec<TxStatRow> = (1..=600u64).map(|i| tiny(i, 100, 10)).collect();
+    {
+        let t = TxStat::create(&dir).unwrap();
+        t.append_batch(0, &rows).unwrap();
+        fail_next_txstat_flush_after_ahead(&path);
+        assert!(
+            t.append_batch(600, &[tiny(7, 1, 2)]).is_err(),
+            "the failpoint must stop before the cell pwrite"
+        );
+        assert!(dir.join("txstat.body.ahead").is_file());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(4096)).unwrap();
+    file.write_all(&[0u8; 4096]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let t = TxStat::open(&dir).unwrap();
+    assert_eq!(t.count(), 601);
+    assert_eq!(t.get_cell(Fk(509)).unwrap(), pack_cell(&rows[508]).unwrap().0);
+    assert_eq!(
+        t.get_cell(Fk(601)).unwrap(),
+        pack_cell(&tiny(7, 1, 2)).unwrap().0
+    );
+    assert!(!dir.join("txstat.body.ahead").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn create_empty_then_extend_zeros() {
     let dir = TempDir::labeled("txstat-extend").unwrap();
     let t = TxStat::create(&dir).unwrap();

@@ -17,10 +17,13 @@
 //! tweaks do not open these files.
 
 use crate::error::StoreError;
-use crate::file::{GrowPolicy, TableFile, FILE_HEADER_LEN};
+use crate::file::{self, GrowPolicy, TableFile, FILE_HEADER_LEN};
+use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{
     le_u32, le_u64, read_uleb128, uleb128_len, write_uleb128, Fk, TableKind,
 };
+use std::collections::BTreeMap;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -35,6 +38,114 @@ pub const BLK_SLOT: u64 = 16;
 /// Overflow blob ceiling. A longer on-disk length is corrupt, not an allocation.
 #[doc(hidden)]
 pub const TXSTAT_BLOB_CEILING: usize = 16 * 1024 * 1024;
+
+const AHEAD_MAGIC: &[u8; 4] = b"TTA1";
+const AHEAD_VERSION: u16 = 1;
+const AHEAD_HEAD: usize = 20;
+const AHEAD_REC: usize = 8 + 32 + 4096;
+
+#[cfg(debug_assertions)]
+static FAIL_AHEAD: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Leave the next txstat page image behind and fail before the pwrite.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_txstat_flush_after_ahead(path: &Path) {
+    *FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_ahead(path: &Path) -> bool {
+    let mut fail = FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+    if fail.as_deref() == Some(path) {
+        *fail = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn ahead_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("txstat"))
+        .to_os_string();
+    name.push(".ahead");
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+fn read_page(path: &Path, file: &TableFile, block: u64) -> Result<[u8; 4096], StoreError> {
+    let mut image = [0u8; 4096];
+    let len = std::fs::metadata(path)
+        .map_err(|e| StoreError::io(path, e))?
+        .len();
+    if block < len {
+        let n = ((len - block) as usize).min(4096);
+        file.pread_all(block, &mut image[..n])?;
+    }
+    Ok(image)
+}
+
+/// Apply full-page images left by an interrupted `write_at_head`.
+fn restore_ahead(path: &Path) -> Result<(), StoreError> {
+    let side = ahead_path(path);
+    let raw = match std::fs::read(&side) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(&side, e)),
+    };
+    if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
+        return Err(StoreError::Corrupt("txstat ahead header"));
+    }
+    if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
+        return Err(StoreError::Corrupt("txstat ahead version"));
+    }
+    let count = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+    let logical = u64::from_le_bytes(raw[12..20].try_into().unwrap());
+    let mut at = AHEAD_HEAD;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| StoreError::io(path, e))?;
+    for _ in 0..count {
+        if raw.len() < at + AHEAD_REC {
+            return Err(StoreError::Corrupt("txstat ahead short"));
+        }
+        let off = u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+        let sum = &raw[at + 8..at + 40];
+        let image = &raw[at + 40..at + AHEAD_REC];
+        if !off.is_multiple_of(4096) {
+            return Err(StoreError::Corrupt("txstat ahead offset"));
+        }
+        let mut eng = sha256::HashEngine::default();
+        eng.input(&off.to_le_bytes());
+        eng.input(image);
+        if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
+            return Err(StoreError::Corrupt("txstat ahead checksum"));
+        }
+        file.seek(SeekFrom::Start(off))
+            .map_err(|e| StoreError::io(path, e))?;
+        file.write_all(image)
+            .map_err(|e| StoreError::io(path, e))?;
+        at += AHEAD_REC;
+    }
+    let header = file::encode_leading_header(TableKind::TxStat, logical);
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| StoreError::io(path, e))?;
+    file.write_all(&header)
+        .map_err(|e| StoreError::io(path, e))?;
+    file.sync_all().map_err(|e| StoreError::io(path, e))?;
+    drop(file);
+    std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
+    if let Some(parent) = side.parent() {
+        file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+    }
+    Ok(())
+}
 
 #[doc(hidden)]
 pub fn checked_blob_len(len: usize, remain: u64) -> Result<usize, StoreError> {
@@ -232,6 +343,61 @@ pub struct TxStat {
 }
 
 impl TxStat {
+    /// Write the intended full pages before an in-place cell write.
+    fn write_ahead_pages(&self, start: u64, bytes: &[u8]) -> Result<Option<PathBuf>, StoreError> {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let first = start & !4095;
+        let last = (start + bytes.len() as u64 - 1) & !4095;
+        let mut blocks: BTreeMap<u64, [u8; 4096]> = BTreeMap::new();
+        let mut block = first;
+        while block <= last {
+            blocks.insert(block, read_page(&self.body.path(), &self.body, block)?);
+            block += 4096;
+        }
+        for (at, byte) in bytes.iter().enumerate() {
+            let off = start + at as u64;
+            let image = blocks.get_mut(&(off & !4095)).unwrap();
+            image[(off & 4095) as usize] = *byte;
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(AHEAD_MAGIC);
+        buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.body.logical_len().max(start + bytes.len() as u64).to_le_bytes());
+        for (off, image) in &blocks {
+            buf.extend_from_slice(&off.to_le_bytes());
+            let mut eng = sha256::HashEngine::default();
+            eng.input(&off.to_le_bytes());
+            eng.input(image);
+            buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
+            buf.extend_from_slice(image);
+        }
+        let side = ahead_path(self.body.path());
+        file::write_synced_tmp_rename(&side, &buf)?;
+        #[cfg(debug_assertions)]
+        if take_fail_ahead(self.body.path()) {
+            return Err(StoreError::io(
+                self.body.path(),
+                std::io::Error::other("injected txstat ahead failure"),
+            ));
+        }
+        Ok(Some(side))
+    }
+
+    fn remove_ahead(side: Option<PathBuf>) -> Result<(), StoreError> {
+        let Some(side) = side else {
+            return Ok(());
+        };
+        std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
+        if let Some(parent) = side.parent() {
+            file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+        }
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         self.body.flush()?;
         self.ovf.flush()?;
@@ -273,6 +439,7 @@ impl TxStat {
             std::fs::remove_file(&leftover).map_err(|e| StoreError::io(&leftover, e))?;
         }
         let body_path = Self::body_path(dir);
+        restore_ahead(&body_path)?;
         let body = if body_path.exists() {
             TableFile::open(body_path, TableKind::TxStat)?
         } else {
@@ -478,7 +645,9 @@ impl TxStat {
                 tails.push((base_count + 1 + i as u64, t));
             }
         }
+        let side = self.write_ahead_pages(start, &blob)?;
         self.body.write_at_pwrite(start, &blob)?;
+        Self::remove_ahead(side)?;
         let new = base_count + rows.len() as u64;
         self.count.store(new, Ordering::Release);
         Ok(tails)
@@ -494,7 +663,9 @@ impl TxStat {
             return Err(StoreError::Corrupt("txstat overflow needs header blob"));
         }
         let off = Self::entry_offset(id)?;
+        let side = self.write_ahead_pages(off, &cell)?;
         self.body.write_at_pwrite(off, &cell)?;
+        Self::remove_ahead(side)?;
         Ok(())
     }
 
@@ -525,7 +696,9 @@ impl TxStat {
                 tails.push((idx, t));
             }
         }
+        let side = self.write_ahead_pages(start, &blob)?;
         self.body.write_at_pwrite(start, &blob)?;
+        Self::remove_ahead(side)?;
         let raw = encode_ovf_blob(&tails)?;
         self.put_header_blob(header_fk, &raw)
     }
