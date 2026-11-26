@@ -37,7 +37,9 @@ pub const RPC_MAX_CONNECTIONS: usize = 256;
 #[doc(hidden)]
 pub const REST_REPLY_BYTES: usize = 64 * 1024 * 1024;
 /// How long a built REST reply waits for its share of [`REST_REPLY_BYTES`]
-/// before it is dropped and answered 503.
+/// before it is dropped and answered 503. It is the fixed part of a reply's
+/// write deadline: a reply that stalls frees its bytes within it, but one
+/// draining at the minimum rate can hold them longer.
 const REST_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const RPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 use rbitcoin_log::info;
