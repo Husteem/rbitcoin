@@ -2295,7 +2295,11 @@ async fn electrum_reads_wait_on_their_share_of_the_store_budget() {
     let mut pad = pool_pad().await;
     pad.q.set_api_read_budget(2);
     let share = pad.q.api_read_share(rbitcoin_query::ApiSurface::Electrum);
-    assert_eq!(share.available_permits(), 1, "half of a budget of two");
+    assert_eq!(
+        share.available_permits(),
+        1,
+        "a budget of two split four ways, at least one"
+    );
     let held = share.acquire_owned().await.unwrap();
     let req = json!({"jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.get_balance",
         "params":[pad.sh.clone()]});

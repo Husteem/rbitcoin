@@ -2215,10 +2215,12 @@ async fn rest_waits_on_its_share_before_the_store_budget() {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
-    assert_eq!(rbitcoin_query::api_read_share_size(1), 1);
-    assert_eq!(rbitcoin_query::api_read_share_size(7), 3);
     // The share is sized from the configured budget, not from what happens
     // to be free when the listener binds.
+    ctx.query.set_api_surfaces(&[
+        rbitcoin_query::ApiSurface::Rpc,
+        rbitcoin_query::ApiSurface::Rest,
+    ]);
     ctx.query.set_api_read_budget(8);
     let busy = ctx
         .query
@@ -2226,9 +2228,10 @@ async fn rest_waits_on_its_share_before_the_store_budget() {
         .acquire_many_owned(7)
         .await
         .expect("permits");
-    assert_eq!(ctx.query.api_read_budget_size(), 8);
     assert_eq!(
-        rbitcoin_query::api_read_share_size(ctx.query.api_read_budget_size()),
+        ctx.query
+            .api_read_share(rbitcoin_query::ApiSurface::Rest)
+            .available_permits(),
         4
     );
     drop(busy);
@@ -2236,9 +2239,9 @@ async fn rest_waits_on_its_share_before_the_store_budget() {
 }
 
 /// JSON-RPC takes its own share of the store-read budget first, as REST
-/// does: with a budget of two (a share of one), a second store-reading call
-/// waits on the share, not on the budget, so RPC can never hold every permit
-/// Electrum, Esplora and REST read through.
+/// does: with a budget of two and all four surfaces on (a share of one), a
+/// second store-reading call waits on the share, not on the budget, so RPC
+/// can never hold every permit Electrum, Esplora and REST read through.
 #[tokio::test]
 async fn rpc_waits_on_its_share_before_the_store_budget() {
     let (ctx, dir) = http_wait_ctx();

@@ -1622,6 +1622,62 @@ fn startup_sets_datadir_hdd_on_the_store() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The store-read budget is split across the API surfaces this config
+/// turns on. A surface that is off is not counted, so one surface alone may
+/// use the whole budget, and the enabled shares sum to the budget.
+#[test]
+fn startup_splits_the_store_read_budget_across_enabled_surfaces() {
+    use rbitcoin_query::ApiSurface::{Electrum, Esplora, Rest, Rpc};
+
+    let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let share = |q: &Query, s| q.api_read_share(s).available_permits();
+    /// One config: its budget, the surfaces it turns on, and each one's
+    /// expected share.
+    struct Case {
+        label: &'static str,
+        budget: usize,
+        on: &'static [(rbitcoin_query::ApiSurface, usize)],
+    }
+    let cases = [
+        Case {
+            label: "only-electrum",
+            budget: 6,
+            on: &[(Electrum, 6)],
+        },
+        Case {
+            label: "electrum-esplora",
+            budget: 6,
+            on: &[(Esplora, 3), (Electrum, 3)],
+        },
+        Case {
+            label: "all-four",
+            budget: 7,
+            on: &[(Rpc, 2), (Rest, 2), (Esplora, 2), (Electrum, 1)],
+        },
+        Case {
+            label: "rpc-electrum-hdd",
+            budget: 1,
+            on: &[(Rpc, 1), (Electrum, 1)],
+        },
+    ];
+    for Case { label, budget, on } in cases {
+        let has = |s| on.iter().any(|(x, _)| *x == s);
+        let dir = scratch_dir(&format!("read-shares-{label}"));
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        let mut cfg = NodeConfig::default();
+        cfg.store_read_budget = Some(budget);
+        cfg.rpc.listen = has(Rpc).then_some(addr);
+        cfg.rpc.rest = has(Rest);
+        cfg.listen.electrum = has(Electrum).then_some(addr);
+        cfg.listen.esplora = has(Esplora).then_some(rbitcoin_esplora::EsploraListen::Tcp(addr));
+        apply_startup_index_mode(&q, &cfg, 0).unwrap();
+        for (surface, n) in on {
+            assert_eq!(share(&q, *surface), *n, "{label}: {surface:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn startup_names_the_genesis_coinbase_on_the_query() {
     let dir = scratch_dir("genesis-coinbase");

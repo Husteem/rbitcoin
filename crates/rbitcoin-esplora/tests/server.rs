@@ -2358,7 +2358,11 @@ async fn esplora_blocks_waits_on_its_share_of_the_store_budget() {
         .await
         .expect("listen");
     let share = q.api_read_share(rbitcoin_query::ApiSurface::Esplora);
-    assert_eq!(share.available_permits(), 1, "half of a budget of two");
+    assert_eq!(
+        share.available_permits(),
+        1,
+        "a budget of two split four ways, at least one"
+    );
     let hold = share.acquire_owned().await.expect("share permit");
     let addr = handle.local_addr;
     let stalled = tokio::spawn(async move { http_get(addr, "/blocks").await });
