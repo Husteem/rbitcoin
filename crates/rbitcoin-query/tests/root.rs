@@ -2235,3 +2235,45 @@ fn sh_history_retries_when_a_torn_posting_read_errors() {
     assert_eq!(rows[0].txid, txid0);
     drop(dir);
 }
+
+/// A torn strong bit inside the revalidation window must not shrink a good
+/// tip. Restore runs against the pre-revalidation fence.
+#[test]
+fn open_restores_in_window_strong_before_revalidate() {
+    let (dir, q) = temp_query("strong-open-order");
+    let mut prev = Fk::NULL;
+    let mut hash: Option<[u8; 32]> = None;
+    for h in 0u32..8 {
+        let (mut header, tx) = coinbase_block(h, prev, hash);
+        // A real merkle root and genesis hash, so a reopen revalidates.
+        header.merkle_root = tx.tx.txid;
+        header.hash = rbitcoin_store::block_header_hash(
+            header.version,
+            &hash.unwrap_or([0u8; 32]),
+            &header.merkle_root,
+            header.timestamp,
+            header.bits,
+            header.nonce,
+        );
+        hash = Some(header.hash);
+        prev = q.connect_block(Height(h), &header, &[tx]).unwrap();
+    }
+    let tip_tx = q.block_tx_fks(Height(7)).unwrap()[0];
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    q.store().strong_tx.set_unstrong(&write, tip_tx).unwrap();
+    q.store().strong_tx.flush().unwrap();
+    assert!(!q.store().is_confirmed_strong(tip_tx).unwrap());
+    drop(q);
+
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(
+        q.tip_height(),
+        Some(Height(7)),
+        "a torn in-window strong bit must not shrink the tip"
+    );
+    assert!(
+        q.store().is_confirmed_strong(tip_tx).unwrap(),
+        "open must restore the fence bit before revalidation"
+    );
+    drop(dir);
+}
