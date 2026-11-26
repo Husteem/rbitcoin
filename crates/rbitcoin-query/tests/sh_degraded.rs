@@ -1099,3 +1099,43 @@ fn a_head_that_fails_open_needs_the_documented_manual_wipe() {
     assert!(q.sh_history_available());
     assert!(q.scripthash_create_count(&key).unwrap() > 0);
 }
+
+/// A stop with scripthash writes not yet synced leaves `scripthash.dirty`.
+/// The next start is refused with advice; it does not rebuild by itself. A
+/// clean shutdown syncs and clears the mark, and an asked-for rebuild wipes
+/// it with the index (#2074).
+#[test]
+fn unsynced_sh_writes_refuse_the_next_start_until_a_rebuild() {
+    use rbitcoin_store::scripthash::{mark_sh_rebuild, sh_dirty_marked};
+    let (dir, q, _c, _key) = heavy_chain("sh-dirty-refuse");
+    q.store().scripthash.flush().unwrap();
+    assert!(!sh_dirty_marked(dir.path()));
+    assert_eq!(q.sh_dirty_refusal(true), None);
+
+    // A write that is never synced, then an unclean stop.
+    drop(q.store().scripthash.begin_dirty_write().unwrap());
+    drop(q);
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    let refusal = q.sh_dirty_refusal(true).expect("refused");
+    assert!(refusal.contains("RBITCOIN_SH_FORCE_REBUILD=1"), "{refusal}");
+    assert!(refusal.contains("--sh-index"), "{refusal}");
+    assert_eq!(
+        q.sh_dirty_refusal(false),
+        None,
+        "no index, nothing to distrust"
+    );
+
+    // A clean shutdown of a dirty index syncs it and clears the mark.
+    q.flush_for_shutdown().unwrap();
+    assert!(!sh_dirty_marked(dir.path()));
+    drop(q.store().scripthash.begin_dirty_write().unwrap());
+    drop(q);
+
+    // An asked-for rebuild is allowed through and the wipe drops the mark.
+    let q = Query::open_or_create_tiny(dir.path()).unwrap();
+    assert!(q.sh_dirty_refusal(true).is_some());
+    mark_sh_rebuild(q.store().path()).unwrap();
+    assert_eq!(q.sh_dirty_refusal(true), None);
+    assert!(q.startup_sh_rebuild(true).unwrap());
+    assert!(!sh_dirty_marked(dir.path()), "the wipe drops the mark");
+}

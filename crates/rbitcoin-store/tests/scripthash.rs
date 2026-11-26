@@ -4283,3 +4283,41 @@ fn collect_syncs_the_scanned_creates_first() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A write that may land in place over bytes a durable head still points at
+/// marks the index dirty first. Only a full `flush` clears the mark, so after
+/// an unclean stop the mark is still there and open can refuse to trust the
+/// index (#2074).
+#[test]
+fn writes_mark_the_index_dirty_until_a_full_flush() {
+    let dir = tmp();
+    let sh = script_hash(&[0x5a]);
+    let marker = dir.join(rbitcoin_store::scripthash::SH_DIRTY_NAME);
+    {
+        let t = ScriptHashTable::create_tiny(&dir).unwrap();
+        assert!(!marker.exists(), "a new index is clean");
+        t.put_create_batch_append(&[rec(sh, 1, 0), rec(sh, 2, 0)])
+            .unwrap();
+        assert!(marker.exists(), "an append marks the index dirty");
+        t.flush().unwrap();
+        assert!(!marker.exists(), "a full flush clears the mark");
+        t.flush_async().unwrap();
+        assert!(!marker.exists());
+
+        t.unlink_creates_batch(&[(sh, vec![Fk(2)])]).unwrap();
+        assert!(marker.exists(), "an unlink marks the index dirty");
+        t.flush().unwrap();
+        assert!(!marker.exists());
+
+        t.put_create_batch_append(&[rec(sh, 3, 0)]).unwrap();
+        t.flush_async().unwrap();
+        assert!(marker.exists(), "an unsynced flush keeps the mark");
+    }
+    // Dropped without a full flush: the mark survives the reopen.
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(marker.exists(), "the mark outlives an unclean stop");
+    assert!(rbitcoin_store::scripthash::sh_dirty_marked(&dir));
+    t.flush().unwrap();
+    assert!(!marker.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

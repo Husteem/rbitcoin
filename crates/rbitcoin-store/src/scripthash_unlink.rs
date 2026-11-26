@@ -143,6 +143,10 @@ impl ScriptHashTable {
     /// replaced page is freed. A full-list drop stays in memory until
     /// [`Self::commit_deferred_empty_heads`].
     pub fn unlink_creates_batch(&self, groups: &[([u8; 32], Vec<Fk>)]) -> Result<(), StoreError> {
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let _dirty = self.begin_dirty_write()?;
         let mut batch = UnlinkBatch::default();
         for (scripthash, fks) in groups {
             self.unlink_one(scripthash, fks, &mut batch)?;
@@ -420,6 +424,10 @@ impl ScriptHashTable {
     /// A free that fails after the head sync stays queued. The retry frees
     /// only the pages that are still on the list.
     pub fn commit_deferred_empty_heads(&self) -> Result<(), StoreError> {
+        if self.pending_empty.lock().unwrap().is_empty() {
+            return Ok(());
+        }
+        let _dirty = self.begin_dirty_write()?;
         // One free error used to stop the loop and sit at the end, so the
         // next pop retried it before any key that had not been tried. Drain
         // the jobs already queued. Failures go back after that pass.

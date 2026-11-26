@@ -480,6 +480,7 @@ impl Query {
 
     fn wipe_sh_for_rebuild(&self) -> Result<(), QueryError> {
         self.sh_run.prepare_force_full_rebuild(&self.store)?;
+        self.store.scripthash.clear_dirty_after_wipe()?;
         rbitcoin_store::clear_unsorted_shard_dir(&rbitcoin_store::unsorted_shard_dir(
             self.store.path(),
         ));
@@ -535,6 +536,29 @@ impl Query {
         }
         self.sync_sh_publish()?;
         self.clear_sh_degraded_marker()
+    }
+
+    /// Why the node must not start: the last run stopped with scripthash
+    /// writes not yet synced ([`rbitcoin_store::scripthash::SH_DIRTY_NAME`]),
+    /// and no wipe was asked for. Some of those writes land in place over
+    /// bytes a durable head still points at, so the index can read as valid
+    /// and be wrong. The operator chooses the rebuild; it is not started here.
+    pub fn sh_dirty_refusal(&self, shindex: bool) -> Option<String> {
+        let dirty = self
+            .store
+            .path()
+            .join(rbitcoin_store::scripthash::SH_DIRTY_NAME);
+        if !shindex
+            || !dirty.is_file()
+            || self.sh_degraded_marker_present()
+            || self.sh_force_rebuild()
+        {
+            return None;
+        }
+        Some(format!(
+            "scripthash index: {} is present, so the node stopped while index writes were not yet synced. The index may hold a torn write that reads as valid and answers address and scripthash queries wrongly. Start once with RBITCOIN_SH_FORCE_REBUILD=1 to wipe and rebuild it (those queries answer 503 until the rebuild finishes at tip), or start without --sh-index.",
+            dirty.display()
+        ))
     }
 
     /// Open-time wipe. Runs before IBD / resume, so a node whose SH head is
