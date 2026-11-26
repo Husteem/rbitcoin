@@ -345,6 +345,8 @@ const AHEAD_REC: usize = 8 + 32 + 4096;
 
 #[cfg(debug_assertions)]
 static FAIL_AHEAD: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(debug_assertions)]
+static FAIL_SECOND_WRITE: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 /// Leave the next ahead image for `path` behind and fail before the pwrite.
 #[cfg(debug_assertions)]
@@ -353,9 +355,27 @@ pub fn fail_next_hash_head_flush_after_ahead(path: &Path) {
     *FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
 }
 
+/// Fail after the second dirty-chunk pwrite of the next flush of `path`.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_hash_head_flush_on_second_write(path: &Path) {
+    *FAIL_SECOND_WRITE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+}
+
 #[cfg(debug_assertions)]
 fn take_fail_ahead(path: &Path) -> bool {
     let mut fail = FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+    if fail.as_deref() == Some(path) {
+        *fail = None;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_second_write(path: &Path) -> bool {
+    let mut fail = FAIL_SECOND_WRITE.lock().unwrap_or_else(|e| e.into_inner());
     if fail.as_deref() == Some(path) {
         *fail = None;
         true
@@ -376,17 +396,7 @@ fn ahead_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Apply full 4 KiB page images left by an interrupted `SlotPageCache::flush`.
-///
-/// A dirty 3 KiB chunk can share a page with a clean neighbor. The image is
-/// the whole page, so restoring it also puts the neighbor back.
-fn restore_ahead(path: &Path) -> Result<(), StoreError> {
-    let side = ahead_path(path);
-    let raw = match std::fs::read(&side) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(StoreError::io(&side, e)),
-    };
+fn parse_ahead_pages(raw: &[u8]) -> Result<BTreeMap<u64, [u8; 4096]>, StoreError> {
     if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
         return Err(StoreError::Corrupt("hash head ahead header"));
     }
@@ -399,7 +409,7 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         return Err(StoreError::Corrupt("hash head ahead length"));
     }
     let mut at = AHEAD_HEAD;
-    let mut images = Vec::with_capacity(count);
+    let mut images = BTreeMap::new();
     for _ in 0..count {
         if raw.len() < at + AHEAD_REC {
             return Err(StoreError::Corrupt("hash head ahead short"));
@@ -418,12 +428,55 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
             return Err(StoreError::Corrupt("hash head ahead checksum"));
         }
-        images.push((off, image));
+        let mut page = [0u8; 4096];
+        page.copy_from_slice(image);
+        images.insert(off, page);
         at += AHEAD_REC;
     }
     if at != raw.len() {
         return Err(StoreError::Corrupt("hash head ahead length"));
     }
+    Ok(images)
+}
+
+fn load_ahead_pages(path: &Path) -> Result<BTreeMap<u64, [u8; 4096]>, StoreError> {
+    let side = ahead_path(path);
+    match std::fs::read(&side) {
+        Ok(raw) => parse_ahead_pages(&raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(StoreError::io(&side, e)),
+    }
+}
+
+fn encode_ahead_pages(blocks: &BTreeMap<u64, [u8; 4096]>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(AHEAD_MAGIC);
+    buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    for (off, image) in blocks {
+        buf.extend_from_slice(&off.to_le_bytes());
+        let mut eng = sha256::HashEngine::default();
+        eng.input(&off.to_le_bytes());
+        eng.input(image);
+        buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
+        buf.extend_from_slice(image);
+    }
+    buf
+}
+
+/// Apply full 4 KiB page images left by an interrupted `SlotPageCache::flush`.
+///
+/// A dirty 3 KiB chunk can share a page with a clean neighbor. The image is
+/// the whole page, so restoring it also puts the neighbor back.
+fn restore_ahead(path: &Path) -> Result<(), StoreError> {
+    let side = ahead_path(path);
+    let raw = match std::fs::read(&side) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(&side, e)),
+    };
+    let images = parse_ahead_pages(&raw)?;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -432,7 +485,8 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
     for (off, image) in images {
         file.seek(SeekFrom::Start(off))
             .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(image).map_err(|e| StoreError::io(path, e))?;
+        file.write_all(&image)
+            .map_err(|e| StoreError::io(path, e))?;
     }
     file.durable_sync_all()
         .map_err(|e| StoreError::io(path, e))?;
@@ -1025,19 +1079,11 @@ impl<'a> SlotPageCache<'a> {
         let side = if blocks.is_empty() {
             None
         } else {
-            let mut buf = Vec::new();
-            buf.extend_from_slice(AHEAD_MAGIC);
-            buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
-            buf.extend_from_slice(&0u16.to_le_bytes());
-            buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
-            for (off, image) in &blocks {
-                buf.extend_from_slice(&off.to_le_bytes());
-                let mut eng = sha256::HashEngine::default();
-                eng.input(&off.to_le_bytes());
-                eng.input(image);
-                buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
-                buf.extend_from_slice(image);
-            }
+            // A leftover sidecar from a failed write keeps pages this write
+            // does not replace; new images win on pages they cover.
+            let mut merged = load_ahead_pages(self.head.file.path())?;
+            merged.extend(blocks);
+            let buf = encode_ahead_pages(&merged);
             self.head.multi.flush()?;
             let side = ahead_path(self.head.file.path());
             file::write_synced_tmp_rename(&side, &buf)?;
@@ -1051,10 +1097,19 @@ impl<'a> SlotPageCache<'a> {
             Some(side)
         };
         // BTreeMap iterates in chunk/slot order → sequential writeback (map or pwrite).
+        let mut writes = 0u32;
         for (_, chunk) in self.chunks.iter_mut() {
             if chunk.dirty {
                 let off = HashHead::slot_file_off(chunk.base_slot);
                 self.head.file.write_at(off, &chunk.data)?;
+                writes = writes.saturating_add(1);
+                #[cfg(debug_assertions)]
+                if writes >= 2 && take_fail_second_write(self.head.file.path()) {
+                    return Err(StoreError::io(
+                        self.head.file.path(),
+                        std::io::Error::other("injected hash head second-write failure"),
+                    ));
+                }
             }
         }
         if side.is_some() {

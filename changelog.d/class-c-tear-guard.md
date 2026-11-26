@@ -9,11 +9,16 @@ Fixed
   strong flush is repaired from the confirmed fence instead. `txstat.blk`
   and `txstat.ovf` are unchanged ([#2071],
   [#2072], [#2073], [#2075]).
-- **txstat appends use the Class A tail guard.** Append-only `txstat` batches
-  no longer mirror every new cell page into `txstat.body.ahead`; the Class A
-  page-0/tail guard already covers the only old page an append can touch. The
-  in-place `getblockstats` stamp still journals its page set. This removes
-  roughly one copy of `txstat.body` from a full IBD.
+- **A later write keeps outstanding `*.ahead` page images.** Replacing the
+  sidecar merges every image the new write does not cover; new images win on
+  overlap. `HashHead`, `ScriptHashHead`, in-place `txstat` stamps, and
+  `header_txs` share that merge ([#2108]).
+- **txstat appends leave the Class A tail guard in charge of new cells.** An
+  append-only batch does not copy the new tail into `txstat.body.ahead`. It
+  drops leftover images that overlap the append and keeps pages it does not
+  touch. Restore will not shrink a durable length past the sidecar or replay
+  bytes the append already published. The in-place `getblockstats` stamp
+  still journals its page set.
 - **Scripthash free-list and allocator state are ordered and checked.** The
   unlink batch syncs freed links before the allocator header that names
   them, the header's `bump` and free heads must be in range, a popped link
@@ -23,10 +28,7 @@ Fixed
 - **A served block filter is checked against its index hash.** A torn body
   no longer returns filter bytes that do not match the stored
   `filter_hash`.
-- **Not 0.10.0 blockers:** the failed-write carry-over of outstanding
-  `*.ahead` pages ([#2108]) and a torn block-filter parent rebuild ([#2109])
-  are deferred to 0.10.x. Neither touches the archive or the tip commit;
-  affected derived state recovers by rebuilding the table/index.
+- A torn block-filter parent rebuild is still deferred ([#2109]).
 
 [#2071]: https://github.com/rbitcoin-org/rbitcoin/issues/2071
 [#2072]: https://github.com/rbitcoin-org/rbitcoin/issues/2072

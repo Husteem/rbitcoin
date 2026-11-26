@@ -1126,14 +1126,7 @@ impl ArrayTable {
         Self::restore_ahead_inner(path, remove)
     }
 
-    fn restore_ahead_inner(path: &Path, remove: bool) -> Result<(), StoreError> {
-        use std::io::{Seek, SeekFrom, Write};
-        let side = Self::ahead_path(path);
-        let raw = match std::fs::read(&side) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(StoreError::io(&side, e)),
-        };
+    fn parse_ahead(raw: &[u8]) -> Result<(Vec<u8>, u64, Vec<(u64, Vec<u8>)>), StoreError> {
         if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
             return Err(StoreError::Corrupt("array ahead header"));
         }
@@ -1144,7 +1137,7 @@ impl ArrayTable {
         if count == 0 || count > (raw.len().saturating_sub(AHEAD_HEAD)) / AHEAD_REC {
             return Err(StoreError::Corrupt("array ahead count"));
         }
-        let header = &raw[12..28];
+        let header = raw[12..28].to_vec();
         let logical = u64::from_le_bytes([
             header[8], header[9], header[10], header[11], header[12], header[13], header[14],
             header[15],
@@ -1184,12 +1177,93 @@ impl ArrayTable {
             if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
                 return Err(StoreError::Corrupt("array ahead checksum"));
             }
-            images.push((off, image));
+            images.push((off, image.to_vec()));
             at = image_at + len;
         }
         if at != raw.len() {
             return Err(StoreError::Corrupt("array ahead length"));
         }
+        Ok((header, logical, images))
+    }
+
+    fn load_ahead_records(path: &Path) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
+        let side = Self::ahead_path(path);
+        match std::fs::read(&side) {
+            Ok(raw) => Self::parse_ahead(&raw).map(|(_, _, records)| records),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(StoreError::io(&side, e)),
+        }
+    }
+
+    fn leftover_pieces(old_off: u64, old: &[u8], news: &[(u64, Vec<u8>)]) -> Vec<(u64, Vec<u8>)> {
+        let mut pieces = vec![(old_off, old.to_vec())];
+        for (new_off, new) in news {
+            let new_end = *new_off + new.len() as u64;
+            let mut next = Vec::new();
+            for (off, bytes) in pieces {
+                let end = off + bytes.len() as u64;
+                if end <= *new_off || off >= new_end {
+                    next.push((off, bytes));
+                    continue;
+                }
+                if off < *new_off {
+                    let keep = (*new_off - off) as usize;
+                    next.push((off, bytes[..keep].to_vec()));
+                }
+                if end > new_end {
+                    let skip = (new_end - off) as usize;
+                    next.push((new_end, bytes[skip..].to_vec()));
+                }
+            }
+            pieces = next;
+        }
+        pieces
+    }
+
+    fn clip_record(off: u64, mut bytes: Vec<u8>, logical: u64) -> Option<(u64, Vec<u8>)> {
+        if off < FILE_HEADER_LEN as u64 || off >= logical || bytes.is_empty() {
+            return None;
+        }
+        let end = off.saturating_add(bytes.len() as u64).min(logical);
+        if end <= off {
+            return None;
+        }
+        bytes.truncate((end - off) as usize);
+        if bytes.is_empty() || (bytes.len() as u64) > AHEAD_MAX_BYTES {
+            return None;
+        }
+        Some((off, bytes))
+    }
+
+    fn encode_ahead(header: &[u8], records: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(AHEAD_HEAD + 4096 + records.len() * AHEAD_REC);
+        buf.extend_from_slice(AHEAD_MAGIC);
+        buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        buf.extend_from_slice(header);
+        for (off, image) in records {
+            buf.extend_from_slice(&off.to_le_bytes());
+            buf.extend_from_slice(&(image.len() as u32).to_le_bytes());
+            let mut eng = sha256::HashEngine::default();
+            eng.input(&off.to_le_bytes());
+            eng.input(&(image.len() as u32).to_le_bytes());
+            eng.input(image);
+            buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
+            buf.extend_from_slice(image);
+        }
+        buf
+    }
+
+    fn restore_ahead_inner(path: &Path, remove: bool) -> Result<(), StoreError> {
+        use std::io::{Seek, SeekFrom, Write};
+        let side = Self::ahead_path(path);
+        let raw = match std::fs::read(&side) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(StoreError::io(&side, e)),
+        };
+        let (header, _logical, images) = Self::parse_ahead(&raw)?;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1200,11 +1274,12 @@ impl ArrayTable {
         for (off, image) in images {
             file.seek(SeekFrom::Start(off))
                 .map_err(|e| StoreError::io(path, e))?;
-            file.write_all(image).map_err(|e| StoreError::io(path, e))?;
+            file.write_all(&image)
+                .map_err(|e| StoreError::io(path, e))?;
         }
         file.seek(SeekFrom::Start(0))
             .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(header)
+        file.write_all(&header)
             .map_err(|e| StoreError::io(path, e))?;
         file.durable_sync_all()
             .map_err(|e| StoreError::io(path, e))?;
@@ -1273,22 +1348,19 @@ impl ArrayTable {
             records.push((FILE_HEADER_LEN as u64, page));
         }
         records.push((block_start, image));
-        let mut buf = Vec::with_capacity(AHEAD_HEAD + 4096 + records.len() * AHEAD_REC);
-        buf.extend_from_slice(AHEAD_MAGIC);
-        buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&(records.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&header);
-        for (off, image) in &records {
-            buf.extend_from_slice(&off.to_le_bytes());
-            buf.extend_from_slice(&(image.len() as u32).to_le_bytes());
-            let mut eng = sha256::HashEngine::default();
-            eng.input(&off.to_le_bytes());
-            eng.input(&(image.len() as u32).to_le_bytes());
-            eng.input(image);
-            buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
-            buf.extend_from_slice(image);
+        // A leftover sidecar from a failed write keeps ranges this write does
+        // not replace; leftover pieces of old ranges are reinserted, new wins.
+        let mut merged = Vec::new();
+        for (off, old) in Self::load_ahead_records(self.file.path())? {
+            for (piece_off, piece) in Self::leftover_pieces(off, &old, &records) {
+                if let Some(clipped) = Self::clip_record(piece_off, piece, logical) {
+                    merged.push(clipped);
+                }
+            }
         }
+        merged.extend(records);
+        merged.sort_unstable_by_key(|(off, _)| *off);
+        let buf = Self::encode_ahead(&header, &merged);
         let side = Self::ahead_path(self.file.path());
         file::write_synced_tmp_rename(&side, &buf)?;
         Ok(Some(side))

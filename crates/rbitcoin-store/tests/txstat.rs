@@ -64,6 +64,70 @@ fn torn_txstat_page_restores_from_ahead_image() {
 }
 
 #[test]
+fn leftover_ahead_pages_survive_a_later_write() {
+    let dir = TempDir::labeled("txstat-ahead-merge").unwrap();
+    let path = dir.join("txstat.body");
+    let rows: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
+    {
+        let t = TxStat::create(&dir).unwrap();
+        t.append_batch(0, &rows).unwrap();
+        fail_next_txstat_flush_after_ahead(&path);
+        assert!(
+            t.write_block_rows(Fk(1), 510, &rows[509..601]).is_err(),
+            "the failpoint must stop before the cell pwrite"
+        );
+        fail_next_txstat_flush_after_ahead(&path);
+        assert!(
+            t.write_row(Fk(1), &tiny(9, 9, 9)).is_err(),
+            "the later write must replace the sidecar"
+        );
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(4096)).unwrap();
+    file.write_all(&[0u8; 4096]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let t = TxStat::open(&dir).unwrap();
+    assert_eq!(t.count(), 601);
+    assert_eq!(
+        t.get_cell(Fk(510)).unwrap(),
+        pack_cell(&rows[509]).unwrap().0,
+        "the committed cell on the first page was lost"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn append_does_not_replay_a_stale_ahead_over_new_tail() {
+    let dir = TempDir::labeled("txstat-stale-ahead").unwrap();
+    let path = dir.join("txstat.body");
+    let first: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
+    let extra: Vec<TxStatRow> = (602..=700u64).map(|i| tiny(i, 100, 10)).collect();
+    {
+        let t = TxStat::create(&dir).unwrap();
+        t.append_batch(0, &first).unwrap();
+        fail_next_txstat_flush_after_ahead(&path);
+        assert!(t.write_row(Fk(1), &tiny(9, 9, 9)).is_err());
+        t.append_batch(601, &extra).unwrap();
+        assert_eq!(t.count(), 700);
+    }
+    let t = TxStat::open(&dir).unwrap();
+    assert_eq!(t.count(), 700);
+    assert_eq!(
+        t.get_cell(Fk(700)).unwrap(),
+        pack_cell(&extra[98]).unwrap().0,
+        "restore replayed a stale image over the appended tail"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn create_empty_then_extend_zeros() {
     let dir = TempDir::labeled("txstat-extend").unwrap();
     let t = TxStat::create(&dir).unwrap();

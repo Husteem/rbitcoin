@@ -312,26 +312,65 @@ fn occ_sidecar_reads_the_count_and_ignores_short() {
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
 }
 
-fn zero_ahead_blocks(path: &std::path::Path) {
-    let mut side = path.as_os_str().to_os_string();
-    side.push(".ahead");
-    let raw = std::fs::read(std::path::PathBuf::from(side)).unwrap();
-    assert_eq!(&raw[0..4], b"SHA1");
-    let count = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
-    let mut at = 12usize;
+fn key_in_chunk(chunk: u64, slots: u64, skip: &[[u8; 32]]) -> [u8; 32] {
+    for i in 0u64.. {
+        let mut key = [0u8; 32];
+        key[0..8].copy_from_slice(&i.to_le_bytes());
+        if skip.iter().any(|s| *s == key) {
+            continue;
+        }
+        if ScriptHashHead::hash_slot(&ScriptHashHead::to_key(&key), slots) / SLOTS_PER_CHUNK
+            == chunk
+        {
+            return key;
+        }
+    }
+    unreachable!("no key hashed to chunk {chunk}")
+}
+
+fn chunk_pages(chunk: u64, slots: u64) -> Vec<u64> {
+    let base = chunk * SLOTS_PER_CHUNK;
+    let n = (slots - base).min(SLOTS_PER_CHUNK);
+    let off = ScriptHashHead::slot_file_off(base);
+    let len = n * SH_HEAD_SLOT_SIZE as u64;
+    let first = off & !4095;
+    let last = (off + len - 1) & !4095;
+    let mut pages = Vec::new();
+    let mut page = first;
+    while page <= last {
+        pages.push(page);
+        page += 4096;
+    }
+    pages
+}
+
+fn zero_pages(path: &std::path::Path, pages: &[u64]) {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .unwrap();
     use std::io::{Seek, SeekFrom, Write};
-    for _ in 0..count {
-        let block = u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
-        file.seek(SeekFrom::Start(block)).unwrap();
+    for &page in pages {
+        file.seek(SeekFrom::Start(page)).unwrap();
         file.write_all(&[0u8; 4096]).unwrap();
-        at += 8 + 32 + 4096;
     }
     file.sync_all().unwrap();
+}
+
+/// Zero the 4 KiB blocks the write covers, computed from the keys, not the sidecar.
+fn zero_ahead_blocks(path: &std::path::Path, keys: &[[u8; 32]], slots: u64) {
+    let mut pages = Vec::new();
+    for key in keys {
+        let chunk =
+            ScriptHashHead::hash_slot(&ScriptHashHead::to_key(key), slots) / SLOTS_PER_CHUNK;
+        for page in chunk_pages(chunk, slots) {
+            if !pages.contains(&page) {
+                pages.push(page);
+            }
+        }
+    }
+    zero_pages(path, &pages);
 }
 
 #[test]
@@ -369,7 +408,7 @@ fn torn_chunk_restores_from_ahead_image() {
             "the failpoint must stop before the chunk pwrite"
         );
     }
-    zero_ahead_blocks(&path);
+    zero_ahead_blocks(&path, &[keys[100]], 256);
     let h = ScriptHashHead::open(&path).unwrap().expect("live head");
     for (i, key) in keys.iter().enumerate() {
         assert_eq!(
@@ -378,6 +417,59 @@ fn torn_chunk_restores_from_ahead_image() {
             "key {i} lost after a torn chunk"
         );
     }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+}
+
+#[test]
+fn leftover_ahead_pages_survive_a_later_write() {
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-shhead-merge-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    let slots = 1024u64;
+    let a = key_in_chunk(0, slots, &[]);
+    let b = key_in_chunk(3, slots, std::slice::from_ref(&a));
+    let c = key_in_chunk(6, slots, &[a, b]);
+    let a2 = key_in_chunk(0, slots, &[a, b, c]);
+    let b2 = key_in_chunk(3, slots, &[a, b, c, a2]);
+    {
+        let h = ScriptHashHead::create_with_slots(&path, slots).unwrap();
+        h.insert_many(&[
+            (a, ShHeadValue::inline_one(Fk(1))),
+            (b, ShHeadValue::inline_one(Fk(2))),
+        ])
+        .unwrap();
+        h.flush().unwrap();
+        fail_next_scripthash_head_flush_on_second_write(&path);
+        assert!(
+            h.insert_many(&[
+                (a2, ShHeadValue::inline_one(Fk(3))),
+                (b2, ShHeadValue::inline_one(Fk(4))),
+            ])
+            .is_err(),
+            "the failpoint must stop after the second chunk pwrite"
+        );
+        fail_next_scripthash_head_flush_after_ahead(&path);
+        assert!(
+            h.insert_many(&[(c, ShHeadValue::inline_one(Fk(5)))])
+                .is_err(),
+            "the later write must replace the sidecar"
+        );
+    }
+    zero_pages(&path, &chunk_pages(0, slots));
+    let h = ScriptHashHead::open(&path).unwrap().expect("live head");
+    assert_eq!(
+        h.get(&a).unwrap(),
+        Some(ShHeadValue::inline_one(Fk(1))),
+        "the committed key on the first page was lost"
+    );
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
 }

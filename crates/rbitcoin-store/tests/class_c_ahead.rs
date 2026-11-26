@@ -147,3 +147,71 @@ fn torn_header_txs_block_restores_from_ahead_image() {
     assert!(!dir.join("header_txs_count.body.ahead").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn leftover_ahead_pages_survive_a_later_write() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        let mut parent_hash = [0u8; 32];
+        let mut prev = Fk::NULL;
+        for h in 0..1100u32 {
+            let (rec, ins, outs) = coinbase(h);
+            let tx = s
+                .put_tx_full_batch_indexed(&[(rec, ins, outs)], true)
+                .unwrap()[0];
+            let txid = s.txs.body_txid(tx).unwrap();
+            let header = hdr(prev, parent_hash, h, txid);
+            parent_hash = header.hash;
+            let hfk = s.put_header(&header).unwrap();
+            s.header_txs.put_range(&write, hfk, tx, 1).unwrap();
+            prev = hfk;
+            if h == 599 {
+                s.header_txs.flush().unwrap();
+            }
+        }
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_payload(
+            &dir.join("header_txs_first.body"),
+        );
+        assert!(
+            s.header_txs.flush().is_err(),
+            "the failpoint must leave the sidecar after a successful payload"
+        );
+        assert!(dir.join("header_txs_first.body.ahead").is_file());
+
+        let (rec, ins, outs) = coinbase(1100);
+        let tx = s
+            .put_tx_full_batch_indexed(&[(rec, ins, outs)], true)
+            .unwrap()[0];
+        let txid = s.txs.body_txid(tx).unwrap();
+        let header = hdr(prev, parent_hash, 1100, txid);
+        let hfk = s.put_header(&header).unwrap();
+        s.header_txs.put_range(&write, hfk, tx, 1).unwrap();
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(
+            &dir.join("header_txs_first.body"),
+        );
+        assert!(
+            s.header_txs.flush().is_err(),
+            "the later write must replace the sidecar"
+        );
+    }
+
+    let first = dir.join("header_txs_first.body");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&first)
+        .unwrap();
+    file.seek(SeekFrom::Start(4096)).unwrap();
+    file.write_all(&[0u8; 4096]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let s = Store::open_tiny(&dir).unwrap();
+    assert!(
+        s.header_txs.has_body(Fk(600)).unwrap(),
+        "the committed range on the first page was lost"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

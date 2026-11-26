@@ -21,10 +21,10 @@ use crate::error::StoreError;
 use crate::file::{self, GrowPolicy, TableFile, FILE_HEADER_LEN};
 use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{
-    le_u32, le_u64, read_uleb128, uleb128_len, write_uleb128, Fk, TableKind,
+    le_u32, le_u64, read_uleb128, uleb128_len, write_uleb128, Fk, TableKind, STORE_MAGIC,
 };
 use std::collections::BTreeMap;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -90,14 +90,7 @@ fn read_page(path: &Path, file: &TableFile, block: u64) -> Result<[u8; 4096], St
     Ok(image)
 }
 
-/// Apply full-page images left by an interrupted `write_at_head`.
-fn restore_ahead(path: &Path) -> Result<(), StoreError> {
-    let side = ahead_path(path);
-    let raw = match std::fs::read(&side) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(StoreError::io(&side, e)),
-    };
+fn parse_ahead(raw: &[u8]) -> Result<(u64, BTreeMap<u64, [u8; 4096]>), StoreError> {
     if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
         return Err(StoreError::Corrupt("txstat ahead header"));
     }
@@ -116,7 +109,7 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         raw[12], raw[13], raw[14], raw[15], raw[16], raw[17], raw[18], raw[19],
     ]);
     let mut at = AHEAD_HEAD;
-    let mut images = Vec::with_capacity(count);
+    let mut images = BTreeMap::new();
     for _ in 0..count {
         if raw.len() < at + AHEAD_REC {
             return Err(StoreError::Corrupt("txstat ahead short"));
@@ -135,23 +128,90 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
             return Err(StoreError::Corrupt("txstat ahead checksum"));
         }
-        images.push((off, image));
+        let mut page = [0u8; 4096];
+        page.copy_from_slice(image);
+        images.insert(off, page);
         at += AHEAD_REC;
     }
     if at != raw.len() {
         return Err(StoreError::Corrupt("txstat ahead length"));
     }
+    Ok((logical, images))
+}
+
+fn load_ahead(path: &Path) -> Result<Option<(u64, BTreeMap<u64, [u8; 4096]>)>, StoreError> {
+    let side = ahead_path(path);
+    match std::fs::read(&side) {
+        Ok(raw) => parse_ahead(&raw).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(StoreError::io(&side, e)),
+    }
+}
+
+fn encode_ahead(logical: u64, blocks: &BTreeMap<u64, [u8; 4096]>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(AHEAD_MAGIC);
+    buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&logical.to_le_bytes());
+    for (off, image) in blocks {
+        buf.extend_from_slice(&off.to_le_bytes());
+        let mut eng = sha256::HashEngine::default();
+        eng.input(&off.to_le_bytes());
+        eng.input(image);
+        buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
+        buf.extend_from_slice(image);
+    }
+    buf
+}
+
+/// Apply full-page images left by an interrupted `write_at_head`.
+fn restore_ahead(path: &Path) -> Result<(), StoreError> {
+    let side = ahead_path(path);
+    let raw = match std::fs::read(&side) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(&side, e)),
+    };
+    let (logical, images) = parse_ahead(&raw)?;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)
         .map_err(|e| StoreError::io(path, e))?;
+    let mut disk_header = [0u8; FILE_HEADER_LEN];
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| StoreError::io(path, e))?;
+    let disk_logical = match file.read_exact(&mut disk_header) {
+        Ok(()) => le_u64!(disk_header, 8),
+        Err(_) => 0,
+    };
+    // A later append may have grown the file past this image; do not shrink
+    // the header or replay bytes the append already published.
+    let keep_disk = disk_header[0..4] == STORE_MAGIC && disk_logical > logical;
     for (off, image) in images {
+        if keep_disk && off >= logical {
+            continue;
+        }
+        let write_len = if keep_disk {
+            (logical.saturating_sub(off) as usize).min(4096)
+        } else {
+            4096
+        };
+        if write_len == 0 {
+            continue;
+        }
         file.seek(SeekFrom::Start(off))
             .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(image).map_err(|e| StoreError::io(path, e))?;
+        file.write_all(&image[..write_len])
+            .map_err(|e| StoreError::io(path, e))?;
     }
-    let header = file::encode_leading_header(TableKind::TxStat, logical);
+    let header = if keep_disk {
+        disk_header
+    } else {
+        file::encode_leading_header(TableKind::TxStat, logical)
+    };
     file.seek(SeekFrom::Start(0))
         .map_err(|e| StoreError::io(path, e))?;
     file.write_all(&header)
@@ -390,26 +450,16 @@ impl TxStat {
             };
             image[(off & 4095) as usize] = *byte;
         }
-        let mut buf = Vec::new();
-        buf.extend_from_slice(AHEAD_MAGIC);
-        buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
-        buf.extend_from_slice(
-            &self
-                .body
-                .logical_len()
-                .max(start + bytes.len() as u64)
-                .to_le_bytes(),
-        );
-        for (off, image) in &blocks {
-            buf.extend_from_slice(&off.to_le_bytes());
-            let mut eng = sha256::HashEngine::default();
-            eng.input(&off.to_le_bytes());
-            eng.input(image);
-            buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
-            buf.extend_from_slice(image);
+        let mut logical = self.body.logical_len().max(start + bytes.len() as u64);
+        // A leftover sidecar from a failed write keeps pages this write does
+        // not replace; new images win on pages they cover.
+        if let Some((old_logical, old_blocks)) = load_ahead(self.body.path())? {
+            let mut merged = old_blocks;
+            merged.extend(blocks);
+            blocks = merged;
+            logical = logical.max(old_logical);
         }
+        let buf = encode_ahead(logical, &blocks);
         let side = ahead_path(self.body.path());
         file::write_synced_tmp_rename(&side, &buf)?;
         #[cfg(debug_assertions)]
@@ -688,6 +738,19 @@ impl TxStat {
         }
         // Append-only. Class A tear_guard owns page 0 and the old partial
         // tail; the barrier syncs txstat with the rest of the archive.
+        // Drop leftover images this append supersedes so restore cannot
+        // replay them over the new tail; keep pages it does not touch.
+        if let Some((old_logical, mut old_blocks)) = load_ahead(self.body.path())? {
+            let end = start + blob.len() as u64;
+            old_blocks.retain(|&off, _| off.saturating_add(4096) <= start || off >= end);
+            let side = ahead_path(self.body.path());
+            if old_blocks.is_empty() {
+                Self::remove_ahead(Some(side))?;
+            } else {
+                let buf = encode_ahead(old_logical, &old_blocks);
+                file::write_synced_tmp_rename(&side, &buf)?;
+            }
+        }
         self.body.write_at_pwrite(start, &blob)?;
         let new = base_count + rows.len() as u64;
         self.count.store(new, Ordering::Release);
