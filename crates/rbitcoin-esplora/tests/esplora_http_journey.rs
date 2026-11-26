@@ -1213,10 +1213,10 @@ async fn tx_routes(addr: SocketAddr, txid: &str) -> Vec<(String, u16, String)> {
 }
 
 /// A transaction that was in a block, is no longer on the active chain, and is
-/// not in the mempool is gone: 404 on every `/tx/:txid` route. It answers
-/// `confirmed: false` only while the mempool holds it. A txid that is neither
-/// stored nor in the mempool answers `200 {"confirmed":false}` on `/status`, as
-/// electrs does, and 404 on the routes that return the transaction.
+/// not in the mempool is gone: 404 on every `/tx/:txid` route that returns
+/// the transaction. On `/status` it answers `200 {"confirmed":false}`, as a
+/// txid that is neither stored nor in the mempool does, and as electrs does
+/// for both.
 #[tokio::test(flavor = "current_thread")]
 async fn reorged_out_tx_is_404_unless_the_mempool_holds_it() {
     use bitcoin::absolute::LockTime;
@@ -1314,11 +1314,17 @@ async fn reorged_out_tx_is_404_unless_the_mempool_holds_it() {
         .connect_block(Height(h), &alt, &[alt_cb, stored_spend(&other, cbs[0])])
         .unwrap();
 
-    let (st, _) = http_get(pad.addr, &format!("/tx/{}/status", ids[0])).await;
-    assert_eq!(st, 404, "conflicted, not in the mempool");
     for id in &ids {
         for (path, st, body) in tx_routes(pad.addr, id).await {
-            assert_eq!(st, 404, "reorged out, not in the mempool: {path}: {body}");
+            if path.ends_with("/status") {
+                assert_eq!(
+                    (st, body.as_str()),
+                    (200, r#"{"confirmed":false}"#),
+                    "reorged out, not in the mempool: {path}"
+                );
+            } else {
+                assert_eq!(st, 404, "reorged out, not in the mempool: {path}: {body}");
+            }
         }
     }
     let unknown = "ee".repeat(32);
@@ -1349,7 +1355,9 @@ async fn reorged_out_tx_is_404_unless_the_mempool_holds_it() {
     let full: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(full["status"]["confirmed"], false, "{body}");
     // The conflicted one stays gone.
-    let (st, _) = http_get(pad.addr, &format!("/tx/{}/status", ids[0])).await;
+    let (st, body) = http_get(pad.addr, &format!("/tx/{}/status", ids[0])).await;
+    assert_eq!((st, body.as_str()), (200, r#"{"confirmed":false}"#));
+    let (st, _) = http_get(pad.addr, &format!("/tx/{}", ids[0])).await;
     assert_eq!(st, 404);
 
     // A pinned `asof` view never reads the mempool, so it keeps its answer.
@@ -1656,12 +1664,11 @@ async fn outspend_after_a_connect_past_the_pinned_view_is_not_unspent() {
 }
 
 /// `tx_status` reads the status on the view it pinned and asks the mempool
-/// only for an unconfirmed answer. A tip change after the row was found must
-/// not turn into `200 {"confirmed":false}` for a tx the mempool lacks: it is a
-/// 404 once the pool is unchanged, and a 503 when the pool moved since the
-/// request began.
+/// only for an unconfirmed answer. A tx dropped after the row was found is
+/// `200 {"confirmed":false}` once the pool is unchanged, as any txid the
+/// mempool lacks, and a 503 when the pool moved since the request began.
 #[tokio::test(flavor = "current_thread")]
-async fn status_of_a_tx_dropped_mid_request_is_never_200_unconfirmed() {
+async fn status_of_a_tx_dropped_mid_request_waits_for_the_pool() {
     let (dir, mut pad, handle) = reorg_pad("status-mid-request").await;
     let st = app_state(&pad);
     let ran = std::cell::Cell::new(0u32);
@@ -1679,7 +1686,11 @@ async fn status_of_a_tx_dropped_mid_request_is_never_200_unconfirmed() {
         ran.set(ran.get() + 1);
         q.disconnect_tip().unwrap();
     });
-    assert_eq!(resp.status(), 404, "gone, pool unchanged");
+    assert_eq!(resp.status(), 200, "gone, pool unchanged");
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), br#"{"confirmed":false}"#);
     forget_tip(&mut pad);
 
     // The pool moves (a disconnect holds and releases it) in the same gap.

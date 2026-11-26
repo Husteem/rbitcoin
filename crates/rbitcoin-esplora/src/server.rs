@@ -1757,12 +1757,14 @@ pub async fn tx_status(
 /// is found and before the view is pinned, where a tip change would land.
 ///
 /// The status is read on the pinned view. Only an unconfirmed answer asks the
-/// mempool, so a tip change between the reads cannot turn a confirmed tx into
-/// a 200 `confirmed: false` for a tx the mempool does not hold: the pool's
-/// settle generation was taken first and a moved one is a 503.
+/// mempool. The pool's settle generation is taken first, so while a reorg
+/// still holds a dropped tx out of the pool the answer is a 503, not
+/// unconfirmed.
 ///
-/// A txid the store never saw answers 200 `confirmed: false`, as electrs does;
-/// clients ask before the tx is broadcast. With `asof` it is a 404.
+/// A txid the mempool does not hold and the store never saw, or saw only in
+/// a block that left the chain, answers 200 `confirmed: false`, as electrs
+/// does; clients ask before the tx is broadcast. With `asof` a txid the
+/// store never saw is a 404.
 #[doc(hidden)]
 pub fn tx_status_reply(
     st: &AppState,
@@ -1787,10 +1789,8 @@ pub fn tx_status_reply(
                 Err(e) => return store_err(e),
             };
             if asof.is_none() && status["confirmed"] != true {
-                match mempool_holds(st, txid, settle0) {
-                    Ok(true) => {}
-                    Ok(false) => return not_found(),
-                    Err(e) => return store_err(e),
+                if let Err(e) = mempool_holds(st, txid, settle0) {
+                    return store_err(e);
                 }
             }
             maybe_attach_view(json_reply_here(status), view)
