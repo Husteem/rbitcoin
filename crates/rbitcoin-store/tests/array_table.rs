@@ -793,8 +793,8 @@ fn ahead_rejects_every_bad_shape_and_applies_a_good_one() {
 
     let cases = [
         ahead_raw(1, 0, ahead_header(logical), &[]),
-        ahead_raw(2, 1, ahead_header(logical), &[good.clone()]),
-        ahead_raw(1, 2, ahead_header(logical), &[good.clone()]),
+        ahead_raw(2, 1, ahead_header(logical), std::slice::from_ref(&good)),
+        ahead_raw(1, 2, ahead_header(logical), std::slice::from_ref(&good)),
         ahead_raw(1, 1, ahead_header(logical), &[vec![0u8; 10]]),
         ahead_raw(1, 1, ahead_header(logical), &[ahead_rec(0, &[1u8; 8])]),
         ahead_raw(
