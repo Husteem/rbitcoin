@@ -2284,7 +2284,12 @@ async fn coin_reads_wait_out_a_short_connect_hold() {
         let holder = std::thread::spawn(move || {
             let hold = mp.template_hold();
             held_tx.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            // Until the read parks in its wait. A read that does not wait
+            // answers while the pool is held.
+            let t0 = std::time::Instant::now();
+            while mp.settle_waiters() == 0 && t0.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             drop(hold);
         });
         held_rx.recv().unwrap();

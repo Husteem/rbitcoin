@@ -188,7 +188,7 @@ pub fn render(status: &NodeStatus) -> String {
     );
     out.counter(
         "rbitcoin_api_settle_gave_up_total",
-        "Waits that reached the bound with the pool still held.",
+        "Block connects that held the pool past the wait bound of a waiting read.",
         settle.gave_up.total(),
     );
     out.counter(

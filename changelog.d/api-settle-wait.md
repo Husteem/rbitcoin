@@ -9,4 +9,4 @@ Fixed
   hold, or a tip move during the read, still answers "chain view moved".
   `/metrics` counts the waits (`rbitcoin_api_settle_waits_total`,
   `_wait_seconds_total`, `_gave_up_total`, `_refused_total`), and a 5 s window
-  with a wait logs one INFO `api: settle waits=` line.
+  with a wait or a refusal logs one INFO `api: settle waits=` line.

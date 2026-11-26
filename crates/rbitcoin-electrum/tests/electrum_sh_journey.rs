@@ -116,6 +116,7 @@ pub fn view_hash(q: &Query) -> ([u8; 32], Height) {
                 &mut pin_conn,
                 view,
                 is_asof,
+                None,
             )
         },
     );

@@ -1744,6 +1744,12 @@ pub struct SettleGate {
     wake: Mutex<()>,
     settled: std::sync::Condvar,
     wait_max: Mutex<Duration>,
+    /// The held generation a read last gave up on. Later reads during that
+    /// same hold do not wait again, so a loop of reads, or a crowd of them,
+    /// waits one bound per hold, not one per read.
+    gave_up_on: AtomicU64,
+    /// Reads parked in [`Self::wait_even`] (tests wait for one to park).
+    waiting: AtomicUsize,
 }
 
 impl SettleGate {
@@ -1753,6 +1759,8 @@ impl SettleGate {
             wake: Mutex::new(()),
             settled: std::sync::Condvar::new(),
             wait_max: Mutex::new(SETTLE_WAIT_MAX),
+            gave_up_on: AtomicU64::new(0),
+            waiting: AtomicUsize::new(0),
         }
     }
 
@@ -1772,10 +1780,11 @@ impl SettleGate {
 
     /// An even generation, waiting for a hold to end. Returns the odd one
     /// after `wait_max`, which [`require_settled`] refuses. On a reactor
-    /// thread it does not wait.
+    /// thread, or during a hold a read already gave up on, it does not wait.
     fn wait_even(&self) -> u64 {
         let gen = self.gen();
         if gen.is_multiple_of(2)
+            || self.gave_up_on.load(Ordering::SeqCst) == gen
             || (crate::reactor::on_tokio_worker() && !crate::reactor::in_blocking_region())
         {
             return gen;
@@ -1783,10 +1792,14 @@ impl SettleGate {
         let t0 = Instant::now();
         let max = *self.wait_max.lock().unwrap_or_else(|e| e.into_inner());
         let mut wake = self.wake.lock().unwrap_or_else(|e| e.into_inner());
+        self.waiting.fetch_add(1, Ordering::SeqCst);
         let gen = loop {
             let gen = self.gen();
             let left = max.saturating_sub(t0.elapsed());
-            if gen.is_multiple_of(2) || left.is_zero() {
+            if gen.is_multiple_of(2)
+                || left.is_zero()
+                || self.gave_up_on.load(Ordering::SeqCst) == gen
+            {
                 break gen;
             }
             wake = self
@@ -1795,17 +1808,15 @@ impl SettleGate {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         };
+        self.waiting.fetch_sub(1, Ordering::SeqCst);
         drop(wake);
         let waited = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
         SETTLE_WAITS.waits.note(waited);
-        if gen % 2 == 1 {
+        if !gen.is_multiple_of(2) && self.gave_up_on.swap(gen, Ordering::SeqCst) != gen {
             SETTLE_WAITS.gave_up.add(1);
-            rbitcoin_log::warn_repeated(
-                rbitcoin_log::RepeatedInfo::SettleWaitGaveUp,
-                format_args!(
-                    "api: a read waited {max:?} for a block connect to settle and \
-                     answered \"chain view moved\""
-                ),
+            rbitcoin_log::warn!(
+                "api: a read waited {max:?} for a block connect to settle and answered \
+                 \"chain view moved\"; reads during this hold no longer wait"
             );
         }
         gen
@@ -1818,7 +1829,8 @@ impl SettleGate {
 pub struct SettleWaitMeter {
     /// Reads that found the pool held, and how long each waited.
     pub waits: crate::perf_meter::RequestMeter,
-    /// Waits that reached the bound with the pool still held.
+    /// Holds that outlasted the bound for a waiting read. Reads during such
+    /// a hold after the first give-up do not wait.
     pub gave_up: crate::perf_meter::PerfCounter,
     /// Reads [`require_settled`] refused: they waited past the bound, or a
     /// tip move started during the read.
@@ -6767,6 +6779,13 @@ impl MempoolHub {
     /// pool that matches the tip.
     pub fn pool_settle_gen(&self) -> u64 {
         self.pool_settle.gen()
+    }
+
+    /// Reads parked waiting for a hold to end on this hub.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn settle_waiters(&self) -> usize {
+        self.pool_settle.waiting.load(Ordering::SeqCst)
     }
 
     /// The longest [`pool_settle`] waits for a hold to end on this hub.

@@ -1688,6 +1688,42 @@ async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `/utxo` read that arrives while a connect holds the pool waits, then
+/// pins the tip that connect left. Pinning first and waiting after joined the
+/// old tip's coins with the new pool, so a coin spent in the connected block
+/// read unspent (#2147 review).
+#[tokio::test(flavor = "current_thread")]
+async fn a_utxo_read_across_a_connect_pins_the_new_tip() {
+    use bitcoin::hashes::Hash;
+    let (dir, mut pad, handle) = reorg_pad("utxo-across-connect").await;
+    let tx = spend_tx(&pad, 0);
+    let cb = display_txid(bitcoin::Txid::from_byte_array(pad.cbs[0]));
+    let path = format!("/scripthash/{}/utxo", hex_encode(script_hash(&[0x51])));
+    let (st, body) = http_get(pad.addr, &path).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains(&cb), "the coin is unspent before: {body}");
+
+    let hub = Arc::clone(&pad.hub);
+    let hold = hub.template_hold();
+    let addr = pad.addr;
+    let read = tokio::spawn(async move { http_get(addr, &path).await });
+    // The read parks in its settle wait on a blocking thread.
+    while hub.settle_waiters() == 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    pad.connect(vec![stored_spend(&tx, pad.cbs[0])]);
+    drop(hold);
+    let (st, body) = read.await.unwrap();
+    assert_eq!(st, 200, "{body}");
+    assert!(
+        !body.contains(&cb),
+        "a coin spent in the connected block read unspent: {body}"
+    );
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A block connected after the view was pinned spends the coin above the
 /// view, and its spend has already left the pool. An outspend read on that
 /// view once the pool has settled again is a 503, not unspent.

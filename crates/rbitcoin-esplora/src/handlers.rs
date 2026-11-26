@@ -1345,6 +1345,9 @@ pub fn utxo_response(
     asof: Option<[u8; 32]>,
     client: Option<&str>,
 ) -> Response {
+    // Before the pin: a read that waits out a connect then pins the tip that
+    // connect left.
+    let settle0 = pool_settle(st.mempool.as_deref());
     let (list, view) = match sh_at_view(
         st,
         sh,
@@ -1357,6 +1360,7 @@ pub fn utxo_response(
                 sh,
                 slot,
                 view,
+                settle0,
             )
         },
         Vec::new(),

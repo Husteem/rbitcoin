@@ -297,11 +297,9 @@ pub enum RepeatedInfo {
     /// The SV2 template provider refused a socket at its session cap or its
     /// netgroup's share.
     Sv2AtMaxSessions = 5,
-    /// An API read waited the whole bound for a block connect to settle.
-    SettleWaitGaveUp = 6,
 }
 
-const REPEATED_INFO_SLOTS: usize = RepeatedInfo::SettleWaitGaveUp as usize + 1;
+const REPEATED_INFO_SLOTS: usize = RepeatedInfo::Sv2AtMaxSessions as usize + 1;
 const REPEATED_INFO_GAP_MS: u64 = 1_000;
 
 thread_local! {

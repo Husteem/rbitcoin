@@ -3283,17 +3283,55 @@ fn an_api_read_waits_out_a_connect_hold() {
         let settle0 = pool_settle(Some(&bg));
         (settle0, require_settled(Some(&bg), settle0).is_ok())
     });
-    std::thread::sleep(Duration::from_millis(50));
-    assert!(
-        !read.is_finished(),
-        "the read answered while the pool was held"
-    );
+    let parked = Instant::now();
+    while mp.settle_waiters() == 0 {
+        assert!(
+            !read.is_finished(),
+            "the read answered while the pool was held"
+        );
+        assert!(parked.elapsed() < Duration::from_secs(10), "never waited");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     drop(hold);
     let (settle0, settled) = read.join().unwrap();
     assert_eq!(settle0 % 2, 0, "the read sampled a held pool");
     assert!(settled, "a read after the hold ended was refused");
     assert!(SETTLE_WAITS.waits.requests.total() > waits);
-    assert!(SETTLE_WAITS.waits.wall_us.total() >= waited_us + 40_000);
+    assert!(SETTLE_WAITS.waits.wall_us.total() > waited_us);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// Once a read gives up on a hold, later reads during that hold do not wait
+/// again: a loop of reads, or a crowd of them, waits one bound per hold, not
+/// one per read.
+#[test]
+fn reads_wait_out_one_bound_per_hold() {
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+    mp.set_settle_wait_max(Duration::from_millis(200));
+    let hold = mp.template_hold();
+    let t0 = Instant::now();
+    assert_eq!(pool_settle(Some(&mp)) % 2, 1);
+    assert!(t0.elapsed() >= Duration::from_millis(200), "did not wait");
+    let t1 = Instant::now();
+    for _ in 0..5 {
+        assert_eq!(pool_settle(Some(&mp)) % 2, 1);
+    }
+    assert!(
+        t1.elapsed() < Duration::from_millis(200),
+        "a read waited again on a hold already given up on"
+    );
+    drop(hold);
+    let _again = mp.template_hold();
+    let t2 = Instant::now();
+    assert_eq!(pool_settle(Some(&mp)) % 2, 1);
+    assert!(
+        t2.elapsed() >= Duration::from_millis(200),
+        "the next hold is waited out again"
+    );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&store_dir);
 }
