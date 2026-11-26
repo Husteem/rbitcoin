@@ -4764,6 +4764,23 @@ impl MempoolHub {
                     .await;
             }
         };
+        // The preflight can miss a parent that is in the pool by the time
+        // prepare resolves it. The cap still applies before commit. A missing
+        // input never reaches here.
+        if let Some(max) = max_fee_sat_kvb {
+            if rbitcoin_consensus::policy::fee_exceeds_max(prep.fee_sat, prep.weight, max) {
+                let hub = Arc::clone(self);
+                return crate::reactor::off_pool(move || {
+                    let us = t0.elapsed().as_micros() as u64;
+                    hub.meter_accept_stages(lock_us, stages);
+                    hub.finish_accept_err(
+                        us,
+                        AcceptError::Policy(crate::broadcast_reject::MAX_FEE_REASON),
+                    )
+                })
+                .await;
+            }
+        }
         let hub = Arc::clone(self);
         let tx_c = tx;
         // The permit covers the coin re-read only. Promotion runs after it

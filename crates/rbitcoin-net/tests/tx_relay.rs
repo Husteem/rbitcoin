@@ -2401,6 +2401,46 @@ fn fee_look_copies_one_output() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The parent is already in the mempool, so the child takes the ordinary
+/// admit. Over the caller's cap it does not commit. Under the cap it does.
+/// A child with no parent is still missing inputs.
+#[test]
+fn a_pooled_parent_child_over_the_max_fee_does_not_commit() {
+    let (_store, q, cbs) = pad_cbs(2);
+    let dir = tmp();
+    let hub = Arc::new(MempoolHub::open(&dir, q).unwrap());
+    hub.set_relay_enabled(true);
+    let cap = rbitcoin_consensus::policy::DEFAULT_MAX_RAW_TX_FEE_SAT_KVB;
+    let parent = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let parent_id = parent.compute_txid();
+    block_on(hub.accept_tx_from_async(parent, TxOrigin::Local)).expect("parent");
+    let child = spend_vout(OutPoint::new(parent_id, 0), 1);
+    let err = block_on(hub.broadcast_local_async(child.clone(), Some(cap)))
+        .expect_err("the child pays more than the cap");
+    assert_eq!(BroadcastReject::of(&err), BroadcastReject::max_fee());
+    assert!(hub.contains(&parent_id));
+    assert!(!hub.contains(&child.compute_txid()));
+
+    let modest = spend_true(cbs[1], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let modest_id = modest.compute_txid();
+    block_on(hub.accept_tx_from_async(modest.clone(), TxOrigin::Local)).expect("modest parent");
+    let pay = modest.output[0].value.to_sat() - 5_000;
+    let ok_child = spend_vout(OutPoint::new(modest_id, 0), pay);
+    let admitted = block_on(hub.broadcast_local_async(ok_child.clone(), Some(cap)))
+        .expect("a child under the cap is admitted");
+    assert_eq!(admitted, LocalBroadcast::Admitted);
+    assert!(hub.contains(&ok_child.compute_txid()));
+
+    let missing = spend_vout(OutPoint::new(Txid::from_byte_array([8u8; 32]), 0), 1);
+    let gone = block_on(hub.broadcast_local_async(missing, Some(cap)))
+        .expect_err("an unresolved input is not a fee reject");
+    assert_eq!(
+        BroadcastReject::of(&gone).message,
+        "bad-txns-inputs-missingorspent"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The orphan 1p1c path commits both members before the trim. When the
 /// trim drops them, the conflict the parent replaced comes back.
 #[test]

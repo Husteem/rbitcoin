@@ -17,4 +17,7 @@ Fixed
   `Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)` at
   0.10 BTC/kvB) (#2020). A one-parent one-child submit whose parent is only
   in the extra pool is held to that same cap (the caller's `maxfeerate` on
-  RPC): the parent rolls back and the answer is the same `-25`.
+  RPC): the parent rolls back and the answer is the same `-25`. A child
+  whose parent is already in the mempool at admit time is held to that cap
+  before it commits. An Electrum package over 25 transactions or 404,000
+  weight is refused with the package-too-large reason before the fee walk.
