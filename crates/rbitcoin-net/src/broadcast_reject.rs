@@ -17,6 +17,12 @@ const TRANSACTION_ALREADY_IN_UTXO_SET: i64 = -27;
 /// Core `TransactionError::MISSING_INPUTS` text on `sendrawtransaction`.
 const MISSING_OR_SPENT: &str = "bad-txns-inputs-missingorspent";
 
+/// Core `max-fee-exceeded` text. A 1p1c child that clears this only after its
+/// parent output resolves uses the same string, so [`BroadcastReject::of`]
+/// answers `-25` rather than a generic `-26`.
+pub(crate) const MAX_FEE_REASON: &str =
+    "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)";
+
 /// The code and message `sendrawtransaction` answers a refused tx with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BroadcastReject {
@@ -34,6 +40,9 @@ impl BroadcastReject {
                 code: TRANSACTION_ERROR,
                 message: MISSING_OR_SPENT.into(),
             };
+        }
+        if reason == MAX_FEE_REASON {
+            return Self::max_fee();
         }
         Self {
             code: TRANSACTION_REJECTED,
@@ -61,7 +70,7 @@ impl BroadcastReject {
     pub fn max_fee() -> Self {
         Self {
             code: TRANSACTION_ERROR,
-            message: "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)".into(),
+            message: MAX_FEE_REASON.into(),
         }
     }
 

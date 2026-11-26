@@ -48,14 +48,13 @@ pub fn tx_output_sum_sat(tx: &Transaction) -> Option<u64> {
 }
 
 fn prevout_txout(hub: &MempoolHub, op: &OutPoint) -> Option<TxOut> {
-    if let Some(parent) = hub.get_tx(&op.txid) {
-        let out = parent.output.get(op.vout as usize)?;
+    if let Some(out) = hub.live_output(op) {
         // Admission still loads this output. Pricing it turns a 1 sat spend
         // into the fee cap and hides the script reject.
         if is_unspendable(out.script_pubkey.as_bytes()) {
             return None;
         }
-        return Some(out.clone());
+        return Some(out);
     }
     hub.utxo_provider().get_txout(op)
 }

@@ -7594,7 +7594,7 @@ pub async fn on_tx(
             let admitted = crate::reactor::finish_join(
                 crate::reactor::spawn_with_store_budget(async move {
                     let result = mp_task
-                        .accept_tx_from_work(tx_task, crate::tx_relay::TxOrigin::Relay(from))
+                        .accept_tx_from_work(tx_task, crate::tx_relay::TxOrigin::Relay(from), None)
                         .await;
                     if let Ok(r) = &result {
                         if !mp_task.relay_enabled() {

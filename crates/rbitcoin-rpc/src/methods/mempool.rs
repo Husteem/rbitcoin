@@ -944,7 +944,9 @@ pub async fn sendrawtransaction_async(
     // The note and the blocksonly rebroadcast sit on the admit task. Dropping
     // this request must not skip them after the tx is already published.
     rbitcoin_net::spawn_with_store_budget(async move {
-        let accepted = mp_done.broadcast_local_async(tx_done.clone()).await;
+        let accepted = mp_done
+            .broadcast_local_async(tx_done.clone(), Some(max_feerate))
+            .await;
         // After publish, before the note. A dropped request stays here only
         // when a test armed the latch. The note still runs on this task.
         park_before_unbroadcast_note(&mp_done).await;

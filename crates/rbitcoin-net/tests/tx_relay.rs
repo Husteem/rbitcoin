@@ -11,6 +11,7 @@ use rbitcoin_net::fee_history_file;
 use rbitcoin_net::send_queue::peer_out_channel;
 use rbitcoin_net::tx_relay::parent_req::{InvSource, ParentNote};
 use rbitcoin_net::tx_relay::*;
+use rbitcoin_net::BroadcastReject;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use std::collections::{BTreeSet, HashMap};
@@ -2324,6 +2325,82 @@ fn onep_rollback_unindexes_slot_eviction() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A local child whose parent is only in the extra pool pays its fee once
+/// that output resolves. Over the default max fee, the pair does not commit.
+/// Under it, both members do.
+#[test]
+fn a_local_1p1c_over_the_max_fee_does_not_commit() {
+    let (_store, q, cbs) = pad_cbs(2);
+    let dir = tmp();
+    let hub = Arc::new(MempoolHub::open(&dir, q).unwrap());
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[0], 0, ScriptBuf::from_bytes(vec![0x51]));
+    let parent_id = parent.compute_txid();
+    assert!(hub.try_note_extra_compact(&parent));
+    let child = spend_vout(OutPoint::new(parent_id, 0), 1);
+    let err = block_on(hub.broadcast_client_async(child.clone()))
+        .expect_err("the child pays more than the default max fee");
+    assert_eq!(err, BroadcastReject::max_fee());
+    assert!(!hub.contains(&parent_id), "the parent must roll back");
+    assert!(!hub.contains(&child.compute_txid()));
+
+    let modest = spend_true(cbs[1], 0, ScriptBuf::from_bytes(vec![0x51]));
+    let modest_id = modest.compute_txid();
+    assert!(hub.try_note_extra_compact(&modest));
+    let pay = modest.output[0].value.to_sat() - 5_000;
+    let ok_child = spend_vout(OutPoint::new(modest_id, 0), pay);
+    let admitted = block_on(hub.broadcast_client_async(ok_child.clone()))
+        .expect("a pair under the cap is admitted");
+    assert_eq!(admitted, LocalBroadcast::Admitted);
+    assert!(hub.contains(&modest_id));
+    assert!(hub.contains(&ok_child.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Pricing one mempool input copies that output. It does not copy the
+/// parent's output vector.
+#[test]
+fn fee_look_copies_one_output() {
+    let (_store, q, cbs) = pad_cbs(2);
+    let dir = tmp();
+    let hub = Arc::new(MempoolHub::open(&dir, q).unwrap());
+    hub.set_relay_enabled(true);
+    let n = 200;
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cbs[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: (0..n)
+            .map(|_| TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: spk.clone(),
+            })
+            .collect(),
+    };
+    block_on(hub.accept_tx_from_async(parent.clone(), TxOrigin::Local)).expect("parent");
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 50_000);
+    let watched = std::mem::size_of::<TxOut>() * n;
+    let _ = crate::alloc_count::take_largest();
+    crate::alloc_count::watch(watched);
+    let _ = rbitcoin_net::tx_fee_exceeds_max(&hub, &child, 10_000_000);
+    let hits = crate::alloc_count::take_hits();
+    let largest = crate::alloc_count::take_largest();
+    assert_eq!(
+        hits, 0,
+        "fee look copied the parent output table; largest ask {largest}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The orphan 1p1c path commits both members before the trim. When the
 /// trim drops them, the conflict the parent replaced comes back.
 #[test]
@@ -4121,7 +4198,7 @@ fn broadcast_replaces_the_conflict_a_failed_package_restores() {
     }
 
     let hub_send = Arc::clone(&hub);
-    let send = std::thread::spawn(move || block_on(hub_send.broadcast_local_async(c)));
+    let send = std::thread::spawn(move || block_on(hub_send.broadcast_local_async(c, None)));
     while !send.is_finished() && hub.tentative_waiters() == 0 {
         assert!(
             Instant::now() < deadline,
@@ -4169,7 +4246,7 @@ fn broadcast_waits_for_settle_after_its_tx_left() {
     hub.pause_after_broadcast_admit
         .store(true, Ordering::Release);
     let hub_send = Arc::clone(&hub);
-    let send = std::thread::spawn(move || block_on(hub_send.broadcast_local_async(child)));
+    let send = std::thread::spawn(move || block_on(hub_send.broadcast_local_async(child, None)));
     let deadline = Instant::now() + Duration::from_secs(10);
     while !hub.broadcast_admit_parked.load(Ordering::Acquire) {
         assert!(
@@ -6707,7 +6784,7 @@ fn api_admits_wait_on_their_script_lane() {
         let h = Arc::clone(&hub);
         let test = tokio::spawn(async move { h.test_accept_async(probed, None).await });
         let h = Arc::clone(&hub);
-        let bcast = tokio::spawn(async move { h.broadcast_local_async(local).await });
+        let bcast = tokio::spawn(async move { h.broadcast_local_async(local, None).await });
         let h = Arc::clone(&hub);
         let package = tokio::spawn(async move { h.accept_package_async(vec![pkg]).await });
         let h = Arc::clone(&hub);

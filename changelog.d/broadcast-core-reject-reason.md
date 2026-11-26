@@ -15,4 +15,6 @@ Fixed
   `POST /tx`, and BlindBit `forward-tx` apply the same nonstandard-version
   and default max-fee rejects as `sendrawtransaction` (`"version"`; `-25`
   `Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)` at
-  0.10 BTC/kvB) (#2020).
+  0.10 BTC/kvB) (#2020). A one-parent one-child submit whose parent is only
+  in the extra pool is held to that same cap (the caller's `maxfeerate` on
+  RPC): the parent rolls back and the answer is the same `-25`.

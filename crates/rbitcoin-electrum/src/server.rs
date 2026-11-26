@@ -3531,16 +3531,22 @@ pub(crate) async fn broadcast_package_async(
     }
     let mp_fee = Arc::clone(&mp);
     let txs_fee = txs.clone();
-    let over_max = rbitcoin_net::off_pool_budgeted(move || {
-        txs_fee.iter().any(|tx| {
-            rbitcoin_net::package_tx_fee_exceeds_max(
-                &mp_fee,
-                tx,
-                &txs_fee,
-                rbitcoin_consensus::policy::DEFAULT_MAX_RAW_TX_FEE_SAT_KVB,
-            ) == Some(true)
-        })
-    })
+    let budget = mp.query.api_read_budget();
+    // The package walk reads the chain, so it holds the Electrum store permit.
+    let over_max = rbitcoin_net::with_store_budget(
+        budget,
+        ApiSurface::Electrum,
+        rbitcoin_net::off_pool_budgeted(move || {
+            txs_fee.iter().any(|tx| {
+                rbitcoin_net::package_tx_fee_exceeds_max(
+                    &mp_fee,
+                    tx,
+                    &txs_fee,
+                    rbitcoin_consensus::policy::DEFAULT_MAX_RAW_TX_FEE_SAT_KVB,
+                ) == Some(true)
+            })
+        }),
+    )
     .await;
     if over_max {
         return Err(ReplyError::daemon(

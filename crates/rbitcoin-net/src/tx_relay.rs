@@ -3099,6 +3099,14 @@ impl MempoolHub {
         self.lock_read().get_tx(txid).cloned()
     }
 
+    /// One live output. The read lock covers that output's clone and then
+    /// drops. A fee look must not copy the rest of the parent.
+    pub(crate) fn live_output(&self, op: &OutPoint) -> Option<TxOut> {
+        self.lock_read()
+            .get_tx(&op.txid)
+            .and_then(|tx| tx.output.get(op.vout as usize).cloned())
+    }
+
     /// The isolated loop's read. A held write is one lagged lap, then this
     /// waits. A successful `try_read` keeps that guard: dropping it and
     /// calling [`Self::get_tx`] lets a writer arrive in the gap and block
@@ -4472,6 +4480,7 @@ impl MempoolHub {
                                         TxOrigin::Relay(from),
                                         AcceptPath::Relay,
                                         child.announcers,
+                                        None,
                                     )
                                     .await;
                                 let hub = Arc::clone(self);
@@ -4563,9 +4572,10 @@ impl MempoolHub {
         self: &Arc<Self>,
         tx: Transaction,
         origin: TxOrigin,
+        max_fee_sat_kvb: Option<u64>,
     ) -> Result<AcceptResult, AcceptError> {
         let result = self
-            .accept_with_utxo_async(tx, origin, AcceptPath::Relay, Vec::new())
+            .accept_with_utxo_async(tx, origin, AcceptPath::Relay, Vec::new(), max_fee_sat_kvb)
             .await;
         if let (TxOrigin::Local, Ok(r)) = (origin, &result) {
             let txid = r.txid;
@@ -4584,6 +4594,18 @@ impl MempoolHub {
         tx: Transaction,
         origin: TxOrigin,
     ) -> Result<AcceptResult, AcceptError> {
+        self.admit_uncancellable(tx, origin, None).await
+    }
+
+    /// [`Self::accept_tx_from_work`] on a task the caller cannot cancel.
+    /// `max_fee_sat_kvb` reaches the local 1p1c child check. Direct admits
+    /// pass `None`.
+    async fn admit_uncancellable(
+        self: &Arc<Self>,
+        tx: Transaction,
+        origin: TxOrigin,
+        max_fee_sat_kvb: Option<u64>,
+    ) -> Result<AcceptResult, AcceptError> {
         let hub = Arc::clone(self);
         crate::reactor::finish_join(
             crate::reactor::spawn_with_store_budget(async move {
@@ -4593,7 +4615,7 @@ impl MempoolHub {
                     TxOrigin::Local => hub.api_lane().await,
                     TxOrigin::Relay(_) => None,
                 };
-                hub.accept_tx_from_work(tx, origin).await
+                hub.accept_tx_from_work(tx, origin, max_fee_sat_kvb).await
             })
             .await,
             "tx admit",
@@ -4603,6 +4625,12 @@ impl MempoolHub {
     /// Admit `tx` from this node's own client as [`Self::accept_tx_from_async`]
     /// does. A txid already pooled is a [`LocalBroadcast`] success.
     ///
+    /// `max_fee_sat_kvb` is the caller's cap (`0` inside `Some` is unlimited).
+    /// `None` skips the second look. A 1p1c child whose parent is only in the
+    /// extra pool has no prevout at the first look, so the cap is applied
+    /// again after that output resolves and before the child commits. The
+    /// parent rolls back. Peer relay passes `None`.
+    ///
     /// A txid an unsettled [`Tentative`] admit holds, as a member or as the
     /// spender of one, is answered once that admit settles, as Core answers
     /// after `cs_main`. A txid that has left the pool by then is admitted
@@ -4610,11 +4638,14 @@ impl MempoolHub {
     pub async fn broadcast_local_async(
         self: &Arc<Self>,
         tx: Transaction,
+        max_fee_sat_kvb: Option<u64>,
     ) -> Result<LocalBroadcast, AcceptError> {
         let txid = tx.compute_txid();
         loop {
-            let admitted =
-                LocalBroadcast::of(self.accept_tx_from_async(tx.clone(), TxOrigin::Local).await);
+            let admitted = LocalBroadcast::of(
+                self.admit_uncancellable(tx.clone(), TxOrigin::Local, max_fee_sat_kvb)
+                    .await,
+            );
             if let Err(e) = &admitted {
                 // A committed member still holds this tx's conflict or its
                 // parent's output. Wait for the admit to settle, then retry
@@ -4664,7 +4695,7 @@ impl MempoolHub {
         if over_max {
             return Err(BroadcastReject::max_fee());
         }
-        self.broadcast_local_async(tx)
+        self.broadcast_local_async(tx, Some(DEFAULT_MAX_RAW_TX_FEE_SAT_KVB))
             .await
             .map_err(|e| BroadcastReject::of(&e))
     }
@@ -4680,6 +4711,7 @@ impl MempoolHub {
             TxOrigin::Local,
             AcceptPath::PackageMember(admit),
             Vec::new(),
+            None,
         )
         .await
     }
@@ -4690,6 +4722,7 @@ impl MempoolHub {
         origin: TxOrigin,
         path: AcceptPath,
         announcers: Vec<u64>,
+        max_fee_sat_kvb: Option<u64>,
     ) -> Result<AcceptResult, AcceptError> {
         let from = origin.peer();
         let t0 = Instant::now();
@@ -4718,7 +4751,15 @@ impl MempoolHub {
             Err(e) => {
                 return self
                     .accept_prepare_failed_async(
-                        tx, origin, path, announcers, e, stages, lock_us, t0,
+                        tx,
+                        origin,
+                        path,
+                        announcers,
+                        e,
+                        stages,
+                        lock_us,
+                        t0,
+                        max_fee_sat_kvb,
                     )
                     .await;
             }
@@ -4821,6 +4862,7 @@ impl MempoolHub {
         stages: rbitcoin_mempool::AcceptStageUs,
         lock_us: u64,
         t0: Instant,
+        max_fee_sat_kvb: Option<u64>,
     ) -> Result<AcceptResult, AcceptError> {
         if path.returns_failure(&e) {
             let hub = Arc::clone(self);
@@ -4859,14 +4901,29 @@ impl MempoolHub {
                 .await;
             }
             let from = origin.peer();
-            if let Some(r) = self.admit_1p1c_work(&tx, &missing, origin).await {
-                let hub = Arc::clone(self);
-                return crate::reactor::off_pool(move || {
-                    let us = t0.elapsed().as_micros() as u64;
-                    hub.meter_accept_wall(us, true);
-                    Ok(r)
-                })
-                .await;
+            match self
+                .admit_1p1c_work(&tx, &missing, origin, max_fee_sat_kvb)
+                .await
+            {
+                Ok(Some(r)) => {
+                    let hub = Arc::clone(self);
+                    return crate::reactor::off_pool(move || {
+                        let us = t0.elapsed().as_micros() as u64;
+                        hub.meter_accept_wall(us, true);
+                        Ok(r)
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    let hub = Arc::clone(self);
+                    return crate::reactor::off_pool(move || {
+                        let us = t0.elapsed().as_micros() as u64;
+                        hub.meter_accept_stages(lock_us, stages);
+                        hub.finish_accept_err(us, e)
+                    })
+                    .await;
+                }
+                Ok(None) => {}
             }
             let hub = Arc::clone(self);
             let tx_p = tx;
@@ -4895,17 +4952,29 @@ impl MempoolHub {
         })
         .await;
         if let Some(child) = child {
-            if let Some(r) = self
-                .admit_with_waiting_spender_work(&tx, child, origin)
+            match self
+                .admit_with_waiting_spender_work(&tx, child, origin, max_fee_sat_kvb)
                 .await
             {
-                let hub = Arc::clone(self);
-                return crate::reactor::off_pool(move || {
-                    let us = t0.elapsed().as_micros() as u64;
-                    hub.meter_accept_wall(us, true);
-                    Ok(r)
-                })
-                .await;
+                Ok(Some(r)) => {
+                    let hub = Arc::clone(self);
+                    return crate::reactor::off_pool(move || {
+                        let us = t0.elapsed().as_micros() as u64;
+                        hub.meter_accept_wall(us, true);
+                        Ok(r)
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    let hub = Arc::clone(self);
+                    return crate::reactor::off_pool(move || {
+                        let us = t0.elapsed().as_micros() as u64;
+                        hub.meter_accept_stages(lock_us, stages);
+                        hub.finish_accept_err(us, e)
+                    })
+                    .await;
+                }
+                Ok(None) => {}
             }
         }
         let hub = Arc::clone(self);
@@ -4923,20 +4992,33 @@ impl MempoolHub {
         parent: &Transaction,
         child: Transaction,
         origin: TxOrigin,
-    ) -> Option<AcceptResult> {
+        max_fee_sat_kvb: Option<u64>,
+    ) -> Result<Option<AcceptResult>, AcceptError> {
         let pid = parent.compute_txid();
         let admitted = self
-            .admit_1p1c_work(&child, &BTreeSet::from([pid]), origin)
-            .await
-            .is_some();
+            .admit_1p1c_work(&child, &BTreeSet::from([pid]), origin, max_fee_sat_kvb)
+            .await;
+        let paired = match admitted {
+            Err(e) => {
+                let hub = Arc::clone(self);
+                let wtxid = child.compute_wtxid();
+                crate::reactor::off_pool(move || {
+                    let _ = hub.orphan_write(|g| g.orphanage.remove_wtxid(&wtxid));
+                })
+                .await;
+                return Err(e);
+            }
+            Ok(result) => result.is_some(),
+        };
         let hub = Arc::clone(self);
-        crate::reactor::off_pool(move || {
-            if !admitted {
+        let out = crate::reactor::off_pool(move || {
+            if !paired {
                 hub.drop_rejected_orphan(&child);
             }
-            admitted.then(|| hub.live_accept_result(&pid)).flatten()
+            paired.then(|| hub.live_accept_result(&pid)).flatten()
         })
-        .await
+        .await;
+        Ok(out)
     }
 
     /// Index a committed 1p1c pair, or put its conflicts back when trim drops one.
@@ -4988,7 +5070,8 @@ impl MempoolHub {
         child: &Transaction,
         missing: &BTreeSet<Txid>,
         origin: TxOrigin,
-    ) -> Option<AcceptResult> {
+        max_fee_sat_kvb: Option<u64>,
+    ) -> Result<Option<AcceptResult>, AcceptError> {
         let hub = Arc::clone(self);
         let child_c = child.clone();
         let missing_c = missing.clone();
@@ -5004,12 +5087,14 @@ impl MempoolHub {
             PairLookup::Remember(key) => {
                 let hub = Arc::clone(self);
                 crate::reactor::off_pool(move || hub.note_recent_reject(key)).await;
-                return None;
+                return Ok(None);
             }
-            PairLookup::Skip => return None,
+            PairLookup::Skip => return Ok(None),
         };
-        let admitted = self.admit_pair_work(parent, child, origin).await;
-        if let (None, Some(key)) = (&admitted, key) {
+        let admitted = self
+            .admit_pair_work(parent, child, origin, max_fee_sat_kvb)
+            .await;
+        if let (Ok(None), Some(key)) = (&admitted, key) {
             let hub = Arc::clone(self);
             crate::reactor::off_pool(move || hub.note_recent_reject(key)).await;
         }
@@ -5022,10 +5107,11 @@ impl MempoolHub {
         parent: Transaction,
         child: &Transaction,
         origin: TxOrigin,
-    ) -> Option<AcceptResult> {
+        max_fee_sat_kvb: Option<u64>,
+    ) -> Result<Option<AcceptResult>, AcceptError> {
         let guard = self.begin_tentative_guard();
         let admitted = self
-            .admit_pair_work_held(parent, child, origin, guard.admit())
+            .admit_pair_work_held(parent, child, origin, guard.admit(), max_fee_sat_kvb)
             .await;
         guard.settle_async().await;
         admitted
@@ -5037,7 +5123,8 @@ impl MempoolHub {
         child: &Transaction,
         origin: TxOrigin,
         admit: Tentative,
-    ) -> Option<AcceptResult> {
+        max_fee_sat_kvb: Option<u64>,
+    ) -> Result<Option<AcceptResult>, AcceptError> {
         let mut stages = rbitcoin_mempool::AcceptStageUs::default();
         let mut lock_us = 0u64;
         let hub = Arc::clone(self);
@@ -5060,7 +5147,7 @@ impl MempoolHub {
                 let hub = Arc::clone(self);
                 let parent_f = parent.clone();
                 crate::reactor::off_pool(move || hub.note_if_accept_failure(&parent_f, &e)).await;
-                return None;
+                return Ok(None);
             }
         };
         let hub = Arc::clone(self);
@@ -5093,7 +5180,7 @@ impl MempoolHub {
                 self.restore_replaced_async(undone).await;
                 let hub = Arc::clone(self);
                 crate::reactor::off_pool(move || hub.publish_fee_floor()).await;
-                return None;
+                return Ok(None);
             }
         };
         self.park_after_tentative_commit().await;
@@ -5126,9 +5213,24 @@ impl MempoolHub {
                     hub.rollback_1p1c_parent(&txid, &evicted);
                 })
                 .await;
-                return None;
+                return Ok(None);
             }
         };
+        if let Some(max) = max_fee_sat_kvb {
+            if rbitcoin_consensus::policy::fee_exceeds_max(prep_c.fee_sat, prep_c.weight, max) {
+                let hub = Arc::clone(self);
+                let stages_f = stages;
+                let lock_f = lock_us;
+                let txid = parent_res.txid;
+                let evicted = parent_res.evicted.clone();
+                crate::reactor::off_pool(move || {
+                    hub.meter_accept_stages(lock_f, stages_f);
+                    hub.rollback_1p1c_parent(&txid, &evicted);
+                })
+                .await;
+                return Err(AcceptError::Policy(crate::broadcast_reject::MAX_FEE_REASON));
+            }
+        }
         let hub = Arc::clone(self);
         let child_c = Arc::new(child.clone());
         let child_commit = crate::reactor::off_pool_budgeted(move || {
@@ -5150,8 +5252,9 @@ impl MempoolHub {
                 let parent_pub = parent;
                 let child_pub = child.clone();
                 let prevouts_c = child_commit.prevouts;
-                self.publish_1p1c(parent_pub, child_pub, parent_res, r, prevouts_p, prevouts_c)
-                    .await
+                Ok(self
+                    .publish_1p1c(parent_pub, child_pub, parent_res, r, prevouts_p, prevouts_c)
+                    .await)
             }
             Err(e) => {
                 let hub = Arc::clone(self);
@@ -5172,7 +5275,7 @@ impl MempoolHub {
                     hub.publish_fee_floor();
                 })
                 .await;
-                None
+                Ok(None)
             }
         }
     }
