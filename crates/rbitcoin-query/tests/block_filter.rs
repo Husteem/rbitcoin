@@ -250,3 +250,67 @@ fn by_hash_drops_a_row_when_the_height_moved() {
     assert_ne!(got, sentinel, "the moved height must not return that row");
     assert_eq!(got, good);
 }
+
+#[test]
+fn by_hash_counts_a_block_that_left_the_chain_during_the_read() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("filter-left-chain");
+    q.set_block_filter_index(true).unwrap();
+    rbitcoin_query::prepare_live_indexes(&q).unwrap();
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let ms = rbitcoin_consensus::Milestone::height(u32::MAX);
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        ms,
+    )
+    .unwrap();
+    let b1 =
+        rbitcoin_consensus::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    rbitcoin_query::accept_and_connect_block(&q, &params, rbitcoin_primitives::Height(1), &b1, ms)
+        .unwrap();
+    let hash = b1.block_hash().to_byte_array();
+    rbitcoin_query::chain_view::forget_height_of_hash_on_call(2);
+    let err = q.basic_filter_for_hash_within(&hash, 0).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(rbitcoin_query::block_filter::FILTER_STALE_TOO_DEEP),
+        "{err}"
+    );
+}
+
+#[test]
+fn by_hash_drops_a_row_the_index_does_not_name() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("filter-row-bind");
+    q.set_block_filter_index(true).unwrap();
+    rbitcoin_query::prepare_live_indexes(&q).unwrap();
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let ms = rbitcoin_consensus::Milestone::height(u32::MAX);
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        ms,
+    )
+    .unwrap();
+    let b1 =
+        rbitcoin_consensus::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    rbitcoin_query::accept_and_connect_block(&q, &params, rbitcoin_primitives::Height(1), &b1, ms)
+        .unwrap();
+    let hash = b1.block_hash().to_byte_array();
+    let good = q.basic_filter_for_hash(&hash).unwrap().unwrap().0;
+    let sentinel = vec![0xcd; 8];
+    rbitcoin_query::block_filter::lie_next_basic_filter_body(sentinel.clone());
+    let got = q.basic_filter_for_hash(&hash).unwrap().unwrap().0;
+    assert_ne!(
+        got, sentinel,
+        "a body the idx does not name must not be returned"
+    );
+    assert_eq!(got, good);
+}

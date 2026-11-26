@@ -39,7 +39,10 @@ Fixed
   the replacement row, and errors if the row keeps moving. A by-hash read
   returns that error instead of a filter the idx rejected. If the height's
   block changed during the read, the by-hash read rebuilds the requested
-  hash instead of returning the replacement row.
+  hash instead of returning the replacement row. It returns a stored row
+  only when that row's idx slot still names the block and the body matches
+  the slot. A block that leaves the best chain during the read counts toward
+  the stale-block budget, including a budget of zero.
 - A torn block-filter parent rebuild is still deferred ([#2109]).
 
 [#2071]: https://github.com/rbitcoin-org/rbitcoin/issues/2071

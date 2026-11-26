@@ -346,14 +346,15 @@ pub fn arm_fail_sync(handle: IoHandle, n: u32) {
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn arm_fail_sync_after(handle: IoHandle, skip: u32, n: u32) {
-    if skip > 0 {
-        let mut slots = SYNC_SKIP.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = slots.iter_mut().find(|(h, _)| *h == handle) {
-            slot.1 = skip;
-        } else {
-            slots.push((handle, skip));
-        }
+    let mut slots = SYNC_SKIP.lock().unwrap_or_else(|e| e.into_inner());
+    if skip == 0 {
+        slots.retain(|(h, _)| *h != handle);
+    } else if let Some(slot) = slots.iter_mut().find(|(h, _)| *h == handle) {
+        slot.1 = skip;
+    } else {
+        slots.push((handle, skip));
     }
+    drop(slots);
     arm_fail_sync(handle, n);
 }
 

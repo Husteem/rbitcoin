@@ -400,15 +400,18 @@ impl Query {
         hash: &[u8; 32],
         max_stale: usize,
     ) -> Result<Option<(Vec<u8>, FilterHeader)>, QueryError> {
-        let height = self.height_of_hash(hash)?;
+        let mut height = self.height_of_hash(hash)?;
         if let Some(h) = height {
             match self.basic_filter_at(h.0) {
                 Ok(Some(row)) => {
                     // A reload inside the repair can observe a block that
-                    // replaced `h`. That row is not the requested hash.
-                    if self.height_of_hash(hash)? == Some(h) {
+                    // replaced `h`. That row is not this hash, and the hash
+                    // may have left the best chain during the read.
+                    let now = self.height_of_hash(hash)?;
+                    if now == Some(h) && self.stored_row_is_hash(h.0, hash, &row.0)? {
                         return Ok(Some(row));
                     }
+                    height = now;
                 }
                 Ok(None) => {}
                 Err(e) => return Err(e),
@@ -440,6 +443,25 @@ impl Query {
             filter.content.clone(),
             filter.filter_header(&parent_header),
         )))
+    }
+
+    /// The idx row at `height` still names `hash`, and `body` is that row.
+    fn stored_row_is_hash(
+        &self,
+        height: u32,
+        hash: &[u8; 32],
+        body: &[u8],
+    ) -> Result<bool, QueryError> {
+        let Some(table) = self.block_filter_table() else {
+            return Ok(false);
+        };
+        let Some((fk, _)) = self.get_header_by_hash(hash)? else {
+            return Ok(false);
+        };
+        let Some((_, slot)) = table.filter(Height(height))? else {
+            return Ok(false);
+        };
+        Ok(slot.header_fk == fk && check_filter_hash(body, &slot).is_ok())
     }
 
     #[cfg(debug_assertions)]

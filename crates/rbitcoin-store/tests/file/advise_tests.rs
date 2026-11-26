@@ -592,6 +592,28 @@ fn sync_data_only_leaves_hwm_and_pending_sync() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[test]
+fn arm_fail_sync_after_zero_drops_a_leftover_skip() {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("rbitcoin-sync-skip-{id}"));
+    let _ = std::fs::remove_file(&path);
+    let f = TableFile::create(&path, TableKind::TxOut).unwrap();
+    let handle = f.io_handle();
+    struct Disarm(rbitcoin_store::io_handle::IoHandle);
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            rbitcoin_store::io_handle::disarm_pwrite(self.0);
+        }
+    }
+    let _disarm = Disarm(handle);
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 2, 1);
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 0, 1);
+    let err = f.sync_data_only().unwrap_err();
+    assert!(matches!(err, StoreError::Io { .. }), "{err}");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// HWM on disk never exceeds what is fully written (complete-or-fail publish).
 #[test]
 fn hwm_publish_matches_full_payload_after_flush() {
