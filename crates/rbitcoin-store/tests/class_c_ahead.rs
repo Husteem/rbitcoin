@@ -296,6 +296,42 @@ fn leftover_ahead_pages_survive_a_later_write() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The `confirmed[]` sidecar's rename must be durable before the payload
+/// write it guards, and its unlink after it: one directory sync each.
+#[test]
+fn confirmed_flush_dirsyncs_the_sidecar_before_the_payload() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("confirmed-dirsync").unwrap();
+    let path = dir.path.join("confirmed.body");
+    let t = ConfirmedTable::create(&dir.path).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    t.set(&write, Height(0), Fk(1)).unwrap();
+    rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    assert!(t.flush().is_err(), "the failpoint stops before the payload");
+    let before_payload = rbitcoin_store::file::take_fsynced_dirs();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    t.flush().unwrap();
+    let full = rbitcoin_store::file::take_fsynced_dirs();
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            before_payload.len(),
+            1,
+            "the sidecar rename must reach the directory before the payload, got {before_payload:?}"
+        );
+        assert_eq!(
+            full.len(),
+            2,
+            "one sync after the sidecar and one after the unlink, got {full:?}"
+        );
+    }
+    // Windows `fsync_parent_dir` is a no-op, so the trace stays empty.
+    #[cfg(not(unix))]
+    drop((before_payload, full));
+}
+
 /// Every `confirmed[]` flush rewrites the length in page 0 and the block that
 /// holds the previous tip. A tear of either must come back from the image.
 #[test]

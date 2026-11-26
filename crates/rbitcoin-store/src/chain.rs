@@ -5,7 +5,7 @@ use crate::array_table::{
     STRONG_BIT_RESERVE_BYTES, STRONG_BIT_RESERVE_BYTES_TINY,
 };
 use crate::error::StoreError;
-use crate::file::{fsync_parent_dir, TableFile, FILE_HEADER_LEN};
+use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::HeadScale;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use rbitcoin_primitives::{Fk, Height, TableKind};
@@ -147,7 +147,7 @@ impl ConfirmedTable {
     /// Write the synced image of the pages this flush rewrites, then the
     /// payload, then drop the image.
     pub fn flush(&self) -> Result<(), StoreError> {
-        let ahead = self.arr.write_ahead(0)?;
+        let ahead = ArrayTable::write_aheads(&[&self.arr], 0)?;
         #[cfg(debug_assertions)]
         if take_fail_ahead(self.arr.file.path()) {
             return Err(StoreError::io(
@@ -899,15 +899,7 @@ impl HeaderTxsTable {
     pub fn flush(&self) -> Result<(), StoreError> {
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let pair_gen = self.pair_gen_for_flush()?;
-        let first_ahead = self.first.write_ahead(pair_gen)?;
-        let count_ahead = self.count.write_ahead(pair_gen)?;
-        if first_ahead.is_some() || count_ahead.is_some() {
-            if let Some(parent) = self.first.file.path().parent() {
-                if !parent.as_os_str().is_empty() {
-                    fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-                }
-            }
-        }
+        ArrayTable::write_aheads(&[&self.first, &self.count], pair_gen)?;
         #[cfg(debug_assertions)]
         if take_fail_ahead(self.first.file.path()) {
             return Err(StoreError::io(

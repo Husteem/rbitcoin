@@ -1320,9 +1320,30 @@ impl ArrayTable {
         Ok(())
     }
 
+    /// Write each table's synced `*.ahead` sidecar, then sync their directory
+    /// once, so every image is durable before any payload write it guards.
+    /// Only the in-RAM Class C range tables use it; every table shares the
+    /// store directory. `pair_gen` stamps each image (`0`: unstamped).
+    pub(crate) fn write_aheads(
+        tables: &[&ArrayTable],
+        pair_gen: u16,
+    ) -> Result<Vec<PathBuf>, StoreError> {
+        let mut sides = Vec::with_capacity(tables.len());
+        for t in tables {
+            sides.extend(t.write_ahead_file(pair_gen)?);
+        }
+        if let Some(parent) = sides.first().and_then(|s| s.parent()) {
+            if !parent.as_os_str().is_empty() {
+                file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+            }
+        }
+        Ok(sides)
+    }
+
     /// Write the dirty range's intended post-write header and bytes to a
-    /// synced `*.ahead` sidecar. Only the in-RAM Class C range tables use it.
-    pub(crate) fn write_ahead(&self, pair_gen: u16) -> Result<Option<PathBuf>, StoreError> {
+    /// file-synced `*.ahead` sidecar. [`Self::write_aheads`] syncs the
+    /// directory.
+    fn write_ahead_file(&self, pair_gen: u16) -> Result<Option<PathBuf>, StoreError> {
         if !self.in_ram || self.byte_body {
             return Ok(None);
         }
@@ -1389,7 +1410,6 @@ impl ArrayTable {
         merged.sort_unstable_by_key(|(off, _)| *off);
         let buf = Self::encode_ahead(&header, &merged, pair_gen);
         let side = Self::ahead_path(self.file.path());
-        // File sync only. The caller directory-syncs once for the whole pair.
         file::write_file_synced_tmp_rename(&side, &buf)?;
         Ok(Some(side))
     }
