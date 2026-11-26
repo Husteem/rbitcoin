@@ -33,3 +33,5 @@ Fixed
 [#2073]: https://github.com/rbitcoin-org/rbitcoin/issues/2073
 [#2074]: https://github.com/rbitcoin-org/rbitcoin/issues/2074
 [#2075]: https://github.com/rbitcoin-org/rbitcoin/issues/2075
+[#2108]: https://github.com/rbitcoin-org/rbitcoin/issues/2108
+[#2109]: https://github.com/rbitcoin-org/rbitcoin/issues/2109
