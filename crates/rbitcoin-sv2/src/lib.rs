@@ -35,8 +35,29 @@ pub const MAX_SESSIONS: usize = 8;
 /// without asmap, also under `--asmap`) may hold at once. A silent SRI pool
 /// and a silent attacker look the same, so no idle deadline can tell them
 /// apart; a share keeps one network from taking the whole table.
-/// `127.0.0.1` and `::1` are two netgroups.
+/// `127.0.0.1` and `::1` are two netgroups. The default for
+/// [`Sv2TpConfig::netgroup_sessions`].
 pub const MAX_SESSIONS_PER_NETGROUP: usize = MAX_SESSIONS / 2;
+
+/// Idle time before the first keepalive probe on an accepted session.
+const SESSION_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+/// Probe interval and count: a client gone without a FIN is closed about
+/// 30 + 3 × 10 s after its last segment.
+const SESSION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const SESSION_KEEPALIVE_PROBES: u32 = 3;
+
+/// Turn on TCP keepalive for an accepted session. Sessions may stay silent
+/// for hours, and a client that drops without a FIN would otherwise keep its
+/// slot and netgroup share until a template write times out in the kernel
+/// (about 15 minutes on Linux).
+pub fn set_session_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    let ka = socket2::TcpKeepalive::new().with_time(SESSION_KEEPALIVE_IDLE);
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    let ka = ka
+        .with_interval(SESSION_KEEPALIVE_INTERVAL)
+        .with_retries(SESSION_KEEPALIVE_PROBES);
+    socket2::SockRef::from(stream).set_tcp_keepalive(&ka)
+}
 
 /// Default [`Sv2TpConfig::setup_timeout`]. A session holds a slot from TCP
 /// accept, so without it `MAX_SESSIONS` silent sockets lock clients out.
@@ -110,6 +131,10 @@ pub struct Sv2TpConfig {
     /// How long a changed coinbase budget waits after the previous template.
     /// The node passes [`CONSTRAINTS_COOLDOWN`].
     pub constraints_cooldown: Duration,
+    /// Sessions one netgroup may hold, 1 to [`MAX_SESSIONS`]
+    /// (default [`MAX_SESSIONS_PER_NETGROUP`]). [`MAX_SESSIONS`] turns the
+    /// share off, for miners behind one NAT, LAN or loopback tunnel.
+    pub netgroup_sessions: usize,
 }
 
 /// Template work across this listener's sessions, for `tip: perf` and
@@ -172,7 +197,7 @@ pub fn log_disconnect(peer: SocketAddr, how: &io::Result<()>) {
 
 /// Bind the listener and serve TDP sessions until [`Sv2TpHandle::shutdown`].
 ///
-/// At `MAX_SESSIONS`, or at [`MAX_SESSIONS_PER_NETGROUP`] from the
+/// At `MAX_SESSIONS`, or at [`Sv2TpConfig::netgroup_sessions`] from the
 /// newcomer's netgroup, the next connection is closed before the handshake;
 /// existing sessions are not touched.
 pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
@@ -224,6 +249,7 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
         interval: config.template_interval,
     };
     let constraints_cooldown = config.constraints_cooldown;
+    let netgroup_sessions = config.netgroup_sessions.clamp(1, MAX_SESSIONS);
     let chain = config.chain;
     let listener = rbitcoin_net::listen::bind_tcp(config.listen)?;
     let local_addr = listener.local_addr()?;
@@ -259,12 +285,10 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
                 drop(stream);
                 continue;
             };
-            let Some(group) = GroupShare::take(&groups, peer) else {
+            let Some(group) = GroupShare::take(&groups, peer, netgroup_sessions) else {
                 rbitcoin_log::warn_repeated(
                     rbitcoin_log::RepeatedInfo::Sv2AtMaxSessions,
-                    format_args!(
-                        "sv2: reject {peer} (netgroup at {MAX_SESSIONS_PER_NETGROUP} sessions)"
-                    ),
+                    format_args!("sv2: reject {peer} (netgroup at {netgroup_sessions} sessions)"),
                 );
                 drop(stream);
                 continue;
@@ -280,6 +304,9 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
                     continue;
                 }
             };
+            if let Err(e) = set_session_keepalive(&stream) {
+                rbitcoin_log::debug!(Sv2, "keepalive for {peer} ({e})");
+            }
             rbitcoin_log::debug!(Sv2, "connect {peer}");
             let chain = Arc::clone(&chain);
             let stats = Arc::clone(&stats_c);
@@ -317,8 +344,8 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
     })
 }
 
-/// One session's place in its netgroup's [`MAX_SESSIONS_PER_NETGROUP`]
-/// share, returned on drop.
+/// One session's place in its netgroup's
+/// [`Sv2TpConfig::netgroup_sessions`] share, returned on drop.
 struct GroupShare {
     groups: Arc<Mutex<HashMap<u64, usize>>>,
     key: u64,
@@ -326,11 +353,15 @@ struct GroupShare {
 
 impl GroupShare {
     /// `None`: `peer`'s netgroup already holds its share.
-    fn take(groups: &Arc<Mutex<HashMap<u64, usize>>>, peer: SocketAddr) -> Option<Self> {
+    fn take(
+        groups: &Arc<Mutex<HashMap<u64, usize>>>,
+        peer: SocketAddr,
+        share: usize,
+    ) -> Option<Self> {
         let key = rbitcoin_net::netgroup(peer, None);
         let mut g = groups.lock().unwrap_or_else(|e| e.into_inner());
         let n = g.entry(key).or_default();
-        if *n >= MAX_SESSIONS_PER_NETGROUP {
+        if *n >= share {
             return None;
         }
         *n += 1;

@@ -325,6 +325,7 @@ is no plaintext mode.
 | `--sv2-tp-idle-timeout SECS` (`sv2_tp_idle_timeout`) | 0 | Drops a session that sends no frame for SECS after its first `CoinbaseOutputConstraints`; 0 to 86400, `0` never. Only a frame the client sends moves it; template pushes do not. SRI pools and JDCs send nothing between shares, so leave it off for them |
 | `--sv2-tp-fee-delta SATS` (`sv2_tp_fee_delta`) | 1000 | Fee gain over a client's last template that pushes a new one on the same tip; `0` pushes any rebuild after a mempool change that did not lower the fees |
 | `--sv2-tp-template-interval SECS` (`sv2_tp_template_interval`) | 5 | Check period: each session checks for that gain every SECS, and a fee push never comes sooner than this after the client's last template. A gain can wait up to one more period than on sv2-tp, which rechecks every second after its interval; `1` matches that. 1 to 86400 |
+| `--sv2-tp-netgroup-sessions N` (`sv2_tp_netgroup_sessions`) | 4 | Sessions one netgroup (IPv4 `/16`, IPv6 `/32`) may hold, 1 to 8. `8` turns the share off, for miners behind one NAT, one LAN, or one tunnel endpoint on loopback. |
 
 `--sv2-tp-listen` needs one of the authority flags. At startup the node logs
 `sv2 TP on ADDR (authority pubkey KEY)`. KEY is in the SRI `key-utils`
@@ -344,9 +345,13 @@ bits depend only on the previous hash.
 At most 8 sessions run at once, and at most 4 from one netgroup (IPv4
 `/16`, IPv6 `/32`, also under `--asmap`; `127.0.0.1` and `::1` are two
 netgroups). Over either cap the new connection is closed before the
-handshake, logged at most once a second. There is no flag for the share:
-a fifth client from one `/16`, such as miners behind one NAT or one
-tunnel endpoint, is refused the same way an attacker's would be. A connection that has not finished the
+handshake, logged at most once a second. By default a fifth client from
+one `/16`, such as miners behind one NAT or one tunnel endpoint, is
+refused the same way an attacker's would be; `--sv2-tp-netgroup-sessions`
+changes the 4, and `8` turns the share off. Accepted sessions use TCP
+keepalive (first probe after 30 s idle, then every 10 s, 3 probes), so a
+client that vanishes without closing its connection frees its slot and
+share about a minute after its last packet. A connection that has not finished the
 Noise handshake and `SetupConnection` and sent its first
 `CoinbaseOutputConstraints` within 10 s is closed; after that a client may
 stay silent indefinitely unless `--sv2-tp-idle-timeout` is set. A client that stops reading is closed

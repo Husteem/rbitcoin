@@ -165,6 +165,7 @@ fn operator_conf_and_argv() {
         "--sv2-tp-idle-timeout",
         "--sv2-tp-fee-delta",
         "--sv2-tp-template-interval",
+        "--sv2-tp-netgroup-sessions",
         "--rpc",
         "--rpc-listen",
         "--rest",

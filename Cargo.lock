@@ -1181,6 +1181,7 @@ dependencies = [
  "rbitcoin-primitives",
  "rbitcoin-query",
  "rbitcoin-store",
+ "socket2",
  "template_distribution_sv2",
  "tokio",
 ]

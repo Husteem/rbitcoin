@@ -33,6 +33,7 @@ codec_sv2 = { workspace = true }
 binary_sv2 = { workspace = true }
 common_messages_sv2 = { workspace = true }
 template_distribution_sv2 = { workspace = true }
+socket2 = { workspace = true }
 
 [dev-dependencies]
 rbitcoin-query = { workspace = true }

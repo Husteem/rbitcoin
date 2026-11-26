@@ -531,6 +531,8 @@ pub struct NodeConfig {
     /// Minimum time from a session's last push to a fee push. Default 5 s.
     /// Conf and CLI set whole seconds (at least 1); tests may set the floor.
     pub sv2_tp_template_interval: Duration,
+    /// `--sv2-tp-netgroup-sessions`: sessions one netgroup may hold.
+    pub sv2_tp_netgroup_sessions: usize,
     /// How long a changed SV2 coinbase budget waits. Default
     /// [`rbitcoin_sv2::CONSTRAINTS_COOLDOWN`]. Not a conf key; tests that wait
     /// on the next budget set [`rbitcoin_sv2::CONSTRAINTS_COOLDOWN_TEST`].
@@ -681,6 +683,7 @@ impl Default for NodeConfig {
             sv2_tp_idle_timeout: Duration::ZERO,
             sv2_tp_fee_delta: rbitcoin_sv2::FEE_DELTA,
             sv2_tp_template_interval: rbitcoin_sv2::TEMPLATE_INTERVAL,
+            sv2_tp_netgroup_sessions: rbitcoin_sv2::MAX_SESSIONS_PER_NETGROUP,
             sv2_tp_constraints_cooldown: rbitcoin_sv2::CONSTRAINTS_COOLDOWN,
             milestone_height: 0,
             milestone_explicit: false,
@@ -1799,6 +1802,18 @@ impl NodeConfig {
                         ))
                     })?;
                 self.sv2_tp_template_interval = Duration::from_secs(secs);
+            }
+            "sv2_tp_netgroup_sessions" => {
+                let max = rbitcoin_sv2::MAX_SESSIONS;
+                self.sv2_tp_netgroup_sessions = val
+                    .parse()
+                    .ok()
+                    .filter(|n: &usize| (1..=max).contains(n))
+                    .ok_or_else(|| {
+                        NodeError::Config(format!(
+                            "conf sv2_tp_netgroup_sessions: want a count in 1..={max}"
+                        ))
+                    })?;
             }
             "sv2_tp_cert_validity" => {
                 self.sv2_tp_cert_validity_secs = val

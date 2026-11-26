@@ -60,6 +60,57 @@ async fn setup_ok(addr: SocketAddr, pk: [u8; 32]) -> TpClient {
     c
 }
 
+/// `netgroup_sessions` replaces the default share: miners behind one NAT,
+/// one LAN or one loopback tunnel can take more of the table, or the
+/// operator can tighten it. The global cap still applies.
+#[tokio::test]
+async fn netgroup_sessions_sets_the_share() {
+    let tc = shared_regtest(0);
+    for share in [1, MAX_SESSIONS] {
+        let tp = run_sv2_tp({
+            let mut cfg = test_tp_config(Arc::clone(&tc.chain), [7; 32]);
+            cfg.netgroup_sessions = share;
+            cfg
+        })
+        .await
+        .expect("listen");
+        let (addr, pk) = (tp.local_addr, tp.authority_pubkey);
+        let mut live = Vec::new();
+        for _ in 0..share {
+            live.push(setup_ok(addr, pk).await);
+        }
+        assert!(
+            TpClient::connect(addr, pk).await.is_err(),
+            "loopback past a share of {share} must close before the handshake"
+        );
+        drop(live);
+        tp.shutdown().await;
+    }
+}
+
+/// An accepted session's socket has TCP keepalive on, so a client that
+/// drops without a FIN frees its slot and netgroup share in about a
+/// minute, not after the kernel's retransmit timeout.
+#[test]
+fn accepted_sockets_get_tcp_keepalive() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (accepted, _) = listener.accept().unwrap();
+    accepted.set_nonblocking(true).unwrap();
+    let accepted = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let _g = rt.enter();
+        let s = tokio::net::TcpStream::from_std(accepted).unwrap();
+        rbitcoin_sv2::set_session_keepalive(&s).unwrap();
+        s.into_std().unwrap()
+    };
+    let sock = socket2::SockRef::from(&accepted);
+    assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE");
+}
+
 /// One netgroup takes at most half the table, so idle clients from one
 /// network cannot lock out a miner from another. The newcomer is refused;
 /// existing sessions are not touched.
