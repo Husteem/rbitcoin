@@ -1930,8 +1930,9 @@ impl Store {
     ///
     /// A torn strong flush, a hole repair that rewrites a suffix, or a short
     /// `strong_tx.body` header can clear a confirmed bit. The fence
-    /// (`confirmed[]` + `header_txs`) is the independent source; open sets the
-    /// missing bits before revalidation can mistake the create for unconfirmed.
+    /// (`confirmed[]` + `header_txs`) is the independent source; Query open
+    /// calls this before revalidation so a torn in-window bit cannot shrink a
+    /// good tip, then again after a revalidation shrink.
     /// The fast path is one popcount over the image; only a real shortfall
     /// walks the runs.
     #[doc(hidden)]

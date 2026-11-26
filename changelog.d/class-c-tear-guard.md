@@ -2,11 +2,12 @@ Fixed
 - **Class C and derived writes survive a torn in-place page.** A
   `header_txs` append rewrote the block holding the previous tip's committed
   range, `header.head` rewrote a 3 KiB chunk beside committed slots, and
-  `txstat` stamped cells in place. A power cut could tear those pages, and
+  `txstat.body` stamped cells in place. A power cut could tear those pages, and
   open accepted a missing `header_txs` range as `Ok` or served a
   well-formed wrong stats or filter value. Those writes now put a synced
   `*.ahead` image of the intended pages first; open restores it. A torn
-  strong flush is repaired from the confirmed fence instead ([#2071],
+  strong flush is repaired from the confirmed fence instead. `txstat.blk`
+  and `txstat.ovf` are unchanged ([#2071],
   [#2072], [#2073], [#2075]).
 - **Scripthash free-list and allocator state are ordered and checked.** The
   unlink batch syncs freed links before the allocator header that names

@@ -10,6 +10,7 @@ use crate::hashhead::HeadScale;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use rbitcoin_primitives::{Fk, Height, TableKind};
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Best-chain height → header fk. Length = tip_height + 1 when non-empty.
 pub struct ConfirmedTable {
@@ -543,6 +544,9 @@ pub struct HeaderTxsTable {
     pub count: ArrayTable,
     /// One counter for a header's `(first, count)` pair.
     seq: AtomicU64,
+    /// Serializes a write with the sidecar+flush pair. A sidecar must describe
+    /// exactly the slots the following flush writes.
+    write: Mutex<()>,
 }
 
 #[cfg(debug_assertions)]
@@ -573,6 +577,7 @@ impl HeaderTxsTable {
             first: ArrayTable::create(dir.join("header_txs_first.body"), TableKind::ArrayLink)?,
             count: ArrayTable::create(dir.join("header_txs_count.body"), TableKind::ArrayLink)?,
             seq: AtomicU64::new(0),
+            write: Mutex::new(()),
         })
     }
 
@@ -595,6 +600,7 @@ impl HeaderTxsTable {
             first: ArrayTable::open(first_path, TableKind::ArrayLink)?,
             count: ArrayTable::open(count_path, TableKind::ArrayLink)?,
             seq: AtomicU64::new(0),
+            write: Mutex::new(()),
         })
     }
 
@@ -639,6 +645,7 @@ impl HeaderTxsTable {
         if first_tx_fk.is_null() || n == 0 {
             return Err(StoreError::InvalidFk);
         }
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
         self.first.set_zero_gap(write, id - 1, first_tx_fk.0)?;
         self.count.set_zero_gap(write, id - 1, u64::from(n))?;
@@ -662,6 +669,7 @@ impl HeaderTxsTable {
             first_pairs.push((id - 1, first.0));
             count_pairs.push((id - 1, u64::from(n)));
         }
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
         self.first.set_many_zero_gap(write, &first_pairs)?;
         self.count.set_many_zero_gap(write, &count_pairs)?;
@@ -687,6 +695,7 @@ impl HeaderTxsTable {
             first_pairs.push((id - 1, first_tx_fk.0));
             count_pairs.push((id - 1, u64::from(n)));
         }
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
         self.first.set_many_zero_gap(write, &first_pairs)?;
         self.count.set_many_zero_gap(write, &count_pairs)?;
@@ -772,6 +781,7 @@ impl HeaderTxsTable {
         if idx >= self.first.len() {
             return Ok(false);
         }
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
         self.first.set(write, idx, 0)?;
         self.count.set(write, idx, 0)?;
@@ -787,6 +797,7 @@ impl HeaderTxsTable {
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let first_ahead = self.first.write_ahead()?;
         let count_ahead = self.count.write_ahead()?;
         #[cfg(debug_assertions)]
@@ -803,6 +814,7 @@ impl HeaderTxsTable {
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let first_ahead = self.first.write_ahead()?;
         let count_ahead = self.count.write_ahead()?;
         self.first

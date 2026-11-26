@@ -1,7 +1,9 @@
 use rbitcoin_primitives::{Fk, TableKind};
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::file::TableFile;
-use rbitcoin_store::scripthash::{read_alloc_header, write_alloc_header, AllocState};
+use rbitcoin_store::scripthash::{
+    pop_free_head, read_alloc_header, write_alloc_header, AllocState,
+};
 use rbitcoin_store::scripthash_layout::{slab_bytes, SH_MAX_CLASS, SH_PREFIX_PAGE};
 use rbitcoin_store::scripthash_pages::SH_FLAG_BIT;
 use rbitcoin_store::scripthash_slabs::*;
@@ -141,4 +143,28 @@ fn fk_delta_stream_roundtrip_and_packed_len() {
     decode_fk_delta_stream_into(&[], 0, &mut keep).unwrap();
     assert_eq!(keep, vec![Fk(99)]);
     assert!(decode_slab_payload_into(&[0], &mut Vec::new()).is_err());
+}
+
+#[test]
+fn popped_free_link_out_of_range_is_corrupt() {
+    let dir = rbitcoin_store::testutil::fresh_path("sh-free-link");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scripthash.body");
+    let file = TableFile::create(&path, TableKind::ScriptHash).unwrap();
+    file.set_logical_len(8192).unwrap();
+    let mut state = AllocState {
+        live_count: 0,
+        bump: 8192,
+        free_head: [0u64; SH_MAX_CLASS as usize + 1],
+    };
+    state.free_head[0] = 4096;
+    write_alloc_header(&file, &state).unwrap();
+    file.write_at(4096, &8200u64.to_le_bytes()).unwrap();
+    let mut heads = state.free_head;
+    match pop_free_head(&file, &mut heads, 0) {
+        Err(StoreError::Corrupt(_)) => {}
+        Ok(_) => panic!("an out-of-range next link must be Corrupt"),
+        Err(e) => panic!("an out-of-range next link must be Corrupt, got {e}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

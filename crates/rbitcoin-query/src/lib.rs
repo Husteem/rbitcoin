@@ -1007,7 +1007,14 @@ impl Query {
     ) -> Result<Self, QueryError> {
         write_create_loc::clear();
         let store = Store::open_or_create_layout(layout)?;
-        // Core checkblocks-style tip window first so repair sees the final fence.
+        // Set fence strong bits before revalidation: a torn in-window bit must
+        // not shrink a good tip. The post-revalidation repair below handles a
+        // fence the window shrank.
+        let cleared = store.repair_class_c_above_tip()?;
+        let restored = store.restore_strong_from_fence()?;
+        if cleared > 0 || restored > 0 {
+            let _ = store.strong_tx.flush();
+        }
         let reval = store.revalidate_tip_window_n(n)?;
         if !reval.is_clean() {
             eprintln!(
@@ -1021,10 +1028,8 @@ impl Query {
                 reval.tip_shrunk
             );
         }
-        // One complement repair (holes + short suffix), then set every fence
-        // bit a torn strong flush cleared. The clear makes the popcount fast
-        // path in restore_strong_from_fence meaningful: an off-fence hole bit
-        // can no longer stand in for a missing fence bit.
+        // Revalidation may have shrunk the tip: clear bits off the final
+        // fence, then restore any surviving fence bit.
         let cleared = store.repair_class_c_above_tip()?;
         let restored = store.restore_strong_from_fence()?;
         if cleared > 0 || restored > 0 {

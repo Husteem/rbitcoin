@@ -311,3 +311,73 @@ fn occ_sidecar_reads_the_count_and_ignores_short() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
 }
+
+fn zero_ahead_blocks(path: &std::path::Path) {
+    let mut side = path.as_os_str().to_os_string();
+    side.push(".ahead");
+    let raw = std::fs::read(std::path::PathBuf::from(side)).unwrap();
+    assert_eq!(&raw[0..4], b"SHA1");
+    let count = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+    let mut at = 12usize;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    for _ in 0..count {
+        let block = u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+        file.seek(SeekFrom::Start(block)).unwrap();
+        file.write_all(&[0u8; 4096]).unwrap();
+        at += 8 + 32 + 4096;
+    }
+    file.sync_all().unwrap();
+}
+
+#[test]
+fn torn_chunk_restores_from_ahead_image() {
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-shhead-ahead-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    let keys: Vec<[u8; 32]> = (0u64..101)
+        .map(|i| {
+            let mut k = [0u8; 32];
+            k[0..8].copy_from_slice(&i.to_le_bytes());
+            k
+        })
+        .collect();
+    {
+        let h = ScriptHashHead::create_with_slots(&path, 256).unwrap();
+        let batch: Vec<_> = keys[..100]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (*k, ShHeadValue::inline_one(Fk(i as u64 + 1))))
+            .collect();
+        h.insert_many(&batch).unwrap();
+        h.flush().unwrap();
+        fail_next_scripthash_head_flush_after_ahead(&path);
+        assert!(
+            h.insert_many(&[(keys[100], ShHeadValue::inline_one(Fk(101)))])
+                .is_err(),
+            "the failpoint must stop before the chunk pwrite"
+        );
+    }
+    zero_ahead_blocks(&path);
+    let h = ScriptHashHead::open(&path).unwrap().expect("live head");
+    for (i, key) in keys.iter().enumerate() {
+        assert_eq!(
+            h.get(key).unwrap(),
+            Some(ShHeadValue::inline_one(Fk(i as u64 + 1))),
+            "key {i} lost after a torn chunk"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+}

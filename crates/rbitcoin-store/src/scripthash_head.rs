@@ -16,15 +16,18 @@
 //! A head this process just created is still empty. The ingest file itself is
 //! created on the first insert, not when the store is created.
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{self, TableFile, FILE_HEADER_LEN};
 use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};
 use crate::scripthash_layout::{
     head_key_from_full, pack8_bytes, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN,
     SH_HEAD_SLOT_SIZE, SH_HEAD_VALUE_LEN,
 };
+use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{bytes, TableKind};
 use std::collections::BTreeMap;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -150,6 +153,110 @@ pub fn scan_occupied(file: &TableFile, slots: u64) -> Result<u64, StoreError> {
     Ok(occupied)
 }
 
+const AHEAD_MAGIC: &[u8; 4] = b"SHA1";
+const AHEAD_VERSION: u16 = 1;
+const AHEAD_HEAD: usize = 12;
+const AHEAD_REC: usize = 8 + 32 + 4096;
+
+#[cfg(debug_assertions)]
+static FAIL_AHEAD: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Leave the next scripthash-head page image behind and fail before the pwrite.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_scripthash_head_flush_after_ahead(path: &Path) {
+    *FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_ahead(path: &Path) -> bool {
+    let mut fail = FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+    if fail.as_deref() == Some(path) {
+        *fail = None;
+        true
+    } else {
+        false
+    }
+}
+
+fn ahead_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("shhead"))
+        .to_os_string();
+    name.push(".ahead");
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+fn read_page(path: &Path, file: &TableFile, block: u64) -> Result<[u8; 4096], StoreError> {
+    let mut image = [0u8; 4096];
+    let len = std::fs::metadata(path)
+        .map_err(|e| StoreError::io(path, e))?
+        .len();
+    if block < len {
+        let n = ((len - block) as usize).min(4096);
+        file.pread_all(block, &mut image[..n])?;
+    }
+    Ok(image)
+}
+
+/// Apply full 4 KiB page images left by an interrupted `SlotPageCache::flush`.
+fn restore_ahead(path: &Path) -> Result<(), StoreError> {
+    let side = ahead_path(path);
+    let raw = match std::fs::read(&side) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(&side, e)),
+    };
+    if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
+        return Err(StoreError::Corrupt("scripthash head ahead header"));
+    }
+    if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
+        return Err(StoreError::Corrupt("scripthash head ahead version"));
+    }
+    let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+    let mut at = AHEAD_HEAD;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| StoreError::io(path, e))?;
+    for _ in 0..count {
+        if raw.len() < at + AHEAD_REC {
+            return Err(StoreError::Corrupt("scripthash head ahead short"));
+        }
+        let mut off_buf = [0u8; 8];
+        off_buf.copy_from_slice(&raw[at..at + 8]);
+        let off = u64::from_le_bytes(off_buf);
+        let sum = &raw[at + 8..at + 40];
+        let image = &raw[at + 40..at + AHEAD_REC];
+        if !off.is_multiple_of(4096) {
+            return Err(StoreError::Corrupt("scripthash head ahead offset"));
+        }
+        let mut eng = sha256::HashEngine::default();
+        eng.input(&off_buf);
+        eng.input(image);
+        if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
+            return Err(StoreError::Corrupt("scripthash head ahead checksum"));
+        }
+        file.seek(SeekFrom::Start(off))
+            .map_err(|e| StoreError::io(path, e))?;
+        file.write_all(image).map_err(|e| StoreError::io(path, e))?;
+        at += AHEAD_REC;
+    }
+    file.durable_sync_all()
+        .map_err(|e| StoreError::io(path, e))?;
+    drop(file);
+    std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
+    if let Some(parent) = side.parent() {
+        file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+    }
+    Ok(())
+}
+
 impl ScriptHashHead {
     /// Occupied/slots before ingest seals to L0 (`SHSR`).
     pub const SH_SEAL_LOAD: f64 = 0.80;
@@ -178,6 +285,7 @@ impl ScriptHashHead {
         if !path.exists() {
             return Ok(None);
         }
+        restore_ahead(&path)?;
         let file = TableFile::open(&path, TableKind::HashHead)?;
         let head = Self::from_file(file)?;
         if !head.large_and_empty() {
@@ -690,6 +798,57 @@ impl<'a> SlotPageCache<'a> {
 
     #[doc(hidden)]
     pub fn flush(&mut self) -> Result<(), StoreError> {
+        let mut blocks: BTreeMap<u64, [u8; 4096]> = BTreeMap::new();
+        for chunk in self.chunks.values().filter(|chunk| chunk.dirty) {
+            let off = ScriptHashHead::slot_file_off(chunk.base_slot);
+            let len = chunk.data.len() as u64;
+            let first = off & !4095;
+            let last = (off + len - 1) & !4095;
+            let mut block = first;
+            while block <= last {
+                if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(block) {
+                    entry.insert(read_page(self.head.file.path(), &self.head.file, block)?);
+                }
+                let Some(image) = blocks.get_mut(&block) else {
+                    block += 4096;
+                    continue;
+                };
+                let lo = off.max(block);
+                let hi = (off + len).min(block + 4096);
+                let src = (lo - off) as usize;
+                let dst = (lo - block) as usize;
+                image[dst..dst + (hi - lo) as usize]
+                    .copy_from_slice(&chunk.data[src..src + (hi - lo) as usize]);
+                block += 4096;
+            }
+        }
+        let side = if blocks.is_empty() {
+            None
+        } else {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(AHEAD_MAGIC);
+            buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes());
+            buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+            for (off, image) in &blocks {
+                buf.extend_from_slice(&off.to_le_bytes());
+                let mut eng = sha256::HashEngine::default();
+                eng.input(&off.to_le_bytes());
+                eng.input(image);
+                buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
+                buf.extend_from_slice(image);
+            }
+            let side = ahead_path(self.head.file.path());
+            file::write_synced_tmp_rename(&side, &buf)?;
+            #[cfg(debug_assertions)]
+            if take_fail_ahead(self.head.file.path()) {
+                return Err(StoreError::io(
+                    self.head.file.path(),
+                    std::io::Error::other("injected scripthash head ahead failure"),
+                ));
+            }
+            Some(side)
+        };
         for (_, chunk) in self.chunks.iter_mut() {
             if chunk.dirty {
                 let off = ScriptHashHead::slot_file_off(chunk.base_slot);
@@ -698,6 +857,13 @@ impl<'a> SlotPageCache<'a> {
             }
         }
         self.chunks.clear();
+        if let Some(side) = side {
+            self.head.file.sync_data_only()?;
+            std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
+            if let Some(parent) = side.parent() {
+                file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+            }
+        }
         Ok(())
     }
 }

@@ -660,6 +660,7 @@ impl TxStat {
         }
         let side = self.write_ahead_pages(start, &blob)?;
         self.body.write_at_pwrite(start, &blob)?;
+        self.body.sync_data_only()?;
         Self::remove_ahead(side)?;
         let new = base_count + rows.len() as u64;
         self.count.store(new, Ordering::Release);
@@ -678,6 +679,7 @@ impl TxStat {
         let off = Self::entry_offset(id)?;
         let side = self.write_ahead_pages(off, &cell)?;
         self.body.write_at_pwrite(off, &cell)?;
+        self.body.sync_data_only()?;
         Self::remove_ahead(side)?;
         Ok(())
     }
@@ -711,6 +713,7 @@ impl TxStat {
         }
         let side = self.write_ahead_pages(start, &blob)?;
         self.body.write_at_pwrite(start, &blob)?;
+        self.body.sync_data_only()?;
         Self::remove_ahead(side)?;
         let raw = encode_ovf_blob(&tails)?;
         self.put_header_blob(header_fk, &raw)

@@ -374,8 +374,12 @@ impl Query {
     ) -> Result<Option<(Vec<u8>, FilterHeader)>, QueryError> {
         let height = self.height_of_hash(hash)?;
         if let Some(h) = height {
-            if let Some(row) = self.basic_filter_at(h.0)? {
-                return Ok(Some(row));
+            match self.basic_filter_at(h.0) {
+                Ok(Some(row)) => return Ok(Some(row)),
+                Ok(None) => {}
+                // A torn body is stale, not a dead index: rebuild it below.
+                Err(StoreError::Corrupt(_)) => {}
+                Err(e) => return Err(e),
             }
         }
         let Some((header_fk, _)) = self.get_header_by_hash(hash)? else {

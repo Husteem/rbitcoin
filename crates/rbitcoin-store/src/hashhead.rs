@@ -1048,6 +1048,7 @@ impl<'a> SlotPageCache<'a> {
         }
         self.chunks.clear();
         if let Some(side) = side {
+            self.head.file.sync_data_only()?;
             std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
             if let Some(parent) = side.parent() {
                 file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
