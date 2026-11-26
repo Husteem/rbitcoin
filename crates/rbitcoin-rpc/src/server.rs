@@ -834,25 +834,16 @@ fn store_budget_waiters(ctx: &RpcContext) -> Arc<AtomicUsize> {
     )
 }
 
-/// `surface`'s share permit, then a budget permit: one surface alone cannot
-/// take every permit the other readers share.
+/// A store-read permit for `surface`, within its ceiling of the budget the
+/// other readers share.
 async fn acquire_store_budget(ctx: &RpcContext, surface: ApiSurface) -> StorePermit {
-    let share = ctx
-        .query
-        .api_read_share(surface)
-        .acquire_owned()
-        .await
-        .expect("store share");
     let budget = ctx.query.api_read_budget();
-    let budget = match Arc::clone(&budget).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            #[cfg(debug_assertions)]
-            let _waiting = rbitcoin_net::StoreBudgetWait::enter(store_budget_waiters(ctx));
-            budget.acquire_owned().await.expect("store budget")
-        }
-    };
-    StorePermit::new(Some(share), budget)
+    if let Some(permit) = budget.try_acquire(surface) {
+        return permit;
+    }
+    #[cfg(debug_assertions)]
+    let _waiting = rbitcoin_net::StoreBudgetWait::enter(store_budget_waiters(ctx));
+    budget.acquire(surface).await
 }
 
 async fn read_http_body(req: Request) -> Result<Bytes, Response> {
@@ -993,14 +984,12 @@ pub async fn rpc_post(State(state): State<AppState>, req: Request) -> Response {
         || http_body_has_template(&parsed)
     {
         let budget = ctx.query.api_read_budget();
-        let share = ctx.query.api_read_share(ApiSurface::Rpc);
         #[cfg(debug_assertions)]
         let waiters = store_budget_waiters(&ctx);
         let rpc = exec_http_rpc_async(ctx, parsed, &state.work_queue);
         #[cfg(debug_assertions)]
         let rpc = rbitcoin_net::with_store_budget_waiters(waiters, rpc);
-        let rpc = rbitcoin_net::with_store_budget(budget, rpc);
-        let out = rbitcoin_net::with_store_share(share, rpc).await;
+        let out = rbitcoin_net::with_store_budget(budget, ApiSurface::Rpc, rpc).await;
         return match out {
             Err(()) => (
                 StatusCode::SERVICE_UNAVAILABLE,

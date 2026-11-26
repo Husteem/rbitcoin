@@ -3298,9 +3298,7 @@ pub async fn broadcast_raw_tx_async(
         .clone();
     let txid = tx.compute_txid();
     let budget = mp.query.api_read_budget();
-    let share = mp.query.api_read_share(ApiSurface::Electrum);
-    let admit = rbitcoin_net::with_store_budget(budget, mp.broadcast_local_async(tx));
-    rbitcoin_net::with_store_share(share, admit)
+    rbitcoin_net::with_store_budget(budget, ApiSurface::Electrum, mp.broadcast_local_async(tx))
         .await
         .map_err(|e| format!("broadcast reject: {e}"))?;
     Ok(json!(txid.to_string()))
@@ -3317,11 +3315,10 @@ pub async fn broadcast_package_async(
         .ok_or_else(|| "mempool not available".to_string())?
         .clone();
     let budget = mp.query.api_read_budget();
-    let share = mp.query.api_read_share(ApiSurface::Electrum);
-    let admit = rbitcoin_net::with_store_budget(budget, mp.accept_package_async(txs));
-    let accepted = rbitcoin_net::with_store_share(share, admit)
-        .await
-        .map_err(|e| format!("broadcast_package reject: {e}"))?;
+    let accepted =
+        rbitcoin_net::with_store_budget(budget, ApiSurface::Electrum, mp.accept_package_async(txs))
+            .await
+            .map_err(|e| format!("broadcast_package reject: {e}"))?;
     Ok(package_broadcast_value(verbose, &accepted))
 }
 

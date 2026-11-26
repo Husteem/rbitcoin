@@ -634,7 +634,13 @@ pub async fn forward_tx(
     let txid = tx.compute_txid();
     let handle = tokio::spawn(async move {
         let _permit = permit;
-        match rbitcoin_net::with_store_budget(budget, mp.broadcast_local_async(tx)).await {
+        match rbitcoin_net::with_store_budget(
+            budget,
+            rbitcoin_query::ApiSurface::Esplora,
+            mp.broadcast_local_async(tx),
+        )
+        .await
+        {
             Ok(_) => json_reply_here(block_hash_hex(&txid.to_byte_array())),
             Err(e) => error(StatusCode::BAD_REQUEST, &e.to_string()),
         }

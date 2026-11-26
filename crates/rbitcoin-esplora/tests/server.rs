@@ -2326,7 +2326,10 @@ async fn esplora_blocks_waits_on_the_store_budget() {
     let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
-    let hold = q.api_read_budget().acquire_owned().await.expect("permit");
+    let hold = q
+        .api_read_budget()
+        .acquire(rbitcoin_query::ApiSurface::Rpc)
+        .await;
     let addr = handle.local_addr;
     let stalled = tokio::spawn(async move { http_get(addr, "/blocks").await });
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2344,12 +2347,13 @@ async fn esplora_blocks_waits_on_the_store_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Esplora takes its own share of the store budget before a budget permit.
-/// With the share held, `/blocks` waits although the budget has room, so
-/// Esplora and BlindBit clients alone cannot hold every permit; it answers
-/// once the share is free.
+/// Esplora reads count against Esplora's ceiling of the store budget. With
+/// a budget of two and the other surfaces on, Esplora may hold one permit:
+/// with it held, `/blocks` waits although the budget has room, so Esplora
+/// and BlindBit clients alone cannot hold every permit; it answers once the
+/// permit is free.
 #[tokio::test]
-async fn esplora_blocks_waits_on_its_share_of_the_store_budget() {
+async fn esplora_blocks_waits_at_its_ceiling_of_the_store_budget() {
     let (dir, q) = temp_query("esplora-share");
     q.set_api_read_budget(2);
     let q = Arc::new(q);
@@ -2357,25 +2361,25 @@ async fn esplora_blocks_waits_on_its_share_of_the_store_budget() {
     let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
-    let share = q.api_read_share(rbitcoin_query::ApiSurface::Esplora);
+    let budget = q.api_read_budget();
     assert_eq!(
-        share.available_permits(),
+        budget.ceil(rbitcoin_query::ApiSurface::Esplora),
         1,
-        "a budget of two split four ways, at least one"
+        "one short of a budget of two"
     );
-    let hold = share.acquire_owned().await.expect("share permit");
+    let hold = budget.acquire(rbitcoin_query::ApiSurface::Esplora).await;
     let addr = handle.local_addr;
     let stalled = tokio::spawn(async move { http_get(addr, "/blocks").await });
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !stalled.is_finished(),
-        "GET /blocks ran while Esplora's share was held"
+        "GET /blocks ran at Esplora's ceiling"
     );
-    assert_eq!(q.api_read_budget().available_permits(), 2);
+    assert_eq!(budget.available(), 1, "the budget has room");
     drop(hold);
     let (st, body) = tokio::time::timeout(Duration::from_secs(5), stalled)
         .await
-        .expect("GET finishes after the share")
+        .expect("GET finishes once Esplora holds a permit less")
         .expect("join");
     assert_eq!(st, 200, "{body}");
     handle.shutdown().await;
@@ -2512,7 +2516,10 @@ async fn answered_upload_holds_its_permit_until_the_response() {
     cfg.limits.max_connections = 1;
     q.set_api_read_budget(1);
     let q = Arc::new(q);
-    let store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let store = q
+        .api_read_budget()
+        .acquire(rbitcoin_query::ApiSurface::Rpc)
+        .await;
     let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
@@ -2615,7 +2622,10 @@ async fn body_read_before_admission_keeps_the_size_limit() {
     q.connect_block(Height(0), &h0, &[cb0]).unwrap();
     q.set_api_read_budget(1);
     let q = Arc::new(q);
-    let store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let store = q
+        .api_read_budget()
+        .acquire(rbitcoin_query::ApiSurface::Rpc)
+        .await;
     let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
     cfg.limits.max_request_bytes = MAX;
     cfg.limits.max_connections = 1;

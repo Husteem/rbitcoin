@@ -452,7 +452,7 @@ async fn blindbit_v1_routes_share_one_inflight_limit() {
     // A stalled body would not: it is read before the request is admitted.
     q.set_api_read_budget(1);
     let q = Arc::new(q);
-    let store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let store = q.api_read_budget().acquire(rbitcoin_query::ApiSurface::Rpc).await;
     let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
@@ -639,7 +639,7 @@ async fn dropped_blindbit_waiter_clears_waiting() {
     // handler, so it keeps its BlindBit permit.
     q.set_api_read_budget(1);
     let q = Arc::new(q);
-    let _store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let _store = q.api_read_budget().acquire(rbitcoin_query::ApiSurface::Rpc).await;
     let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");

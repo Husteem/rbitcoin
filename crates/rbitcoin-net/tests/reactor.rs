@@ -25,14 +25,12 @@ mod off_pool_reentry {
 #[cfg(test)]
 mod store_permit_drop {
     use super::*;
-    use std::sync::Arc;
     use std::time::Duration;
-    use tokio::sync::Semaphore;
 
     #[tokio::test]
     async fn dropping_the_guard_returns_the_permit() {
-        let sem = Arc::new(Semaphore::new(1));
-        with_store_budget(sem, async {
+        let budget = rbitcoin_query::ApiReadBudget::new(1, &rbitcoin_query::ALL_API_SURFACES);
+        with_store_budget(budget, rbitcoin_query::ApiSurface::Rpc, async {
             let first = acquire_armed_store_budget().await;
             let guard = hold_store_permit(first);
             drop(guard);

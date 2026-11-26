@@ -3,7 +3,7 @@
 //! Tokio names both multi-thread workers and `spawn_blocking` threads
 //! `tokio-rt-worker`. Blocking-pool work must enter [`BlockingRegion`].
 
-use rbitcoin_query::StorePermit;
+use rbitcoin_query::{ApiReadBudget, ApiSurface, StorePermit};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
@@ -14,9 +14,9 @@ use std::thread;
 use tokio::sync::Semaphore;
 
 tokio::task_local! {
-    static API_STORE_BUDGET: Arc<Semaphore>;
-    /// The surface's share of [`API_STORE_BUDGET`] ([`with_store_share`]).
-    static API_STORE_SHARE: Arc<Semaphore>;
+    /// The store-read budget and the surface this task reads for
+    /// ([`with_store_budget`]).
+    static API_STORE_BUDGET: (Arc<ApiReadBudget>, ApiSurface);
     /// [`rbitcoin_query::Query::heavy_sh_join`] for [`armed_blocking`].
     static API_HEAVY_TURN: Arc<Semaphore>;
     #[cfg(debug_assertions)]
@@ -120,19 +120,17 @@ pub async fn off_pool<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
     }
 }
 
-/// Run `fut` with the API store-read budget armed. Prepare takes one permit
-/// and drops it before script verify. The commit coin re-read takes one
-/// again. A task that never calls this does not take the budget (P2P decode,
-/// and admits that are not an API read).
-pub async fn with_store_budget<R>(budget: Arc<Semaphore>, fut: impl Future<Output = R>) -> R {
-    API_STORE_BUDGET.scope(budget, fut).await
-}
-
-/// Run `fut` with its API surface's share of the armed budget
-/// ([`rbitcoin_query::Query::api_read_share`]): each armed permit takes a
-/// share permit first.
-pub async fn with_store_share<R>(share: Arc<Semaphore>, fut: impl Future<Output = R>) -> R {
-    API_STORE_SHARE.scope(share, fut).await
+/// Run `fut` with the API store-read budget armed for `surface`: each
+/// armed permit counts against that surface's minimum and ceiling. Prepare
+/// takes one permit and drops it before script verify. The commit coin
+/// re-read takes one again. A task that never calls this does not take the
+/// budget (P2P decode, and admits that are not an API read).
+pub async fn with_store_budget<R>(
+    budget: Arc<ApiReadBudget>,
+    surface: ApiSurface,
+    fut: impl Future<Output = R>,
+) -> R {
+    API_STORE_BUDGET.scope((budget, surface), fut).await
 }
 
 /// Run `fut` with the node's heavy scripthash turn armed for
@@ -192,14 +190,12 @@ pub fn finish_join<T>(joined: Result<T, tokio::task::JoinError>, cancel: &'stati
     }
 }
 
-/// `tokio::spawn` does not keep the task-local budget, share or heavy turn.
-/// Copy them into the child so a detached admit still waits for a store
-/// permit.
+/// `tokio::spawn` does not keep the task-local budget or heavy turn. Copy
+/// them into the child so a detached admit still waits for a store permit.
 pub fn spawn_with_store_budget<T: Send + 'static>(
     fut: impl Future<Output = T> + Send + 'static,
 ) -> tokio::task::JoinHandle<T> {
-    let budget = API_STORE_BUDGET.try_with(Arc::clone).ok();
-    let share = API_STORE_SHARE.try_with(Arc::clone).ok();
+    let budget = API_STORE_BUDGET.try_with(|(b, s)| (Arc::clone(b), *s)).ok();
     let turn = API_HEAVY_TURN.try_with(Arc::clone).ok();
     tokio::spawn(async move {
         let fut = async move {
@@ -208,14 +204,8 @@ pub fn spawn_with_store_budget<T: Send + 'static>(
                 None => fut.await,
             }
         };
-        let fut = async move {
-            match share {
-                Some(share) => with_store_share(share, fut).await,
-                None => fut.await,
-            }
-        };
         match budget {
-            Some(budget) => with_store_budget(budget, fut).await,
+            Some((budget, surface)) => with_store_budget(budget, surface, fut).await,
             None => fut.await,
         }
     })
@@ -271,30 +261,23 @@ pub async fn armed_blocking<T: Send + 'static>(
     blocking_heavy_turn(turn.as_ref(), acquire_armed_store_budget, f).await
 }
 
-/// One permit of the armed budget, after one of the armed share when the
-/// task has one, or `None` when this task has no budget. The waits are
-/// async. The caller moves the permit into the read so a dropped request
-/// does not release it while the read still runs.
+/// One permit of the armed budget for the armed surface, or `None` when
+/// this task has no budget. The wait is async. The caller moves the permit
+/// into the read so a dropped request does not release it while the read
+/// still runs.
 pub async fn acquire_armed_store_budget() -> Option<StorePermit> {
-    let Ok(sem) = API_STORE_BUDGET.try_with(Arc::clone) else {
+    let Ok((budget, surface)) = API_STORE_BUDGET.try_with(|(b, s)| (Arc::clone(b), *s)) else {
         return None;
     };
-    let share = match API_STORE_SHARE.try_with(Arc::clone) {
-        Ok(share) => Some(share.acquire_owned().await.expect("store share")),
-        Err(_) => None,
-    };
-    let budget = match Arc::clone(&sem).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            #[cfg(debug_assertions)]
-            let _waiting = STORE_BUDGET_WAITERS
-                .try_with(Arc::clone)
-                .ok()
-                .map(StoreBudgetWait::enter);
-            sem.acquire_owned().await.expect("store budget")
-        }
-    };
-    Some(StorePermit::new(share, budget))
+    if let Some(permit) = budget.try_acquire(surface) {
+        return Some(permit);
+    }
+    #[cfg(debug_assertions)]
+    let _waiting = STORE_BUDGET_WAITERS
+        .try_with(Arc::clone)
+        .ok()
+        .map(StoreBudgetWait::enter);
+    Some(budget.acquire(surface).await)
 }
 
 /// Park `permit` on this thread. [`release_store_permit`] drops it before

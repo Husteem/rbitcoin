@@ -2166,15 +2166,19 @@ async fn long_poll_queue_full_is_503_before_the_store_budget() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
-/// REST takes its own share of the store-read budget first: with a share
-/// of one, a second REST request waits on the share, not on the budget, so
-/// REST can never hold every permit the other readers share.
+/// REST reads count against REST's ceiling of the store-read budget: with
+/// a budget of two and the other surfaces on, REST may hold one permit, so
+/// with it held a REST request waits although the budget has room. REST can
+/// never hold every permit the other readers share.
 #[tokio::test]
-async fn rest_waits_on_its_share_before_the_store_budget() {
+async fn rest_waits_at_its_ceiling_of_the_store_budget() {
+    use rbitcoin_query::ApiSurface::Rest;
+
     let (ctx, dir) = http_wait_ctx();
     ctx.query.set_api_read_budget(2);
     let budget = ctx.query.api_read_budget();
-    let hold = budget.clone().acquire_many_owned(2).await.expect("permits");
+    assert_eq!(budget.ceil(Rest), 1, "one short of a budget of two");
+    let hold = budget.acquire(Rest).await;
     let state = || AppState {
         ctx: Arc::clone(&ctx),
         auth: RpcAuth::new("test-token"),
@@ -2195,59 +2199,40 @@ async fn rest_waits_on_its_share_before_the_store_budget() {
         ))
     };
     let a = get(state());
-    let b = get(state());
     wait_for_store_budget(&ctx).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let waiters = {
-        let active = ctx.active.lock().unwrap_or_else(|err| err.into_inner());
-        Arc::clone(&active.store_budget_waiters)
-    };
-    assert_eq!(
-        waiters.load(Ordering::SeqCst),
-        1,
-        "only REST's share waits on the store budget"
-    );
+    assert!(!a.is_finished(), "REST read at its ceiling");
+    assert_eq!(budget.available(), 1, "the budget has room");
+    assert_eq!(budget.waiting(Rest), 1);
     drop(hold);
-    for r in [a, b] {
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r)
-            .await
-            .expect("REST finishes")
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-    // The share is sized from the configured budget, not from what happens
-    // to be free when the listener binds.
-    ctx.query.set_api_surfaces(&[
-        rbitcoin_query::ApiSurface::Rpc,
-        rbitcoin_query::ApiSurface::Rest,
-    ]);
-    ctx.query.set_api_read_budget(8);
-    let busy = ctx
-        .query
-        .api_read_budget()
-        .acquire_many_owned(7)
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), a)
         .await
-        .expect("permits");
-    assert_eq!(
-        ctx.query
-            .api_read_share(rbitcoin_query::ApiSurface::Rest)
-            .available_permits(),
-        4
-    );
-    drop(busy);
+        .expect("REST finishes")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The limits come from the configured budget and the surfaces on, not
+    // from what happens to be free when the listener binds.
+    ctx.query
+        .set_api_surfaces(&[rbitcoin_query::ApiSurface::Rpc, Rest]);
+    ctx.query.set_api_read_budget(8);
+    let budget = ctx.query.api_read_budget();
+    assert_eq!((budget.min(Rest), budget.ceil(Rest)), (4, 7));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// JSON-RPC takes its own share of the store-read budget first, as REST
-/// does: with a budget of two and all four surfaces on (a share of one), a
-/// second store-reading call waits on the share, not on the budget, so RPC
-/// can never hold every permit Electrum, Esplora and REST read through.
+/// JSON-RPC reads count against RPC's ceiling, as REST's do: with a budget
+/// of two and the other surfaces on, RPC may hold one permit, so with it
+/// held a store-reading call waits although the budget has room. RPC can
+/// never hold every permit Electrum, Esplora and REST read through.
 #[tokio::test]
-async fn rpc_waits_on_its_share_before_the_store_budget() {
+async fn rpc_waits_at_its_ceiling_of_the_store_budget() {
+    use rbitcoin_query::ApiSurface::Rpc;
+
     let (ctx, dir) = http_wait_ctx();
     ctx.query.set_api_read_budget(2);
     let budget = ctx.query.api_read_budget();
-    let hold = budget.clone().acquire_many_owned(2).await.expect("permits");
+    assert_eq!(budget.ceil(Rpc), 1, "one short of a budget of two");
+    let hold = budget.acquire(Rpc).await;
     let state = || AppState {
         ctx: Arc::clone(&ctx),
         auth: RpcAuth::new("test-token"),
@@ -2266,26 +2251,17 @@ async fn rpc_waits_on_its_share_before_the_store_budget() {
         ))
     };
     let a = post(state());
-    let b = post(state());
     wait_for_store_budget(&ctx).await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let waiters = {
-        let active = ctx.active.lock().unwrap_or_else(|err| err.into_inner());
-        Arc::clone(&active.store_budget_waiters)
-    };
-    assert_eq!(
-        waiters.load(Ordering::SeqCst),
-        1,
-        "only RPC's share waits on the store budget"
-    );
+    assert!(!a.is_finished(), "RPC read at its ceiling");
+    assert_eq!(budget.available(), 1, "the budget has room");
+    assert_eq!(budget.waiting(Rpc), 1);
     drop(hold);
-    for r in [a, b] {
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), r)
-            .await
-            .expect("RPC finishes")
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), a)
+        .await
+        .expect("RPC finishes")
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2296,7 +2272,7 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
     let (ctx, dir) = http_wait_ctx();
     ctx.query.set_api_read_budget(1);
     let budget = ctx.query.api_read_budget();
-    let hold = budget.clone().acquire_owned().await.expect("permit");
+    let hold = budget.acquire(rbitcoin_query::ApiSurface::Electrum).await;
     let state = AppState {
         ctx: Arc::clone(&ctx),
         auth: RpcAuth::new("test-token"),
@@ -2368,14 +2344,14 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         !mixed_call.is_finished(),
         "a batch with a store read ran while the only permit was held"
     );
-    assert_eq!(budget.available_permits(), 0);
+    assert_eq!(budget.available(), 0);
     drop(hold);
     let mixed_response = tokio::time::timeout(std::time::Duration::from_secs(2), mixed_call)
         .await
         .expect("mixed batch finishes after the permit")
         .expect("join");
     assert_eq!(mixed_response.status(), StatusCode::OK);
-    assert_eq!(budget.available_permits(), 1);
+    assert_eq!(budget.available(), 1);
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
@@ -2394,7 +2370,7 @@ fn store_budget_wait_does_not_need_a_pool_thread() {
         let (ctx, dir) = http_wait_ctx();
         ctx.query.set_api_read_budget(1);
         let budget = ctx.query.api_read_budget();
-        let hold = budget.clone().acquire_owned().await.expect("permit");
+        let hold = budget.acquire(rbitcoin_query::ApiSurface::Electrum).await;
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let parked = tokio::task::spawn_blocking(move || {
@@ -2426,17 +2402,17 @@ fn store_budget_wait_does_not_need_a_pool_thread() {
             !call.is_finished(),
             "the read ran while the only permit was held"
         );
-        assert_eq!(budget.available_permits(), 0);
+        assert_eq!(budget.available(), 0);
         drop(hold);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while budget.available_permits() != 0 {
+            while budget.available() != 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         })
         .await
         .expect("the request took the permit");
         assert_eq!(
-            budget.available_permits(),
+            budget.available(),
             0,
             "the request took the permit while the pool thread stayed parked"
         );
@@ -2910,9 +2886,8 @@ fn getblocktemplate_rebuilds_when_the_tip_moves_during_the_permit_wait() {
         let permit = ctx
             .query
             .api_read_budget()
-            .acquire_owned()
-            .await
-            .expect("permit");
+            .acquire(rbitcoin_query::ApiSurface::Electrum)
+            .await;
         let gbt_state = gbt_app(Arc::clone(&ctx));
         let body = serde_json::json!({
             "jsonrpc": "1.0",

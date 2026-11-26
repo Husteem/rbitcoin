@@ -966,7 +966,11 @@ async fn read_only_batch_completes_when_the_store_budget_is_one() {
     .clone();
     assert_eq!(reply.len(), 3, "{reply:?}");
 
-    let hold = q.api_read_budget().acquire_owned().await.expect("permit");
+    // Another surface holds the one permit.
+    let hold = q
+        .api_read_budget()
+        .acquire(rbitcoin_query::ApiSurface::Rpc)
+        .await;
     let mut stalled = TcpStream::connect(handle.local_addr).await.unwrap();
     let mut line = serde_json::to_string(&items).unwrap();
     line.push('\n');
@@ -998,7 +1002,11 @@ fn subscription_restatus_waits_without_a_pool_thread() {
         let (dir, q) = tmp_store();
         q.set_api_read_budget(1);
         let q = Arc::new(q);
-        let hold = q.api_read_budget().acquire_owned().await.expect("permit");
+        // Another surface holds the one permit.
+        let hold = q
+            .api_read_budget()
+            .acquire(rbitcoin_query::ApiSurface::Rpc)
+            .await;
         let (_read, write) = tokio::io::duplex(256);
         let mut writer = ConnWrite::new(write, Duration::from_secs(2));
         let subs = HashSet::new();
@@ -2286,21 +2294,20 @@ async fn coin_reads_refuse_while_the_pool_is_held() {
     let _ = std::fs::remove_dir_all(&pad.dir);
 }
 
-/// Electrum reads take Electrum's share of the store-read budget before a
-/// budget permit. With the share held, a read waits although the budget has
-/// room, so Electrum clients alone never hold every permit; it answers once
-/// the share is free.
+/// Electrum reads count against Electrum's ceiling of the store-read
+/// budget. With a budget of two and the other surfaces on, Electrum may hold
+/// one permit: with it held, a read waits although the budget has room, so
+/// Electrum clients alone never hold every permit; it answers once the
+/// permit is free.
 #[tokio::test]
-async fn electrum_reads_wait_on_their_share_of_the_store_budget() {
+async fn electrum_reads_wait_at_their_ceiling_of_the_store_budget() {
+    use rbitcoin_query::ApiSurface::Electrum;
+
     let mut pad = pool_pad().await;
     pad.q.set_api_read_budget(2);
-    let share = pad.q.api_read_share(rbitcoin_query::ApiSurface::Electrum);
-    assert_eq!(
-        share.available_permits(),
-        1,
-        "a budget of two split four ways, at least one"
-    );
-    let held = share.acquire_owned().await.unwrap();
+    let budget = pad.q.api_read_budget();
+    assert_eq!(budget.ceil(Electrum), 1, "one short of a budget of two");
+    let held = budget.acquire(Electrum).await;
     let req = json!({"jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.get_balance",
         "params":[pad.sh.clone()]});
     let mut line = serde_json::to_string(&req).unwrap();
@@ -2313,8 +2320,9 @@ async fn electrum_reads_wait_on_their_share_of_the_store_budget() {
     let mut early = String::new();
     let waited =
         tokio::time::timeout(Duration::from_millis(300), pad.client.read_line(&mut early)).await;
-    assert!(waited.is_err(), "answered with the share held: {early}");
-    assert_eq!(pad.q.api_read_budget().available_permits(), 2);
+    assert!(waited.is_err(), "answered at the ceiling: {early}");
+    assert_eq!(budget.available(), 1, "the budget has room");
+    assert_eq!(budget.waiting(Electrum), 1);
     drop(held);
     let bal = pad.read().await;
     assert_eq!(bal["result"]["confirmed"], 1, "{bal}");
@@ -2653,7 +2661,11 @@ async fn tip_after_a_lag_restatuses_every_outpoint() {
         pad_block(&pad.q, h, 0, &[pad_coinbase(h, 0)]);
     }
     pad.q.set_api_read_budget(1);
-    let held = pad.q.api_read_budget().acquire_owned().await.unwrap();
+    let held = pad
+        .q
+        .api_read_budget()
+        .acquire(rbitcoin_query::ApiSurface::Rpc)
+        .await;
     pad_tip(&pad, 1, None);
     // The header push comes first; the touch read then waits on the permit.
     let push = pad.read().await;
@@ -3890,7 +3902,7 @@ async fn sp_scan_steps_outlive_the_idle_window() {
     // The test holds both after the reply, so each release runs one step.
     chain.q.set_api_read_budget(2);
     let budget = chain.q.api_read_budget();
-    let mut held = budget.clone().acquire_owned().await.unwrap();
+    let mut held = budget.acquire(rbitcoin_query::ApiSurface::Rpc).await;
     let mut cfg = sp_cfg();
     cfg.sp_scan_chunk = 1;
     cfg.limits.idle_timeout = Duration::from_millis(800);
@@ -3900,12 +3912,12 @@ async fn sp_scan_steps_outlive_the_idle_window() {
         .await
         .remove(0);
     sp_accepted(&reply);
-    let other = budget.clone().acquire_owned().await.unwrap();
+    let other = budget.acquire(rbitcoin_query::ApiSurface::Rest).await;
     // Every release lets one step through well inside the idle window, but
     // the four together outlast it.
     for _ in 0..4 {
         drop(held);
-        held = budget.clone().acquire_owned().await.unwrap();
+        held = budget.acquire(rbitcoin_query::ApiSurface::Rpc).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     drop((held, other));

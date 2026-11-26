@@ -6,9 +6,11 @@ Security
   burst of Electrum or Esplora reads, held all three permits and every
   other API read waited. REST was already held to half the budget.
   JSON-RPC (long-polls and templates included), REST, Electrum, and the
-  Esplora listener with BlindBit now each take a share before a budget
-  permit, so the total stays within the budget. The surfaces the node
-  serves split the budget evenly (at least one permit each); a surface
-  that is off is not counted, so a node serving only Electrum still gives
-  it the whole budget. With a budget of 1 (`--datadir-hdd`) every surface
-  may take the one permit.
+  Esplora listener with BlindBit are now each sure of an even split of the
+  budget among the surfaces the node serves (at least one permit), and a
+  busy surface borrows idle permits up to one short of the budget, or all
+  of it when it is the only surface on. A freed permit goes first to a
+  surface below its split, so a surface whose permits are lent out waits
+  for at most one running read. A surface that is off reserves nothing.
+  With a budget of 1 (`--datadir-hdd`) the surfaces take turns at the one
+  permit.

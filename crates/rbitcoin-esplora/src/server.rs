@@ -319,17 +319,15 @@ pub fn powered_by_header() -> HeaderValue {
     .clone()
 }
 
-/// Arm the process store-read budget, Esplora's share of it, and the heavy
-/// scripthash turn for this request. `spawn_join` and mempool admit then take
-/// a share permit and a budget permit on the async task, and a heavy join
-/// waits for its turn there. BlindBit is on this listener and takes the
-/// same share.
+/// Arm the process store-read budget for Esplora, and the heavy scripthash
+/// turn, for this request. `spawn_join` and mempool admit then take a
+/// permit counted against Esplora on the async task, and a heavy join waits
+/// for its turn there. BlindBit is on this listener and counts as Esplora.
 pub async fn arm_store_budget(State(st): State<AppState>, req: Request, next: Next) -> Response {
     let budget = st.query.api_read_budget();
-    let share = st.query.api_read_share(rbitcoin_query::ApiSurface::Esplora);
     let turn = std::sync::Arc::clone(&st.query.heavy_sh_join);
-    let read = rbitcoin_net::with_store_budget(budget, next.run(req));
-    let read = rbitcoin_net::with_store_share(share, read);
+    let read =
+        rbitcoin_net::with_store_budget(budget, rbitcoin_query::ApiSurface::Esplora, next.run(req));
     rbitcoin_net::with_heavy_turn(turn, read).await
 }
 

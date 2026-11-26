@@ -1,6 +1,7 @@
 //! Domain query layer over [`rbitcoin_store::Store`].
 
 #[doc(hidden)]
+pub mod api_read_budget;
 pub mod archive;
 #[doc(hidden)]
 pub mod batch_parents;
@@ -454,80 +455,7 @@ pub use stamp::{
 };
 pub use wave_prevout::SpendEdge;
 
-/// An API surface with its own share of [`Query::api_read_budget`]. One
-/// surface's clients cannot take every permit the others read through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ApiSurface {
-    /// JSON-RPC, including long-polls and templates.
-    Rpc = 0,
-    /// `--rest`.
-    Rest = 1,
-    /// Esplora and BlindBit, one listener.
-    Esplora = 2,
-    Electrum = 3,
-}
-
-const API_SURFACES: usize = 4;
-
-const ALL_API_SURFACES: [ApiSurface; API_SURFACES] = [
-    ApiSurface::Rpc,
-    ApiSurface::Rest,
-    ApiSurface::Esplora,
-    ApiSurface::Electrum,
-];
-
-/// Each surface's share of a budget of `budget` permits. The surfaces in
-/// `enabled` split the budget evenly; the remainder goes one permit each to
-/// the first of them in [`ApiSurface`] order. A surface that is off is not
-/// counted, so the enabled shares sum to the budget and each is held for its
-/// surface; the off surface keeps a one-permit share that nothing takes, so
-/// a stray read through it still runs. Every share is at least one permit: with fewer permits than
-/// enabled surfaces (`--datadir-hdd` is 1) the surfaces contend for the
-/// budget itself. A share only allocates budget permits, it never adds any:
-/// its holder still takes a budget permit.
-pub fn api_read_share_sizes(budget: usize, enabled: &[ApiSurface]) -> [usize; API_SURFACES] {
-    let on: Vec<ApiSurface> = ALL_API_SURFACES
-        .into_iter()
-        .filter(|s| enabled.contains(s))
-        .collect();
-    let mut sizes = [1; API_SURFACES];
-    let Some(n) = std::num::NonZeroUsize::new(on.len()) else {
-        return sizes;
-    };
-    for (i, s) in on.into_iter().enumerate() {
-        let extra = usize::from(i < budget % n);
-        sizes[s as usize] = (budget / n + extra).max(1);
-    }
-    sizes
-}
-
-fn api_read_shares(
-    budget: usize,
-    enabled: &[ApiSurface],
-) -> [Arc<tokio::sync::Semaphore>; API_SURFACES] {
-    let sizes = api_read_share_sizes(budget, enabled);
-    std::array::from_fn(|i| Arc::new(tokio::sync::Semaphore::new(sizes[i])))
-}
-
-/// One store-read permit of [`Query::api_read_budget`], and the share permit
-/// its surface took first. Dropping it returns both.
-pub struct StorePermit {
-    _share: Option<tokio::sync::OwnedSemaphorePermit>,
-    _budget: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl StorePermit {
-    /// `share` is `None` for a read that belongs to no API surface.
-    pub fn new(
-        share: Option<tokio::sync::OwnedSemaphorePermit>,
-        budget: tokio::sync::OwnedSemaphorePermit,
-    ) -> Self {
-        Self {
-            _share: share,
-            _budget: budget,
-        }
-    }
-}
+pub use api_read_budget::{ApiReadBudget, ApiSurface, StorePermit, ALL_API_SURFACES};
 
 /// One transaction to apply when connecting a block.
 #[derive(Clone, Debug)]
@@ -792,16 +720,11 @@ pub struct Query {
     /// 0 = off. An unpaged SH join above this create count holds
     /// [`Self::heavy_sh_join`] for its whole walk.
     pub heavy_sh_creates: AtomicU32,
-    /// Shared API store-read slots. Tests leave this at `tokio::sync::Semaphore::MAX_PERMITS`.
-    /// The node replaces it once at listen from `--store-read-budget`.
-    pub api_read_budget: std::sync::Mutex<Arc<tokio::sync::Semaphore>>,
-    /// The permit count [`Self::api_read_budget`] was built with, whatever
-    /// is held at the moment.
-    api_read_budget_size: std::sync::atomic::AtomicUsize,
-    /// Each [`ApiSurface`]'s share of [`Self::api_read_budget`], rebuilt
-    /// with it or with [`Self::set_api_surfaces`].
-    api_read_shares: std::sync::Mutex<[Arc<tokio::sync::Semaphore>; API_SURFACES]>,
-    /// The surfaces the node serves; the shares split the budget among them.
+    /// Shared API store-read slots ([`ApiReadBudget`]). Tests leave this at
+    /// `tokio::sync::Semaphore::MAX_PERMITS`. The node replaces it once
+    /// before listen from `--store-read-budget` and the surfaces it serves.
+    api_read_budget: std::sync::Mutex<Arc<ApiReadBudget>>,
+    /// The surfaces the node serves; the budget is split among them.
     api_surfaces: std::sync::Mutex<Vec<ApiSurface>>,
     /// One heavy unpaged SH join at a time across every Electrum and Esplora
     /// client: one near the cap can peak above 2 GiB. One permit. A join
@@ -1176,13 +1099,7 @@ impl Query {
             genesis_coinbase_fk: std::sync::OnceLock::new(),
             max_sh_creates: AtomicU32::new(DEFAULT_MAX_SH_CREATES),
             heavy_sh_creates: AtomicU32::new(DEFAULT_HEAVY_SH_CREATES),
-            api_read_budget: std::sync::Mutex::new(Arc::new(tokio::sync::Semaphore::new(
-                tokio::sync::Semaphore::MAX_PERMITS,
-            ))),
-            api_read_budget_size: std::sync::atomic::AtomicUsize::new(
-                tokio::sync::Semaphore::MAX_PERMITS,
-            ),
-            api_read_shares: std::sync::Mutex::new(api_read_shares(
+            api_read_budget: std::sync::Mutex::new(ApiReadBudget::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
                 &ALL_API_SURFACES,
             )),
@@ -2397,9 +2314,9 @@ impl Query {
         self.heavy_sh_creates.load(AtomicOrdering::Relaxed)
     }
 
-    /// The process API store-read semaphore. Callers acquire on the async
-    /// task and move the permit into the blocking read.
-    pub fn api_read_budget(&self) -> Arc<tokio::sync::Semaphore> {
+    /// The process API store-read budget. Callers take a permit on the
+    /// async task and move it into the blocking read.
+    pub fn api_read_budget(&self) -> Arc<ApiReadBudget> {
         Arc::clone(
             &self
                 .api_read_budget
@@ -2408,72 +2325,37 @@ impl Query {
         )
     }
 
-    /// Replace the API store-read semaphore and every surface's share of
-    /// it. `0` waits forever. The node passes a count of at least 1.
+    /// Replace the API store-read budget with `n` permits split across the
+    /// surfaces from [`Self::set_api_surfaces`]. `0` waits forever. The node
+    /// passes a count of at least 1.
     pub fn set_api_read_budget(&self, n: usize) {
-        let mut g = self
-            .api_read_budget
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *g = Arc::new(tokio::sync::Semaphore::new(n));
-        self.api_read_budget_size
-            .store(n, std::sync::atomic::Ordering::Relaxed);
-        self.rebuild_api_read_shares();
-    }
-
-    /// The API surfaces the node serves, before any of them binds. The
-    /// budget is split among these ([`api_read_share_sizes`]). All four
-    /// until set.
-    pub fn set_api_surfaces(&self, enabled: &[ApiSurface]) {
-        *self.api_surfaces.lock().unwrap_or_else(|e| e.into_inner()) = enabled.to_vec();
-        self.rebuild_api_read_shares();
-    }
-
-    fn rebuild_api_read_shares(&self) {
         let enabled = self
             .api_surfaces
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         *self
-            .api_read_shares
+            .api_read_budget
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) =
-            api_read_shares(self.api_read_budget_size(), &enabled);
+            .unwrap_or_else(|e| e.into_inner()) = ApiReadBudget::new(n, &enabled);
     }
 
-    /// `surface`'s share of [`Self::api_read_budget`]
-    /// ([`api_read_share_sizes`]). Take a share permit before the budget
-    /// permit and hold both ([`StorePermit`]).
-    pub fn api_read_share(&self, surface: ApiSurface) -> Arc<tokio::sync::Semaphore> {
-        Arc::clone(
-            &self
-                .api_read_shares
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())[surface as usize],
-        )
+    /// The API surfaces the node serves, before any of them binds. The
+    /// budget is split among these ([`ApiReadBudget::new`]). All four until
+    /// set.
+    pub fn set_api_surfaces(&self, enabled: &[ApiSurface]) {
+        *self.api_surfaces.lock().unwrap_or_else(|e| e.into_inner()) = enabled.to_vec();
+        self.set_api_read_budget(self.api_read_budget_size());
     }
 
-    /// `surface`'s share permit, then a budget permit, both waited for on
-    /// this task.
+    /// A store-read permit for `surface`, waited for on this task.
     pub async fn acquire_api_read(&self, surface: ApiSurface) -> StorePermit {
-        let share = self
-            .api_read_share(surface)
-            .acquire_owned()
-            .await
-            .expect("store share");
-        let budget = self
-            .api_read_budget()
-            .acquire_owned()
-            .await
-            .expect("store budget");
-        StorePermit::new(Some(share), budget)
+        self.api_read_budget().acquire(surface).await
     }
 
     /// The configured store-read permit count, held or not.
     pub fn api_read_budget_size(&self) -> usize {
-        self.api_read_budget_size
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.api_read_budget().size()
     }
 
     #[cfg(debug_assertions)]
