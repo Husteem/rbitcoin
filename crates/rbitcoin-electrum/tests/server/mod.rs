@@ -4889,6 +4889,43 @@ async fn sp_lag_rescans_above_the_last_handled_tip() {
     s.assert_quiet(3).await;
 }
 
+/// A running scan reads ahead of the steps the session has taken, past the
+/// last tip event it handled. A lag can hide a reorg of those heights while
+/// that tip stays on the chain, so the scan reads them again: height 9's
+/// payment, which only the new chain has, is sent.
+#[tokio::test]
+async fn sp_lag_restarts_a_scan_that_read_past_the_last_handled_tip() {
+    let paid: Vec<u32> = (0..=8).collect();
+    let mut chain = crate::silent_scan::SpChain::new("el-sp-lag-scan", 10, &paid);
+    let mut s = sp_session_with(&chain.q, sp_cfg_short_steps(), SP_STALL_BUF);
+    let at = |q: &Query, h: u32| TipNotify {
+        height: h,
+        header_hex: header_hex(&q.wire_header_at_height(Height(h)).unwrap()),
+        reorg_from_height: None,
+    };
+    s.tip_tx.send(at(&chain.q, 5)).unwrap();
+    s.assert_quiet(2).await;
+
+    let reply = s
+        .ask(&[sp_subscribe_line(1, chain.sub(json!("0-10")))])
+        .await;
+    // The session stalls writing the first step's note. The scan has the
+    // next step queued and has read heights 8 to 10 from the old chain.
+    s.stall_in_first_note().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    chain.rewind(9);
+    chain.extend(10, &[9]);
+    for _ in 0..12 {
+        s.tip_tx.send(at(&chain.q, 10)).unwrap();
+    }
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(
+        sp_heights(&history),
+        (0..=9).collect::<Vec<u64>>(),
+        "the scan reads heights 9 and 10 again from the new chain"
+    );
+}
+
 /// A range scan cut short by a reorg ends at the new tip. Blocks that
 /// connect inside the range before that scan finishes had no live
 /// subscription to notify, so the finishing step reads them.

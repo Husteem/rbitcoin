@@ -1928,15 +1928,19 @@ fn stored_fork(query: &Query, hash: [u8; 32]) -> Option<u32> {
     None
 }
 
-/// The highest height a live silent-payment subscription has scanned.
+/// The highest height this session's silent-payment subscriptions may have
+/// read. A running scan reads ahead of the steps the session has taken, up
+/// to its range's end or the store's tip, so it counts as its end.
 fn sp_scanned_top(conn: &ElectrumConn) -> Option<u32> {
-    conn.sp_subs.iter().map(|l| l.through).max()
+    let live = conn.sp_subs.iter().map(|l| l.through);
+    let scans = conn.sp_scans.iter().map(|r| r.sub.end.unwrap_or(u32::MAX));
+    live.chain(scans).max()
 }
 
 /// A tip event for the store's tip after the channel lagged. When `last`
 /// (the last tip this session handled) is still on the chain the lost events
-/// only extended it, unless a silent-payment scan already reached past it
-/// (`sp_top`): no handled event checked those heights, so the event forks at
+/// only extended it, unless a silent-payment subscription or running scan
+/// may have read past it (`sp_top`): no handled event checked those heights, so the event forks at
 /// `last` and they are scanned again. Otherwise one was a reorg: the event
 /// forks [`LAG_REORG_DEPTH`] below the lowest silent-payment height (or the
 /// last tip), so those scans start again there. `None` without a tip.
