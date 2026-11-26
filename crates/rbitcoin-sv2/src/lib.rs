@@ -39,24 +39,25 @@ pub const MAX_SESSIONS: usize = 8;
 /// [`Sv2TpConfig::netgroup_sessions`].
 pub const MAX_SESSIONS_PER_NETGROUP: usize = MAX_SESSIONS / 2;
 
-/// Idle time before the first keepalive probe on an accepted session.
-const SESSION_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
-/// Probe interval and count: a client gone without a FIN is closed about
-/// 30 + 3 × 10 s after its last segment.
-const SESSION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
-const SESSION_KEEPALIVE_PROBES: u32 = 3;
-
-/// Turn on TCP keepalive for an accepted session. Sessions may stay silent
-/// for hours, and a client that drops without a FIN would otherwise keep its
-/// slot and netgroup share until a template write times out in the kernel
-/// (about 15 minutes on Linux).
+/// Bound how long a vanished client holds its session. Sessions may stay
+/// silent for hours, and a client that drops without a FIN would otherwise
+/// keep its slot and netgroup share until a template write times out in the
+/// kernel (about 15 minutes on Linux).
+///
+/// Keepalive probes an idle socket after 30 s, then every 10 s, 3 times.
+/// Linux sends no probe while a pushed template is unacknowledged, so there
+/// `TCP_USER_TIMEOUT` also closes a socket whose data goes unacknowledged
+/// for 60 s.
+#[doc(hidden)]
 pub fn set_session_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
-    let ka = socket2::TcpKeepalive::new().with_time(SESSION_KEEPALIVE_IDLE);
+    let sock = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-    let ka = ka
-        .with_interval(SESSION_KEEPALIVE_INTERVAL)
-        .with_retries(SESSION_KEEPALIVE_PROBES);
-    socket2::SockRef::from(stream).set_tcp_keepalive(&ka)
+    let ka = ka.with_interval(Duration::from_secs(10)).with_retries(3);
+    sock.set_tcp_keepalive(&ka)?;
+    #[cfg(target_os = "linux")]
+    sock.set_tcp_user_timeout(Some(Duration::from_secs(60)))?;
+    Ok(())
 }
 
 /// Default [`Sv2TpConfig::setup_timeout`]. A session holds a slot from TCP
@@ -214,6 +215,12 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
             format!("sv2 stale_grace: over {}s", MAX_STALE_GRACE.as_secs()),
         ));
     }
+    if !(1..=MAX_SESSIONS).contains(&config.netgroup_sessions) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("sv2 netgroup_sessions: want 1..={MAX_SESSIONS}"),
+        ));
+    }
     if config.idle_timeout.is_some_and(|t| t > MAX_IDLE_TIMEOUT) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -249,7 +256,7 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
         interval: config.template_interval,
     };
     let constraints_cooldown = config.constraints_cooldown;
-    let netgroup_sessions = config.netgroup_sessions.clamp(1, MAX_SESSIONS);
+    let netgroup_sessions = config.netgroup_sessions;
     let chain = config.chain;
     let listener = rbitcoin_net::listen::bind_tcp(config.listen)?;
     let local_addr = listener.local_addr()?;

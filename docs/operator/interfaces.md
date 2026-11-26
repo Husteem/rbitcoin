@@ -342,16 +342,17 @@ target spacings needs the minimum-difficulty bits. Those bits are inside
 the header hash, so the session drops the solution before `accept_block`
 (`submit_solution_past_the_min_diff_gap_is_dropped`). Mainnet and signet
 bits depend only on the previous hash.
-At most 8 sessions run at once, and at most 4 from one netgroup (IPv4
+At most 8 sessions run at once, and by default at most 4 from one netgroup (IPv4
 `/16`, IPv6 `/32`, also under `--asmap`; `127.0.0.1` and `::1` are two
 netgroups). Over either cap the new connection is closed before the
 handshake, logged at most once a second. By default a fifth client from
 one `/16`, such as miners behind one NAT or one tunnel endpoint, is
 refused the same way an attacker's would be; `--sv2-tp-netgroup-sessions`
 changes the 4, and `8` turns the share off. Accepted sessions use TCP
-keepalive (first probe after 30 s idle, then every 10 s, 3 probes), so a
-client that vanishes without closing its connection frees its slot and
-share about a minute after its last packet. A connection that has not finished the
+keepalive (first probe after 30 s idle, then every 10 s, 3 probes) and, on
+Linux, a 60 s TCP user timeout for unacknowledged data, so a client that
+vanishes without closing its connection frees its slot and share about a
+minute after its last packet. A connection that has not finished the
 Noise handshake and `SetupConnection` and sent its first
 `CoinbaseOutputConstraints` within 10 s is closed; after that a client may
 stay silent indefinitely unless `--sv2-tp-idle-timeout` is set. A client that stops reading is closed
@@ -395,7 +396,7 @@ services.rbitcoin.sv2.tp = {
   port = 8442;                         # default; address = "127.0.0.1"
   authoritySecretFile = "/run/keys/sv2-authority"; # readable by the service user
   # certValidity = 3600; staleGrace = 10; openFirewall = false;
-  # feeDelta = 1000; templateInterval = 5;
+  # feeDelta = 1000; templateInterval = 5; netgroupSessions = 4;
 };
 ```
 

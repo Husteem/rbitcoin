@@ -88,9 +88,10 @@ async fn netgroup_sessions_sets_the_share() {
     }
 }
 
-/// An accepted session's socket has TCP keepalive on, so a client that
-/// drops without a FIN frees its slot and netgroup share in about a
-/// minute, not after the kernel's retransmit timeout.
+/// An accepted session's socket has TCP keepalive on (and, on Linux, a TCP
+/// user timeout), so a client that drops without a FIN frees its slot and
+/// netgroup share in about a minute, not after the kernel's retransmit
+/// timeout.
 #[test]
 fn accepted_sockets_get_tcp_keepalive() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -109,6 +110,32 @@ fn accepted_sockets_get_tcp_keepalive() {
     };
     let sock = socket2::SockRef::from(&accepted);
     assert!(sock.keepalive().unwrap(), "SO_KEEPALIVE");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(sock.tcp_keepalive_time().unwrap(), Duration::from_secs(30));
+        assert_eq!(
+            sock.tcp_keepalive_interval().unwrap(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(sock.tcp_keepalive_retries().unwrap(), 3);
+        assert_eq!(
+            sock.tcp_user_timeout().unwrap(),
+            Some(Duration::from_secs(60))
+        );
+    }
+}
+
+/// A share outside 1..=MAX_SESSIONS is refused at start, as the other
+/// bounded fields are.
+#[tokio::test]
+async fn netgroup_sessions_out_of_range_is_refused() {
+    let tc = shared_regtest(0);
+    for share in [0, MAX_SESSIONS + 1] {
+        let mut cfg = test_tp_config(Arc::clone(&tc.chain), [7; 32]);
+        cfg.netgroup_sessions = share;
+        let err = run_sv2_tp(cfg).await.err().expect("refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+    }
 }
 
 /// One netgroup takes at most half the table, so idle clients from one

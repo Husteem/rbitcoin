@@ -133,6 +133,7 @@ let
             feeDelta = 0;
             templateInterval = 30;
             idleTimeout = 30;
+            netgroupSessions = 8;
             openFirewall = true;
           };
         };
@@ -656,6 +657,7 @@ assert defaultCfg.sv2.tp.certValidity == 3600;
 assert defaultCfg.sv2.tp.staleGrace == 10;
 assert defaultCfg.sv2.tp.feeDelta == 1000;
 assert defaultCfg.sv2.tp.templateInterval == 5;
+assert defaultCfg.sv2.tp.netgroupSessions == 4;
 assert cfg.services.rbitcoin.p2p.port == 18444;
 assert cfg.services.rbitcoin.rpc.port == 18443;
 assert
@@ -854,6 +856,7 @@ assert builtins.match ".*--sv2-tp-cert-validity 600.*" execStart != null;
 assert builtins.match ".*--sv2-tp-stale-grace 0.*" execStart != null;
 assert builtins.match ".*--sv2-tp-fee-delta 0.*" execStart != null;
 assert builtins.match ".*--sv2-tp-template-interval 30.*" execStart != null;
+assert builtins.match ".*--sv2-tp-netgroup-sessions 8.*" execStart != null;
 assert builtins.match ".*--sv2-tp-idle-timeout 30.*" execStart != null;
 assert builtins.match ".*--max-run-secs 1$" execStart != null;
 assert builtins.match ".*--max-inbound.*" (
