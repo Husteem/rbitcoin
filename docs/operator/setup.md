@@ -257,6 +257,18 @@ docker exec rbitcoin rbitcoin-cli getblockchaininfo
 - **Verify** the image binaries against the Release checksums:
   [`reproducible-builds.md`](../reproducible-builds.md).
 
+### Stop timeout
+
+A stop flushes the store and can take tens of seconds during catch-up
+([`mainnet.md`](mainnet.md)). The NixOS unit allows 5 minutes. A systemd unit
+you write yourself should set the same, because the default is 90 s and a
+kill on timeout is a `kill -9`:
+
+```ini
+[Service]
+TimeoutStopSec=5min
+```
+
 ### Low-priority service on a shared Linux host
 
 Initial block download (IBD) sustains CPU and storage work for a long time. On

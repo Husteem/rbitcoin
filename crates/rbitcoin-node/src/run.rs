@@ -125,8 +125,9 @@ impl Shutdown {
     }
 
     pub fn request(&self) {
+        // A write-behind thread stores the flag before it calls `fail`.
+        self.requested_at.get_or_init(Instant::now);
         if !self.flag.swap(true, Ordering::SeqCst) {
-            let _ = self.requested_at.set(Instant::now());
             self.notify.notify_waiters();
         }
     }
@@ -1858,6 +1859,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
 
+    let tail_start = Instant::now();
     if let Ok(g) = shared_peers.lock() {
         addrman.merge_from(&g);
     }
@@ -1891,13 +1893,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         h.shutdown().await;
     }
     shutdown.request();
+    let listeners = tail_start.elapsed();
     let mut step = Instant::now();
     let mut lap = || {
         let took = step.elapsed();
         step = Instant::now();
         took
     };
-    let reached_tail = shutdown.since_requested();
     if let Some(h) = sh_writebehind {
         let _ = h.join();
     }
@@ -1918,8 +1920,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     .map_err(|e| NodeError::Config(format!("tip-accept idle: {e}")))?;
     let tip_accept = lap();
     // One spend checkpoint at the snapshot, then Class C. Not `Store::flush`.
-    // This waits out a checkpoint already running, which in IBD is most of
-    // the stop (#2118).
     spend_sync.shutdown();
     let spend_checkpoint = lap();
     // Host-friendly: fsync tip tables; MS_ASYNC Class A.
@@ -1937,14 +1937,16 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             mempool_blocking(&mempool, |mp| (mp.generation(), mp.live_count())).await?;
         info!("node: mempool flushed gen={gen} live={live}");
     }
-    node.shutdown().await;
     let mempool_flush = lap();
+    node.shutdown().await;
+    let peers = lap();
     info!(
-        "node: shutdown steps since_signal={:?} reached_tail={reached_tail:?} \
+        "node: shutdown steps since_request={:?} tail={:?} listeners={listeners:?} \
          writebehind={writebehind:?} tip_accept={tip_accept:?} \
          spend_checkpoint={spend_checkpoint:?} store_flush={store_flush:?} \
-         mempool_flush={mempool_flush:?}",
-        shutdown.since_requested()
+         mempool_flush={mempool_flush:?} peers={peers:?}",
+        shutdown.since_requested(),
+        tail_start.elapsed()
     );
     shutdown.result()?;
     info!("node: clean exit");

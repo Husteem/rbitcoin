@@ -1224,6 +1224,16 @@ fn shutdown_flag_and_node_handle_smoke() {
     failed.fail(rbitcoin_node::NodeError::Init("second".into()));
     assert!(failed.requested());
     assert_eq!(failed.result().unwrap_err().to_string(), "Error: first");
+    // A write-behind thread stores the shared flag, then fails the node.
+    let halted = Shutdown::new();
+    assert_eq!(halted.since_requested(), Duration::ZERO);
+    halted.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    halted.fail(rbitcoin_node::NodeError::Init("write-behind".into()));
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(
+        halted.since_requested() > Duration::ZERO,
+        "the stop time is recorded after the flag was already set"
+    );
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1494,19 +1504,27 @@ async fn sigterm_ends_a_start_waiting_on_tor_control() {
             out.iter().any(|l| l.contains("node: clean exit")),
             "{held}: SIGTERM must run the shutdown tail: {out:?}"
         );
-        // Each step of the tail is timed, from the signal on.
         let steps = out
             .iter()
             .find(|l| l.contains("node: shutdown steps"))
             .unwrap_or_else(|| panic!("{held}: no shutdown step timing: {out:?}"));
         for step in [
-            "since_signal=",
+            "since_request=",
+            "tail=",
+            "listeners=",
+            "writebehind=",
+            "tip_accept=",
             "spend_checkpoint=",
             "store_flush=",
             "mempool_flush=",
+            "peers=",
         ] {
             assert!(steps.contains(step), "{held}: {step} missing: {steps}");
         }
+        assert!(
+            !steps.contains("since_request=0ns"),
+            "{held}: the SIGTERM time was not recorded: {steps}"
+        );
     }
 }
 
