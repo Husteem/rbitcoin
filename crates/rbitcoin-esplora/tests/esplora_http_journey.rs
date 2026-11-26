@@ -1437,20 +1437,22 @@ async fn by_txid_batch_serves_pruned_rows_beside_live_ones() {
     assert_eq!(st, 200, "pruned by-txid batch: {text}");
     let rows: Value = serde_json::from_str(&text).unwrap();
     let got: Vec<_> = rows.as_array().unwrap().iter().map(|r| r["txid"].clone()).collect();
-    let want: Vec<Value> = [spend_id, pad.cbs[0], child_id]
+    let want_ids = [spend_id, pad.cbs[0], child_id];
+    let want: Vec<Value> = want_ids
         .iter()
         .map(|id| Value::from(block_hash_hex(id)))
         .collect();
     assert_eq!(got, want, "{text}");
     assert_eq!(rows[0]["pruned"], true, "the spend is pruned: {text}");
     assert_eq!(rows[1]["pruned"], true, "the coinbase is pruned: {text}");
+    assert_eq!(rows[1]["vin"][0]["is_coinbase"], true, "{text}");
     assert!(rows[2].get("pruned").is_none(), "the child is live: {text}");
     assert_eq!(rows[2]["vin"][0]["txid"], block_hash_hex(&spend_id), "{text}");
-    for (i, id) in [spend_id, child_id].iter().enumerate() {
+    for (row, id) in rows.as_array().unwrap().iter().zip(&want_ids) {
         let (st, one) = http_get(pad.addr, &format!("/tx/{}", block_hash_hex(id))).await;
         assert_eq!(st, 200, "{one}");
         let one: Value = serde_json::from_str(&one).unwrap();
-        assert_eq!(one, rows[if i == 0 { 0 } else { 2 }], "batch row matches GET /tx");
+        assert_eq!(&one, row, "batch row matches GET /tx");
     }
 
     handle.shutdown().await;
