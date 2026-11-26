@@ -14,6 +14,23 @@ fn dir() -> PathBuf {
     p
 }
 
+/// A [`dir`] removed when the test ends, on success or panic.
+struct CleanDir(PathBuf);
+
+impl CleanDir {
+    /// The guard and its path.
+    fn new() -> (Self, PathBuf) {
+        let d = dir();
+        (Self(d.clone()), d)
+    }
+}
+
+impl Drop for CleanDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn delta_dir(d: &std::path::Path) -> PathBuf {
     d.join(SPEND_DELTA_DIR)
 }
@@ -676,6 +693,93 @@ fn a_populated_schema_29_log_becomes_a_delta_generation() {
     assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
     let s = rbitcoin_store::Store::open_tiny(&d).unwrap();
     assert_eq!(s.spend_directory_slot(16).unwrap(), Some(meta));
+}
+
+/// An upgrade whose open fails after the spend delta published its
+/// adoption already says schema 30, and the 29 log is gone: no schema-29
+/// binary can open the datadir and write spends the published delta would
+/// never read.
+#[test]
+fn an_upgrade_open_that_fails_after_the_adoption_is_already_30() {
+    let (_clean, d) = CleanDir::new();
+    schema_29_store(&d);
+    let meta =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 7).unwrap();
+    write_schema_29_log(&d, &[(0, page_zero_image(meta))], 0, false);
+    // The header table opens after the tx table: its refusal fails the open
+    // once the adoption published.
+    let path = d.join("header.body");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[..4].copy_from_slice(b"XXXX");
+    std::fs::write(&path, bytes).unwrap();
+    assert!(rbitcoin_store::Store::open_tiny(&d).is_err());
+    assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+    assert!(!d.join("spend.pages.commit").exists());
+    assert!(!d.join("spend.pages").exists());
+}
+
+/// An upgrade that died after the first schema-30 open created
+/// `spent.delta/` but before the adoption published: `meta` is still 29, so
+/// the next open adopts the dense body's spends again.
+#[test]
+fn an_upgrade_killed_before_the_adoption_adopts_again() {
+    let (_clean, d) = CleanDir::new();
+    schema_29_store(&d);
+    let slot =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk(9), 0).unwrap();
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join("spent.body"))
+            .unwrap();
+        f.seek(SeekFrom::Start(16)).unwrap();
+        f.write_all(&slot).unwrap();
+    }
+    // An open that fails before the adoption leaves `meta` at 29: a
+    // `spent.delta` that is a file stops it there.
+    std::fs::write(delta_dir(&d), b"x").unwrap();
+    assert!(rbitcoin_store::Store::open_tiny(&d).is_err());
+    assert_eq!(
+        rbitcoin_store::store::check_meta(&d).unwrap(),
+        29,
+        "meta moved to 30 before the adoption published"
+    );
+    std::fs::remove_file(delta_dir(&d)).unwrap();
+    drop(SpendPageLog::create(&d).unwrap());
+    let s = rbitcoin_store::Store::open_tiny(&d).unwrap();
+    assert_eq!(s.spend_directory_slot(16).unwrap(), Some(slot));
+    drop(s);
+    assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+}
+
+/// A schema-30 datadir that lost `spent.delta/` refuses to open, even when
+/// its sparse `spent.body` reaches the published end on disk: that length
+/// cannot tell it from a body an older schema's Class A filled, and adopting
+/// it would leave every spend the delta held unspent (#2038).
+#[test]
+fn a_schema_30_body_without_its_delta_refuses_whatever_its_length() {
+    let (_clean, d) = CleanDir::new();
+    schema_29_store(&d);
+    {
+        // The upgrade: adopts the body, writes `meta` 30.
+        let s = rbitcoin_store::Store::open_tiny(&d).unwrap();
+        assert_eq!(rbitcoin_store::store::check_meta(&d).unwrap(), 30);
+        let end = s.txs.spent.body_published_len();
+        drop(s);
+        std::fs::remove_dir_all(delta_dir(&d)).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.join("spent.body"))
+            .unwrap();
+        if f.metadata().unwrap().len() < end {
+            f.set_len(end).unwrap();
+        }
+    }
+    let err = rbitcoin_store::Store::open_tiny(&d)
+        .err()
+        .expect("a schema-30 body without spent.delta must refuse");
+    assert!(err.to_string().contains("spent.delta is missing"), "{err}");
 }
 
 /// A held schema-29 log is not refused: refusing after `meta` is 30 would

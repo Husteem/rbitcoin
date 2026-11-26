@@ -550,14 +550,28 @@ impl Store {
         let height_fence = HeightFence::from_confirmed(&confirmed, &header_txs)?;
         drop_leftover_tx_height(&path);
         crate::scripthash::unlink_scripthash_run_leftovers(&path)?;
-        open_layout_rewrite_current(&path, meta_ver)?;
+        open_layout_rewrite_before_spend_delta(&path, meta_ver)?;
         let seqsigwit_dir = resolve_seqsigwit_dir(&layout)?;
         if layout.is_split() {
             refuse_cold_index_dirs(&path, &seqsigwit_dir)?;
         }
         let committed = committed_create_count(&header_txs)?;
-        let txs =
-            TxTable::open_seqsigwit(&path, &seqsigwit_dir, layout.open_opts(), Some(committed))?;
+        let txs = TxTable::open_seqsigwit(
+            &path,
+            &seqsigwit_dir,
+            layout.open_opts(),
+            Some(crate::tx_table::OpenedFromStore {
+                committed,
+                schema: meta_ver,
+            }),
+        )?;
+        // Right after the spend delta published its adoption of a pre-30
+        // `spent.body` (#2038). Before it a crash opens as pre-30 and adopts
+        // again. After it no schema-29 binary may open the datadir: its spend
+        // writes would land in a page log the published delta ignores. The
+        // 29 files go once `meta` 30 is durable.
+        open_layout_rewrite_current(&path, meta_ver)?;
+        crate::spend_pages_v29::remove(&path)?;
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
         }
@@ -2635,9 +2649,14 @@ fn replaces_incomplete_first_creation(err: &StoreError) -> bool {
 /// empty witness locator is what an older binary truncates.
 #[doc(hidden)]
 pub fn write_meta(dir: &Path) -> Result<(), StoreError> {
+    write_meta_at(dir, SCHEMA_VERSION)
+}
+
+/// [`write_meta`] at `version`.
+fn write_meta_at(dir: &Path, version: u16) -> Result<(), StoreError> {
     let mut bytes = Vec::with_capacity(STORE_MAGIC.len() + 2);
     bytes.extend_from_slice(&STORE_MAGIC);
-    bytes.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&version.to_le_bytes());
     crate::file::write_synced_tmp_rename(&dir.join("meta"), &bytes)
 }
 
@@ -2699,6 +2718,26 @@ pub fn drop_leftover_tx_height(path: &Path) {
     }
 }
 
+/// The last schema before the spend delta. Open moves an older `meta` here
+/// before any table rewrite, so every binary older than that refuses the
+/// datadir, and to [`SCHEMA_VERSION`] only once the spend delta has adopted
+/// the old `spent.body` ([`open_layout_rewrite_current`]).
+const SCHEMA_BEFORE_SPEND_DELTA: u16 = 29;
+
+/// `meta` to [`SCHEMA_BEFORE_SPEND_DELTA`] when it is older.
+#[doc(hidden)]
+pub fn open_layout_rewrite_before_spend_delta(
+    path: &Path,
+    meta_ver: u16,
+) -> Result<(), StoreError> {
+    if meta_ver < SCHEMA_BEFORE_SPEND_DELTA {
+        write_meta_at(path, SCHEMA_BEFORE_SPEND_DELTA)?;
+    }
+    Ok(())
+}
+
+/// `meta` to [`SCHEMA_VERSION`] when it is older. Runs after the tx table
+/// opened, so the spend delta's adoption of a pre-30 body is published.
 #[doc(hidden)]
 pub fn open_layout_rewrite_current(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
     if meta_ver < SCHEMA_VERSION {
