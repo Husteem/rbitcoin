@@ -3158,6 +3158,25 @@ async fn broadcast_hex_cap_enforced() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `blockchain.tweaks.subscribe` stream waits for its next wave as long
+/// as the read idle window, not the shorter write stall bound.
+#[tokio::test]
+async fn tweaks_wave_wait_uses_the_read_idle_window() {
+    let (_client, server) = tokio::io::duplex(1024);
+    let (server_r, server_w) = tokio::io::split(server);
+    let mut reader = LineReader::new(server_r, DEFAULT_MAX_LINE_BYTES);
+    let mut writer = rbitcoin_electrum::server::ConnWrite::new(server_w, Duration::from_millis(20))
+        .with_read_idle(Duration::from_secs(10));
+    let mut wave = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Err("slow wave".to_string())
+    });
+    let got = tweaks_wait_wave_or_ping(&mut reader, &mut writer, &mut wave)
+        .await
+        .expect("the wave is waited for, not timed out");
+    assert!(matches!(got, TweaksWait::Wave(Err(_))));
+}
+
 #[test]
 fn serve_limits_public_proxy_defaults() {
     let lim = ServeLimits::for_public_proxy();
@@ -3169,7 +3188,17 @@ fn serve_limits_public_proxy_defaults() {
     );
     let params = ChainParams::regtest();
     let cfg = ElectrumConfig::for_params("0.0.0.0:50001".parse().unwrap(), &params);
-    assert_eq!(cfg.limits, lim);
+    assert_eq!(
+        cfg.limits,
+        ServeLimits {
+            idle_timeout: Duration::from_secs(DEFAULT_ELECTRUM_IDLE_TIMEOUT_SECS),
+            ..lim
+        }
+    );
+    assert_eq!(
+        cfg.write_stall,
+        Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+    );
     assert_eq!(cfg.max_connections(), DEFAULT_MAX_CONNECTIONS);
     assert_eq!(cfg.max_line_bytes(), DEFAULT_MAX_LINE_BYTES);
 }
@@ -5234,7 +5263,7 @@ async fn stalled_scripthash_push_ends_the_connection() {
         },
     };
     let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    cfg.limits.idle_timeout = std::time::Duration::from_millis(80);
+    cfg.write_stall = std::time::Duration::from_millis(80);
     let (tip_tx, tip_rx) = tokio::sync::broadcast::channel(1);
     let stop = ElectrumStop::new(false);
     let task = tokio::spawn(handle_client(

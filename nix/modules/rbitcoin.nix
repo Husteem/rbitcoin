@@ -401,6 +401,10 @@ let
   ++ optional (cfg.electrum.enable && cfg.electrum.maxSpSubs != null) (
     toString cfg.electrum.maxSpSubs
   )
+  ++ optional (cfg.electrum.enable && cfg.electrum.idleTimeout != null) "--electrum-idle-timeout"
+  ++ optional (cfg.electrum.enable && cfg.electrum.idleTimeout != null) (
+    toString cfg.electrum.idleTimeout
+  )
   ++ optional cfg.esplora.enable "--esplora-listen"
   ++ optional cfg.esplora.enable (
     if cfg.esplora.socketPath != null then
@@ -1368,6 +1372,17 @@ in
           blockchain.silentpayments.subscribe address cap per Electrum connection
           (--electrum-max-sp-subs). Null keeps the node default (16). Each address
           scans every new block.
+        '';
+      };
+
+      idleTimeout = mkOption {
+        type = types.nullOr (types.ints.between 1 86400);
+        default = null;
+        example = 3600;
+        description = ''
+          Seconds an Electrum connection may send no request before it is closed
+          (--electrum-idle-timeout). Null keeps the node default (600). Pushes to
+          the connection do not count.
         '';
       };
     };

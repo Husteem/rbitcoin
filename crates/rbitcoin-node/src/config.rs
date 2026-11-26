@@ -489,6 +489,8 @@ pub struct NodeConfig {
     /// Max `blockchain.silentpayments.subscribe` addresses per Electrum
     /// connection (>= 1). Default [`rbitcoin_electrum::DEFAULT_MAX_SP_SUBS`].
     pub electrum_max_sp_subs: usize,
+    /// Electrum read idle window (`--electrum-idle-timeout`, 1 to 86400 s).
+    pub electrum_idle_timeout: Duration,
     /// Max Esplora requests in flight across the whole listener (>= 1).
     /// Default [`rbitcoin_electrum::DEFAULT_MAX_CONNECTIONS`].
     pub esplora_max_inflight: usize,
@@ -660,6 +662,9 @@ impl Default for NodeConfig {
             heavy_sh_creates: rbitcoin_query::DEFAULT_HEAVY_SH_CREATES,
             electrum_max_subs: rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS,
             electrum_max_sp_subs: rbitcoin_electrum::DEFAULT_MAX_SP_SUBS,
+            electrum_idle_timeout: Duration::from_secs(
+                rbitcoin_electrum::DEFAULT_ELECTRUM_IDLE_TIMEOUT_SECS,
+            ),
             esplora_max_inflight: rbitcoin_electrum::DEFAULT_MAX_CONNECTIONS,
             esplora_min_drain_rate: rbitcoin_esplora::DEFAULT_MIN_DRAIN_RATE,
             store_read_budget: None,
@@ -1679,6 +1684,19 @@ impl NodeConfig {
                     ));
                 }
                 self.electrum_max_sp_subs = n;
+            }
+            "electrum_idle_timeout" => {
+                let max = rbitcoin_electrum::MAX_ELECTRUM_IDLE_TIMEOUT_SECS;
+                let secs = val
+                    .parse()
+                    .ok()
+                    .filter(|s: &u64| (1..=max).contains(s))
+                    .ok_or_else(|| {
+                        NodeError::Config(format!(
+                            "conf electrum_idle_timeout: want seconds 1 to {max}"
+                        ))
+                    })?;
+                self.electrum_idle_timeout = Duration::from_secs(secs);
             }
             "store_read_budget" => {
                 let n: i64 = val
