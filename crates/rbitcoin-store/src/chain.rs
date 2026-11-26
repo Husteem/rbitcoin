@@ -7,7 +7,7 @@ use crate::array_table::{
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::hashhead::HeadScale;
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicU64, Ordering};
 use rbitcoin_primitives::{Fk, Height, TableKind};
 use std::path::Path;
 
@@ -546,19 +546,25 @@ pub struct HeaderTxsTable {
 }
 
 #[cfg(debug_assertions)]
-static FAIL_AHEAD: AtomicBool = AtomicBool::new(false);
+static FAIL_AHEAD: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
-/// Leave the next `header_txs` write-ahead sidecars behind and fail before the
-/// payload flush, as a power cut between the sidecar and the flush would.
+/// Leave the next `header_txs` write-ahead sidecars for `path` behind and fail
+/// before the payload flush, as a power cut would.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
-pub fn fail_next_header_txs_flush_after_ahead() {
-    FAIL_AHEAD.store(true, Ordering::SeqCst);
+pub fn fail_next_header_txs_flush_after_ahead(path: &Path) {
+    *FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_path_buf());
 }
 
 #[cfg(debug_assertions)]
-fn take_fail_ahead() -> bool {
-    FAIL_AHEAD.swap(false, Ordering::SeqCst)
+fn take_fail_ahead(path: &Path) -> bool {
+    let mut fail = FAIL_AHEAD.lock().unwrap_or_else(|e| e.into_inner());
+    if fail.as_deref() == Some(path) {
+        *fail = None;
+        true
+    } else {
+        false
+    }
 }
 
 impl HeaderTxsTable {
@@ -784,7 +790,7 @@ impl HeaderTxsTable {
         let first_ahead = self.first.write_ahead()?;
         let count_ahead = self.count.write_ahead()?;
         #[cfg(debug_assertions)]
-        if take_fail_ahead() {
+        if take_fail_ahead(self.first.file.path()) {
             return Err(StoreError::io(
                 self.first.file.path(),
                 std::io::Error::other("injected header_txs ahead failure"),
