@@ -1879,6 +1879,7 @@ async fn empty_work_queue_is_http_503() {
         work_queue: Arc::new(Semaphore::new(0)),
         rest_queue: Arc::new(Semaphore::new(1)),
         rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: true,
     };
@@ -1897,6 +1898,144 @@ async fn empty_work_queue_is_http_503() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
+/// A built REST reply holds its bytes of the budget until its body is gone.
+/// While the budget is spent a new REST request is 503 and nothing is built.
+/// A reply larger than the whole budget still goes out alone.
+#[tokio::test]
+async fn unwritten_rest_replies_hold_the_byte_budget() {
+    const BUDGET: usize = 16;
+    let (state, dir) = rest_budget_state(BUDGET);
+    let rest_reply_bytes = state.rest_reply_bytes.clone();
+    let get = || {
+        rest_entry(
+            State(state.clone()),
+            axum::http::Request::get("/rest/chaininfo.json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+    };
+    let held = get().await;
+    assert_eq!(held.status(), StatusCode::OK);
+    assert_eq!(
+        rest_reply_bytes.available(),
+        0,
+        "a reply over the budget takes all of it"
+    );
+
+    let refused = get().await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(refused.into_body(), 64)
+        .await
+        .expect("503 body");
+    assert_eq!(&body[..], b"Work queue depth exceeded\n");
+
+    let body = axum::body::to_bytes(held.into_body(), 1 << 20)
+        .await
+        .expect("held body");
+    let v: serde_json::Value = serde_json::from_slice(&body).expect("chaininfo json");
+    assert_eq!(v["chain"], "regtest");
+    // One frame is collected without a copy, so `body` is the reply itself.
+    drop(body);
+    assert_eq!(rest_reply_bytes.available(), BUDGET);
+
+    let again = get().await;
+    assert_eq!(again.status(), StatusCode::OK);
+    drop(again);
+    assert_eq!(
+        rest_reply_bytes.available(),
+        BUDGET,
+        "a dropped body returns its bytes"
+    );
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+fn rest_budget_state(budget: usize) -> (AppState, rbitcoin_store::testutil::TempDir) {
+    let (ctx, dir) = http_wait_ctx();
+    let state = AppState {
+        ctx,
+        auth: RpcAuth::new("test-token"),
+        cookie: None,
+        work_queue: Arc::new(Semaphore::new(1)),
+        rest_queue: Arc::new(Semaphore::new(4)),
+        rest_store: Arc::new(Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(budget),
+        rest: true,
+        require_auth: true,
+    };
+    (state, dir)
+}
+
+/// Hyper drops the body once it has queued the last frame, and that frame
+/// can sit in its write queue while the client stops reading. The budget
+/// covers the reply's memory, so it comes back only when the last frame
+/// handed out is dropped too, not when the body is.
+#[tokio::test]
+async fn a_queued_last_frame_keeps_the_reply_bytes() {
+    use hyper::body::Body as _;
+    const BUDGET: usize = 1 << 20;
+    let (state, dir) = rest_budget_state(BUDGET);
+    let rest_reply_bytes = state.rest_reply_bytes.clone();
+    let reply = rest_entry(
+        State(state),
+        axum::http::Request::get("/rest/chaininfo.json")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(reply.status(), StatusCode::OK);
+    let mut body = reply.into_body();
+    let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+        .await
+        .expect("a frame")
+        .expect("no error");
+    assert!(body.is_end_stream(), "chaininfo is one frame");
+    drop(body);
+    let held = BUDGET - rest_reply_bytes.available();
+    assert!(held > 0, "the queued last frame still holds its bytes");
+    drop(frame);
+    assert_eq!(rest_reply_bytes.available(), BUDGET);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// A reply over two slices goes out as full slices in order, then the tail,
+/// and the size hint counts down what is left. Any one slice still held keeps
+/// the reply's bytes after the body and the other slices are dropped.
+#[tokio::test]
+async fn a_multi_slice_reply_keeps_its_bytes_while_any_slice_lives() {
+    use hyper::body::Body as _;
+    let len = 2 * REST_REPLY_CHUNK + 1;
+    let budget = ReplyBytes::new(4 * REST_REPLY_CHUNK);
+    let total = budget.available();
+    let reply: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let mut body = budget.body(reply.clone()).expect("budget free");
+    assert_eq!(total - budget.available(), len);
+    assert_eq!(body.size_hint().exact(), Some(len as u64));
+    let mut slices = Vec::new();
+    for want in [REST_REPLY_CHUNK, REST_REPLY_CHUNK, 1] {
+        let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("a frame")
+            .expect("no error");
+        let data = frame.into_data().expect("a data frame");
+        assert_eq!(data.len(), want);
+        slices.push(data);
+        let sent: usize = slices.iter().map(|s| s.len()).sum();
+        assert_eq!(body.size_hint().exact(), Some((len - sent) as u64));
+    }
+    assert!(body.is_end_stream());
+    assert_eq!(slices.concat(), reply, "slices are the reply in order");
+    let kept = slices.swap_remove(1);
+    drop(body);
+    drop(slices);
+    assert_eq!(
+        total - budget.available(),
+        len,
+        "the middle slice holds the reply"
+    );
+    drop(kept);
+    assert_eq!(budget.available(), total);
+}
+
 /// A later long-poll drops the work-queue slot. A slot taken during the wait
 /// is waited for, not reported as a queue error. The calls that follow still
 /// run. A POST that has not run a call is still 503.
@@ -1911,6 +2050,7 @@ async fn batch_waits_to_retake_the_queue_after_a_long_poll() {
         work_queue: Arc::clone(&work_queue),
         rest_queue: Arc::new(Semaphore::new(1)),
         rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: true,
     };
@@ -1978,6 +2118,7 @@ async fn full_work_queue_is_503_before_the_store_budget() {
         work_queue: Arc::new(Semaphore::new(0)),
         rest_queue: Arc::new(Semaphore::new(1)),
         rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: true,
     };
@@ -2009,6 +2150,7 @@ async fn long_poll_queue_full_is_503_before_the_store_budget() {
         work_queue: Arc::new(Semaphore::new(0)),
         rest_queue: Arc::new(Semaphore::new(1)),
         rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: true,
     };
@@ -2045,6 +2187,7 @@ async fn rest_waits_on_its_share_before_the_store_budget() {
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(4)),
         rest_store: Arc::clone(&rest_store),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: true,
         require_auth: false,
     };
@@ -2110,6 +2253,7 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(1)),
         rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
     };
@@ -2132,6 +2276,7 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(1)),
         rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
     };
@@ -2159,6 +2304,7 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(1)),
         rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
     };
@@ -2215,6 +2361,7 @@ fn store_budget_wait_does_not_need_a_pool_thread() {
             work_queue: Arc::new(Semaphore::new(4)),
             rest_queue: Arc::new(Semaphore::new(1)),
             rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
+            rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
             rest: false,
             require_auth: false,
         };
@@ -2476,6 +2623,7 @@ pub(crate) fn gbt_app(ctx: Arc<rbitcoin_rpc::methods::RpcContext>) -> AppState {
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(1)),
         rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
     }
@@ -3666,6 +3814,7 @@ async fn earlier_wait_reports_the_tip_from_when_it_finished() {
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(1)),
         rest_store: Arc::new(tokio::sync::Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
     };
