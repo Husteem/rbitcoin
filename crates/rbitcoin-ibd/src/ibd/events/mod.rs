@@ -1788,6 +1788,9 @@ pub fn abandon_unwritable_sibling(
     height: u32,
 ) {
     st.unservable.insert(hash);
+    // Abandoned for a failed write, not for mutated copies: an older
+    // mutated-copy record must not let an announcer reopen it.
+    st.mutated_copies.remove(&hash);
     st.body.stop_reget(hash);
     st.tip_siblings.retain(|h| *h != hash);
     st.header_write_misses.remove(&hash);

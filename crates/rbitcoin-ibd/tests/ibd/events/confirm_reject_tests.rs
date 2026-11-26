@@ -5830,3 +5830,24 @@ fn a_copy_sender_that_reconnects_is_still_kept_off_a_reopened_header() {
     assert!(may_serve(&st, 10, &hash), "a new peer may take A");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A header abandoned because its write failed stays abandoned, even when
+/// it still has a mutated-copy record from earlier: only an abandonment for
+/// mutated copies reopens (#1992).
+#[test]
+fn a_header_abandoned_for_a_failed_write_does_not_reopen() {
+    use rbitcoin_ibd::ibd::events::{abandon_unwritable_sibling, apply_headers_event};
+
+    let (dir, hub, mut st, a) = abandoned_a("reopen-unwritable");
+    let hash = a.block_hash();
+    apply_headers_event(&mut st, &hub, 2, vec![a.header]);
+    assert!(!st.unservable.contains(&hash), "peer 2 reopens A");
+    abandon_unwritable_sibling(&mut st, &hub, hash, 1);
+    assert!(st.unservable.contains(&hash), "the failed write abandons A");
+    apply_headers_event(&mut st, &hub, 3, vec![a.header]);
+    assert!(
+        st.unservable.contains(&hash),
+        "a fresh announcer does not reopen a header abandoned for a failed write"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
