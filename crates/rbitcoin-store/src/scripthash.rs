@@ -3516,8 +3516,7 @@ pub fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreErr
         word.copy_from_slice(&buf[off..off + 8]);
         *h = u64::from_le_bytes(word);
         if *h != 0
-            && (*h < SH_PREFIX_PAGE as u64
-                || h.saturating_add(slab_bytes(class as u8)) > bump)
+            && (*h < SH_PREFIX_PAGE as u64 || h.saturating_add(slab_bytes(class as u8)) > bump)
         {
             return Err(StoreError::Corrupt("scripthash free head out of range"));
         }

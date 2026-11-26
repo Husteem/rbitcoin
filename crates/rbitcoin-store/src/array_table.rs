@@ -1148,6 +1148,7 @@ impl ArrayTable {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .map_err(|e| StoreError::io(path, e))?;
         file.seek(SeekFrom::Start(0))
@@ -1156,8 +1157,7 @@ impl ArrayTable {
             .map_err(|e| StoreError::io(path, e))?;
         file.seek(SeekFrom::Start(block_start))
             .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(image)
-            .map_err(|e| StoreError::io(path, e))?;
+        file.write_all(image).map_err(|e| StoreError::io(path, e))?;
         file.sync_all().map_err(|e| StoreError::io(path, e))?;
         drop(file);
         std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
@@ -1185,8 +1185,7 @@ impl ArrayTable {
         let start = from.min(disk);
         let logical = FILE_HEADER_LEN as u64 + n * ELEM;
         let payload_start = FILE_HEADER_LEN as u64 + start * ELEM;
-        let block_start = (payload_start & !(FLUSH_SCRATCH as u64 - 1))
-            .max(FILE_HEADER_LEN as u64);
+        let block_start = (payload_start & !(FLUSH_SCRATCH as u64 - 1)).max(FILE_HEADER_LEN as u64);
         if logical <= block_start {
             return Ok(None);
         }
@@ -1197,7 +1196,12 @@ impl ArrayTable {
         let words = self.slots.slots(Ordering::Acquire);
         let mut image = vec![0u8; len];
         let first = ((block_start - FILE_HEADER_LEN as u64) / ELEM) as usize;
-        for (i, slot) in words.iter().enumerate().skip(first).take(n as usize - first) {
+        for (i, slot) in words
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(n as usize - first)
+        {
             let at = i * ELEM as usize + FILE_HEADER_LEN - block_start as usize;
             if at + ELEM as usize <= image.len() {
                 image[at..at + ELEM as usize]

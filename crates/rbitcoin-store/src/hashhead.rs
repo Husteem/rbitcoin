@@ -417,8 +417,7 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         }
         file.seek(SeekFrom::Start(off))
             .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(image)
-            .map_err(|e| StoreError::io(path, e))?;
+        file.write_all(image).map_err(|e| StoreError::io(path, e))?;
         at += AHEAD_REC;
     }
     file.sync_all().map_err(|e| StoreError::io(path, e))?;
@@ -992,8 +991,8 @@ impl<'a> SlotPageCache<'a> {
             let last = (off + len - 1) & !4095;
             let mut block = first;
             while block <= last {
-                if !blocks.contains_key(&block) {
-                    blocks.insert(block, read_page(self.head.file.path(), &self.head.file, block)?);
+                if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(block) {
+                    entry.insert(read_page(self.head.file.path(), &self.head.file, block)?);
                 }
                 let image = blocks.get_mut(&block).unwrap();
                 let lo = off.max(block);

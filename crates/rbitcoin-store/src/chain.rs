@@ -573,8 +573,18 @@ impl HeaderTxsTable {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let first_path = dir.join("header_txs_first.body");
         let count_path = dir.join("header_txs_count.body");
-        ArrayTable::restore_ahead(&first_path)?;
-        ArrayTable::restore_ahead(&count_path)?;
+        // The pair is one commit. Only restore when both sidecars exist; a
+        // lone one is a crash between the two sidecar writes, before either
+        // payload, and the old pair is still whole.
+        let first_side = ArrayTable::ahead_path(&first_path);
+        let count_side = ArrayTable::ahead_path(&count_path);
+        if first_side.is_file() && count_side.is_file() {
+            ArrayTable::restore_ahead(&first_path)?;
+            ArrayTable::restore_ahead(&count_path)?;
+        } else {
+            let _ = std::fs::remove_file(&first_side);
+            let _ = std::fs::remove_file(&count_side);
+        }
         Ok(Self {
             first: ArrayTable::open(first_path, TableKind::ArrayLink)?,
             count: ArrayTable::open(count_path, TableKind::ArrayLink)?,
@@ -780,9 +790,7 @@ impl HeaderTxsTable {
                 std::io::Error::other("injected header_txs ahead failure"),
             ));
         }
-        if let Err(e) = self.first.flush().and_then(|()| self.count.flush()) {
-            return Err(e);
-        }
+        self.first.flush().and_then(|()| self.count.flush())?;
         ArrayTable::remove_ahead(first_ahead)?;
         ArrayTable::remove_ahead(count_ahead)?;
         Ok(())
@@ -791,9 +799,9 @@ impl HeaderTxsTable {
     pub fn flush_async(&self) -> Result<(), StoreError> {
         let first_ahead = self.first.write_ahead()?;
         let count_ahead = self.count.write_ahead()?;
-        if let Err(e) = self.first.flush_async().and_then(|()| self.count.flush_async()) {
-            return Err(e);
-        }
+        self.first
+            .flush_async()
+            .and_then(|()| self.count.flush_async())?;
         ArrayTable::remove_ahead(first_ahead)?;
         ArrayTable::remove_ahead(count_ahead)?;
         Ok(())

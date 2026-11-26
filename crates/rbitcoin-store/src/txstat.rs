@@ -129,8 +129,7 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         }
         file.seek(SeekFrom::Start(off))
             .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(image)
-            .map_err(|e| StoreError::io(path, e))?;
+        file.write_all(image).map_err(|e| StoreError::io(path, e))?;
         at += AHEAD_REC;
     }
     let header = file::encode_leading_header(TableKind::TxStat, logical);
@@ -353,7 +352,7 @@ impl TxStat {
         let mut blocks: BTreeMap<u64, [u8; 4096]> = BTreeMap::new();
         let mut block = first;
         while block <= last {
-            blocks.insert(block, read_page(&self.body.path(), &self.body, block)?);
+            blocks.insert(block, read_page(self.body.path(), &self.body, block)?);
             block += 4096;
         }
         for (at, byte) in bytes.iter().enumerate() {
@@ -366,7 +365,13 @@ impl TxStat {
         buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
-        buf.extend_from_slice(&self.body.logical_len().max(start + bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(
+            &self
+                .body
+                .logical_len()
+                .max(start + bytes.len() as u64)
+                .to_le_bytes(),
+        );
         for (off, image) in &blocks {
             buf.extend_from_slice(&off.to_le_bytes());
             let mut eng = sha256::HashEngine::default();

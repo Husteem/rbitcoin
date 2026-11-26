@@ -49,7 +49,10 @@ fn torn_txstat_page_restores_from_ahead_image() {
 
     let t = TxStat::open(&dir).unwrap();
     assert_eq!(t.count(), 601);
-    assert_eq!(t.get_cell(Fk(509)).unwrap(), pack_cell(&rows[508]).unwrap().0);
+    assert_eq!(
+        t.get_cell(Fk(509)).unwrap(),
+        pack_cell(&rows[508]).unwrap().0
+    );
     assert_eq!(
         t.get_cell(Fk(601)).unwrap(),
         pack_cell(&tiny(7, 1, 2)).unwrap().0
