@@ -796,9 +796,24 @@ pub async fn tx_outspend(
     .await
 }
 
-/// Most entries one `GET /tx/:txid/outspends` answers. A tx with more outputs
-/// is read a page at a time with `?start_index=`.
+/// Entries in one `?start_index=` page of `GET /tx/:txid/outspends`. An
+/// outspends reply with more entries, unpaged or bulk, is built under the
+/// node's single heavy turn ([`outspends_heavy_turn`]).
 pub const MAX_TX_OUTSPENDS_PAGE: u32 = 10_000;
+
+/// The node's single heavy turn when an outspends reply has more than
+/// [`MAX_TX_OUTSPENDS_PAGE`] entries, so only one such reply is built at a
+/// time. Taken before any spender is read and held for the whole build.
+#[doc(hidden)]
+pub fn outspends_heavy_turn(
+    query: &Query,
+    entries: u64,
+) -> Result<Option<rbitcoin_query::scripthash::JoinAdmit>, rbitcoin_query::QueryError> {
+    if entries <= u64::from(MAX_TX_OUTSPENDS_PAGE) {
+        return Ok(None);
+    }
+    query.take_heavy_turn().map(Some)
+}
 
 #[derive(Deserialize)]
 pub struct OutspendsPageQuery {
@@ -852,6 +867,10 @@ pub async fn tx_outspends(
             Ok(r) => r,
             Err(r) => return r,
         };
+        let _turn = match outspends_heavy_turn(&st.query, u64::from(end - first)) {
+            Ok(t) => t,
+            Err(e) => return store_err(e),
+        };
         let view = match pin_or_reject(&st.query, ChainViewKind::Tip, asof) {
             Ok(v) => v,
             Err(r) => return r,
@@ -886,19 +905,13 @@ pub fn confirmed_output_count(query: &Query, fk: Fk) -> Result<u32, StoreError> 
         .ok_or(StoreError::NotFound)
 }
 
-/// The vouts `first..end` one `/tx/:txid/outspends` reply covers. Without
-/// `start_index` a tx over [`MAX_TX_OUTSPENDS_PAGE`] outputs is a 400, so an
-/// Esplora client never takes a short array for the whole tx. A
+/// The vouts `first..end` one `/tx/:txid/outspends` reply covers: every one
+/// without `start_index`, as Esplora answers, else one page from there. A
 /// `start_index` past the last output is a 404, except 0 on a tx with none.
 #[allow(clippy::result_large_err)] // axum Response
 #[doc(hidden)]
 pub fn outspends_page(start: Option<u32>, nout: u32) -> Result<(u32, u32), Response> {
     match start {
-        None if nout > MAX_TX_OUTSPENDS_PAGE => Err((
-            StatusCode::BAD_REQUEST,
-            "Too many outputs; page with start_index",
-        )
-            .into_response()),
         None => Ok((0, nout)),
         Some(s) if s > 0 && s >= nout => {
             Err((StatusCode::NOT_FOUND, "start index out of range").into_response())

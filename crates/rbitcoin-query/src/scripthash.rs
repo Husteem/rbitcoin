@@ -935,6 +935,15 @@ impl Query {
                 _turn: None,
             });
         }
+        self.take_heavy_turn()
+    }
+
+    /// The node's single heavy turn for any heavy API read, taken as
+    /// [`Self::heavy_turn`] takes it: admitted under the [`heavy_turn_job`]
+    /// that holds it, taken when free, and refused at once when taken so the
+    /// job's caller waits on its task and runs the read again. Hold the admit
+    /// for the whole read.
+    pub fn take_heavy_turn(&self) -> Result<JoinAdmit, QueryError> {
         if HEAVY_TURN_GRANTED.with(std::cell::Cell::get) {
             return Ok(JoinAdmit {
                 heavy: true,
@@ -951,7 +960,7 @@ impl Query {
                 #[cfg(debug_assertions)]
                 self.heavy_turn_refusals
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err(StoreError::Rejected("heavy scripthash join busy"))
+                Err(StoreError::Rejected("heavy turn busy"))
             }
         }
     }
@@ -2603,8 +2612,9 @@ impl ShHistoryWalk {
     }
 }
 
-/// An admitted unpaged join. A heavy one holds the node's single heavy turn
-/// until this drops, unless its [`heavy_turn_job`] already holds it.
+/// An admitted unpaged join or heavy read. A heavy one holds the node's
+/// single heavy turn until this drops, unless its [`heavy_turn_job`] already
+/// holds it.
 pub struct JoinAdmit {
     pub heavy: bool,
     _turn: Option<tokio::sync::OwnedSemaphorePermit>,

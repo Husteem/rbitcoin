@@ -630,6 +630,10 @@ pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Res
         }
         nouts.push(nout);
     }
+    let _turn = match crate::handlers::outspends_heavy_turn(&st.query, total) {
+        Ok(t) => t,
+        Err(e) => return store_err(e),
+    };
     let view = match pin_or_reject(&st.query, ChainViewKind::Tip, None) {
         Ok(v) => v,
         Err(r) => return r,

@@ -115,7 +115,7 @@ timeout (`TimeoutLayer`, status 408). `admit_connection` holds the wait.
 | Max broadcast hex | ~8 MiB | `transaction.broadcast` hex length |
 | Max batch items | 345 | Requests in one JSON-RPC batch line; more is one `-32600`. The reply is written one slot at a time. A connection holds at most 1 MiB of finished, unwritten replies, or one reply (`BATCH_HELD_BYTES`): a read that finishes past that drops its reply and runs again at its slot, so a slow reader costs its own reads again, not RAM |
 | Batch reads at once | half the blocking pool, at least 1 (2 at 4 threads) | Read-only batch items in flight per connection (tasks and unwritten replies). Node-wide disk slots are `--store-read-budget`, not half the pool. One batch no longer keeps half the pool by occupying it. The tasks wait asynchronously when the budget is taken |
-| Heavy SH joins at once | 1 (`--heavy-sh-creates`, default 10000) | Node-wide: an unpaged Electrum/Esplora join above N creates waits for any other such join, from any connection or batch. Lighter joins stay parallel. **0** turns it off |
+| Heavy SH joins at once | 1 (`--heavy-sh-creates`, default 10000) | Node-wide: an unpaged Electrum/Esplora join above N creates waits for any other such join, from any connection or batch. Lighter joins stay parallel. **0** turns it off. Esplora outspends replies over 10,000 entries take the same turn regardless of N |
 
 Edge rate-limits, auth, and TLS cipher policy stay on the proxy. See
 [`SECURITY.md`](../../SECURITY.md).
