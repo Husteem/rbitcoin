@@ -200,3 +200,79 @@ fn concurrent_header_blobs_keep_their_own_bytes() {
         .collect();
     assert!(wrong.is_empty(), "headers read another blob: {wrong:?}");
 }
+
+fn ahead_body(logical: u64) -> Vec<u8> {
+    let mut h = vec![0u8; 20];
+    h[0..4].copy_from_slice(b"TTA1");
+    h[4..6].copy_from_slice(&1u16.to_le_bytes());
+    h[8..12].copy_from_slice(&1u32.to_le_bytes());
+    h[12..20].copy_from_slice(&logical.to_le_bytes());
+    h
+}
+
+fn ahead_page(off: u64) -> Vec<u8> {
+    use bitcoin_hashes::{sha256, Hash, HashEngine};
+    let mut image = vec![0u8; 4096];
+    image[0] = 9;
+    let mut out = Vec::new();
+    out.extend_from_slice(&off.to_le_bytes());
+    let mut eng = sha256::HashEngine::default();
+    eng.input(&off.to_le_bytes());
+    eng.input(&image);
+    out.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
+    out.extend_from_slice(&image);
+    out
+}
+
+#[test]
+fn txstat_open_rejects_every_bad_ahead_shape() {
+    let dir = TempDir::labeled("txstat-ahead-bad").unwrap();
+    let side = dir.join("txstat.body.ahead");
+    let t = TxStat::create(&dir).unwrap();
+    drop(t);
+
+    let mut zero = ahead_body(4096);
+    zero[8..12].copy_from_slice(&0u32.to_le_bytes());
+    let mut bad_magic = ahead_body(4096);
+    bad_magic[0] ^= 1;
+    let mut bad_ver = ahead_body(4096);
+    bad_ver[4] = 2;
+    let mut short = ahead_body(4096);
+    short.extend_from_slice(&[0u8; 10]);
+    let mut misaligned = ahead_body(4096);
+    let mut bad_sum = ahead_page(4096);
+    bad_sum[8] ^= 1;
+    let mut trailing = ahead_body(4096);
+    trailing.extend_from_slice(&ahead_page(4096));
+    trailing.push(0);
+
+    for (case, raw) in [
+        zero,
+        bad_magic,
+        bad_ver,
+        short,
+        {
+            misaligned.extend_from_slice(&ahead_page(4096));
+            misaligned[20..28].copy_from_slice(&1u64.to_le_bytes());
+            misaligned
+        },
+        {
+            let mut bad_off = ahead_body(4096);
+            bad_off.extend_from_slice(&ahead_page(4097));
+            bad_off
+        },
+        {
+            let mut b = ahead_body(8192);
+            b.extend_from_slice(&bad_sum);
+            b
+        },
+        trailing,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        std::fs::write(&side, raw).unwrap();
+        assert!(TxStat::open(&dir).is_err(), "case {case} was accepted");
+    }
+    let _ = std::fs::remove_dir_all(dir.path());
+}

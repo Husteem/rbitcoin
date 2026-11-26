@@ -105,6 +105,9 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         return Err(StoreError::Corrupt("txstat ahead version"));
     }
     let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+    if count == 0 {
+        return Err(StoreError::Corrupt("txstat ahead count"));
+    }
     let logical = u64::from_le_bytes([
         raw[12], raw[13], raw[14], raw[15], raw[16], raw[17], raw[18], raw[19],
     ]);
@@ -136,6 +139,9 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
             .map_err(|e| StoreError::io(path, e))?;
         file.write_all(image).map_err(|e| StoreError::io(path, e))?;
         at += AHEAD_REC;
+    }
+    if at != raw.len() {
+        return Err(StoreError::Corrupt("txstat ahead length"));
     }
     let header = file::encode_leading_header(TableKind::TxStat, logical);
     file.seek(SeekFrom::Start(0))
