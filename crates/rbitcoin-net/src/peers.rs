@@ -3030,11 +3030,13 @@ impl PeerHub {
     /// Rows for a net this process cannot dial are not stored. Unroutable
     /// clearnet is not stored. Relaying is separate and drops the same rows.
     /// `source` is the sending peer; its netgroup bounds how much of a full
-    /// book it may replace.
+    /// book it may replace. `now` is the node clock, used to reject a
+    /// gossiped time outside Core's window.
     pub fn learn_addrv2(
         &self,
         source: crate::NetAddr,
         list: &[bitcoin::p2p::address::AddrV2Message],
+        now: u64,
     ) {
         let g = self.addrman.lock().unwrap_or_else(|e| e.into_inner());
         let Some(am) = g.as_ref() else {
@@ -3046,7 +3048,7 @@ impl PeerHub {
                 if crate::netaddr::netaddr_unroutable_gossip(addr) {
                     continue;
                 }
-                book.add_learned_addr(addr, source, crate::seeds::MAX_ADDR_MAN);
+                book.add_gossiped_addr(addr, source, a.time, now, crate::seeds::MAX_ADDR_MAN);
             }
         }
     }
@@ -3121,10 +3123,10 @@ impl PeerHub {
         let Some(am) = am else {
             return Vec::new();
         };
-        let entries = {
-            let g = am.lock().unwrap_or_else(|e| e.into_inner());
-            g.entries()
-        };
+        // One lock for the snapshot, the sample, and the stamp: a concurrent
+        // eviction cannot remove a sampled row between two lock sections.
+        let mut g = am.lock().unwrap_or_else(|e| e.into_inner());
+        let entries = g.entries();
         let addrs: Vec<crate::NetAddr> = entries
             .iter()
             .map(|e| e.addr)
@@ -3145,10 +3147,14 @@ impl PeerHub {
             let j = (state as usize) % (i + 1);
             idxs.swap(i, j);
         }
+        let sampled: Vec<crate::NetAddr> = idxs.iter().take(cap).map(|&i| addrs[i]).collect();
+        g.stamp_missing_seen_for(&sampled, now);
         let mut out = Vec::with_capacity(cap);
-        for &i in idxs.iter().take(cap) {
-            out.push((now as u32, addrs[i]));
+        for addr in sampled {
+            let last_seen = g.last_seen_of(&addr);
+            out.push((crate::seeds::row_reply_time(last_seen, now), addr));
         }
+        drop(g);
         cache.insert(key, (now, out.clone()));
         out
     }
@@ -3883,6 +3889,20 @@ impl PeerHub {
         peer
     }
 
+    fn note_disconnected_outbound(&self, net: crate::NetAddr) {
+        let am = {
+            let g = self.addrman.lock().unwrap_or_else(|e| e.into_inner());
+            g.clone()
+        };
+        let Some(am) = am else {
+            return;
+        };
+        let now = self.now_secs().min(u64::from(u32::MAX)) as u32;
+        am.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_disconnected_addr(net, now);
+    }
+
     pub fn unregister(&self, id: u64) {
         if let Some(mp) = self
             .mempool
@@ -3899,6 +3919,18 @@ impl PeerHub {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
         if let Some(p) = removed {
+            // Core `FinalizeNode` calls `AddrMan::Connected` for a full
+            // outbound peer after it is gone, so the time is refreshed at
+            // disconnect, never while the session is live.
+            if p.handshake_complete()
+                && !p.inbound
+                && matches!(
+                    p.conn_type,
+                    PeerConnType::OutboundFullRelay | PeerConnType::Manual
+                )
+            {
+                self.note_disconnected_outbound(p.net);
+            }
             p.release_all_cmpct();
             p.end_block_download();
             self.end_headers_sync(&p);

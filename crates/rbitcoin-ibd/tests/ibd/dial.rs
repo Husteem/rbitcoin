@@ -878,6 +878,39 @@ fn apply_dial_result_updates_book() {
 }
 
 #[test]
+fn apply_dial_result_sets_flags_and_keeps_the_row_time() {
+    let mut book = AddrMan::new();
+    let good = addr(15);
+    let row = rbitcoin_net::NetAddr::from_socket(good);
+    assert!(book.add_learned_addr_at(row, row, 1_690_000_000, 0, 1_700_000_000, 8));
+    let result = DialBatchResult {
+        slots: vec![dummy_slot(0, good, true)],
+        failed: vec![],
+        attempted: vec![row],
+    };
+    let now = Instant::now();
+    let mut cooldown = HashMap::new();
+    let mut strikes = HashMap::new();
+    apply_dial_result(&mut book, &result, &mut cooldown, &mut strikes, now);
+    assert!(book.flags(&good).has_connected());
+    assert_eq!(
+        book.last_seen_of(&row),
+        1_690_000_000,
+        "a live outbound is not advertised as just seen"
+    );
+    book.note_disconnected_addr(row, 1_700_000_000);
+    assert_eq!(book.last_seen_of(&row), 1_700_000_000);
+    book.note_disconnected_addr(row, 1_700_000_600);
+    assert_eq!(
+        book.last_seen_of(&row),
+        1_700_000_000,
+        "twenty minutes is not old enough"
+    );
+    book.note_disconnected_addr(row, 1_700_001_201);
+    assert_eq!(book.last_seen_of(&row), 1_700_001_201);
+}
+
+#[test]
 fn redial_want_at_least_two_when_short() {
     assert_eq!(redial_want(16, 16), 0);
     assert_eq!(redial_want(15, 16), 2);

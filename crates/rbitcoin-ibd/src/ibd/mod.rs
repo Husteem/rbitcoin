@@ -502,7 +502,16 @@ impl PeerBookSession {
             if let Ok(mut g) = s.lock() {
                 let mut book = self.book.clone();
                 for e in g.entries() {
-                    if !self.seen.contains(&e.addr) {
+                    // A row this session pulled before the shared book changed
+                    // is written back from the session copy. Merge only the
+                    // shared time into it, so a reply-side normalization is
+                    // kept and a successful connection's cleared flag is not
+                    // restored; a row the session dropped stays out.
+                    if self.seen.contains(&e.addr) {
+                        if book.entry_of(&e.addr).is_some() {
+                            book.merge_seen_from(&g, e.addr);
+                        }
+                    } else {
                         book.copy_row_from(&g, e.addr);
                     }
                 }

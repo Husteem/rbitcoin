@@ -223,19 +223,21 @@ fn trust_peer_ignores_learned_addrs() {
     rbitcoin_ibd::ibd::events::learn_peer_addrs(
         true,
         &mut book,
-        &[learned],
+        &[(1_700_000_000, learned)],
         local,
         rbitcoin_net::NetAddr::Ip(local),
         0,
+        1_700_000_000,
     );
     assert!(book.is_empty(), "trust-peer must not keep gossip");
     rbitcoin_ibd::ibd::events::learn_peer_addrs(
         false,
         &mut book,
-        &[learned],
+        &[(1_700_000_000, learned)],
         local,
         rbitcoin_net::NetAddr::Ip(local),
         0,
+        1_700_000_000,
     );
     assert_eq!(book.len(), 1, "flag off still learns addresses");
 }

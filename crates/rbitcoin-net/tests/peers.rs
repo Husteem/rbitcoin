@@ -1821,6 +1821,193 @@ fn getaddr_omits_unroutable_clearnet() {
     );
 }
 
+/// A `getaddr` reply carries the time the row was learned. Stamping the
+/// reply time makes a dead row look freshly seen to the receiver, which keeps
+/// it in that node's book and on the wire: addr stamping.
+#[test]
+fn getaddr_reply_keeps_the_learned_time() {
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    hub.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+    let source = rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333)));
+    let learned_at = 1_699_000_000;
+    hub.learn_addrv2(
+        source,
+        &[AddrV2Message {
+            time: learned_at,
+            services: ServiceFlags::NETWORK,
+            addr: rbitcoin_net::NetAddr::Ip(SocketAddr::from(([9, 9, 9, 9], 8333))).to_addrv2(),
+            port: 8333,
+        }],
+        1_700_000_000,
+    );
+    let got = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(
+        got[0].0,
+        learned_at - 2 * 60 * 60,
+        "reply must not restamp the row, and gossip is discounted"
+    );
+}
+
+/// A row with no learned time (seed, `peers` file, `addnode`) is reported as
+/// Core backdates an untrusted time: five days old, never `now`.
+#[test]
+fn getaddr_reply_backdates_a_row_with_no_time() {
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    let mut am = rbitcoin_net::seeds::AddrMan::new();
+    am.add(SocketAddr::from(([9, 9, 9, 9], 8333)));
+    hub.set_addrman(Arc::new(Mutex::new(am)));
+    let got = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, 1_700_000_000 - 5 * 24 * 60 * 60);
+}
+
+/// A gossiped time outside Core's trust window (before 1973, or more than ten
+/// minutes ahead) is dropped: the row keeps no time instead of a fresh one.
+#[test]
+fn getaddr_reply_drops_an_insane_gossiped_time() {
+    let now = 1_700_000_000u64;
+    for time in [0u32, now as u32 + 3_600] {
+        let hub = PeerHub::new();
+        hub.set_mock_now(now);
+        hub.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+        hub.learn_addrv2(
+            rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333))),
+            &[AddrV2Message {
+                time,
+                services: ServiceFlags::NETWORK,
+                addr: rbitcoin_net::NetAddr::Ip(SocketAddr::from(([9, 9, 9, 9], 8333))).to_addrv2(),
+                port: 8333,
+            }],
+            now,
+        );
+        let got = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(
+            got[0].0,
+            now as u32 - 5 * 24 * 60 * 60 - 2 * 60 * 60,
+            "gossiped time {time} is outside Core's window"
+        );
+    }
+}
+
+/// Re-gossip of a held row cannot move its time forward: otherwise a spammer
+/// keeps a dead row fresh by repeating it.
+#[test]
+fn getaddr_reply_does_not_refresh_a_held_row() {
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    hub.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+    let source = rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333)));
+    let row = |time: u32| AddrV2Message {
+        time,
+        services: ServiceFlags::NETWORK,
+        addr: rbitcoin_net::NetAddr::Ip(SocketAddr::from(([9, 9, 9, 9], 8333))).to_addrv2(),
+        port: 8333,
+    };
+    hub.learn_addrv2(source, &[row(1_699_996_400)], 1_700_000_000);
+    hub.learn_addrv2(source, &[row(1_700_000_000)], 1_700_000_000);
+    let got = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, 1_699_996_400 - 2 * 60 * 60);
+}
+
+/// Core `ProcessAddrs` charges a source's gossip two hours, so the row we
+/// report is not fresher than Core's book would hold.
+#[test]
+fn getaddr_reply_discounts_gossip_by_two_hours() {
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    hub.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+    hub.learn_addrv2(
+        rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333))),
+        &[AddrV2Message {
+            time: 1_699_996_400,
+            services: ServiceFlags::NETWORK,
+            addr: rbitcoin_net::NetAddr::Ip(SocketAddr::from(([9, 9, 9, 9], 8333))).to_addrv2(),
+            port: 8333,
+        }],
+        1_700_000_000,
+    );
+    let got = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, 1_699_996_400 - 2 * 60 * 60);
+}
+
+/// A held row moves to newer gossip after Core's interval, so a peer that
+/// keeps vouching for a live row does not let it age out.
+#[test]
+fn getaddr_reply_refreshes_a_held_row_after_the_interval() {
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    hub.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+    let source = rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333)));
+    let row = |time: u32| AddrV2Message {
+        time,
+        services: ServiceFlags::NETWORK,
+        addr: rbitcoin_net::NetAddr::Ip(SocketAddr::from(([9, 9, 9, 9], 8333))).to_addrv2(),
+        port: 8333,
+    };
+    hub.learn_addrv2(source, &[row(1_699_996_400)], 1_700_000_000);
+    // Now, one hour later: after the two-hour penalty the claim is older, so
+    // the held row keeps its time.
+    hub.learn_addrv2(source, &[row(1_700_000_000)], 1_700_000_000);
+    let first = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert_eq!(first[0].0, 1_699_996_400 - 2 * 60 * 60);
+    // Six hours later the claim is four hours newer and past the interval.
+    hub.set_mock_now(1_700_021_600);
+    hub.learn_addrv2(source, &[row(1_700_021_600)], 1_700_021_600);
+    let later = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18445)));
+    assert_eq!(later[0].0, 1_700_021_600 - 2 * 60 * 60);
+}
+
+/// The refresh interval uses the peer's claim, not the two-hour discounted
+/// time: a 23-hour-old third-party claim is still inside Core's one-hour
+/// band, even though the stored time is 27 hours old.
+#[test]
+fn getaddr_reply_selects_the_interval_before_the_gossip_penalty() {
+    let now = 1_700_000_000u64;
+    let hub = PeerHub::new();
+    hub.set_mock_now(now);
+    hub.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+    let source = rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333)));
+    let row = |time: u32| AddrV2Message {
+        time,
+        services: ServiceFlags::NETWORK,
+        addr: rbitcoin_net::NetAddr::Ip(SocketAddr::from(([9, 9, 9, 9], 8333))).to_addrv2(),
+        port: 8333,
+    };
+    // Claim now-25h: stored now-27h after the penalty.
+    hub.learn_addrv2(source, &[row((now - 25 * 3_600) as u32)], now);
+    // Claim now-23h: online, discounted to now-25h, one hour past stored+1h.
+    hub.learn_addrv2(source, &[row((now - 23 * 3_600) as u32)], now);
+    let got = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, (now - 25 * 3_600) as u32);
+}
+
+/// A row no peer taught a time is backdated once, on its first serve, and
+/// ages from there instead of looking five days old on every reply.
+#[test]
+fn a_row_with_no_time_ages_from_its_first_reply() {
+    let hub = PeerHub::new();
+    hub.set_mock_now(1_700_000_000);
+    let mut am = rbitcoin_net::seeds::AddrMan::new();
+    am.add(SocketAddr::from(([9, 9, 9, 9], 8333)));
+    hub.set_addrman(Arc::new(Mutex::new(am)));
+    let first = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));
+    assert_eq!(first[0].0, 1_700_000_000 - 5 * 24 * 60 * 60);
+    hub.set_mock_now(1_700_000_000 + 10 * 24 * 60 * 60);
+    let later = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18445)));
+    assert_eq!(
+        later[0].0,
+        1_700_000_000 - 5 * 24 * 60 * 60,
+        "the backdate is fixed once, not recomputed"
+    );
+}
+
 include!("overlay_addrman_journey.rs");
 
 #[test]

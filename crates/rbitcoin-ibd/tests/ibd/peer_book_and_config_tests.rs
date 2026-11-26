@@ -62,6 +62,102 @@ fn peer_book_session_injects_seeds_and_flushes_on_drop() {
     sess2.flush();
 }
 
+/// The flush into the shared (served) book keeps the time a catch-up peer
+/// taught the session book, so the transfer does not drop it back to the
+/// five-day backdate.
+#[test]
+fn a_flush_keeps_a_gossiped_row_time() {
+    let shared = Arc::new(Mutex::new(AddrMan::new()));
+    let mut sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[]);
+    let row = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 8333);
+    let now = 1_700_000_000u64;
+    rbitcoin_ibd::ibd::events::inject_learned_addrs(
+        sess.book_mut(),
+        &[(1_699_996_400, rbitcoin_net::NetAddr::Ip(row))],
+        SocketAddr::from(([127, 0, 0, 1], 18444)),
+        rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333))),
+        1,
+        now,
+    );
+    sess.flush();
+    let book = shared.lock().unwrap();
+    assert_eq!(
+        book.last_seen_of(&rbitcoin_net::NetAddr::Ip(row)),
+        1_699_996_400 - 2 * 60 * 60
+    );
+}
+
+/// A reply-side normalization of a shared row during catch-up survives the
+/// session's flush; a row taken at construction is not written back over the
+/// newer shared time.
+#[test]
+fn a_flush_keeps_a_normalized_shared_time() {
+    let shared = Arc::new(Mutex::new(AddrMan::new()));
+    let row = sa(7);
+    shared.lock().unwrap().add(row);
+    let sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[]);
+    let net = rbitcoin_net::NetAddr::from_socket(row);
+    let now = 1_700_000_000u64;
+    shared.lock().unwrap().stamp_missing_seen_for(&[net], now);
+    let fixed = (now - 5 * 24 * 60 * 60) as u32;
+    assert_eq!(shared.lock().unwrap().last_seen_of(&net), fixed);
+    drop(sess);
+    assert_eq!(
+        shared.lock().unwrap().last_seen_of(&net),
+        fixed,
+        "the flush keeps the normalized time"
+    );
+}
+
+/// A taken row's flush merges only its time: a successful session
+/// connection's cleared `INCOMPATIBLE` flag is not restored from the shared
+/// book's stale copy.
+#[test]
+fn a_flush_keeps_a_cleared_flag() {
+    let shared = Arc::new(Mutex::new(AddrMan::new()));
+    let row = sa(8);
+    let net = rbitcoin_net::NetAddr::from_socket(row);
+    {
+        let mut book = shared.lock().unwrap();
+        assert!(book.add_learned_addr_at(net, net, 1_700_000_000, 0, 1_700_000_000, 8));
+        book.note_connect_failed_addr(net, true);
+        assert!(book.flags_of(&net).is_incompatible());
+    }
+    let mut sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[]);
+    sess.book_mut().note_connected_addr(net);
+    assert!(!sess.book().flags_of(&net).is_incompatible());
+    sess.flush();
+    assert!(
+        !shared.lock().unwrap().flags_of(&net).is_incompatible(),
+        "the flush must not restore the stale flag"
+    );
+}
+
+/// A future time normalized downward by a reply is a normalized value, not
+/// a stale one: the flush keeps the lower backdate.
+#[test]
+fn a_flush_keeps_a_lowered_normalized_time() {
+    let shared = Arc::new(Mutex::new(AddrMan::new()));
+    let row = sa(11);
+    let net = rbitcoin_net::NetAddr::from_socket(row);
+    let now = 1_700_000_000u64;
+    let future = 1_800_000_000;
+    assert!(shared
+        .lock()
+        .unwrap()
+        .add_learned_addr_at(net, net, future, 0, now, 8));
+    let sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[]);
+    shared.lock().unwrap().stamp_missing_seen_for(&[net], now);
+    let fixed = (now - 5 * 24 * 60 * 60) as u32;
+    assert_eq!(shared.lock().unwrap().last_seen_of(&net), fixed);
+    drop(sess);
+    assert_eq!(
+        shared.lock().unwrap().last_seen_of(&net),
+        fixed,
+        "the lowered normalized time survives the flush"
+    );
+}
+
 /// Rows another writer adds to the shared book during catch-up (the
 /// deferred DNS seeds) reach this session and survive its flush. A row
 /// the session dropped is not pulled back in.

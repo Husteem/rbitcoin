@@ -484,9 +484,28 @@ pub fn apply_peer_event(
                 local_addr,
                 from,
                 peer,
+                hub.clock.now_secs(),
             );
         }
-        PeerEvent::Dead { peer, reason } => apply_peer_dead(st, peer_book, peer, reason),
+        PeerEvent::Dead { peer, reason } => {
+            // Core `FinalizeNode` refreshes an outbound full-relay row's
+            // time after the peer is gone. The catch-up slot ending is that
+            // point; the dial success only set the flags.
+            if let Some(s) = st.slots.iter().find(|s| s.id == peer) {
+                if matches!(
+                    s.conn_type,
+                    rbitcoin_net::peers::PeerConnType::OutboundFullRelay
+                        | rbitcoin_net::peers::PeerConnType::Manual
+                ) {
+                    let net = s.net;
+                    peer_book.note_disconnected_addr(
+                        net,
+                        hub.clock.now_secs().min(u64::from(u32::MAX)) as u32,
+                    );
+                }
+            }
+            apply_peer_dead(st, peer_book, peer, reason)
+        }
     }
 }
 
@@ -1193,33 +1212,36 @@ pub fn apply_peer_dead(
 pub fn learn_peer_addrs(
     trust_peer: bool,
     book: &mut AddrMan,
-    addrs: &[rbitcoin_net::NetAddr],
+    addrs: &[(u32, rbitcoin_net::NetAddr)],
     local_addr: SocketAddr,
     source: rbitcoin_net::NetAddr,
     from_peer: usize,
+    now: u64,
 ) {
     if trust_peer {
         return;
     }
-    inject_learned_addrs(book, addrs, local_addr, source, from_peer);
+    inject_learned_addrs(book, addrs, local_addr, source, from_peer, now);
 }
 
 /// Grow the IBD dial book from peer-advertised addresses (getaddr responses).
 ///
 /// `source` is the peer at `from_peer`; its netgroup bounds how much of a
-/// full book it may replace.
+/// full book it may replace. `now` is the node clock; each row keeps its
+/// claimed time, sanitized and charged as `learn_addrv2` does.
 pub fn inject_learned_addrs(
     book: &mut AddrMan,
-    addrs: &[rbitcoin_net::NetAddr],
+    addrs: &[(u32, rbitcoin_net::NetAddr)],
     local_addr: SocketAddr,
     source: rbitcoin_net::NetAddr,
     from_peer: usize,
+    now: u64,
 ) {
     if addrs.is_empty() {
         return;
     }
     let mut added = 0usize;
-    for &a in addrs {
+    for &(time, a) in addrs {
         if a.port() == 0 || rbitcoin_net::netaddr::netaddr_unroutable_gossip(a) {
             continue;
         }
@@ -1227,7 +1249,7 @@ pub fn inject_learned_addrs(
             rbitcoin_net::NetAddr::Ip(s) if s == local_addr => continue,
             _ => {}
         }
-        if book.add_learned_addr(a, source, MAX_PEER_POOL) {
+        if book.add_gossiped_addr(a, source, time, now, MAX_PEER_POOL) {
             tally_learned_addr(&mut added);
         }
     }

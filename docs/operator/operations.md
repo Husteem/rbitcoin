@@ -213,8 +213,8 @@ sent again.
 `--onion HOST:PORT` stores a separate SOCKS endpoint for onion destinations.
 `--only-net onion` (repeatable with `ipv4`/`ipv6`/`i2p`/`cjdns`) filters dial and learn;
 onion requires `--proxy` or `--onion`. `--connect foo.onion:8333` is a start
-error when the v3 checksum is invalid. The peers file is `rbitcoin-peers-v2`
-(v1 IPv4/IPv6 still loads).
+error when the v3 checksum is invalid. The peers file is `rbitcoin-peers-v3`
+(v1 and v2 still load).
 
 `--listen=0` / `--no-listen` disables the regular P2P bind. If both the regular
 and marked binds are absent, `--listen-onion` opens an ephemeral port on `127.0.0.1`.

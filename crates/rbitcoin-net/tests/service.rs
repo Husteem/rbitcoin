@@ -1176,3 +1176,137 @@ async fn dual_stack_inbound_ipv4_keeps_a_mapped_whitelist_grant() {
         "noban@::ffff:127.0.0.1 on a dual-stack 127.0.0.1 inbound"
     );
 }
+
+/// A full outbound handshake refreshes the row we dialed; an inbound
+/// session leaves its row alone. Both run through a node's real connection
+/// paths, not the registration helper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handshakes_refresh_only_outbound_rows() {
+    use rbitcoin_net::peers::DialTarget;
+    use rbitcoin_net::seeds::AddrMan;
+    use rbitcoin_net::socks::Dialer;
+    use std::sync::Mutex;
+
+    let (_srv_dir, srv_query) =
+        rbitcoin_query::testutil::tiny_query_labeled("handshake-refresh-srv");
+    let srv = P2PNode::start_with_dialer(
+        "127.0.0.1:0".parse().unwrap(),
+        srv_query,
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:srv/".into(),
+        rbitcoin_net::DEFAULT_MAX_INBOUND,
+        Dialer::Direct,
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .expect("server node");
+    let (_cli_dir, cli_query) =
+        rbitcoin_query::testutil::tiny_query_labeled("handshake-refresh-cli");
+    let cli = P2PNode::start_with_dialer(
+        "127.0.0.1:0".parse().unwrap(),
+        cli_query,
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:cli/".into(),
+        rbitcoin_net::DEFAULT_MAX_INBOUND,
+        Dialer::Direct,
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .expect("client node");
+
+    let now = 1_700_000_000u64;
+    cli.peers.set_mock_now(now);
+    let target = rbitcoin_net::NetAddr::from_socket(srv.local_addr);
+    let mut book = AddrMan::new();
+    assert!(book.add_learned_addr_at(target, target, 1_690_000_000, 0, now, 8));
+    let book = Arc::new(Mutex::new(book));
+    cli.peers.set_addrman(Arc::clone(&book));
+
+    let prepared = prepare_outbound_session(
+        DialTarget::from_net(target),
+        None,
+        Magic::REGTEST,
+        cli.local_addr,
+        Arc::clone(&cli.hub),
+        Arc::clone(&cli.peers),
+        cli.user_agent.clone(),
+        Arc::clone(&cli.follow_live),
+        PeerConnType::OutboundFullRelay,
+        Dialer::Direct,
+    )
+    .await
+    .expect("outbound handshake");
+    let live = first_handshaken(cli.peers.clone(), false);
+    let task = tokio::spawn(run_prepared_outbound(prepared));
+    live.await.unwrap().expect("live outbound row");
+    assert_eq!(
+        book.lock().unwrap().last_seen_of(&target),
+        1_690_000_000,
+        "a live outbound is not advertised as just seen"
+    );
+
+    // Inbound: bind a fixed source, put that row in the book, handshake in.
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let src = sock.local_addr().unwrap();
+    let src_net = rbitcoin_net::NetAddr::from_socket(src);
+    assert!(book
+        .lock()
+        .unwrap()
+        .add_learned_addr_at(src_net, src_net, 1_690_000_000, 0, now, 8));
+    let watch = first_handshaken(cli.peers.clone(), true);
+    let stream = sock.connect(cli.local_addr).await.unwrap();
+    let hs = rbitcoin_net::peer::connect_and_handshake_timed(
+        Duration::from_secs(5),
+        stream,
+        Magic::REGTEST,
+        src,
+        cli.local_addr,
+        0,
+        false,
+        "/rbitcoin:inbound/",
+        rbitcoin_net::peer::HandshakePolicy::plain(),
+    )
+    .await
+    .expect("inbound handshake");
+    let row = watch.await.unwrap().expect("handshaken inbound row");
+    assert!(row.inbound);
+    assert_eq!(
+        book.lock().unwrap().last_seen_of(&src_net),
+        1_690_000_000,
+        "a live inbound does not refresh its row"
+    );
+
+    // Close the outbound peer: Core `FinalizeNode` refreshes at disconnect.
+    srv.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("outbound session ends")
+        .expect("outbound task")
+        .expect("outbound session result");
+    assert_eq!(
+        book.lock().unwrap().last_seen_of(&target),
+        now as u32,
+        "the outbound row refreshes when the session ends"
+    );
+
+    // Close the inbound peer: an inbound session never refreshes a row.
+    drop(hs);
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while cli.peers.snapshot().iter().any(|p| p.inbound) && std::time::Instant::now() < end {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !cli.peers.snapshot().iter().any(|p| p.inbound),
+        "the inbound session closed before the row-time check"
+    );
+    assert_eq!(
+        book.lock().unwrap().last_seen_of(&src_net),
+        1_690_000_000,
+        "an inbound session never refreshes its row"
+    );
+
+    cli.shutdown().await;
+}

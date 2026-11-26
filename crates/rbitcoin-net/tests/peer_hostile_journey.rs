@@ -41,57 +41,58 @@ async fn addrv2_gossip_drops_unroutable_clearnet() {
     dst.set_wants_addrv2();
     let (_dst_tx, mut dst_rx) = dst.open_out();
     peers.set_mock_now(peer.connected_at_secs() + 10_000);
+    let t = peers.now_secs() as u32 - 60;
 
     let public = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
         port: 8333,
     };
     let lan = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Ipv4(Ipv4Addr::new(10, 0, 0, 1)),
         port: 8333,
     };
     let cgnat = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Ipv4(Ipv4Addr::new(100, 64, 0, 1)),
         port: 8333,
     };
     let zero_port = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 8)),
         port: 0,
     };
     let i2p = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::I2p([0x11; 32]),
         port: 0,
     };
     let tor_v2 = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::TorV2([0xab; 10]),
         port: 8333,
     };
     let cjdns_bad = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Cjdns(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
         port: 8333,
     };
     let cjdns = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Cjdns(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1)),
         port: 8333,
     };
     let unknown = AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr: AddrV2::Unknown(0x99, vec![1, 2, 3, 4]),
         port: 8333,
@@ -134,6 +135,261 @@ async fn addrv2_gossip_drops_unroutable_clearnet() {
         book.entry_of(&rbitcoin_net::NetAddr::from_socket(lan_sock)).is_none(),
         "learn_addrv2 does not store RFC1918"
     );
+}
+
+/// Core `ProcessAddrs` rewrites an insane address time before
+/// `RelayAddress`, so a neighbor never receives a future or 1970 time.
+#[tokio::test]
+async fn addrv2_relay_sanitizes_an_insane_time() {
+    use bitcoin::p2p::message::NetworkMessage;
+    use std::sync::{Arc, Mutex};
+
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+    let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+    let ver = hostile_ver(src_addr);
+    let src = peers.register(
+        src_addr,
+        src_addr,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    src.set_wants_addrv2();
+    let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 8333);
+    let dst = peers.register(
+        dst_addr,
+        dst_addr,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    dst.set_wants_addrv2();
+    let (_, mut dst_rx) = dst.open_out();
+    let now = 1_700_000_000u64;
+    peers.set_mock_now(now);
+    while dst_rx.try_recv().is_ok() {}
+
+    let mut follow = PeerFollowState::new();
+    on_addrv2(
+        &mut follow,
+        Some(src.as_ref()),
+        &[AddrV2Message {
+            time: now as u32 + 3_600,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
+            port: 8333,
+        }],
+    )
+    .unwrap();
+    let got = dst_rx.try_recv().expect("relayed").expect_msg();
+    let NetworkMessage::AddrV2(rows) = got else {
+        panic!("expected addrv2, got {got:?}");
+    };
+    assert_eq!(rows[0].time, now as u32 - 5 * 24 * 60 * 60);
+}
+
+/// A peer that announces its own listen address from a different TCP source
+/// port keeps the full claim: Core compares the host, not the port.
+#[test]
+fn a_self_announcement_keeps_its_full_time_across_ports() {
+    use std::sync::Mutex;
+
+    let (_dir, chain) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getaddr-self-announce");
+    let chain = rbitcoin_net::ChainHub::into_arc(chain);
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(1_700_000_000);
+    peers.set_addrman(Arc::new(Mutex::new(rbitcoin_net::seeds::AddrMan::new())));
+    let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 5555);
+    let src = peers.register(
+        src_addr,
+        src_addr,
+        &hostile_ver(src_addr),
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let mut follow = PeerFollowState::new();
+    on_addrv2(
+        &mut follow,
+        Some(src.as_ref()),
+        &[AddrV2Message {
+            time: 1_699_996_400,
+            services: ServiceFlags::NETWORK,
+            addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
+            port: 8333,
+        }],
+    )
+    .unwrap();
+    let ask_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21001);
+    let ask = peers.register(
+        ask_addr,
+        ask_addr,
+        &hostile_ver(ask_addr),
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    ask.set_wants_addrv2();
+    let (out_tx, mut out_rx) = ask.open_out();
+    on_getaddr(&chain, &out_tx, Some(ask.as_ref())).unwrap();
+    let rows = loop {
+        let out = out_rx.try_recv().expect("a getaddr reply");
+        if let NetworkMessage::AddrV2(rows) = out.expect_msg() {
+            break rows;
+        }
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].time, 1_699_996_400);
+}
+
+/// A reply stamps only the rows it returns. A v1 getaddr that leaves an
+/// onion out does not start its backdate.
+#[test]
+fn getaddr_stamps_only_the_rows_it_returns() {
+    use std::sync::Mutex;
+
+    let now = 1_700_000_000u64;
+    let (_dir, chain) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getaddr-returned");
+    let chain = rbitcoin_net::ChainHub::into_arc(chain);
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(now);
+    let mut am = rbitcoin_net::seeds::AddrMan::new();
+    am.set_onion_reachable(true);
+    let onion: rbitcoin_net::NetAddr =
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333"
+            .parse()
+            .unwrap();
+    am.add_addr(onion);
+    let book = Arc::new(Mutex::new(am));
+    peers.set_addrman(Arc::clone(&book));
+
+    let v1_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21002);
+    let v1 = peers.register(
+        v1_addr,
+        v1_addr,
+        &hostile_ver(v1_addr),
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let (v1_tx, mut v1_rx) = v1.open_out();
+    on_getaddr(&chain, &v1_tx, Some(v1.as_ref())).unwrap();
+    let rows = loop {
+        let out = v1_rx.try_recv().expect("a v1 getaddr reply");
+        if let NetworkMessage::Addr(rows) = out.expect_msg() {
+            break rows;
+        }
+    };
+    assert!(rows.is_empty(), "v1 excludes the onion: {rows:?}");
+    assert_eq!(
+        book.lock().unwrap().last_seen_of(&onion),
+        0,
+        "a row this reply did not return is not stamped"
+    );
+
+    peers.set_mock_now(now + 10 * 24 * 60 * 60);
+    let v2_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21003);
+    let v2 = peers.register(
+        v2_addr,
+        v2_addr,
+        &hostile_ver(v2_addr),
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    v2.set_wants_addrv2();
+    let (v2_tx, mut v2_rx) = v2.open_out();
+    on_getaddr(&chain, &v2_tx, Some(v2.as_ref())).unwrap();
+    let rows = loop {
+        let out = v2_rx.try_recv().expect("a v2 getaddr reply");
+        if let NetworkMessage::AddrV2(rows) = out.expect_msg() {
+            break rows;
+        }
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].time,
+        (now + 10 * 24 * 60 * 60 - 5 * 24 * 60 * 60) as u32
+    );
+}
+
+/// A peers file written on a fast clock is normalized once: the first v2
+/// reply backdates the row, and a later reply reports the same point, not a
+/// fresh five-days-old time.
+#[test]
+fn a_future_peers_time_is_backdated_once() {
+    use std::sync::Mutex;
+
+    let now = 1_700_000_000u64;
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-peers-future-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("peers");
+    std::fs::write(
+        &path,
+        "rbitcoin-peers-v3\n9.9.9.9:8333 0x00 1700003600\n",
+    )
+    .unwrap();
+    let book = Arc::new(Mutex::new(
+        rbitcoin_net::seeds::AddrMan::load(&path).unwrap(),
+    ));
+    let (_hub_dir, chain) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getaddr-future");
+    let chain = rbitcoin_net::ChainHub::into_arc(chain);
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(now);
+    peers.set_addrman(Arc::clone(&book));
+
+    let ask = peers.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21004),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21004),
+        &hostile_ver(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            21004,
+        )),
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    ask.set_wants_addrv2();
+    let (out_tx, mut out_rx) = ask.open_out();
+    on_getaddr(&chain, &out_tx, Some(ask.as_ref())).unwrap();
+    let rows = loop {
+        let out = out_rx.try_recv().expect("a getaddr reply");
+        if let NetworkMessage::AddrV2(rows) = out.expect_msg() {
+            break rows;
+        }
+    };
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].time, (now - 5 * 24 * 60 * 60) as u32);
+
+    peers.set_mock_now(now + 10 * 24 * 60 * 60);
+    let ask = peers.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21005),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 21005),
+        &hostile_ver(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            21005,
+        )),
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    ask.set_wants_addrv2();
+    let (out_tx, mut out_rx) = ask.open_out();
+    on_getaddr(&chain, &out_tx, Some(ask.as_ref())).unwrap();
+    let rows = loop {
+        let out = out_rx.try_recv().expect("a getaddr reply");
+        if let NetworkMessage::AddrV2(rows) = out.expect_msg() {
+            break rows;
+        }
+    };
+    assert_eq!(
+        rows[0].time,
+        (now - 5 * 24 * 60 * 60) as u32,
+        "the backdate is fixed once, not recomputed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A peer gossips this node's own onion, I2P, CJDNS and external addresses
@@ -197,9 +453,10 @@ async fn addrv2_relay_drops_own_addresses() {
     onion_peer.set_wants_addrv2();
     let (_, mut onion_rx) = onion_peer.open_out();
     peers.set_mock_now(src.connected_at_secs() + 10_000);
+    let t = peers.now_secs() as u32 - 60;
 
     let row = |addr: AddrV2, port: u16| AddrV2Message {
-        time: 1,
+        time: t,
         services: ServiceFlags::NETWORK,
         addr,
         port,

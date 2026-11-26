@@ -919,6 +919,58 @@ fn peers_file_roundtrip_preserves_flags() {
 }
 
 #[test]
+fn peers_file_roundtrip_preserves_last_seen() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-peers-seen-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("peers");
+    let mut am = AddrMan::new();
+    let a = addr(30);
+    assert!(am.add_learned_addr_at(
+        NetAddr::from_socket(a),
+        NetAddr::from_socket(a),
+        1_699_000_000,
+        0,
+        1_700_000_000,
+        8
+    ));
+    am.save(&path).unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        body.starts_with(AddrMan::PEERS_FILE_MAGIC_V3),
+        "a row time needs the v3 line: {body}"
+    );
+    let loaded = AddrMan::load(&path).unwrap();
+    assert_eq!(
+        loaded.last_seen_of(&NetAddr::from_socket(a)),
+        1_699_000_000,
+        "a restart must not forget when the row was learned"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A merge keeps the newer row time: a session book that ended a connection
+/// to a row must not lose that time when it is folded back into the shared
+/// book.
+#[test]
+fn merge_from_keeps_the_newer_row_time() {
+    let mut shared = AddrMan::new();
+    let row = NetAddr::from_socket(addr(44));
+    assert!(shared.add_learned_addr_at(row, row, 1_690_000_000, 0, 1_700_000_000, 8));
+    let mut session = AddrMan::new();
+    session.copy_row_from(&shared, row);
+    session.note_disconnected_addr(row, 1_700_000_000);
+    shared.merge_from(&session);
+    assert_eq!(shared.last_seen_of(&row), 1_700_000_000);
+}
+
+#[test]
 fn seed_lookup_names_x_filter_before_unfiltered() {
     let names = seed_lookup_names(Network::Mainnet);
     assert_eq!(names[0][0], "x809.dnsseed.bluematt.me.");
@@ -1235,6 +1287,11 @@ rbitcoin-peers-v2
         "a public address still loads"
     );
     assert!(loaded.flags(&public).has_connected());
+    assert_eq!(
+        loaded.last_seen_of(&rbitcoin_net::NetAddr::from_socket(public)),
+        0,
+        "a v2 row has no time"
+    );
     let lan: SocketAddr = "10.0.0.1:8333".parse().unwrap();
     assert!(
         loaded

@@ -43,12 +43,12 @@ Long IBD runs can be interrupted if the host auto-suspends. Pass
 `systemd-inhibit` is missing or logind rejects the request, the node logs a
 warning and continues without inhibit.
 
-**Peers file:** `{datadir}/peers` stores discovered addresses and **PeerFlags**
-(connected / fast / slow / incompatible / last-fail) between runs. Loaded at
-start (before seeds), updated after IBD and on shutdown. Seeds are merged in
-without clearing known flags. New writes are `rbitcoin-peers-v2` (IPv4, IPv6,
-and Tor v3 `.onion:port` tokens). `rbitcoin-peers-v1` IPv4/IPv6 files still
-load.
+**Peers file:** `{datadir}/peers` stores discovered addresses, **PeerFlags**
+(connected / fast / slow / incompatible / last-fail), and each row's last-seen
+Unix time between runs. Loaded at start (before seeds), updated after IBD and
+on shutdown. Seeds are merged in without clearing known flags. New writes are
+`rbitcoin-peers-v3` (IPv4, IPv6, Tor v3 `.onion:port`, and the row time).
+`rbitcoin-peers-v1` and `-v2` files still load; their rows have no time.
 
 **Index modes:** Direct vs Tip: [`docs/concurrency.md`](../concurrency.md).
 IBD finishes Class A + `tx.head` + spend annotations **before** tip; tip entry

@@ -2899,15 +2899,18 @@ fn getaddr_reply_omits_own_addresses() {
     let rbitcoin_net::NetAddr::Onion { pk: wallet_pk, .. } = wallet_onion else {
         unreachable!()
     };
-    peers.learn_addrv2(
-        rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333))),
-        &[
+    let rows = [
         gossip(AddrV2::TorV3(pk), 8333),
         gossip(AddrV2::TorV3(wallet_pk), 8333),
         gossip(AddrV2::I2p([0x11; 32]), 0),
         gossip(AddrV2::Ipv4(Ipv4Addr::new(42, 42, 42, 42)), 8333),
         gossip(AddrV2::Ipv4(Ipv4Addr::new(93, 184, 216, 34)), 8333),
-    ]);
+    ];
+    peers.learn_addrv2(
+        rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333))),
+        &rows,
+        peers.now_secs(),
+    );
     let early_bind = SocketAddr::from(([127, 0, 0, 1], 8333));
     let cached = peers.addr_response_net(early_bind, true);
     assert_eq!(cached.len(), 1, "{cached:?}");

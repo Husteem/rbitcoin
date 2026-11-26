@@ -1206,7 +1206,7 @@ fn socket_addrs_from_addr_and_addrv2_filter() {
         (5, limited_v2),
         (6, unusable),
     ]);
-    assert_eq!(out, vec![good, limited_sa]);
+    assert_eq!(out, vec![(3, good), (5, limited_sa)]);
 
     let v2_good = AddrV2Message {
         time: 1,
@@ -1235,10 +1235,13 @@ fn socket_addrs_from_addr_and_addrv2_filter() {
     let out2 = net_addrs_from_addrv2(&[v2_good, v2_net_only, v2_bad_svc, v2_zero_port]);
     assert_eq!(
         out2,
-        vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
-            18444
-        ))]
+        vec![(
+            1,
+            rbitcoin_net::NetAddr::Ip(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+                18444
+            ))
+        )]
     );
 
     let v6_multi = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)), 8333);
@@ -1251,7 +1254,7 @@ fn socket_addrs_from_addr_and_addrv2_filter() {
         port: 8333,
     };
     let out3 = net_addrs_from_addrv2(&[v2_v6]);
-    assert_eq!(out3, vec![rbitcoin_net::NetAddr::Ip(v6_net)]);
+    assert_eq!(out3, vec![(1, rbitcoin_net::NetAddr::Ip(v6_net))]);
 
     let onion: rbitcoin_net::NetAddr =
         "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
@@ -1267,7 +1270,7 @@ fn socket_addrs_from_addr_and_addrv2_filter() {
         port,
     };
     let nets = net_addrs_from_addrv2(&[v2_onion]);
-    assert_eq!(nets, vec![onion]);
+    assert_eq!(nets, vec![(1, onion)]);
 }
 
 /// Legacy `addr` has no BIP155 network id. `fc00::/8` is CJDNS, not a
@@ -1283,17 +1286,18 @@ fn v1_addr_fc00_is_cjdns_not_clearnet() {
     let flags = ServiceFlags::NETWORK | ServiceFlags::P2P_V2;
     let rows = net_addrs_from_addr(&[(1, Address::new(&fc, flags)), (2, Address::new(&v4, flags))]);
     assert!(
-        rows.iter()
-            .any(|a| matches!(a, rbitcoin_net::NetAddr::Cjdns { ip, port: 8333 } if *ip == fc_ip)),
+        rows.iter().any(
+            |(_, a)| matches!(a, rbitcoin_net::NetAddr::Cjdns { ip, port: 8333 } if *ip == fc_ip)
+        ),
         "fc00 must be CJDNS, got {rows:?}"
     );
     assert!(rows
         .iter()
-        .any(|a| matches!(a, rbitcoin_net::NetAddr::Ip(s) if *s == v4)));
+        .any(|(_, a)| matches!(a, rbitcoin_net::NetAddr::Ip(s) if *s == v4)));
     assert!(
         !rows
             .iter()
-            .any(|a| matches!(a, rbitcoin_net::NetAddr::Ip(s) if s.ip() == IpAddr::V6(fc_ip))),
+            .any(|(_, a)| matches!(a, rbitcoin_net::NetAddr::Ip(s) if s.ip() == IpAddr::V6(fc_ip))),
         "fc00 must not stay a clearnet Ip"
     );
 
@@ -1305,6 +1309,7 @@ fn v1_addr_fc00_is_cjdns_not_clearnet() {
         local,
         rbitcoin_net::NetAddr::Ip(local),
         1,
+        1_700_000_000,
     );
     assert!(
         off.entries()
@@ -1326,6 +1331,7 @@ fn v1_addr_fc00_is_cjdns_not_clearnet() {
         local,
         rbitcoin_net::NetAddr::Ip(local),
         1,
+        1_700_000_000,
     );
     assert!(
         on.entries().iter().any(|e| matches!(
@@ -1334,6 +1340,28 @@ fn v1_addr_fc00_is_cjdns_not_clearnet() {
         )),
         "reachable CJDNS is learned as CJDNS: {:?}",
         on.entries()
+    );
+}
+
+/// The IBD dial book keeps the time a catch-up peer claimed, with Core's
+/// two-hour gossip discount, so the rows it flushes into the served book are
+/// not all pinned five days old.
+#[test]
+fn ibd_gossip_keeps_the_claimed_time() {
+    let local = SocketAddr::from(([127, 0, 0, 1], 18444));
+    let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 8333);
+    let mut book = rbitcoin_net::seeds::AddrMan::new();
+    rbitcoin_ibd::ibd::events::inject_learned_addrs(
+        &mut book,
+        &[(1_699_996_400, rbitcoin_net::NetAddr::Ip(peer))],
+        local,
+        rbitcoin_net::NetAddr::Ip(local),
+        1,
+        1_700_000_000,
+    );
+    assert_eq!(
+        book.last_seen_of(&rbitcoin_net::NetAddr::Ip(peer)),
+        1_699_996_400 - 2 * 60 * 60
     );
 }
 

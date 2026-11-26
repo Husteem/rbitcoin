@@ -322,6 +322,67 @@ impl PeerFlags {
 pub struct PeerEntry {
     pub addr: NetAddr,
     pub flags: PeerFlags,
+    /// Unix seconds when a peer said it last saw this row. `0` means no peer
+    /// taught a time yet (a seed, `addnode`, or a v1/v2 `peers` row before
+    /// its first serve).
+    pub last_seen: u32,
+}
+
+/// Core's trust window for a gossiped address time: after 1973 and no more
+/// than ten minutes ahead. A row outside the window takes
+/// [`UNKNOWN_SEEN_AGE_SECS`] back from the node clock.
+pub const ADDR_TIME_FLOOR: u32 = 100_000_000;
+
+/// Age a row with no trusted time starts at: Core backdates an untrusted
+/// address time by five days.
+pub const UNKNOWN_SEEN_AGE_SECS: u64 = 5 * 24 * 60 * 60;
+
+/// Core's `ProcessAddrs` penalty on a time a peer gossiped, so one source
+/// cannot hold a row fresher than two hours of its own claim.
+pub const GOSSIP_TIME_PENALTY_SECS: u32 = 2 * 60 * 60;
+
+fn backdated_seen(now: u64) -> u32 {
+    let now = now.min(u64::from(u32::MAX)) as u32;
+    now.saturating_sub(UNKNOWN_SEEN_AGE_SECS as u32)
+}
+
+/// The Unix time a gossiped address is taken to have been seen: its own time
+/// when it is inside Core's window, else five days back. Never `0`, so every
+/// gossiped row ages from a fixed point.
+#[doc(hidden)]
+pub fn learned_addr_time(time: u32, now: u64) -> u32 {
+    if time <= ADDR_TIME_FLOOR || u64::from(time) > now.saturating_add(600) {
+        backdated_seen(now)
+    } else {
+        time
+    }
+}
+
+/// The time a `getaddr` reply or `getnodeaddresses` row carries. A row that
+/// no peer taught a time, or whose stored time is more than ten minutes in
+/// the future, is backdated as Core's `ProcessAddrs` does.
+#[doc(hidden)]
+pub fn row_reply_time(last_seen: u32, now: u64) -> u32 {
+    let now = now.min(u64::from(u32::MAX)) as u32;
+    if last_seen == 0 || u64::from(last_seen) > u64::from(now).saturating_add(600) {
+        return now.saturating_sub(UNKNOWN_SEEN_AGE_SECS as u32);
+    }
+    last_seen
+}
+
+/// Same network host, ignoring the port. Core compares an address to the peer
+/// that sent it with `CNetAddr` equality, so an inbound peer's self-announce
+/// (listen port) matches its source (TCP port) and takes no gossip penalty.
+#[doc(hidden)]
+pub fn same_host(a: NetAddr, b: NetAddr) -> bool {
+    match (a, b) {
+        (NetAddr::Ip(x), NetAddr::Ip(y)) => x.ip().to_canonical() == y.ip().to_canonical(),
+        (NetAddr::Onion { pk: x, .. }, NetAddr::Onion { pk: y, .. }) => x == y,
+        (NetAddr::I2p { dest: x, .. }, NetAddr::I2p { dest: y, .. }) => x == y,
+        (NetAddr::Cjdns { ip: x, .. }, NetAddr::Cjdns { ip: y, .. }) => x == y,
+        (NetAddr::Name { id: x, .. }, NetAddr::Name { id: y, .. }) => x == y,
+        _ => false,
+    }
 }
 
 /// Hard cap for learned / `peers` file / addrv2 (not `--connect` / DNS inject).
@@ -363,6 +424,13 @@ pub struct AddrMan {
     /// Insertion-order keys (IPv4 preferred on inject).
     pub order: Vec<NetAddr>,
     pub by_addr: HashMap<NetAddr, PeerFlags>,
+    /// Unix seconds a peer last said it saw the row. A row with no entry has
+    /// no learned time; see [`row_reply_time`].
+    seen: HashMap<NetAddr, u32>,
+    /// The value [`Self::stamp_missing_seen_for`] replaced on a row. A flush
+    /// or merge keeps the normalized time when the other book still holds
+    /// the replaced one, even when the normalized time is lower.
+    seen_replaced: HashMap<NetAddr, u32>,
     pub asmap: Option<Arc<AsMap>>,
     pub last_attempt: HashMap<NetAddr, Instant>,
     pub only_net: Vec<OnlyNet>,
@@ -659,10 +727,37 @@ impl AddrMan {
     }
 
     pub fn add_learned_addr(&mut self, addr: NetAddr, source: NetAddr, cap: usize) -> bool {
+        self.add_learned_addr_at(addr, source, 0, 0, 0, cap)
+    }
+
+    /// [`Self::add_learned_addr`] for a row a peer claimed at `claimed`
+    /// (Unix seconds, already inside Core's window). `penalty` is Core's
+    /// discount on that claim (`0` for a row a peer announces as itself).
+    /// `now` is the node clock.
+    ///
+    /// Core selects the refresh interval from the sanitized but unpenalized
+    /// `addr.nTime`, then stores `addr.nTime - time_penalty`
+    /// (`AddrManImpl::AddSingle`). A held row takes the new time only when it
+    /// is at least an hour (or a day, for a claim older than a day) newer, so
+    /// one gossip stream cannot hold a row fresh.
+    pub fn add_learned_addr_at(
+        &mut self,
+        addr: NetAddr,
+        source: NetAddr,
+        claimed: u32,
+        penalty: u32,
+        now: u64,
+        cap: usize,
+    ) -> bool {
+        let last_seen = claimed.saturating_sub(penalty);
         if !self.dialable(addr) {
             return false;
         }
-        if self.by_addr.contains_key(&addr) || cap == 0 {
+        if self.by_addr.contains_key(&addr) {
+            self.refresh_seen(addr, claimed, last_seen, now);
+            return false;
+        }
+        if cap == 0 {
             return false;
         }
         if self.order.len() > cap {
@@ -673,10 +768,60 @@ impl AddrMan {
             return false;
         }
         self.by_addr.insert(addr, PeerFlags::empty());
+        if last_seen != 0 {
+            self.seen.insert(addr, last_seen);
+        }
         self.order.push(addr);
         self.charge(addr, group);
         self.note_added();
         true
+    }
+
+    /// Core `AddSingle` refresh interval for a row seen within the last day.
+    const SEEN_UPDATE_ONLINE_SECS: u64 = 60 * 60;
+    /// Core `AddSingle` refresh interval for a row last seen a day or more ago.
+    const SEEN_UPDATE_OFFLINE_SECS: u64 = 24 * 60 * 60;
+
+    /// Take `last_seen` for a held row when it is newer than what the book
+    /// has by Core's interval for the claim's age.
+    fn refresh_seen(&mut self, addr: NetAddr, claimed: u32, last_seen: u32, now: u64) {
+        if last_seen == 0 {
+            return;
+        }
+        let stored = self.seen.get(&addr).copied().unwrap_or(0);
+        let online = now.saturating_sub(u64::from(claimed)) < Self::SEEN_UPDATE_OFFLINE_SECS;
+        let interval = if online {
+            Self::SEEN_UPDATE_ONLINE_SECS
+        } else {
+            Self::SEEN_UPDATE_OFFLINE_SECS
+        };
+        if u64::from(stored) + interval < u64::from(last_seen) {
+            self.seen.insert(addr, last_seen);
+            self.seen_replaced.remove(&addr);
+        }
+    }
+
+    /// Store a row a peer gossiped at `time` (untrusted Unix seconds).
+    ///
+    /// Sanitizes the time to Core's window, charges the source two hours
+    /// unless the row is that peer's own host, and applies the held-row
+    /// refresh interval. The one ingest for `addrv2`, `addr`, and a catch-up
+    /// `getaddr` reply.
+    pub fn add_gossiped_addr(
+        &mut self,
+        addr: NetAddr,
+        source: NetAddr,
+        time: u32,
+        now: u64,
+        cap: usize,
+    ) -> bool {
+        let claimed = learned_addr_time(time, now);
+        let penalty = if same_host(addr, source) {
+            0
+        } else {
+            GOSSIP_TIME_PENALTY_SECS
+        };
+        self.add_learned_addr_at(addr, source, claimed, penalty, now, cap)
     }
 
     /// `group` already taught its share of the rows.
@@ -690,14 +835,14 @@ impl AddrMan {
         *self.taught_by_group.entry(group).or_insert(0) += 1;
     }
 
-    /// Copy `other`'s row `addr` with its flags. A row this book lacks also
-    /// takes `other`'s source, so a copy between live books keeps each
-    /// group's share. A row both books hold keeps this book's source. A full
-    /// book takes no new untried row from a group at its share, as
-    /// [`Self::add_learned_addr`] refuses it: a group that taught its share
-    /// in each of two live books does not hold both after they are
-    /// reconciled. A row `other` connected to is always taken: a peer that
-    /// answered a dial is not gossip.
+    /// Copy `other`'s row `addr` with its flags and learned time. A row this
+    /// book lacks also takes `other`'s source, so a copy between live books
+    /// keeps each group's share. A row both books hold keeps this book's
+    /// source and takes the newer or normalized time. A full book takes no new untried row
+    /// from a group at its share, as [`Self::add_learned_addr`] refuses it: a
+    /// group that taught its share in each of two live books does not hold
+    /// both after they are reconciled. A row `other` connected to is always
+    /// taken: a peer that answered a dial is not gossip.
     pub fn copy_row_from(&mut self, other: &AddrMan, addr: NetAddr) {
         let held = self.by_addr.contains_key(&addr);
         let group = other.learned_from.get(&addr).copied();
@@ -710,11 +855,30 @@ impl AddrMan {
             return;
         }
         self.add_with_flags_addr(addr, flags);
+        if self.by_addr.contains_key(&addr) {
+            self.merge_seen_from(other, addr);
+        }
         if held || !self.by_addr.contains_key(&addr) {
             return;
         }
         if let Some(group) = group {
             self.charge(addr, group);
+        }
+    }
+
+    /// Take `other`'s time for `addr` when it is newer, or when `other` holds
+    /// the normalized value for a time this book replaced (a future time
+    /// reset to the backdate is lower, not newer).
+    pub fn merge_seen_from(&mut self, other: &AddrMan, addr: NetAddr) {
+        let other_seen = other.last_seen_of(&addr);
+        if other_seen == 0 {
+            return;
+        }
+        let self_seen = self.last_seen_of(&addr);
+        let normalized = other.seen_replaced.get(&addr).copied() == Some(self_seen);
+        if normalized || other_seen > self_seen {
+            self.seen.insert(addr, other_seen);
+            self.seen_replaced.remove(&addr);
         }
     }
 
@@ -733,6 +897,8 @@ impl AddrMan {
     #[doc(hidden)]
     pub fn evict_one(&mut self, addr: NetAddr) {
         self.by_addr.remove(&addr);
+        self.seen.remove(&addr);
+        self.seen_replaced.remove(&addr);
         self.last_attempt.remove(&addr);
         if let Some(group) = self.learned_from.remove(&addr) {
             if let Entry::Occupied(mut n) = self.taught_by_group.entry(group) {
@@ -800,6 +966,8 @@ impl AddrMan {
         let keep_set: HashSet<NetAddr> = keep.iter().copied().collect();
         self.order = keep;
         self.by_addr.retain(|a, _| keep_set.contains(a));
+        self.seen.retain(|a, _| keep_set.contains(a));
+        self.seen_replaced.retain(|a, _| keep_set.contains(a));
         self.last_attempt.retain(|a, _| keep_set.contains(a));
         self.learned_from.retain(|a, _| keep_set.contains(a));
         self.taught_by_group.clear();
@@ -854,9 +1022,16 @@ impl AddrMan {
 
     #[doc(hidden)]
     pub fn entry_of(&self, addr: &NetAddr) -> Option<PeerEntry> {
-        self.by_addr
-            .get(addr)
-            .map(|&flags| PeerEntry { addr: *addr, flags })
+        self.by_addr.get(addr).map(|&flags| PeerEntry {
+            addr: *addr,
+            flags,
+            last_seen: self.last_seen_of(addr),
+        })
+    }
+
+    /// Unix seconds a peer last said it saw `addr`; `0` when none did.
+    pub fn last_seen_of(&self, addr: &NetAddr) -> u32 {
+        self.seen.get(addr).copied().unwrap_or(0)
     }
 
     pub fn len(&self) -> usize {
@@ -867,13 +1042,46 @@ impl AddrMan {
         self.order.is_empty()
     }
 
-    /// Successful BIP324 handshake.
+    /// Successful handshake: the row is known good. The time is not touched
+    /// here, as Core's `Good_` leaves `nTime` alone at verack so a live
+    /// outbound peer is not advertised as just seen.
     pub fn note_connected_addr(&mut self, addr: NetAddr) {
         self.add_addr(addr);
         if let Some(f) = self.by_addr.get_mut(&addr) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.remove(PeerFlags::FAILED_LAST_CONNECT);
             f.remove(PeerFlags::INCOMPATIBLE);
+        }
+    }
+
+    /// A full outbound session ended. Core `Connected_` runs from
+    /// `FinalizeNode` and refreshes the row when its time is more than twenty
+    /// minutes old.
+    pub fn note_disconnected_addr(&mut self, addr: NetAddr, now: u32) {
+        const REFRESH_SECS: u32 = 20 * 60;
+        let stored = self.seen.get(&addr).copied().unwrap_or(0);
+        if now.saturating_sub(stored) > REFRESH_SECS {
+            self.seen.insert(addr, now);
+            self.seen_replaced.remove(&addr);
+        }
+    }
+
+    /// Fix a time for the rows one reply returns, once: a missing time takes
+    /// the five-day backdate, and a stored time more than ten minutes ahead
+    /// is rewritten to it, as `ProcessAddrs` would. The row then ages instead
+    /// of looking five days old on every serve. The caller holds the book
+    /// lock with its row selection, so every address is live.
+    #[doc(hidden)]
+    pub fn stamp_missing_seen_for(&mut self, addrs: &[NetAddr], now: u64) {
+        let backdated = backdated_seen(now);
+        let now32 = now.min(u64::from(u32::MAX)) as u32;
+        for addr in addrs {
+            let replaced = self.seen.get(addr).copied().unwrap_or(0);
+            let stale = replaced == 0 || u64::from(replaced) > u64::from(now32).saturating_add(600);
+            if stale {
+                self.seen.insert(*addr, backdated);
+                self.seen_replaced.insert(*addr, replaced);
+            }
         }
     }
 
@@ -1103,6 +1311,8 @@ impl AddrMan {
     /// On-disk format magic line (text, one peer per line).
     pub const PEERS_FILE_MAGIC: &'static str = "rbitcoin-peers-v1";
     pub const PEERS_FILE_MAGIC_V2: &'static str = "rbitcoin-peers-v2";
+    /// Adds the row's last-seen Unix seconds as the third field.
+    pub const PEERS_FILE_MAGIC_V3: &'static str = "rbitcoin-peers-v3";
 
     /// Load peers + flags from `path`. Missing file → empty book (not an error).
     pub fn load(path: &Path) -> std::io::Result<Self> {
@@ -1120,15 +1330,19 @@ impl AddrMan {
                 continue;
             }
             if !saw_magic {
-                if line != Self::PEERS_FILE_MAGIC && line != Self::PEERS_FILE_MAGIC_V2 {
+                if line != Self::PEERS_FILE_MAGIC
+                    && line != Self::PEERS_FILE_MAGIC_V2
+                    && line != Self::PEERS_FILE_MAGIC_V3
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "peers file {}:{}: expected magic `{}` or `{}`",
+                            "peers file {}:{}: expected magic `{}`, `{}`, or `{}`",
                             path.display(),
                             lineno + 1,
                             Self::PEERS_FILE_MAGIC,
-                            Self::PEERS_FILE_MAGIC_V2
+                            Self::PEERS_FILE_MAGIC_V2,
+                            Self::PEERS_FILE_MAGIC_V3
                         ),
                     ));
                 }
@@ -1179,7 +1393,23 @@ impl AddrMan {
             if crate::netaddr::netaddr_unroutable_gossip(addr) {
                 continue;
             }
+            let last_seen: u32 = match parts.next() {
+                None => 0,
+                Some(s) => s.parse().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "peers file {}:{}: bad time: {e}",
+                            path.display(),
+                            lineno + 1
+                        ),
+                    )
+                })?,
+            };
             am.remember(addr, PeerFlags(flags_u));
+            if last_seen != 0 {
+                am.seen.insert(addr, last_seen);
+            }
         }
         if !saw_magic && am.is_empty() {
             // Empty or comment-only without magic — treat as empty book.
@@ -1190,7 +1420,8 @@ impl AddrMan {
         Ok(am)
     }
 
-    /// Atomic save of peers + flags to `path` (`path.tmp` then rename).
+    /// Atomic save of peers, flags, and row times to `path` (`path.tmp` then
+    /// rename).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1198,13 +1429,13 @@ impl AddrMan {
         let tmp = path.with_extension("tmp");
         {
             let mut f = std::fs::File::create(&tmp)?;
-            writeln!(f, "{}", Self::PEERS_FILE_MAGIC_V2)?;
+            writeln!(f, "{}", Self::PEERS_FILE_MAGIC_V3)?;
             writeln!(
                 f,
-                "# addr flags  (flags: bit0=connected bit1=fast bit2=slow bit3=incompat bit4=fail)"
+                "# addr flags seen  (flags: bit0=connected bit1=fast bit2=slow bit3=incompat bit4=fail)"
             )?;
             for e in self.entries() {
-                writeln!(f, "{} 0x{:02x}", e.addr, e.flags.0)?;
+                writeln!(f, "{} 0x{:02x} {}", e.addr, e.flags.0, e.last_seen)?;
             }
             f.durable_sync_all()?;
         }
