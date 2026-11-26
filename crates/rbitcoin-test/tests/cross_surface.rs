@@ -2087,6 +2087,37 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         "min relay fee not met",
     )
     .await;
+    let over_max = acs_spend(
+        rpc_cb,
+        50_0000_0000,
+        49_0000_0000,
+        ScriptBuf::from_bytes(vec![0x52]),
+    );
+    pin_broadcast_reject_matches_sendraw(
+        rpc_addr,
+        electrum_addr,
+        esplora_addr,
+        &encode_tx(&over_max),
+        -25,
+        "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
+    )
+    .await;
+    let mut bad_version = acs_spend(
+        rpc_cb,
+        50_0000_0000,
+        1_000,
+        ScriptBuf::from_bytes(vec![0x52]),
+    );
+    bad_version.version = bitcoin::transaction::Version::non_standard(4);
+    pin_broadcast_reject_matches_sendraw(
+        rpc_addr,
+        electrum_addr,
+        esplora_addr,
+        &encode_tx(&bad_version),
+        -26,
+        "version",
+    )
+    .await;
     let at_min = acs_spend(
         exact_cb,
         50_0000_0000,

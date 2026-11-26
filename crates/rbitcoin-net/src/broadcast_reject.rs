@@ -49,6 +49,22 @@ impl BroadcastReject {
         }
     }
 
+    /// `sendrawtransaction`/`submitpackage`: a version outside 1..=3.
+    pub fn version() -> Self {
+        Self {
+            code: TRANSACTION_REJECTED,
+            message: "version".into(),
+        }
+    }
+
+    /// `sendrawtransaction`/`submitpackage`: the fee is over `maxfeerate`.
+    pub fn max_fee() -> Self {
+        Self {
+            code: TRANSACTION_ERROR,
+            message: "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)".into(),
+        }
+    }
+
     pub(crate) fn query(e: QueryError) -> Self {
         Self {
             code: MISC_ERROR,

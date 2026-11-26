@@ -23,6 +23,8 @@ pub mod fee_history;
 #[doc(hidden)]
 pub mod fee_history_file;
 #[doc(hidden)]
+pub mod fee_look;
+#[doc(hidden)]
 pub mod i2p_sam;
 #[doc(hidden)]
 pub mod inv_bucket;
@@ -88,6 +90,9 @@ pub use compact::{
 pub use ephemeral::spawn_isolated_broadcast_loop;
 pub use error::NetError;
 pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
+pub use fee_look::{
+    fold_tx_fee_sat, package_tx_fee_exceeds_max, tx_fee_exceeds_max, tx_output_sum_sat, TxFeeLook,
+};
 pub use i2p_sam::{
     i2p_addr_from_sam_b64, I2pBackoff, I2pKeeper, I2pRole, I2pSam, SAM_RETRY, SAM_RETRY_TEST,
 };

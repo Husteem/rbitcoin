@@ -14,6 +14,7 @@ use crate::perf_meter::PerfCounter;
 use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
+use rbitcoin_consensus::policy::DEFAULT_MAX_RAW_TX_FEE_SAT_KVB;
 use rbitcoin_mempool::{
     fee_at_target_sat_kvb, fine_candidate_rates, flow_for_depth, frontier_feerate_from_chunks,
     hold_defined_then_monotone, min_rate_for_capacity, percentile_sat, published_depth_rate,
@@ -4636,7 +4637,8 @@ impl MempoolHub {
     }
 
     /// An Electrum or Esplora client's broadcast: Core's `-27` for a tx whose
-    /// outputs are still coins, else [`Self::broadcast_local_async`], with a
+    /// outputs are still coins, then the version and default max-fee checks
+    /// `sendrawtransaction` runs, else [`Self::broadcast_local_async`], with a
     /// refusal answered as `sendrawtransaction` answers it. The caller holds a
     /// store budget ([`crate::with_store_budget`]).
     pub async fn broadcast_client_async(
@@ -4649,6 +4651,18 @@ impl MempoolHub {
             crate::off_pool_budgeted(move || query.outputs_already_in_utxo_set(&coins)).await;
         if confirmed.map_err(BroadcastReject::query)? {
             return Err(BroadcastReject::already_in_utxo_set());
+        }
+        if crate::test_accept::submit_tx_version_nonstandard(&tx) {
+            return Err(BroadcastReject::version());
+        }
+        let hub = Arc::clone(self);
+        let fee_tx = tx.clone();
+        let over_max = crate::off_pool_budgeted(move || {
+            crate::fee_look::tx_fee_exceeds_max(&hub, &fee_tx, DEFAULT_MAX_RAW_TX_FEE_SAT_KVB)
+        })
+        .await;
+        if over_max {
+            return Err(BroadcastReject::max_fee());
         }
         self.broadcast_local_async(tx)
             .await

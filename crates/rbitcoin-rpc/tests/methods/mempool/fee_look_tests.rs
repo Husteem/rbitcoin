@@ -1,6 +1,5 @@
-use rbitcoin_rpc::methods::mempool::{
-    fold_tx_fee_sat, submitpackage_topology_disallowed, TxFeeLook,
-};
+use rbitcoin_net::{fold_tx_fee_sat, TxFeeLook};
+use rbitcoin_rpc::methods::mempool::submitpackage_topology_disallowed;
 
 #[test]
 fn topology_gate_only_when_dialect() {

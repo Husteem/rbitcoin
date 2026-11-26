@@ -1460,9 +1460,7 @@ async fn answer_one(
                 broadcast_raw_tx_async(&asked.params, ctx.config, ctx.mempool.as_ref()).await
             }
             "blockchain.transaction.broadcast_package" => {
-                broadcast_package_async(&asked.params, ctx.config, ctx.mempool.as_ref())
-                    .await
-                    .map_err(ReplyError::from)
+                broadcast_package_async(&asked.params, ctx.config, ctx.mempool.as_ref()).await
             }
             _ => Err("unknown broadcast".into()),
         };
@@ -3517,20 +3515,43 @@ pub(crate) async fn broadcast_raw_tx_async(
 }
 
 /// Accept a package, with each member's scripts awaited on the connection task.
-pub async fn broadcast_package_async(
+pub(crate) async fn broadcast_package_async(
     params: &Value,
     config: &ElectrumConfig,
     mempool: Option<&Arc<MempoolHub>>,
-) -> Result<Value, String> {
+) -> Result<Value, ReplyError> {
     let (txs, verbose) = decode_broadcast_package(params, config)?;
     let mp = mempool
         .ok_or_else(|| "mempool not available".to_string())?
         .clone();
+    if txs.iter().any(rbitcoin_net::submit_tx_version_nonstandard) {
+        return Err(ReplyError::daemon(
+            rbitcoin_net::BroadcastReject::version().message,
+        ));
+    }
+    let mp_fee = Arc::clone(&mp);
+    let txs_fee = txs.clone();
+    let over_max = rbitcoin_net::off_pool_budgeted(move || {
+        txs_fee.iter().any(|tx| {
+            rbitcoin_net::package_tx_fee_exceeds_max(
+                &mp_fee,
+                tx,
+                &txs_fee,
+                rbitcoin_consensus::policy::DEFAULT_MAX_RAW_TX_FEE_SAT_KVB,
+            ) == Some(true)
+        })
+    })
+    .await;
+    if over_max {
+        return Err(ReplyError::daemon(
+            rbitcoin_net::BroadcastReject::max_fee().message,
+        ));
+    }
     let budget = mp.query.api_read_budget();
     let accepted =
         rbitcoin_net::with_store_budget(budget, ApiSurface::Electrum, mp.accept_package_async(txs))
             .await
-            .map_err(|e| format!("broadcast_package reject: {e}"))?;
+            .map_err(|e| ReplyError::daemon(rbitcoin_net::BroadcastReject::of(&e).message))?;
     Ok(package_broadcast_value(verbose, &accepted))
 }
 

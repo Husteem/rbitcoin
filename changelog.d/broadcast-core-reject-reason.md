@@ -11,4 +11,8 @@ Fixed
   BlindBit `forward-tx` carries the same reason inside its `{"error"}` body.
   A transaction whose outputs are still coins is
   `-27 Transaction outputs already in utxo set` on all three, as on RPC with
-  the tx index on (#1904).
+  the tx index on (#1904). Electrum (single tx and package), Esplora
+  `POST /tx`, and BlindBit `forward-tx` apply the same nonstandard-version
+  and default max-fee rejects as `sendrawtransaction` (`"version"`; `-25`
+  `Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)` at
+  0.10 BTC/kvB) (#2020).
