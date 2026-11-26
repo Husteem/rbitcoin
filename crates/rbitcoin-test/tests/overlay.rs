@@ -10,10 +10,10 @@ use rbitcoin_node::{NodeConfig, P2pListen};
 use rbitcoin_test::jsonrpc::write_rpc_token;
 use rbitcoin_test::mine::spend_anyone_can_spend;
 use rbitcoin_test::overlay::{
-    base_node, ephemeral_addr, i2p_b32_from_dest, jsonrpc, jsonrpc_try, localaddresses,
-    require_env, restart_daemon, socks_electrum_rpc, socks_http_get, spawn_node, wait_file,
-    wait_i2p_stream, wait_jsonrpc, wait_onion_port, wait_p2p_onion, wait_peer_network,
-    wait_socks_onion, OverlayEnv,
+    base_node, control_gate, ephemeral_addr, i2p_b32_from_dest, jsonrpc, jsonrpc_try,
+    localaddresses, require_env, restart_daemon, socks_electrum_rpc, socks_http_get, spawn_node,
+    wait_file, wait_hs_desc_uploaded, wait_i2p_stream, wait_jsonrpc, wait_onion_port,
+    wait_p2p_onion, wait_peer_network, wait_socks_onion, OverlayEnv,
 };
 use rbitcoin_test::TempDir;
 use serde_json::json;
@@ -323,6 +323,187 @@ async fn cjdns_tun_two_node() {
     b.stop().await;
 }
 
+#[test]
+fn hs_desc_uploaded_line_is_the_stored_event() {
+    let id = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv";
+    assert!(rbitcoin_test::overlay::hs_desc_uploaded(
+        &format!("650 HS_DESC UPLOADED {id} NO_AUTH $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        id
+    ));
+    assert!(!rbitcoin_test::overlay::hs_desc_uploaded(
+        &format!("650 HS_DESC UPLOAD {id} NO_AUTH $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        id
+    ));
+    assert!(!rbitcoin_test::overlay::hs_desc_uploaded(
+        &format!("650 HS_DESC FAILED {id} NO_AUTH $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        id
+    ));
+    assert!(!rbitcoin_test::overlay::hs_desc_uploaded(
+        "650 HS_DESC UPLOADED other NO_AUTH",
+        id
+    ));
+}
+
+#[tokio::test]
+async fn control_gate_holds_a_new_connection_until_release() {
+    let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_addr = upstream.local_addr().unwrap();
+    let gate = control_gate(up_addr).await;
+    gate.hold();
+    let mut client = tokio::net::TcpStream::connect(gate.listen).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), upstream.accept())
+            .await
+            .is_err(),
+        "a held gate forwarded the node's control connection"
+    );
+    gate.release();
+    let (mut up, _) = tokio::time::timeout(Duration::from_secs(2), upstream.accept())
+        .await
+        .expect("release")
+        .unwrap();
+    client.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    up.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ping");
+    drop(up);
+    let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf[..1]))
+        .await
+        .expect("upstream close")
+        .unwrap();
+    assert_eq!(n, 0, "the node must see the control connection close");
+}
+
+#[tokio::test]
+async fn uploaded_watch_returns_only_after_the_subscription_drops() {
+    use rbitcoin_node::tor_control::{hmac_sha256, SAFECOOKIE_CLIENT_KEY, SAFECOOKIE_SERVER_KEY};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let dir = TempDir::new().unwrap();
+    let cookie_path = dir.path().join("cookie");
+    std::fs::write(&cookie_path, [9u8; 32]).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let id = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuv";
+    let event =
+        format!("650 HS_DESC UPLOADED {id} NO_AUTH $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n");
+
+    let early = std::sync::Arc::new(tokio::sync::Notify::new());
+    let early_sent = std::sync::Arc::clone(&early);
+    // The original subscription stays up until the test has seen that its
+    // UPLOADED did not finish the watch. A timer here can expire during that
+    // check and deliver the replacement event too soon.
+    let close_original = std::sync::Arc::new(tokio::sync::Notify::new());
+    let close_original_bg = std::sync::Arc::clone(&close_original);
+    let event_bg = event.clone();
+    let cookie_bg = cookie_path.clone();
+    tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        drop(sock);
+
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut write = speak_until_setevents(sock, &cookie_bg).await;
+        write.write_all(event_bg.as_bytes()).await.unwrap();
+        early_sent.notify_one();
+        close_original_bg.notified().await;
+        drop(write);
+
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut write = speak_until_setevents(sock, &cookie_bg).await;
+        write.write_all(event_bg.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let attached = std::sync::Arc::new(tokio::sync::Notify::new());
+    let resumed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let attached_w = std::sync::Arc::clone(&attached);
+    let resumed_w = std::sync::Arc::clone(&resumed);
+    let mut watch = tokio::spawn(async move {
+        wait_hs_desc_uploaded(
+            addr,
+            &cookie_path,
+            id,
+            Duration::from_secs(5),
+            &attached_w,
+            &resumed_w,
+        )
+        .await;
+    });
+    tokio::time::timeout(Duration::from_secs(3), attached.notified())
+        .await
+        .expect("attached");
+    early.notified().await;
+    tokio::select! {
+        _ = &mut watch => panic!("watch treated the original tor's UPLOADED as the restart"),
+        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+    }
+    close_original.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), resumed.notified())
+        .await
+        .expect("resumed");
+    tokio::time::timeout(Duration::from_secs(3), &mut watch)
+        .await
+        .expect("post-drop UPLOADED")
+        .expect("watch");
+
+    async fn speak_until_setevents(
+        sock: tokio::net::TcpStream,
+        cookie_path: &std::path::Path,
+    ) -> tokio::net::tcp::OwnedWriteHalf {
+        let cookie = std::fs::read(cookie_path).unwrap();
+        let (read, mut write) = sock.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let mut nonces = None;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(hex) = line.strip_prefix("AUTHCHALLENGE SAFECOOKIE ") {
+                let client = decode_hex32(hex.trim());
+                let server = [7u8; 32];
+                nonces = Some((client, server));
+                let mut mat = cookie.clone();
+                mat.extend_from_slice(&client);
+                mat.extend_from_slice(&server);
+                let hash = hmac_sha256(SAFECOOKIE_SERVER_KEY, &mat);
+                let reply = format!(
+                    "250 AUTHCHALLENGE SERVERHASH={} SERVERNONCE={}\r\n",
+                    rbitcoin_primitives::hex_encode(hash),
+                    rbitcoin_primitives::hex_encode(server)
+                );
+                write.write_all(reply.as_bytes()).await.unwrap();
+                continue;
+            }
+            let reply = if line.starts_with("PROTOCOLINFO") {
+                "250-PROTOCOLINFO 1\r\n250-AUTH METHODS=COOKIE,SAFECOOKIE\r\n250 OK\r\n"
+            } else if let Some(hex) = line.strip_prefix("AUTHENTICATE ") {
+                let (client, server) = nonces.expect("AUTHCHALLENGE");
+                let mut mat = cookie.clone();
+                mat.extend_from_slice(&client);
+                mat.extend_from_slice(&server);
+                let want = hmac_sha256(SAFECOOKIE_CLIENT_KEY, &mat);
+                if hex.trim() == rbitcoin_primitives::hex_encode(want) {
+                    "250 OK\r\n"
+                } else {
+                    "515 Authentication failed\r\n"
+                }
+            } else if line.starts_with("GETINFO version") {
+                "250-version=0.4.9.16\r\n250 OK\r\n"
+            } else if line.starts_with("SETEVENTS") {
+                write.write_all(b"250 OK\r\n").await.unwrap();
+                break;
+            } else {
+                "250 OK\r\n"
+            };
+            write.write_all(reply.as_bytes()).await.unwrap();
+        }
+        write
+    }
+
+    fn decode_hex32(s: &str) -> [u8; 32] {
+        let bytes = rbitcoin_primitives::hex_decode(s).unwrap();
+        bytes.try_into().unwrap()
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tor_onion_comes_back_after_tor_restarts() {
     let env = require_env();
@@ -331,11 +512,41 @@ async fn tor_onion_comes_back_after_tor_restarts() {
     let b_rpc = ephemeral_addr();
     let a_rpc = ephemeral_addr();
 
-    let b = spawn_node(tor_b(&env, b_dir.path(), b_rpc), b_rpc).await;
+    let gate = control_gate(env.tor_control).await;
+    let mut cfg = tor_b(&env, b_dir.path(), b_rpc);
+    cfg.tor.control = Some(gate.listen);
+    let b = spawn_node(cfg, b_rpc).await;
     generate_n(b_rpc, 3).await;
     let (onion, port) = wait_p2p_onion(b_rpc, Duration::from_secs(90)).await;
     wait_socks_onion(env.tor_socks, &onion, port, Duration::from_secs(90)).await;
 
+    let service_id = onion.strip_suffix(".onion").unwrap_or(&onion).to_string();
+    let (control, cookie) = (env.tor_control, env.tor_cookie.clone());
+    let attached = std::sync::Arc::new(tokio::sync::Notify::new());
+    let resumed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let attached_watch = std::sync::Arc::clone(&attached);
+    let resumed_watch = std::sync::Arc::clone(&resumed);
+    let uploaded = tokio::spawn(async move {
+        wait_hs_desc_uploaded(
+            control,
+            &cookie,
+            &service_id,
+            Duration::from_secs(90),
+            &attached_watch,
+            &resumed_watch,
+        )
+        .await;
+    });
+    tokio::time::timeout(Duration::from_secs(30), attached.notified())
+        .await
+        .expect("HS_DESC watch on the tor about to restart");
+    gate.hold();
+    let release = gate.clone();
+    let resumed_release = std::sync::Arc::clone(&resumed);
+    tokio::spawn(async move {
+        resumed_release.notified().await;
+        release.release();
+    });
     restart_daemon(&env.tor_restart).await;
     let again = wait_p2p_onion(b_rpc, Duration::from_secs(90)).await;
     assert_eq!(
@@ -343,6 +554,7 @@ async fn tor_onion_comes_back_after_tor_restarts() {
         (onion.clone(), port),
         "the same onion after the restart"
     );
+    uploaded.await.expect("HS_DESC upload watch");
     wait_socks_onion(env.tor_socks, &onion, port, Duration::from_secs(90)).await;
 
     let a = spawn_node(tor_a(&env, a_dir.path(), a_rpc, &onion, port), a_rpc).await;

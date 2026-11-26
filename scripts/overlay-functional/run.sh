@@ -58,6 +58,10 @@ WORKDIR="$(mktemp -d /tmp/rbitcoin-overlay.XXXXXX)"
 cleanup() {
   local st=$?
   set +e
+  if [[ "$st" -ne 0 && -f "$WORKDIR/tor/client/notice.log" ]]; then
+    echo "overlay-functional: tor client log" >&2
+    tail -n 80 "$WORKDIR/tor/client/notice.log" >&2 || true
+  fi
   if [[ "$st" -ne 0 && -d "$WORKDIR/i2p" ]]; then
     echo "overlay-functional: i2pd logs" >&2
     local log
