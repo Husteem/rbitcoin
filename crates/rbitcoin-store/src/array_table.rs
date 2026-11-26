@@ -1334,10 +1334,9 @@ impl ArrayTable {
         let logical = FILE_HEADER_LEN as u64 + n * ELEM;
         let payload_start = FILE_HEADER_LEN as u64 + start * ELEM;
         let block_start = (payload_start & !(FLUSH_SCRATCH as u64 - 1)).max(FILE_HEADER_LEN as u64);
-        if logical <= block_start {
-            return Ok(None);
-        }
-        let len = (logical - block_start) as usize;
+        // A shrink to a block boundary writes no slot, but the flush still
+        // rewrites the length in page 0, so the page-0 record below stays.
+        let len = logical.saturating_sub(block_start) as usize;
         if len as u64 > AHEAD_MAX_BYTES {
             return Err(StoreError::Corrupt("array ahead image too large"));
         }
@@ -1348,7 +1347,7 @@ impl ArrayTable {
             .iter()
             .enumerate()
             .skip(first)
-            .take(n as usize - first)
+            .take((n as usize).saturating_sub(first))
         {
             let at = i * ELEM as usize + FILE_HEADER_LEN - block_start as usize;
             if at + ELEM as usize <= image.len() {
@@ -1369,7 +1368,9 @@ impl ArrayTable {
             }
             records.push((FILE_HEADER_LEN as u64, page));
         }
-        records.push((block_start, image));
+        if !image.is_empty() {
+            records.push((block_start, image));
+        }
         // A leftover sidecar from a failed write keeps ranges this write does
         // not replace; leftover pieces of old ranges are reinserted, new wins.
         let mut merged = Vec::new();

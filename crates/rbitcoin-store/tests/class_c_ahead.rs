@@ -334,6 +334,36 @@ fn torn_confirmed_page_zero_restores_from_ahead_image() {
     assert!(!dir.path.join("confirmed.body.ahead").exists());
 }
 
+/// A disconnect to a length that ends on a 4 KiB boundary writes no slot,
+/// but the flush still rewrites the length in page 0.
+#[test]
+fn torn_page_zero_after_a_block_aligned_shrink_restores() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("confirmed-aligned").unwrap();
+    let path = dir.path.join("confirmed.body");
+    {
+        let t = ConfirmedTable::create(&dir.path).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        for h in 0..512u32 {
+            t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+        }
+        t.flush().unwrap();
+        // 16 B header + 510 slots is exactly one 4 KiB block.
+        t.disconnect_tip(&write, Height(511)).unwrap();
+        t.disconnect_tip(&write, Height(510)).unwrap();
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&path);
+        assert!(t.flush().is_err(), "the failpoint must stop the flush");
+        assert!(dir.path.join("confirmed.body.ahead").is_file());
+    }
+
+    zero_header_and_block(&path);
+    let t = ConfirmedTable::open(&dir.path).unwrap();
+    assert_eq!(t.tip_height(), Some(Height(509)));
+    assert_eq!(t.get(Height(0)).unwrap(), Some(Fk(1)));
+    assert_eq!(t.get(Height(509)).unwrap(), Some(Fk(510)));
+}
+
 #[test]
 fn one_header_txs_failpoint_does_not_clear_another_path() {
     let a = rbitcoin_store::testutil::TempDir::labeled("ahead-a").unwrap();
