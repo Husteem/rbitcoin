@@ -228,15 +228,17 @@ pub(crate) fn cut_or_refuse_confirmed_hole(
         return Ok(());
     };
     let hole = hole?;
-    let top_byte = FILE_HEADER_LEN as u64 + u64::from(top) * ELEM;
-    let block_byte = top_byte & !(FLUSH_SCRATCH as u64 - 1);
+    // The block is the one that holds the sealed tip, not the top non-null
+    // slot: a torn block can null a run that ends in the block before it.
+    let cap_byte = FILE_HEADER_LEN as u64 + u64::from(cap) * ELEM;
+    let block_byte = cap_byte & !(FLUSH_SCRATCH as u64 - 1);
     let block_first = block_byte.saturating_sub(FILE_HEADER_LEN as u64) / ELEM;
     if u64::from(hole) < block_first {
-        eprintln!("rbitcoin: confirmed[{hole}] is null below tip {top}; the store needs a reindex");
+        eprintln!("rbitcoin: confirmed[{hole}] is null below tip {cap}; the store needs a reindex");
         return Err(StoreError::Corrupt("confirmed[] null slot below the tip"));
     }
     eprintln!(
-        "rbitcoin: confirmed[{hole}] is null in the block that holds tip {top}; \
+        "rbitcoin: confirmed[{hole}] is null in the block that holds tip {cap}; \
          cutting the tip to {}",
         i64::from(hole) - 1
     );

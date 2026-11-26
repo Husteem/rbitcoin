@@ -432,7 +432,7 @@ fn seal_clamp_to_a_different_block_at_the_sealed_height_drops_it() {
 
 /// Heights `0..len` sealed at the tip, then `confirmed[hole]` nulled and
 /// flushed, with the spend marker three below the tip.
-fn sealed_chain_with_hole(dir: &std::path::Path, len: u32, hole: u32) {
+fn sealed_chain_with_hole(dir: &std::path::Path, len: u32, holes: &[u32]) {
     let s = Store::create_tiny(dir).unwrap();
     let write = rbitcoin_store::ClassCWrite::for_test();
     let mut parent_hash = [0u8; 32];
@@ -446,9 +446,11 @@ fn sealed_chain_with_hole(dir: &std::path::Path, len: u32, hole: u32) {
     }
     s.headers.flush().unwrap();
     s.flush_class_c_tip().unwrap();
-    s.confirmed
-        .set_raw_for_test(&write, Height(hole), 0)
-        .unwrap();
+    for &hole in holes {
+        s.confirmed
+            .set_raw_for_test(&write, Height(hole), 0)
+            .unwrap();
+    }
     s.confirmed.flush().unwrap();
     rbitcoin_store::spend_durable::SpendDurable::new(len - 3, len - 3)
         .store(s.path())
@@ -460,7 +462,7 @@ fn sealed_chain_with_hole(dir: &std::path::Path, len: u32, hole: u32) {
 #[test]
 fn null_slot_in_the_sealed_tip_block_cuts_the_tip_at_open() {
     let dir = tmp();
-    sealed_chain_with_hole(&dir, 20, 16);
+    sealed_chain_with_hole(&dir, 20, &[16]);
     let s = Store::open_tiny(&dir).expect("a hole in the tip block is crash damage");
     assert_eq!(s.confirmed.tip_height(), Some(Height(15)));
     let _ = std::fs::remove_dir_all(&dir);
@@ -474,13 +476,36 @@ fn null_slot_in_the_sealed_tip_block_cuts_the_tip_at_open() {
 fn null_confirmed_slot_below_the_tip_refuses_open() {
     let dir = tmp();
     // Height 519 is in the second 4 KiB block; height 3 is in page 0.
-    sealed_chain_with_hole(&dir, 520, 3);
+    sealed_chain_with_hole(&dir, 520, &[3]);
     match Store::open_tiny(&dir) {
         Err(rbitcoin_store::StoreError::Corrupt(reason)) => {
             assert!(reason.contains("confirmed"), "{reason}");
         }
         Err(e) => panic!("wrong error: {e}"),
         Ok(_) => panic!("open accepted a null confirmed[] slot below the tip"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The block that holds the sealed tip bounds the cut, not the top non-null
+/// slot. With the sealed tip at 520, a torn block nulls 510..=520 and the
+/// top slot left is 509, in the block before. A null at 508 is outside the
+/// sealed tip's block, so open refuses it.
+#[test]
+fn null_below_the_sealed_tip_block_refuses_open_after_a_trailing_run() {
+    let dir = tmp();
+    let mut holes: Vec<u32> = (510..=520).collect();
+    holes.push(508);
+    sealed_chain_with_hole(&dir, 521, &holes);
+    match Store::open_tiny(&dir) {
+        Err(rbitcoin_store::StoreError::Corrupt(reason)) => {
+            assert!(reason.contains("confirmed"), "{reason}");
+        }
+        Err(e) => panic!("wrong error: {e}"),
+        Ok(s) => panic!(
+            "open cut a hole outside the sealed tip block; tip {:?}",
+            s.confirmed.tip_height()
+        ),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
