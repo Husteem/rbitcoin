@@ -22,6 +22,7 @@ from rpc_proxy import (
     node_rpc_port,
     peel_authproxy_args,
     rewrite_testmempoolaccept_abort,
+    rewrite_testmempoolaccept_cluster,
     rewrite_unspendable_spend,
     shim_miniwallet_scantxoutset,
     whitelist_map,
@@ -187,6 +188,75 @@ try:
     raise SystemExit("combo must not be expanded")
 except RpcError as e:
     assert "raw()" in e.message, e.message
+cluster = {
+    "result": [
+        {
+            "txid": "aa",
+            "wtxid": "wa",
+            "allowed": False,
+            "reject-reason": "too-large-cluster",
+        },
+        {
+            "txid": "bb",
+            "wtxid": "wb",
+            "allowed": False,
+            "reject-reason": "too-large-cluster",
+        },
+    ]
+}
+rewrite_testmempoolaccept_cluster("testmempoolaccept", cluster)
+assert cluster["result"] == [
+    {"txid": "aa", "wtxid": "wa", "package-error": "too-large-cluster"},
+    {"txid": "bb", "wtxid": "wb", "package-error": "too-large-cluster"},
+], cluster
+mixed_cluster = {
+    "result": [
+        {"txid": "aa", "wtxid": "wa", "allowed": True},
+        {
+            "txid": "bb",
+            "wtxid": "wb",
+            "allowed": False,
+            "reject-reason": "too-large-cluster",
+        },
+    ]
+}
+rewrite_testmempoolaccept_cluster("testmempoolaccept", mixed_cluster)
+assert mixed_cluster["result"][0]["allowed"] is True, mixed_cluster
+assert mixed_cluster["result"][1] == {
+    "txid": "bb",
+    "wtxid": "wb",
+    "package-error": "too-large-cluster",
+}, mixed_cluster
+lone_cluster = {
+    "result": [
+        {
+            "txid": "aa",
+            "wtxid": "wa",
+            "allowed": False,
+            "reject-reason": "too-large-cluster",
+        }
+    ]
+}
+rewrite_testmempoolaccept_cluster("testmempoolaccept", lone_cluster)
+assert lone_cluster["result"][0]["reject-reason"] == "too-large-cluster", lone_cluster
+send_cluster = {
+    "result": [
+        {
+            "txid": "aa",
+            "wtxid": "wa",
+            "allowed": False,
+            "reject-reason": "too-large-cluster",
+        },
+        {
+            "txid": "bb",
+            "wtxid": "wb",
+            "allowed": False,
+            "reject-reason": "too-large-cluster",
+        },
+    ]
+}
+rewrite_testmempoolaccept_cluster("sendrawtransaction", send_cluster)
+assert send_cluster["result"][0]["reject-reason"] == "too-large-cluster", send_cluster
 rewrite_testmempoolaccept_abort("testmempoolaccept", seq)
 assert seq["result"][0] == {"txid": "aa", "wtxid": "wa"}, seq
 assert seq["result"][1]["reject-reason"] == "missing-inputs", seq

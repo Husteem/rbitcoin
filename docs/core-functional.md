@@ -73,7 +73,10 @@ Production (unset) still package-evaluates a child-with-parents remainder
 that failed min relay, the dynamic mempool floor, or missing inputs. The RPC
 proxy rewrites multi-tx `testmempoolaccept` abort-class rows
 (`missing-inputs` / `max-fee-exceeded` / `bip125-replacement-disallowed`) to
-`{txid,wtxid}`; the node keeps earlier `allowed: true`.
+`{txid,wtxid}`; the node keeps earlier `allowed: true`. A multi-tx row whose
+`reject-reason` is `too-large-cluster` becomes Core's `{txid,wtxid,package-error}`
+for that row only. A one-tx call and a member of another cluster stay as the
+node reported them.
 `getmempoolinfo.maxmempool` is already the virtual-size byte cap. The shim's
 4× `-maxmempool` map makes that number match Core. A `generateblock` spend of
 an unspendable output still fails the script on the node; the proxy rewrites
@@ -160,7 +163,8 @@ the asserts then hit `sendrawtransaction` / `generate*` / P2P. Do **not**
 dialect the node does not ship. Named Core-functional shim dialect is allowed
 when documented: child env (`RBITCOIN_RPC_WAIT_TIP_IDLE`,
 `RBITCOIN_RPC_PACKAGE_DIALECT`) and proxy JSON (abort-class
-`testmempoolaccept` blanking). Do not `run` a silent Core-clone
+`testmempoolaccept` blanking, and `too-large-cluster` as `package-error`
+on that multi-tx row). Do not `run` a silent Core-clone
 of production RPC.
 
 First production-green pair (historical): `feature_uacomment.py`

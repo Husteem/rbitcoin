@@ -389,6 +389,27 @@ def shim_miniwallet_scantxoutset(
     return {"success": True, "height": int(tip_height), "unspents": unspents, "total_amount": _sat_btc(total)}
 
 
+def rewrite_testmempoolaccept_cluster(method: Any, parsed: dict[str, Any]) -> None:
+    """Core's package cluster failure is `package-error`, not `reject-reason`.
+
+    A one-transaction call keeps `reject-reason`. A member of another cluster
+    stays allowed. Only an over-cap row in a multi-transaction result changes.
+    """
+    if method != "testmempoolaccept":
+        return
+    result = parsed.get("result")
+    if not isinstance(result, list) or len(result) < 2:
+        return
+    for i, row in enumerate(result):
+        if not isinstance(row, dict) or row.get("reject-reason") != "too-large-cluster":
+            continue
+        result[i] = {
+            "txid": row.get("txid"),
+            "wtxid": row.get("wtxid"),
+            "package-error": "too-large-cluster",
+        }
+
+
 def rewrite_testmempoolaccept_abort(method: Any, parsed: dict[str, Any]) -> None:
     """Core PCKG abort: first abort-class row keeps reject-reason; others id-only."""
     if method != "testmempoolaccept":
@@ -459,6 +480,7 @@ def _rewrite_forwarded_body(method: Any, body: bytes) -> bytes:
     changed = rewrite_unspendable_spend(method, parsed)
     if method == "testmempoolaccept":
         before = json.dumps(parsed, sort_keys=True)
+        rewrite_testmempoolaccept_cluster(method, parsed)
         rewrite_testmempoolaccept_abort(method, parsed)
         changed = changed or json.dumps(parsed, sort_keys=True) != before
     if not changed:
@@ -775,7 +797,9 @@ class RpcProxy:
                 "id": item.get("id"),
             }
         if isinstance(parsed, dict):
-            rewrite_testmempoolaccept_abort(item.get("method"), parsed)
+            method = item.get("method")
+            rewrite_testmempoolaccept_cluster(method, parsed)
+            rewrite_testmempoolaccept_abort(method, parsed)
             return parsed
         return {
             "result": None,
