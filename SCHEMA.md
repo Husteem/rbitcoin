@@ -237,6 +237,7 @@ itself changed.
     tear_guard/tail.0                # alternating partial-tail image and published lengths (generation 0 = unused). No SCHEMA_VERSION bump
     tear_guard/tail.1                # the other tail slot. No SCHEMA_VERSION bump
     scripthash.rebuild               # optional: one byte. The next start wipes and rebuilds the scripthash index; removed when that rebuild finishes. No SCHEMA_VERSION bump
+    scripthash.dirty                 # optional: one byte while scripthash writes may be unsynced. A --sh-index start that finds it refuses; a wipe removes it. No SCHEMA_VERSION bump
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
     spent.delta/{seg.<id>, idx.<id>, log.<id>, commit, fold}  # schema-30 spend delta overlay
     spend_durable                    # annotated-through A + durable-through D heights. No SCHEMA_VERSION bump

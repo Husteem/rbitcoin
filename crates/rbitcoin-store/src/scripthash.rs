@@ -109,6 +109,124 @@ pub fn clear_sh_rebuild(store_dir: &Path) -> Result<(), StoreError> {
     }
 }
 
+/// Present while the index may hold a write that is not yet synced. Some of
+/// those writes land in place over bytes a durable head still points at (a
+/// same-class slab rewritten in place, a freed slab's free-list link, the
+/// alloc header), so after an unclean stop the index can read as valid and
+/// be wrong. The node refuses to start while it is present (#2074).
+pub const SH_DIRTY_NAME: &str = "scripthash.dirty";
+
+pub fn sh_dirty_marked(store_dir: &Path) -> bool {
+    store_dir.join(SH_DIRTY_NAME).is_file()
+}
+
+/// Sync the directories whose files index writes and wipes create or
+/// remove (ingest seal, sealed and packed heads, compaction), so those
+/// entries are durable before [`SH_DIRTY_NAME`] goes.
+fn fsync_sh_dirs(store_dir: &Path) -> Result<(), StoreError> {
+    for d in [
+        store_dir.join("scripthash.body"),
+        store_dir.join("scripthash.head"),
+        store_dir.join(crate::scripthash_overflow::OVERFLOW_DIR),
+    ] {
+        if d.is_dir() {
+            crate::file::fsync_parent_dir(&d).map_err(|e| StoreError::io(&d, e))?;
+        }
+    }
+    Ok(())
+}
+
+/// [`SH_DIRTY_NAME`] for one open table. A writer marks before it writes
+/// and holds `scope` for the write. [`ScriptHashTable::flush`] clears the
+/// mark only if no write started since its sync began (`gen` unchanged), and
+/// never while `held`: a mark found at open, or one a failed write left, is
+/// for bytes a sync does not repair, so only a wipe removes it.
+struct ShDirty {
+    scope: RwLock<()>,
+    state: Mutex<ShDirtyState>,
+}
+
+struct ShDirtyState {
+    marked: bool,
+    held: bool,
+    gen: u64,
+}
+
+impl ShDirty {
+    fn open(store_dir: &Path) -> Self {
+        let marked = sh_dirty_marked(store_dir);
+        Self {
+            scope: RwLock::new(()),
+            state: Mutex::new(ShDirtyState {
+                marked,
+                held: marked,
+                gen: 0,
+            }),
+        }
+    }
+
+    /// A write returned an error partway: keep the mark until a wipe.
+    fn hold(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).held = true;
+    }
+
+    fn begin(&self, store_dir: &Path) -> Result<std::sync::RwLockReadGuard<'_, ()>, StoreError> {
+        let scope = self.scope.read().unwrap_or_else(|e| e.into_inner());
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.gen = s.gen.wrapping_add(1);
+        if !s.marked {
+            crate::file::write_synced_tmp_rename(&store_dir.join(SH_DIRTY_NAME), &[1])?;
+            s.marked = true;
+        }
+        Ok(scope)
+    }
+
+    /// The write count with no write in progress.
+    fn quiet_gen(&self) -> u64 {
+        let _quiet = self.scope.write().unwrap_or_else(|e| e.into_inner());
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).gen
+    }
+
+    fn is_marked(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).marked
+    }
+
+    /// The index files were wiped and the wipe synced: nothing is left to
+    /// distrust.
+    fn clear_after_wipe(&self, store_dir: &Path) -> Result<(), StoreError> {
+        let _quiet = self.scope.write().unwrap_or_else(|e| e.into_inner());
+        fsync_sh_dirs(store_dir)?;
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        Self::remove_marker(&mut s, store_dir)?;
+        s.held = false;
+        Ok(())
+    }
+
+    /// Remove the file and sync its directory. `marked` follows the file:
+    /// once the unlink lands it is false even if the sync then fails, so the
+    /// next write creates the mark again instead of trusting a missing one.
+    fn remove_marker(s: &mut ShDirtyState, store_dir: &Path) -> Result<(), StoreError> {
+        let path = store_dir.join(SH_DIRTY_NAME);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&path, e)),
+        }
+        s.marked = false;
+        crate::file::fsync_parent_dir(store_dir).map_err(|e| StoreError::io(store_dir, e))
+    }
+
+    fn clear_if_unchanged(&self, store_dir: &Path, gen: u64) -> Result<(), StoreError> {
+        let _quiet = self.scope.write().unwrap_or_else(|e| e.into_inner());
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.marked && !s.held && s.gen == gen {
+            fsync_sh_dirs(store_dir)?;
+            Self::remove_marker(&mut s, store_dir)?;
+        }
+        Ok(())
+    }
+}
+
 /// Load durable inclusion HWM (`0` if missing/corrupt).
 pub fn load_include_hwm(store_dir: &Path) -> u64 {
     let p = store_dir.join(INCLUDE_HWM_NAME);
@@ -278,6 +396,8 @@ pub struct ScriptHashTable {
     ovf_alloc: Option<Mutex<AllocState>>,
     /// Full-list unlinks whose empty head waits for the tip shrink.
     pending_empty: Mutex<Vec<unlink::PendingEmpty>>,
+    /// [`SH_DIRTY_NAME`] for this table.
+    dirty: ShDirty,
 }
 
 #[doc(hidden)]
@@ -955,6 +1075,7 @@ impl ScriptHashTable {
             allocs,
             ovf_alloc: Some(Mutex::new(ovf_st)),
             pending_empty: Mutex::new(Vec::new()),
+            dirty: ShDirty::open(dir),
         })
     }
 
@@ -1036,6 +1157,7 @@ impl ScriptHashTable {
             allocs,
             ovf_alloc,
             pending_empty: Mutex::new(Vec::new()),
+            dirty: ShDirty::open(dir),
         };
         // v1 = schema-13 slabs; v2 = schema-14 pages; v3 = schema-15 slabs.
         // Field layout is the same; only an empty older header upgrades silently.
@@ -1642,10 +1764,17 @@ impl ScriptHashTable {
         &self,
         recs: &[ScriptHashRecord],
     ) -> Result<(usize, AppendTiming), StoreError> {
-        let mut timing = AppendTiming::default();
         if recs.is_empty() {
-            return Ok((0, timing));
+            return Ok((0, AppendTiming::default()));
         }
+        self.dirty_write(|| self.put_create_batch_append_marked(recs))
+    }
+
+    fn put_create_batch_append_marked(
+        &self,
+        recs: &[ScriptHashRecord],
+    ) -> Result<(usize, AppendTiming), StoreError> {
+        let mut timing = AppendTiming::default();
 
         let t_sort = std::time::Instant::now();
         let mut order: Vec<usize> = (0..recs.len()).collect();
@@ -2532,7 +2661,54 @@ impl ScriptHashTable {
         Ok(())
     }
 
+    /// Write and sync every body and head. A sync with no write started
+    /// since it began clears [`SH_DIRTY_NAME`].
     pub fn flush(&self) -> Result<(), StoreError> {
+        let gen = self.dirty.quiet_gen();
+        self.flush_synced()?;
+        self.dirty.clear_if_unchanged(&self.store_dir, gen)
+    }
+
+    /// Process exit. A dirty index gets the full synced [`Self::flush`], which
+    /// clears [`SH_DIRTY_NAME`] so the next start trusts it. A clean one has
+    /// nothing unsynced to lose and keeps the fast unsynced writeback.
+    pub fn flush_for_close(&self) -> Result<(), StoreError> {
+        if self.dirty.is_marked() {
+            self.flush()
+        } else {
+            self.flush_async()
+        }
+    }
+
+    /// After a wipe for rebuild, sync the reset bodies and heads, then drop
+    /// [`SH_DIRTY_NAME`] once the wipe is durable.
+    pub fn clear_dirty_after_wipe(&self) -> Result<(), StoreError> {
+        self.flush_synced()?;
+        self.dirty.clear_after_wipe(&self.store_dir)
+    }
+
+    /// Run a write that can land in place with [`SH_DIRTY_NAME`] set for its
+    /// whole span. An error keeps the mark until a wipe.
+    pub(crate) fn dirty_write<T>(
+        &self,
+        write: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let _scope = self.begin_dirty_write()?;
+        let out = write();
+        if out.is_err() {
+            self.dirty.hold();
+        }
+        out
+    }
+
+    /// Mark [`SH_DIRTY_NAME`] before a write that can land in place. Hold the
+    /// guard until the write returns.
+    #[doc(hidden)]
+    pub fn begin_dirty_write(&self) -> Result<std::sync::RwLockReadGuard<'_, ()>, StoreError> {
+        self.dirty.begin(&self.store_dir)
+    }
+
+    fn flush_synced(&self) -> Result<(), StoreError> {
         self.persist_all_allocs()?;
         self.flush_all_bodies()?;
         if let Some(h) = self.ingest.lock().unwrap().as_ref() {

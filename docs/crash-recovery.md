@@ -69,9 +69,22 @@ can lose a confirmed bit below the window
 `header.head` can lose a mapping for any height
 ([#2073](https://github.com/rbitcoin-org/rbitcoin/issues/2073)). `confirmed[]`
 is held by `tip_seal` and `trim_trailing_nulls`, not by a redo. The scripthash
-allocator has the same exposure in its free list
-([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)), and the
-in-place derived cells are lower severity
+index has the same exposure (a same-class slab rewritten in place, a freed
+slab's free-list link, the alloc header) and is gated instead of repaired:
+an append, an unlink or a deferred empty-head commit writes
+`scripthash.dirty` before it writes. A full synced `ScriptHashTable::flush`
+(file data, then the `scripthash.body`, `scripthash.head` and
+`scripthash.ovf` directories) removes the mark only when no write started
+since its sync began, and never a mark that was present at open or that a
+failed write left: syncing torn bytes does not repair them, so only a wipe
+removes those. A clean shutdown of a dirty index runs that flush. The cold
+build and pack paths do not mark: an unsealed shard is untrusted until its
+pack mark, and its keys stay in ingest or overflow until then. A start with
+`--sh-index` that finds the file refuses and names the fix:
+`RBITCOIN_SH_FORCE_REBUILD=1` (or the `scripthash.rebuild` and degraded
+markers) wipes the index at open and removes the file, or start without
+`--sh-index` ([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)).
+The in-place derived cells are lower severity
 ([#2075](https://github.com/rbitcoin-org/rbitcoin/issues/2075)). Until those
 are closed, the whole-store guarantee is the guarded state above, not every
 row. There is also no clean-close gate and no whole-store snapshot, so a Class

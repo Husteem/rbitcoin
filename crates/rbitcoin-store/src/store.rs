@@ -2486,7 +2486,7 @@ impl Store {
         );
         let txs = self.txs.flush_async();
         let spenders = self.spenders.flush_async();
-        let scripthash = self.scripthash.flush_async();
+        let scripthash = self.scripthash.flush_for_close();
         // One dense image of the open tx.head tail. Not Store::flush: that
         // fsyncs every Class A body.
         if let Err(e) = self.txs.flush_head() {

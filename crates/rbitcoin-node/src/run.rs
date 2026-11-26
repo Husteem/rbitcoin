@@ -2418,6 +2418,9 @@ pub async fn startup_follows_without_catch_up(hub: &Arc<ChainHub>) -> bool {
 /// Open-time SH head handling: wipe a head a previous run marked degraded (or
 /// that `RBITCOIN_SH_FORCE_REBUILD` names), then drop a head nothing proves.
 fn prepare_sh_head_at_open(query: &Query, shindex: bool) -> Result<(), NodeError> {
+    if let Some(refusal) = query.sh_dirty_refusal(shindex) {
+        return Err(NodeError::Config(refusal));
+    }
     query
         .startup_sh_rebuild(shindex)
         .map_err(|e| NodeError::Config(format!("scripthash rebuild at open: {e}")))?;
