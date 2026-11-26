@@ -1119,6 +1119,13 @@ impl ArrayTable {
         Self::restore_ahead_inner(path, false)
     }
 
+    /// Test-only entry to the private restore path.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn restore_ahead_for_test(path: &Path, remove: bool) -> Result<(), StoreError> {
+        Self::restore_ahead_inner(path, remove)
+    }
+
     fn restore_ahead_inner(path: &Path, remove: bool) -> Result<(), StoreError> {
         use std::io::{Seek, SeekFrom, Write};
         let side = Self::ahead_path(path);
@@ -1377,118 +1384,5 @@ impl ArrayTable {
     pub fn flush_async(&self) -> Result<(), StoreError> {
         self.flush_dirty()?;
         self.file.flush_async()
-    }
-}
-
-#[cfg(test)]
-mod ahead_tests {
-    use super::*;
-
-    fn side(path: &Path) -> PathBuf {
-        ArrayTable::ahead_path(path)
-    }
-
-    fn header(logical: u64) -> [u8; 16] {
-        let mut h = [0u8; 16];
-        h[8..16].copy_from_slice(&logical.to_le_bytes());
-        h
-    }
-
-    fn rec(off: u64, image: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&off.to_le_bytes());
-        out.extend_from_slice(&(image.len() as u32).to_le_bytes());
-        let mut eng = sha256::HashEngine::default();
-        eng.input(&off.to_le_bytes());
-        eng.input(&(image.len() as u32).to_le_bytes());
-        eng.input(image);
-        out.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
-        out.extend_from_slice(image);
-        out
-    }
-
-    fn raw(version: u16, count: u32, header: [u8; 16], records: &[Vec<u8>]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(AHEAD_MAGIC);
-        out.extend_from_slice(&version.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&count.to_le_bytes());
-        out.extend_from_slice(&header);
-        for r in records {
-            out.extend_from_slice(r);
-        }
-        out
-    }
-
-    fn write_bad(path: &Path, raw: &[u8]) {
-        std::fs::write(side(path), raw).unwrap();
-    }
-
-    #[test]
-    fn ahead_rejects_every_bad_shape_and_applies_a_good_one() {
-        let dir = crate::testutil::TempDir::labeled("ahead-shapes").unwrap();
-        let path = dir.path().join("table");
-        let logical = 8192u64;
-        let good = rec(4096, &[7u8; 8]);
-        let page0 = rec(16, &[3u8; 16]);
-        let ok = raw(
-            AHEAD_VERSION,
-            2,
-            header(logical),
-            &[page0.clone(), good.clone()],
-        );
-
-        write_bad(&path, &raw(AHEAD_VERSION, 0, header(logical), &[]));
-        assert!(ArrayTable::restore_ahead_inner(&path, true).is_err());
-        write_bad(
-            &path,
-            &raw(AHEAD_VERSION + 1, 1, header(logical), &[good.clone()]),
-        );
-        assert!(ArrayTable::restore_ahead_inner(&path, true).is_err());
-        write_bad(
-            &path,
-            &raw(AHEAD_VERSION, 2, header(logical), &[good.clone()]),
-        );
-        assert!(ArrayTable::restore_ahead_inner(&path, true).is_err());
-        write_bad(
-            &path,
-            &raw(AHEAD_VERSION, 1, header(logical), &[vec![0u8; 10]]),
-        );
-        assert!(ArrayTable::restore_ahead_inner(&path, true).is_err());
-        write_bad(
-            &path,
-            &raw(AHEAD_VERSION, 1, header(logical), &[rec(0, &[1u8; 8])]),
-        );
-        assert!(ArrayTable::restore_ahead_inner(&path, true).is_err());
-        write_bad(
-            &path,
-            &raw(
-                AHEAD_VERSION,
-                1,
-                header(logical),
-                &[rec(logical, &[1u8; 8])],
-            ),
-        );
-        assert!(ArrayTable::restore_ahead_inner(&path, true).is_err());
-        let mut bad_sum = good.clone();
-        bad_sum[12] ^= 1;
-        write_bad(&path, &raw(AHEAD_VERSION, 1, header(logical), &[bad_sum]));
-        assert!(ArrayTable::restore_ahead_inner(&path, true).is_err());
-        let mut trailing = ok.clone();
-        trailing.push(0);
-        write_bad(&path, &trailing);
-        assert!(ArrayTable::restore_ahead_inner(&path, true).is_err());
-        let mut bad_magic = ok.clone();
-        bad_magic[0] ^= 1;
-        write_bad(&path, &bad_magic);
-        assert!(ArrayTable::restore_ahead_inner(&path, true).is_err());
-
-        write_bad(&path, &ok);
-        ArrayTable::restore_ahead_inner(&path, false).unwrap();
-        assert!(side(&path).exists(), "keep must leave the sidecar");
-        ArrayTable::restore_ahead_inner(&path, true).unwrap();
-        assert!(!side(&path).exists(), "remove must unlink the sidecar");
-        assert!(std::fs::read(&path).unwrap().len() >= 4104);
-        let _ = std::fs::remove_dir_all(dir.path());
     }
 }
