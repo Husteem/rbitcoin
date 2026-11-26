@@ -358,11 +358,11 @@ let
       blockTime = 120;
     };
   };
-  v1PortMsg = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, onion, Electrum, or Esplora port";
+  v1PortMsg = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, onion, Electrum, Esplora, RPC, health, or SV2 port";
   onionListenNeedsOnionMsg = "services.rbitcoin.p2p.onionListen requires p2p.listenOnion or an onion p2p.externalIp";
   onionListenAddrMsg = "services.rbitcoin.p2p.onionListen needs a specific IP and a nonzero port, as ADDR:PORT or [ADDR]:PORT";
   onionListenInboundMsg = "services.rbitcoin.p2p.onionListen requires p2p.maxInbound > 0";
-  onionListenPortMsg = "services.rbitcoin.p2p.onionListen needs its own port, not the P2P, Electrum, or Esplora port";
+  onionListenPortMsg = "services.rbitcoin.p2p.onionListen needs its own port, not the P2P, Electrum, Esplora, RPC, health, or SV2 port";
   onionListenTrustMsg = "services.rbitcoin.trustPeer cannot be combined with p2p.onionListen";
   onionListenI2pMsg = "services.rbitcoin.i2p.acceptIncoming with p2p.onionListen requires p2p.listen (the onion listener is reserved for Tor)";
   onionListenOpts = {
@@ -1063,9 +1063,33 @@ assert builtins.elem onionListenPortMsg (failedAssertions (badSystem (onionListe
     port = 8334;
   };
 })));
+# The RPC, health and SV2 listeners bind after the onion one, and a clash
+# exits the node at start.
+assert builtins.elem onionListenPortMsg (failedAssertions (badSystem (onionListenOpts // {
+  rpc = {
+    enable = true;
+    port = 8334;
+  };
+})));
+assert builtins.elem onionListenPortMsg (failedAssertions (badSystem (onionListenOpts // {
+  health = {
+    enable = true;
+    port = 8334;
+  };
+})));
+assert builtins.elem onionListenPortMsg (failedAssertions (badSystem (onionListenOpts // {
+  sv2.tp = {
+    enable = true;
+    port = 8334;
+  };
+})));
 assert builtins.elem v1PortMsg (failedAssertions (badSystem (onionListenOpts // {
   netPermissionBind = [ "v1,noban@127.0.0.1:8334" ];
 })));
+assert builtins.elem v1PortMsg (failedAssertions (badSystem {
+  rpc.enable = true;
+  netPermissionBind = [ "v1,noban@127.0.0.1:8332" ];
+}));
 assert builtins.elem onionListenTrustMsg (failedAssertions (badSystem {
   trustPeer = "192.0.2.10:8333";
   p2p.onionListen = "127.0.0.1:8334";

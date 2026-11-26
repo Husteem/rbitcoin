@@ -275,9 +275,12 @@ bind keeps the per-IP limit. Those peers also skip the ten-minute netgroup wait 
 inbound eviction, as on the marked listener. Other TCP sources allow up to
 eight unfinished handshakes per IP.
 
-On NixOS, set the Tor listener beside the module-managed P2P listener:
+On NixOS, set the Tor listener beside the module-managed P2P listener.
+It needs `listenOnion`, or an onion `externalIp` for a hidden service you
+run yourself:
 
 ```nix
+services.rbitcoin.p2p.listenOnion = true;
 services.rbitcoin.p2p.onionListen = "127.0.0.1:8334";
 ```
 

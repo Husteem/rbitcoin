@@ -65,6 +65,13 @@ let
     optional cfg.p2p.listen cfg.p2p.port
     ++ optional cfg.electrum.enable cfg.electrum.port
     ++ optional (cfg.esplora.enable && cfg.esplora.socketPath == null) cfg.esplora.port;
+  # Every TCP port the node binds for this module. A second bind there exits
+  # the node at start.
+  nodeListenPorts =
+    forwardedPorts
+    ++ optional cfg.rpc.enable cfg.rpc.port
+    ++ optional cfg.health.enable cfg.health.port
+    ++ optional cfg.sv2.tp.enable cfg.sv2.tp.port;
   # The marked Tor listener's port; v1 binds may not share it.
   onionListenPort = if cfg.p2p.onionListen == null then null else whitebindPort cfg.p2p.onionListen;
   onionListenHost =
@@ -1157,7 +1164,7 @@ in
       openFirewall = mkOption {
         type = types.bool;
         default = false;
-        description = "Open the P2P listen port, and any netPermissionBind port except a `v1` one, in the NixOS firewall. Ignored when listen is false.";
+        description = "Open the P2P listen port, and any netPermissionBind port except a `v1` one or the `onionListen` port, in the NixOS firewall. The firewall opens ports, not addresses, so a grant on another address at either port stays closed too. Ignored when listen is false.";
       };
     };
 
@@ -1634,8 +1641,8 @@ in
         message = "services.rbitcoin.netPermissionBind requires p2p.listen";
       }
       {
-        assertion = lib.all (p: !builtins.elem p (forwardedPorts ++ optional (onionListenPort != null) onionListenPort)) v1BindPorts;
-        message = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, onion, Electrum, or Esplora port";
+        assertion = lib.all (p: !builtins.elem p (nodeListenPorts ++ optional (onionListenPort != null) onionListenPort)) v1BindPorts;
+        message = "services.rbitcoin.netPermissionBind v1 needs its own port, not the P2P, onion, Electrum, Esplora, RPC, health, or SV2 port";
       }
       {
         assertion =
@@ -1653,8 +1660,8 @@ in
         message = "services.rbitcoin.p2p.onionListen requires p2p.maxInbound > 0";
       }
       {
-        assertion = onionListenPort == null || !builtins.elem onionListenPort forwardedPorts;
-        message = "services.rbitcoin.p2p.onionListen needs its own port, not the P2P, Electrum, or Esplora port";
+        assertion = onionListenPort == null || !builtins.elem onionListenPort nodeListenPorts;
+        message = "services.rbitcoin.p2p.onionListen needs its own port, not the P2P, Electrum, Esplora, RPC, health, or SV2 port";
       }
       {
         assertion = cfg.trustPeer == null || cfg.p2p.onionListen == null;
