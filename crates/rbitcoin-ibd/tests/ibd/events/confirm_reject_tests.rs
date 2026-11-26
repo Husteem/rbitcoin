@@ -5626,6 +5626,7 @@ fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
     for id in [kept, other, third, fourth, fifth] {
         let mut slot = crate::ibd::assign::dummy_slot(id);
         slot.addr = std::net::SocketAddr::from(([127, 0, 0, id as u8], 18444));
+        slot.net = rbitcoin_net::NetAddr::from_socket(slot.addr);
         slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
         st.slots.push(slot);
     }
@@ -5722,6 +5723,7 @@ fn a_probe_reply_asks_again_for_an_abandoned_header() {
     for id in [kept, other] {
         let mut slot = crate::ibd::assign::dummy_slot(id);
         slot.addr = std::net::SocketAddr::from(([127, 0, 0, id as u8], 18444));
+        slot.net = rbitcoin_net::NetAddr::from_socket(slot.addr);
         slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
         st.slots.push(slot);
     }
@@ -5775,6 +5777,23 @@ fn abandoned_a(
     IbdWorkState,
     bitcoin::Block,
 ) {
+    abandoned_a_at(label, |id| {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, id as u8], 18444));
+        (addr, rbitcoin_net::NetAddr::from_socket(addr))
+    })
+}
+
+/// [`abandoned_a`] with peer `id` at `peer_at(id)`: its socket and its
+/// network address.
+fn abandoned_a_at(
+    label: &str,
+    peer_at: impl Fn(usize) -> (std::net::SocketAddr, rbitcoin_net::NetAddr),
+) -> (
+    rbitcoin_query::testutil::TempDir,
+    rbitcoin_net::chain::ChainHub,
+    IbdWorkState,
+    bitcoin::Block,
+) {
     use bitcoin::Network;
     use rbitcoin_ibd::ibd::events::{
         apply_headers_event, finish_deferred_archived_clear, BadPrevParent, DeferredArchivedClear,
@@ -5794,7 +5813,9 @@ fn abandoned_a(
     let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
     for id in 1..=3 {
         let mut slot = crate::ibd::assign::dummy_slot(id);
-        slot.addr = std::net::SocketAddr::from(([127, 0, 0, id as u8], 18444));
+        let (addr, net) = peer_at(id);
+        slot.addr = addr;
+        slot.net = net;
         slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
         st.slots.push(slot);
     }
@@ -5817,7 +5838,38 @@ fn abandoned_a(
     (dir, hub, st, a)
 }
 
-/// The copy senders are kept off a reopened header by IP for one stall
+/// Onion, I2P and `--proxy` peers have no socket address: their slot
+/// socket is `0.0.0.0`. A copy sender is known by its network address, so
+/// one onion peer's copies do not stop another onion peer from reopening
+/// the header, or keep it off the header (#1992).
+#[test]
+fn an_onion_copy_sender_does_not_block_other_onion_peers() {
+    use rbitcoin_ibd::ibd::events::apply_headers_event;
+    use rbitcoin_ibd::ibd::header_walk::may_serve;
+
+    let (dir, hub, mut st, a) = abandoned_a_at("reopen-onion", |id| {
+        let none = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+        let net = rbitcoin_net::NetAddr::Onion {
+            pk: [id as u8; 32],
+            port: 8333,
+        };
+        (none, net)
+    });
+    let hash = a.block_hash();
+    apply_headers_event(&mut st, &hub, 2, vec![a.header]);
+    assert!(
+        !st.unservable.contains(&hash),
+        "another onion peer reopens A"
+    );
+    assert!(
+        !may_serve(&st, 1, &hash),
+        "the onion copy sender is kept off A"
+    );
+    assert!(may_serve(&st, 2, &hash), "the announcer may take A");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The copy senders are kept off a reopened header by address for one stall
 /// window, on any connection: a sender that reconnects from a new port gets
 /// a new slot with an empty record, and must not take the retry meant for
 /// another peer (#1992).
@@ -5836,6 +5888,7 @@ fn a_copy_sender_that_reconnects_is_still_kept_off_a_reopened_header() {
     for (id, ip) in [(9usize, 1u8), (10, 10)] {
         let mut slot = crate::ibd::assign::dummy_slot(id);
         slot.addr = std::net::SocketAddr::from(([127, 0, 0, ip], 18555));
+        slot.net = rbitcoin_net::NetAddr::from_socket(slot.addr);
         slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
         st.slots.push(slot);
     }
@@ -5882,7 +5935,8 @@ fn a_reopened_header_the_stored_plan_drops_is_abandoned_again() {
     let before = st.mutated_copies[&hash];
     // The batch reopened A, but the plan stores only another header.
     let mut after = before;
-    assert!(after.take_reopen(std::net::IpAddr::from([127, 0, 0, 2]), 1));
+    let peer_2 = st.slots.iter().find(|s| s.id == 2).unwrap().copy_sender();
+    assert!(after.take_reopen(peer_2, 1));
     st.mutated_copies.insert(hash, after);
     st.unservable.remove(&hash);
     let mut other = a.header;

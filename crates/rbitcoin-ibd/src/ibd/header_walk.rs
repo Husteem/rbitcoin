@@ -887,7 +887,7 @@ pub fn may_serve(st: &IbdWorkState, peer: usize, hash: &BlockHash) -> bool {
     let path = &st.height_to_hash;
     let kept_off = st.mutated_copies.get(hash);
     let askable = |s: &PeerSlot| {
-        s.may_take_block(hash, now) && !kept_off.is_some_and(|c| c.keeps_off(s.addr.ip(), now))
+        s.may_take_block(hash, now) && !kept_off.is_some_and(|c| c.keeps_off(s.copy_sender(), now))
     };
     let shows = |s: &PeerSlot| askable(s) && height.is_some_and(|ht| s.chain.shows(path, ht));
     let open =

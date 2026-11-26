@@ -762,11 +762,12 @@ fn manual_staller_keeps_a_reopened_block_the_other_peer_is_kept_off() {
     let (mut st, mut wire) = connect_peers(&hub, 2, PeerConnType::Manual);
     owe_on_wire(&mut st, 0, h(1), 0);
     st.slots[1].addr = std::net::SocketAddr::from(([192, 0, 2, 9], 8333));
+    st.slots[1].net = rbitcoin_net::NetAddr::from_socket(st.slots[1].addr);
     let mut copies = rbitcoin_ibd::ibd::state::MutatedCopies::default();
     for _ in 0..3 {
-        copies.note(Some(st.slots[1].addr.ip()));
+        copies.note(Some(st.slots[1].copy_sender()));
     }
-    let reopener = std::net::IpAddr::from([192, 0, 2, 1]);
+    let reopener = rbitcoin_net::NetAddr::from_socket(([192, 0, 2, 1], 0).into());
     assert!(copies.take_reopen(reopener, 60_000));
     st.mutated_copies.insert(h(1), copies);
 

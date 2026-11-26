@@ -846,7 +846,7 @@ pub fn disconnect_stalled_block_peers_at<S: std::hash::BuildHasher>(
                     o.may_take_block(h, now_ms)
                         && !mutated
                             .get(h)
-                            .is_some_and(|c| c.keeps_off(o.addr.ip(), now_ms))
+                            .is_some_and(|c| c.keeps_off(o.copy_sender(), now_ms))
                 })
         });
         if !handoff {

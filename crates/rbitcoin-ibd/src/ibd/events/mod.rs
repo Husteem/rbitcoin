@@ -730,6 +730,7 @@ pub fn plan_header_reply(
     let reopened = reopen_announced(st, peer, &headers);
     let hashes: Vec<BlockHash> = headers.iter().map(|h| h.block_hash()).collect();
     let before = super::header_walk::candidate_tip(st);
+    let challenger = st.header_walk.challenger.clone();
     let plan = plan_linked(st, hub, peer, ask, headers, linked, inflight);
     // A candidate that moved onto the batch holds it up to its new tip, at
     // the soft cap with nothing stored.
@@ -741,25 +742,32 @@ pub fn plan_header_reply(
             .map_or(&[][..], |at| &hashes[..=at]),
         None => &[],
     };
-    settle_reopens(st, reopened, &plan, held);
+    // A batch whose reopens are given back is refused through those
+    // headers, so a challenger it recorded through them goes too.
+    if settle_reopens(st, reopened, &plan, held) {
+        st.header_walk.challenger = challenger;
+    }
     plan
 }
 
 /// Abandon again each header [`reopen_announced`] reopened that neither
 /// `plan` stores nor the walk's candidate `held`, with its record as it was.
+/// True when one was.
 #[doc(hidden)]
 pub fn settle_reopens(
     st: &mut IbdWorkState,
     mut reopened: Vec<(BlockHash, super::state::MutatedCopies)>,
     plan: &HeaderPlan,
     held: &[BlockHash],
-) {
+) -> bool {
     reopened.retain(|(hash, _)| !held.contains(hash));
     // A stored plan can keep only a prefix of the batch (`proven_header_prefix`).
     if let HeaderPlan::Store { headers, .. } = plan {
         reopened.retain(|(hash, _)| !headers.iter().any(|h| h.block_hash() == *hash));
     }
+    let closed = !reopened.is_empty();
     close_reopened(st, reopened);
+    closed
 }
 
 /// [`plan_header_reply`] for a batch past its proof and validity checks.
@@ -1117,7 +1125,11 @@ fn answer_probe(
         // reply is kept from the walk, so nothing would settle the reopen. The
         // walk asks the peer again, and its batch reopens the header where a
         // refused batch gives the reopen back.
-        let ip = st.slots.iter().find(|s| s.id == peer).map(|s| s.addr.ip());
+        let ip = st
+            .slots
+            .iter()
+            .find(|s| s.id == peer)
+            .map(|s| s.copy_sender());
         let reopenable = ip.is_some_and(|ip| {
             headers.iter().any(|h| {
                 let hash = h.block_hash();
@@ -1591,7 +1603,7 @@ pub fn finish_deferred_archived_clear(
             // copies from peers we keep count toward the abandon bound.
             let sender_ip = sender
                 .and_then(|id| st.slots.iter().find(|s| s.id == id))
-                .map(|s| s.addr.ip());
+                .map(|s| s.copy_sender());
             let dropped = sender.is_some_and(|peer| punish_mutated_sender(st, peer, hash));
             if dropped {
                 cap_tracked(&mut st.mutated_copies, hash, MUTATED_TRACK_CAP);
@@ -1864,7 +1876,7 @@ fn cap_tracked<V>(counts: &mut crate::ibd::state::BlockHashMap<V>, hash: BlockHa
 pub fn note_mutated_copy(
     st: &mut IbdWorkState,
     hash: BlockHash,
-    sender: Option<std::net::IpAddr>,
+    sender: Option<rbitcoin_net::NetAddr>,
 ) -> bool {
     cap_tracked(&mut st.mutated_copies, hash, MUTATED_TRACK_CAP);
     let copies = st.mutated_copies.entry(hash).or_default();
@@ -1874,7 +1886,7 @@ pub fn note_mutated_copy(
 
 /// A header abandoned for mutated copies (#1811) goes back on the path when
 /// `peer` announces it and sent none of those copies, kept or dropped
-/// (#1992). The peers that did are kept off it by IP for one stall window,
+/// (#1992). The peers that did are kept off it by address for one stall window,
 /// on any connection ([`super::header_walk::may_serve`]), so the re-get
 /// goes to `peer`. The count stays: the next mutated copy abandons it again.
 /// At most `MUTATED_REOPENS` reopens per hash keep #1811 bounded. A header
@@ -1883,7 +1895,12 @@ pub fn reopen_for_announcer(st: &mut IbdWorkState, peer: usize, hash: BlockHash)
     if !st.unservable.contains(&hash) {
         return;
     }
-    let Some(ip) = st.slots.iter().find(|s| s.id == peer).map(|s| s.addr.ip()) else {
+    let Some(ip) = st
+        .slots
+        .iter()
+        .find(|s| s.id == peer)
+        .map(|s| s.copy_sender())
+    else {
         return;
     };
     let Some(copies) = st.mutated_copies.get_mut(&hash) else {

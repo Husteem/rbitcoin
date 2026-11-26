@@ -9436,7 +9436,9 @@ fn a_reopened_header_the_walk_absorbs_at_the_cap_keeps_its_reopen() {
     // h2 was abandoned for copies another IP sent.
     let mut copies = MutatedCopies::default();
     for _ in 0..3 {
-        copies.note(Some(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9))));
+        copies.note(Some(rbitcoin_net::NetAddr::from_socket(
+            ([10, 9, 9, 9], 0).into(),
+        )));
     }
     st.mutated_copies.insert(h2.block_hash(), copies);
     st.unservable.insert(h2.block_hash());
@@ -9471,6 +9473,13 @@ fn a_refused_batch_through_an_abandoned_header_does_not_reopen_it() {
         assert!(
             !st.tip_siblings.contains(&hash),
             "a refused batch leaves no ask lane for A"
+        );
+        assert!(
+            st.header_walk
+                .challenger
+                .as_ref()
+                .is_none_or(|c| c.tip.hash != Some(hash)),
+            "a refused batch leaves no challenger through A"
         );
     }
     // None of them spent a reopen: a heavier chain through A still reopens it.
