@@ -27,7 +27,9 @@ Fixed
   `ingest_insert_many`.
 - **Scripthash free-list links become durable before the allocator header.**
   Ingest, unlink, suffix free, and undo recovery sync the body after
-  `free_slab` before `write_alloc_header`. `bump` and free heads must be in
+  `free_slab` before `write_alloc_header`. An unlink batch syncs each body
+  once after every free on that file, then writes its header once. `bump`
+  and free heads must be in
   range, a popped link must be in range, and a slab's decoded count must
   match its head's `used`. A same-class slab rewritten in place can still
   pass that `used` check; copy-on-write is not in this change ([#2074]).

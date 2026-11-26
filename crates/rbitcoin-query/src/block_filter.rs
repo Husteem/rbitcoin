@@ -458,7 +458,7 @@ impl Query {
         let Some((fk, _)) = self.get_header_by_hash(hash)? else {
             return Ok(false);
         };
-        let Some((_, slot)) = table.filter(Height(height))? else {
+        let Some(slot) = table.slot(Height(height))? else {
             return Ok(false);
         };
         Ok(slot.header_fk == fk && check_filter_hash(body, &slot).is_ok())

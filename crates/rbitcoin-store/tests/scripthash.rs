@@ -2838,6 +2838,35 @@ fn unlink_batch_publishes_both_heads() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two frees on one body take one device barrier, then one alloc header.
+#[test]
+fn unlink_batch_syncs_one_body_once() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let a = script_hash(&[0x63]);
+    let b = script_hash(&[0x64]);
+    for i in 1..=3u64 {
+        put_create(&t, rec(a, i, i as u32));
+        put_create(&t, rec(b, i + 10, i as u32));
+    }
+    let handle = t.ovf_file().io_handle();
+    struct Disarm(rbitcoin_store::io_handle::IoHandle);
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            rbitcoin_store::io_handle::disarm_pwrite(self.0);
+        }
+    }
+    let _disarm = Disarm(handle);
+    // The batch syncs the overflow body once before the frees. One more
+    // barrier covers both free lists. A third sync is the per-key loop.
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 2, 1);
+    t.unlink_creates_batch(&[(a, vec![Fk(2)]), (b, vec![Fk(12)])])
+        .unwrap();
+    assert_eq!(t.entries(&a).unwrap().len(), 2);
+    assert_eq!(t.entries(&b).unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn reinit_clears_head_when_live_count_already_zero() {
     // Crash mid-finish: heads durable, alloc live_count still 0.

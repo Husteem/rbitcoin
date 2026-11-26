@@ -327,14 +327,33 @@ impl ScriptHashTable {
             self.unlink_write_home(&job.scripthash, job.home, &job.new_val)?;
         }
         self.sync_batch_homes(&batch)?;
-        for job in &batch.rewrites {
+        // One barrier per body, after every free-list write for that file.
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (i, job) in batch.rewrites.iter().enumerate() {
             let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
-            let alloc_mu = self.alloc_for(&job.scripthash, super::KeyHome::from(job.home));
+            let key = std::ptr::from_ref(body) as usize;
+            if let Some(group) = groups.iter_mut().find(|(id, _)| *id == key) {
+                group.1.push(i);
+            } else {
+                groups.push((key, vec![i]));
+            }
+        }
+        for (_, jobs) in groups {
+            let first = &batch.rewrites[jobs[0]];
+            let body = self.body_for(&first.scripthash, super::KeyHome::from(first.home));
+            let alloc_mu = self.alloc_for(&first.scripthash, super::KeyHome::from(first.home));
             let mut alloc = alloc_mu.lock().unwrap();
-            alloc.live_count = alloc.live_count.saturating_sub(job.removed);
-            if let Err(e) = self.free_if_paged(body, &mut alloc, &job.old) {
-                let _ = write_alloc_header(body, &alloc);
-                return Err(e);
+            for &i in &jobs {
+                let job = &batch.rewrites[i];
+                alloc.live_count = alloc.live_count.saturating_sub(job.removed);
+                if let Err(e) = self.free_if_paged(body, &mut alloc, &job.old) {
+                    // Links already written in this group must be durable
+                    // before the header that names them.
+                    if body.sync_data_only().is_ok() {
+                        let _ = write_alloc_header(body, &alloc);
+                    }
+                    return Err(e);
+                }
             }
             // Free-list links are durable before the header that names them.
             // A crash between the two leaves the old header and a leak, never
