@@ -66,6 +66,12 @@ Stop with Ctrl+C or SIGTERM. The node flushes and exits 0. Start again with
 the same `--datadir`. There is no resume flag. `kill -9` can drop the last
 unflushed pages ([`crash-recovery.md`](../crash-recovery.md)).
 
+One stop during catch-up, on a mainnet run near height 875,000, took about
+17 s. Most of that was the spend checkpoint: the stop waits for the one in
+flight, then runs one more. One stop in tip follow took 0.33 s. The
+`node: shutdown steps` line logs each step of a stop. For the stop budget a
+service manager should allow, see [`setup.md`](setup.md#stop-timeout).
+
 One run of 0.9.99 on a ThinkPad X1 Carbon Gen 13 (Intel Core Ultra 7 258V,
 32 GiB RAM, Crucial T500 2 TB) started at 2026-11-09T17:52Z with the default
 milestone 966143 and the scripthash index on. Block catch-up reached height

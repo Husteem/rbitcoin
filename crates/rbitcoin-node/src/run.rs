@@ -79,6 +79,8 @@ pub struct Shutdown {
     /// Set only by [`Self::fail`]. SIGTERM, Ctrl+C, and RPC `stop` leave it empty.
     failure: std::sync::Mutex<Option<NodeError>>,
     pub notify: Notify,
+    /// When the first [`Self::request`] landed.
+    requested_at: OnceLock<Instant>,
 }
 
 impl Shutdown {
@@ -87,6 +89,7 @@ impl Shutdown {
             flag: Arc::new(AtomicBool::new(false)),
             failure: std::sync::Mutex::new(None),
             notify: Notify::new(),
+            requested_at: OnceLock::new(),
         })
     }
 
@@ -122,9 +125,18 @@ impl Shutdown {
     }
 
     pub fn request(&self) {
+        // A write-behind thread stores the flag before it calls `fail`.
+        self.requested_at.get_or_init(Instant::now);
         if !self.flag.swap(true, Ordering::SeqCst) {
             self.notify.notify_waiters();
         }
+    }
+
+    /// Time since shutdown was first requested, zero before that.
+    pub fn since_requested(&self) -> Duration {
+        self.requested_at
+            .get()
+            .map_or(Duration::ZERO, Instant::elapsed)
     }
 
     pub fn requested(&self) -> bool {
@@ -1847,6 +1859,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         );
     }
 
+    let tail_start = Instant::now();
     if let Ok(g) = shared_peers.lock() {
         addrman.merge_from(&g);
     }
@@ -1880,6 +1893,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         h.shutdown().await;
     }
     shutdown.request();
+    let listeners = tail_start.elapsed();
+    let mut step = Instant::now();
+    let mut lap = || {
+        let took = step.elapsed();
+        step = Instant::now();
+        took
+    };
     if let Some(h) = sh_writebehind {
         let _ = h.join();
     }
@@ -1889,6 +1909,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(h) = index_writebehind {
         let _ = h.join();
     }
+    let writebehind = lap();
     // In-flight tip accepts hold the hub. Drain them before the store flush.
     let hub = std::sync::Arc::clone(&node.hub);
     tokio::task::spawn_blocking(move || {
@@ -1897,8 +1918,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     })
     .await
     .map_err(|e| NodeError::Config(format!("tip-accept idle: {e}")))?;
+    let tip_accept = lap();
     // One spend checkpoint at the snapshot, then Class C. Not `Store::flush`.
     spend_sync.shutdown();
+    let spend_checkpoint = lap();
     // Host-friendly: fsync tip tables; MS_ASYNC Class A.
     // Full multi‑GiB fdatasync froze the desktop for 1–2+ minutes on exit.
     if let Err(e) = node.hub.query.flush_for_shutdown() {
@@ -1906,6 +1929,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     } else {
         info!("node: store flushed (shutdown-friendly)");
     }
+    let store_flush = lap();
     if let Err(e) = mempool_blocking(&mempool, |mp| mp.flush()).await? {
         warn!("node: mempool flush warning: {e}");
     } else {
@@ -1913,7 +1937,17 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             mempool_blocking(&mempool, |mp| (mp.generation(), mp.live_count())).await?;
         info!("node: mempool flushed gen={gen} live={live}");
     }
+    let mempool_flush = lap();
     node.shutdown().await;
+    let peers = lap();
+    info!(
+        "node: shutdown steps since_request={:?} tail={:?} listeners={listeners:?} \
+         writebehind={writebehind:?} tip_accept={tip_accept:?} \
+         spend_checkpoint={spend_checkpoint:?} store_flush={store_flush:?} \
+         mempool_flush={mempool_flush:?} peers={peers:?}",
+        shutdown.since_requested(),
+        tail_start.elapsed()
+    );
     shutdown.result()?;
     info!("node: clean exit");
     Ok(())
