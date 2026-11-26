@@ -587,10 +587,11 @@ async fn repeated_transaction_data_requests_close_the_session() {
     }
     c.request_transaction_data(template_id).await.unwrap();
     let closed = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if c.recv().await.is_err() {
-                break;
-            }
+        while let Ok(f) = c.recv().await {
+            assert_ne!(
+                f.msg_type, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS,
+                "a third reply for one template must not be sent"
+            );
         }
     })
     .await;
