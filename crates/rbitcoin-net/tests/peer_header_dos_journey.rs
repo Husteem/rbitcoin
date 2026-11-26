@@ -4614,6 +4614,58 @@ async fn a_later_connecting_page_clears_parked_marks() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Two headers parked before their parent are marked at that parent. The
+/// parent, parked next, is marked at its own unknown parent. Once another
+/// peer stores that header, a header on the first two reaches it through
+/// both marks, connects, and is stored.
+#[tokio::test]
+async fn a_chain_parked_out_of_order_connects_once_its_root_is_known() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-root-chain");
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
+    let tip = hub.tip_header().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18628, 68, true);
+    let (out_tx, _rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let chain = regtest_headers_after(&tip, 5);
+    for page in [vec![chain[2]], vec![chain[3]], vec![chain[1]]] {
+        push(
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(peer.as_ref()),
+            NetworkMessage::Headers(page),
+        )
+        .await;
+    }
+    let other = live_peer(&peers, 18629, 69, true);
+    let (other_tx, _other_rx) = peer_out_channel();
+    push(
+        &hub,
+        &other_tx,
+        &mut PeerFollowState::new(),
+        Some(other.as_ref()),
+        NetworkMessage::Headers(vec![chain[0]]),
+    )
+    .await;
+    assert!(hub.knows_header(&chain[0].block_hash()));
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(vec![chain[4]]),
+    )
+    .await;
+    assert!(
+        hub.knows_header(&chain[4].block_hash()),
+        "a header on the parked chain connects once its root is known"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Newest-first, each message is the parent of the headers already parked.
 /// Rewriting every descendant on that admit copies the parked set. The last
 /// header of an 8,000-header chain must stay inside the one-batch bound,

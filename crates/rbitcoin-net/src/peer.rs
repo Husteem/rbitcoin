@@ -639,14 +639,30 @@ fn empty_no_base() -> &'static NoBaseMap {
     EMPTY.get_or_init(NoBaseMap::new)
 }
 
-/// Steps recorded for `hash` when its unknown parent is still unknown.
-/// `None` when `hash` is unmarked or that parent is a header we have.
+/// Roots [`no_base_depth`] follows through their own marks. A root parked
+/// after the headers marked at it gets a mark of its own, and those marks are
+/// not rewritten, so the next root is looked up when a walk stops. Past this
+/// many, the mark counts as unknown, which keeps a long chain of out-of-order
+/// one-header pages to a bounded lookup per stop.
+#[doc(hidden)]
+pub const MAX_MARK_HOPS: usize = 16;
+
+/// Steps from `hash` to the unknown parent its mark leads to, following up
+/// to [`MAX_MARK_HOPS`] roots that are marked themselves. `None` when `hash`
+/// is unmarked or the chain of roots reaches genesis or a header we have.
 fn no_base_depth(hub: &ChainHub, no_base: &NoBaseMap, hash: &BlockHash) -> Option<u32> {
-    let (root, depth) = no_base.get(hash)?;
-    if is_genesis_hash(root) || hub.knows_header(root) {
-        return None;
+    let (mut root, mut depth) = *no_base.get(hash)?;
+    for _ in 0..MAX_MARK_HOPS {
+        if is_genesis_hash(&root) || hub.knows_header(&root) {
+            return None;
+        }
+        let Some(&(next, more)) = no_base.get(&root) else {
+            return Some(depth);
+        };
+        root = next;
+        depth = depth.saturating_add(more);
     }
-    Some(*depth)
+    Some(depth)
 }
 
 /// A new hash at the cap is refused. The headers already held stay.
