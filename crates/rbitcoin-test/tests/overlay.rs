@@ -391,6 +391,11 @@ async fn uploaded_watch_returns_only_after_the_subscription_drops() {
 
     let early = std::sync::Arc::new(tokio::sync::Notify::new());
     let early_sent = std::sync::Arc::clone(&early);
+    // The original subscription stays up until the test has seen that its
+    // UPLOADED did not finish the watch. A timer here can expire during that
+    // check and deliver the replacement event too soon.
+    let close_original = std::sync::Arc::new(tokio::sync::Notify::new());
+    let close_original_bg = std::sync::Arc::clone(&close_original);
     let event_bg = event.clone();
     let cookie_bg = cookie_path.clone();
     tokio::spawn(async move {
@@ -401,7 +406,7 @@ async fn uploaded_watch_returns_only_after_the_subscription_drops() {
         let mut write = speak_until_setevents(sock, &cookie_bg).await;
         write.write_all(event_bg.as_bytes()).await.unwrap();
         early_sent.notify_one();
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        close_original_bg.notified().await;
         drop(write);
 
         let (sock, _) = listener.accept().await.unwrap();
@@ -433,6 +438,7 @@ async fn uploaded_watch_returns_only_after_the_subscription_drops() {
         _ = &mut watch => panic!("watch treated the original tor's UPLOADED as the restart"),
         _ = tokio::time::sleep(Duration::from_millis(250)) => {}
     }
+    close_original.notify_one();
     tokio::time::timeout(Duration::from_secs(3), resumed.notified())
         .await
         .expect("resumed");
