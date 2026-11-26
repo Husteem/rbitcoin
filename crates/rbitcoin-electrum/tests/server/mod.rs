@@ -3158,6 +3158,44 @@ async fn broadcast_hex_cap_enforced() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Twenty-six members is over the package count. The refusal is the package
+/// error, with no mempool open.
+#[tokio::test]
+async fn package_over_the_count_is_refused_before_the_fee_walk() {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let hex = rbitcoin_primitives::hex_encode(serialize(&tx));
+    let members: Vec<_> = (0..26).map(|_| json!(hex.clone())).collect();
+    let (dir, q) = tmp_store();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &ChainParams::regtest());
+    let (handle, mut stream) = electrum_tcp_client(&Arc::new(q), cfg, None).await;
+    let err = electrum_tcp_call(
+        &mut stream,
+        "blockchain.transaction.broadcast_package",
+        json!([members]),
+    )
+    .await
+    .expect_err("26 members are over the package count");
+    assert!(err.contains("package too large"), "{err}");
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `blockchain.tweaks.subscribe` stream waits for its next wave as long
 /// as the read idle window, not the shorter write stall bound.
 #[tokio::test]

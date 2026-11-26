@@ -33,7 +33,7 @@ async fn blindbit_v1_routes_serve_the_thin_tweak_index() {
             version: 2,
             locktime: 0,
             input_count: 1,
-            output_count: 2,
+            output_count: 3,
         },
         inputs: vec![InputRecord {
             prev_txid: cb0_txid,
@@ -48,6 +48,9 @@ async fn blindbit_v1_routes_serve_the_thin_tweak_index() {
         outputs: vec![
             OutputRecord::unspent(600, p2tr(&key_small)),
             OutputRecord::unspent(200_000, p2tr(&key_big)),
+            // OP_TRUE, not P2TR: /utxos/1 stays two rows. 49 BTC so
+            // forward-tx can exceed the 0.10 BTC/kvB cap.
+            OutputRecord::unspent(49_0000_0000, vec![0x51]),
         ],
     };
     let fk1 = q.connect_block(Height(1), &h1, &[cb1, elig]).unwrap();
@@ -248,9 +251,38 @@ async fn blindbit_v1_routes_serve_the_thin_tweak_index() {
     let low_body = json!({ "data": bitcoin::consensus::encode::serialize_hex(&low) }).to_string();
     let (st, resp) = http_post(addr, "/blindbit/v1/forward-tx", low_body.as_bytes()).await;
     assert_eq!(st, 400, "{resp}");
-    assert!(serde_json::from_str::<Value>(&resp).unwrap()["error"].is_string(), "{resp}");
+    let err: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        err["error"],
+        json!(r#"sendrawtransaction RPC error: {"code":-26,"message":"insufficient fee"}"#),
+        "{resp}"
+    );
     assert!(!hub.contains(&low.compute_txid()));
     assert!(hub.contains(&fwd.compute_txid()));
+    let mut bad_version = fwd.clone();
+    bad_version.version = bitcoin::transaction::Version::non_standard(4);
+    let body = json!({ "data": bitcoin::consensus::encode::serialize_hex(&bad_version) }).to_string();
+    let (st, resp) = http_post(addr, "/blindbit/v1/forward-tx", body.as_bytes()).await;
+    assert_eq!(st, 400, "{resp}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&resp).unwrap()["error"],
+        json!(r#"sendrawtransaction RPC error: {"code":-26,"message":"version"}"#),
+        "{resp}"
+    );
+    let mut over_max = fwd.clone();
+    over_max.input[0].previous_output = bitcoin::OutPoint {
+        txid: bitcoin::Txid::from_byte_array(elig_txid),
+        vout: 2,
+    };
+    over_max.output[0].value = bitcoin::Amount::from_sat(1);
+    let body = json!({ "data": bitcoin::consensus::encode::serialize_hex(&over_max) }).to_string();
+    let (st, resp) = http_post(addr, "/blindbit/v1/forward-tx", body.as_bytes()).await;
+    assert_eq!(st, 400, "{resp}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&resp).unwrap()["error"],
+        json!(r#"sendrawtransaction RPC error: {"code":-25,"message":"Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"}"#),
+        "{resp}"
+    );
     for bad in [&b"not json"[..], br#"{"data":"zz"}"#, br#"{"data":"00"}"#] {
         let (st, resp) = http_post(addr, "/blindbit/v1/forward-tx", bad).await;
         assert_eq!(st, 400, "{resp}");

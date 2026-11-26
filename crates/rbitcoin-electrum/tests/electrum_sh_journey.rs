@@ -498,12 +498,20 @@ async fn broadcast_of_a_pooled_tx_answers_its_txid(
         broadcast(relayed).await,
         Ok(json!(relayed.compute_txid().to_string()))
     );
-    let got = broadcast(&orphan).await;
-    assert!(
-        got.as_ref()
-            .is_err_and(|e| e.starts_with("broadcast reject")),
-        "{got:?}"
+    assert_eq!(
+        broadcast(&orphan).await,
+        Err("bad-txns-inputs-missingorspent".to_string())
     );
+    // A refusal is electrs's daemon-error class; a request we cannot decode is
+    // still the generic method error.
+    let malformed = electrum_tcp_rpc(
+        &mut stream,
+        3,
+        "blockchain.transaction.broadcast",
+        json!(["00"]),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], 1, "{malformed}");
     handle.shutdown().await;
 }
 

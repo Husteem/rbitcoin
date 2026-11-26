@@ -103,7 +103,7 @@ pub fn package_has_conflicts(txs: &[Transaction]) -> bool {
 }
 
 /// Core `reject-reason` text for a mempool reject.
-pub fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
+pub(crate) fn accept_reject_reason(e: &impl std::fmt::Display) -> String {
     let owned = e.to_string();
     let s = owned.strip_prefix("policy: ").unwrap_or(owned.as_str());
     if s == "coinbase immature" {

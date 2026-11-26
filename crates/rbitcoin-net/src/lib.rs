@@ -3,6 +3,8 @@
 #[doc(hidden)]
 pub mod asmap;
 #[doc(hidden)]
+pub mod broadcast_reject;
+#[doc(hidden)]
 pub mod cache;
 #[doc(hidden)]
 pub mod chain;
@@ -20,6 +22,8 @@ pub mod eviction;
 pub mod fee_history;
 #[doc(hidden)]
 pub mod fee_history_file;
+#[doc(hidden)]
+pub mod fee_look;
 #[doc(hidden)]
 pub mod i2p_sam;
 #[doc(hidden)]
@@ -76,6 +80,7 @@ pub use asmap::{
     ASMAP_JUMP_SHORT_TAIL, ASMAP_MATCH_PAST_END, ASMAP_SECOND_DEFAULT, ASMAP_TRAILING_ONE,
     ASMAP_TWO_SHORT_MATCHES, LONE_RETURN_ASMAP, LOOPBACK_ASMAP, TWO_PREFIX_ASMAP,
 };
+pub use broadcast_reject::BroadcastReject;
 pub use cache::BlockCache;
 pub use chain::{check_block_proposal_with, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
 pub use compact::{
@@ -85,6 +90,9 @@ pub use compact::{
 pub use ephemeral::spawn_isolated_broadcast_loop;
 pub use error::NetError;
 pub use eviction::{select_inbound_eviction, InboundEvictCandidate};
+pub use fee_look::{
+    fold_tx_fee_sat, package_tx_fee_exceeds_max, tx_fee_exceeds_max, tx_output_sum_sat, TxFeeLook,
+};
 pub use i2p_sam::{
     i2p_addr_from_sam_b64, I2pBackoff, I2pKeeper, I2pRole, I2pSam, SAM_RETRY, SAM_RETRY_TEST,
 };
@@ -133,8 +141,7 @@ pub use serve_perf::{
 pub use service::{P2PNode, REDIAL_INTERVAL, REDIAL_INTERVAL_TEST};
 pub use socks::{Dialer, NetProxies};
 pub use test_accept::{
-    accept_reject_reason, package_has_conflicts, submit_tx_version_nonstandard, TestAcceptRow,
-    TestAcceptVerdict,
+    package_has_conflicts, submit_tx_version_nonstandard, TestAcceptRow, TestAcceptVerdict,
 };
 pub use tx_relay::{
     arm_template_prev_sample, pool_settle, require_settled, sample_template_prev_for_build,

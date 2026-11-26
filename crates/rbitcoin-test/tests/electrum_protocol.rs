@@ -1861,10 +1861,9 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         json!([miss_hex]),
     )
     .await;
-    let tx_msg = bad_tx["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        tx_msg.contains("broadcast reject"),
-        "consensus-invalid broadcast with hub: {bad_tx}"
+    assert_eq!(
+        bad_tx["error"]["message"], "bad-txns-inputs-missingorspent",
+        "missing-input broadcast with hub: {bad_tx}"
     );
 
     let cb1 = coinbase_txids[0].to_string();
@@ -1914,9 +1913,8 @@ async fn electrum_leftover_mempool_does_not_double_count() {
         json!([[miss_hex.clone()]]),
     )
     .await;
-    let pkg_miss_msg = pkg_miss["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        pkg_miss_msg.contains("broadcast_package reject"),
+    assert_eq!(
+        pkg_miss["error"]["message"], "bad-txns-inputs-missingorspent",
         "invalid package with hub: {pkg_miss}"
     );
 
@@ -1952,6 +1950,37 @@ async fn electrum_leftover_mempool_does_not_double_count() {
     assert!(
         mp.is_local_origin(&pkg.compute_txid()),
         "broadcast_package is a local submit"
+    );
+    let mut pkg_bad_version = pkg.clone();
+    pkg_bad_version.version = TxVersion::non_standard(4);
+    let bad_version_hex = bitcoin::consensus::encode::serialize_hex(&pkg_bad_version);
+    let pkg_bad_version = rpc(
+        &mut stream,
+        61,
+        "blockchain.transaction.broadcast_package",
+        json!([[bad_version_hex], true]),
+    )
+    .await;
+    assert_eq!(pkg_bad_version["error"]["code"], 2, "{pkg_bad_version}");
+    assert_eq!(
+        pkg_bad_version["error"]["message"], "version",
+        "{pkg_bad_version}"
+    );
+    let mut pkg_over_max = pkg.clone();
+    pkg_over_max.output[0].value = Amount::from_sat(1);
+    let over_max_hex = bitcoin::consensus::encode::serialize_hex(&pkg_over_max);
+    let pkg_over_max = rpc(
+        &mut stream,
+        62,
+        "blockchain.transaction.broadcast_package",
+        json!([[over_max_hex], true]),
+    )
+    .await;
+    assert_eq!(pkg_over_max["error"]["code"], 2, "{pkg_over_max}");
+    assert_eq!(
+        pkg_over_max["error"]["message"],
+        "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
+        "{pkg_over_max}"
     );
     let past = rpc(
         &mut stream,

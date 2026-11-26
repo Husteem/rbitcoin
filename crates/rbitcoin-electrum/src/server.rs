@@ -1325,7 +1325,7 @@ async fn land<W: AsyncWrite + Unpin>(
         conn,
         last_sent,
         flight.asked,
-        result,
+        result.map_err(ReplyError::from),
         stamped,
         Took::Ran(ran),
     );
@@ -1489,7 +1489,7 @@ async fn answer_one(
             conn,
             last_sent,
             asked,
-            result,
+            result.map_err(ReplyError::from),
             None,
             Took::Since(t0),
         ));
@@ -1519,10 +1519,38 @@ async fn answer_one(
         conn,
         last_sent,
         asked,
-        result,
+        result.map_err(ReplyError::from),
         stamped,
         Took::Since(t0),
     ))
+}
+
+/// A method error and the JSON-RPC code to answer it with. A broadcast
+/// refusal is electrs's daemon-error class (2); other method errors are 1.
+pub(crate) struct ReplyError {
+    message: String,
+    code: i16,
+}
+
+impl From<String> for ReplyError {
+    fn from(message: String) -> Self {
+        Self { message, code: 1 }
+    }
+}
+
+impl From<&str> for ReplyError {
+    fn from(message: &str) -> Self {
+        Self {
+            message: message.into(),
+            code: 1,
+        }
+    }
+}
+
+impl ReplyError {
+    fn daemon(message: String) -> Self {
+        Self { message, code: 2 }
+    }
 }
 
 /// Status bookkeeping, metering, the API log line, and the reply object.
@@ -1532,7 +1560,7 @@ fn finish_reply(
     conn: &ElectrumConn,
     last_sent: &mut HashMap<[u8; 32], String>,
     asked: Asked,
-    result: Result<Value, String>,
+    result: Result<Value, ReplyError>,
     stamped: Option<ChainView>,
     took: Took,
 ) -> Value {
@@ -1576,10 +1604,14 @@ fn finish_reply(
                 method,
                 &params_s,
                 wall_ms,
-                Some(&e),
+                Some(&e.message),
             );
-            let code = if e == RAW_TX_NOT_FOUND { 2 } else { 1 };
-            json!({"jsonrpc":"2.0","id": id, "error": {"code": code, "message": e}})
+            let code = if e.message == RAW_TX_NOT_FOUND {
+                2
+            } else {
+                e.code
+            };
+            json!({"jsonrpc":"2.0","id": id, "error": {"code": code, "message": e.message}})
         }
     }
 }
@@ -3462,39 +3494,77 @@ fn package_broadcast_value(verbose: bool, accepted: &[rbitcoin_net::AcceptResult
 }
 
 /// Accept one raw tx, with script verify awaited on the connection task. A tx
-/// whose txid is already pooled answers the txid too.
-pub async fn broadcast_raw_tx_async(
+/// whose txid is already pooled answers the txid too. A refusal is the
+/// message `sendrawtransaction` gives, which electrs forwards from Core, at
+/// electrs's daemon-error code.
+pub(crate) async fn broadcast_raw_tx_async(
     params: &Value,
     config: &ElectrumConfig,
     mempool: Option<&Arc<MempoolHub>>,
-) -> Result<Value, String> {
+) -> Result<Value, ReplyError> {
     let tx = broadcast_tx_from_params(params, config)?;
     let mp = mempool
         .ok_or_else(|| "mempool not available".to_string())?
         .clone();
     let txid = tx.compute_txid();
     let budget = mp.query.api_read_budget();
-    rbitcoin_net::with_store_budget(budget, ApiSurface::Electrum, mp.broadcast_local_async(tx))
+    rbitcoin_net::with_store_budget(budget, ApiSurface::Electrum, mp.broadcast_client_async(tx))
         .await
-        .map_err(|e| format!("broadcast reject: {e}"))?;
+        .map_err(|reject| ReplyError::daemon(reject.message))?;
     Ok(json!(txid.to_string()))
 }
 
 /// Accept a package, with each member's scripts awaited on the connection task.
-pub async fn broadcast_package_async(
+pub(crate) async fn broadcast_package_async(
     params: &Value,
     config: &ElectrumConfig,
     mempool: Option<&Arc<MempoolHub>>,
-) -> Result<Value, String> {
+) -> Result<Value, ReplyError> {
     let (txs, verbose) = decode_broadcast_package(params, config)?;
+    // Count and weight before the fee walk. An over-size package never
+    // hashes members against each other, and needs no mempool.
+    if let Err(e) = MempoolHub::check_package_shape(&txs) {
+        return Err(ReplyError::daemon(
+            rbitcoin_net::BroadcastReject::of(&e).message,
+        ));
+    }
     let mp = mempool
         .ok_or_else(|| "mempool not available".to_string())?
         .clone();
+    if txs.iter().any(rbitcoin_net::submit_tx_version_nonstandard) {
+        return Err(ReplyError::daemon(
+            rbitcoin_net::BroadcastReject::version().message,
+        ));
+    }
+    let mp_fee = Arc::clone(&mp);
+    let txs_fee = txs.clone();
+    let budget = mp.query.api_read_budget();
+    // The package walk reads the chain, so it holds the Electrum store permit.
+    let over_max = rbitcoin_net::with_store_budget(
+        budget,
+        ApiSurface::Electrum,
+        rbitcoin_net::off_pool_budgeted(move || {
+            txs_fee.iter().any(|tx| {
+                rbitcoin_net::package_tx_fee_exceeds_max(
+                    &mp_fee,
+                    tx,
+                    &txs_fee,
+                    rbitcoin_consensus::policy::DEFAULT_MAX_RAW_TX_FEE_SAT_KVB,
+                ) == Some(true)
+            })
+        }),
+    )
+    .await;
+    if over_max {
+        return Err(ReplyError::daemon(
+            rbitcoin_net::BroadcastReject::max_fee().message,
+        ));
+    }
     let budget = mp.query.api_read_budget();
     let accepted =
         rbitcoin_net::with_store_budget(budget, ApiSurface::Electrum, mp.accept_package_async(txs))
             .await
-            .map_err(|e| format!("broadcast_package reject: {e}"))?;
+            .map_err(|e| ReplyError::daemon(rbitcoin_net::BroadcastReject::of(&e).message))?;
     Ok(package_broadcast_value(verbose, &accepted))
 }
 
