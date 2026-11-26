@@ -54,10 +54,13 @@ pub fn set_session_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<
     let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     let ka = ka.with_interval(Duration::from_secs(10)).with_retries(3);
-    sock.set_tcp_keepalive(&ka)?;
+    // Each option is tried even when the other fails; an error is returned
+    // for the caller's log.
     #[cfg(target_os = "linux")]
-    sock.set_tcp_user_timeout(Some(Duration::from_secs(60)))?;
-    Ok(())
+    let user_timeout = sock.set_tcp_user_timeout(Some(Duration::from_secs(60)));
+    #[cfg(not(target_os = "linux"))]
+    let user_timeout = Ok(());
+    sock.set_tcp_keepalive(&ka).and(user_timeout)
 }
 
 /// Default [`Sv2TpConfig::setup_timeout`]. A session holds a slot from TCP
