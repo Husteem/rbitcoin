@@ -12451,10 +12451,11 @@ mod peer_header_pins {
         assert_eq!(join, hashes[0]);
     }
 
-    /// A held body is a header we know. Walking its pending parent must not
-    /// hide that.
+    /// A held orphan (its parent has no row) has no header row, so a header
+    /// built on it is unconnecting: the node asks for headers instead of
+    /// storing a child the store refuses and scoring its sender (#2090).
     #[test]
-    fn peer_header_held_prev_connects() {
+    fn peer_header_on_a_held_orphan_does_not_connect() {
         let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hdr-connect");
         let header = hdr(BlockHash::from_byte_array([4; 32]), 8);
         let known = header.block_hash();
@@ -12467,7 +12468,7 @@ mod peer_header_pins {
         );
         let mut pending = HashMap::new();
         pending.insert(known, header);
-        assert!(header_announcement_connects(&hub, &pending, known));
+        assert!(!header_announcement_connects(&hub, &pending, known));
     }
 
     /// Ten seconds is already late. The ask is dropped.

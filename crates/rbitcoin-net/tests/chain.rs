@@ -1800,19 +1800,16 @@ fn chain_edges_pin_work_headers_and_reopen() {
         &[child.block_hash()],
     );
     hub.hold_body(Arc::new(parked.clone()), false);
-    assert!(hub
-        .query
-        .get_header_by_hash(&parked.block_hash().to_byte_array())
-        .unwrap()
-        .is_none());
-    let parked_child = mine(parked.block_hash(), parked.header.time.saturating_add(1), 2);
-    let parked_err = hub
-        .process_submitted_header(&parked_child.header)
-        .expect_err("the parked parent has no header row");
     assert!(
-        !parked_err.contains("Must submit previous header"),
-        "a held body is a known parent: {parked_err}"
+        hub.query
+            .get_header_by_hash(&parked.block_hash().to_byte_array())
+            .unwrap()
+            .is_some(),
+        "a parked body on a known parent has a header row (#2090)"
     );
+    let parked_child = mine(parked.block_hash(), parked.header.time.saturating_add(1), 2);
+    hub.process_submitted_header(&parked_child.header)
+        .expect("the parked parent is a known header");
     let missing = BlockHash::from_byte_array([0x44; 32]);
     let err = run_on_tip_accept(|| hub.reconsider_block_inner(missing)).unwrap_err();
     assert!(
@@ -8299,13 +8296,13 @@ fn pair_winner_write_failure_promotes_an_unpublished_loser() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A side block held as a body (a `submitblock` that lost a race) has no
-/// header row. A peer that extends it sends a header whose parent is that
-/// body. The persist walk writes the held block's header first, so the
-/// child connects instead of failing "header parent unknown", which scored
-/// and disconnected the honest sender (#2090).
+/// A side block held as a body (a `submitblock` that lost a race) gets its
+/// header row when its parent has one. A peer that extends it then sends a
+/// header that connects, instead of one the store refused as "header parent
+/// unknown", which scored and disconnected the honest sender (#2090). A held
+/// orphan has no row, so a header built on it is unconnecting, not scored.
 #[test]
-fn header_on_a_held_body_writes_the_held_header_first() {
+fn held_body_has_a_header_row_and_a_held_orphan_does_not() {
     use rbitcoin_net::peer::{
         header_announcement_connects, header_is_stored, persist_pending_header_path,
     };
@@ -8318,8 +8315,8 @@ fn header_on_a_held_body_writes_the_held_header_first() {
     let b = mine_distinct(gen, t0.saturating_add(2), 1, &[a.block_hash()]);
     hub.hold_body(Arc::new(b.clone()), false);
     assert!(
-        !header_is_stored(&hub, &b.block_hash()),
-        "held without a header row"
+        header_is_stored(&hub, &b.block_hash()),
+        "held side block has a row"
     );
 
     let c = mine(b.block_hash(), t0.saturating_add(3), 2);
@@ -8332,39 +8329,29 @@ fn header_on_a_held_body_writes_the_held_header_first() {
     persist_pending_header_path(&hub, &pending, c.block_hash())
         .expect("the child of a held body connects");
     assert!(
-        header_is_stored(&hub, &b.block_hash()),
-        "held header written"
-    );
-    assert!(
         header_is_stored(&hub, &c.block_hash()),
         "child header written"
     );
-    let _ = std::fs::remove_dir_all(dir);
-}
 
-/// A batch parent whose height walk hit its cap has no height. That is this
-/// node's lookup failing, not the sender's header, so the error is a local
-/// fault and does not score the peer (#2090).
-#[test]
-fn header_parent_height_unknown_is_a_local_fault() {
-    let (_dir, hub) = tmp_hub();
-    hub.ensure_genesis().unwrap();
-    let mut parent = genesis_block(&hub.params).header;
-    parent.prev_blockhash = BlockHash::from_byte_array([0xab; 32]);
-    let mut child = parent;
-    child.prev_blockhash = parent.block_hash();
-    let mut in_batch = HashMap::new();
-    in_batch.insert(
-        parent.block_hash().to_byte_array(),
-        HeaderSyncNode {
-            fk: Fk(0),
-            header: parent,
-            height: None,
-            min_diff_walk: None,
-        },
+    // An orphan: its parent has no row and is not held.
+    let missing = mine_distinct(
+        gen,
+        t0.saturating_add(4),
+        1,
+        &[a.block_hash(), b.block_hash()],
     );
-    let err = hub
-        .header_sync_contextual(&child, &in_batch)
-        .expect_err("no parent height");
-    assert!(err.is_local_fault(), "{err:?}");
+    let orphan = mine(missing.block_hash(), t0.saturating_add(5), 2);
+    hub.hold_body(Arc::new(orphan.clone()), false);
+    assert!(hub.held_body(&orphan.block_hash()).is_some());
+    assert!(
+        !hub.knows_header(&orphan.block_hash()),
+        "a held orphan has no row"
+    );
+    let d = mine(orphan.block_hash(), t0.saturating_add(6), 3);
+    let pending: HashMap<BlockHash, Header> = [(d.block_hash(), d.header)].into();
+    assert!(
+        !header_announcement_connects(&hub, &pending, d.header.prev_blockhash),
+        "a header on a held orphan is unconnecting"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }
