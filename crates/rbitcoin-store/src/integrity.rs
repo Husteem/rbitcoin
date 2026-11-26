@@ -193,6 +193,39 @@ impl TipFault {
     }
 }
 
+/// Refuse a `confirmed[]` with a null slot under the tip open will keep.
+///
+/// A torn page comes back from the write-ahead image, so the only nulls a
+/// crash leaves are on top: above the sealed tip, or a trailing run under it
+/// that the trim removes. A null below that is not crash damage. Open would
+/// build a fence without that height and clear its strong bits, so it stops
+/// before any repair runs.
+pub(crate) fn refuse_confirmed_hole(
+    dir: &Path,
+    confirmed: &crate::chain::ConfirmedTable,
+) -> Result<(), StoreError> {
+    let Some(tip) = confirmed.tip_height() else {
+        return Ok(());
+    };
+    let cap = TipSeal::load(dir)?.map_or(tip.0, |s| s.tip_height.min(tip.0));
+    let mut top = cap;
+    while confirmed.get(Height(top))?.is_none() {
+        let Some(below) = top.checked_sub(1) else {
+            return Ok(());
+        };
+        top = below;
+    }
+    for h in 0..top {
+        if confirmed.get(Height(h))?.is_none() {
+            eprintln!(
+                "rbitcoin: confirmed[{h}] is null below tip {top}; the store needs a reindex"
+            );
+            return Err(StoreError::Corrupt("confirmed[] null slot below the tip"));
+        }
+    }
+    Ok(())
+}
+
 impl Store {
     /// Persist tip seal after a complete Class C tip barrier (connect or disconnect).
     ///

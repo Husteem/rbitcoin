@@ -547,6 +547,7 @@ impl Store {
             HeaderTxsTable::create(&path)?
         };
         let confirmed = ConfirmedTable::open(&path)?;
+        crate::integrity::refuse_confirmed_hole(&path, &confirmed)?;
         let height_fence = HeightFence::from_confirmed(&confirmed, &header_txs)?;
         drop_leftover_tx_height(&path);
         crate::scripthash::unlink_scripthash_run_leftovers(&path)?;
