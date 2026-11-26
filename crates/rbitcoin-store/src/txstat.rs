@@ -427,7 +427,6 @@ pub struct TxStat {
     pub ovf: TableFile,
     pub blk: TableFile,
     pub count: AtomicU64,
-    pub ovf_len: AtomicU64,
     /// Serialises [`Self::put_header_blob`]'s read of the `ovf` end and its
     /// append. Readers stamp blocks too, so appends run on several threads.
     ovf_append: Mutex<()>,
@@ -525,7 +524,6 @@ impl TxStat {
             ovf,
             blk,
             count: AtomicU64::new(0),
-            ovf_len: AtomicU64::new(0),
             ovf_append: Mutex::new(()),
             journal: Mutex::new(()),
         })
@@ -578,13 +576,11 @@ impl TxStat {
             }
             f
         };
-        let ovf_len = ovf.data_len();
         Ok(Self {
             body,
             ovf,
             blk,
             count: AtomicU64::new(count),
-            ovf_len: AtomicU64::new(ovf_len),
             ovf_append: Mutex::new(()),
             journal: Mutex::new(()),
         })
