@@ -9454,6 +9454,58 @@ fn a_reopened_header_the_walk_absorbs_at_the_cap_keeps_its_reopen() {
     );
 }
 
+/// A reply whose later header stays abandoned for this peer (it sent that
+/// header's copies) does not move the walk onto it: the walk would then rest
+/// on a header no peer is asked for. The first header keeps its reopen only
+/// where the reply puts it on the path (#1992).
+#[test]
+fn a_reply_through_a_header_still_abandoned_does_not_extend_the_walk() {
+    use rbitcoin_ibd::ibd::state::MutatedCopies;
+
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reopen-later-abandoned");
+    hub.ensure_genesis().unwrap();
+    floor_unreachable(&mut hub);
+    let gen = hub.tip_hash().unwrap();
+    let h1 = mine(gen, 1);
+    let h2 = mine(h1.block_hash(), 2);
+    let h3 = mine(h2.block_hash(), 3);
+    let (s0, _rx0) = slot(0);
+    let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+    queue_at_cap_ending_on(&mut st, &hub, h1);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    // h2 was abandoned for another peer's copies; h3 for this peer's.
+    let other = rbitcoin_net::NetAddr::from_socket(([10, 9, 9, 9], 0).into());
+    let me = st.slots[0].copy_sender();
+    for (h, sender) in [(h2, other), (h3, me)] {
+        let mut copies = MutatedCopies::default();
+        for _ in 0..3 {
+            copies.note(Some(sender));
+        }
+        st.mutated_copies.insert(h.block_hash(), copies);
+        st.unservable.insert(h.block_hash());
+    }
+    let h2_record = st.mutated_copies[&h2.block_hash()];
+    apply(&mut st, &hub, 0, vec![h2, h3]);
+    assert_ne!(
+        st.header_walk.tip_hash(),
+        Some(h3.block_hash()),
+        "the walk does not rest on a header still abandoned"
+    );
+    assert!(st.unservable.contains(&h3.block_hash()));
+    assert!(
+        !st.ordered_set.contains(&h3.block_hash()),
+        "h3 is not queued"
+    );
+    // h2 keeps its reopen only where the reply stored it on the path.
+    let kept = !st.unservable.contains(&h2.block_hash());
+    assert_eq!(
+        kept,
+        st.ordered_set.contains(&h2.block_hash()),
+        "h2 reopened iff queued"
+    );
+    assert_eq!(kept, st.mutated_copies[&h2.block_hash()] != h2_record);
+}
+
 /// A batch through an abandoned header that is then refused (here A alone,
 /// no heavier than the candidate B) does not reopen it: the header would
 /// leave the abandoned set without going back on the path, and the refused

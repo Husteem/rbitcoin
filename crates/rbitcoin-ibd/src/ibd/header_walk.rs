@@ -1496,7 +1496,9 @@ pub fn offer_alternate(
     if !pow_linked(headers) {
         return None;
     }
-    if st.unservable.contains(&headers[0].block_hash()) {
+    // A chain through an abandoned header, at its start or later, is not
+    // one the walk can download.
+    if through_abandoned(st, headers) {
         return Some(true);
     }
     if short_below_floor(st, hub, headers) {
@@ -2837,6 +2839,15 @@ pub fn extend_tip(
     extend_connected(st, hub, headers, peer)
 }
 
+/// Whether any of `headers` is abandoned (`unservable`). A batch that
+/// reopened its abandoned headers first ([`crate::ibd::events`]) holds only
+/// those this peer could not reopen.
+fn through_abandoned(st: &IbdWorkState, headers: &[Header]) -> bool {
+    headers
+        .iter()
+        .any(|h| st.unservable.contains(&h.block_hash()))
+}
+
 /// Record `headers` on the candidate. The caller already decided this batch
 /// is allowed to extend, including a stored prefix of a full reply.
 fn extend_connected(
@@ -2845,10 +2856,7 @@ fn extend_connected(
     headers: &[Header],
     peer: Option<usize>,
 ) -> bool {
-    if headers
-        .first()
-        .is_some_and(|h| st.unservable.contains(&h.block_hash()))
-    {
+    if through_abandoned(st, headers) {
         return false;
     }
     if over_length(st, headers.len()) {
