@@ -1740,8 +1740,13 @@ impl ScriptHashTable {
                 let ents = val.inline_entries();
                 Ok(ents.iter().copied().max_by_key(|f| f.0))
             }
-            ShHeadValue::Slab { class, off, .. } => {
+            ShHeadValue::Slab { class, off, used } => {
                 let ents = self.read_slab(body, *class, *off)?;
+                if ents.len() != *used as usize {
+                    return Err(StoreError::Corrupt(
+                        "invariant: scripthash slab used != decoded fk count",
+                    ));
+                }
                 Ok(ents.last().copied())
             }
             ShHeadValue::Extent { last_page } => {
