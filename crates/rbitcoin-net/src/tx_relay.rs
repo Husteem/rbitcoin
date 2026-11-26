@@ -1749,7 +1749,7 @@ pub struct SettleGate {
     /// waits one bound per hold, not one per read.
     gave_up_on: AtomicU64,
     /// Reads parked in [`Self::wait_even`] (tests wait for one to park).
-    waiting: AtomicUsize,
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl SettleGate {
@@ -1760,7 +1760,7 @@ impl SettleGate {
             settled: std::sync::Condvar::new(),
             wait_max: Mutex::new(SETTLE_WAIT_MAX),
             gave_up_on: AtomicU64::new(0),
-            waiting: AtomicUsize::new(0),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
