@@ -62,14 +62,14 @@ fn zero_header_and_block(path: &Path) {
         .open(path)
         .unwrap();
     file.seek(SeekFrom::Start(0)).unwrap();
-    file.write_all(&[0u8; 16]).unwrap();
+    file.write_all(&[0u8; 4096]).unwrap();
     file.seek(SeekFrom::Start(4096)).unwrap();
     file.write_all(&[0u8; 4096]).unwrap();
     file.sync_all().unwrap();
-    let mut check = [1u8; 16];
+    let mut check = [1u8; 4096];
     file.seek(SeekFrom::Start(0)).unwrap();
     file.read_exact(&mut check).unwrap();
-    assert_eq!(check, [0u8; 16]);
+    assert_eq!(check, [0u8; 4096]);
 }
 
 #[test]

@@ -590,8 +590,10 @@ impl HeaderTxsTable {
         let first_side = ArrayTable::ahead_path(&first_path);
         let count_side = ArrayTable::ahead_path(&count_path);
         if first_side.is_file() && count_side.is_file() {
-            ArrayTable::restore_ahead(&first_path)?;
-            ArrayTable::restore_ahead(&count_path)?;
+            ArrayTable::restore_ahead_keep(&first_path)?;
+            ArrayTable::restore_ahead_keep(&count_path)?;
+            ArrayTable::remove_ahead(Some(first_side.clone()))?;
+            ArrayTable::remove_ahead(Some(count_side.clone()))?;
         } else {
             let _ = std::fs::remove_file(&first_side);
             let _ = std::fs::remove_file(&count_side);
@@ -820,6 +822,8 @@ impl HeaderTxsTable {
         self.first
             .flush_async()
             .and_then(|()| self.count.flush_async())?;
+        self.first.file.sync_data_only()?;
+        self.count.file.sync_data_only()?;
         ArrayTable::remove_ahead(first_ahead)?;
         ArrayTable::remove_ahead(count_ahead)?;
         Ok(())

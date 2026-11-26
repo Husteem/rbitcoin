@@ -336,16 +336,21 @@ pub fn pop_free_head(
     body: &TableFile,
     free_head: &mut [u64; SH_MAX_CLASS as usize + 1],
     class: u8,
+    bump: u64,
 ) -> Result<Option<u64>, StoreError> {
     let idx = class as usize;
     if idx >= free_head.len() || free_head[idx] == 0 {
         return Ok(None);
     }
     let off = free_head[idx];
+    let size = slab_bytes(class);
+    if off < SH_PREFIX_PAGE as u64 || off.saturating_add(size) > bump {
+        return Err(StoreError::Corrupt("scripthash free head out of range"));
+    }
     let mut next = [0u8; 8];
     body.read_at(off, &mut next)?;
     let next = u64::from_le_bytes(next);
-    if next != 0 && (next < SH_PREFIX_PAGE as u64 || next >= body.logical_len()) {
+    if next != 0 && (next < SH_PREFIX_PAGE as u64 || next.saturating_add(size) > bump) {
         return Err(StoreError::Corrupt("scripthash free link out of range"));
     }
     free_head[idx] = next;
@@ -2530,7 +2535,7 @@ impl ScriptHashTable {
         if class > SH_MAX_CLASS {
             return Err(StoreError::Corrupt("scripthash page class overflow"));
         }
-        if let Some(off) = pop_free_head(body, &mut alloc.free_head, class)? {
+        if let Some(off) = pop_free_head(body, &mut alloc.free_head, class, alloc.bump)? {
             return Ok(off);
         }
         let need = slab_bytes(class);
@@ -3334,8 +3339,9 @@ impl<'a> ScriptHashBulkSession<'a> {
     #[doc(hidden)]
     pub fn alloc_reloc_class(&mut self, class: u8) -> Result<u64, StoreError> {
         {
+            let bump = self.bump;
             let (body, free) = self.body_and_free();
-            if let Some(off) = pop_free_head(body, free, class)? {
+            if let Some(off) = pop_free_head(body, free, class, bump)? {
                 return Ok(off);
             }
         }

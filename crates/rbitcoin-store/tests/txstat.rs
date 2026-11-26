@@ -42,6 +42,8 @@ fn torn_txstat_page_restores_from_ahead_image() {
         .open(&path)
         .unwrap();
     use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.write_all(&[0u8; 4096]).unwrap();
     file.seek(SeekFrom::Start(4096)).unwrap();
     file.write_all(&[0u8; 4096]).unwrap();
     file.sync_all().unwrap();

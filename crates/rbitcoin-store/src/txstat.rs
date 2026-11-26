@@ -362,6 +362,10 @@ impl TxStat {
             blocks.insert(block, read_page(self.body.path(), &self.body, block)?);
             block += 4096;
         }
+        // The length write at offset 8 touches page 0 too.
+        if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(0) {
+            entry.insert(read_page(self.body.path(), &self.body, 0)?);
+        }
         for (at, byte) in bytes.iter().enumerate() {
             let off = start + at as u64;
             let Some(image) = blocks.get_mut(&(off & !4095)) else {

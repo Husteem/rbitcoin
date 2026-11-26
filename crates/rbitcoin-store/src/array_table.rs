@@ -161,7 +161,8 @@ const CLEAN: u64 = u64::MAX;
 /// synced before the payload, so open can put them back after a tear.
 const AHEAD_MAGIC: &[u8; 4] = b"ATA1";
 const AHEAD_VERSION: u16 = 1;
-const AHEAD_HEAD: usize = 68;
+const AHEAD_HEAD: usize = 28;
+const AHEAD_REC: usize = 8 + 4 + 32;
 const AHEAD_MAX_BYTES: u64 = 64 << 20;
 
 /// Where a flush calls its test hook.
@@ -1112,7 +1113,13 @@ impl ArrayTable {
     /// The image is the intended post-write header and payload, not the old
     /// bytes. It is safe to apply twice: a crash after the payload, before the
     /// sidecar is removed, restores the same state.
-    pub(crate) fn restore_ahead(path: &Path) -> Result<(), StoreError> {
+    /// Apply the image but leave the sidecar, so a pair can remove both only
+    /// after both restores succeed.
+    pub(crate) fn restore_ahead_keep(path: &Path) -> Result<(), StoreError> {
+        Self::restore_ahead_inner(path, false)
+    }
+
+    fn restore_ahead_inner(path: &Path, remove: bool) -> Result<(), StoreError> {
         use std::io::{Seek, SeekFrom, Write};
         let side = Self::ahead_path(path);
         let raw = match std::fs::read(&side) {
@@ -1123,32 +1130,52 @@ impl ArrayTable {
         if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
             return Err(StoreError::Corrupt("array ahead header"));
         }
-        let version = u16::from_le_bytes([raw[4], raw[5]]);
-        if version != AHEAD_VERSION {
+        if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
             return Err(StoreError::Corrupt("array ahead version"));
         }
-        let block_start = u64::from_le_bytes([
-            raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
-        ]);
-        let len = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]) as usize;
-        let header = &raw[20..36];
+        let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+        let header = &raw[12..28];
         let logical = u64::from_le_bytes([
             header[8], header[9], header[10], header[11], header[12], header[13], header[14],
             header[15],
         ]);
-        let image = &raw[AHEAD_HEAD..];
-        if len != image.len()
-            || block_start < FILE_HEADER_LEN as u64
-            || (len as u64) > AHEAD_MAX_BYTES
-            || block_start.checked_add(len as u64) != Some(logical)
-        {
-            return Err(StoreError::Corrupt("array ahead geometry"));
-        }
-        let mut eng = sha256::HashEngine::default();
-        eng.input(&raw[..36]);
-        eng.input(image);
-        if sha256::Hash::from_engine(eng).to_byte_array() != raw[36..68] {
-            return Err(StoreError::Corrupt("array ahead checksum"));
+        let mut at = AHEAD_HEAD;
+        let mut images = Vec::with_capacity(count);
+        for _ in 0..count {
+            if raw.len() < at + AHEAD_REC {
+                return Err(StoreError::Corrupt("array ahead short"));
+            }
+            let off = u64::from_le_bytes([
+                raw[at],
+                raw[at + 1],
+                raw[at + 2],
+                raw[at + 3],
+                raw[at + 4],
+                raw[at + 5],
+                raw[at + 6],
+                raw[at + 7],
+            ]);
+            let len =
+                u32::from_le_bytes([raw[at + 8], raw[at + 9], raw[at + 10], raw[at + 11]]) as usize;
+            let sum = &raw[at + 12..at + 44];
+            let image_at = at + AHEAD_REC;
+            let image = raw
+                .get(image_at..image_at + len)
+                .ok_or(StoreError::Corrupt("array ahead image"))?;
+            if off < FILE_HEADER_LEN as u64
+                || (len as u64) > AHEAD_MAX_BYTES
+                || off.checked_add(len as u64).is_none_or(|end| end > logical)
+            {
+                return Err(StoreError::Corrupt("array ahead geometry"));
+            }
+            let mut eng = sha256::HashEngine::default();
+            eng.input(&raw[at..at + 12]);
+            eng.input(image);
+            if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
+                return Err(StoreError::Corrupt("array ahead checksum"));
+            }
+            images.push((off, image));
+            at = image_at + len;
         }
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -1157,19 +1184,23 @@ impl ArrayTable {
             .truncate(false)
             .open(path)
             .map_err(|e| StoreError::io(path, e))?;
+        for (off, image) in images {
+            file.seek(SeekFrom::Start(off))
+                .map_err(|e| StoreError::io(path, e))?;
+            file.write_all(image).map_err(|e| StoreError::io(path, e))?;
+        }
         file.seek(SeekFrom::Start(0))
             .map_err(|e| StoreError::io(path, e))?;
         file.write_all(header)
             .map_err(|e| StoreError::io(path, e))?;
-        file.seek(SeekFrom::Start(block_start))
-            .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(image).map_err(|e| StoreError::io(path, e))?;
         file.durable_sync_all()
             .map_err(|e| StoreError::io(path, e))?;
         drop(file);
-        std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
-        if let Some(parent) = side.parent() {
-            file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+        if remove {
+            std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
+            if let Some(parent) = side.parent() {
+                file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+            }
         }
         Ok(())
     }
@@ -1216,19 +1247,35 @@ impl ArrayTable {
             }
         }
         let header = file::encode_leading_header(self.file.kind, logical);
-        let mut buf = Vec::with_capacity(AHEAD_HEAD + len);
+        let mut records: Vec<(u64, Vec<u8>)> = Vec::with_capacity(2);
+        if block_start > FILE_HEADER_LEN as u64 {
+            let page_len = (logical.min(FLUSH_SCRATCH as u64) - FILE_HEADER_LEN as u64) as usize;
+            let mut page = vec![0u8; page_len];
+            let slots = page_len / ELEM as usize;
+            for (i, slot) in words.iter().enumerate().take(slots.min(n as usize)) {
+                let at = i * ELEM as usize;
+                page[at..at + ELEM as usize]
+                    .copy_from_slice(&slot.load(Ordering::Relaxed).to_le_bytes());
+            }
+            records.push((FILE_HEADER_LEN as u64, page));
+        }
+        records.push((block_start, image));
+        let mut buf = Vec::with_capacity(AHEAD_HEAD + 4096 + records.len() * AHEAD_REC);
         buf.extend_from_slice(AHEAD_MAGIC);
         buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
-        buf.extend_from_slice(&block_start.to_le_bytes());
-        buf.extend_from_slice(&(len as u32).to_le_bytes());
+        buf.extend_from_slice(&(records.len() as u32).to_le_bytes());
         buf.extend_from_slice(&header);
-        let mut eng = sha256::HashEngine::default();
-        eng.input(&buf[..36]);
-        eng.input(&image);
-        let sum = sha256::Hash::from_engine(eng).to_byte_array();
-        buf.extend_from_slice(&sum);
-        buf.extend_from_slice(&image);
+        for (off, image) in &records {
+            buf.extend_from_slice(&off.to_le_bytes());
+            buf.extend_from_slice(&(image.len() as u32).to_le_bytes());
+            let mut eng = sha256::HashEngine::default();
+            eng.input(&off.to_le_bytes());
+            eng.input(&(image.len() as u32).to_le_bytes());
+            eng.input(image);
+            buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
+            buf.extend_from_slice(image);
+        }
         let side = Self::ahead_path(self.file.path());
         file::write_synced_tmp_rename(&side, &buf)?;
         Ok(Some(side))

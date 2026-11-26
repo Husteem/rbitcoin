@@ -97,6 +97,10 @@ pub fn remove_ingest_files(head_path: &Path) -> Result<(), StoreError> {
     if occ.exists() {
         std::fs::remove_file(&occ).map_err(|e| StoreError::io(&occ, e))?;
     }
+    let ahead = ahead_path(head_path);
+    if ahead.exists() {
+        std::fs::remove_file(&ahead).map_err(|e| StoreError::io(&ahead, e))?;
+    }
     Ok(())
 }
 
@@ -853,12 +857,13 @@ impl<'a> SlotPageCache<'a> {
             if chunk.dirty {
                 let off = ScriptHashHead::slot_file_off(chunk.base_slot);
                 self.head.file.write_at(off, &chunk.data)?;
-                chunk.dirty = false;
             }
+        }
+        if side.is_some() {
+            self.head.file.sync_data_only()?;
         }
         self.chunks.clear();
         if let Some(side) = side {
-            self.head.file.sync_data_only()?;
             std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
             if let Some(parent) = side.parent() {
                 file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;

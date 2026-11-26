@@ -1027,6 +1027,7 @@ impl<'a> SlotPageCache<'a> {
                 buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
                 buf.extend_from_slice(image);
             }
+            self.head.multi.flush()?;
             let side = ahead_path(self.head.file.path());
             file::write_synced_tmp_rename(&side, &buf)?;
             #[cfg(debug_assertions)]
@@ -1043,12 +1044,13 @@ impl<'a> SlotPageCache<'a> {
             if chunk.dirty {
                 let off = HashHead::slot_file_off(chunk.base_slot);
                 self.head.file.write_at(off, &chunk.data)?;
-                chunk.dirty = false;
             }
+        }
+        if side.is_some() {
+            self.head.file.sync_data_only()?;
         }
         self.chunks.clear();
         if let Some(side) = side {
-            self.head.file.sync_data_only()?;
             std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
             if let Some(parent) = side.parent() {
                 file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;

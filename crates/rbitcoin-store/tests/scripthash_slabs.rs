@@ -161,7 +161,7 @@ fn popped_free_link_out_of_range_is_corrupt() {
     write_alloc_header(&file, &state).unwrap();
     file.write_at(4096, &8200u64.to_le_bytes()).unwrap();
     let mut heads = state.free_head;
-    match pop_free_head(&file, &mut heads, 0) {
+    match pop_free_head(&file, &mut heads, 0, 8192) {
         Err(StoreError::Corrupt(_)) => {}
         Ok(_) => panic!("an out-of-range next link must be Corrupt"),
         Err(e) => panic!("an out-of-range next link must be Corrupt, got {e}"),
