@@ -430,8 +430,13 @@ async fn outspends_by_txid_outpoint_and_query(sock: &std::path::Path, pad: &Pad)
 
 /// One confirmed coinbase spend with `nout` OP_TRUE outputs. Returns its txid.
 fn mine_fan_tx(pad: &Pad, nout: u32) -> Txid {
+    mine_fan_tx_from(pad, 0, nout)
+}
+
+/// [`mine_fan_tx`] spending coinbase `cb` of the pad.
+fn mine_fan_tx_from(pad: &Pad, cb: usize, nout: u32) -> Txid {
     let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let mut fan = spend_true(pad.cbs[0], 0, spk.clone());
+    let mut fan = spend_true(pad.cbs[cb], 0, spk.clone());
     fan.output = (0..nout)
         .map(|_| TxOut {
             value: Amount::from_sat(10_000),
@@ -497,8 +502,9 @@ fn mine_txs(pad: &Pad, txs: Vec<Transaction>) -> u32 {
 /// before the spends pages them all unspent.
 #[tokio::test]
 async fn tx_outspends_pages_a_large_fanout() {
-    let pad = pad_hub("outspends-page", 1);
+    let pad = pad_hub("outspends-page", 2);
     let fan_txid = mine_fan_tx(&pad, 10_001);
+    let full = mine_fan_tx_from(&pad, 1, 10_000);
     let fan = fan_txid.to_string();
     let before = pad.q.tip_header_fk().unwrap().unwrap();
     let before = hex_hash(&pad.q.get_header(before).unwrap().hash);
@@ -577,7 +583,12 @@ async fn tx_outspends_pages_a_large_fanout() {
         let (st, resp) = http_get_unix(&sock, &format!("/tx/{fan}/outspends?{q}")).await;
         assert_eq!(st, want, "{q}: {resp}");
     }
-    // A tx at the page size still answers whole without `start_index`.
+    // A tx of exactly the page size still answers whole without
+    // `start_index`.
+    let whole = page(format!("/tx/{full}/outspends")).await;
+    assert_eq!(whole.len(), 10_000);
+    assert!(whole.iter().all(|s| *s == json!({"spent": false})));
+    // So does a small tx.
     let (st, resp) = http_get_unix(&sock, &format!("/tx/{}/outspends", pair.compute_txid())).await;
     assert_eq!((st, resp.as_str()), (200, r#"[{"spent":false}]"#));
     let (st, _) = http_get_unix(
