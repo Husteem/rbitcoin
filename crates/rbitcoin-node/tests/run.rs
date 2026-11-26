@@ -1494,6 +1494,19 @@ async fn sigterm_ends_a_start_waiting_on_tor_control() {
             out.iter().any(|l| l.contains("node: clean exit")),
             "{held}: SIGTERM must run the shutdown tail: {out:?}"
         );
+        // Each step of the tail is timed, from the signal on.
+        let steps = out
+            .iter()
+            .find(|l| l.contains("node: shutdown steps"))
+            .unwrap_or_else(|| panic!("{held}: no shutdown step timing: {out:?}"));
+        for step in [
+            "since_signal=",
+            "spend_checkpoint=",
+            "store_flush=",
+            "mempool_flush=",
+        ] {
+            assert!(steps.contains(step), "{held}: {step} missing: {steps}");
+        }
     }
 }
 
