@@ -1395,6 +1395,68 @@ async fn reorg_pad(
     (dir, pad, handle)
 }
 
+/// On a pruned node the by-txid batch serves a pruned tx as the same
+/// partial `GET /tx` gives, and still lists every other found tx: a pruned
+/// spend, a pruned coinbase, and a live child of the pruned spend.
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn by_txid_batch_serves_pruned_rows_beside_live_ones() {
+    use bitcoin::hashes::Hash;
+    let (dir, mut pad, handle) = reorg_pad("by-txid-pruned").await;
+    let spend = spend_tx(&pad, 0);
+    let spend_id = spend.compute_txid().to_byte_array();
+    pad.connect(vec![stored_spend(&spend, pad.cbs[0])]);
+    while pad.hashes.len() < 420 {
+        pad.connect(vec![]);
+    }
+    let mut child = spend_tx(&pad, 0);
+    child.input[0].previous_output = bitcoin::OutPoint {
+        txid: spend.compute_txid(),
+        vout: 0,
+    };
+    child.output.truncate(1);
+    child.output[0].value = bitcoin::Amount::from_sat(20_0000_0000 - 1_000);
+    let child_id = child.compute_txid().to_byte_array();
+    pad.connect(vec![stored_spend(&child, spend_id)]);
+    pad.q.set_prune_seqsigwit(true).unwrap();
+    pad.q.apply_prune_seqsigwit_tip().unwrap();
+
+    let ids = [spend_id, pad.cbs[0], [0x11; 32], child_id];
+    let hex: Vec<String> = ids.iter().map(|id| format!("\"{}\"", block_hash_hex(id))).collect();
+    let body = format!("[{}]", hex.join(","));
+    let resp = rbitcoin_esplora::internal::post_internal_txs(
+        State(app_state(&pad)),
+        axum::body::Bytes::from(body),
+    )
+    .await;
+    let st = resp.status();
+    let raw = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    assert_eq!(st, 200, "pruned by-txid batch: {text}");
+    let rows: Value = serde_json::from_str(&text).unwrap();
+    let got: Vec<_> = rows.as_array().unwrap().iter().map(|r| r["txid"].clone()).collect();
+    let want: Vec<Value> = [spend_id, pad.cbs[0], child_id]
+        .iter()
+        .map(|id| Value::from(block_hash_hex(id)))
+        .collect();
+    assert_eq!(got, want, "{text}");
+    assert_eq!(rows[0]["pruned"], true, "the spend is pruned: {text}");
+    assert_eq!(rows[1]["pruned"], true, "the coinbase is pruned: {text}");
+    assert!(rows[2].get("pruned").is_none(), "the child is live: {text}");
+    assert_eq!(rows[2]["vin"][0]["txid"], block_hash_hex(&spend_id), "{text}");
+    for (i, id) in [spend_id, child_id].iter().enumerate() {
+        let (st, one) = http_get(pad.addr, &format!("/tx/{}", block_hash_hex(id))).await;
+        assert_eq!(st, 200, "{one}");
+        let one: Value = serde_json::from_str(&one).unwrap();
+        assert_eq!(one, rows[if i == 0 { 0 } else { 2 }], "batch row matches GET /tx");
+    }
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A two-output spend of coinbase `cb`.
 fn spend_tx(pad: &HttpPad, cb: usize) -> bitcoin::Transaction {
     use bitcoin::absolute::LockTime;
