@@ -1904,19 +1904,8 @@ async fn empty_work_queue_is_http_503() {
 #[tokio::test]
 async fn unwritten_rest_replies_hold_the_byte_budget() {
     const BUDGET: usize = 16;
-    let (ctx, dir) = http_wait_ctx();
-    let rest_reply_bytes = ReplyBytes::new(BUDGET);
-    let state = AppState {
-        ctx,
-        auth: RpcAuth::new("test-token"),
-        cookie: None,
-        work_queue: Arc::new(Semaphore::new(1)),
-        rest_queue: Arc::new(Semaphore::new(4)),
-        rest_store: Arc::new(Semaphore::new(1)),
-        rest_reply_bytes: rest_reply_bytes.clone(),
-        rest: true,
-        require_auth: true,
-    };
+    let (state, dir) = rest_budget_state(BUDGET);
+    let rest_reply_bytes = state.rest_reply_bytes.clone();
     let get = || {
         rest_entry(
             State(state.clone()),
@@ -1945,6 +1934,8 @@ async fn unwritten_rest_replies_hold_the_byte_budget() {
         .expect("held body");
     let v: serde_json::Value = serde_json::from_slice(&body).expect("chaininfo json");
     assert_eq!(v["chain"], "regtest");
+    // One frame is collected without a copy, so `body` is the reply itself.
+    drop(body);
     assert_eq!(rest_reply_bytes.available(), BUDGET);
 
     let again = get().await;
@@ -1955,6 +1946,54 @@ async fn unwritten_rest_replies_hold_the_byte_budget() {
         BUDGET,
         "a dropped body returns its bytes"
     );
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+fn rest_budget_state(budget: usize) -> (AppState, rbitcoin_store::testutil::TempDir) {
+    let (ctx, dir) = http_wait_ctx();
+    let state = AppState {
+        ctx,
+        auth: RpcAuth::new("test-token"),
+        cookie: None,
+        work_queue: Arc::new(Semaphore::new(1)),
+        rest_queue: Arc::new(Semaphore::new(4)),
+        rest_store: Arc::new(Semaphore::new(1)),
+        rest_reply_bytes: ReplyBytes::new(budget),
+        rest: true,
+        require_auth: true,
+    };
+    (state, dir)
+}
+
+/// Hyper drops the body once it has queued the last frame, and that frame
+/// can sit in its write queue while the client stops reading. The budget
+/// covers the reply's memory, so it comes back only when the last frame
+/// handed out is dropped too, not when the body is.
+#[tokio::test]
+async fn a_queued_last_frame_keeps_the_reply_bytes() {
+    use hyper::body::Body as _;
+    const BUDGET: usize = 1 << 20;
+    let (state, dir) = rest_budget_state(BUDGET);
+    let rest_reply_bytes = state.rest_reply_bytes.clone();
+    let reply = rest_entry(
+        State(state),
+        axum::http::Request::get("/rest/chaininfo.json")
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(reply.status(), StatusCode::OK);
+    let mut body = reply.into_body();
+    let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+        .await
+        .expect("a frame")
+        .expect("no error");
+    assert!(body.is_end_stream(), "chaininfo is one frame");
+    drop(body);
+    let held = BUDGET - rest_reply_bytes.available();
+    assert!(held > 0, "the queued last frame still holds its bytes");
+    drop(frame);
+    assert_eq!(rest_reply_bytes.available(), BUDGET);
     let _ = std::fs::remove_dir_all(dir.path());
 }
 

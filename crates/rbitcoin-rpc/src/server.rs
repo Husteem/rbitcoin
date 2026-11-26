@@ -553,8 +553,10 @@ pub async fn rest_entry(State(state): State<AppState>, req: axum::extract::Reque
         reply.status,
         [(header::CONTENT_TYPE, reply.content_type)],
         axum::body::Body::new(RestReplyBody {
-            rest: Bytes::from(reply.body),
-            _bytes: bytes,
+            rest: Bytes::from_owner(BudgetedReply {
+                body: reply.body,
+                _bytes: bytes,
+            }),
         }),
     )
         .into_response()
@@ -569,15 +571,28 @@ fn rest_queue_full() -> Response {
 }
 
 /// Largest slice of a REST reply handed to hyper at once. Hyper polls for
-/// the next slice only once its write buffer has room, so the body, and the
-/// budget it holds, lives until about this much is left unwritten.
+/// the next slice only once its write buffer has room.
 const REST_REPLY_CHUNK: usize = 64 * 1024;
 
-/// A built REST reply and its share of [`REST_REPLY_BYTES`]. The share goes
-/// back when hyper drops the body: written, or the connection gone.
+/// A built REST reply's bytes and their share of [`REST_REPLY_BYTES`]. Every
+/// slice handed to hyper shares this allocation, so the share goes back only
+/// when the body and the last slice are dropped: written, or the connection
+/// gone. Hyper drops the body once it has queued the last slice, before that
+/// slice is written.
+struct BudgetedReply {
+    body: Vec<u8>,
+    _bytes: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for BudgetedReply {
+    fn as_ref(&self) -> &[u8] {
+        &self.body
+    }
+}
+
+/// The unsent rest of a [`BudgetedReply`].
 struct RestReplyBody {
     rest: Bytes,
-    _bytes: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl HttpBody for RestReplyBody {
