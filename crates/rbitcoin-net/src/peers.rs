@@ -2291,6 +2291,11 @@ pub struct PeerHub {
     /// not apply to those peers. `--net-permission-bind` still matches the
     /// listen address.
     overlay_loopback_forward: AtomicBool,
+    /// Listeners accept only while this is `true`. A node that holds inbound
+    /// at start opens it in [`Self::publish_local_endpoints`], once the
+    /// forwarding facts above are set, so an early Tor or I2P peer on
+    /// loopback is not judged as an ordinary source.
+    inbound_open: tokio::sync::watch::Sender<bool>,
     /// Misbehavior keys → unix second the refusal ends. In memory only.
     pub discouraged_addrs: Mutex<HashMap<DiscourageKey, u64>>,
     /// Netgroup → unix second a slot-loss refusal ends.
@@ -2547,6 +2552,7 @@ impl PeerHub {
             mempool: Mutex::new(None),
             net_perms: Mutex::new(crate::net_permissions::NetPermTable::default()),
             overlay_loopback_forward: AtomicBool::new(false),
+            inbound_open: tokio::sync::watch::channel(true).0,
             discouraged_addrs: Mutex::new(HashMap::new()),
             discouraged_groups: Mutex::new(HashMap::new()),
             netgroup_key: std::hash::RandomState::new(),
@@ -2626,6 +2632,17 @@ impl PeerHub {
 
     pub fn set_net_perms(&self, t: crate::net_permissions::NetPermTable) {
         *self.net_perms.lock().unwrap_or_else(|e| e.into_inner()) = t;
+    }
+
+    /// Close the listeners' accept loops until [`Self::publish_local_endpoints`].
+    pub(crate) fn hold_inbound(&self) {
+        self.inbound_open.send_replace(false);
+    }
+
+    /// Wait until listeners may accept, or the hub is gone.
+    pub(crate) async fn wait_inbound_open(&self) {
+        let mut open = self.inbound_open.subscribe();
+        let _ = open.wait_for(|o| *o).await;
     }
 
     /// Treat inbound loopback as potentially forwarded.
@@ -2850,6 +2867,7 @@ impl PeerHub {
         self.set_external_endpoints(endpoints);
         self.set_net_perms(perms);
         self.set_listen_port(port);
+        self.inbound_open.send_replace(true);
     }
 
     pub fn set_listen_port(&self, port: u16) {

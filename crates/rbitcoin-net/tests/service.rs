@@ -799,6 +799,74 @@ async fn listener_cap_silent_inbound_releases_the_slot() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A node started with `hold_inbound` binds its listener but accepts
+/// nothing until `publish_local_endpoints` installs the permission table and
+/// endpoints. Tor or I2P inbound that arrives while start is still wiring
+/// forwarding comes from loopback; it must be judged as forwarded, not
+/// against the per-source handshake cap (#2099).
+#[tokio::test]
+async fn held_inbound_waits_for_the_forwarding_facts() {
+    use rbitcoin_net::net_permissions::NetPermTable;
+    use rbitcoin_net::peers::MAX_INCOMPLETE_INBOUND_PER_ADDR;
+    use tokio::net::TcpStream;
+
+    let (_dir, query) = rbitcoin_query::testutil::tiny_query_labeled("held-inbound");
+    let mut node = P2PNode::start_inner(
+        Some("127.0.0.1:0".parse().unwrap()),
+        query,
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:test-held-inbound/".into(),
+        rbitcoin_net::DEFAULT_MAX_INBOUND,
+        rbitcoin_net::socks::Dialer::Direct,
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+        true,
+    )
+    .await
+    .unwrap();
+    // An `add_listen` bind is held too: here the marked onion listener.
+    let onion = node
+        .add_listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let n = MAX_INCOMPLETE_INBOUND_PER_ADDR + 2;
+    let mut early = Vec::new();
+    for target in [node.local_addr, onion] {
+        for _ in 0..n {
+            early.push(TcpStream::connect(target).await.unwrap());
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        node.peers.snapshot().iter().all(|p| !p.inbound),
+        "nothing is accepted before the endpoints are published"
+    );
+
+    node.peers.set_overlay_loopback_forward(true);
+    node.peers.publish_local_endpoints(
+        node.local_addr.port(),
+        Vec::new(),
+        NetPermTable {
+            onion_bind: Some(onion),
+            ..Default::default()
+        },
+    );
+    let mut inbound = 0;
+    for _ in 0..200 {
+        inbound = node.peers.snapshot().iter().filter(|p| p.inbound).count();
+        if inbound == 2 * n {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    node.shutdown().await;
+    assert_eq!(
+        inbound,
+        2 * n,
+        "every early loopback inbound on either listener is admitted as forwarded"
+    );
+}
+
 #[tokio::test]
 async fn marked_onion_listener_ignores_the_ordinary_source_cap() {
     use rbitcoin_net::net_permissions::NetPermTable;
