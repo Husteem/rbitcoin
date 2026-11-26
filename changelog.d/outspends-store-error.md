@@ -7,4 +7,5 @@ Fixed
   not found`, a confirmed cursor past the mempool page restarted the
   page, a script's mempool rows dropped or misdated a tx whose lookup
   failed, and `POST /internal/txs` left out a confirmed row it could not
-  build. They now answer the store error.
+  build. They now answer the store error. One pruned txid fails that whole
+  batch with 404 `pruned`. A txid that was never stored is still omitted.

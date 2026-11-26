@@ -90,7 +90,7 @@ the same POST with `after_txid` reuse. Idle **30s**; **256** clients (evict
 idle-longest). Not an 8-script LRU and not a >5s process whale cache. Extra
 operator RAM is the kernel page cache of Class A `txout` / SH heads. Public
 explorer second-hit of a whale GET is nginx/CDN (`/api/address/` is cacheable).
-`--max-sh-creates N` (`N>0` → Esplora **503** on an unpaged join) is the fuse; default **10000**. **0** is unlimited. A height-ascending page that closes before the cap, or a newest-first page of a script with no more creates than the page limit, is still served; any other newest-first page (a deep cursor included) or a `from_height` window takes the cap.
+`--max-sh-creates N` (`N>0` → Esplora **503** on an unpaged join) is the fuse; default **10000**. **0** is unlimited. A height-ascending page that closes before the cap, or a newest-first page of a script with no more creates than the page limit, is still served. Any other newest-first page, including the first page of a script above the cap, and a `from_height` window, take the cap and are **503**.
 
 Re-measure fat keys on the operator host (`rbitcoin-bench --suite casa
 --passes 1 --warmup 1`). Do not treat agent-VM times as product numbers.

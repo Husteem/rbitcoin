@@ -89,6 +89,9 @@ RPC, Electrum, and Esplora listeners are disabled by default. Their module
 options bind to loopback unless changed. Enabling Electrum or Esplora also
 enables the required scripthash index. `p2p.openFirewall`,
 `electrum.openFirewall`, and `esplora.openFirewall` are separate opt-ins.
+`p2p.openFirewall` does not open a `v1` `netPermissionBind` port. Open that
+port on the interface with
+`networking.firewall.interfaces.<name>.allowedTCPPorts`.
 JSON-RPC has no firewall option; expose it only through an explicitly managed
 firewall or tunnel.
 

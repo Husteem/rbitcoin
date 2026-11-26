@@ -49,6 +49,8 @@ Unix time between runs. Loaded at start (before seeds), updated after IBD and
 on shutdown. Seeds are merged in without clearing known flags. New writes are
 `rbitcoin-peers-v3` (IPv4, IPv6, Tor v3 `.onion:port`, and the row time).
 `rbitcoin-peers-v1` and `-v2` files still load; their rows have no time.
+A 0.9.x binary does not know the v3 header, starts with an empty book, and
+its next save replaces this file. Copy `{datadir}/peers` before rolling back.
 
 **Index modes:** Direct vs Tip: [`docs/concurrency.md`](../concurrency.md).
 IBD finishes Class A + `tx.head` + spend annotations **before** tip; tip entry
