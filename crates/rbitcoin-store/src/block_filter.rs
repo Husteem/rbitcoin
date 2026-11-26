@@ -34,6 +34,33 @@ use rbitcoin_primitives::{bytes, le_u32, le_u64, Fk, Height, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 
+#[cfg(debug_assertions)]
+static FAIL_REPAIR: Mutex<std::collections::BTreeMap<PathBuf, u8>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Make the next `count` `repair_body` calls for `path` report that the
+/// idx slot moved, without writing.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_block_filter_repair(path: &Path) {
+    let mut armed = FAIL_REPAIR.lock().unwrap_or_else(|e| e.into_inner());
+    let n = armed.entry(path.to_path_buf()).or_default();
+    *n = n.saturating_add(1);
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_repair(path: &Path) -> bool {
+    let mut armed = FAIL_REPAIR.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(n) = armed.get_mut(path) else {
+        return false;
+    };
+    *n = n.saturating_sub(1);
+    if *n == 0 {
+        armed.remove(path);
+    }
+    true
+}
+
 #[doc(hidden)]
 pub const SLOT: u64 = 80;
 #[doc(hidden)]
@@ -411,6 +438,10 @@ impl BlockFilterTable {
         }
         if filter.len() != row.len as usize {
             return Err(StoreError::Corrupt("blockfilter repair length"));
+        }
+        #[cfg(debug_assertions)]
+        if take_fail_repair(inner.segs[si].body.path()) {
+            return Ok(false);
         }
         inner.segs[si]
             .body

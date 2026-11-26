@@ -138,6 +138,7 @@ fn torn_filter_body_is_written_back() {
         *b ^= 0xff;
     }
     std::fs::write(&body, &raw).unwrap();
+    rbitcoin_store::block_filter::fail_next_block_filter_repair(&body);
 
     let got = q
         .basic_filter_at(1)
@@ -160,5 +161,25 @@ fn torn_filter_body_is_written_back() {
     assert_eq!(
         again, good,
         "a later by-height read must see the write-back"
+    );
+
+    std::fs::write(&body, &raw).unwrap();
+    rbitcoin_store::block_filter::fail_next_block_filter_repair(&body);
+    rbitcoin_store::block_filter::fail_next_block_filter_repair(&body);
+    let err = q.basic_filter_at(1).unwrap_err();
+    assert!(
+        err.to_string().contains("blockfilter repair slot moved"),
+        "{err}"
+    );
+    let still = q
+        .block_filter_table()
+        .unwrap()
+        .filter(rbitcoin_primitives::Height(1))
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_ne!(
+        still, good,
+        "a repair that keeps seeing a moved slot must not write"
     );
 }
