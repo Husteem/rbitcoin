@@ -1218,7 +1218,7 @@ async fn tx_routes(addr: SocketAddr, txid: &str) -> Vec<(String, u16, String)> {
 /// txid that is neither stored nor in the mempool does, and as electrs does
 /// for both.
 #[tokio::test(flavor = "current_thread")]
-async fn reorged_out_tx_is_404_unless_the_mempool_holds_it() {
+async fn reorged_out_tx_is_gone_unless_the_mempool_holds_it() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize_hex;
     use bitcoin::hashes::Hash;
@@ -1549,8 +1549,8 @@ async fn reorged_out_tx_in_the_mempool_serves_the_mempool_copy() {
 /// While a connect, disconnect or reorg holds the pool (`template_hold`, odd
 /// settle generation), a transaction of a disconnected block is neither
 /// confirmed nor in the mempool yet. Every tx route answers 503 for it, not
-/// the 404 that tells a client the tx was dropped, and 404 once the pool has
-/// settled.
+/// the answer for a dropped tx, and once the pool has settled the routes
+/// that return the transaction answer 404 and `/status` `confirmed: false`.
 #[tokio::test(flavor = "current_thread")]
 async fn unlisted_tx_is_503_while_a_reorg_holds_the_pool() {
     let (dir, mut pad, handle) = reorg_pad("reorg-window").await;
@@ -1568,7 +1568,11 @@ async fn unlisted_tx_is_503_while_a_reorg_holds_the_pool() {
     assert_eq!((st, body.as_str()), (200, r#"{"confirmed":false}"#));
     drop(hold);
     for (path, st, body) in tx_routes(pad.addr, &id).await {
-        assert_eq!((st, body.as_str()), (404, "Not Found"), "{path}");
+        if path.ends_with("/status") {
+            assert_eq!((st, body.as_str()), (200, r#"{"confirmed":false}"#), "{path}");
+        } else {
+            assert_eq!((st, body.as_str()), (404, "Not Found"), "{path}");
+        }
     }
 
     handle.shutdown().await;

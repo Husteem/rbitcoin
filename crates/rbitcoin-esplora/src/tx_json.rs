@@ -37,8 +37,9 @@ pub enum Listing {
 
 /// Whether the node serves a stored tx row, and from where.
 ///
-/// Esplora answers 404 for [`Listing::Gone`], and `confirmed: false` means
-/// "in the mempool". Gone is only answered once the pool has settled since
+/// The routes that return the transaction answer 404 for [`Listing::Gone`],
+/// and there `confirmed: false` means "in the mempool" (`/status` does not
+/// use this). Gone is only answered once the pool has settled since
 /// `settle0` ([`require_settled`]). A pinned `?asof=` view has no mempool and
 /// does not use this.
 pub fn tx_listing(
