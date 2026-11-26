@@ -1099,15 +1099,27 @@ fn answer_probe(
                 linked,
             );
         }
-        // An abandoned header this peer may serve reopens here too. The walk
-        // then asks the peer again, and the batch path re-plants it.
-        let reopened = !reopen_announced(st, peer, headers).is_empty();
+        // An abandoned header this peer may reopen is not reopened here: this
+        // reply is kept from the walk, so nothing would settle the reopen. The
+        // walk asks the peer again, and its batch reopens the header where a
+        // refused batch gives the reopen back.
+        let ip = st.slots.iter().find(|s| s.id == peer).map(|s| s.addr.ip());
+        let reopenable = ip.is_some_and(|ip| {
+            headers.iter().any(|h| {
+                let hash = h.block_hash();
+                st.unservable.contains(&hash)
+                    && st
+                        .mutated_copies
+                        .get(&hash)
+                        .is_some_and(|c| c.may_reopen(ip))
+            })
+        });
         // A header this node has not seen: the peer's chain leaves this one
         // or runs past the path. The walk asks it, as after a block inv.
         let last = headers[headers.len() - 1].block_hash();
         let seen = st.hash_height.contains_key(&last)
             || matches!(hub.query.height_of_hash(&last.to_byte_array()), Ok(Some(_)));
-        if reopened || !seen {
+        if reopenable || !seen {
             super::header_walk::note_block_inv(st, peer);
         }
     }
@@ -1580,12 +1592,7 @@ pub fn finish_deferred_archived_clear(
             // it: stop the re-get and take the header off the path, or
             // `ordered` never empties and IBD never leaves catch-up (#1811).
             if !dropped && note_mutated_copy(st, hash, sender_ip) {
-                st.unservable.insert(hash);
-                st.body.stop_reget(hash);
-                // A tip+1 sibling is never on the path, so the walk cut below
-                // does not reach it. Drop its ask lane here or assign keeps
-                // asking for a body the peer always sends mutated.
-                st.tip_siblings.retain(|h| *h != hash);
+                abandon_mutated(st, hash);
                 if !st.is_on_path(&hash, height) {
                     super::header_walk::forget_sibling_rows(st, hash);
                     return;
@@ -1900,11 +1907,21 @@ fn reopen_announced(
 /// the reopens it counted.
 fn close_reopened(st: &mut IbdWorkState, reopened: Vec<(BlockHash, super::state::MutatedCopies)>) {
     for (hash, before) in reopened {
-        st.unservable.insert(hash);
+        abandon_mutated(st, hash);
         if let Some(copies) = st.mutated_copies.get_mut(&hash) {
             *copies = before;
         }
     }
+}
+
+/// Abandon `hash` for mutated copies: off the path, no re-get, and no ask
+/// lane. A tip+1 sibling is never on the path, so a walk cut does not reach
+/// it; its lane is dropped here or assign keeps asking for a body the peer
+/// always sends mutated, or for a header a refused batch briefly reopened.
+fn abandon_mutated(st: &mut IbdWorkState, hash: BlockHash) {
+    st.unservable.insert(hash);
+    st.body.stop_reget(hash);
+    st.tip_siblings.retain(|h| *h != hash);
 }
 
 /// Core `MaybePunishNodeForBlock` (`BLOCK_MUTATED`): drop the sender and

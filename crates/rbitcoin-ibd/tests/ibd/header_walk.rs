@@ -9387,6 +9387,33 @@ fn a_heavier_fork_through_an_abandoned_header_reopens_it() {
     let _ = dir;
 }
 
+/// At the soft cap the walk records a heavier fork as its candidate and
+/// stores nothing: the checkpoint is the record. A fork through an
+/// abandoned header that the walk adopts keeps the header reopened, or the
+/// candidate would rest on an abandoned header (#1992).
+#[test]
+fn a_heavier_fork_the_walk_adopts_at_the_cap_keeps_its_reopen() {
+    let (dir, hub, mut st, a, _rx) = abandoned_a_under_b("reopen-fork-cap");
+    let hash = a.block_hash();
+    let mut n = 0u32;
+    while st.ordered.len() < ORDERED_HEADERS_SOFT_CAP {
+        push_dummy(&mut st, n);
+        n += 1;
+    }
+    let a2 = mine(hash, 3);
+    apply(&mut st, &hub, 2, vec![a, a2]);
+    assert_eq!(
+        candidate_tip(&st),
+        Some(a2.block_hash()),
+        "the walk adopts the heavier chain through A"
+    );
+    assert!(
+        !st.unservable.contains(&hash),
+        "the candidate does not rest on an abandoned header"
+    );
+    let _ = dir;
+}
+
 /// A batch through an abandoned header that is then refused (here A alone,
 /// no heavier than the candidate B) does not reopen it: the header would
 /// leave the abandoned set without going back on the path, and the refused
@@ -9402,6 +9429,10 @@ fn a_refused_batch_through_an_abandoned_header_does_not_reopen_it() {
         assert!(
             st.unservable.contains(&hash),
             "a refused batch leaves A abandoned"
+        );
+        assert!(
+            !st.tip_siblings.contains(&hash),
+            "a refused batch leaves no ask lane for A"
         );
     }
     // None of them spent a reopen: a heavier chain through A still reopens it.

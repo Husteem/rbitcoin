@@ -5695,10 +5695,11 @@ fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A fresh announcer's reply to an open probe reopens an abandoned header
-/// too, though that reply skips the batch path (#1992).
+/// A fresh announcer's reply to an open probe skips the batch path, so it
+/// does not reopen an abandoned header there: the walk asks that peer again,
+/// and the peer's batch reopens it (#1992).
 #[test]
-fn a_probe_reply_reopens_an_abandoned_header() {
+fn a_probe_reply_asks_again_for_an_abandoned_header() {
     use bitcoin::Network;
     use rbitcoin_ibd::ibd::events::{
         finish_deferred_archived_clear, on_headers_batch, plan_header_batch, BadPrevParent,
@@ -5745,7 +5746,22 @@ fn a_probe_reply_reopens_an_abandoned_header() {
         st.header_walk.probe_open, None,
         "the reply answered the probe"
     );
-    assert!(!st.unservable.contains(&hash), "a probe reply reopens A");
+    // The probe reply is kept from the walk, so nothing would settle a
+    // reopen taken here: the walk asks the peer again instead, and its
+    // batch reopens A where a refused batch gives the reopen back.
+    assert!(
+        st.unservable.contains(&hash),
+        "a probe reply does not spend a reopen"
+    );
+    assert_eq!(
+        st.header_walk.challenge,
+        Some(other),
+        "the walk asks the peer again"
+    );
+    let before = st.mutated_copies[&hash];
+    let _ = plan_header_batch(&mut st, &hub, other, vec![a.header]);
+    assert!(!st.unservable.contains(&hash), "the peer's batch reopens A");
+    assert_ne!(st.mutated_copies[&hash], before, "that reopen is counted");
     let _ = std::fs::remove_dir_all(dir);
 }
 
