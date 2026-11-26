@@ -377,7 +377,11 @@ fn seal_clamp_exposes_null_run_and_tip_drops_below_it() {
     rbitcoin_store::spend_durable::SpendDurable::new(12, 12)
         .store(s.path())
         .unwrap();
+    drop(s);
 
+    // Reopen: the hole check must measure from the sealed tip and let the
+    // null run above height 4 through to the clamp and trim.
+    let s = Store::open_tiny(&dir).unwrap();
     let r = s.revalidate_tip_window_n(6).unwrap();
     let tip = s.confirmed.tip_height().expect("a tip below the null run");
     assert_eq!(tip, Height(4), "{r:?}");
