@@ -1150,7 +1150,7 @@ impl ArrayTable {
             return Err(StoreError::Corrupt("array ahead version"));
         }
         let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
-        if count == 0 || count > (raw.len().saturating_sub(AHEAD_HEAD)) / AHEAD_REC {
+        if count > (raw.len().saturating_sub(AHEAD_HEAD)) / AHEAD_REC {
             return Err(StoreError::Corrupt("array ahead count"));
         }
         let header = raw[12..28].to_vec();
@@ -1158,6 +1158,11 @@ impl ArrayTable {
             header[8], header[9], header[10], header[11], header[12], header[13], header[14],
             header[15],
         ]);
+        // Zero records is a header-only image, valid only for a shrink to an
+        // empty table.
+        if count == 0 && logical != FILE_HEADER_LEN as u64 {
+            return Err(StoreError::Corrupt("array ahead count"));
+        }
         let mut at = AHEAD_HEAD;
         let mut images = Vec::with_capacity(count);
         for _ in 0..count {
@@ -1325,10 +1330,9 @@ impl ArrayTable {
         if from == CLEAN {
             return Ok(None);
         }
+        // An empty table still gets an image: the flush rewrites the length in
+        // page 0, and the header-only image also supersedes a leftover one.
         let n = self.len.load(Ordering::Acquire);
-        if n == 0 {
-            return Ok(None);
-        }
         let disk = self.disk_len.load(Ordering::Acquire);
         let start = from.min(disk);
         let logical = FILE_HEADER_LEN as u64 + n * ELEM;
@@ -1357,7 +1361,7 @@ impl ArrayTable {
         }
         let header = file::encode_leading_header(self.file.kind, logical);
         let mut records: Vec<(u64, Vec<u8>)> = Vec::with_capacity(2);
-        if block_start > FILE_HEADER_LEN as u64 {
+        if block_start > FILE_HEADER_LEN as u64 && logical > FILE_HEADER_LEN as u64 {
             let page_len = (logical.min(FLUSH_SCRATCH as u64) - FILE_HEADER_LEN as u64) as usize;
             let mut page = vec![0u8; page_len];
             let slots = page_len / ELEM as usize;
