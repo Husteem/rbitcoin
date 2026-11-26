@@ -22,7 +22,7 @@ Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file 
 | Process RAM, body-queue caps, production evict | [`ibd-memory.md`](./ibd-memory.md) |
 | io_uring vs fd; do not flatten a purpose-built machine | [`io-modality.md`](./io-modality.md) |
 | Which head file (tx / header / scripthash) | [`heads.md`](./heads.md) |
-| Crash, tip-as-commit, kill-9 | [`crash-recovery.md`](./crash-recovery.md) |
+| Crash, store integrity, tip-as-commit, kill-9 | [`crash-recovery.md`](./crash-recovery.md) |
 | Tests, budgets, coverage, fixtures | [`../TESTING.md`](../TESTING.md) |
 | A missed cargo-mutants case | [`../TESTING.md`](../TESTING.md) (What a mutant kill looks like). The miss list is `missed.txt` on the `mutants-state` branch |
 | Kill missed mutants since the last kill | [`../.agents/skills/kill-nightly-mutants/SKILL.md`](../.agents/skills/kill-nightly-mutants/SKILL.md) |
