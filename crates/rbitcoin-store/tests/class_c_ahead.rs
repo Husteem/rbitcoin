@@ -109,7 +109,9 @@ fn torn_header_txs_block_restores_from_ahead_image() {
         let hfk = s.put_header(&header).unwrap();
         s.header_txs.put_range(&write, hfk, tx, 1).unwrap();
         h601 = hfk;
-        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&dir.join("header_txs_first.body"));
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(
+            &dir.join("header_txs_first.body"),
+        );
         assert!(
             s.header_txs.flush().is_err(),
             "the failpoint must stop before the payload flush"
