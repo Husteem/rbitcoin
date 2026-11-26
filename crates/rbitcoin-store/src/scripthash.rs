@@ -30,7 +30,7 @@ use crate::scripthash_slabs::{
 use crate::scripthash_sorted_head::SortedHead;
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{le_u64, uleb128_len, Fk, TableKind};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -1265,6 +1265,33 @@ impl ScriptHashTable {
         Ok(())
     }
 
+    fn sync_bodies_for(&self, keys: &[([u8; 32], ShHeadValue, KeyHome)]) -> Result<(), StoreError> {
+        let mut seen = BTreeSet::new();
+        for (key, _, kh) in keys {
+            let body = self.body_for(key, *kh);
+            if seen.insert(body.path().to_path_buf()) {
+                body.sync_data_only()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_alloc_headers_for(
+        &self,
+        keys: &[([u8; 32], ShHeadValue, KeyHome)],
+    ) -> Result<(), StoreError> {
+        let mut seen = BTreeSet::new();
+        for (key, _, kh) in keys {
+            let body = self.body_for(key, *kh);
+            if seen.insert(body.path().to_path_buf()) {
+                let alloc_mu = self.alloc_for(key, *kh);
+                let alloc = alloc_mu.lock().unwrap();
+                write_alloc_header(body, &alloc)?;
+            }
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn flush_all_bodies(&self) -> Result<(), StoreError> {
         for b in &self.bodies {
@@ -1871,7 +1898,6 @@ impl ScriptHashTable {
             let alloc_mu = self.alloc_for(&key, kh);
             let mut alloc = alloc_mu.lock().unwrap();
             let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add)?;
-            write_alloc_header(body, &alloc)?;
             drop(alloc);
             head_final.push((key, new_val, kh));
         }
@@ -1881,6 +1907,11 @@ impl ScriptHashTable {
         if !head_final.is_empty() {
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
+            // Slabs and free-list links durable, then alloc headers, then the
+            // ingest head that names those slabs.
+            self.sync_bodies_for(&head_final)?;
+            self.write_alloc_headers_for(&head_final)?;
+            self.sync_bodies_for(&head_final)?;
             self.apply_head_upserts(&head_final, flush_each)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }

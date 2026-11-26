@@ -531,6 +531,10 @@ impl ScriptHashTable {
             alloc.live_count = alloc.live_count.saturating_sub(job.removed);
             job.live_applied = true;
         }
+        if let Err(e) = body.sync_data_only() {
+            job.pages_left = Some(Vec::new());
+            return Err(e);
+        }
         if let Err(e) = write_alloc_header(body, &alloc) {
             job.pages_left = Some(Vec::new());
             return Err(e);
@@ -659,6 +663,7 @@ impl ScriptHashTable {
                 for off in drop_pages {
                     self.free_slab(body, &mut alloc, SH_PAGE_SLAB_CLASS, off)?;
                 }
+                body.sync_data_only()?;
                 write_alloc_header(body, &alloc)?;
                 Ok(true)
             }
@@ -770,6 +775,7 @@ impl ScriptHashTable {
         };
         let mut alloc = alloc_mu.lock().unwrap();
         self.rollback_undo(body, &mut alloc, &rec)?;
+        body.sync_data_only()?;
         write_alloc_header(body, &alloc)?;
         body.sync_data_only()?;
         Ok(())
