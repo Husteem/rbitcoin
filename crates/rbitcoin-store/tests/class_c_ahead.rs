@@ -87,6 +87,9 @@ fn header_txs_flush_dirsyncs_the_pair_once() {
         2,
         "the pair should sync the directory once after the sidecars and once after the unlinks, got {dirs:?}"
     );
+    // Windows `fsync_parent_dir` is a no-op, so the trace stays empty.
+    #[cfg(not(unix))]
+    drop(dirs);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
