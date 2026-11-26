@@ -1298,6 +1298,10 @@ async fn handshakes_refresh_only_outbound_rows() {
     while cli.peers.snapshot().iter().any(|p| p.inbound) && std::time::Instant::now() < end {
         tokio::task::yield_now().await;
     }
+    assert!(
+        !cli.peers.snapshot().iter().any(|p| p.inbound),
+        "the inbound session closed before the row-time check"
+    );
     assert_eq!(
         book.lock().unwrap().last_seen_of(&src_net),
         1_690_000_000,
