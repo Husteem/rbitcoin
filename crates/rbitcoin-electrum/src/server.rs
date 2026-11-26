@@ -555,6 +555,9 @@ pub struct ElectrumConn {
     /// restatuses only the outpoints it touches; a gap or a reorg restatuses
     /// all.
     outpoint_tip: Option<u32>,
+    /// Height and hash of the last tip event handled, to tell a lagged
+    /// channel that lost a reorg from one that lost only blocks.
+    last_tip: Option<(u32, [u8; 32])>,
     /// Silent-payment subscriptions whose history has been sent.
     sp_subs: Vec<SpLive>,
     /// History scans of subscribes that have not reached the tip, at most
@@ -578,6 +581,7 @@ impl ElectrumConn {
             sh_join: None,
             outpoint_subs: HashMap::new(),
             outpoint_tip: None,
+            last_tip: None,
             sp_subs: Vec::new(),
             sp_scans: Vec::new(),
             sp_waiting: std::collections::VecDeque::new(),
@@ -641,80 +645,43 @@ where
                             });
                             writer.line(msg).await?;
                         }
-                        // A status that could not be read keeps the
-                        // watermark back: the next tip restatuses everything.
-                        let mut read_all = true;
-                        if !conn.outpoint_subs.is_empty() {
-                            // The next block: only the outpoints it creates or
-                            // spends. A reorg, a gap, or a block that cannot
-                            // be read restatuses every subscription.
-                            let next = t.reorg_from_height.is_none()
-                                && conn.outpoint_tip.and_then(|h| h.checked_add(1)) == Some(t.height);
-                            let touch = if next {
-                                block_outpoint_touch(&query, t.height).await
-                            } else {
-                                None
-                            };
-                            let mut ops: Vec<([u8; 32], u32)> = conn
-                                .outpoint_subs
-                                .keys()
-                                .copied()
-                                .filter(|op| touch.as_ref().is_none_or(|t| t.touches(op)))
-                                .collect();
-                            if let Some(t) = &touch {
-                                let rest: Vec<_> = conn
-                                    .outpoint_subs
-                                    .iter()
-                                    .filter(|(op, _)| !t.touches(op))
-                                    .map(|(op, sent)| (*op, sent.clone()))
-                                    .collect();
-                                ops.extend(pool_spender_changed(&query, mempool.clone(), rest).await);
-                            }
-                            if !ops.is_empty() {
-                                read_all = emit_outpoint_notes(
-                                    &mut writer,
-                                    &query,
-                                    mempool.clone(),
-                                    ops,
-                                    &mut conn.outpoint_subs,
-                                )
-                                .await?;
-                            }
-                        }
-                        conn.outpoint_tip = read_all.then_some(t.height);
-                        restart_sp_scans_after_reorg(&mut conn.sp_scans, &query, &params, &t);
-                        emit_sp_tips(&mut writer, &query, &params, &mut conn, &t).await?;
-                        if !conn.sh_subs.is_empty() {
-                            let heights = if t.reorg_from_height.is_some() {
-                                None
-                            } else {
-                                Some(vec![t.height])
-                            };
-                            sh_rescan |= !emit_sh_notes(
-                                &mut writer,
-                                &query,
-                                mempool.clone(),
-                                &conn.sh_subs,
-                                &mut last_sent_status,
-                                heights,
-                            )
-                            .await?;
-                        }
+                        on_tip_notes(&mut writer, &query, &params, &mempool, &mut conn, &mut last_sent_status, &mut sh_rescan, &t).await?;
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // A lost tip can be a same-height reorg. The next
-                        // tip restatuses every outpoint, even at height + 1.
-                        conn.outpoint_tip = None;
-                        if !conn.sh_subs.is_empty() {
-                            sh_rescan |= !emit_sh_notes(
-                                &mut writer,
-                                &query,
-                                mempool.clone(),
-                                &conn.sh_subs,
-                                &mut last_sent_status,
-                                None,
-                            )
-                            .await?;
+                        // A lost event can be a reorg. A tip built from the
+                        // store stands in for the events, as a reorg when the
+                        // last tip this session handled is gone.
+                        let q = Arc::clone(&query);
+                        let fork_floor = sp_fork_floor(&conn);
+                        let sp_top = sp_scanned_top(&conn);
+                        let last = conn.last_tip;
+                        let lagged = budgeted_blocking(&query, move || lagged_tip(&q, last, fork_floor, sp_top))
+                            .await
+                            .ok()
+                            .flatten();
+                        match lagged {
+                            Some(t) => {
+                                // The next block restatuses every outpoint.
+                                conn.outpoint_tip = None;
+                                on_tip_notes(&mut writer, &query, &params, &mempool, &mut conn, &mut last_sent_status, &mut sh_rescan, &t).await?;
+                            }
+                            None => {
+                                rbitcoin_log::warn!(
+                                    "electrum: tip events lagged and the tip could not be read; only scripthash statuses are sent again"
+                                );
+                                conn.outpoint_tip = None;
+                                if !conn.sh_subs.is_empty() {
+                                    sh_rescan |= !emit_sh_notes(
+                                        &mut writer,
+                                        &query,
+                                        mempool.clone(),
+                                        &conn.sh_subs,
+                                        &mut last_sent_status,
+                                        None,
+                                    )
+                                    .await?;
+                                }
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -1299,6 +1266,7 @@ fn read_conn(conn: &mut ElectrumConn, method: &str) -> ElectrumConn {
         },
         outpoint_subs: HashMap::new(),
         outpoint_tip: None,
+        last_tip: None,
         sp_subs: Vec::new(),
         sp_scans: Vec::new(),
         sp_waiting: std::collections::VecDeque::new(),
@@ -1525,6 +1493,7 @@ async fn answer_one(
         sh_join: conn.sh_join.take(),
         outpoint_subs: std::mem::take(&mut conn.outpoint_subs),
         outpoint_tip: conn.outpoint_tip,
+        last_tip: conn.last_tip,
         sp_subs: std::mem::take(&mut conn.sp_subs),
         sp_scans: std::mem::take(&mut conn.sp_scans),
         sp_waiting: std::mem::take(&mut conn.sp_waiting),
@@ -1841,6 +1810,187 @@ async fn emit_sp_tips<W: AsyncWrite + Unpin>(
     }
     conn.sp_subs = kept;
     Ok(())
+}
+
+/// One tip event's outpoint, silent-payment and scripthash notes. A lagged
+/// channel runs it for the tip [`lagged_tip`] builds; the events still
+/// queued push their own headers in order.
+#[allow(clippy::too_many_arguments)] // the session's state, unbundled
+async fn on_tip_notes<W: AsyncWrite + Unpin>(
+    writer: &mut ConnWrite<W>,
+    query: &Arc<Query>,
+    params: &Arc<ChainParams>,
+    mempool: &Option<Arc<MempoolHub>>,
+    conn: &mut ElectrumConn,
+    last_sent_status: &mut HashMap<[u8; 32], String>,
+    sh_rescan: &mut bool,
+    t: &TipNotify,
+) -> Result<(), std::io::Error> {
+    // A status that could not be read keeps the watermark back: the next
+    // tip restatuses everything.
+    let mut read_all = true;
+    // A queued plain event at or below the height every outpoint was last
+    // restatused at (a lag already caught up past it) changes none of them.
+    let stale = t.reorg_from_height.is_none() && conn.outpoint_tip.is_some_and(|h| t.height <= h);
+    if !conn.outpoint_subs.is_empty() && !stale {
+        // The next block: only the outpoints it creates or spends. A reorg,
+        // a gap, or a block that cannot be read restatuses every
+        // subscription.
+        let next = t.reorg_from_height.is_none()
+            && conn.outpoint_tip.and_then(|h| h.checked_add(1)) == Some(t.height);
+        let touch = if next {
+            block_outpoint_touch(query, t.height).await
+        } else {
+            None
+        };
+        let mut ops: Vec<([u8; 32], u32)> = conn
+            .outpoint_subs
+            .keys()
+            .copied()
+            .filter(|op| touch.as_ref().is_none_or(|t| t.touches(op)))
+            .collect();
+        if let Some(t) = &touch {
+            let rest: Vec<_> = conn
+                .outpoint_subs
+                .iter()
+                .filter(|(op, _)| !t.touches(op))
+                .map(|(op, sent)| (*op, sent.clone()))
+                .collect();
+            ops.extend(pool_spender_changed(query, mempool.clone(), rest).await);
+        }
+        if !ops.is_empty() {
+            read_all =
+                emit_outpoint_notes(writer, query, mempool.clone(), ops, &mut conn.outpoint_subs)
+                    .await?;
+        }
+    }
+    if !stale {
+        conn.outpoint_tip = read_all.then_some(t.height);
+    }
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, query, params, t);
+    emit_sp_tips(writer, query, params, conn, t).await?;
+    if !conn.sh_subs.is_empty() {
+        let heights = if t.reorg_from_height.is_some() {
+            None
+        } else {
+            Some(vec![t.height])
+        };
+        *sh_rescan |= !emit_sh_notes(
+            writer,
+            query,
+            mempool.clone(),
+            &conn.sh_subs,
+            last_sent_status,
+            heights,
+        )
+        .await?;
+    }
+    // A queued event older than the tip a lag recovered to must not lower
+    // the mark: a later lag would test a block below what was scanned. A
+    // reorg event replaces it.
+    let behind =
+        t.reorg_from_height.is_none() && conn.last_tip.is_some_and(|(height, _)| t.height < height);
+    if !behind {
+        conn.last_tip = tip_block_hash(&t.header_hex).map(|hash| (t.height, hash));
+    }
+    Ok(())
+}
+
+/// The block hash of a tip event's header, or `None` when it does not decode.
+fn tip_block_hash(header_hex: &str) -> Option<[u8; 32]> {
+    use bitcoin::hashes::Hash;
+    let bytes = rbitcoin_primitives::hex_decode(header_hex).ok()?;
+    let header: bitcoin::block::Header = bitcoin::consensus::deserialize(&bytes).ok()?;
+    Some(header.block_hash().to_byte_array())
+}
+
+/// Blocks below the lowest silent-payment height a lagged reorg rescans when
+/// the replaced tip's header is not stored, so its fork cannot be walked
+/// ([`stored_fork`]). A deeper reorg then is missed.
+const LAG_REORG_DEPTH: u32 = 6;
+
+/// The lowest height this session's live silent-payment subscriptions and
+/// scans have reached, `None` when it has none.
+fn sp_fork_floor(conn: &ElectrumConn) -> Option<u32> {
+    let live = conn.sp_subs.iter().map(|l| l.through);
+    let scans = conn.sp_scans.iter().map(|r| r.next.saturating_sub(1));
+    live.chain(scans).min()
+}
+
+/// Steps [`stored_fork`] walks before it gives up on a replaced tip.
+const LAG_FORK_WALK: u32 = 2016;
+
+/// The active-chain height where the stored header `hash` (a replaced tip)
+/// leaves it, by its `prev` links. `None` when the header or an ancestor is
+/// not stored, or the walk passes [`LAG_FORK_WALK`] steps.
+fn stored_fork(query: &Query, hash: [u8; 32]) -> Option<u32> {
+    let (_, mut rec) = query.get_header_by_hash(&hash).ok()??;
+    for _ in 0..LAG_FORK_WALK {
+        let parent = query.get_header(rec.prev_fk).ok()?;
+        if let Some(h) = query.confirmed_height_of_hash(&parent.hash).ok()? {
+            return Some(h.0);
+        }
+        rec = parent;
+    }
+    None
+}
+
+/// The highest height this session's silent-payment subscriptions may have
+/// read. A running scan reads ahead of the steps the session has taken, up
+/// to its range's end or the store's tip, so it counts as its end.
+fn sp_scanned_top(conn: &ElectrumConn) -> Option<u32> {
+    let live = conn.sp_subs.iter().map(|l| l.through);
+    let scans = conn.sp_scans.iter().map(|r| r.sub.end.unwrap_or(u32::MAX));
+    live.chain(scans).max()
+}
+
+/// A tip event for the store's tip after the channel lagged. When `last`
+/// (the last tip this session handled) is still on the chain the lost events
+/// only extended it, unless a silent-payment subscription or running scan
+/// may have read past it (`sp_top`): no handled event checked those heights, so the event forks at
+/// `last` and they are scanned again. Otherwise one was a reorg: the event
+/// forks [`LAG_REORG_DEPTH`] below the lowest silent-payment height (or the
+/// last tip), so those scans start again there. `None` without a tip.
+fn lagged_tip(
+    query: &Query,
+    last: Option<(u32, [u8; 32])>,
+    sp_floor: Option<u32>,
+    sp_top: Option<u32>,
+) -> Option<TipNotify> {
+    use bitcoin::hashes::Hash;
+    let tip = query.tip_height()?;
+    let hdr = query.wire_header_at_height(tip).ok()?;
+    let kept = last.is_some_and(|(height, hash)| {
+        height <= tip.0
+            && query
+                .wire_header_at_height(Height(height))
+                .is_ok_and(|h| h.block_hash().to_byte_array() == hash)
+    });
+    let unchecked_above = last
+        .filter(|(height, _)| kept && sp_top.is_some_and(|top| top > *height))
+        .map(|(height, _)| height);
+    let reorg_from_height = unchecked_above.or_else(|| {
+        (!kept).then(|| {
+            if let Some(fork) = last.and_then(|(_, hash)| stored_fork(query, hash)) {
+                return fork;
+            }
+            let below = sp_floor
+                .or(last.map(|(h, _)| h))
+                .unwrap_or(tip.0)
+                .min(tip.0);
+            let fork = below.saturating_sub(LAG_REORG_DEPTH);
+            rbitcoin_log::info!(
+                "electrum: tip events lagged past a replaced tip whose header is not stored; \
+                 treating it as a reorg from {fork}"
+            );
+            fork
+        })
+    });
+    Some(TipNotify {
+        height: tip.0,
+        header_hex: header_hex(&hdr),
+        reorg_from_height,
+    })
 }
 
 /// Heights `from..=to` connected after the history: one note when any of

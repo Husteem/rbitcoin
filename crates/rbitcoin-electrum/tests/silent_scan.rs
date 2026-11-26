@@ -529,6 +529,8 @@ pub struct SpChain {
     tip_fk: rbitcoin_primitives::Fk,
     tip_hash: Option<[u8; 32]>,
     next: u32,
+    /// Bumped by [`SpChain::rewind`] so a replaced height gets a new block.
+    epoch: u8,
 }
 
 pub const SP_CHAIN_T0: u32 = 1_600_000_000;
@@ -582,6 +584,7 @@ impl SpChain {
             tip_fk: Fk::NULL,
             tip_hash: None,
             next: 0,
+            epoch: 0,
         };
         chain.extend(last, paid);
         chain
@@ -603,6 +606,7 @@ impl SpChain {
         for h in self.next..=last {
             let mut merkle = [0u8; 32];
             merkle[..4].copy_from_slice(&h.to_le_bytes());
+            merkle[30] = self.epoch;
             merkle[31] = 0xcb;
             let timestamp = SP_CHAIN_T0 + h * 600;
             let hash = match self.tip_hash {
@@ -651,6 +655,24 @@ impl SpChain {
                 .unwrap();
         }
         self.next = last + 1;
+    }
+
+    /// Disconnect every height from `from` up. [`SpChain::extend`] then
+    /// connects different blocks there: a reorg.
+    pub fn rewind(&mut self, from: u32) {
+        use rbitcoin_primitives::Height;
+        while self.q.tip_height().is_some_and(|h| h.0 >= from) {
+            self.q.disconnect_tip().unwrap();
+        }
+        let (fk, rec) = self
+            .q
+            .header_at_height(Height(from - 1))
+            .unwrap()
+            .expect("the fork's parent is stored");
+        self.tip_fk = fk;
+        self.tip_hash = Some(rec.hash);
+        self.next = from;
+        self.epoch += 1;
     }
 
     pub fn sub(&self, start: serde_json::Value) -> serde_json::Value {

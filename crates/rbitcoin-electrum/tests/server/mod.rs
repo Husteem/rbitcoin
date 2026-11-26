@@ -2603,8 +2603,8 @@ fn pad_tip(pad: &PoolPad, height: u32, reorg_from_height: Option<u32>) {
         .unwrap();
 }
 
-/// A lagged tip channel can hide a same-height reorg, so the next tip
-/// restatuses every subscription, even at the next height.
+/// A lagged tip channel can hide a same-height reorg, so the lag itself
+/// restatuses every subscription before the queued tips push their headers.
 #[tokio::test]
 async fn tip_after_a_lag_restatuses_every_outpoint() {
     let mut pad = pool_pad().await;
@@ -2630,12 +2630,18 @@ async fn tip_after_a_lag_restatuses_every_outpoint() {
     }
     drop(held);
     let push = pad.read().await;
-    assert_eq!(push["params"][0]["height"], 2, "{push}");
-    let push = pad.read().await;
     assert_eq!(
         push["method"], "blockchain.outpoint.subscribe",
-        "the tip after a lag skipped an untouched outpoint: {push}"
+        "the lag skipped an untouched outpoint: {push}"
     );
+    let push = pad.read().await;
+    assert_eq!(push["params"][0]["height"], 2, "{push}");
+    // The queued events are below the tip the lag restatused at: they push
+    // their headers and nothing else.
+    for h in 3..=5 {
+        let push = pad.read().await;
+        assert_eq!(push["params"][0]["height"], h, "{push}");
+    }
     let _ = std::fs::remove_dir_all(&pad.dir);
 }
 
@@ -4746,6 +4752,212 @@ async fn sp_reorg_to_a_lower_tip_rewinds_the_scan() {
     assert_eq!(progress, [1.0]);
     assert_eq!(sp_heights(&history), [9]);
     s.assert_quiet(3).await;
+}
+
+/// A lagged tip channel can drop a reorg. The last tip the session handled
+/// is no longer on the chain, so the session treats the lag as a reorg below
+/// its live subscriptions and scans again: height 9's payment, already sent,
+/// is sent again from the new chain.
+#[tokio::test]
+async fn sp_lagged_tip_events_rescan_below_a_replaced_tip() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-lag", 10, &[9]);
+    let mut s = sp_session(&chain.q);
+    let reply = s.ask(&[sp_subscribe_line(1, chain.sub(json!(0)))]).await;
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(sp_heights(&history), [9]);
+
+    // A tip at 10 whose block the chain no longer holds.
+    let mut gone = chain.q.wire_header_at_height(Height(10)).unwrap();
+    gone.nonce = gone.nonce.wrapping_add(1);
+    s.tip_tx
+        .send(TipNotify {
+            height: 10,
+            header_hex: header_hex(&gone),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    s.assert_quiet(2).await;
+
+    // More events than the channel holds, all at the real tip. The session
+    // only sees the lag, and its last tip is no longer on the chain.
+    let tip = TipNotify {
+        height: 10,
+        header_hex: header_hex(&chain.q.wire_header_at_height(Height(10)).unwrap()),
+        reorg_from_height: None,
+    };
+    for _ in 0..12 {
+        s.tip_tx.send(tip.clone()).unwrap();
+    }
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(
+        sp_heights(&history),
+        [9],
+        "the lag rescans below the lost tip"
+    );
+    s.assert_quiet(2).await;
+
+    // The last tip handled is the real one now: another lag only extended
+    // it, and nothing is scanned again.
+    for _ in 0..12 {
+        s.tip_tx.send(tip.clone()).unwrap();
+    }
+    s.assert_quiet(3).await;
+
+    // An older event does not lower the mark. The tip at 10 is replaced
+    // again, then a late event for 5 (still on the chain) arrives: the next
+    // lag still tests 10 and rescans.
+    s.tip_tx
+        .send(TipNotify {
+            height: 10,
+            header_hex: header_hex(&gone),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    s.assert_quiet(4).await;
+    let mut lower = tip.clone();
+    lower.height = 5;
+    lower.header_hex = header_hex(&chain.q.wire_header_at_height(Height(5)).unwrap());
+    s.tip_tx.send(lower).unwrap();
+    s.assert_quiet(5).await;
+    for _ in 0..12 {
+        s.tip_tx.send(tip.clone()).unwrap();
+    }
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(
+        sp_heights(&history),
+        [9],
+        "a lag after an older event rescans"
+    );
+}
+
+/// When the replaced tip's header is still stored, a lag rescans from its
+/// real fork, not from a guess six blocks down: the payment at 5, below
+/// the fork at 7, is not sent again.
+#[tokio::test]
+async fn sp_lag_rescans_from_the_stored_fork_of_a_replaced_tip() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-lag-fork", 10, &[5, 9]);
+    let mut s = sp_session(&chain.q);
+    let reply = s.ask(&[sp_subscribe_line(1, chain.sub(json!(0)))]).await;
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(sp_heights(&history), [5, 9]);
+
+    // A stale tip at 8 on top of 7, stored as a disconnected block's header.
+    use bitcoin::hashes::Hash;
+    let (fk7, _) = chain.q.header_at_height(Height(7)).unwrap().unwrap();
+    let mut stale = chain.q.wire_header_at_height(Height(8)).unwrap();
+    stale.nonce = stale.nonce.wrapping_add(1);
+    chain
+        .q
+        .put_header(&rbitcoin_store::HeaderRecord {
+            prev_fk: fk7,
+            version: stale.version.to_consensus(),
+            timestamp: stale.time,
+            bits: stale.bits.to_consensus(),
+            nonce: stale.nonce,
+            merkle_root: stale.merkle_root.to_byte_array(),
+            hash: stale.block_hash().to_byte_array(),
+            size: 0,
+            weight: 0,
+        })
+        .unwrap();
+    s.tip_tx
+        .send(TipNotify {
+            height: 8,
+            header_hex: header_hex(&stale),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    s.assert_quiet(2).await;
+    let tip = TipNotify {
+        height: 10,
+        header_hex: header_hex(&chain.q.wire_header_at_height(Height(10)).unwrap()),
+        reorg_from_height: None,
+    };
+    for _ in 0..12 {
+        s.tip_tx.send(tip.clone()).unwrap();
+    }
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(
+        sp_heights(&history),
+        [9],
+        "the rescan starts above the fork at 7"
+    );
+    s.assert_quiet(3).await;
+}
+
+/// A live subscription can scan past the last tip event the session handled
+/// (its history scan reads the store's tip). A lag whose last handled tip is
+/// still on the chain did not check the heights above it, so those are
+/// scanned again: a reorg there may be among the lost events.
+#[tokio::test]
+async fn sp_lag_rescans_above_the_last_handled_tip() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-lag-above", 10, &[9]);
+    let mut s = sp_session(&chain.q);
+    let reply = s.ask(&[sp_subscribe_line(1, chain.sub(json!(0)))]).await;
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(sp_heights(&history), [9]);
+
+    // The session handles a tip event for 5, below what the scan reached.
+    let at = |h: u32| TipNotify {
+        height: h,
+        header_hex: header_hex(&chain.q.wire_header_at_height(Height(h)).unwrap()),
+        reorg_from_height: None,
+    };
+    s.tip_tx.send(at(5)).unwrap();
+    s.assert_quiet(2).await;
+    for _ in 0..12 {
+        s.tip_tx.send(at(5)).unwrap();
+    }
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(
+        sp_heights(&history),
+        [9],
+        "heights above the last tip are scanned again"
+    );
+    s.assert_quiet(3).await;
+}
+
+/// A running scan reads ahead of the steps the session has taken, past the
+/// last tip event it handled. A lag can hide a reorg of those heights while
+/// that tip stays on the chain, so the scan reads them again: height 9's
+/// payment, which only the new chain has, is sent.
+#[tokio::test]
+async fn sp_lag_restarts_a_scan_that_read_past_the_last_handled_tip() {
+    let paid: Vec<u32> = (0..=8).collect();
+    let mut chain = crate::silent_scan::SpChain::new("el-sp-lag-scan", 10, &paid);
+    let mut s = sp_session_with(&chain.q, sp_cfg_short_steps(), SP_STALL_BUF);
+    let at = |q: &Query, h: u32| TipNotify {
+        height: h,
+        header_hex: header_hex(&q.wire_header_at_height(Height(h)).unwrap()),
+        reorg_from_height: None,
+    };
+    s.tip_tx.send(at(&chain.q, 5)).unwrap();
+    s.assert_quiet(2).await;
+
+    let reply = s
+        .ask(&[sp_subscribe_line(1, chain.sub(json!("0-10")))])
+        .await;
+    // The session stalls writing the first step's note. The scan has the
+    // next step queued and has read heights 8 to 10 from the old chain.
+    s.stall_in_first_note().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    chain.rewind(9);
+    chain.extend(10, &[9]);
+    for _ in 0..12 {
+        s.tip_tx.send(at(&chain.q, 10)).unwrap();
+    }
+    let (history, _) = sp_read_history(&mut s.client, &reply[0]["result"]).await;
+    assert_eq!(
+        sp_heights(&history),
+        (0..=9).collect::<Vec<u64>>(),
+        "the scan reads heights 9 and 10 again from the new chain"
+    );
 }
 
 /// A range scan cut short by a reorg ends at the new tip. Blocks that
