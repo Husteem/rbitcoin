@@ -10,8 +10,9 @@ Security
   tunnel endpoint on IPv4 loopback, is refused too.
 - **An SV2 session gets a template's transactions at most twice.**
   Each `RequestTransactionData` reply serializes every template
-  transaction. A third request for the same template closes the
-  session. The bound is per template and per session: a client that
+  transaction. A third request for the same template is answered
+  `RequestTransactionData.Error` `stale-template-id`, and the session
+  stays open. The bound is per template and per session: a client that
   reconnects gets new templates, and asking for those serializes the
   same transactions again. The netgroup share above limits how many
   such sessions run at once.

@@ -566,13 +566,18 @@ async fn bip54_template_timelocks_the_coinbase() {
     tp.shutdown().await;
 }
 
-/// A template's transaction data is sent at most twice per session. A
-/// client asking for it again is closed, as a constraints flood is: each
-/// reply re-serializes every template transaction (#1944).
+/// A template's transaction data is sent at most twice per session: each
+/// reply re-serializes every template transaction (#1944). A further request
+/// gets `RequestTransactionData.Error` with `stale-template-id`, the code
+/// every SRI JDC release accepts, and the session stays open, so a JDC that
+/// asks again does not lose its template provider (#2085).
 #[tokio::test(flavor = "multi_thread")]
-async fn repeated_transaction_data_requests_close_the_session() {
+async fn repeated_transaction_data_requests_get_an_error_and_keep_the_session() {
     let tc = shared_regtest(0);
-    use template_distribution_sv2::MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS;
+    use template_distribution_sv2::{
+        RequestTransactionDataError, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR,
+        MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS,
+    };
 
     let FirstTemplate {
         tp,
@@ -585,20 +590,24 @@ async fn repeated_transaction_data_requests_close_the_session() {
         let f = recv_in_time(&mut c).await;
         assert_eq!(f.msg_type, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS);
     }
-    c.request_transaction_data(template_id).await.unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Ok(f) = c.recv().await {
-            assert_ne!(
-                f.msg_type, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS,
-                "a third reply for one template must not be sent"
-            );
-        }
-    })
-    .await;
-    assert!(
-        closed.is_ok(),
-        "a further request for the same template must close the session"
-    );
+    for _ in 0..3 {
+        c.request_transaction_data(template_id).await.unwrap();
+        let mut f = recv_in_time(&mut c).await;
+        assert_eq!(
+            f.msg_type, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR,
+            "a request past the cap is refused, not served or closed"
+        );
+        let e: RequestTransactionDataError =
+            binary_sv2::from_bytes(&mut f.payload).expect("decode");
+        assert_eq!(e.template_id, template_id);
+        assert_eq!(e.error_code.as_utf8_or_hex(), "stale-template-id");
+    }
+    // Other requests on the session keep their own answers.
+    c.request_transaction_data(template_id + 1).await.unwrap();
+    let mut f = recv_in_time(&mut c).await;
+    assert_eq!(f.msg_type, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR);
+    let e: RequestTransactionDataError = binary_sv2::from_bytes(&mut f.payload).expect("decode");
+    assert_eq!(e.error_code.as_utf8_or_hex(), "template-id-not-found");
     tp.shutdown().await;
 }
 
