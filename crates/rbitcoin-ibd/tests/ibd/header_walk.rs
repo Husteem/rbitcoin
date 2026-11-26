@@ -3101,6 +3101,85 @@ fn a_challenger_can_extend_past_the_current_tip() {
     );
 }
 
+/// A batch that extends the challenger through a header this peer cannot
+/// reopen (it sent that header's copies) is refused, though its first header
+/// reopens: a challenger that then beat the candidate would move the walk
+/// onto a header no peer is asked for (#1992).
+#[test]
+fn a_challenger_extension_through_a_header_still_abandoned_is_refused() {
+    use rbitcoin_ibd::ibd::state::MutatedCopies;
+
+    let (_dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reopen-challenger");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let common = mine(gen, 1);
+    let current = mine(common.block_hash(), 2);
+    let current_tip = mine(current.block_hash(), 3);
+    let side = mine(common.block_hash(), 12);
+    let side_tip = mine(side.block_hash(), 13);
+    let x4 = mine(side_tip.block_hash(), 14);
+    let x5 = mine(x4.block_hash(), 15);
+    hub.milestone.height = 5;
+    let (first, mut first_rx) = slot(0);
+    let (second, mut second_rx) = slot(1);
+    let mut st = IbdWorkState::new(vec![first, second], Some(gen), Some(0));
+    fill_queue(&mut st);
+
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let _ = drain_getheaders(&mut first_rx);
+    apply(&mut st, &hub, 0, vec![common]);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let _ = drain_getheaders(&mut first_rx);
+    apply(&mut st, &hub, 0, vec![current, current_tip]);
+    apply_peer_event(
+        &mut st,
+        &hub,
+        PeerEvent::BlocksInv {
+            peer: 1,
+            hashes: vec![side_tip.block_hash()],
+        },
+        &AtomicU32::new(0),
+        &mut AddrMan::new(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
+        None,
+    );
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let _ = drain_getheaders(&mut second_rx);
+    apply(&mut st, &hub, 1, vec![side, side_tip]);
+    assert!(
+        st.header_walk.challenger.is_some(),
+        "the side chain challenges"
+    );
+
+    // x4 was abandoned for another peer's copies, x5 for peer 1's own.
+    let other = rbitcoin_net::NetAddr::from_socket(([10, 9, 9, 9], 0).into());
+    let me = st.slots.iter().find(|s| s.id == 1).unwrap().copy_sender();
+    for (h, sender) in [(x4, other), (x5, me)] {
+        let mut copies = MutatedCopies::default();
+        for _ in 0..3 {
+            copies.note(Some(sender));
+        }
+        st.mutated_copies.insert(h.block_hash(), copies);
+        st.unservable.insert(h.block_hash());
+    }
+    apply(&mut st, &hub, 1, vec![x4, x5]);
+    assert_ne!(
+        st.header_walk.tip_hash(),
+        Some(x5.block_hash()),
+        "the walk does not move onto a header still abandoned"
+    );
+    assert!(st
+        .header_walk
+        .challenger
+        .as_ref()
+        .is_none_or(|c| c.tip.hash != Some(x5.block_hash())));
+    assert!(st.unservable.contains(&x5.block_hash()));
+    assert!(
+        st.unservable.contains(&x4.block_hash()),
+        "the refused batch gives x4's reopen back"
+    );
+}
+
 /// Median time while the tip is still genesis, then that same hub confirms
 /// a stale ancestor and rewinds onto it. Retarget is a second hub: its
 /// period length is not regtest difficulty, and each checkpoint layout

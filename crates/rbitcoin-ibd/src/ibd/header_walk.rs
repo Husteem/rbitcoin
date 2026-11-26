@@ -1057,6 +1057,11 @@ pub fn suppress_competing_chain(
     // returns that before this function runs, so the length comparison is not
     // a second gate.
     if challenger_extends(st, prev) {
+        // The challenger can replace the candidate: it takes no header no
+        // peer is asked for, as the candidate does not.
+        if through_abandoned(st, headers) {
+            return true;
+        }
         return extend_challenger(st, hub, Some(peer), headers);
     }
     // A batch that has not met the next checkpoint is not a competing chain.
