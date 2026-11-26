@@ -938,11 +938,11 @@ impl Query {
         self.take_heavy_turn()
     }
 
-    /// The node's single heavy turn for any heavy API read, taken as
-    /// [`Self::heavy_turn`] takes it: admitted under the [`heavy_turn_job`]
-    /// that holds it, taken when free, and refused at once when taken so the
-    /// job's caller waits on its task and runs the read again. Hold the admit
-    /// for the whole read.
+    /// The node's single heavy turn for any heavy API read, as a heavy
+    /// unpaged scripthash join takes it: admitted under the
+    /// [`heavy_turn_job`] that holds it, taken when free, and refused at once
+    /// when taken so the job's caller waits on its task and runs the read
+    /// again. Hold the admit for the whole read.
     pub fn take_heavy_turn(&self) -> Result<JoinAdmit, QueryError> {
         if HEAVY_TURN_GRANTED.with(std::cell::Cell::get) {
             return Ok(JoinAdmit {
