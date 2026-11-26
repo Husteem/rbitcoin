@@ -571,11 +571,11 @@ static FAIL_AFTER_FIRST: std::sync::Mutex<std::collections::BTreeSet<std::path::
 static FAIL_AFTER_PAYLOAD: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// Leave the next `header_txs` write-ahead sidecars for `path` behind and fail
-/// before the payload flush, as a power cut would.
+/// Leave the next write-ahead sidecar for `path` (`header_txs_*` or
+/// `confirmed`) behind and fail before the payload flush, as a power cut would.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
-pub fn fail_next_header_txs_flush_after_ahead(path: &Path) {
+pub fn fail_next_array_flush_after_ahead(path: &Path) {
     FAIL_AHEAD
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -595,7 +595,7 @@ pub fn fail_next_header_txs_flush_after_first(path: &Path) {
 /// Fail after the payload flush of `path`, before the sidecars are removed.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
-pub fn fail_next_header_txs_flush_after_payload(path: &Path) {
+pub fn fail_next_array_flush_after_payload(path: &Path) {
     FAIL_AFTER_PAYLOAD
         .lock()
         .unwrap_or_else(|e| e.into_inner())

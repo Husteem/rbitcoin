@@ -83,13 +83,13 @@ fn open_drops_header_txs_sidecars_from_different_flushes() {
         t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
         t.flush().unwrap();
         t.put_range(&write, Fk(1), Fk(5), 3).unwrap();
-        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(
             &dir.join("header_txs_first.body"),
         );
         assert!(t.flush().is_err());
         let saved = std::fs::read(&count_side).unwrap();
         t.put_range(&write, Fk(1), Fk(8), 4).unwrap();
-        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(
             &dir.join("header_txs_first.body"),
         );
         assert!(t.flush().is_err());
@@ -119,7 +119,7 @@ fn open_restores_the_pair_when_a_retry_rewrites_one_sidecar() {
         t.put_range(&write, Fk(1), Fk(5), 3).unwrap();
         rbitcoin_store::chain::fail_next_header_txs_flush_after_first(&body);
         assert!(t.flush().is_err());
-        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&body);
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(&body);
         assert!(t.flush().is_err());
     }
     let t = rbitcoin_store::HeaderTxsTable::open(&dir).unwrap();
@@ -189,7 +189,7 @@ fn torn_header_txs_block_restores_from_ahead_image() {
         let hfk = s.put_header(&header).unwrap();
         s.header_txs.put_range(&write, hfk, tx, 1).unwrap();
         h601 = hfk;
-        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(
             &dir.join("header_txs_first.body"),
         );
         assert!(
@@ -251,7 +251,7 @@ fn leftover_ahead_pages_survive_a_later_write() {
                 s.header_txs.flush().unwrap();
             }
         }
-        rbitcoin_store::chain::fail_next_header_txs_flush_after_payload(
+        rbitcoin_store::chain::fail_next_array_flush_after_payload(
             &dir.join("header_txs_first.body"),
         );
         assert!(
@@ -268,7 +268,7 @@ fn leftover_ahead_pages_survive_a_later_write() {
         let header = hdr(prev, parent_hash, 1100, txid);
         let hfk = s.put_header(&header).unwrap();
         s.header_txs.put_range(&write, hfk, tx, 1).unwrap();
-        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(
             &dir.join("header_txs_first.body"),
         );
         assert!(
@@ -313,7 +313,7 @@ fn torn_confirmed_page_zero_restores_from_ahead_image() {
         t.flush().unwrap();
         // Height 600 lands in the block that holds heights 510..=599.
         t.set(&write, Height(600), Fk(601)).unwrap();
-        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&path);
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
         assert!(
             t.flush().is_err(),
             "the failpoint must stop before the payload flush"
@@ -352,7 +352,7 @@ fn torn_page_zero_after_a_block_aligned_shrink_restores() {
         // 16 B header + 510 slots is exactly one 4 KiB block.
         t.disconnect_tip(&write, Height(511)).unwrap();
         t.disconnect_tip(&write, Height(510)).unwrap();
-        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&path);
+        rbitcoin_store::chain::fail_next_array_flush_after_ahead(&path);
         assert!(t.flush().is_err(), "the failpoint must stop the flush");
         assert!(dir.path.join("confirmed.body.ahead").is_file());
     }
@@ -372,15 +372,15 @@ fn one_header_txs_failpoint_does_not_clear_another_path() {
     let tb = rbitcoin_store::HeaderTxsTable::create(&b.path).unwrap();
     let pa = a.path.join("header_txs_first.body");
     let pb = b.path.join("header_txs_first.body");
-    rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&pa);
-    rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&pb);
+    rbitcoin_store::chain::fail_next_array_flush_after_ahead(&pa);
+    rbitcoin_store::chain::fail_next_array_flush_after_ahead(&pb);
     assert!(tb.flush().is_err(), "path b was armed");
     assert!(
         ta.flush().is_err(),
         "arming path b cleared the failpoint for path a"
     );
-    rbitcoin_store::chain::fail_next_header_txs_flush_after_payload(&pa);
-    rbitcoin_store::chain::fail_next_header_txs_flush_after_payload(&pb);
+    rbitcoin_store::chain::fail_next_array_flush_after_payload(&pa);
+    rbitcoin_store::chain::fail_next_array_flush_after_payload(&pb);
     assert!(tb.flush().is_err(), "path b payload failpoint was armed");
     assert!(
         ta.flush().is_err(),
