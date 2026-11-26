@@ -724,15 +724,28 @@ pub fn plan_header_reply(
         return HeaderPlan::Done;
     }
     // Before the batch is judged: a fork or alternate that starts at an
-    // abandoned header is refused while it stays abandoned. A batch that is
-    // then not stored would leave it off the path with a reopen spent, so
-    // it is abandoned again.
+    // abandoned header is refused while it stays abandoned. A header the
+    // plan then does not store would be left off the path with a reopen
+    // spent, so it is abandoned again.
     let reopened = reopen_announced(st, peer, &headers);
     let plan = plan_linked(st, hub, peer, ask, headers, linked, inflight);
-    if !matches!(plan, HeaderPlan::Store { .. }) {
-        close_reopened(st, reopened);
-    }
+    settle_reopens(st, reopened, &plan);
     plan
+}
+
+/// Abandon again each header [`reopen_announced`] reopened that `plan` does
+/// not store, with its record as it was.
+#[doc(hidden)]
+pub fn settle_reopens(
+    st: &mut IbdWorkState,
+    mut reopened: Vec<(BlockHash, super::state::MutatedCopies)>,
+    plan: &HeaderPlan,
+) {
+    // A stored plan can keep only a prefix of the batch (`proven_header_prefix`).
+    if let HeaderPlan::Store { headers, .. } = plan {
+        reopened.retain(|(hash, _)| !headers.iter().any(|h| h.block_hash() == *hash));
+    }
+    close_reopened(st, reopened);
 }
 
 /// [`plan_header_reply`] for a batch past its proof and validity checks.

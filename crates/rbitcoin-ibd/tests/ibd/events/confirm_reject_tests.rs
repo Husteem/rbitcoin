@@ -5851,3 +5851,33 @@ fn a_header_abandoned_for_a_failed_write_does_not_reopen() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A stored plan can keep only a prefix of the batch (`proven_header_prefix`
+/// cuts it at the checkpoint it met). A header the batch reopened but the
+/// plan does not store is abandoned again with its record as it was, so it
+/// neither leaves the abandoned set off the path nor spends a reopen (#1992).
+#[test]
+fn a_reopened_header_the_stored_plan_drops_is_abandoned_again() {
+    use rbitcoin_ibd::ibd::events::{settle_reopens, HeaderPlan};
+    use rbitcoin_ibd::ibd::header_walk::InFlight;
+
+    let (dir, _hub, mut st, a) = abandoned_a("reopen-settle");
+    let hash = a.block_hash();
+    let before = st.mutated_copies[&hash];
+    // The batch reopened A, but the plan stores only another header.
+    let mut after = before;
+    assert!(after.take_reopen(std::net::IpAddr::from([127, 0, 0, 2]), 1));
+    st.mutated_copies.insert(hash, after);
+    st.unservable.remove(&hash);
+    let mut other = a.header;
+    other.nonce = other.nonce.wrapping_add(1);
+    let plan = HeaderPlan::Store {
+        headers: vec![other],
+        known: Vec::new(),
+        inflight: InFlight::capture(&st),
+    };
+    settle_reopens(&mut st, vec![(hash, before)], &plan);
+    assert!(st.unservable.contains(&hash), "A is abandoned again");
+    assert_eq!(st.mutated_copies[&hash], before, "its reopen is given back");
+    let _ = std::fs::remove_dir_all(dir);
+}
