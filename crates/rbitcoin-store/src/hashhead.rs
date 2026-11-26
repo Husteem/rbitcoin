@@ -14,6 +14,7 @@
 //! fd pread/pwrite. Probe walks reuse the same chunk cache so
 //! a hop is not one pread per open-address step.
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::file::{self, TableFile, FILE_HEADER_LEN};
 use bitcoin_hashes::{sha256, Hash, HashEngine};
@@ -392,7 +393,7 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
     if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
         return Err(StoreError::Corrupt("hash head ahead version"));
     }
-    let count = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+    let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
     let mut at = AHEAD_HEAD;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -403,7 +404,9 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         if raw.len() < at + AHEAD_REC {
             return Err(StoreError::Corrupt("hash head ahead short"));
         }
-        let off = u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+        let mut off_buf = [0u8; 8];
+        off_buf.copy_from_slice(&raw[at..at + 8]);
+        let off = u64::from_le_bytes(off_buf);
         let sum = &raw[at + 8..at + 40];
         let image = &raw[at + 40..at + AHEAD_REC];
         if !off.is_multiple_of(4096) {
@@ -420,7 +423,8 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         file.write_all(image).map_err(|e| StoreError::io(path, e))?;
         at += AHEAD_REC;
     }
-    file.sync_all().map_err(|e| StoreError::io(path, e))?;
+    file.durable_sync_all()
+        .map_err(|e| StoreError::io(path, e))?;
     drop(file);
     std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
     if let Some(parent) = side.parent() {
@@ -994,7 +998,10 @@ impl<'a> SlotPageCache<'a> {
                 if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(block) {
                     entry.insert(read_page(self.head.file.path(), &self.head.file, block)?);
                 }
-                let image = blocks.get_mut(&block).unwrap();
+                let Some(image) = blocks.get_mut(&block) else {
+                    block += 4096;
+                    continue;
+                };
                 let lo = off.max(block);
                 let hi = (off + len).min(block + 4096);
                 let src = (lo - off) as usize;

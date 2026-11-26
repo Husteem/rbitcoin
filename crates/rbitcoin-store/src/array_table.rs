@@ -10,6 +10,7 @@
 //! In-RAM gets take no reader-writer lock.
 //! Counter order is the Class C paragraph of `docs/concurrency.md`.
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::file::{self, TableFile, FILE_HEADER_LEN};
 use crate::sync::atomic::{self, AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -1126,10 +1127,15 @@ impl ArrayTable {
         if version != AHEAD_VERSION {
             return Err(StoreError::Corrupt("array ahead version"));
         }
-        let block_start = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-        let len = u32::from_le_bytes(raw[16..20].try_into().unwrap()) as usize;
+        let block_start = u64::from_le_bytes([
+            raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+        ]);
+        let len = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]) as usize;
         let header = &raw[20..36];
-        let logical = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let logical = u64::from_le_bytes([
+            header[8], header[9], header[10], header[11], header[12], header[13], header[14],
+            header[15],
+        ]);
         let image = &raw[AHEAD_HEAD..];
         if len != image.len()
             || block_start < FILE_HEADER_LEN as u64
@@ -1158,7 +1164,8 @@ impl ArrayTable {
         file.seek(SeekFrom::Start(block_start))
             .map_err(|e| StoreError::io(path, e))?;
         file.write_all(image).map_err(|e| StoreError::io(path, e))?;
-        file.sync_all().map_err(|e| StoreError::io(path, e))?;
+        file.durable_sync_all()
+            .map_err(|e| StoreError::io(path, e))?;
         drop(file);
         std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
         if let Some(parent) = side.parent() {

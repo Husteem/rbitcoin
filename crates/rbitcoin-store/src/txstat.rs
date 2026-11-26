@@ -16,6 +16,7 @@
 //! the stream is in that header's overflow blob (`encoded[8..]`). Pin / SH /
 //! tweaks do not open these files.
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
 use crate::file::{self, GrowPolicy, TableFile, FILE_HEADER_LEN};
 use bitcoin_hashes::{sha256, Hash, HashEngine};
@@ -103,8 +104,10 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
     if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
         return Err(StoreError::Corrupt("txstat ahead version"));
     }
-    let count = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
-    let logical = u64::from_le_bytes(raw[12..20].try_into().unwrap());
+    let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+    let logical = u64::from_le_bytes([
+        raw[12], raw[13], raw[14], raw[15], raw[16], raw[17], raw[18], raw[19],
+    ]);
     let mut at = AHEAD_HEAD;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -115,7 +118,9 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         if raw.len() < at + AHEAD_REC {
             return Err(StoreError::Corrupt("txstat ahead short"));
         }
-        let off = u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+        let mut off_buf = [0u8; 8];
+        off_buf.copy_from_slice(&raw[at..at + 8]);
+        let off = u64::from_le_bytes(off_buf);
         let sum = &raw[at + 8..at + 40];
         let image = &raw[at + 40..at + AHEAD_REC];
         if !off.is_multiple_of(4096) {
@@ -137,7 +142,8 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         .map_err(|e| StoreError::io(path, e))?;
     file.write_all(&header)
         .map_err(|e| StoreError::io(path, e))?;
-    file.sync_all().map_err(|e| StoreError::io(path, e))?;
+    file.durable_sync_all()
+        .map_err(|e| StoreError::io(path, e))?;
     drop(file);
     std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
     if let Some(parent) = side.parent() {
@@ -357,7 +363,9 @@ impl TxStat {
         }
         for (at, byte) in bytes.iter().enumerate() {
             let off = start + at as u64;
-            let image = blocks.get_mut(&(off & !4095)).unwrap();
+            let Some(image) = blocks.get_mut(&(off & !4095)) else {
+                continue;
+            };
             image[(off & 4095) as usize] = *byte;
         }
         let mut buf = Vec::new();
