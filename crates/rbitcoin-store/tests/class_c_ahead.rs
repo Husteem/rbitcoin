@@ -108,6 +108,30 @@ fn open_drops_header_txs_sidecars_from_different_flushes() {
 }
 
 #[test]
+fn open_restores_the_pair_when_a_retry_rewrites_one_sidecar() {
+    let dir = tmp();
+    let body = dir.join("header_txs_first.body");
+    {
+        let t = rbitcoin_store::HeaderTxsTable::create(&dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+        t.flush().unwrap();
+        t.put_range(&write, Fk(1), Fk(5), 3).unwrap();
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_first(&body);
+        assert!(t.flush().is_err());
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&body);
+        assert!(t.flush().is_err());
+    }
+    let t = rbitcoin_store::HeaderTxsTable::open(&dir).unwrap();
+    assert_eq!(
+        (t.first.get(0).unwrap(), t.count.get(0).unwrap()),
+        (5, 3),
+        "open kept first 5 beside count 1"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn header_txs_flush_dirsyncs_the_pair_once() {
     let dir = tmp();
     let t = rbitcoin_store::HeaderTxsTable::create(&dir).unwrap();

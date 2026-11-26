@@ -1477,6 +1477,10 @@ impl ArrayTable {
         Ok(())
     }
 
+    pub(crate) fn has_unstored(&self) -> bool {
+        self.unstored_from.load(Ordering::Acquire) != CLEAN
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         self.flush_dirty()?;
         self.file.flush()

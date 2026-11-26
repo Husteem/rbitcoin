@@ -553,6 +553,9 @@ pub struct HeaderTxsTable {
 static FAIL_AHEAD: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 #[cfg(debug_assertions)]
+static FAIL_AFTER_FIRST: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+#[cfg(debug_assertions)]
 static FAIL_AFTER_PAYLOAD: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
@@ -562,6 +565,16 @@ static FAIL_AFTER_PAYLOAD: std::sync::Mutex<std::collections::BTreeSet<std::path
 #[doc(hidden)]
 pub fn fail_next_header_txs_flush_after_ahead(path: &Path) {
     FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+/// Fail after `first` is durable and before `count` is written.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_header_txs_flush_after_first(path: &Path) {
+    FAIL_AFTER_FIRST
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(path.to_path_buf());
@@ -580,6 +593,14 @@ pub fn fail_next_header_txs_flush_after_payload(path: &Path) {
 #[cfg(debug_assertions)]
 fn take_fail_ahead(path: &Path) -> bool {
     FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_after_first(path: &Path) -> bool {
+    FAIL_AFTER_FIRST
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(path)
@@ -606,9 +627,9 @@ impl HeaderTxsTable {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let first_path = dir.join("header_txs_first.body");
         let count_path = dir.join("header_txs_count.body");
-        // The pair is one commit. Restore only when both sidecars carry the
-        // same nonzero stamp. A lone file, an unstamped file, or two stamps
-        // is a crash between the two renames, and the payload pair is whole.
+        // Restore only when both sidecars carry the same nonzero stamp.
+        // A retry with one dirty column writes that stamp again, so a crash
+        // still has one pair. A lone file, stamp 0, or two stamps is not one pair.
         let first_side = ArrayTable::ahead_path(&first_path);
         let count_side = ArrayTable::ahead_path(&count_path);
         let first_gen = Self::sidecar_gen(&first_path)?;
@@ -836,9 +857,28 @@ impl HeaderTxsTable {
         Ok(if next == 0 { 1 } else { next })
     }
 
+    /// Stamp for this flush. One dirty column keeps the partner sidecar's
+    /// stamp. Two dirty columns take a new stamp and both files are rewritten.
+    fn pair_gen_for_flush(&self) -> Result<u16, StoreError> {
+        let first_dirty = self.first.has_unstored();
+        let count_dirty = self.count.has_unstored();
+        if first_dirty != count_dirty {
+            let partner = if count_dirty {
+                self.first.file.path()
+            } else {
+                self.count.file.path()
+            };
+            let stamp = Self::sidecar_gen(partner)?;
+            if stamp != 0 {
+                return Ok(stamp);
+            }
+        }
+        self.next_pair_gen()
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        let pair_gen = self.next_pair_gen()?;
+        let pair_gen = self.pair_gen_for_flush()?;
         let first_ahead = self.first.write_ahead(pair_gen)?;
         let count_ahead = self.count.write_ahead(pair_gen)?;
         if first_ahead.is_some() || count_ahead.is_some() {
@@ -855,7 +895,15 @@ impl HeaderTxsTable {
                 std::io::Error::other("injected header_txs ahead failure"),
             ));
         }
-        self.first.flush().and_then(|()| self.count.flush())?;
+        self.first.flush()?;
+        #[cfg(debug_assertions)]
+        if take_fail_after_first(self.first.file.path()) {
+            return Err(StoreError::io(
+                self.first.file.path(),
+                std::io::Error::other("injected header_txs first-column failure"),
+            ));
+        }
+        self.count.flush()?;
         #[cfg(debug_assertions)]
         if take_fail_after_payload(self.first.file.path()) {
             return Err(StoreError::io(
@@ -863,7 +911,10 @@ impl HeaderTxsTable {
                 std::io::Error::other("injected header_txs payload failure"),
             ));
         }
-        ArrayTable::remove_ahead(first_ahead.into_iter().chain(count_ahead))?;
+        ArrayTable::remove_ahead([
+            ArrayTable::ahead_path(self.first.file.path()),
+            ArrayTable::ahead_path(self.count.file.path()),
+        ])?;
         Ok(())
     }
 }
