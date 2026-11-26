@@ -2851,8 +2851,8 @@ pub async fn peer_session_with(
                     }
                     // A ping or pong already in `decode_q` is applied with those
                     // frames. A later pong must not move the clock ahead of an
-                    // earlier block. `on_ping` holds its pong while a getdata
-                    // or getblocktxn tail is still unsent.
+                    // earlier block. `on_ping` holds its pong while a getdata,
+                    // getblocktxn or cfilter tail is still unsent.
                     if (frame.is_ping() || frame.is_pong()) && !decode_q.is_empty() {
                         let n = frame.payload_len();
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3130,8 +3130,10 @@ pub async fn peer_session_with(
                             return Err(e);
                         }
                     }
-                    if !follow.cfilter_tail.is_empty() {
-                        if let Err(e) = serve_cfilter_tail(&out_tx, follow, session.as_deref()) {
+                    if !follow.cfilter_tail.is_empty() || !follow.cfilter_requests.is_empty() {
+                        if let Err(e) =
+                            resume_cfilters(hub.as_ref(), &out_tx, follow, session.as_deref()).await
+                        {
                             let _ = apply_queued_decodes(
                                 &mut decode_q,
                                 hub.as_ref(),
@@ -3770,10 +3772,14 @@ pub struct PeerFollowState {
     /// non-empty, so a peer that never reads cannot stack reconstructs.
     pub getblocktxn_tail: VecDeque<BlockTransactionsRequest>,
     /// Unsent replies of one compact-filter request paused on the writer
-    /// (#2078). The session reads no frame while it is non-empty, so it
-    /// holds one request's replies: up to 1,000 filters, already read in
-    /// full before the first is queued.
+    /// (#2078): up to 1,000 filters, already read in full before the first
+    /// is queued. Only one request's replies are held at a time.
     pub cfilter_tail: VecDeque<NetworkMessage>,
+    /// Compact-filter requests applied while a range was parked, waiting
+    /// for it (a frame decoded before the pause). Their replies are read
+    /// only once the tail is empty, so they cost their request bytes, and
+    /// the decode queue's frame cap bounds them.
+    pub cfilter_requests: VecDeque<NetworkMessage>,
     /// Ping nonce held until every serve tail is empty. Queuing the pong
     /// earlier lets it leave before the rest of that reply. A later ping
     /// replaces this nonce.
@@ -3812,6 +3818,7 @@ impl PeerFollowState {
             getdata_tail: VecDeque::new(),
             getblocktxn_tail: VecDeque::new(),
             cfilter_tail: VecDeque::new(),
+            cfilter_requests: VecDeque::new(),
             parked_pong: None,
             continuation_block: None,
         }
@@ -4198,15 +4205,37 @@ pub async fn on_compact_filters(
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
-    // The reply that crossed the budget is already queued.
-    if session.is_some_and(|s| s.send_over_budget()) {
-        return Ok(());
+    // Queued behind any parked range, so a request that arrives over the
+    // budget is answered once the writer drains, not dropped. Up to 1,000
+    // filters or 2,000 filter headers are read on the blocking pool under a
+    // header permit, not on the session's worker.
+    follow.cfilter_requests.push_back(payload);
+    resume_cfilters(hub, out_tx, follow, session).await
+}
+
+/// Send the parked compact-filter range, then read and send each queued
+/// request in order, until a reply crosses the send budget. A request's
+/// replies are read only once the range before it is sent, so one range at
+/// most is held.
+#[doc(hidden)]
+pub async fn resume_cfilters(
+    hub: &ChainHub,
+    out_tx: &PeerOutTx,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
+    loop {
+        serve_cfilter_tail(out_tx, follow, session)?;
+        if !follow.cfilter_tail.is_empty() {
+            return Ok(());
+        }
+        let Some(payload) = follow.cfilter_requests.pop_front() else {
+            return Ok(());
+        };
+        let replies =
+            run_header_job(hub, move |hub| compact_filter_replies(hub, &payload)).await??;
+        follow.cfilter_tail.extend(replies);
     }
-    // Up to 1,000 filters or 2,000 filter headers are read on the blocking
-    // pool under a header permit, not on the session's worker.
-    let replies = run_header_job(hub, move |hub| compact_filter_replies(hub, &payload)).await??;
-    follow.cfilter_tail.extend(replies);
-    serve_cfilter_tail(out_tx, follow, session)
 }
 
 /// Queue compact-filter replies in order until a reply pushes the writer
@@ -4468,6 +4497,7 @@ fn serve_tail_pending(follow: &PeerFollowState) -> bool {
     !follow.getdata_tail.is_empty()
         || !follow.getblocktxn_tail.is_empty()
         || !follow.cfilter_tail.is_empty()
+        || !follow.cfilter_requests.is_empty()
 }
 
 /// Queue a pong parked by [`on_ping`] once both serve tails are empty.

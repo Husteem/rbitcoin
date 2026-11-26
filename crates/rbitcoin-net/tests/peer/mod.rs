@@ -11215,6 +11215,55 @@ fn getcfilters_parks_the_rest_past_the_send_budget() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A compact-filter request that the session applies while an earlier
+/// range is still parked (a frame decoded before the pause) does not stack
+/// its replies on the tail: at most one range is ever held (#2078).
+#[test]
+fn a_second_getcfilters_does_not_stack_on_a_parked_range() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cf-stack");
+    let hub = std::sync::Arc::new(hub);
+    hub.query.set_block_filter_index(true).unwrap();
+    hub.ensure_genesis().unwrap();
+    hub.mine(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let range = hub.tip_height().unwrap() as usize + 1;
+    let peer = outbound_peer();
+    let (tx, _rx) = peer.open_out();
+    let req = || {
+        NetworkMessage::GetCFilters(bitcoin::p2p::message_filter::GetCFilters {
+            filter_type: 0,
+            start_height: 0,
+            stop_hash: hub.tip_hash().unwrap(),
+        })
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut follow = PeerFollowState::new();
+    for _ in 0..3 {
+        // The writer sits on the cap, so each request's first reply crosses.
+        let gap = rbitcoin_net::peers::PEER_SEND_BUDGET - peer.send_queued();
+        let at_cap = hold_send_bytes(&peer, gap);
+        assert!(!peer.send_over_budget());
+        rt.block_on(on_compact_filters(
+            req(),
+            &hub,
+            &tx,
+            &mut follow,
+            Some(peer.as_ref()),
+        ))
+        .unwrap();
+        assert!(
+            follow.cfilter_tail.len() <= range,
+            "parked replies stay within one range: {}",
+            follow.cfilter_tail.len()
+        );
+        drop(at_cap);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A `getcfilters` whose replies cross the 4 MiB send budget is not cut
 /// short: the rest of the range is parked and sent once the writer drains,
 /// in order, as a paused `getdata` tail is (#2078).
@@ -11276,19 +11325,25 @@ async fn getcfilters_past_the_send_budget_sends_the_whole_range() {
     };
     write_peer_msg(&mut raw, NetworkMessage::GetCFilters(req)).await;
     wait_session_read(&node, &sess, "getcfilters").await;
+    // A ping sent while the range is parked is answered after it.
+    write_peer_msg(&mut raw, NetworkMessage::Ping(7)).await;
     drop(held);
     let heights = tokio::time::timeout(Duration::from_secs(10), async {
         let mut got = Vec::new();
-        while got.len() < tip_h as usize + 1 {
-            if let NetworkMessage::CFilter(f) = next_peer_msg(&mut raw).await.unwrap() {
-                got.push(f.block_hash);
+        loop {
+            match next_peer_msg(&mut raw).await.unwrap() {
+                NetworkMessage::CFilter(f) => got.push(f.block_hash),
+                NetworkMessage::Pong(7) => return got,
+                _ => {}
             }
         }
-        got
     })
     .await
-    .expect("every filter in the range arrives once the writer drains");
-    assert_eq!(heights, want, "in height order");
+    .expect("the range and then the pong arrive once the writer drains");
+    assert_eq!(
+        heights, want,
+        "every filter, in height order, before the pong"
+    );
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
