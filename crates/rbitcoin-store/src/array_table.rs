@@ -1134,6 +1134,9 @@ impl ArrayTable {
             return Err(StoreError::Corrupt("array ahead version"));
         }
         let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+        if count > (raw.len().saturating_sub(AHEAD_HEAD)) / AHEAD_REC {
+            return Err(StoreError::Corrupt("array ahead count"));
+        }
         let header = &raw[12..28];
         let logical = u64::from_le_bytes([
             header[8], header[9], header[10], header[11], header[12], header[13], header[14],
