@@ -692,45 +692,73 @@ pub async fn post_outspends_by_outpoint(State(st): State<AppState>, body: Bytes)
         let Some(arr) = v.as_array() else {
             return bad_request("body must be a JSON array of txid:vout");
         };
-        outspends_by_outpoint(&st, arr, || {})
+        let mp = st.mempool.as_deref();
+        let settle0 = pool_settle(mp);
+        let view = match pin_or_reject(&st.query, ChainViewKind::Tip, None) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        #[cfg(debug_assertions)]
+        outspends_pinned(&st.query);
+        let mut out = Vec::with_capacity(arr.len());
+        for x in arr {
+            let Some(s) = x.as_str() else {
+                out.push(json!({"spent": false}));
+                continue;
+            };
+            let Some((tid_s, vout_s)) = s.rsplit_once(':') else {
+                out.push(json!({"spent": false}));
+                continue;
+            };
+            let Ok(txid) = parse_hash32(tid_s) else {
+                out.push(json!({"spent": false}));
+                continue;
+            };
+            let Ok(vout) = vout_s.parse::<u32>() else {
+                out.push(json!({"spent": false}));
+                continue;
+            };
+            match outspend_json(&st.query, mp, &txid, vout, view.as_ref(), settle0) {
+                Ok(v) => out.push(v),
+                Err(e) => return store_err(e),
+            }
+        }
+        json_reply_here(out)
     })
     .await
 }
 
-/// One outspend slot per `txid:vout` entry, on one view. `after_pin` runs
-/// once the view is pinned, before any slot is read.
-#[cfg(unix)]
+#[cfg(all(unix, debug_assertions))]
+type PinHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(all(unix, debug_assertions))]
+static OUTSPENDS_PIN_HOOKS: std::sync::Mutex<Vec<(usize, PinHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run `hook` once, after the next by-outpoint outspends request on this
+/// store has pinned its view and before it reads a slot. Debug builds only.
+#[cfg(all(unix, debug_assertions))]
 #[doc(hidden)]
-pub fn outspends_by_outpoint(st: &AppState, arr: &[Value], after_pin: impl FnOnce()) -> Response {
-    let mp = st.mempool.as_deref();
-    let settle0 = pool_settle(mp);
-    let view = match pin_or_reject(&st.query, ChainViewKind::Tip, None) {
-        Ok(v) => v,
-        Err(r) => return r,
+pub fn set_outspends_pin_hook_for_test(query: &rbitcoin_query::Query, hook: PinHook) {
+    OUTSPENDS_PIN_HOOKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((std::ptr::from_ref(query) as usize, hook));
+}
+
+#[cfg(all(unix, debug_assertions))]
+fn outspends_pinned(query: &rbitcoin_query::Query) {
+    let key = std::ptr::from_ref(query) as usize;
+    let hook = {
+        let mut hooks = OUTSPENDS_PIN_HOOKS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        hooks
+            .iter()
+            .position(|(k, _)| *k == key)
+            .map(|i| hooks.swap_remove(i).1)
     };
-    after_pin();
-    let mut out = Vec::with_capacity(arr.len());
-    for x in arr {
-        let Some(s) = x.as_str() else {
-            out.push(json!({"spent": false}));
-            continue;
-        };
-        let Some((tid_s, vout_s)) = s.rsplit_once(':') else {
-            out.push(json!({"spent": false}));
-            continue;
-        };
-        let Ok(txid) = parse_hash32(tid_s) else {
-            out.push(json!({"spent": false}));
-            continue;
-        };
-        let Ok(vout) = vout_s.parse::<u32>() else {
-            out.push(json!({"spent": false}));
-            continue;
-        };
-        match outspend_json(&st.query, mp, &txid, vout, view.as_ref(), settle0) {
-            Ok(v) => out.push(v),
-            Err(e) => return store_err(e),
-        }
+    if let Some(hook) = hook {
+        hook();
     }
-    json_reply_here(out)
 }

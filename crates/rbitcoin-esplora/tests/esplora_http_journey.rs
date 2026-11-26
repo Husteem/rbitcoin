@@ -1612,28 +1612,34 @@ async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
 /// A block connected after the view was pinned spends the coin above the
 /// view, and its spend has already left the pool. An outspend read on that
 /// view once the pool has settled again is a 503, not unspent.
-#[cfg(unix)]
+#[cfg(all(unix, debug_assertions))]
 #[tokio::test(flavor = "current_thread")]
 async fn outspend_after_a_connect_past_the_pinned_view_is_not_unspent() {
     use bitcoin::hashes::Hash;
     use rbitcoin_esplora::handlers::write_outspends;
-    let (dir, mut pad, handle) = reorg_pad("outspend-after-pin").await;
-    let st = app_state(&pad);
+    let (dir, pad, handle) = reorg_pad("outspend-after-pin").await;
     let tx = spend_tx(&pad, 0);
     let cb = pad.cbs[0];
     let settle0 = pad.hub.pool_settle_gen();
     let view = pad.q.pin_chain_view().unwrap().expect("tip");
-    let hub = Arc::clone(&pad.hub);
-    let outpoint = json!([format!("{}:0", display_txid(bitcoin::Txid::from_byte_array(cb)))]);
-    let resp = rbitcoin_esplora::internal::outspends_by_outpoint(
-        &st,
-        outpoint.as_array().unwrap(),
-        || {
+    let h = u32::try_from(pad.hashes.len()).unwrap();
+    let (header, coinbase_tx) = coinbase(h, pad.tip_fk, pad.hashes.last().copied());
+    let txs = vec![coinbase_tx, stored_spend(&tx, cb)];
+    let (q, hub) = (Arc::clone(&pad.q), Arc::clone(&pad.hub));
+    rbitcoin_esplora::internal::set_outspends_pin_hook_for_test(
+        &pad.q,
+        Box::new(move || {
             let hold = hub.template_hold();
-            pad.connect(vec![stored_spend(&tx, cb)]);
+            q.connect_block(Height(h), &header, &txs).unwrap();
             drop(hold);
-        },
+        }),
     );
+    let outpoint = format!("{}:0", display_txid(bitcoin::Txid::from_byte_array(cb)));
+    let resp = rbitcoin_esplora::internal::post_outspends_by_outpoint(
+        State(app_state(&pad)),
+        Bytes::from(json!([outpoint]).to_string()),
+    )
+    .await;
     assert_eq!(resp.status(), 503);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
