@@ -156,6 +156,13 @@ impl ConfirmedTable {
             ));
         }
         self.arr.flush()?;
+        #[cfg(debug_assertions)]
+        if take_fail_after_payload(self.arr.file.path()) {
+            return Err(StoreError::io(
+                self.arr.file.path(),
+                std::io::Error::other("injected confirmed payload failure"),
+            ));
+        }
         ArrayTable::remove_ahead(ahead)
     }
 }

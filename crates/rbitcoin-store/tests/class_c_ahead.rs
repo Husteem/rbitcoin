@@ -389,6 +389,35 @@ fn torn_page_zero_after_a_shrink_to_empty_restores() {
     assert!(!dir.path.join("confirmed.body.ahead").exists());
 }
 
+/// A crash after the payload landed and before the sidecar was removed:
+/// open replays the same pages and removes the sidecar.
+#[test]
+fn confirmed_ahead_left_after_the_payload_replays_the_same_state() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("confirmed-after").unwrap();
+    let path = dir.path.join("confirmed.body");
+    {
+        let t = ConfirmedTable::create(&dir.path).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        for h in 0..520u32 {
+            t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+        }
+        rbitcoin_store::chain::fail_next_array_flush_after_payload(&path);
+        assert!(
+            t.flush().is_err(),
+            "the failpoint must stop before the sidecar is removed"
+        );
+        assert!(dir.path.join("confirmed.body.ahead").is_file());
+    }
+
+    let t = ConfirmedTable::open(&dir.path).unwrap();
+    assert_eq!(t.tip_height(), Some(Height(519)));
+    assert_eq!(t.get(Height(0)).unwrap(), Some(Fk(1)));
+    assert_eq!(t.get(Height(519)).unwrap(), Some(Fk(520)));
+    assert!(!dir.path.join("confirmed.body.ahead").exists());
+}
+
 #[test]
 fn one_header_txs_failpoint_does_not_clear_another_path() {
     let a = rbitcoin_store::testutil::TempDir::labeled("ahead-a").unwrap();
