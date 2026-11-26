@@ -73,6 +73,41 @@ fn zero_header_and_block(path: &Path) {
 }
 
 #[test]
+fn open_drops_header_txs_sidecars_from_different_flushes() {
+    let dir = tmp();
+    let count_side = dir.join("header_txs_count.body.ahead");
+    let first_side = dir.join("header_txs_first.body.ahead");
+    let saved_count = {
+        let t = rbitcoin_store::HeaderTxsTable::create(&dir).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+        t.flush().unwrap();
+        t.put_range(&write, Fk(1), Fk(5), 3).unwrap();
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(
+            &dir.join("header_txs_first.body"),
+        );
+        assert!(t.flush().is_err());
+        let saved = std::fs::read(&count_side).unwrap();
+        t.put_range(&write, Fk(1), Fk(8), 4).unwrap();
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(
+            &dir.join("header_txs_first.body"),
+        );
+        assert!(t.flush().is_err());
+        saved
+    };
+    std::fs::write(&count_side, &saved_count).unwrap();
+    let t = rbitcoin_store::HeaderTxsTable::open(&dir).unwrap();
+    assert_eq!(
+        (t.first.get(0).unwrap(), t.count.get(0).unwrap()),
+        (1, 1),
+        "open restored first from one flush and count from another"
+    );
+    assert!(!first_side.exists());
+    assert!(!count_side.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn header_txs_flush_dirsyncs_the_pair_once() {
     let dir = tmp();
     let t = rbitcoin_store::HeaderTxsTable::create(&dir).unwrap();

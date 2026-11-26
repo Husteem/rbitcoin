@@ -1,8 +1,9 @@
 Fixed
 - **Class C and derived writes survive a torn in-place page.** A
   `header_txs` append rewrote the block holding the previous tip's committed
-  range. The two sidecars share one directory sync, and the two unlinks
-  share one. `header.head` rewrote a 3 KiB chunk beside committed slots, and
+  range. The two sidecars share one directory sync and one pair stamp,
+  and the two unlinks share one directory sync. Open restores the pair
+  only when both stamps match. `header.head` rewrote a 3 KiB chunk beside committed slots, and
   `txstat.body` stamped cells in place. A power cut could tear those pages, and
   open accepted a missing `header_txs` range as `Ok` or served a
   well-formed wrong stats or filter value. Those writes now put a synced

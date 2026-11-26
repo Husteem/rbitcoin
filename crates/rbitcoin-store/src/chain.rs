@@ -606,19 +606,18 @@ impl HeaderTxsTable {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let first_path = dir.join("header_txs_first.body");
         let count_path = dir.join("header_txs_count.body");
-        // The pair is one commit. Only restore when both sidecars exist; a
-        // lone one is a crash between the two sidecar writes, before either
-        // payload, and the old pair is still whole.
+        // The pair is one commit. Restore only when both sidecars carry the
+        // same nonzero stamp. A lone file, an unstamped file, or two stamps
+        // is a crash between the two renames, and the payload pair is whole.
         let first_side = ArrayTable::ahead_path(&first_path);
         let count_side = ArrayTable::ahead_path(&count_path);
-        if first_side.is_file() && count_side.is_file() {
+        let first_gen = Self::sidecar_gen(&first_path)?;
+        let count_gen = Self::sidecar_gen(&count_path)?;
+        if first_gen != 0 && first_gen == count_gen {
             ArrayTable::restore_ahead_keep(&first_path)?;
             ArrayTable::restore_ahead_keep(&count_path)?;
-            ArrayTable::remove_ahead([first_side, count_side])?;
-        } else {
-            let _ = std::fs::remove_file(&first_side);
-            let _ = std::fs::remove_file(&count_side);
         }
+        ArrayTable::remove_ahead([first_side, count_side])?;
         Ok(Self {
             first: ArrayTable::open(first_path, TableKind::ArrayLink)?,
             count: ArrayTable::open(count_path, TableKind::ArrayLink)?,
@@ -819,10 +818,29 @@ impl HeaderTxsTable {
         })
     }
 
+    fn sidecar_gen(path: &Path) -> Result<u16, StoreError> {
+        let side = ArrayTable::ahead_path(path);
+        match std::fs::read(&side) {
+            Ok(raw) => ArrayTable::ahead_pair_gen(&raw),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(StoreError::io(&side, e)),
+        }
+    }
+
+    /// Next stamp for a `(first, count)` sidecar pair. `0` is reserved for
+    /// an image this writer did not stamp.
+    fn next_pair_gen(&self) -> Result<u16, StoreError> {
+        let prev = Self::sidecar_gen(self.first.file.path())?
+            .max(Self::sidecar_gen(self.count.file.path())?);
+        let next = prev.wrapping_add(1);
+        Ok(if next == 0 { 1 } else { next })
+    }
+
     pub fn flush(&self) -> Result<(), StoreError> {
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        let first_ahead = self.first.write_ahead()?;
-        let count_ahead = self.count.write_ahead()?;
+        let pair_gen = self.next_pair_gen()?;
+        let first_ahead = self.first.write_ahead(pair_gen)?;
+        let count_ahead = self.count.write_ahead(pair_gen)?;
         if first_ahead.is_some() || count_ahead.is_some() {
             if let Some(parent) = self.first.file.path().parent() {
                 if !parent.as_os_str().is_empty() {

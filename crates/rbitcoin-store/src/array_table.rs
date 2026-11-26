@@ -1131,6 +1131,17 @@ impl ArrayTable {
         Self::restore_ahead_inner(path, remove)
     }
 
+    /// Pair stamp in the reserved header slot. `0` is an unstamped image.
+    pub(crate) fn ahead_pair_gen(raw: &[u8]) -> Result<u16, StoreError> {
+        if raw.len() < 8 || raw[0..4] != *AHEAD_MAGIC {
+            return Err(StoreError::Corrupt("array ahead header"));
+        }
+        if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
+            return Err(StoreError::Corrupt("array ahead version"));
+        }
+        Ok(u16::from_le_bytes([raw[6], raw[7]]))
+    }
+
     fn parse_ahead(raw: &[u8]) -> Result<AheadImage, StoreError> {
         if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
             return Err(StoreError::Corrupt("array ahead header"));
@@ -1243,11 +1254,11 @@ impl ArrayTable {
         Some((off, bytes))
     }
 
-    fn encode_ahead(header: &[u8], records: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    fn encode_ahead(header: &[u8], records: &[(u64, Vec<u8>)], pair_gen: u16) -> Vec<u8> {
         let mut buf = Vec::with_capacity(AHEAD_HEAD + 4096 + records.len() * AHEAD_REC);
         buf.extend_from_slice(AHEAD_MAGIC);
         buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
+        buf.extend_from_slice(&pair_gen.to_le_bytes());
         buf.extend_from_slice(&(records.len() as u32).to_le_bytes());
         buf.extend_from_slice(header);
         for (off, image) in records {
@@ -1306,7 +1317,7 @@ impl ArrayTable {
 
     /// Write the dirty range's intended post-write header and bytes to a
     /// synced `*.ahead` sidecar. Only the in-RAM Class C range tables use it.
-    pub(crate) fn write_ahead(&self) -> Result<Option<PathBuf>, StoreError> {
+    pub(crate) fn write_ahead(&self, pair_gen: u16) -> Result<Option<PathBuf>, StoreError> {
         if !self.in_ram || self.byte_body {
             return Ok(None);
         }
@@ -1371,7 +1382,7 @@ impl ArrayTable {
         }
         merged.extend(records);
         merged.sort_unstable_by_key(|(off, _)| *off);
-        let buf = Self::encode_ahead(&header, &merged);
+        let buf = Self::encode_ahead(&header, &merged, pair_gen);
         let side = Self::ahead_path(self.file.path());
         // File sync only. The caller directory-syncs once for the whole pair.
         file::write_file_synced_tmp_rename(&side, &buf)?;
