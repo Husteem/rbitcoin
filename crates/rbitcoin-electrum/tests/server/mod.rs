@@ -3141,6 +3141,25 @@ async fn broadcast_hex_cap_enforced() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `blockchain.tweaks.subscribe` stream waits for its next wave as long
+/// as the read idle window, not the shorter write stall bound.
+#[tokio::test]
+async fn tweaks_wave_wait_uses_the_read_idle_window() {
+    let (_client, server) = tokio::io::duplex(1024);
+    let (server_r, server_w) = tokio::io::split(server);
+    let mut reader = LineReader::new(server_r, DEFAULT_MAX_LINE_BYTES);
+    let mut writer = rbitcoin_electrum::server::ConnWrite::new(server_w, Duration::from_millis(20))
+        .with_read_idle(Duration::from_secs(10));
+    let mut wave = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Err("slow wave".to_string())
+    });
+    let got = tweaks_wait_wave_or_ping(&mut reader, &mut writer, &mut wave)
+        .await
+        .expect("the wave is waited for, not timed out");
+    assert!(matches!(got, TweaksWait::Wave(Err(_))));
+}
+
 #[test]
 fn serve_limits_public_proxy_defaults() {
     let lim = ServeLimits::for_public_proxy();

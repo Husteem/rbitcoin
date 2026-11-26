@@ -3230,6 +3230,7 @@ async fn node_listen_and_exit() {
     cfg.milestone_height = 100;
     cfg.shindex = true;
     cfg.listen.electrum = Some(electrum_addr);
+    cfg.electrum_idle_timeout = Duration::from_secs(2);
     cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
     cfg.rpc.listen = Some(rpc_addr);
     cfg.listen.health = Some(health_addr);
@@ -3255,6 +3256,20 @@ async fn node_listen_and_exit() {
     assert_eq!(count["result"], 0, "{count}");
     let mined = jsonrpc(rpc_addr, "generate", json!([1])).await;
     assert!(mined["result"].is_array(), "{mined}");
+    // --electrum-idle-timeout reaches the listener: the subscribed
+    // connection sends nothing more and is closed; the header push for the
+    // new block does not keep it open.
+    let closed = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut buf = [0u8; 4096];
+        loop {
+            match el.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "the quiet Electrum connection stayed open");
     let ready_deadline = Instant::now() + Duration::from_secs(20);
     let ready = loop {
         let got = http_get(health_addr, "/readyz").await;

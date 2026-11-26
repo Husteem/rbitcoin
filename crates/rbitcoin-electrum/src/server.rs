@@ -155,7 +155,8 @@ pub const DEFAULT_MAX_SP_SCANS: usize = 32;
 /// hands on, so a few connections cannot hold every slot of
 /// [`DEFAULT_MAX_SP_SCANS`].
 pub const MAX_SP_SCANS_PER_CONN: usize = crate::silent_scan::SP_SCAN_PERMITS;
-/// Idle read timeout — disconnect quiet clients (DoS of FD/tasks).
+/// Idle read timeout — disconnect quiet clients (DoS of FD/tasks). Also
+/// Electrum's write stall bound ([`ElectrumConfig::write_stall`]).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Electrum's read idle window: a connection that sends no request for this
 /// long is closed. Wallets that subscribe and wait, or ping every few
@@ -624,7 +625,8 @@ where
     let mut last_sent_status: HashMap<[u8; 32], String> = HashMap::new();
     let notify = Arc::new(Notify::new());
     let mut mempool_rx = mempool.as_ref().map(|m| m.subscribe_announces());
-    let mut writer = ConnWrite::new(writer, config.write_stall);
+    let mut writer =
+        ConnWrite::new(writer, config.write_stall).with_read_idle(config.idle_timeout());
     let mut sh_seen = query.sh_indexed_through_height();
     // A status read overlapped a held pool, so the tick reads every sub again.
     let mut sh_rescan = false;
@@ -638,8 +640,8 @@ where
 
     loop {
         start_waiting_sp_scans(&mut conn, &query, &params, config.sp_scan_chunk);
-        let read_by = *read_deadline
-            .get_or_insert_with(|| tokio::time::Instant::now() + config.idle_timeout());
+        let read_by =
+            *read_deadline.get_or_insert_with(|| tokio::time::Instant::now() + writer.read_idle());
         let stop_wait = stop.notified();
         if stop.load() {
             break;
@@ -2826,7 +2828,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let idle = writer.idle();
+    let idle = writer.read_idle();
     tokio::select! {
         biased;
         line = tokio::time::timeout(idle, reader.read_line()) => {
@@ -2860,20 +2862,31 @@ where
     }
 }
 
-/// One connection's writes. Each write takes a fresh `idle` timeout.
+/// One connection's writes. Each write takes a fresh `idle` timeout (the
+/// write stall bound). `read_idle` is how long the session waits for the
+/// client's next request; it is `idle` until [`Self::with_read_idle`].
 #[doc(hidden)]
 pub struct ConnWrite<W> {
     inner: W,
     idle: Duration,
+    read_idle: Duration,
 }
 
 impl<W> ConnWrite<W> {
     pub fn new(inner: W, idle: Duration) -> Self {
-        Self { inner, idle }
+        Self {
+            inner,
+            idle,
+            read_idle: idle,
+        }
     }
 
-    pub fn idle(&self) -> Duration {
-        self.idle
+    pub fn with_read_idle(self, read_idle: Duration) -> Self {
+        Self { read_idle, ..self }
+    }
+
+    pub fn read_idle(&self) -> Duration {
+        self.read_idle
     }
 }
 
