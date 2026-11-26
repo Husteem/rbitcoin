@@ -724,8 +724,27 @@ pub fn plan_header_reply(
         return HeaderPlan::Done;
     }
     // Before the batch is judged: a fork or alternate that starts at an
-    // abandoned header is refused while it stays abandoned.
-    let _ = reopen_announced(st, peer, &headers);
+    // abandoned header is refused while it stays abandoned. A batch that is
+    // then not stored would leave it off the path with a reopen spent, so
+    // it is abandoned again.
+    let reopened = reopen_announced(st, peer, &headers);
+    let plan = plan_linked(st, hub, peer, ask, headers, linked, inflight);
+    if !matches!(plan, HeaderPlan::Store { .. }) {
+        close_reopened(st, reopened);
+    }
+    plan
+}
+
+/// [`plan_header_reply`] for a batch past its proof and validity checks.
+fn plan_linked(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    peer: usize,
+    ask: super::header_walk::HeaderAsk,
+    headers: Vec<bitcoin::block::Header>,
+    linked: bool,
+    inflight: super::header_walk::InFlight,
+) -> HeaderPlan {
     let class = super::header_walk::classify_linked(st, hub, ask, &headers, linked);
     let mut headers = headers;
     let keep = match class {
@@ -1069,7 +1088,7 @@ fn answer_probe(
         }
         // An abandoned header this peer may serve reopens here too. The walk
         // then asks the peer again, and the batch path re-plants it.
-        let reopened = reopen_announced(st, peer, headers);
+        let reopened = !reopen_announced(st, peer, headers).is_empty();
         // A header this node has not seen: the peer's chain leaves this one
         // or runs past the path. The walk asks it, as after a block inv.
         let last = headers[headers.len() - 1].block_hash();
@@ -1862,22 +1881,37 @@ pub fn reopen_for_announcer(st: &mut IbdWorkState, peer: usize, hash: BlockHash)
     st.unservable.remove(&hash);
 }
 
-/// [`reopen_for_announcer`] for each header `peer` sent. True when one
-/// reopened.
+/// [`reopen_for_announcer`] for each header `peer` sent. Each reopened hash
+/// comes back with its record as it was, for [`close_reopened`].
 fn reopen_announced(
     st: &mut IbdWorkState,
     peer: usize,
     headers: &[bitcoin::block::Header],
-) -> bool {
-    let mut reopened = false;
+) -> Vec<(BlockHash, super::state::MutatedCopies)> {
+    let mut reopened = Vec::new();
     for hdr in headers {
         let hash = hdr.block_hash();
-        if st.unservable.contains(&hash) {
-            reopen_for_announcer(st, peer, hash);
-            reopened |= !st.unservable.contains(&hash);
+        if !st.unservable.contains(&hash) {
+            continue;
+        }
+        let before = st.mutated_copies.get(&hash).copied();
+        reopen_for_announcer(st, peer, hash);
+        if let (false, Some(before)) = (st.unservable.contains(&hash), before) {
+            reopened.push((hash, before));
         }
     }
     reopened
+}
+
+/// Abandon again the headers [`reopen_announced`] reopened, and give back
+/// the reopens it counted.
+fn close_reopened(st: &mut IbdWorkState, reopened: Vec<(BlockHash, super::state::MutatedCopies)>) {
+    for (hash, before) in reopened {
+        st.unservable.insert(hash);
+        if let Some(copies) = st.mutated_copies.get_mut(&hash) {
+            *copies = before;
+        }
+    }
 }
 
 /// Core `MaybePunishNodeForBlock` (`BLOCK_MUTATED`): drop the sender and

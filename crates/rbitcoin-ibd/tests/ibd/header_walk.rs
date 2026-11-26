@@ -9310,24 +9310,29 @@ fn a_walk_move_past_a_sibling_keeps_it_recorded() {
     assert!(!st.hash_height.contains_key(&sibling));
 }
 
-/// After A is abandoned for mutated copies another chain becomes the
-/// candidate. A fresh peer's heavier chain through A must still reopen A:
-/// the fork is judged with A servable, so A's body is asked of that peer
-/// (#1992).
-#[test]
-fn a_heavier_fork_through_an_abandoned_header_reopens_it() {
+/// Header A (height 1) abandoned for three mutated copies from kept peer 0,
+/// then a sibling B made the candidate by peer 1. Peer 2 sent no copy.
+fn abandoned_a_under_b(
+    label: &str,
+) -> (
+    rbitcoin_query::testutil::TempDir,
+    ChainHub,
+    IbdWorkState,
+    Header,
+    Vec<mpsc::UnboundedReceiver<PeerCmd>>,
+) {
     use rbitcoin_ibd::ibd::events::{
         finish_deferred_archived_clear, BadPrevParent, DeferredArchivedClear,
         MUTATED_COPIES_BEFORE_ABANDON,
     };
 
-    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reopen-fork");
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled(label);
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
-    let (mut s0, _rx0) = slot(0);
+    let (mut s0, rx0) = slot(0);
     s0.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
-    let (s1, _rx1) = slot(1);
-    let (s2, _rx2) = slot(2);
+    let (s1, rx1) = slot(1);
+    let (s2, rx2) = slot(2);
     let mut st = IbdWorkState::new(vec![s0, s1, s2], Some(gen), Some(0));
     ensure_origin(&mut st, &hub);
     assert!(send_getheaders(&mut st, &hub).unwrap());
@@ -9348,7 +9353,6 @@ fn a_heavier_fork_through_an_abandoned_header_reopens_it() {
         finish_deferred_archived_clear(&mut st, Some(&hub), &copy);
     }
     assert!(st.unservable.contains(&hash), "peer 0's copies abandon A");
-
     let b = mine(gen, 2);
     assert!(send_getheaders(&mut st, &hub).unwrap());
     apply(&mut st, &hub, 1, vec![b]);
@@ -9357,7 +9361,16 @@ fn a_heavier_fork_through_an_abandoned_header_reopens_it() {
         Some(b.block_hash()),
         "B is the candidate"
     );
+    (dir, hub, st, a, vec![rx0, rx1, rx2])
+}
 
+/// After A is abandoned another chain becomes the candidate. A fresh peer's
+/// heavier chain through A must still reopen A: the fork is judged with A
+/// servable, so A goes back on the path and is asked of that peer (#1992).
+#[test]
+fn a_heavier_fork_through_an_abandoned_header_reopens_it() {
+    let (dir, hub, mut st, a, _rx) = abandoned_a_under_b("reopen-fork");
+    let hash = a.block_hash();
     let a2 = mine(hash, 3);
     apply(&mut st, &hub, 2, vec![a, a2]);
     assert!(
@@ -9369,6 +9382,24 @@ fn a_heavier_fork_through_an_abandoned_header_reopens_it() {
         Some(a2.block_hash()),
         "the heavier chain through A is the candidate"
     );
+    assert!(st.ordered_set.contains(&hash), "A is queued again");
     assert!(may_serve(&st, 2, &hash), "A is asked of the announcer");
+    let _ = dir;
+}
+
+/// A batch through an abandoned header that is then refused (here A alone,
+/// no heavier than the candidate B) does not reopen it: the header would
+/// leave the abandoned set without going back on the path, and the refused
+/// batch would spend one of the bounded reopens (#1992).
+#[test]
+fn a_refused_batch_through_an_abandoned_header_does_not_reopen_it() {
+    let (dir, hub, mut st, a, _rx) = abandoned_a_under_b("reopen-refused");
+    let hash = a.block_hash();
+    apply(&mut st, &hub, 2, vec![a]);
+    assert!(!st.ordered_set.contains(&hash), "the batch is refused");
+    assert!(
+        st.unservable.contains(&hash),
+        "a refused batch leaves A abandoned"
+    );
     let _ = dir;
 }
