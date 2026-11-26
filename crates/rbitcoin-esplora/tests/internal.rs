@@ -1444,6 +1444,7 @@ async fn bulk_routes_answer_503_for_an_unlisted_row_while_a_reorg_holds_the_pool
     let ids = serde_json::to_vec(&json!([fan])).unwrap();
     pad.q.disconnect_tip().unwrap();
 
+    pad.hub.set_settle_wait_max(std::time::Duration::ZERO);
     let hold = pad.hub.template_hold();
     let (st, body) = http_post_unix(&sock, "/internal/txs", &ids).await;
     assert_eq!((st, body.as_str()), (503, "chain view moved"));

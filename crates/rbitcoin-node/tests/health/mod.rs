@@ -238,6 +238,23 @@ async fn running_stage_is_visible_on_every_route() {
     panic!("stage not visible:\n{last}");
 }
 
+/// How often and how long API reads wait for a block connect to settle is on
+/// `/metrics` (#2139).
+#[tokio::test(flavor = "multi_thread")]
+async fn settle_waits_are_on_metrics() {
+    rbitcoin_net::SETTLE_WAITS.waits.note(1_500);
+    let addr = serve(router(NodeStatus::new(Network::Regtest, false), true)).await;
+    let m = get_soon(addr, "/metrics").await;
+    for name in [
+        "rbitcoin_api_settle_waits_total",
+        "rbitcoin_api_settle_wait_seconds_total",
+        "rbitcoin_api_settle_gave_up_total",
+        "rbitcoin_api_settle_refused_total",
+    ] {
+        assert!(m.contains(&format!("\n{name} ")), "{name} missing:\n{m}");
+    }
+}
+
 /// `/metrics` is absent without `--metrics`.
 #[tokio::test]
 async fn metrics_route_needs_the_flag() {

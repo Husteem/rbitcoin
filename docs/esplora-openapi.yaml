@@ -392,7 +392,8 @@ paths:
         for a txid that is neither stored nor in the mempool, and for a stored tx
         reorged out and not back in the mempool, as electrs answers (the other
         `/tx/{txid}` routes are 404 for those txids). A reorged-out tx is **503**
-        `chain view moved` instead while a connect, disconnect or reorg holds the pool.
+        `chain view moved` instead while a connect, disconnect or reorg holds the pool
+        longer than the 5 s a request waits for it to end.
         With `?asof=`: confirmed only if the tx is in a block at or below the
         as-of block; a tx confirmed later reads `{"confirmed": false}`, and a txid
         that is not stored is **404**.

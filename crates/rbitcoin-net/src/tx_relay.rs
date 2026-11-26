@@ -1516,7 +1516,7 @@ pub struct MempoolHub {
     /// write this; only the outer hold sends it.
     template_commit: Mutex<Option<[u8; 32]>>,
     /// Odd while a [`TemplateHold`] is out, so the pool may not match the tip.
-    pool_settle: AtomicU64,
+    pool_settle: SettleGate,
     /// INV immediately instead of waiting on mocktime.
     pub immediate_relay: AtomicBool,
     /// Last `setmocktime` (0 = wall). Used to age mempool txs for delayed INV.
@@ -1635,7 +1635,7 @@ fn template_hold_leave() {
 pub struct TemplateHold<'a> {
     updates: &'a AtomicU64,
     watch: &'a tokio::sync::watch::Sender<u64>,
-    settle: &'a AtomicU64,
+    settle: &'a SettleGate,
     slot: Option<std::sync::MutexGuard<'a, Option<[u8; 32]>>>,
     commit: &'a std::sync::Mutex<Option<[u8; 32]>>,
     /// `template_updates` at enter, before `pool_settle` goes odd. A note
@@ -1668,7 +1668,7 @@ impl Drop for TemplateHold<'_> {
             if now != self.updates_at_enter {
                 self.watch.send_replace(now);
             }
-            self.settle.fetch_add(1, Ordering::SeqCst);
+            self.settle.leave();
             let after = self.updates.load(Ordering::SeqCst);
             if after != now {
                 self.watch.send_replace(after);
@@ -1730,10 +1730,120 @@ pub(crate) fn failed_in_scripts(e: &AcceptError) -> bool {
     }
 }
 
-/// The mempool's settle generation. Read it before the reads that decide a
-/// listing or a spend and hand it to [`require_settled`]. 0 without a mempool.
+/// How long an API read waits by default for a connect, disconnect or reorg
+/// to settle before it answers "chain view moved".
+pub const SETTLE_WAIT_MAX: Duration = Duration::from_secs(5);
+
+/// The settle generation and the wake for reads waiting on it. A
+/// [`TemplateHold`] makes it odd on enter and even on leave.
+#[derive(Debug)]
+pub struct SettleGate {
+    gen: AtomicU64,
+    /// Held to check the generation before a wait and to notify after a
+    /// leave, so a wake cannot fall between the two.
+    wake: Mutex<()>,
+    settled: std::sync::Condvar,
+    wait_max: Mutex<Duration>,
+}
+
+impl SettleGate {
+    fn new() -> Self {
+        Self {
+            gen: AtomicU64::new(0),
+            wake: Mutex::new(()),
+            settled: std::sync::Condvar::new(),
+            wait_max: Mutex::new(SETTLE_WAIT_MAX),
+        }
+    }
+
+    fn gen(&self) -> u64 {
+        self.gen.load(Ordering::SeqCst)
+    }
+
+    fn enter(&self) {
+        self.gen.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn leave(&self) {
+        self.gen.fetch_add(1, Ordering::SeqCst);
+        let _wake = self.wake.lock().unwrap_or_else(|e| e.into_inner());
+        self.settled.notify_all();
+    }
+
+    /// An even generation, waiting for a hold to end. Returns the odd one
+    /// after `wait_max`, which [`require_settled`] refuses. On a reactor
+    /// thread it does not wait.
+    fn wait_even(&self) -> u64 {
+        let gen = self.gen();
+        if gen.is_multiple_of(2)
+            || (crate::reactor::on_tokio_worker() && !crate::reactor::in_blocking_region())
+        {
+            return gen;
+        }
+        let t0 = Instant::now();
+        let max = *self.wait_max.lock().unwrap_or_else(|e| e.into_inner());
+        let mut wake = self.wake.lock().unwrap_or_else(|e| e.into_inner());
+        let gen = loop {
+            let gen = self.gen();
+            let left = max.saturating_sub(t0.elapsed());
+            if gen.is_multiple_of(2) || left.is_zero() {
+                break gen;
+            }
+            wake = self
+                .settled
+                .wait_timeout(wake, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        };
+        drop(wake);
+        let waited = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+        SETTLE_WAITS.waits.note(waited);
+        if gen % 2 == 1 {
+            SETTLE_WAITS.gave_up.add(1);
+            rbitcoin_log::warn_repeated(
+                rbitcoin_log::RepeatedInfo::SettleWaitGaveUp,
+                format_args!(
+                    "api: a read waited {max:?} for a block connect to settle and \
+                     answered \"chain view moved\""
+                ),
+            );
+        }
+        gen
+    }
+}
+
+/// API reads that met a held pool. `/metrics` reads the totals; the 5 s perf
+/// tick logs a window.
+#[derive(Debug, Default)]
+pub struct SettleWaitMeter {
+    /// Reads that found the pool held, and how long each waited.
+    pub waits: crate::perf_meter::RequestMeter,
+    /// Waits that reached the bound with the pool still held.
+    pub gave_up: crate::perf_meter::PerfCounter,
+    /// Reads [`require_settled`] refused: they waited past the bound, or a
+    /// tip move started during the read.
+    pub refused: crate::perf_meter::PerfCounter,
+}
+
+impl SettleWaitMeter {
+    pub const fn new() -> Self {
+        Self {
+            waits: crate::perf_meter::RequestMeter::new(),
+            gave_up: crate::perf_meter::PerfCounter::new(),
+            refused: crate::perf_meter::PerfCounter::new(),
+        }
+    }
+}
+
+pub static SETTLE_WAITS: SettleWaitMeter = SettleWaitMeter::new();
+
+/// The mempool's settle generation for an API read. Take it before the
+/// reads that decide a listing or a spend, and hand it to
+/// [`require_settled`]. While a connect, disconnect or reorg holds the pool
+/// this waits for it to end, up to [`SETTLE_WAIT_MAX`]. It blocks, so call it
+/// off the reactor, and before any pin or mempool lock. 0 without a mempool.
 pub fn pool_settle(mempool: Option<&MempoolHub>) -> u64 {
-    mempool.map_or(0, MempoolHub::pool_settle_gen)
+    mempool.map_or(0, |m| m.pool_settle.wait_even())
 }
 
 /// Refuse to call a tx gone, or a coin unspent, while the chain tip may be
@@ -1753,6 +1863,7 @@ pub fn require_settled(
 ) -> Result<(), rbitcoin_store::StoreError> {
     match mempool {
         Some(m) if settle0 % 2 == 1 || m.pool_settle_gen() != settle0 => {
+            SETTLE_WAITS.refused.add(1);
             Err(rbitcoin_store::StoreError::Stale("chain view moved"))
         }
         _ => Ok(()),
@@ -1915,7 +2026,7 @@ impl MempoolHub {
             #[cfg(debug_assertions)]
             template_prev_waiters: AtomicUsize::new(0),
             template_commit: Mutex::new(None),
-            pool_settle: AtomicU64::new(0),
+            pool_settle: SettleGate::new(),
             min_live_accept_at: AtomicU64::new(u64::MAX),
             tip_ctx: Mutex::new(None),
             parent_req: Mutex::new(parent_req::ParentTracker::new()),
@@ -6600,7 +6711,7 @@ impl MempoolHub {
         // A hold publishes once, on drop, for the tip it commits. Sending
         // here would wake a one-shot wait on the stump, or on an
         // intermediate block of a fork that is still connecting.
-        if self.pool_settle.load(Ordering::SeqCst) & 1 == 0 {
+        if self.pool_settle.gen() & 1 == 0 {
             self.template_watch.send_replace(next);
         }
     }
@@ -6638,7 +6749,7 @@ impl MempoolHub {
         }
         let slot = self.template_prev.lock().unwrap();
         let updates_at_enter = self.template_updates.load(Ordering::SeqCst);
-        self.pool_settle.fetch_add(1, Ordering::SeqCst);
+        self.pool_settle.enter();
         template_hold_enter();
         TemplateHold {
             updates: &self.template_updates,
@@ -6655,7 +6766,19 @@ impl MempoolHub {
     /// reader that sees one even value before and after its reads saw a
     /// pool that matches the tip.
     pub fn pool_settle_gen(&self) -> u64 {
-        self.pool_settle.load(Ordering::SeqCst)
+        self.pool_settle.gen()
+    }
+
+    /// The longest [`pool_settle`] waits for a hold to end on this hub.
+    /// Tests that keep a hold out across requests set it low.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn set_settle_wait_max(&self, max: Duration) {
+        *self
+            .pool_settle
+            .wait_max
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = max;
     }
 
     pub fn template_prev(&self) -> Option<[u8; 32]> {

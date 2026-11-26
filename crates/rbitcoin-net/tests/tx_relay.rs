@@ -3265,6 +3265,62 @@ fn dropped_hold_publishes_an_update_that_landed_without_a_commit() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// Every block connect holds the pool. An API read that starts in that window
+/// waits for the hold to end and then reads a settled pool. It no longer
+/// answers "chain view moved" about once per block (#2139). The wait is
+/// counted for `/metrics`.
+#[test]
+fn an_api_read_waits_out_a_connect_hold() {
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+    let waits = SETTLE_WAITS.waits.requests.total();
+    let waited_us = SETTLE_WAITS.waits.wall_us.total();
+    let hold = mp.template_hold();
+    let bg = Arc::clone(&mp);
+    let read = std::thread::spawn(move || {
+        let settle0 = pool_settle(Some(&bg));
+        (settle0, require_settled(Some(&bg), settle0).is_ok())
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !read.is_finished(),
+        "the read answered while the pool was held"
+    );
+    drop(hold);
+    let (settle0, settled) = read.join().unwrap();
+    assert_eq!(settle0 % 2, 0, "the read sampled a held pool");
+    assert!(settled, "a read after the hold ended was refused");
+    assert!(SETTLE_WAITS.waits.requests.total() > waits);
+    assert!(SETTLE_WAITS.waits.wall_us.total() >= waited_us + 40_000);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// A hold that outlasts the bound still gets an answer: the wait gives up and
+/// `require_settled` refuses the read, as before. Both outcomes are counted.
+#[test]
+fn a_read_past_the_settle_bound_is_refused_and_counted() {
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+    mp.set_settle_wait_max(Duration::from_millis(30));
+    let gave_up = SETTLE_WAITS.gave_up.total();
+    let refused = SETTLE_WAITS.refused.total();
+    let _hold = mp.template_hold();
+    let t0 = Instant::now();
+    let settle0 = pool_settle(Some(&mp));
+    assert!(t0.elapsed() >= Duration::from_millis(30), "did not wait");
+    assert_eq!(settle0 % 2, 1);
+    assert!(require_settled(Some(&mp), settle0).is_err());
+    assert!(SETTLE_WAITS.gave_up.total() > gave_up);
+    assert!(SETTLE_WAITS.refused.total() > refused);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
 /// A template build samples the stripped tip twice. If the tip moves between
 /// those reads, the build must retry and arm the new hash, not the stale one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

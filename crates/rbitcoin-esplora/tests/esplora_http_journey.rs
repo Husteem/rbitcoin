@@ -1623,6 +1623,8 @@ async fn unlisted_tx_is_503_while_a_reorg_holds_the_pool() {
     pad.connect(vec![stored_spend(&tx, pad.cbs[0])]);
     pad.q.disconnect_tip().unwrap();
 
+    // Past the wait bound: a hold this long is answered 503.
+    pad.hub.set_settle_wait_max(std::time::Duration::ZERO);
     let hold = pad.hub.template_hold();
     for (path, st, body) in tx_routes(pad.addr, &id).await {
         assert_eq!((st, body.as_str()), (503, "chain view moved"), "{path}");
@@ -1662,6 +1664,7 @@ async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
         format!("/scripthash/{sh}"),
     ];
 
+    pad.hub.set_settle_wait_max(std::time::Duration::ZERO);
     let hold = pad.hub.template_hold();
     for path in &routes {
         let (st, body) = http_get(pad.addr, path).await;

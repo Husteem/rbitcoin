@@ -2260,22 +2260,51 @@ async fn ping_then_null_push(pad: &mut PoolPad, hold: rbitcoin_net::tx_relay::Te
     assert_eq!(push["params"][1], Value::Null, "{push}");
 }
 
-/// While a connect, disconnect or reorg holds the pool, a coin whose spend
-/// is re-entering it would read unspent. Listunspent, balance and outpoint
-/// status refuse until the pool settles, then answer.
-#[tokio::test]
-async fn coin_reads_refuse_while_the_pool_is_held() {
-    let mut pad = pool_pad().await;
-    let sh = pad.sh.clone();
+fn coin_read_calls(sh: &Value) -> [(&'static str, Value); 3] {
     let mut txid = [0u8; 32];
     txid[31] = 0xce;
     let op = json!([rbitcoin_primitives::display_hash_hex(txid), 0]);
-    let calls = [
+    [
         ("blockchain.scripthash.listunspent", json!([sh])),
         ("blockchain.scripthash.get_balance", json!([sh])),
         ("blockchain.outpoint.get_status", op),
-    ];
+    ]
+}
+
+/// Every block connect holds the pool for a moment. A coin read that arrives
+/// then waits for the hold to end and answers, instead of failing about once
+/// per block (#2139).
+#[tokio::test]
+async fn coin_reads_wait_out_a_short_connect_hold() {
+    let mut pad = pool_pad().await;
+    let calls = coin_read_calls(&json!(pad.sh.clone()));
+    for (i, (method, params)) in calls.iter().enumerate() {
+        let mp = Arc::clone(&pad.mp);
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let hold = mp.template_hold();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(hold);
+        });
+        held_rx.recv().unwrap();
+        let r = pad.call(i as u32, method, params.clone()).await;
+        holder.join().unwrap();
+        assert!(r["error"].is_null(), "{method} across a hold: {r}");
+    }
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
+/// While a connect, disconnect or reorg holds the pool, a coin whose spend
+/// is re-entering it would read unspent. A hold that outlasts the wait bound
+/// (zero here) refuses listunspent, balance and outpoint status until the
+/// pool settles, then they answer.
+#[tokio::test]
+async fn coin_reads_refuse_while_the_pool_is_held() {
+    let mut pad = pool_pad().await;
+    let calls = coin_read_calls(&json!(pad.sh.clone()));
     let mp = Arc::clone(&pad.mp);
+    mp.set_settle_wait_max(std::time::Duration::ZERO);
     let hold = mp.template_hold();
     for (i, (method, params)) in calls.iter().enumerate() {
         let r = pad.call(i as u32, method, params.clone()).await;
