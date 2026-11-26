@@ -395,11 +395,7 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
     }
     let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
     let mut at = AHEAD_HEAD;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| StoreError::io(path, e))?;
+    let mut images = Vec::with_capacity(count);
     for _ in 0..count {
         if raw.len() < at + AHEAD_REC {
             return Err(StoreError::Corrupt("hash head ahead short"));
@@ -418,10 +414,21 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
             return Err(StoreError::Corrupt("hash head ahead checksum"));
         }
+        images.push((off, image));
+        at += AHEAD_REC;
+    }
+    if at != raw.len() {
+        return Err(StoreError::Corrupt("hash head ahead length"));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| StoreError::io(path, e))?;
+    for (off, image) in images {
         file.seek(SeekFrom::Start(off))
             .map_err(|e| StoreError::io(path, e))?;
         file.write_all(image).map_err(|e| StoreError::io(path, e))?;
-        at += AHEAD_REC;
     }
     file.durable_sync_all()
         .map_err(|e| StoreError::io(path, e))?;

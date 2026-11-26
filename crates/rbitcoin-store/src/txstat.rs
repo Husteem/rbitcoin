@@ -112,11 +112,7 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         raw[12], raw[13], raw[14], raw[15], raw[16], raw[17], raw[18], raw[19],
     ]);
     let mut at = AHEAD_HEAD;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| StoreError::io(path, e))?;
+    let mut images = Vec::with_capacity(count);
     for _ in 0..count {
         if raw.len() < at + AHEAD_REC {
             return Err(StoreError::Corrupt("txstat ahead short"));
@@ -135,13 +131,21 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
             return Err(StoreError::Corrupt("txstat ahead checksum"));
         }
-        file.seek(SeekFrom::Start(off))
-            .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(image).map_err(|e| StoreError::io(path, e))?;
+        images.push((off, image));
         at += AHEAD_REC;
     }
     if at != raw.len() {
         return Err(StoreError::Corrupt("txstat ahead length"));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| StoreError::io(path, e))?;
+    for (off, image) in images {
+        file.seek(SeekFrom::Start(off))
+            .map_err(|e| StoreError::io(path, e))?;
+        file.write_all(image).map_err(|e| StoreError::io(path, e))?;
     }
     let header = file::encode_leading_header(TableKind::TxStat, logical);
     file.seek(SeekFrom::Start(0))

@@ -246,6 +246,19 @@ fn txstat_open_rejects_every_bad_ahead_shape() {
     trailing.extend_from_slice(&ahead_page(4096));
     trailing.push(0);
 
+    let body_path = dir.join("txstat.body");
+    let before = std::fs::read(&body_path).unwrap();
+    let mut prefix_then_trailing = ahead_body(4096);
+    prefix_then_trailing.extend_from_slice(&ahead_page(0));
+    prefix_then_trailing.push(0);
+    std::fs::write(&side, prefix_then_trailing).unwrap();
+    assert!(TxStat::open(&dir).is_err());
+    assert_eq!(
+        std::fs::read(&body_path).unwrap(),
+        before,
+        "a malformed journal must not apply its prefix"
+    );
+
     for (case, raw) in [
         zero,
         bad_magic,
