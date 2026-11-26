@@ -42,6 +42,74 @@ fn dense_load_inserts_until_full_without_rehash() {
     cleanup_hh(&path);
 }
 
+/// Zero the 4 KiB blocks named by the `.ahead` records, as a torn chunk
+/// writeback would.
+fn zero_ahead_blocks(path: &std::path::Path) {
+    let mut side = path.as_os_str().to_os_string();
+    side.push(".ahead");
+    let side = std::path::PathBuf::from(side);
+    let raw = std::fs::read(&side).unwrap();
+    assert_eq!(&raw[0..4], b"HHA1");
+    let count = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+    let mut at = 12usize;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    use std::io::{Seek, SeekFrom, Write};
+    for _ in 0..count {
+        let block = u64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+        file.seek(SeekFrom::Start(block)).unwrap();
+        file.write_all(&[0u8; 4096]).unwrap();
+        at += 8 + 32 + 4096;
+    }
+    file.sync_all().unwrap();
+}
+
+#[test]
+fn torn_chunk_restores_from_ahead_image() {
+    let path = tmp_path();
+    let keys: Vec<[u8; 32]> = (0u64..101)
+        .map(|i| {
+            let mut key = [0u8; 32];
+            key[0..8].copy_from_slice(&i.to_le_bytes());
+            key
+        })
+        .collect();
+    {
+        let h = HashHead::create_with_slots(&path, 256).unwrap();
+        let batch: Vec<_> = keys[..100]
+            .iter()
+            .enumerate()
+            .map(|(i, key)| (*key, Fk(i as u64 + 1)))
+            .collect();
+        h.insert_many(&batch).unwrap();
+        h.flush().unwrap();
+        fail_next_hash_head_flush_after_ahead(&path);
+        assert!(
+            h.insert_many(&[(keys[100], Fk(101))]).is_err(),
+            "the failpoint must stop before the chunk pwrite"
+        );
+    }
+    zero_ahead_blocks(&path);
+    let h = HashHead::open(&path).unwrap();
+    for (i, key) in keys.iter().enumerate() {
+        assert_eq!(
+            h.get(key).unwrap(),
+            Some(Fk(i as u64 + 1)),
+            "key {i} lost after a torn chunk"
+        );
+    }
+    let mut side = path.as_os_str().to_os_string();
+    side.push(".ahead");
+    assert!(
+        !std::path::PathBuf::from(side).exists(),
+        "open must remove the applied ahead image"
+    );
+    cleanup_hh(&path);
+}
+
 #[test]
 fn persist_survives_reopen() {
     let path = tmp_path();
