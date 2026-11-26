@@ -2589,7 +2589,13 @@ pub async fn admit_broadcast(st: AppState, tx: bitcoin::Transaction) -> Response
     };
     let txid = tx.compute_txid();
     let budget = st.query.api_read_budget();
-    match rbitcoin_net::with_store_budget(budget, mp.broadcast_local_async(tx)).await {
+    match rbitcoin_net::with_store_budget(
+        budget,
+        rbitcoin_query::ApiSurface::Esplora,
+        mp.broadcast_local_async(tx),
+    )
+    .await
+    {
         Ok(_) => plain_ok(block_hash_hex(&txid.to_byte_array())),
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
@@ -2736,6 +2742,7 @@ pub async fn post_txs_test(
         }
         let rows = rbitcoin_net::with_store_budget(
             st.query.api_read_budget(),
+            rbitcoin_query::ApiSurface::Esplora,
             mp.test_accept_rows_async(decoded, max_sat_kvb),
         )
         .await;
@@ -2802,8 +2809,12 @@ pub async fn post_tx_package(State(st): State<AppState>, body: Bytes) -> Respons
             }
         }
     }
-    match rbitcoin_net::with_store_budget(st.query.api_read_budget(), mp.accept_package_async(txs))
-        .await
+    match rbitcoin_net::with_store_budget(
+        st.query.api_read_budget(),
+        rbitcoin_query::ApiSurface::Esplora,
+        mp.accept_package_async(txs),
+    )
+    .await
     {
         Ok(results) => {
             let txids: Vec<String> = results

@@ -10,7 +10,7 @@ use rbitcoin_net::RequestMeter;
 use rbitcoin_net::{BlockingRegion, MempoolHub};
 use rbitcoin_primitives::{Fk, Height};
 
-use rbitcoin_query::{ChainView, ChainViewKind, HistoryFilter, Query, ShJoinSlot};
+use rbitcoin_query::{ApiSurface, ChainView, ChainViewKind, HistoryFilter, Query, ShJoinSlot};
 use rbitcoin_store::StoreError;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1366,12 +1366,12 @@ fn spawn_dispatch(
     // refused answer; the rerun picks it up there.
     tokio::spawn(async move {
         let turn = Arc::clone(&q.heavy_sh_join);
-        let budget = q.api_read_budget();
+        let reader = Arc::clone(&q);
         let permit = || {
-            let budget = Arc::clone(&budget);
+            let q = Arc::clone(&reader);
             async move {
                 if reads {
-                    Some(budget.acquire_owned().await.expect("store budget"))
+                    Some(q.acquire_api_read(ApiSurface::Electrum).await)
                 } else {
                     None
                 }
@@ -1405,11 +1405,7 @@ async fn budgeted_blocking<T: Send + 'static>(
     query: &Query,
     mut f: impl FnMut() -> T + Send + 'static,
 ) -> Result<T, tokio::task::JoinError> {
-    let budget = query.api_read_budget();
-    let permit = || {
-        let budget = Arc::clone(&budget);
-        async move { Some(budget.acquire_owned().await.expect("store budget")) }
-    };
+    let permit = || async { Some(query.acquire_api_read(ApiSurface::Electrum).await) };
     rbitcoin_net::blocking_heavy_turn(Some(&query.heavy_sh_join), permit, move |_| f()).await
 }
 
@@ -2748,11 +2744,7 @@ where
         let lim = limits;
         let last_h = last;
         tokio::spawn(async move {
-            let permit = q
-                .api_read_budget()
-                .acquire_owned()
-                .await
-                .expect("store budget");
+            let permit = q.acquire_api_read(ApiSurface::Electrum).await;
             match tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let _g = BlockingRegion::enter();
@@ -3456,7 +3448,7 @@ pub async fn broadcast_raw_tx_async(
         .clone();
     let txid = tx.compute_txid();
     let budget = mp.query.api_read_budget();
-    rbitcoin_net::with_store_budget(budget, mp.broadcast_local_async(tx))
+    rbitcoin_net::with_store_budget(budget, ApiSurface::Electrum, mp.broadcast_local_async(tx))
         .await
         .map_err(|e| format!("broadcast reject: {e}"))?;
     Ok(json!(txid.to_string()))
@@ -3473,9 +3465,10 @@ pub async fn broadcast_package_async(
         .ok_or_else(|| "mempool not available".to_string())?
         .clone();
     let budget = mp.query.api_read_budget();
-    let accepted = rbitcoin_net::with_store_budget(budget, mp.accept_package_async(txs))
-        .await
-        .map_err(|e| format!("broadcast_package reject: {e}"))?;
+    let accepted =
+        rbitcoin_net::with_store_budget(budget, ApiSurface::Electrum, mp.accept_package_async(txs))
+            .await
+            .map_err(|e| format!("broadcast_package reject: {e}"))?;
     Ok(package_broadcast_value(verbose, &accepted))
 }
 

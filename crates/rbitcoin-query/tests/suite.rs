@@ -4,6 +4,7 @@ rbitcoin_store::skip_flushes_before_main!();
 static ALLOC: alloc_count::Counting = alloc_count::Counting;
 
 mod alloc_count;
+mod api_read_budget;
 
 mod archive;
 mod batch_parents;

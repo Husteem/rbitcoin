@@ -3153,7 +3153,7 @@ fn dropped_hold_publishes_an_update_that_landed_without_a_commit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sample_template_prev_retries_when_the_tip_moves() {
     use rbitcoin_net::{off_pool, sample_template_prev_for_build, with_store_budget};
-    use tokio::sync::Semaphore;
+    use rbitcoin_query::ApiSurface;
 
     let dir = tmp();
     let store_dir = tmp();
@@ -3184,11 +3184,15 @@ async fn sample_template_prev_retries_when_the_tip_moves() {
     while !entered.load(std::sync::atomic::Ordering::SeqCst) {
         tokio::task::yield_now().await;
     }
-    let budget = Arc::new(Semaphore::new(0));
+    // Another surface holds the one permit.
+    let budget = rbitcoin_query::ApiReadBudget::new(1, &rbitcoin_query::ALL_API_SURFACES);
+    let hold = budget.acquire(ApiSurface::Electrum).await;
     let sample_mp = Arc::clone(&mp);
-    let task = tokio::spawn(with_store_budget(Arc::clone(&budget), async move {
-        sample_template_prev_for_build(Some(sample_mp)).await
-    }));
+    let task = tokio::spawn(with_store_budget(
+        Arc::clone(&budget),
+        ApiSurface::Rpc,
+        async move { sample_template_prev_for_build(Some(sample_mp)).await },
+    ));
     tokio::time::sleep(Duration::from_millis(50)).await;
     release.store(true, std::sync::atomic::Ordering::SeqCst);
     blocker.await.expect("off-pool gate");
@@ -3198,7 +3202,7 @@ async fn sample_template_prev_retries_when_the_tip_moves() {
         "sample must be waiting on the store budget between the two tip reads"
     );
     mp.note_template_prev(second);
-    budget.add_permits(1);
+    drop(hold);
     let got = tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .expect("sample retried")
@@ -6910,11 +6914,12 @@ async fn package_admit_waits_on_the_store_budget() {
         },
         parent.output[0].value.to_sat() - 1_000,
     );
-    let hold = budget.clone().acquire_owned().await.expect("permit");
+    let hold = budget.acquire(rbitcoin_query::ApiSurface::Rpc).await;
     let hub_pkg = Arc::clone(&hub);
     let admit = tokio::spawn(async move {
         rbitcoin_net::with_store_budget(
             hub_pkg.query.api_read_budget(),
+            rbitcoin_query::ApiSurface::Electrum,
             hub_pkg.accept_package_async(vec![parent, child]),
         )
         .await

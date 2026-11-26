@@ -73,7 +73,7 @@ pub struct TemplateBuildSample {
     /// sample. `Some` is armed, including `Some(None)` when the pool has no
     /// stripped tip.
     pub armed: Option<Option<[u8; 32]>>,
-    pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub permit: Option<rbitcoin_query::StorePermit>,
 }
 
 /// Read the template tip for a build.

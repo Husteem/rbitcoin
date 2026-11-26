@@ -2388,6 +2388,21 @@ fn prepare_sh_head_at_open(query: &Query, shindex: bool) -> Result<(), NodeError
         .map_err(|e| NodeError::Config(format!("scripthash index: {e}")))
 }
 
+/// The API surfaces `config` serves. They split the store-read budget.
+fn api_surfaces(config: &NodeConfig) -> Vec<rbitcoin_query::ApiSurface> {
+    use rbitcoin_query::ApiSurface;
+    let rpc = config.rpc.socket || config.rpc.listen.is_some();
+    [
+        (ApiSurface::Rpc, rpc),
+        (ApiSurface::Rest, rpc && config.rpc.rest),
+        (ApiSurface::Esplora, config.listen.esplora.is_some()),
+        (ApiSurface::Electrum, config.listen.electrum.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(surface, on)| on.then_some(surface))
+    .collect()
+}
+
 #[doc(hidden)]
 pub fn apply_startup_index_mode(
     query: &Query,
@@ -2398,6 +2413,7 @@ pub fn apply_startup_index_mode(
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+    query.set_api_surfaces(&api_surfaces(config));
     query.set_api_read_budget(crate::cli::store_read_budget(
         config.datadir_hdd,
         cores,

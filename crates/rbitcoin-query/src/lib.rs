@@ -1,5 +1,6 @@
 //! Domain query layer over [`rbitcoin_store::Store`].
 
+pub mod api_read_budget;
 #[doc(hidden)]
 pub mod archive;
 #[doc(hidden)]
@@ -454,6 +455,8 @@ pub use stamp::{
 };
 pub use wave_prevout::SpendEdge;
 
+pub use api_read_budget::{ApiReadBudget, ApiSurface, StorePermit, ALL_API_SURFACES};
+
 /// One transaction to apply when connecting a block.
 #[derive(Clone, Debug)]
 pub struct TxApply {
@@ -717,12 +720,12 @@ pub struct Query {
     /// 0 = off. An unpaged SH join above this create count holds
     /// [`Self::heavy_sh_join`] for its whole walk.
     pub heavy_sh_creates: AtomicU32,
-    /// Shared API store-read slots. Tests leave this at `tokio::sync::Semaphore::MAX_PERMITS`.
-    /// The node replaces it once at listen from `--store-read-budget`.
-    pub api_read_budget: std::sync::Mutex<Arc<tokio::sync::Semaphore>>,
-    /// The permit count [`Self::api_read_budget`] was built with, whatever
-    /// is held at the moment.
-    api_read_budget_size: std::sync::atomic::AtomicUsize,
+    /// Shared API store-read slots ([`ApiReadBudget`]). Tests leave this at
+    /// `tokio::sync::Semaphore::MAX_PERMITS`. The node replaces it once
+    /// before listen from `--store-read-budget` and the surfaces it serves.
+    api_read_budget: std::sync::Mutex<Arc<ApiReadBudget>>,
+    /// The surfaces the node serves; the budget is split among them.
+    api_surfaces: std::sync::Mutex<Vec<ApiSurface>>,
     /// One heavy unpaged SH join at a time across every Electrum and Esplora
     /// client: one near the cap can peak above 2 GiB. One permit. A join
     /// takes it without waiting; a caller waits for it on its task
@@ -1096,12 +1099,11 @@ impl Query {
             genesis_coinbase_fk: std::sync::OnceLock::new(),
             max_sh_creates: AtomicU32::new(DEFAULT_MAX_SH_CREATES),
             heavy_sh_creates: AtomicU32::new(DEFAULT_HEAVY_SH_CREATES),
-            api_read_budget: std::sync::Mutex::new(Arc::new(tokio::sync::Semaphore::new(
+            api_read_budget: std::sync::Mutex::new(ApiReadBudget::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
-            ))),
-            api_read_budget_size: std::sync::atomic::AtomicUsize::new(
-                tokio::sync::Semaphore::MAX_PERMITS,
-            ),
+                &ALL_API_SURFACES,
+            )),
+            api_surfaces: std::sync::Mutex::new(ALL_API_SURFACES.to_vec()),
             heavy_sh_join: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(debug_assertions)]
             heavy_turn_refusals: AtomicU64::new(0),
@@ -2312,9 +2314,9 @@ impl Query {
         self.heavy_sh_creates.load(AtomicOrdering::Relaxed)
     }
 
-    /// The process API store-read semaphore. Callers acquire on the async
-    /// task and move the permit into the blocking read.
-    pub fn api_read_budget(&self) -> Arc<tokio::sync::Semaphore> {
+    /// The process API store-read budget. Callers take a permit on the
+    /// async task and move it into the blocking read.
+    pub fn api_read_budget(&self) -> Arc<ApiReadBudget> {
         Arc::clone(
             &self
                 .api_read_budget
@@ -2323,22 +2325,37 @@ impl Query {
         )
     }
 
-    /// Replace the API store-read semaphore. `0` waits forever. The node
+    /// Replace the API store-read budget with `n` permits split across the
+    /// surfaces from [`Self::set_api_surfaces`]. `0` waits forever. The node
     /// passes a count of at least 1.
     pub fn set_api_read_budget(&self, n: usize) {
-        let mut g = self
+        let enabled = self
+            .api_surfaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *self
             .api_read_budget
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *g = Arc::new(tokio::sync::Semaphore::new(n));
-        self.api_read_budget_size
-            .store(n, std::sync::atomic::Ordering::Relaxed);
+            .unwrap_or_else(|e| e.into_inner()) = ApiReadBudget::new(n, &enabled);
+    }
+
+    /// The API surfaces the node serves, before any of them binds. The
+    /// budget is split among these ([`ApiReadBudget::new`]). All four until
+    /// set.
+    pub fn set_api_surfaces(&self, enabled: &[ApiSurface]) {
+        *self.api_surfaces.lock().unwrap_or_else(|e| e.into_inner()) = enabled.to_vec();
+        self.set_api_read_budget(self.api_read_budget_size());
+    }
+
+    /// A store-read permit for `surface`, waited for on this task.
+    pub async fn acquire_api_read(&self, surface: ApiSurface) -> StorePermit {
+        self.api_read_budget().acquire(surface).await
     }
 
     /// The configured store-read permit count, held or not.
     pub fn api_read_budget_size(&self) -> usize {
-        self.api_read_budget_size
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.api_read_budget().size()
     }
 
     #[cfg(debug_assertions)]

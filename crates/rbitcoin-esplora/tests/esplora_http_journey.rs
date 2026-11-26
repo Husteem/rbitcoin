@@ -959,7 +959,7 @@ async fn esplora_max_connections_spans_every_route() {
     // read before the request is admitted.
     q.set_api_read_budget(1);
     let q = Arc::new(q);
-    let store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let store = q.api_read_budget().acquire(rbitcoin_query::ApiSurface::Rpc).await;
     let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
@@ -1033,7 +1033,7 @@ async fn esplora_request_timeout_covers_the_wait_for_a_slot() {
     // read before the request is admitted.
     q.set_api_read_budget(1);
     let q = Arc::new(q);
-    let _store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let _store = q.api_read_budget().acquire(rbitcoin_query::ApiSurface::Rpc).await;
     let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");
@@ -1106,7 +1106,7 @@ async fn dropped_admit_waiter_clears_waiting() {
     // read before the request is admitted.
     q.set_api_read_budget(1);
     let q = Arc::new(q);
-    let _store = q.api_read_budget().acquire_owned().await.expect("permit");
+    let _store = q.api_read_budget().acquire(rbitcoin_query::ApiSurface::Rpc).await;
     let handle = run_esplora(cfg, Arc::clone(&q), None)
         .await
         .expect("listen");

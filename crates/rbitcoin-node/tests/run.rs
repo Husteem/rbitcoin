@@ -1622,6 +1622,78 @@ fn startup_sets_datadir_hdd_on_the_store() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The store-read budget is split across the API surfaces this config
+/// turns on. A surface that is off has no minimum, so one surface alone may
+/// use the whole budget; with fewer permits than surfaces each still has a
+/// minimum of one.
+#[test]
+fn startup_splits_the_store_read_budget_across_enabled_surfaces() {
+    use rbitcoin_query::ApiSurface::{Electrum, Esplora, Rest, Rpc};
+
+    let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    /// One config: its budget, and the surfaces it turns on with each one's
+    /// expected minimum and ceiling.
+    struct Case {
+        label: &'static str,
+        budget: usize,
+        on: &'static [(rbitcoin_query::ApiSurface, (usize, usize))],
+    }
+    let cases = [
+        Case {
+            label: "only-electrum",
+            budget: 6,
+            on: &[(Electrum, (6, 6))],
+        },
+        Case {
+            label: "electrum-esplora",
+            budget: 6,
+            on: &[(Esplora, (3, 5)), (Electrum, (3, 5))],
+        },
+        Case {
+            label: "all-four",
+            budget: 7,
+            on: &[
+                (Rpc, (2, 6)),
+                (Rest, (2, 6)),
+                (Esplora, (2, 6)),
+                (Electrum, (1, 6)),
+            ],
+        },
+        Case {
+            label: "rpc-electrum-hdd",
+            budget: 1,
+            on: &[(Rpc, (1, 1)), (Electrum, (1, 1))],
+        },
+    ];
+    for Case { label, budget, on } in cases {
+        let has = |s| on.iter().any(|(x, _)| *x == s);
+        let dir = scratch_dir(&format!("read-shares-{label}"));
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        let mut cfg = NodeConfig::default();
+        cfg.store_read_budget = Some(budget);
+        cfg.rpc.listen = has(Rpc).then_some(addr);
+        cfg.rpc.rest = has(Rest);
+        cfg.listen.electrum = has(Electrum).then_some(addr);
+        cfg.listen.esplora = has(Esplora).then_some(rbitcoin_esplora::EsploraListen::Tcp(addr));
+        apply_startup_index_mode(&q, &cfg, 0).unwrap();
+        let b = q.api_read_budget();
+        for (surface, limits) in on {
+            assert_eq!(
+                (b.min(*surface), b.ceil(*surface)),
+                *limits,
+                "{label}: {surface:?}"
+            );
+        }
+        for surface in rbitcoin_query::ALL_API_SURFACES
+            .into_iter()
+            .filter(|s| !has(*s))
+        {
+            assert_eq!(b.min(surface), 0, "{label}: {surface:?} is off");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[test]
 fn startup_names_the_genesis_coinbase_on_the_query() {
     let dir = scratch_dir("genesis-coinbase");
@@ -2305,9 +2377,8 @@ async fn start_esplora_applies_max_inflight() {
     let store = hub
         .query
         .api_read_budget()
-        .acquire_owned()
-        .await
-        .expect("permit");
+        .acquire(rbitcoin_query::ApiSurface::Rpc)
+        .await;
     let shutdown = Shutdown::new();
     let handles = start_esplora_if_ready(
         true,
