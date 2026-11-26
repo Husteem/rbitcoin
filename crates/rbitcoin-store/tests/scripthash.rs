@@ -294,6 +294,66 @@ fn put_create_batch(t: &ScriptHashTable, recs: impl AsRef<[ScriptHashRecord]>) -
 }
 
 #[test]
+fn ingest_syncs_the_body_before_the_alloc_header() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xc1]);
+    let before = read_alloc_header(t.ovf_file()).unwrap().0.live_count;
+    rbitcoin_store::io_handle::arm_fail_sync(t.ovf_file().io_handle(), 1);
+    let err = t.put_create_batch_append(&[rec(sh, 1, 0)]).unwrap_err();
+    assert!(matches!(err, StoreError::Io { .. }), "{err}");
+    drop(t);
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    let live = read_alloc_header(t.ovf_file()).unwrap().0.live_count;
+    assert_eq!(live, before, "alloc header moved before the body sync");
+    assert!(t.head_value(&sh).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ingest_syncs_the_alloc_header_before_the_head() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xc2]);
+    rbitcoin_store::io_handle::arm_fail_sync_after(t.ovf_file().io_handle(), 1, 1);
+    let err = t.put_create_batch_append(&[rec(sh, 1, 0)]).unwrap_err();
+    assert!(matches!(err, StoreError::Io { .. }), "{err}");
+    drop(t);
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    let live = read_alloc_header(t.ovf_file()).unwrap().0.live_count;
+    assert_eq!(
+        live, 1,
+        "the alloc header must be stored before the second sync"
+    );
+    assert!(
+        t.head_value(&sh).unwrap().is_none(),
+        "ingest head must wait for the alloc-header sync"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn last_create_fk_on_rejects_a_slab_whose_used_lies() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xc3]);
+    assert_eq!(put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0)]), 2);
+    let val = t.head_value(&sh).unwrap().unwrap();
+    let ShHeadValue::Slab { off, used, .. } = val else {
+        panic!("two creates must be a slab, got {val:?}");
+    };
+    assert_eq!(used, 2);
+    let body = t.body_for(&sh, t.key_home(&sh).unwrap());
+    body.write_at(off, &1u16.to_le_bytes()).unwrap();
+    let err = t.last_create_fk_on(body, &val).unwrap_err();
+    match err {
+        StoreError::Corrupt(msg) => assert!(msg.contains("used"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn open_refuses_pack8_paged_mode_10_on_ingest() {
     let dir = tmp();
     {

@@ -172,6 +172,10 @@ static FAIL_HWM: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(
 #[cfg(debug_assertions)]
 static FAIL_SYNC: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
 
+/// Ignore this many `sync_data` calls on these fds before [`FAIL_SYNC`] counts.
+#[cfg(debug_assertions)]
+static SYNC_SKIP: std::sync::Mutex<Vec<(IoHandle, u32)>> = std::sync::Mutex::new(Vec::new());
+
 /// The next `sync_data` on these fds sleeps this long first.
 #[cfg(debug_assertions)]
 static SYNC_DELAY: std::sync::Mutex<Vec<(IoHandle, std::time::Duration)>> =
@@ -279,6 +283,7 @@ pub fn disarm_short_pwrite() {
         .clear();
     FAIL_HWM.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_SYNC.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SYNC_SKIP.lock().unwrap_or_else(|e| e.into_inner()).clear();
     SYNC_DELAY.lock().unwrap_or_else(|e| e.into_inner()).clear();
     FAIL_PREAD.lock().unwrap_or_else(|e| e.into_inner()).clear();
     disarm_fail_pread_len();
@@ -308,6 +313,10 @@ pub fn disarm_pwrite(handle: IoHandle) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(h, _)| *h != handle);
+    SYNC_SKIP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(h, _)| *h != handle);
     SYNC_DELAY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -331,6 +340,21 @@ pub fn arm_fail_sync(handle: IoHandle, n: u32) {
     } else {
         slots.push((handle, n));
     }
+}
+
+/// Let `skip` `sync_data` calls on `handle` succeed, then fail the next `n`.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_fail_sync_after(handle: IoHandle, skip: u32, n: u32) {
+    if skip > 0 {
+        let mut slots = SYNC_SKIP.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = slots.iter_mut().find(|(h, _)| *h == handle) {
+            slot.1 = skip;
+        } else {
+            slots.push((handle, skip));
+        }
+    }
+    arm_fail_sync(handle, n);
 }
 
 /// Fail the next `n` preads of `len` bytes on this thread.
@@ -423,6 +447,18 @@ fn injected_sync(handle: IoHandle) -> Option<i32> {
 /// One armed `sync_data` on `handle` is consumed. Unarmed fds are untouched.
 #[cfg(debug_assertions)]
 pub(crate) fn take_fail_sync(handle: IoHandle) -> bool {
+    {
+        let mut skips = SYNC_SKIP.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = skips.iter().position(|(h, _)| *h == handle) {
+            if skips[i].1 > 0 {
+                skips[i].1 -= 1;
+                if skips[i].1 == 0 {
+                    skips.swap_remove(i);
+                }
+                return false;
+            }
+        }
+    }
     let mut slots = FAIL_SYNC.lock().unwrap_or_else(|e| e.into_inner());
     let Some(i) = slots.iter().position(|(h, _)| *h == handle) else {
         return false;

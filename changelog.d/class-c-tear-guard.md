@@ -17,7 +17,9 @@ Fixed
   append-only batch does not copy the new tail into `txstat.body.ahead`. It
   drops leftover images that overlap the append and keeps pages it does not
   touch. Restore will not shrink a durable length past the sidecar or replay
-  bytes the append already published. The in-place `getblockstats` stamp
+  bytes the append already published. A replay of an older page 0 skips that
+  image's 16-byte header, so a crash before the header rewrite does not plant
+  the old length over a newer tail. The in-place `getblockstats` stamp
   still journals its page set.
 - **Header and scripthash ingest heads become durable after their bodies.**
   `HeaderTable::ensure_batch` syncs `header.body` before `insert_many`.
@@ -34,7 +36,10 @@ Fixed
   `filter_hash`. A by-height read that sees that mismatch recomputes the
   filter and writes it back when the hash matches the idx slot and that
   slot is still the row. A slot that moved is left alone. The read takes
-  the replacement row, and errors if the row keeps moving.
+  the replacement row, and errors if the row keeps moving. A by-hash read
+  returns that error instead of a filter the idx rejected. If the height's
+  block changed during the read, the by-hash read rebuilds the requested
+  hash instead of returning the replacement row.
 - A torn block-filter parent rebuild is still deferred ([#2109]).
 
 [#2071]: https://github.com/rbitcoin-org/rbitcoin/issues/2071

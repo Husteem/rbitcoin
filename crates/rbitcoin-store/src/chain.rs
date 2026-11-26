@@ -843,18 +843,4 @@ impl HeaderTxsTable {
         ArrayTable::remove_ahead(count_ahead)?;
         Ok(())
     }
-
-    pub fn flush_async(&self) -> Result<(), StoreError> {
-        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
-        let first_ahead = self.first.write_ahead()?;
-        let count_ahead = self.count.write_ahead()?;
-        self.first
-            .flush_async()
-            .and_then(|()| self.count.flush_async())?;
-        self.first.file.sync_data_only()?;
-        self.count.file.sync_data_only()?;
-        ArrayTable::remove_ahead(first_ahead)?;
-        ArrayTable::remove_ahead(count_ahead)?;
-        Ok(())
-    }
 }

@@ -49,6 +49,8 @@ const AHEAD_REC: usize = 8 + 32 + 4096;
 
 #[cfg(debug_assertions)]
 static FAIL_AHEAD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+#[cfg(debug_assertions)]
+static FAIL_RESTORE_HEADER: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// Leave the next txstat page image behind and fail before the pwrite.
 #[cfg(debug_assertions)]
@@ -63,6 +65,25 @@ pub fn fail_next_txstat_flush_after_ahead(path: &Path) {
 #[cfg(debug_assertions)]
 fn take_fail_ahead(path: &Path) -> bool {
     FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
+}
+
+/// Stop the next `restore_ahead` of `path` after the page images and before
+/// the header write.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_txstat_restore_before_header(path: &Path) {
+    FAIL_RESTORE_HEADER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_restore_header(path: &Path) -> bool {
+    FAIL_RESTORE_HEADER
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(path)
@@ -215,10 +236,27 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         if write_len == 0 {
             continue;
         }
-        file.seek(SeekFrom::Start(off))
+        // Page 0 of an older image starts with that image's length. A crash
+        // before the header write below must leave the newer length in place.
+        let skip = if keep_disk && off == 0 {
+            FILE_HEADER_LEN.min(write_len)
+        } else {
+            0
+        };
+        if skip == write_len {
+            continue;
+        }
+        file.seek(SeekFrom::Start(off + skip as u64))
             .map_err(|e| StoreError::io(path, e))?;
-        file.write_all(&image[..write_len])
+        file.write_all(&image[skip..write_len])
             .map_err(|e| StoreError::io(path, e))?;
+    }
+    #[cfg(debug_assertions)]
+    if take_fail_restore_header(path) {
+        return Err(StoreError::io(
+            path,
+            std::io::Error::other("injected txstat restore header failure"),
+        ));
     }
     let header = if keep_disk {
         disk_header

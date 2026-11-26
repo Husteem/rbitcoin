@@ -183,3 +183,70 @@ fn torn_filter_body_is_written_back() {
         "a repair that keeps seeing a moved slot must not write"
     );
 }
+
+#[test]
+fn by_hash_refuses_a_body_the_index_hash_rejected() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("filter-hash-reject");
+    q.set_block_filter_index(true).unwrap();
+    rbitcoin_query::prepare_live_indexes(&q).unwrap();
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let ms = rbitcoin_consensus::Milestone::height(u32::MAX);
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        ms,
+    )
+    .unwrap();
+    let b1 =
+        rbitcoin_consensus::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    rbitcoin_query::accept_and_connect_block(&q, &params, rbitcoin_primitives::Height(1), &b1, ms)
+        .unwrap();
+    let hash = b1.block_hash().to_byte_array();
+    let idx = rbitcoin_store::BlockFilterTable::seg_dirs(q.store().cold_files_dir()).idx_path(0);
+    let mut raw = std::fs::read(&idx).unwrap();
+    let at = (rbitcoin_store::block_filter::HDR + rbitcoin_store::block_filter::SLOT + 16) as usize;
+    for b in raw[at..at + 32].iter_mut() {
+        *b ^= 0xff;
+    }
+    std::fs::write(&idx, &raw).unwrap();
+    let err = q.basic_filter_for_hash(&hash).unwrap_err();
+    assert!(
+        err.to_string().contains("blockfilter body does not match"),
+        "{err}"
+    );
+}
+
+#[test]
+fn by_hash_drops_a_row_when_the_height_moved() {
+    let _gate = rbitcoin_consensus::script_pool::steal_test_gate();
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("filter-height-moved");
+    q.set_block_filter_index(true).unwrap();
+    rbitcoin_query::prepare_live_indexes(&q).unwrap();
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let ms = rbitcoin_consensus::Milestone::height(u32::MAX);
+    let genesis = rbitcoin_consensus::genesis_block(&params);
+    rbitcoin_query::accept_and_connect_block(
+        &q,
+        &params,
+        rbitcoin_primitives::Height(0),
+        &genesis,
+        ms,
+    )
+    .unwrap();
+    let b1 =
+        rbitcoin_consensus::mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    rbitcoin_query::accept_and_connect_block(&q, &params, rbitcoin_primitives::Height(1), &b1, ms)
+        .unwrap();
+    let hash = b1.block_hash().to_byte_array();
+    let good = q.basic_filter_for_hash(&hash).unwrap().unwrap().0;
+    let sentinel = vec![0xab; 8];
+    rbitcoin_query::block_filter::lie_next_basic_filter_body(sentinel.clone());
+    rbitcoin_query::chain_view::forget_height_of_hash_on_call(2);
+    let got = q.basic_filter_for_hash(&hash).unwrap().unwrap().0;
+    assert_ne!(got, sentinel, "the moved height must not return that row");
+    assert_eq!(got, good);
+}

@@ -2076,10 +2076,10 @@ impl Store {
     /// Complete-or-fail per table. Call **before** body-queue dequeue so a kill
     /// mid-commit can re-drive from BQ when the barrier had not finished.
     ///
-    /// **Tip last on connect:** if `confirmed` were durable before `strong_tx`,
-    /// a mid-barrier kill advances tip with missing strong bits; re-confirm
-    /// skips those heights and `repair_class_c_above_tip` only clears leftover
-    /// strong not on the fence — permanent unstrong tip txs.
+    /// **Tip last on connect:** `confirmed` is published after the pre-tip
+    /// tables, so a kill cannot advance the tip ahead of that barrier. Open
+    /// sets a missing fence bit in `restore_strong_from_fence` and clears a
+    /// bit the fence does not name. A missing fence bit is not permanent.
     ///
     /// After confirmed is durable, publish soft `crate::TIP_SEAL_NAME` so open
     /// can clamp an incomplete extension that never finished this barrier.

@@ -128,6 +128,34 @@ fn append_does_not_replay_a_stale_ahead_over_new_tail() {
 }
 
 #[test]
+fn restore_keeps_a_newer_length_when_the_header_write_fails() {
+    let dir = TempDir::labeled("txstat-page0-header").unwrap();
+    let path = dir.join("txstat.body");
+    let first: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
+    let extra: Vec<TxStatRow> = (602..=700u64).map(|i| tiny(i, 100, 10)).collect();
+    {
+        let t = TxStat::create(&dir).unwrap();
+        t.append_batch(0, &first).unwrap();
+        fail_next_txstat_flush_after_ahead(&path);
+        assert!(t.write_row(Fk(1), &tiny(9, 9, 9)).is_err());
+        t.append_batch(601, &extra).unwrap();
+        assert_eq!(t.count(), 700);
+    }
+    fail_next_txstat_restore_before_header(&path);
+    assert!(
+        TxStat::open(&dir).is_err(),
+        "restore must stop before the header write"
+    );
+    let t = TxStat::open(&dir).unwrap();
+    assert_eq!(t.count(), 700, "page 0 replay planted the older length");
+    assert_eq!(
+        t.get_cell(Fk(700)).unwrap(),
+        pack_cell(&extra[98]).unwrap().0
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn create_empty_then_extend_zeros() {
     let dir = TempDir::labeled("txstat-extend").unwrap();
     let t = TxStat::create(&dir).unwrap();

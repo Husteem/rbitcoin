@@ -59,6 +59,55 @@ fn alloc_header_rejects_a_free_head_past_bump() {
 }
 
 #[test]
+fn alloc_header_rejects_a_bump_outside_the_body() {
+    let dir = rbitcoin_store::testutil::fresh_path("sh-alloc-bump");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scripthash.body");
+    let file = TableFile::create(&path, TableKind::ScriptHash).unwrap();
+    file.set_logical_len(8192).unwrap();
+    let state = AllocState {
+        live_count: 0,
+        bump: 8,
+        free_head: [0u64; SH_MAX_CLASS as usize + 1],
+    };
+    write_alloc_header(&file, &state).unwrap();
+    match read_alloc_header(&file) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("bump"), "{msg}"),
+        Ok(_) => panic!("bump below the prefix must be Corrupt"),
+        Err(other) => panic!("bump below the prefix must be Corrupt, got {other}"),
+    }
+    let state = AllocState {
+        live_count: 0,
+        bump: 9000,
+        free_head: [0u64; SH_MAX_CLASS as usize + 1],
+    };
+    write_alloc_header(&file, &state).unwrap();
+    match read_alloc_header(&file) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("bump"), "{msg}"),
+        Ok(_) => panic!("bump past the body must be Corrupt"),
+        Err(other) => panic!("bump past the body must be Corrupt, got {other}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pop_free_head_rejects_an_out_of_range_head() {
+    let dir = rbitcoin_store::testutil::fresh_path("sh-free-head");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scripthash.body");
+    let file = TableFile::create(&path, TableKind::ScriptHash).unwrap();
+    file.set_logical_len(8192).unwrap();
+    let mut heads = [0u64; SH_MAX_CLASS as usize + 1];
+    heads[0] = 8;
+    match pop_free_head(&file, &mut heads, 0, 8192) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("free head"), "{msg}"),
+        Ok(_) => panic!("a free head below the prefix must be Corrupt"),
+        Err(other) => panic!("a free head below the prefix must be Corrupt, got {other}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn slab_class_picks_smallest_fit_and_slack() {
     assert_eq!(slab_class_for_n_fks(0), None);
     assert_eq!(slab_class_for_n_fks(1), None);

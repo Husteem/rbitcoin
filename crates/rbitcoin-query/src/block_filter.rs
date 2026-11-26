@@ -19,6 +19,24 @@ use crate::{Query, QueryError};
 use std::sync::atomic::Ordering;
 use std::sync::{Condvar, Mutex};
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static LIE_FILTER_BODY: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The next `basic_filter_at` on this thread that finds a row returns `body`.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn lie_next_basic_filter_body(body: Vec<u8>) {
+    LIE_FILTER_BODY.with(|slot| *slot.borrow_mut() = Some(body));
+}
+
+#[cfg(debug_assertions)]
+fn take_lie_filter_body() -> Option<Vec<u8>> {
+    LIE_FILTER_BODY.with(|slot| slot.borrow_mut().take())
+}
+
 /// Core `getblockfilter` when the index has not reached this block.
 #[doc(hidden)]
 pub const FILTER_STILL_INDEXING: &str =
@@ -375,10 +393,14 @@ impl Query {
         let height = self.height_of_hash(hash)?;
         if let Some(h) = height {
             match self.basic_filter_at(h.0) {
-                Ok(Some(row)) => return Ok(Some(row)),
+                Ok(Some(row)) => {
+                    // A reload inside the repair can observe a block that
+                    // replaced `h`. That row is not the requested hash.
+                    if self.height_of_hash(hash)? == Some(h) {
+                        return Ok(Some(row));
+                    }
+                }
                 Ok(None) => {}
-                // A torn body is stale, not a dead index: rebuild it below.
-                Err(StoreError::Corrupt(_)) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -597,13 +619,20 @@ impl Query {
         let Some(table) = self.block_filter_table() else {
             return Ok(None);
         };
-        table
+        let mut row = table
             .filter(Height(height))?
             .map(|(body, slot)| {
                 let (body, slot) = self.repaired_filter_body(height, body, &slot)?;
                 Ok::<_, QueryError>((body, FilterHeader::from_byte_array(slot.filter_header)))
             })
-            .transpose()
+            .transpose()?;
+        #[cfg(debug_assertions)]
+        if let Some((body, _)) = row.as_mut() {
+            if let Some(lie) = take_lie_filter_body() {
+                *body = lie;
+            }
+        }
+        Ok(row)
     }
 
     /// Filter bytes for `start..=end` in one idx and one body read per
