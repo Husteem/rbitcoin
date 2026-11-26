@@ -1956,7 +1956,6 @@ fn rest_budget_state(budget: usize) -> (AppState, rbitcoin_store::testutil::Temp
         cookie: None,
         work_queue: Arc::new(Semaphore::new(1)),
         rest_queue: Arc::new(Semaphore::new(4)),
-        rest_store: Arc::new(Semaphore::new(1)),
         rest_reply_bytes: ReplyBytes::new(budget),
         rest: true,
         require_auth: true,
@@ -2239,6 +2238,7 @@ async fn rpc_waits_at_its_ceiling_of_the_store_budget() {
         cookie: None,
         work_queue: Arc::new(Semaphore::new(4)),
         rest_queue: Arc::new(Semaphore::new(4)),
+        rest_reply_bytes: ReplyBytes::new(REST_REPLY_BYTES),
         rest: false,
         require_auth: false,
     };
