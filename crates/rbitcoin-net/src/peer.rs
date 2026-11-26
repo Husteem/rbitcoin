@@ -6397,8 +6397,8 @@ fn note_advanced_best_known(
 /// Record `hdr` after it is admitted. A header whose parent is already marked
 /// keeps that unknown parent and one more step. A header that reaches a
 /// header we have, including through a parked parent that already does,
-/// drops every mark waiting on it. Marks parked on this hash before it
-/// arrived take the same parent. A new orphan root is one step.
+/// drops every mark waiting on it. While the parent is still unknown, marks
+/// already parked on this hash stay as they are. A new orphan root is one step.
 fn remember_admitted(
     hub: &ChainHub,
     follow: &mut PeerFollowState,
@@ -6463,53 +6463,46 @@ fn unlink_no_base(
 
 /// `own` is where `hash` sits after this admit. `None` means it reaches a
 /// header this node has, so `hash` and every mark parked on it go away.
-/// `Some` rewrites those marks onto the same unknown parent.
+/// `Some` records only this header. Rewriting descendants while the parent
+/// is still unknown copies the parked set on every newer-first admit.
 fn retarget_no_base(
     no_base: &mut NoBaseMap,
     kids: &mut HashMap<BlockHash, HashSet<BlockHash>>,
     hash: BlockHash,
     own: Option<(BlockHash, u32)>,
 ) {
-    let mut batch = Vec::new();
-    let mut stack = vec![(hash, 0u32)];
-    let mut seen = HashSet::new();
-    seen.insert(hash);
-    while let Some((node, above)) = stack.pop() {
-        if batch.len() >= MAX_PENDING_HEADERS {
-            break;
-        }
-        let Some(childs) = kids.get(&node) else {
-            continue;
-        };
-        let childs: Vec<BlockHash> = childs.iter().copied().collect();
-        for kid in childs {
-            if !seen.insert(kid) {
-                continue;
+    let Some((root, base)) = own else {
+        let mut batch = Vec::new();
+        let mut stack = vec![hash];
+        let mut seen = HashSet::new();
+        seen.insert(hash);
+        while let Some(node) = stack.pop() {
+            if batch.len() >= MAX_PENDING_HEADERS {
+                break;
             }
-            let Some((_, extra)) = no_base.get(&kid).copied() else {
+            let Some(childs) = kids.get(&node) else {
                 continue;
             };
-            let kid_above = above.saturating_add(extra);
-            batch.push((kid, kid_above));
-            stack.push((kid, kid_above));
-        }
-    }
-    match own {
-        Some((root, base)) => {
-            for (kid, above) in batch {
-                set_no_base(no_base, kids, kid, root, base.saturating_add(above));
+            let childs: Vec<BlockHash> = childs.iter().copied().collect();
+            for kid in childs {
+                if !seen.insert(kid) {
+                    continue;
+                }
+                if no_base.contains_key(&kid) {
+                    batch.push(kid);
+                    stack.push(kid);
+                }
             }
-            set_no_base(no_base, kids, hash, root, base);
         }
-        None => {
-            for (kid, _) in &batch {
-                unlink_no_base(no_base, kids, kid);
-                kids.remove(kid);
-            }
-            unlink_no_base(no_base, kids, &hash);
-            kids.remove(&hash);
+        for kid in &batch {
+            unlink_no_base(no_base, kids, kid);
+            kids.remove(kid);
         }
-    }
+        unlink_no_base(no_base, kids, &hash);
+        kids.remove(&hash);
+        return;
+    };
+    set_no_base(no_base, kids, hash, root, base);
 }
 
 fn forget_no_base(follow: &mut PeerFollowState, hash: &BlockHash) {

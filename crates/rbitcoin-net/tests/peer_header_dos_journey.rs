@@ -4614,6 +4614,76 @@ async fn a_later_connecting_page_clears_parked_marks() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Newest-first, each message is the parent of the headers already parked.
+/// Rewriting every descendant on that admit copies the parked set. The last
+/// header of an 8,000-header chain must stay inside the one-batch bound,
+/// and one more header on the leaf must still stop at the mark.
+#[tokio::test]
+async fn newest_first_park_does_not_copy_the_descendant_set() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-chain-newest");
+    let hub = std::sync::Arc::new(hub);
+    hub.ensure_genesis().unwrap();
+    hub.mine(1, op_true(), vec![]).unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18628, 68, true);
+    let (out_tx, _rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    let chain = regtest_header_chain(
+        BlockHash::from_byte_array([0x7b; 32]),
+        MAX_PENDING_HEADERS as u32,
+    );
+    let entries = pending_map_bytes();
+    // Every parent is still unknown, so none of these admits connect.
+    // `chain[0]` is the oldest and is sent once, below, so its admit is the one measured.
+    for hdr in chain.iter().rev().take(chain.len() - 1) {
+        push(
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(peer.as_ref()),
+            NetworkMessage::Headers(vec![*hdr]),
+        )
+        .await;
+    }
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS - 1);
+    let (largest, _) = asks_for(
+        &hub,
+        &out_tx,
+        &mut follow,
+        &peer,
+        entries,
+        NetworkMessage::Headers(vec![chain[0]]),
+    )
+    .await;
+    assert!(
+        largest < entries / 8,
+        "newest-first admit copied the descendant set: {largest} B against a {entries} B map"
+    );
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    let tip = *chain.last().unwrap();
+    let extension = regtest_headers_after(&tip, 1);
+    let _ = hub.take_path_work_steps();
+    let (largest, _) = asks_for(
+        &hub,
+        &out_tx,
+        &mut follow,
+        &peer,
+        entries,
+        NetworkMessage::Headers(extension),
+    )
+    .await;
+    let steps = hub.take_path_work_steps();
+    assert!(
+        steps <= 64,
+        "newest-first leaf: {steps} path-work steps"
+    );
+    assert!(
+        largest < entries / 8,
+        "newest-first leaf: largest ask {largest} B against a {entries} B map"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A connecting batch at the cap stages its evictions in the map and puts
 /// them back when it still does not fit: 7,000 parked ancestors of its
 /// parent stay, 1,000 headers that fail proof of work go, and 2,000 more
