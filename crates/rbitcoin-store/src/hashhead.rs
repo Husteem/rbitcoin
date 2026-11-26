@@ -394,6 +394,10 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
         return Err(StoreError::Corrupt("hash head ahead version"));
     }
     let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+    let payload = raw.len().saturating_sub(AHEAD_HEAD);
+    if !payload.is_multiple_of(AHEAD_REC) || payload / AHEAD_REC != count {
+        return Err(StoreError::Corrupt("hash head ahead length"));
+    }
     let mut at = AHEAD_HEAD;
     let mut images = Vec::with_capacity(count);
     for _ in 0..count {

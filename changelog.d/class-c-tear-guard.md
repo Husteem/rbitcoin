@@ -9,6 +9,11 @@ Fixed
   strong flush is repaired from the confirmed fence instead. `txstat.blk`
   and `txstat.ovf` are unchanged ([#2071],
   [#2072], [#2073], [#2075]).
+- **txstat appends use the Class A tail guard.** Append-only `txstat` batches
+  no longer mirror every new cell page into `txstat.body.ahead`; the Class A
+  page-0/tail guard already covers the only old page an append can touch. The
+  in-place `getblockstats` stamp still journals its page set. This removes
+  roughly one copy of `txstat.body` from a full IBD.
 - **Scripthash free-list and allocator state are ordered and checked.** The
   unlink batch syncs freed links before the allocator header that names
   them, the header's `bump` and free heads must be in range, a popped link

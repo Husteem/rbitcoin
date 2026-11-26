@@ -25,13 +25,13 @@ fn txstat_blob_longer_than_the_file_is_corrupt() {
 fn torn_txstat_page_restores_from_ahead_image() {
     let dir = TempDir::labeled("txstat-ahead").unwrap();
     let path = dir.join("txstat.body");
-    let rows: Vec<TxStatRow> = (1..=600u64).map(|i| tiny(i, 100, 10)).collect();
+    let rows: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
     {
         let t = TxStat::create(&dir).unwrap();
         t.append_batch(0, &rows).unwrap();
         fail_next_txstat_flush_after_ahead(&path);
         assert!(
-            t.append_batch(600, &[tiny(7, 1, 2)]).is_err(),
+            t.write_block_rows(Fk(1), 510, &rows[509..601]).is_err(),
             "the failpoint must stop before the cell pwrite"
         );
         assert!(dir.join("txstat.body.ahead").is_file());
@@ -57,7 +57,7 @@ fn torn_txstat_page_restores_from_ahead_image() {
     );
     assert_eq!(
         t.get_cell(Fk(601)).unwrap(),
-        pack_cell(&tiny(7, 1, 2)).unwrap().0
+        pack_cell(&rows[600]).unwrap().0
     );
     assert!(!dir.join("txstat.body.ahead").exists());
     let _ = std::fs::remove_dir_all(&dir);
@@ -246,6 +246,11 @@ fn txstat_open_rejects_every_bad_ahead_shape() {
     trailing.extend_from_slice(&ahead_page(4096));
     trailing.push(0);
 
+    let mut huge = ahead_body(4096);
+    huge[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&side, huge).unwrap();
+    assert!(TxStat::open(&dir).is_err());
+
     let body_path = dir.join("txstat.body");
     let before = std::fs::read(&body_path).unwrap();
     let mut prefix_then_trailing = ahead_body(4096);
@@ -287,5 +292,18 @@ fn txstat_open_rejects_every_bad_ahead_shape() {
         std::fs::write(&side, raw).unwrap();
         assert!(TxStat::open(&dir).is_err(), "case {case} was accepted");
     }
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+#[test]
+fn append_batch_relies_on_the_class_a_tail_guard() {
+    let dir = TempDir::labeled("txstat-append-no-ahead").unwrap();
+    let t = TxStat::create(&dir).unwrap();
+    t.append_batch(0, &[tiny(1, 2, 3)]).unwrap();
+    assert_eq!(t.count(), 1);
+    assert!(
+        !dir.join("txstat.body.ahead").exists(),
+        "an append-only batch must not copy the appended range"
+    );
     let _ = std::fs::remove_dir_all(dir.path());
 }

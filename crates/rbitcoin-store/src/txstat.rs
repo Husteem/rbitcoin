@@ -108,6 +108,10 @@ fn restore_ahead(path: &Path) -> Result<(), StoreError> {
     if count == 0 {
         return Err(StoreError::Corrupt("txstat ahead count"));
     }
+    let payload = raw.len().saturating_sub(AHEAD_HEAD);
+    if !payload.is_multiple_of(AHEAD_REC) || payload / AHEAD_REC != count {
+        return Err(StoreError::Corrupt("txstat ahead length"));
+    }
     let logical = u64::from_le_bytes([
         raw[12], raw[13], raw[14], raw[15], raw[16], raw[17], raw[18], raw[19],
     ]);
@@ -682,10 +686,9 @@ impl TxStat {
                 tails.push((base_count + 1 + i as u64, t));
             }
         }
-        let side = self.write_ahead_pages(start, &blob)?;
+        // Append-only. Class A tear_guard owns page 0 and the old partial
+        // tail; the barrier syncs txstat with the rest of the archive.
         self.body.write_at_pwrite(start, &blob)?;
-        self.body.sync_data_only()?;
-        Self::remove_ahead(side)?;
         let new = base_count + rows.len() as u64;
         self.count.store(new, Ordering::Release);
         Ok(tails)
