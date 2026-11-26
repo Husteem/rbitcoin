@@ -294,9 +294,12 @@ pub enum RepeatedInfo {
     /// A listener refused a socket to keep descriptors for the store and RPC.
     DescriptorReserve = 3,
     HealthAtMaxConnections = 4,
+    /// The SV2 template provider refused a socket at its session cap or its
+    /// netgroup's share.
+    Sv2AtMaxSessions = 5,
 }
 
-const REPEATED_INFO_SLOTS: usize = RepeatedInfo::HealthAtMaxConnections as usize + 1;
+const REPEATED_INFO_SLOTS: usize = RepeatedInfo::Sv2AtMaxSessions as usize + 1;
 const REPEATED_INFO_GAP_MS: u64 = 1_000;
 
 thread_local! {

@@ -566,6 +566,42 @@ async fn bip54_template_timelocks_the_coinbase() {
     tp.shutdown().await;
 }
 
+/// A template's transaction data is sent at most twice per session. A
+/// client asking for it again is closed, as a constraints flood is: each
+/// reply re-serializes every template transaction (#1944).
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_transaction_data_requests_close_the_session() {
+    let tc = shared_regtest(0);
+    use template_distribution_sv2::MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS;
+
+    let FirstTemplate {
+        tp,
+        mut c,
+        template_id,
+        ..
+    } = first_template(&tc).await;
+    for _ in 0..rbitcoin_sv2::session::MAX_TX_DATA_REPLIES {
+        c.request_transaction_data(template_id).await.unwrap();
+        let f = recv_in_time(&mut c).await;
+        assert_eq!(f.msg_type, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS);
+    }
+    c.request_transaction_data(template_id).await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Ok(f) = c.recv().await {
+            assert_ne!(
+                f.msg_type, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS,
+                "a third reply for one template must not be sent"
+            );
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "a further request for the same template must close the session"
+    );
+    tp.shutdown().await;
+}
+
 /// A solution whose header misses the target is dropped before
 /// `accept_block`: it never claims the compact-block prefill slot. A
 /// solution that meets it still becomes the tip.
