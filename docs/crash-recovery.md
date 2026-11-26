@@ -8,6 +8,78 @@ when bodies exist. A crash during that rebuild leaves no `meta`, so the next ope
 wipes the directory and rebuilds again. Leftover
 **prior layouts** (fuse8 v1, flat `tx.head.meta`) still **refuse**.
 
+## Store integrity: what a crash can and cannot do
+
+This is the guarantee the rest of this page implements. It assumes fail-stop
+hardware and correct software. A crash is a stop, not a silent hardware fault.
+A flipped historical byte is
+[`106`](./external_findings/106-historical-bitrot.md), not a crash.
+
+**Authoritative state.** Class A bodies, the Class C tip (`confirmed[]`,
+`header_txs_*`, `strong_tx`), and the spend delta plus `spent.body` are the
+store's own state. An index that can be rebuilt from Class A is not: `tx.head`
+(from `txid.body`), scripthash (from Class A), and silent-payment tweaks (from a
+Class A backfill). `header.head` is an index too, but it has no rebuild path
+and is listed below. The mempool sidecar is separate: RAM is its source of
+truth, open keeps a readable prefix, and Class A cannot restore an unconfirmed
+transaction.
+
+**What open trusts.**
+
+- Small markers (`meta`, `tip_seal`, `spend_durable`, `class_a.synced`) are
+  whole because each is a synced temp file renamed over the old one.
+  `tip_seal` only lowers a tip; it never raises one.
+- Class A keeps the highest create a durable `header_txs` range or
+  `class_a.synced` names, not the last bytes it finds. Page 0 is restored from
+  `tear_guard/first`; the partial tail block is restored from the alternating
+  `tear_guard/tail.0`/`tail.1` slots written with the stems before
+  `class_a.synced`. A leftover `{stem}.kept` from #1727 is applied on open as a
+  migration, not written by a current append.
+- The tip window re-reads every height above the durable marker `D`
+  (`(D, tip]`) and at least the last six. A missing marker walks from genesis.
+  A stored mismatch shrinks the tip to the last good height. An OS or
+  completion-session read error stops open at that read and does not treat it
+  as a bad block; a preceding trailing-null trim or `tip_seal` clamp may
+  already be persisted.
+- A fold over a page `spent.body` already holds is not trusted as found: the
+  composed page is written to a synced `spent.delta/fold` before `spent.body`,
+  and open copies that file again below the published end. The delta's own
+  files are append-only and publish by a commit rename.
+- `tx.head` rebuilds from `txid.body`; scripthash rebuilds from Class A on a
+  detected corrupt read; silent-payment tweaks have a Class A backfill. Block
+  filters have no read-triggered rebuild: a corrupt filter read returns an
+  error to its caller. Scripthash damage that open cannot parse still refuses
+  (see Thin scripthash).
+
+**The guarantee, for the guarded state.** A crash leaves a prefix of a state
+that existed: every row open keeps was durable before the crash, and the tip
+is never advanced before the Class A bodies, headers, strong bits, and
+`header_txs` range it names are written. The tip may be lower than the last
+in-process tip; that is lost progress, not a wrong chain. Open does not invent
+a height, a tx range, or a spend from a partially written block: it re-reads
+the window, rebuilds a derived index from Class A, or cuts the tail.
+
+**The residual in-place state.** The guarantee above does not yet cover a torn
+4 KiB block or 16 B table header in the arrays written in place.
+`header_txs_*` can lose a committed range below or inside the tip window: a
+missing range is accepted as `Ok` and the height is kept
+([#2071](https://github.com/rbitcoin-org/rbitcoin/issues/2071)). `strong_tx`
+can lose a confirmed bit below the window
+([#2072](https://github.com/rbitcoin-org/rbitcoin/issues/2072)), and
+`header.head` can lose a mapping for any height
+([#2073](https://github.com/rbitcoin-org/rbitcoin/issues/2073)). `confirmed[]`
+is held by `tip_seal` and `trim_trailing_nulls`, not by a redo. The scripthash
+allocator has the same exposure in its free list
+([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)), and the
+in-place derived cells are lower severity
+([#2075](https://github.com/rbitcoin-org/rbitcoin/issues/2075)). Until those
+are closed, the whole-store guarantee is the guarded state above, not every
+row. There is also no clean-close gate and no whole-store snapshot, so a Class
+B/C decode error after a crash can be crash damage rather than a hardware
+fault: the scripthash path marks the index degraded and rebuilds, while a
+Class A read error stops open. A design that needs one auditable "closed
+cleanly" predicate, or a whole-store restore, needs a snapshot instead.
+
 ## Tip as commit point
 
 Best-chain views ignore uncommitted Class C state:
