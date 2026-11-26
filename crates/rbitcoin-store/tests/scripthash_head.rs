@@ -473,3 +473,89 @@ fn leftover_ahead_pages_survive_a_later_write() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
 }
+
+/// A full chunk cache syncs and drops its sidecar. The next wave must not
+/// rewrite those pages into the image a failed sync leaves behind.
+#[test]
+fn cache_eviction_leaves_one_wave_in_the_ahead_image() {
+    let path = std::env::temp_dir().join(format!(
+        "rbitcoin-shhead-wave-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+    let distant = CHUNK_CACHE_MAX as u64 + 50;
+    let slots = (distant + 1) * SLOTS_PER_CHUNK;
+    let slots = slots.next_power_of_two();
+    let mut want = vec![false; distant as usize + 1];
+    let mut keys = Vec::with_capacity(CHUNK_CACHE_MAX + 1);
+    for i in 0u64.. {
+        let mut key = [0u8; 32];
+        key[0..8].copy_from_slice(&i.to_le_bytes());
+        let chunk =
+            ScriptHashHead::hash_slot(&ScriptHashHead::to_key(&key), slots) / SLOTS_PER_CHUNK;
+        let hit = (chunk as usize) < CHUNK_CACHE_MAX || chunk == distant;
+        if hit && !want[chunk as usize] {
+            want[chunk as usize] = true;
+            keys.push(key);
+            if keys.len() == CHUNK_CACHE_MAX + 1 {
+                break;
+            }
+        }
+    }
+    let mut wave_pages: Vec<u64> = (0..CHUNK_CACHE_MAX as u64)
+        .flat_map(|chunk| chunk_pages(chunk, slots))
+        .collect();
+    wave_pages.sort_unstable();
+    wave_pages.dedup();
+    let mut all_pages = wave_pages.clone();
+    all_pages.extend(chunk_pages(distant, slots));
+    all_pages.sort_unstable();
+    all_pages.dedup();
+    assert!(
+        all_pages.len() > wave_pages.len(),
+        "the extra chunk must add a page or the pin cannot see a merged sidecar"
+    );
+    let batch: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| (*key, ShHeadValue::inline_one(Fk(i as u64 + 1))))
+        .collect();
+    {
+        let h = ScriptHashHead::create_with_slots(&path, slots).unwrap();
+        let seed = key_in_chunk(CHUNK_CACHE_MAX as u64 + 2, slots, &keys);
+        h.insert_many(&[(seed, ShHeadValue::inline_one(Fk(1)))])
+            .unwrap();
+        h.flush().unwrap();
+        let handle = h.file.io_handle();
+        struct Disarm(rbitcoin_store::io_handle::IoHandle);
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                rbitcoin_store::io_handle::disarm_pwrite(self.0);
+            }
+        }
+        let _disarm = Disarm(handle);
+        rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+        assert!(
+            h.insert_many(&batch).is_err(),
+            "the armed sync must fail the wave barrier"
+        );
+    }
+    let mut name = path.file_name().unwrap().to_os_string();
+    name.push(".ahead");
+    let ahead = path.parent().unwrap().join(name);
+    let raw = std::fs::read(&ahead).expect("ahead image");
+    let pages = u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+    assert_eq!(
+        pages,
+        wave_pages.len(),
+        "the sidecar kept pages from more than one cache wave"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&ahead);
+    let _ = std::fs::remove_file(occ_sidecar_path(&path));
+}

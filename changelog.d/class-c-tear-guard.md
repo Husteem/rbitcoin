@@ -30,7 +30,10 @@ Fixed
   `free_slab` before `write_alloc_header`. An unlink batch syncs each body
   once after every free on that file, then writes its header once. Ingest
   rewrites in that batch share one `*.ahead` image; the home flush syncs
-  the head file and then drops the sidecar. `bump`
+  the head file and then drops the sidecar. A batch that does not sync
+  ingest leaves an outstanding ingest image in place. Covered ingest keys
+  cleared for a packed shard share one head barrier. A full head-page
+  cache syncs and drops its image before the next wave starts. `bump`
   and free heads must be in
   range, a popped link must be in range, and a slab's decoded count must
   match its head's `used`. A same-class slab rewritten in place can still

@@ -2933,10 +2933,12 @@ impl ScriptHashTable {
         let Some(ingest) = ingest.as_ref() else {
             return Err(StoreError::Corrupt("scripthash: ingest missing"));
         };
-        for key in &covered {
-            ingest.clear_key(key)?;
-        }
-        Ok(())
+        let rows: Vec<([u8; 32], ShHeadValue)> = covered
+            .iter()
+            .map(|key| (*key, ShHeadValue::Empty))
+            .collect();
+        ingest.stage_rewrites(&rows)?;
+        ingest.sync_and_drop_ahead()
     }
 
     #[doc(hidden)]

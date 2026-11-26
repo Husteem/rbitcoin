@@ -896,7 +896,9 @@ impl<'a> SlotPageCache<'a> {
         let chunk_idx = slot / SLOTS_PER_CHUNK;
         if !self.chunks.contains_key(&chunk_idx) {
             if self.chunks.len() >= CHUNK_CACHE_MAX {
-                self.flush()?;
+                // This wave is durable before the next one starts, so a later
+                // flush does not rewrite pages the sidecar already retired.
+                self.flush_durable()?;
             }
             let base_slot = chunk_idx * SLOTS_PER_CHUNK;
             let n = ((self.slots - base_slot) as usize).min(SLOTS_PER_CHUNK as usize);

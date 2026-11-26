@@ -346,9 +346,15 @@ impl ScriptHashTable {
             };
             head.stage_rewrites(&ingest_rows)?;
         }
+        let ingest_synced = batch
+            .rewrites
+            .iter()
+            .any(|job| matches!(job.home, LocatedHome::Main | LocatedHome::Ingest));
         self.sync_batch_homes(&batch)?;
-        if let Some(head) = self.ingest.lock().unwrap().as_ref() {
-            head.drop_ahead()?;
+        if ingest_synced {
+            if let Some(head) = self.ingest.lock().unwrap().as_ref() {
+                head.drop_ahead()?;
+            }
         }
         // One barrier per body, after every free-list write for that file.
         let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
