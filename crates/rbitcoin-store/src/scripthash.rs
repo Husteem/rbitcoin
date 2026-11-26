@@ -13,7 +13,7 @@ use crate::scripthash_head::{prefix_shard_of, ScriptHashHead};
 use crate::scripthash_layout::{
     head_key_from_full, pack8, pack8_bytes, payload_start, slab_bytes, ShHeadValue,
     SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS,
-    SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
+    SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS, SH_PREFIX_PAGE,
 };
 use crate::scripthash_mphf::{mix_key16, MphfHead};
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
@@ -344,7 +344,11 @@ pub fn pop_free_head(
     let off = free_head[idx];
     let mut next = [0u8; 8];
     body.read_at(off, &mut next)?;
-    free_head[idx] = u64::from_le_bytes(next);
+    let next = u64::from_le_bytes(next);
+    if next != 0 && (next < SH_PREFIX_PAGE as u64 || next >= body.logical_len()) {
+        return Err(StoreError::Corrupt("scripthash free link out of range"));
+    }
+    free_head[idx] = next;
     Ok(Some(off))
 }
 
@@ -3493,15 +3497,25 @@ pub fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreErr
     }
     let live_count = le_u64!(buf, 8);
     let bump = le_u64!(buf, 16);
+    let logical = body.logical_len();
+    if bump < SH_PREFIX_PAGE as u64 || bump > logical {
+        return Err(StoreError::Corrupt("scripthash alloc bump out of range"));
+    }
     let mut free_head = [0u64; SH_MAX_CLASS as usize + 1];
     let mut off = 24usize;
-    for h in &mut free_head {
+    for (class, h) in free_head.iter_mut().enumerate() {
         if off + 8 > avail {
             break;
         }
         let mut word = [0u8; 8];
         word.copy_from_slice(&buf[off..off + 8]);
         *h = u64::from_le_bytes(word);
+        if *h != 0
+            && (*h < SH_PREFIX_PAGE as u64
+                || h.saturating_add(slab_bytes(class as u8)) > bump)
+        {
+            return Err(StoreError::Corrupt("scripthash free head out of range"));
+        }
         off += 8;
     }
     Ok((

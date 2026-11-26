@@ -336,6 +336,10 @@ impl ScriptHashTable {
                 let _ = write_alloc_header(body, &alloc);
                 return Err(e);
             }
+            // Free-list links are durable before the header that names them.
+            // A crash between the two leaves the old header and a leak, never
+            // a header pointing at a link the device did not take.
+            body.sync_data_only()?;
             write_alloc_header(body, &alloc)?;
         }
         Ok(())

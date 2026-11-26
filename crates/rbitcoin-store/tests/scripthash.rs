@@ -1600,8 +1600,9 @@ fn alloc_header_reads_the_counts() {
 
     let mut next = state;
     next.live_count = 4;
-    next.bump = state.bump + 8;
-    next.free_head[3] = 8192;
+    next.bump = 8192;
+    next.free_head[3] = 4096;
+    body.set_logical_len(next.bump).unwrap();
     write_alloc_header(&body, &next).unwrap();
     let (state, ver) = match read_alloc_header(&body) {
         Ok(v) => v,
@@ -1610,7 +1611,7 @@ fn alloc_header_reads_the_counts() {
     assert_eq!(ver, SH_ALLOC_VERSION);
     assert_eq!(state.live_count, 4);
     assert_eq!(state.bump, next.bump);
-    assert_eq!(state.free_head[3], 8192);
+    assert_eq!(state.free_head[3], 4096);
 }
 
 #[test]

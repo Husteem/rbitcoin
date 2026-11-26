@@ -1,6 +1,8 @@
-use rbitcoin_primitives::Fk;
+use rbitcoin_primitives::{Fk, TableKind};
 use rbitcoin_store::error::StoreError;
-use rbitcoin_store::scripthash_layout::slab_bytes;
+use rbitcoin_store::file::TableFile;
+use rbitcoin_store::scripthash::{read_alloc_header, write_alloc_header, AllocState};
+use rbitcoin_store::scripthash_layout::{slab_bytes, SH_MAX_CLASS, SH_PREFIX_PAGE};
 use rbitcoin_store::scripthash_pages::SH_FLAG_BIT;
 use rbitcoin_store::scripthash_slabs::*;
 
@@ -28,6 +30,30 @@ fn decode_slab(buf: &[u8]) -> Result<Vec<Fk>, StoreError> {
     let mut out = Vec::new();
     decode_slab_payload_into(buf, &mut out)?;
     Ok(out)
+}
+
+#[test]
+fn alloc_header_rejects_a_free_head_past_bump() {
+    let dir = rbitcoin_store::testutil::fresh_path("sh-alloc-range");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scripthash.body");
+    let file = TableFile::create(&path, TableKind::ScriptHash).unwrap();
+    file.set_logical_len(SH_PREFIX_PAGE as u64).unwrap();
+    let mut state = AllocState {
+        live_count: 0,
+        bump: SH_PREFIX_PAGE as u64,
+        free_head: [0u64; SH_MAX_CLASS as usize + 1],
+    };
+    state.free_head[0] = state.bump.saturating_add(8);
+    write_alloc_header(&file, &state).unwrap();
+    match read_alloc_header(&file) {
+        Err(StoreError::Corrupt(_)) => {}
+        Ok((_, version)) => {
+            panic!("out-of-range free head must be Corrupt, read version {version}")
+        }
+        Err(other) => panic!("out-of-range free head must be Corrupt, got {other}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
