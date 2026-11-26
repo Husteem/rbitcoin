@@ -1997,6 +1997,45 @@ async fn a_queued_last_frame_keeps_the_reply_bytes() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
+/// A reply over two slices goes out as full slices in order, then the tail,
+/// and the size hint counts down what is left. Any one slice still held keeps
+/// the reply's bytes after the body and the other slices are dropped.
+#[tokio::test]
+async fn a_multi_slice_reply_keeps_its_bytes_while_any_slice_lives() {
+    use hyper::body::Body as _;
+    let len = 2 * REST_REPLY_CHUNK + 1;
+    let budget = ReplyBytes::new(4 * REST_REPLY_CHUNK);
+    let total = budget.available();
+    let reply: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    let mut body = budget.body(reply.clone()).expect("budget free");
+    assert_eq!(total - budget.available(), len);
+    assert_eq!(body.size_hint().exact(), Some(len as u64));
+    let mut slices = Vec::new();
+    for want in [REST_REPLY_CHUNK, REST_REPLY_CHUNK, 1] {
+        let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+            .await
+            .expect("a frame")
+            .expect("no error");
+        let data = frame.into_data().expect("a data frame");
+        assert_eq!(data.len(), want);
+        slices.push(data);
+        let sent: usize = slices.iter().map(|s| s.len()).sum();
+        assert_eq!(body.size_hint().exact(), Some((len - sent) as u64));
+    }
+    assert!(body.is_end_stream());
+    assert_eq!(slices.concat(), reply, "slices are the reply in order");
+    let kept = slices.swap_remove(1);
+    drop(body);
+    drop(slices);
+    assert_eq!(
+        total - budget.available(),
+        len,
+        "the middle slice holds the reply"
+    );
+    drop(kept);
+    assert_eq!(budget.available(), total);
+}
+
 /// A later long-poll drops the work-queue slot. A slot taken during the wait
 /// is waited for, not reported as a queue error. The calls that follow still
 /// run. A POST that has not run a call is still 503.

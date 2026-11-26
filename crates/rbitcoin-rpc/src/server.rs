@@ -277,6 +277,19 @@ impl ReplyBytes {
         let want = u32::try_from(len).map_or(self.total, |n| n.min(self.total));
         Arc::clone(&self.permits).try_acquire_many_owned(want).ok()
     }
+
+    /// A built reply as a body that holds its bytes of this budget until the
+    /// body and every slice it handed out are dropped. `None` when they are
+    /// not free now.
+    pub fn body(&self, reply: Vec<u8>) -> Option<axum::body::Body> {
+        let bytes = self.try_take(reply.len())?;
+        Some(axum::body::Body::new(RestReplyBody {
+            rest: Bytes::from_owner(BudgetedReply {
+                body: reply,
+                _bytes: bytes,
+            }),
+        }))
+    }
 }
 
 /// Omitted and `0` are [`DEFAULT_RPC_WORK_QUEUE`]. A positive `N` is `N`.
@@ -546,18 +559,13 @@ pub async fn rest_entry(State(state): State<AppState>, req: axum::extract::Reque
         content_type: "text/plain",
         body: b"rest failed\n".to_vec(),
     });
-    let Some(bytes) = state.rest_reply_bytes.try_take(reply.body.len()) else {
+    let Some(body) = state.rest_reply_bytes.body(reply.body) else {
         return rest_queue_full();
     };
     (
         reply.status,
         [(header::CONTENT_TYPE, reply.content_type)],
-        axum::body::Body::new(RestReplyBody {
-            rest: Bytes::from_owner(BudgetedReply {
-                body: reply.body,
-                _bytes: bytes,
-            }),
-        }),
+        body,
     )
         .into_response()
 }
@@ -572,7 +580,8 @@ fn rest_queue_full() -> Response {
 
 /// Largest slice of a REST reply handed to hyper at once. Hyper polls for
 /// the next slice only once its write buffer has room.
-const REST_REPLY_CHUNK: usize = 64 * 1024;
+#[doc(hidden)]
+pub const REST_REPLY_CHUNK: usize = 64 * 1024;
 
 /// A built REST reply's bytes and their share of [`REST_REPLY_BYTES`]. Every
 /// slice handed to hyper shares this allocation, so the share goes back only
