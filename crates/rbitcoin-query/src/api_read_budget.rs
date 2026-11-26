@@ -76,7 +76,8 @@ impl ApiReadBudget {
     /// `size` permits split across `enabled`. The enabled surfaces split it
     /// evenly, the remainder one permit each to the first of them in
     /// [`ALL_API_SURFACES`] order, at least one each. A surface that is off
-    /// has no minimum. A surface's ceiling is `size` when no other surface is
+    /// has no minimum but borrows like the others, so a caller that arms it
+    /// still reads instead of waiting forever. A surface's ceiling is `size` when no other surface is
     /// on, otherwise `size - 1`, never below its minimum and at least one.
     /// `0` waits forever.
     pub fn new(size: usize, enabled: &[ApiSurface]) -> Arc<Self> {

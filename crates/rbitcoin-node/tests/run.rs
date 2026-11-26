@@ -1623,8 +1623,9 @@ fn startup_sets_datadir_hdd_on_the_store() {
 }
 
 /// The store-read budget is split across the API surfaces this config
-/// turns on. A surface that is off is not counted, so one surface alone may
-/// use the whole budget, and the enabled shares sum to the budget.
+/// turns on. A surface that is off has no minimum, so one surface alone may
+/// use the whole budget; with fewer permits than surfaces each still has a
+/// minimum of one.
 #[test]
 fn startup_splits_the_store_read_budget_across_enabled_surfaces() {
     use rbitcoin_query::ApiSurface::{Electrum, Esplora, Rest, Rpc};

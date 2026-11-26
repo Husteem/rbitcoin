@@ -165,3 +165,40 @@ fn the_budget_is_split_across_the_enabled_surfaces() {
     let two = ApiReadBudget::new(2, &[Rpc, Electrum]);
     assert_eq!((two.min(Rpc), two.ceil(Rpc)), (1, 1), "nothing to borrow");
 }
+
+/// Freed permits that only borrowers want go round the surfaces in turn,
+/// and a surface's waiters are served in the order they asked.
+#[tokio::test]
+async fn borrowers_take_freed_permits_in_turn() {
+    let (_dir, q) = budget("budget-turn", 6, &[Rpc, Rest, Electrum]);
+    let budget = q.api_read_budget();
+    let _rpc = [take(&q, Rpc).await.unwrap(), take(&q, Rpc).await.unwrap()];
+    let _rest = [take(&q, Rest).await.unwrap(), take(&q, Rest).await.unwrap()];
+    let mut electrum = vec![
+        take(&q, Electrum).await.unwrap(),
+        take(&q, Electrum).await.unwrap(),
+    ];
+    // Every surface holds its split. Two RPC waiters ask, then two REST.
+    let mut waits = Vec::new();
+    for s in [Rpc, Rpc, Rest, Rest] {
+        waits.push(wait_for(&q, s));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!((budget.waiting(Rpc), budget.waiting(Rest)), (2, 2));
+
+    drop(electrum.pop());
+    let _first = tokio::time::timeout(Duration::from_secs(5), &mut waits[0])
+        .await
+        .expect("the first RPC waiter is served first")
+        .unwrap();
+    drop(electrum.pop());
+    let _second = tokio::time::timeout(Duration::from_secs(5), &mut waits[2])
+        .await
+        .expect("then REST, not the second RPC waiter")
+        .unwrap();
+    assert!(!waits[1].is_finished(), "the second RPC waiter still waits");
+    assert_eq!((budget.held(Rpc), budget.held(Rest)), (3, 3));
+    for w in waits {
+        w.abort();
+    }
+}
