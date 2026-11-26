@@ -118,6 +118,7 @@ impl P2PNode {
             max_inbound,
             dialer,
             redial,
+            false,
         )
         .await
     }
@@ -142,10 +143,14 @@ impl P2PNode {
             max_inbound,
             dialer,
             redial,
+            false,
         )
         .await
     }
 
+    /// `hold_inbound`: listeners bind but accept nothing until
+    /// [`PeerHub::publish_local_endpoints`], so inbound is judged with the
+    /// permission table and forwarding facts in place.
     #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
     pub async fn start_inner(
         listen: Option<SocketAddr>,
@@ -156,6 +161,7 @@ impl P2PNode {
         max_inbound: usize,
         dialer: crate::socks::Dialer,
         redial: Duration,
+        hold_inbound: bool,
     ) -> Result<Self, NetError> {
         let magic = magic_for_params(&params);
         let hub = ChainHub::into_arc(ChainHub::new(query, params, milestone));
@@ -174,6 +180,9 @@ impl P2PNode {
         };
 
         let peers = PeerHub::new();
+        if hold_inbound {
+            peers.hold_inbound();
+        }
         let (dial_tx, mut dial_rx) = tokio::sync::mpsc::unbounded_channel::<DialRequest>();
         peers.set_dialer(dial_tx);
 
@@ -511,6 +520,11 @@ pub fn spawn_inbound_accept(
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = stop.changed() => return,
+            () = peers.wait_inbound_open() => {}
+        }
         loop {
             if shutdown.load(Ordering::SeqCst) {
                 break;

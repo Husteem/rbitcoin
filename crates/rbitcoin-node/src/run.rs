@@ -610,33 +610,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let p2p_ua =
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &config.uacomments)
             .unwrap_or_else(|_| format!("/rbitcoin:{}/", env!("CARGO_PKG_VERSION")));
-    let mut node = match bind {
-        Some(listen) => {
-            P2PNode::start_with_dialer(
-                listen,
-                query,
-                params.clone(),
-                milestone,
-                p2p_ua,
-                config.listen.max_inbound as usize,
-                config.listen.dialer(),
-                config.connect_redial,
-            )
-            .await
-        }
-        None => {
-            P2PNode::start_outbound_only(
-                query,
-                params.clone(),
-                milestone,
-                p2p_ua,
-                config.listen.max_inbound as usize,
-                config.listen.dialer(),
-                config.connect_redial,
-            )
-            .await
-        }
-    }
+    // Inbound waits for `publish_local_endpoints` below: until then the
+    // node does not know which loopback peers Tor or I2P forwards.
+    let mut node = P2PNode::start_inner(
+        bind.filter(|_| config.listen.max_inbound > 0),
+        query,
+        params.clone(),
+        milestone,
+        p2p_ua,
+        config.listen.max_inbound as usize,
+        config.listen.dialer(),
+        config.connect_redial,
+        true,
+    )
+    .await
     .map_err(|e| p2p_start_err("p2p start", e))?;
     node.peers
         .set_trust_peer(config.trust_peer, config.trust_peer_host.clone());
