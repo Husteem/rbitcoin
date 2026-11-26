@@ -786,15 +786,17 @@ impl TxStat {
         // Append-only. Class A tear_guard owns page 0 and the old partial
         // tail; the barrier syncs txstat with the rest of the archive.
         // Drop leftover images this append supersedes so restore cannot
-        // replay them over the new tail; keep pages it does not touch.
+        // replay them over the new tail. An image whose pages all stay is
+        // already the right file, so leave it in place.
         if let Some(old) = load_ahead(self.body.path())? {
             let end = start + blob.len() as u64;
             let mut old_blocks = old.pages;
+            let before = old_blocks.len();
             old_blocks.retain(|&off, _| off.saturating_add(4096) <= start || off >= end);
             let side = ahead_path(self.body.path());
             if old_blocks.is_empty() {
                 Self::remove_ahead(Some(side))?;
-            } else {
+            } else if old_blocks.len() != before {
                 let buf = encode_ahead(old.logical, &old_blocks);
                 file::write_synced_tmp_rename(&side, &buf)?;
             }

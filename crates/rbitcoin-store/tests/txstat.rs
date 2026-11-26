@@ -104,6 +104,72 @@ fn leftover_ahead_pages_survive_a_later_write() {
 }
 
 #[test]
+fn append_keeps_an_uncovered_ahead_file() {
+    let dir = TempDir::labeled("txstat-ahead-keep").unwrap();
+    let path = dir.join("txstat.body");
+    let side = dir.join("txstat.body.ahead");
+    let rows: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
+    let extra: Vec<TxStatRow> = (602..=610u64).map(|i| tiny(i, 100, 10)).collect();
+    let stamped = tiny(9, 9, 9);
+    {
+        let t = TxStat::create(&dir).unwrap();
+        t.append_batch(0, &rows).unwrap();
+        fail_next_txstat_flush_after_ahead(&path);
+        assert!(t.write_row(Fk(1), &stamped).is_err());
+        let before = std::fs::read(&side).unwrap();
+        #[cfg(unix)]
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&side).unwrap().ino()
+        };
+        t.append_batch(601, &extra).unwrap();
+        assert_eq!(std::fs::read(&side).unwrap(), before);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&side).unwrap().ino(),
+                ino,
+                "append rewrote an ahead image it did not change"
+            );
+        }
+    }
+    let t = TxStat::open(&dir).unwrap();
+    assert_eq!(t.get_cell(Fk(1)).unwrap(), pack_cell(&stamped).unwrap().0);
+    assert_eq!(
+        t.get_cell(Fk(610)).unwrap(),
+        pack_cell(&extra[8]).unwrap().0
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn append_drops_ahead_pages_the_new_tail_covers() {
+    let dir = TempDir::labeled("txstat-ahead-drop").unwrap();
+    let path = dir.join("txstat.body");
+    let rows: Vec<TxStatRow> = (1..=601u64).map(|i| tiny(i, 100, 10)).collect();
+    let extra: Vec<TxStatRow> = (602..=700u64).map(|i| tiny(i, 100, 10)).collect();
+    {
+        let t = TxStat::create(&dir).unwrap();
+        t.append_batch(0, &rows).unwrap();
+        fail_next_txstat_flush_after_ahead(&path);
+        assert!(t.write_block_rows(Fk(1), 510, &rows[509..601]).is_err());
+        t.append_batch(601, &extra).unwrap();
+    }
+    let t = TxStat::open(&dir).unwrap();
+    assert_eq!(
+        t.get_cell(Fk(602)).unwrap(),
+        pack_cell(&extra[0]).unwrap().0,
+        "restore replayed a covered ahead page over the new tail"
+    );
+    assert_eq!(
+        t.get_cell(Fk(510)).unwrap(),
+        pack_cell(&rows[509]).unwrap().0
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn append_does_not_replay_a_stale_ahead_over_new_tail() {
     let dir = TempDir::labeled("txstat-stale-ahead").unwrap();
     let path = dir.join("txstat.body");
