@@ -6409,13 +6409,7 @@ fn remember_admitted(
         return;
     }
     let prev = hdr.prev_blockhash;
-    // A parent mark whose root has since connected is stale. The parent then
-    // counts as parked, so the marks waiting on this hash are dropped.
-    let parent = follow
-        .pending_no_base
-        .get(&prev)
-        .copied()
-        .filter(|(root, _)| !is_genesis_hash(root) && !hub.knows_header(root));
+    let parent = follow.pending_no_base.get(&prev).copied();
     let parent_parked = follow.pending_headers.contains_key(&prev);
     let own = if let Some((root, depth)) = parent {
         Some((root, depth.saturating_add(1)))
