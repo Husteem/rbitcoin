@@ -2570,18 +2570,11 @@ impl PeerHub {
     /// for every loopback peer. Startup warns on this.
     pub fn forwarded_loopback_drops_grants(&self) -> bool {
         let table = self.net_perms.lock().unwrap_or_else(|e| e.into_inner());
-        [
-            IpAddr::from([127, 0, 0, 1]),
-            IpAddr::from(std::net::Ipv6Addr::LOCALHOST),
-        ]
-        .into_iter()
-        .any(|lo| {
-            self.loopback_forwarded(&table, lo)
-                && table
-                    .whitelist
-                    .iter()
-                    .any(|g| g.inbound && g.subnet.contains(lo))
-        })
+        self.loopback_forwarded(&table, IpAddr::from([127, 0, 0, 1]))
+            && table
+                .whitelist
+                .iter()
+                .any(|g| g.inbound && g.subnet.overlaps_loopback())
     }
 
     /// Inbound that a Tor or I2P forwarder delivers: the marked onion bind,

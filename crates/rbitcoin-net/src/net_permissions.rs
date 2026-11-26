@@ -86,6 +86,16 @@ pub enum Subnet {
 }
 
 impl Subnet {
+    /// Some address in `127.0.0.0/8` or `::1` is in this subnet.
+    pub fn overlaps_loopback(self) -> bool {
+        match self {
+            Subnet::V4 { addr, .. } => {
+                addr.octets()[0] == 127 || self.contains(IpAddr::from([127, 0, 0, 1]))
+            }
+            Subnet::V6 { .. } => self.contains(IpAddr::from(Ipv6Addr::LOCALHOST)),
+        }
+    }
+
     pub fn contains(self, ip: IpAddr) -> bool {
         // Core's `CNetAddr` reads a v4-in-v6 address as IPv4, so a V4 subnet
         // matches the mapped form too (an outbound `[::ffff:a.b.c.d]` peer).
