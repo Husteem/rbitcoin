@@ -35,9 +35,15 @@ transaction.
   `tear_guard/tail.0`/`tail.1` slots written with the stems before
   `class_a.synced`. A leftover `{stem}.kept` from #1727 is applied on open as a
   migration, not written by a current append.
-- Class C `header_txs_*`, `header.head`, `txstat.body`, and the scripthash
-  ingest head write a synced `*.ahead` image of the intended pages before an
-  in-place write; open restores it before reading the table.
+- Class C `confirmed[]`, `header_txs_*`, `header.head`, `txstat.body`, and the
+  scripthash ingest head write a synced `*.ahead` image of the intended pages
+  before an in-place write; open restores it before reading the table. An
+  array flush always images page 0, because it rewrites the length there even
+  when a shrink writes no slot.
+- `confirmed[]` has no null slot below the tip open keeps: the lower of the
+  tip and the sealed tip, less a trailing null run. Store open refuses one
+  before it builds the fence, since a torn page comes back from its image and
+  such a null is not crash damage. The fix is a reindex.
 - The tip window re-reads every height above the durable marker `D`
   (`(D, tip]`) and at least the last six. A missing marker walks from genesis.
   A stored mismatch shrinks the tip to the last good height. An OS or
@@ -62,11 +68,11 @@ in-process tip; that is lost progress, not a wrong chain. Open does not invent
 a height, a tx range, or a spend from a partially written block: it re-reads
 the window, rebuilds a derived index from Class A, or cuts the tail.
 
-**The residual in-place state.** `header_txs_*`, `header.head`, `txstat.body`,
-and the scripthash ingest head journal a synced `*.ahead` image, and open
-restores it. A strong bit a fence run names is set again by
-`restore_strong_from_fence`. `strong_tx` has no sidecar. `confirmed[]` is held by `tip_seal` and
-`trim_trailing_nulls`, not by a redo. The scripthash index is gated instead
+**The residual in-place state.** `confirmed.body`, `header_txs_*`,
+`header.head`, `txstat.body`, and the scripthash ingest head journal a synced
+`*.ahead` image, and open restores it. A strong bit a fence run names is set
+again by `restore_strong_from_fence`. `strong_tx` has no sidecar. The
+scripthash index is gated instead
 of repaired: an append, an unlink or a deferred empty-head commit writes
 `scripthash.dirty` before it writes. A full synced `ScriptHashTable::flush`
 (file data, then the `scripthash.body`, `scripthash.head` and
@@ -108,7 +114,8 @@ Best-chain views ignore uncommitted Class C state:
 
 On open (in order):
 
-1. Soft `store/tip_seal` (if present): clamp confirmed tip that advanced without a complete barrier seal.
+0. Store open restores `confirmed.body.ahead`, then refuses a null `confirmed[]` slot below the tip open keeps (What open trusts, above).
+1. Soft `store/tip_seal` (if present): clamp confirmed tip that advanced without a complete barrier seal. This runs before the trailing-null trim, so a null run the clamp leaves on top is trimmed too.
 2. **Tip-window revalidate** (Core `-checkblocks`, default 6, `0` = all): first drop any trailing null `confirmed[]` slots (HWM ahead of last real tip), then the last N confirmed heights — `prev_fk`/hash chain, `header_txs` range bounds, merkle root from `txid.body`, and parent edges on `input`. The walk does not reject a height for a missing strong bit: open sets every strong bit a fence run names before the walk, and again after a shrink. The walk logs `store: tip revalidate <lo>..=<tip>` before the first height and a progress line every 10 seconds. For each create in a checked block, `input` must be stamped, the edge count must match the `seqsigwit` input count (skipped under `--prune-seqsigwit`), the first tx must be the only coinbase edge, and every other edge must name an existing create with an in-range vout. A missing `spend_durable` file is the whole chain (`n == 0`): nothing has been device-flushed, and a matching last 6 heights is not a proof. A present marker widens any other window to at least 6 and far enough to cover `(D, tip]`. `checkblocks=0` stays the whole chain. On failure: clear bad Class A association and/or shrink tip to last good height, rebuild the fence, flush confirmed. A read that fails is not a bad block. An OS error or a completion-session fault (anything but a corrupt or missing record, or a stored length past the body read cap) stops open with that error and changes nothing, as Core stops on a block it cannot read. The next start walks the same window. A short new-layout `input` high-water mark is Class A count skew: open truncates the other stems to the stamped input count before this window, so a `header_txs` range past that count shrinks the tip. Open does not stamp `n_in = 0` onto `PREV_ON_INPUTS` creates. A legacy store with no `input` file, or a partial legacy tail whose next record still has an inline prevout, still backfills edges from `seqsigwit`.
 3. After that walk, the same clear and restore run again, so a shrink does not leave strong bits off the final fence. `repair_class_c_above_tip` clears bits **not on the fence** via complement ranges (holes + suffix until a zero page) and does **not** walk every set bit. `restore_strong_from_fence` sets a bit a surviving run names. The clear logs `class_c repair cleared= ranges= ms=` even when zero.
 4. Replay spend annotations for every height in `(A, tip]` (`spend_durable` annotated-through). A missing file has no device-flushed cursor, so `A = 0` and the chain is rewritten. `finish_post_commit_hashes` is idempotent. Then `sync_data` the replay inputs and publish `A` and durable-through `D` at the surviving tip. The replay logs height progress every 10 seconds.

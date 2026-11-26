@@ -381,7 +381,10 @@ fn seal_clamp_exposes_null_run_and_tip_drops_below_it() {
     let r = s.revalidate_tip_window_n(6).unwrap();
     let tip = s.confirmed.tip_height().expect("a tip below the null run");
     assert_eq!(tip, Height(4), "{r:?}");
-    assert!(s.confirmed.get(tip).unwrap().is_some(), "tip is a null slot");
+    assert!(
+        s.confirmed.get(tip).unwrap().is_some(),
+        "tip is a null slot"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
