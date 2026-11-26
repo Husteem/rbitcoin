@@ -2729,7 +2729,15 @@ async fn failed_outpoint_read_is_retried_at_the_next_tip() {
     assert_eq!(other["result"]["spent"], false, "{other}");
     pad_block(&pad.q, 2, 0, &[pad_coinbase(2, 0)]);
     pad_tip(&pad, 2, None);
-    let push = pad.call(4, "server.ping", json!([])).await;
+    // Both subscriptions are restatused, in no fixed order.
+    let mut lines = vec![pad.call(4, "server.ping", json!([])).await];
+    while lines.last().is_some_and(|l| l["id"] != 4) {
+        lines.push(pad.read().await);
+    }
+    let push = lines
+        .iter()
+        .find(|l| l["params"][0] == genesis)
+        .unwrap_or_else(|| panic!("no push for the failed read: {lines:?}"));
     assert_eq!(push["method"], "blockchain.outpoint.subscribe", "{push}");
     assert_eq!(push["params"][2]["spent"], true, "{push}");
     let _ = std::fs::remove_dir_all(&pad.dir);
