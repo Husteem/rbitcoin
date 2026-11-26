@@ -35,6 +35,9 @@ transaction.
   `tear_guard/tail.0`/`tail.1` slots written with the stems before
   `class_a.synced`. A leftover `{stem}.kept` from #1727 is applied on open as a
   migration, not written by a current append.
+- Class C `header_txs_*`, `header.head`, and `txstat.body` write a synced
+  `*.ahead` image of the intended pages before an in-place write; open restores
+  it before reading the table.
 - The tip window re-reads every height above the durable marker `D`
   (`(D, tip]`) and at least the last six. A missing marker walks from genesis.
   A stored mismatch shrinks the tip to the last good height. An OS or
