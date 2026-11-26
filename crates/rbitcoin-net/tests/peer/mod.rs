@@ -4423,7 +4423,6 @@ fn recent_reject_is_not_requested_from_other_peers() {
         let sender = register(18444, 1);
         let by_txid = register(18445, 2);
         let by_wtxid = register(18446, 3);
-        by_wtxid.set_wtxid_relay();
 
         async fn getdata_for(
             hub: &ChainHub,
@@ -4500,14 +4499,17 @@ fn recent_reject_is_not_requested_from_other_peers() {
             "a rejected tx is not requested by txid"
         );
         assert_eq!(
-            getdata_for(&hub, &by_wtxid, Inventory::WTx(wtxid)).await,
-            vec![],
-            "a rejected tx is not requested by wtxid"
-        );
-        assert_eq!(
             getdata_for(&hub, &by_txid, Inventory::Transaction(child_txid)).await,
             vec![],
             "the segwit child of a rejected tx is not requested by txid"
+        );
+        // A txid ask waits while a wtxid-relay peer is connected, so the
+        // txid checks above come first: a delayed ask is also an empty getdata.
+        by_wtxid.set_wtxid_relay();
+        assert_eq!(
+            getdata_for(&hub, &by_wtxid, Inventory::WTx(wtxid)).await,
+            vec![],
+            "a rejected tx is not requested by wtxid"
         );
         let _ = std::fs::remove_dir_all(dir);
     });
@@ -8744,7 +8746,12 @@ async fn other_peers_rows_do_not_skip_a_fresh_announcement() {
     let peer = preferred_peer(&peers, 2);
     let keep = [0x42; 32];
     assert_eq!(
-        mp.note_inv_tx_requested(peer.id, keep, true, 1_000, false),
+        mp.note_inv_tx_requested(
+            rbitcoin_net::tx_relay::InvSource::new(peer.id, true),
+            keep,
+            1_000,
+            false
+        ),
         rbitcoin_net::tx_relay::ParentNote::RequestNow
     );
     let per_peer = rbitcoin_net::tx_relay::parent_req::MAX_PARENT_ANN_PER_PEER as u32 - 100;
@@ -8754,7 +8761,12 @@ async fn other_peers_rows_do_not_skip_a_fresh_announcement() {
             let mut hash = [0u8; 32];
             hash[..4].copy_from_slice(&n.to_le_bytes());
             hash[31] = 0xf1;
-            mp.note_inv_tx_requested(peer.id.saturating_add(filler), hash, true, 1_000, true);
+            mp.note_inv_tx_requested(
+                rbitcoin_net::tx_relay::InvSource::new(peer.id.saturating_add(filler), true),
+                hash,
+                1_000,
+                true,
+            );
             n += 1;
         }
     }
@@ -8799,6 +8811,157 @@ async fn other_peers_rows_do_not_skip_a_fresh_announcement() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A regtest hub out of IBD with relay on, so `on_inv` asks for announced txs.
+fn enable_tx_inv(dir: &impl AsRef<std::path::Path>, hub: &ChainHub) {
+    hub.ensure_genesis().unwrap();
+    let t = hub.tip_header().unwrap().time;
+    hub.clock.set_mock(i64::from(t) + 1);
+    let mp = rbitcoin_net::tx_relay::MempoolHub::open(
+        dir.as_ref().join("mp"),
+        std::sync::Arc::clone(&hub.query),
+    )
+    .unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    assert!(!hub.in_ibd(), "tx announcements are asked for outside IBD");
+}
+
+/// The items `on_inv` puts in its getdata after `peer` announces `items`.
+fn getdata_after_inv(
+    hub: &ChainHub,
+    peer: &rbitcoin_net::peers::LivePeer,
+    items: &[Inventory],
+) -> Vec<Inventory> {
+    let (out_tx, mut rx) = peer_out_channel();
+    let mut follow = PeerFollowState::new();
+    on_inv(hub, &out_tx, &mut follow, Some(peer), items).unwrap();
+    let mut getdata = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let NetworkMessage::GetData(v) = msg.expect_msg() {
+            getdata = v;
+        }
+    }
+    getdata
+}
+
+fn announced_hash(i: u32) -> [u8; 32] {
+    let mut h = [0xb7; 32];
+    h[..4].copy_from_slice(&i.to_le_bytes());
+    h
+}
+
+/// Core `OVERLOADED_PEER_TX_DELAY`: a peer that already has
+/// `MAX_PEER_TX_REQUEST_IN_FLIGHT` requests outstanding and no relay
+/// permission is not asked for one more at once, so an honest announcer of
+/// the same transaction can answer first.
+#[tokio::test]
+async fn overloaded_peer_waits_before_it_is_asked_for_one_more() {
+    use rbitcoin_net::tx_relay::{MAX_PEER_TX_REQUEST_IN_FLIGHT, OVERLOADED_PEER_TX_DELAY_SECS};
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("overloaded-peer");
+    enable_tx_inv(&dir, &hub);
+    let mp = hub.mempool().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(1_000);
+    let peer = preferred_peer(&peers, 2);
+    let window: Vec<Inventory> = (0..MAX_PEER_TX_REQUEST_IN_FLIGHT as u32)
+        .map(|i| Inventory::WTx(bitcoin::Wtxid::from_byte_array(announced_hash(i))))
+        .collect();
+    assert_eq!(
+        getdata_after_inv(&hub, &peer, &window),
+        window,
+        "a peer with room in its window is asked at once"
+    );
+    let extra = announced_hash(MAX_PEER_TX_REQUEST_IN_FLIGHT as u32);
+    let extra_inv = Inventory::WTx(bitcoin::Wtxid::from_byte_array(extra));
+    assert!(
+        getdata_after_inv(&hub, &peer, &[extra_inv]).is_empty(),
+        "a peer with a full window is not asked at once"
+    );
+    assert!(
+        mp.take_due_parent_getdata(peer.id, 1_000 + OVERLOADED_PEER_TX_DELAY_SECS - 1)
+            .is_empty(),
+        "not before the overloaded delay ends"
+    );
+    let due = mp.take_due_parent_getdata(peer.id, 1_000 + OVERLOADED_PEER_TX_DELAY_SECS);
+    assert_eq!(due.len(), 1, "asked when the delay ends");
+    assert_eq!(due[0].hash, extra);
+    assert!(due[0].wtxid);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A peer with the relay permission is never overloaded (Core
+/// `m_relay_permissions`), however many requests it has outstanding.
+#[tokio::test]
+async fn relay_permitted_peer_is_asked_at_once_past_a_full_window() {
+    use rbitcoin_net::tx_relay::MAX_PEER_TX_REQUEST_IN_FLIGHT;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("relay-perm-window");
+    enable_tx_inv(&dir, &hub);
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(1_000);
+    peers.set_relay_perm(true);
+    let peer = preferred_peer(&peers, 2);
+    let window: Vec<Inventory> = (0..MAX_PEER_TX_REQUEST_IN_FLIGHT as u32)
+        .map(|i| Inventory::WTx(bitcoin::Wtxid::from_byte_array(announced_hash(i))))
+        .collect();
+    assert_eq!(getdata_after_inv(&hub, &peer, &window), window);
+    let extra = Inventory::WTx(bitcoin::Wtxid::from_byte_array(announced_hash(
+        MAX_PEER_TX_REQUEST_IN_FLIGHT as u32,
+    )));
+    assert_eq!(
+        getdata_after_inv(&hub, &peer, &[extra]),
+        vec![extra],
+        "the relay permission keeps a full window from delaying the ask"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Core `TXID_RELAY_DELAY`: a txid announcement waits while any wtxid-relay
+/// peer is connected, so a wtxid announcer of the same transaction wins.
+/// With no wtxid-relay peer, or for a wtxid announcement, it does not wait.
+#[tokio::test]
+async fn txid_announcement_waits_while_a_wtxid_relay_peer_is_connected() {
+    use rbitcoin_net::tx_relay::TXID_RELAY_DELAY_SECS;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("txid-relay-delay");
+    enable_tx_inv(&dir, &hub);
+    let mp = hub.mempool().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_mock_now(1_000);
+    let txid_peer = preferred_peer(&peers, 2);
+    let alone = Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array(announced_hash(1)));
+    assert_eq!(
+        getdata_after_inv(&hub, &txid_peer, &[alone]),
+        vec![alone],
+        "no wtxid-relay peer is connected: asked at once"
+    );
+
+    let wtxid_peer = preferred_peer(&peers, 3);
+    wtxid_peer.set_wtxid_relay();
+    let waits = announced_hash(2);
+    let waits_inv = Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array(waits));
+    assert!(
+        getdata_after_inv(&hub, &txid_peer, &[waits_inv]).is_empty(),
+        "a wtxid-relay peer is connected: the txid announcement waits"
+    );
+    assert!(mp
+        .take_due_parent_getdata(txid_peer.id, 1_000 + TXID_RELAY_DELAY_SECS - 1)
+        .is_empty());
+    let due = mp.take_due_parent_getdata(txid_peer.id, 1_000 + TXID_RELAY_DELAY_SECS);
+    assert_eq!(due.len(), 1, "asked when the delay ends");
+    assert_eq!(due[0].hash, waits);
+    assert!(!due[0].wtxid);
+
+    let by_wtxid = Inventory::WTx(bitcoin::Wtxid::from_byte_array(announced_hash(3)));
+    assert_eq!(
+        getdata_after_inv(&hub, &wtxid_peer, &[by_wtxid]),
+        vec![by_wtxid],
+        "a wtxid announcement never waits for the txid delay"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `unregister` forgets a peer's rows before the peer leaves the live list.
 /// An orphan's other announcer seen in that gap takes no parent row, so no
 /// row outlives its session.
@@ -8833,7 +8996,12 @@ async fn forgotten_announcer_takes_no_orphan_parent_row() {
     };
     let wtxid = orphan.compute_wtxid();
     assert_eq!(
-        mp.note_inv_tx_requested(gone.id, wtxid.to_byte_array(), true, 1_000, true),
+        mp.note_inv_tx_requested(
+            rbitcoin_net::tx_relay::InvSource::new(gone.id, true),
+            wtxid.to_byte_array(),
+            1_000,
+            true
+        ),
         rbitcoin_net::tx_relay::ParentNote::RequestNow
     );
     mp.forget_parent_anns_for_peer(gone.id);
@@ -12887,7 +13055,12 @@ mod peer_session_pins {
             false,
             PeerConnType::OutboundFullRelay,
         );
-        mp.note_inv_tx_requested(other.id, [1; 32], true, 5_000, false);
+        mp.note_inv_tx_requested(
+            rbitcoin_net::tx_relay::InvSource::new(other.id, true),
+            [1; 32],
+            5_000,
+            false,
+        );
         let parent = bitcoin::Txid::from_byte_array([9; 32]);
         use bitcoin::absolute::LockTime;
         use bitcoin::transaction::Version as TxVersion;
