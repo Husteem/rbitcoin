@@ -176,8 +176,12 @@ let
           in
           if builtins.length parts == 2 then builtins.elemAt parts 1 else "";
     in
-    # More than five digits is no port, and could overflow toInt.
-    if builtins.match "[0-9]{1,5}" port != null then lib.toInt port else null;
+    # The node's SocketAddr parse accepts leading zeros (`:008334` is 8334).
+    # More than five digits after them is no port, and could overflow toInt.
+    let
+      m = builtins.match "0*([0-9]{1,5})" port;
+    in
+    if m != null then lib.toInt (lib.head m) else null;
   whitebindPorts = lib.filter (p: p != null) (map whitebindPort cfg.netPermissionBind);
   torControlAddr =
     if cfg.tor.control != null then

@@ -978,6 +978,23 @@ assert rbitcoinFailures (moduleOnly {
 assert
   (moduleOnly (onionListenOpts // { p2p = onionListenOpts.p2p // { openFirewall = true; }; }))
   .config.networking.firewall.allowedTCPPorts == [ 8333 ];
+# The node parses a port with leading zeros as the plain port, so a
+# zero-padded v1 grant is still the v1 port: another grant there does not
+# open it, and it may not share a module-bound port.
+assert
+  let
+    sys = moduleOnly {
+      p2p.openFirewall = true;
+      netPermissionBind = [
+        "v1,noban@192.168.1.10:008334"
+        "noban@127.0.0.1:8334"
+      ];
+    };
+  in
+  rbitcoinFailures sys == [ ] && sys.config.networking.firewall.allowedTCPPorts == [ 8333 ];
+assert builtins.elem v1PortMsg (failedAssertions (badSystem {
+  netPermissionBind = [ "v1,noban@127.0.0.1:0000000008333" ];
+}));
 assert builtins.elem onionListenNeedsOnionMsg (failedAssertions (badSystem {
   p2p.onionListen = "127.0.0.1:8334";
 }));
