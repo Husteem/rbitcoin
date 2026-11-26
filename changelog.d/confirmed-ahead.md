@@ -7,7 +7,9 @@ Fixed
   A null below the revalidation window was skipped by the height fence, and
   open then cleared the strong bits of that block's transactions. The flush
   now writes a synced `confirmed.body.ahead` image first and open restores
-  it. Open clamps to the seal before it trims null slots, and refuses any
-  other null slot below the tip before it builds the fence. An array flush
-  whose shrink ends on a block boundary still images page 0, which covers
+  it. Open clamps to the seal, compares the sealed hash, then trims null
+  slots. Before it builds the fence it cuts the tip below a null in the
+  block that holds the sealed tip (a crash under an older binary) and
+  refuses a null anywhere else. An array flush images page 0 even when a
+  shrink ends on a block boundary or empties the table, which covers
   `header_txs` too.
