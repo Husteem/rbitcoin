@@ -25,6 +25,17 @@ async fn take(q: &Query, surface: ApiSurface) -> Option<StorePermit> {
         .ok()
 }
 
+/// Wait until `n` callers of `surface` are queued.
+async fn queued(budget: &rbitcoin_query::ApiReadBudget, surface: ApiSurface, n: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while budget.waiting(surface) != n {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{n} {surface:?} waiters queue"));
+}
+
 /// A waiter for `surface` on its own task.
 fn wait_for(q: &Arc<Query>, surface: ApiSurface) -> tokio::task::JoinHandle<StorePermit> {
     let q = Arc::clone(q);
@@ -82,10 +93,11 @@ async fn a_freed_permit_goes_first_to_a_surface_below_its_split() {
     let _rest = [take(&q, Rest).await.unwrap(), take(&q, Rest).await.unwrap()];
     // The budget is spent. REST would borrow and asks first; RPC holds
     // nothing of its split and asks second.
+    let budget = q.api_read_budget();
     let mut rest = wait_for(&q, Rest);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    queued(&budget, Rest, 1).await;
     let mut rpc = wait_for(&q, Rpc);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    queued(&budget, Rpc, 1).await;
     assert!(!rest.is_finished() && !rpc.is_finished(), "both wait");
 
     drop(electrum.pop());
@@ -117,8 +129,7 @@ async fn a_dropped_wait_holds_no_permit() {
         let budget = Arc::clone(&budget);
         tokio::spawn(async move { budget.acquire(Electrum).await })
     };
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(budget.waiting(Electrum), 1);
+    self::queued(&budget, Electrum, 1).await;
     queued.abort();
     let _ = queued.await;
     assert_eq!(
@@ -180,9 +191,9 @@ async fn borrowers_take_freed_permits_in_turn() {
     ];
     // Every surface holds its split. Two RPC waiters ask, then two REST.
     let mut waits = Vec::new();
-    for s in [Rpc, Rpc, Rest, Rest] {
+    for (s, n) in [(Rpc, 1), (Rpc, 2), (Rest, 1), (Rest, 2)] {
         waits.push(wait_for(&q, s));
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        queued(&budget, s, n).await;
     }
     assert_eq!((budget.waiting(Rpc), budget.waiting(Rest)), (2, 2));
 
@@ -201,4 +212,37 @@ async fn borrowers_take_freed_permits_in_turn() {
     for w in waits {
         w.abort();
     }
+}
+
+/// With one permit every surface on is below its minimum whenever it holds
+/// nothing, so under steady demand from one surface the permit still goes
+/// round the surfaces that wait.
+#[tokio::test]
+async fn one_permit_goes_round_the_waiting_surfaces() {
+    let (_dir, q) = budget("budget-one", 1, &[Rpc, Electrum]);
+    let budget = q.api_read_budget();
+    let held = take(&q, Rpc).await.expect("the one permit");
+    let mut rpc = wait_for(&q, Rpc);
+    queued(&budget, Rpc, 1).await;
+    let mut electrum = wait_for(&q, Electrum);
+    queued(&budget, Electrum, 1).await;
+    let mut more_rpc = wait_for(&q, Rpc);
+    queued(&budget, Rpc, 2).await;
+
+    drop(held);
+    let next = tokio::time::timeout(Duration::from_secs(5), &mut rpc)
+        .await
+        .expect("RPC's first waiter gets the permit")
+        .unwrap();
+    drop(next);
+    let next = tokio::time::timeout(Duration::from_secs(5), &mut electrum)
+        .await
+        .expect("then Electrum, though RPC still waits")
+        .unwrap();
+    assert!(!more_rpc.is_finished());
+    drop(next);
+    let _last = tokio::time::timeout(Duration::from_secs(5), &mut more_rpc)
+        .await
+        .expect("then RPC again")
+        .unwrap();
 }

@@ -5,8 +5,11 @@
 //! when it is the only surface, otherwise one permit short of it. A freed
 //! permit goes first to a waiter whose surface holds less than its minimum,
 //! then to one under its ceiling, round-robin across surfaces each time. A
-//! read that is running is never taken back, so a surface below its minimum
-//! waits at most until the next permit frees.
+//! read that is running is never taken back, so a waiting surface gets a
+//! permit only as reads finish. When several surfaces are below their
+//! minimum they take freed permits in turn, so one can wait through more
+//! than one release. With one permit every surface on is below its minimum
+//! whenever it holds nothing, so the permit goes round them.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
