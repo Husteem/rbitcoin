@@ -307,16 +307,17 @@ impl MutatedCopies {
         self.senders.contains(&Some(ip))
     }
 
-    /// Whether `ip` may reopen the abandoned hash, and if so count it. Not a
-    /// sender, under [`MUTATED_REOPENS`], and the record not full (an
-    /// unrecorded sender could be one of the copies' senders).
-    pub fn take_reopen(&mut self, ip: std::net::IpAddr) -> bool {
+    /// Whether `ip` may reopen the abandoned hash: not a sender, under
+    /// [`MUTATED_REOPENS`], and the record not full (an unrecorded sender
+    /// could be one of the copies' senders).
+    pub fn may_reopen(&self, ip: std::net::IpAddr) -> bool {
         let full = self.senders.iter().all(Option::is_some);
-        if full || self.sent_by(ip) || self.reopens >= MUTATED_REOPENS {
-            return false;
-        }
-        self.reopens += 1;
-        true
+        !full && !self.sent_by(ip) && self.reopens < MUTATED_REOPENS
+    }
+
+    /// Count one reopen toward [`MUTATED_REOPENS`].
+    pub fn count_reopen(&mut self) {
+        self.reopens = self.reopens.saturating_add(1);
     }
 }
 

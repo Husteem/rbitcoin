@@ -5603,7 +5603,7 @@ fn resume_installation_refuses_an_unservable_entry_and_bounds_the_explore_tip() 
 fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
     use bitcoin::Network;
     use rbitcoin_ibd::ibd::events::{
-        finish_deferred_archived_clear, on_headers_batch, plan_header_batch, BadPrevParent,
+        apply_headers_event, finish_deferred_archived_clear, plan_header_batch, BadPrevParent,
         DeferredArchivedClear, MUTATED_COPIES_BEFORE_ABANDON,
     };
     use rbitcoin_ibd::ibd::header_walk::may_serve;
@@ -5618,7 +5618,6 @@ fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
         .time
         .saturating_add(600);
     let a = rbitcoin_consensus::mine_empty_regtest(tip, time, height);
-    let fks = hub.ensure_headers_batch(&[a.header]).unwrap();
     let hash = a.block_hash();
 
     let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
@@ -5630,7 +5629,7 @@ fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
         slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
         st.slots.push(slot);
     }
-    on_headers_batch(&mut st, &hub, kept, vec![a.header], &fks);
+    apply_headers_event(&mut st, &hub, kept, vec![a.header]);
     assert!(st.ordered_set.contains(&hash), "A is queued");
     let copy = |sender| DeferredArchivedClear {
         height,
@@ -5650,13 +5649,13 @@ fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
         "the kept peer's copies abandon A"
     );
 
-    on_headers_batch(&mut st, &hub, kept, vec![a.header], &fks);
+    apply_headers_event(&mut st, &hub, kept, vec![a.header]);
     assert!(
         st.unservable.contains(&hash),
         "the peer that sent the copies does not reopen A"
     );
 
-    on_headers_batch(&mut st, &hub, other, vec![a.header], &fks);
+    apply_headers_event(&mut st, &hub, other, vec![a.header]);
     assert!(
         !st.unservable.contains(&hash),
         "another peer's announcement reopens A"
@@ -5680,18 +5679,18 @@ fn an_abandoned_header_reopens_for_a_peer_that_never_sent_a_mutated_copy() {
         st.unservable.contains(&hash),
         "the next copy abandons A again"
     );
-    on_headers_batch(&mut st, &hub, other, vec![a.header], &fks);
+    apply_headers_event(&mut st, &hub, other, vec![a.header]);
     assert!(st.unservable.contains(&hash), "a sender does not reopen A");
 
     // Reopens are bounded: two more fresh announcers reopen A, a third does
     // not.
     for (n, peer) in [third, fourth].into_iter().enumerate() {
-        on_headers_batch(&mut st, &hub, peer, vec![a.header], &fks);
+        apply_headers_event(&mut st, &hub, peer, vec![a.header]);
         assert!(!st.unservable.contains(&hash), "reopen {}", n + 2);
         finish_deferred_archived_clear(&mut st, Some(&hub), &copy(peer));
         assert!(st.unservable.contains(&hash));
     }
-    on_headers_batch(&mut st, &hub, fifth, vec![a.header], &fks);
+    apply_headers_event(&mut st, &hub, fifth, vec![a.header]);
     assert!(st.unservable.contains(&hash), "the reopen bound is spent");
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -5747,5 +5746,91 @@ fn a_probe_reply_reopens_an_abandoned_header() {
         "the reply answered the probe"
     );
     assert!(!st.unservable.contains(&hash), "a probe reply reopens A");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A regtest hub at genesis with header A (height 1) abandoned for three
+/// mutated copies from peer 1, and peers 1 to 3 on distinct IPs.
+fn abandoned_a(
+    label: &str,
+) -> (
+    rbitcoin_query::testutil::TempDir,
+    rbitcoin_net::chain::ChainHub,
+    IbdWorkState,
+    bitcoin::Block,
+) {
+    use bitcoin::Network;
+    use rbitcoin_ibd::ibd::events::{
+        apply_headers_event, finish_deferred_archived_clear, BadPrevParent, DeferredArchivedClear,
+        MUTATED_COPIES_BEFORE_ABANDON,
+    };
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled(label);
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let t = hub.tip_height().unwrap();
+    let time = bitcoin::blockdata::constants::genesis_block(Network::Regtest)
+        .header
+        .time
+        .saturating_add(600);
+    let a = rbitcoin_consensus::mine_empty_regtest(tip, time, t + 1);
+    let hash = a.block_hash();
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(t));
+    for id in 1..=3 {
+        let mut slot = crate::ibd::assign::dummy_slot(id);
+        slot.addr = std::net::SocketAddr::from(([127, 0, 0, id as u8], 18444));
+        slot.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
+        st.slots.push(slot);
+    }
+    apply_headers_event(&mut st, &hub, 1, vec![a.header]);
+    assert!(st.ordered_set.contains(&hash), "A is queued");
+    for _ in 0..MUTATED_COPIES_BEFORE_ABANDON {
+        let copy = DeferredArchivedClear {
+            height: t + 1,
+            hash,
+            err: "bad-txnmrklroot".into(),
+            sender: Some(1),
+            parent: BadPrevParent::Tip,
+            retry_tip_child: false,
+            bad_prev: false,
+            was_occupant: true,
+        };
+        finish_deferred_archived_clear(&mut st, Some(&hub), &copy);
+    }
+    assert!(st.unservable.contains(&hash), "peer 1's copies abandon A");
+    (dir, hub, st, a)
+}
+
+/// A reopen keeps the copies' senders off the header first. When a sender's
+/// record of hashes it lacks is full, it could take the header again, so the
+/// header stays abandoned (#1992).
+#[test]
+fn an_abandoned_header_stays_closed_when_a_sender_cannot_be_kept_off_it() {
+    use rbitcoin_ibd::ibd::events::apply_headers_event;
+
+    let (dir, hub, mut st, a) = abandoned_a("reopen-lacks-full");
+    let hash = a.block_hash();
+    let now = rbitcoin_ibd::ibd::peer_io::ibd_mono_ms();
+    let sender = st.slots.iter_mut().find(|s| s.id == 1).unwrap();
+    let mut filled = false;
+    for n in 0u32..4096 {
+        let mut other = [0u8; 32];
+        other[..4].copy_from_slice(&n.to_le_bytes());
+        other[31] = 0xee;
+        if !sender
+            .chain
+            .note_notfound(BlockHash::from_byte_array(other), now)
+        {
+            filled = true;
+            break;
+        }
+    }
+    assert!(filled, "the sender's lacks record is full");
+
+    apply_headers_event(&mut st, &hub, 2, vec![a.header]);
+    assert!(
+        st.unservable.contains(&hash),
+        "A is not reopened while its sender could take it"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

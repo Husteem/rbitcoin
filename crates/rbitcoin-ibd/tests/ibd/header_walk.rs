@@ -9309,3 +9309,66 @@ fn a_walk_move_past_a_sibling_keeps_it_recorded() {
     assert!(st.tip_siblings.is_empty());
     assert!(!st.hash_height.contains_key(&sibling));
 }
+
+/// After A is abandoned for mutated copies another chain becomes the
+/// candidate. A fresh peer's heavier chain through A must still reopen A:
+/// the fork is judged with A servable, so A's body is asked of that peer
+/// (#1992).
+#[test]
+fn a_heavier_fork_through_an_abandoned_header_reopens_it() {
+    use rbitcoin_ibd::ibd::events::{
+        finish_deferred_archived_clear, BadPrevParent, DeferredArchivedClear,
+        MUTATED_COPIES_BEFORE_ABANDON,
+    };
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reopen-fork");
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let (mut s0, _rx0) = slot(0);
+    s0.conn_type = rbitcoin_net::peers::PeerConnType::Manual;
+    let (s1, _rx1) = slot(1);
+    let (s2, _rx2) = slot(2);
+    let mut st = IbdWorkState::new(vec![s0, s1, s2], Some(gen), Some(0));
+    ensure_origin(&mut st, &hub);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let a = mine(gen, 1);
+    let hash = a.block_hash();
+    apply(&mut st, &hub, 0, vec![a]);
+    for _ in 0..MUTATED_COPIES_BEFORE_ABANDON {
+        let copy = DeferredArchivedClear {
+            height: 1,
+            hash,
+            err: "bad-txnmrklroot".into(),
+            sender: Some(0),
+            parent: BadPrevParent::Tip,
+            retry_tip_child: false,
+            bad_prev: false,
+            was_occupant: true,
+        };
+        finish_deferred_archived_clear(&mut st, Some(&hub), &copy);
+    }
+    assert!(st.unservable.contains(&hash), "peer 0's copies abandon A");
+
+    let b = mine(gen, 2);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    apply(&mut st, &hub, 1, vec![b]);
+    assert_eq!(
+        candidate_tip(&st),
+        Some(b.block_hash()),
+        "B is the candidate"
+    );
+
+    let a2 = mine(hash, 3);
+    apply(&mut st, &hub, 2, vec![a, a2]);
+    assert!(
+        !st.unservable.contains(&hash),
+        "the fresh peer's heavier chain reopens A"
+    );
+    assert_eq!(
+        candidate_tip(&st),
+        Some(a2.block_hash()),
+        "the heavier chain through A is the candidate"
+    );
+    assert!(may_serve(&st, 2, &hash), "A is asked of the announcer");
+    let _ = dir;
+}

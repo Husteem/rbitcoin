@@ -340,7 +340,6 @@ pub fn on_headers_batch(
             batch_prev.and_then(|(ph, pht)| (ph == prev).then_some(pht.saturating_add(1)))
         });
         if let Some(h) = height {
-            reopen_for_announcer(st, peer, hash);
             note_header_path(st, hub, hash, h, prev);
             if !st.is_on_path(&hash, h) && super::header_walk::note_off_path(st, hub, peer, hash) {
                 disconnect_peer(st, peer);
@@ -724,6 +723,9 @@ pub fn plan_header_reply(
     if super::header_walk::refuse_invalid_linked(st, peer, &headers, linked) {
         return HeaderPlan::Done;
     }
+    // Before the batch is judged: a fork or alternate that starts at an
+    // abandoned header is refused while it stays abandoned.
+    let _ = reopen_announced(st, peer, &headers);
     let class = super::header_walk::classify_linked(st, hub, ask, &headers, linked);
     let mut headers = headers;
     let keep = match class {
@@ -1067,14 +1069,7 @@ fn answer_probe(
         }
         // An abandoned header this peer may serve reopens here too. The walk
         // then asks the peer again, and the batch path re-plants it.
-        let mut reopened = false;
-        for hdr in headers {
-            let hash = hdr.block_hash();
-            if st.unservable.contains(&hash) {
-                reopen_for_announcer(st, peer, hash);
-                reopened |= !st.unservable.contains(&hash);
-            }
-        }
+        let reopened = reopen_announced(st, peer, headers);
         // A header this node has not seen: the peer's chain leaves this one
         // or runs past the path. The walk asks it, as after a block inv.
         let last = headers[headers.len() - 1].block_hash();
@@ -1837,6 +1832,9 @@ pub fn note_mutated_copy(
 /// re-get goes to `peer`. The count stays: the next mutated copy abandons
 /// it again. At most `MUTATED_REOPENS` reopens per hash keep #1811 bounded.
 /// A header abandoned for another reason stays abandoned.
+///
+/// When a sender's record of hashes it lacks is full, that sender could take
+/// the header again, so it stays abandoned and the reopen is not counted.
 pub fn reopen_for_announcer(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
     if !st.unservable.contains(&hash) {
         return;
@@ -1844,18 +1842,42 @@ pub fn reopen_for_announcer(st: &mut IbdWorkState, peer: usize, hash: BlockHash)
     let Some(ip) = st.slots.iter().find(|s| s.id == peer).map(|s| s.addr.ip()) else {
         return;
     };
-    let Some(copies) = st.mutated_copies.get_mut(&hash) else {
+    let Some(copies) = st.mutated_copies.get(&hash).copied() else {
         return;
     };
-    if !copies.take_reopen(ip) {
+    if !copies.may_reopen(ip) {
         return;
     }
-    let copies = *copies;
-    st.unservable.remove(&hash);
     let now = super::peer_io::ibd_mono_ms();
+    let mut kept_off = true;
     for slot in st.slots.iter_mut().filter(|s| copies.sent_by(s.addr.ip())) {
-        slot.chain.note_notfound(hash, now);
+        kept_off &= slot.chain.note_notfound(hash, now);
     }
+    if !kept_off {
+        return;
+    }
+    if let Some(copies) = st.mutated_copies.get_mut(&hash) {
+        copies.count_reopen();
+    }
+    st.unservable.remove(&hash);
+}
+
+/// [`reopen_for_announcer`] for each header `peer` sent. True when one
+/// reopened.
+fn reopen_announced(
+    st: &mut IbdWorkState,
+    peer: usize,
+    headers: &[bitcoin::block::Header],
+) -> bool {
+    let mut reopened = false;
+    for hdr in headers {
+        let hash = hdr.block_hash();
+        if st.unservable.contains(&hash) {
+            reopen_for_announcer(st, peer, hash);
+            reopened |= !st.unservable.contains(&hash);
+        }
+    }
+    reopened
 }
 
 /// Core `MaybePunishNodeForBlock` (`BLOCK_MUTATED`): drop the sender and
