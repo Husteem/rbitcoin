@@ -392,32 +392,51 @@ fn seal_clamp_exposes_null_run_and_tip_drops_below_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Heights `0..len` sealed at the tip, then `confirmed[hole]` nulled and
+/// flushed, with the spend marker three below the tip.
+fn sealed_chain_with_hole(dir: &std::path::Path, len: u32, hole: u32) {
+    let s = Store::create_tiny(dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    let mut parent_hash = [0u8; 32];
+    let mut prev = Fk::NULL;
+    for h in 0..len {
+        let rec = hdr(prev, parent_hash, h as u8);
+        parent_hash = rec.hash;
+        let fk = s.put_header(&rec).unwrap();
+        prev = fk;
+        s.confirmed.set(&write, Height(h), fk).unwrap();
+    }
+    s.headers.flush().unwrap();
+    s.flush_class_c_tip().unwrap();
+    s.confirmed
+        .set_raw_for_test(&write, Height(hole), 0)
+        .unwrap();
+    s.confirmed.flush().unwrap();
+    rbitcoin_store::spend_durable::SpendDurable::new(len - 3, len - 3)
+        .store(s.path())
+        .unwrap();
+}
+
+/// An older binary rewrote the block that holds the sealed tip with no
+/// image. A hole there is that crash: open cuts the tip below it.
+#[test]
+fn null_slot_in_the_sealed_tip_block_cuts_the_tip_at_open() {
+    let dir = tmp();
+    sealed_chain_with_hole(&dir, 20, 16);
+    let s = Store::open_tiny(&dir).expect("a hole in the tip block is crash damage");
+    assert_eq!(s.confirmed.tip_height(), Some(Height(15)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The write-ahead image restores a torn `confirmed[]` page, so a null slot
-/// under the sealed tip is not crash damage. Open refuses it instead of
-/// building a fence without those heights and clearing their strong bits.
+/// outside the block that holds the sealed tip is not crash damage. Open
+/// refuses it instead of building a fence without those heights and
+/// clearing their strong bits.
 #[test]
 fn null_confirmed_slot_below_the_tip_refuses_open() {
     let dir = tmp();
-    {
-        let s = Store::create_tiny(&dir).unwrap();
-        let write = rbitcoin_store::ClassCWrite::for_test();
-        let mut parent_hash = [0u8; 32];
-        let mut prev = Fk::NULL;
-        for h in 0u32..20 {
-            let rec = hdr(prev, parent_hash, h as u8);
-            parent_hash = rec.hash;
-            let fk = s.put_header(&rec).unwrap();
-            prev = fk;
-            s.confirmed.set(&write, Height(h), fk).unwrap();
-        }
-        s.headers.flush().unwrap();
-        s.flush_class_c_tip().unwrap();
-        s.confirmed.set_raw_for_test(&write, Height(3), 0).unwrap();
-        s.confirmed.flush().unwrap();
-        rbitcoin_store::spend_durable::SpendDurable::new(17, 17)
-            .store(s.path())
-            .unwrap();
-    }
+    // Height 519 is in the second 4 KiB block; height 3 is in page 0.
+    sealed_chain_with_hole(&dir, 520, 3);
     match Store::open_tiny(&dir) {
         Err(rbitcoin_store::StoreError::Corrupt(reason)) => {
             assert!(reason.contains("confirmed"), "{reason}");

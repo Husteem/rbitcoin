@@ -109,8 +109,9 @@ impl ConfirmedTable {
 
     /// Drop a trailing run of null header fks (HWM ahead of last real tip).
     ///
-    /// Returns how many slots were removed. Mid-array holes are left for
-    /// [`Store::revalidate_tip_window_n`] to shrink to last good.
+    /// Returns how many slots were removed. Store open already cut a hole in
+    /// the block that holds the sealed tip and refused any other mid-array
+    /// hole (`integrity::cut_or_refuse_confirmed_hole`).
     pub fn trim_trailing_nulls(&self, write: &ClassCWrite) -> Result<u64, StoreError> {
         let n = self.arr.len();
         if n == 0 {

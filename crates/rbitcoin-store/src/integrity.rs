@@ -193,17 +193,22 @@ impl TipFault {
     }
 }
 
-/// Refuse a `confirmed[]` with a null slot under the tip open will keep.
+/// Cut or refuse a `confirmed[]` with a null slot under the tip open keeps.
 ///
 /// A torn page comes back from the write-ahead image, so the only nulls a
-/// crash leaves are on top: above the sealed tip, or a trailing run under it
-/// that the trim removes. A null below that is not crash damage. Open would
-/// build a fence without that height and clear its strong bits, so it stops
-/// before any repair runs.
-pub(crate) fn refuse_confirmed_hole(
+/// crash of this binary leaves are on top: above the sealed tip, or a
+/// trailing run under it that the trim removes. A binary without the image
+/// rewrote the 4 KiB block that holds the sealed tip on every barrier, so a
+/// null in that block is its crash: the tip is cut below the first one, as
+/// the window used to. A null anywhere else is not crash damage. Open would
+/// build a fence without that height and clear its strong bits, so it
+/// refuses before any repair runs.
+pub(crate) fn cut_or_refuse_confirmed_hole(
     dir: &Path,
     confirmed: &crate::chain::ConfirmedTable,
 ) -> Result<(), StoreError> {
+    use crate::array_table::{ELEM, FLUSH_SCRATCH};
+    use crate::file::FILE_HEADER_LEN;
     let Some(tip) = confirmed.tip_height() else {
         return Ok(());
     };
@@ -215,15 +220,29 @@ pub(crate) fn refuse_confirmed_hole(
         };
         top = below;
     }
-    for h in 0..top {
-        if confirmed.get(Height(h))?.is_none() {
-            eprintln!(
-                "rbitcoin: confirmed[{h}] is null below tip {top}; the store needs a reindex"
-            );
-            return Err(StoreError::Corrupt("confirmed[] null slot below the tip"));
-        }
+    let Some(hole) = (0..top).find_map(|h| match confirmed.get(Height(h)) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(Ok(h)),
+        Err(e) => Some(Err(e)),
+    }) else {
+        return Ok(());
+    };
+    let hole = hole?;
+    let top_byte = FILE_HEADER_LEN as u64 + u64::from(top) * ELEM;
+    let block_byte = top_byte & !(FLUSH_SCRATCH as u64 - 1);
+    let block_first = block_byte.saturating_sub(FILE_HEADER_LEN as u64) / ELEM;
+    if u64::from(hole) < block_first {
+        eprintln!("rbitcoin: confirmed[{hole}] is null below tip {top}; the store needs a reindex");
+        return Err(StoreError::Corrupt("confirmed[] null slot below the tip"));
     }
-    Ok(())
+    eprintln!(
+        "rbitcoin: confirmed[{hole}] is null in the block that holds tip {top}; \
+         cutting the tip to {}",
+        i64::from(hole) - 1
+    );
+    let write = crate::array_table::ClassCWrite::new();
+    confirmed.arr.truncate(&write, u64::from(hole))?;
+    confirmed.flush()
 }
 
 impl Store {
