@@ -4500,7 +4500,8 @@ fn serve_tail_pending(follow: &PeerFollowState) -> bool {
         || !follow.cfilter_requests.is_empty()
 }
 
-/// Queue a pong parked by [`on_ping`] once every serve tail is empty.
+/// Queue a pong parked by [`on_ping`] once every serve tail and queued
+/// compact-filter request is empty.
 fn flush_parked_pong(
     out_tx: &PeerOutTx,
     follow: &mut PeerFollowState,
