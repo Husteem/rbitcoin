@@ -645,7 +645,8 @@ pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Res
         }
         // An unparseable id has `nout == 0`, so it writes `[]`.
         let id = id.as_ref().unwrap_or(&[0; 32]);
-        if let Err(e) = write_outspends(&mut body, &st.query, mp, id, nout, view.as_ref()) {
+        if let Err(e) = write_outspends(&mut body, &st.query, mp, id, nout, view.as_ref(), settle0)
+        {
             return store_err(e);
         }
     }
@@ -691,11 +692,12 @@ pub async fn post_outspends_by_outpoint(State(st): State<AppState>, body: Bytes)
         let Some(arr) = v.as_array() else {
             return bad_request("body must be a JSON array of txid:vout");
         };
+        let mp = st.mempool.as_deref();
+        let settle0 = pool_settle(mp);
         let view = match pin_or_reject(&st.query, ChainViewKind::Tip, None) {
             Ok(v) => v,
             Err(r) => return r,
         };
-        let mp = st.mempool.as_deref();
         let mut out = Vec::with_capacity(arr.len());
         for x in arr {
             let Some(s) = x.as_str() else {
@@ -714,7 +716,7 @@ pub async fn post_outspends_by_outpoint(State(st): State<AppState>, body: Bytes)
                 out.push(json!({"spent": false}));
                 continue;
             };
-            match outspend_json(&st.query, mp, &txid, vout, view.as_ref()) {
+            match outspend_json(&st.query, mp, &txid, vout, view.as_ref(), settle0) {
                 Ok(v) => out.push(v),
                 Err(e) => return store_err(e),
             }

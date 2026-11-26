@@ -136,7 +136,7 @@ fn outspend_json_spent_includes_vin() {
         )
         .unwrap();
     q.store().rebuild_height_fence().unwrap();
-    let v = outspend_json(&q, None, &[0xcb; 32], 0, Some(&view)).unwrap();
+    let v = outspend_json(&q, None, &[0xcb; 32], 0, Some(&view), 0).unwrap();
     assert_eq!(v["spent"], true, "{v}");
     assert!(v.get("txid").is_some(), "{v}");
     assert_eq!(v["vin"], 0, "outspend vin from spent slot: {v}");
@@ -157,6 +157,7 @@ fn outspend_json_spent_includes_vin() {
             &[0xcb; 32],
             30,
             Some(&view),
+            0,
         )
         .unwrap();
         let slots: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();

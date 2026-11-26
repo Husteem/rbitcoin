@@ -1609,6 +1609,44 @@ async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A block connected after the view was pinned spends the coin above the
+/// view, and its spend has already left the pool. An outspend read on that
+/// view once the pool has settled again is a 503, not unspent.
+#[tokio::test(flavor = "current_thread")]
+async fn outspend_after_a_connect_past_the_pinned_view_is_not_unspent() {
+    use rbitcoin_esplora::handlers::{outspend_json, write_outspends};
+    let (dir, mut pad, handle) = reorg_pad("outspend-after-pin").await;
+    let tx = spend_tx(&pad, 0);
+    let cb = pad.cbs[0];
+    let settle0 = pad.hub.pool_settle_gen();
+    let view = pad.q.pin_chain_view().unwrap().expect("tip");
+    let hub = Arc::clone(&pad.hub);
+    let hold = hub.template_hold();
+    pad.connect(vec![stored_spend(&tx, cb)]);
+    drop(hold);
+
+    let slot = outspend_json(&pad.q, Some(&pad.hub), &cb, 0, Some(&view), settle0);
+    assert!(slot.is_err(), "outspend: {slot:?}");
+    let mut body = Vec::new();
+    let slots = write_outspends(
+        &mut body,
+        &pad.q,
+        Some(&pad.hub),
+        &cb,
+        1,
+        Some(&view),
+        settle0,
+    );
+    assert!(
+        slots.is_err(),
+        "outspends: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `tx_status` reads the status on the view it pinned and asks the mempool
 /// only for an unconfirmed answer. A tip change after the row was found must
 /// not turn into `200 {"confirmed":false}` for a tx the mempool lacks: it is a

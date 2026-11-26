@@ -788,7 +788,7 @@ pub async fn tx_outspend(
         } else {
             None
         };
-        match outspend_json(&st.query, mp, &txid, vout, view.as_ref()) {
+        match outspend_json(&st.query, mp, &txid, vout, view.as_ref(), settle0) {
             Ok(v) => maybe_attach_view(json_reply_here(v), view),
             Err(e) => store_err(e),
         }
@@ -881,9 +881,15 @@ pub async fn tx_outspends(
             None
         };
         let mut body = Vec::new();
-        if let Err(e) =
-            write_outspends_range(&mut body, &st.query, mp, &txid, first, end, view.as_ref())
-        {
+        if let Err(e) = write_outspends_range(
+            &mut body,
+            &st.query,
+            mp,
+            &txid,
+            first..end,
+            view.as_ref(),
+            settle0,
+        ) {
             return store_err(e);
         }
         maybe_attach_view(crate::server::json_bytes_reply(body), view)
@@ -922,6 +928,8 @@ pub fn outspends_page(start: Option<u32>, nout: u32) -> Result<(u32, u32), Respo
 
 /// Append the JSON array of `txid`'s first `nout` outspends to `out`. Each
 /// slot is encoded as it is read, so no `Value` tree is held for the array.
+/// `settle0` is the pool settle generation read before `view` was pinned
+/// ([`crate::tx_json::pool_settle`]).
 #[doc(hidden)]
 pub fn write_outspends(
     out: &mut Vec<u8>,
@@ -930,11 +938,12 @@ pub fn write_outspends(
     txid: &[u8; 32],
     nout: u32,
     view: Option<&rbitcoin_query::ChainView>,
+    settle0: u64,
 ) -> Result<(), rbitcoin_query::QueryError> {
-    write_outspends_range(out, query, mempool, txid, 0, nout, view)
+    write_outspends_range(out, query, mempool, txid, 0..nout, view, settle0)
 }
 
-/// Like [`write_outspends`] for vouts `first..end`. Each slot is what
+/// Like [`write_outspends`] for `vouts`. Each slot is what
 /// [`outspend_json`] answers, but the txid is resolved and the spent slots
 /// are read once for the range, and each spending tx's txid and each
 /// block's status are read once however many outputs share them.
@@ -944,11 +953,11 @@ pub fn write_outspends_range(
     query: &Query,
     mempool: Option<&MempoolHub>,
     txid: &[u8; 32],
-    first: u32,
-    end: u32,
+    vouts: std::ops::Range<u32>,
     view: Option<&rbitcoin_query::ChainView>,
+    settle0: u64,
 ) -> Result<(), rbitcoin_query::QueryError> {
-    let settle0 = crate::tx_json::pool_settle(mempool);
+    let std::ops::Range { start: first, end } = vouts;
     let confirmed = match view {
         Some(v) => query.first_strong_spenders_at_range(txid, first, end, Some(v.height.0))?,
         None => Vec::new(),
@@ -996,14 +1005,18 @@ pub fn write_outspends_range(
     Ok(())
 }
 
+/// One outspend slot of `txid` on `view`. `settle0` is the pool settle
+/// generation read before `view` was pinned: a spend in a block connected
+/// after the pin has left the pool, and only a generation that predates the
+/// pin sees that the pool moved.
 pub fn outspend_json(
     query: &Query,
     mempool: Option<&MempoolHub>,
     txid: &[u8; 32],
     vout: u32,
     view: Option<&rbitcoin_query::ChainView>,
+    settle0: u64,
 ) -> Result<Value, rbitcoin_query::QueryError> {
-    let settle0 = crate::tx_json::pool_settle(mempool);
     let create = spend_create(query, txid, view)?;
     outspend_slot(query, mempool, txid, create, vout, view, settle0)
 }
