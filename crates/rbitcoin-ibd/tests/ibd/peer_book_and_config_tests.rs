@@ -70,7 +70,7 @@ fn a_flush_keeps_a_gossiped_row_time() {
     let shared = Arc::new(Mutex::new(AddrMan::new()));
     let mut sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[]);
     let row = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 8333);
-    let now = 1_700_000_000;
+    let now = 1_700_000_000u64;
     rbitcoin_ibd::ibd::events::inject_learned_addrs(
         sess.book_mut(),
         &[(1_699_996_400, rbitcoin_net::NetAddr::Ip(row))],
@@ -84,6 +84,28 @@ fn a_flush_keeps_a_gossiped_row_time() {
     assert_eq!(
         book.last_seen_of(&rbitcoin_net::NetAddr::Ip(row)),
         1_699_996_400 - 2 * 60 * 60
+    );
+}
+
+/// A reply-side normalization of a shared row during catch-up survives the
+/// session's flush; a row taken at construction is not written back over the
+/// newer shared time.
+#[test]
+fn a_flush_keeps_a_normalized_shared_time() {
+    let shared = Arc::new(Mutex::new(AddrMan::new()));
+    let row = sa(7);
+    shared.lock().unwrap().add(row);
+    let sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[]);
+    let net = rbitcoin_net::NetAddr::from_socket(row);
+    let now = 1_700_000_000u64;
+    shared.lock().unwrap().stamp_missing_seen_for(&[net], now);
+    let fixed = (now - 5 * 24 * 60 * 60) as u32;
+    assert_eq!(shared.lock().unwrap().last_seen_of(&net), fixed);
+    drop(sess);
+    assert_eq!(
+        shared.lock().unwrap().last_seen_of(&net),
+        fixed,
+        "the flush keeps the normalized time"
     );
 }
 
