@@ -109,6 +109,55 @@ fn a_flush_keeps_a_normalized_shared_time() {
     );
 }
 
+/// A taken row's flush merges only its time: a successful session
+/// connection's cleared `INCOMPATIBLE` flag is not restored from the shared
+/// book's stale copy.
+#[test]
+fn a_flush_keeps_a_cleared_flag() {
+    let shared = Arc::new(Mutex::new(AddrMan::new()));
+    let row = sa(8);
+    let net = rbitcoin_net::NetAddr::from_socket(row);
+    {
+        let mut book = shared.lock().unwrap();
+        assert!(book.add_learned_addr_at(net, net, 1_700_000_000, 0, 1_700_000_000, 8));
+        book.note_connect_failed_addr(net, true);
+        assert!(book.flags_of(&net).is_incompatible());
+    }
+    let mut sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[]);
+    sess.book_mut().note_connected_addr(net);
+    assert!(!sess.book().flags_of(&net).is_incompatible());
+    sess.flush();
+    assert!(
+        !shared.lock().unwrap().flags_of(&net).is_incompatible(),
+        "the flush must not restore the stale flag"
+    );
+}
+
+/// A future time normalized downward by a reply is a normalized value, not
+/// a stale one: the flush keeps the lower backdate.
+#[test]
+fn a_flush_keeps_a_lowered_normalized_time() {
+    let shared = Arc::new(Mutex::new(AddrMan::new()));
+    let row = sa(11);
+    let net = rbitcoin_net::NetAddr::from_socket(row);
+    let now = 1_700_000_000u64;
+    let future = 1_800_000_000;
+    assert!(shared
+        .lock()
+        .unwrap()
+        .add_learned_addr_at(net, net, future, 0, now, 8));
+    let sess = PeerBookSession::new(Some(Arc::clone(&shared)), &[]);
+    shared.lock().unwrap().stamp_missing_seen_for(&[net], now);
+    let fixed = (now - 5 * 24 * 60 * 60) as u32;
+    assert_eq!(shared.lock().unwrap().last_seen_of(&net), fixed);
+    drop(sess);
+    assert_eq!(
+        shared.lock().unwrap().last_seen_of(&net),
+        fixed,
+        "the lowered normalized time survives the flush"
+    );
+}
+
 /// Rows another writer adds to the shared book during catch-up (the
 /// deferred DNS seeds) reach this session and survive its flush. A row
 /// the session dropped is not pulled back in.
@@ -226,10 +275,7 @@ fn a_flush_does_not_double_a_source_groups_share() {
             .add_learned(other, src(1), MAX_ADDR_MAN));
     }
     let both = rbitcoin_net::NetAddr::from_socket(both);
-    shared
-        .lock()
-        .unwrap()
-        .note_connected_addr(both, 1_700_000_000);
+    shared.lock().unwrap().note_connected_addr(both);
     sess.flush();
     let mut book = shared.lock().unwrap();
     assert_eq!(book.len(), MAX_ADDR_MAN);
@@ -264,7 +310,7 @@ fn a_flush_keeps_a_shared_row_the_node_connected_to() {
         let mut book = shared.lock().unwrap();
         assert!(book.add_learned(row(100_000), src(2), MAX_ADDR_MAN));
         assert!(book.add_learned(row(100_001), src(1), MAX_ADDR_MAN));
-        book.note_connected_addr(connected, 1_700_000_000);
+        book.note_connected_addr(connected);
     }
     sess.flush();
     assert!(shared.lock().unwrap().flags_of(&connected).has_connected());

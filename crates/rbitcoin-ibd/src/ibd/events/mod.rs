@@ -487,7 +487,25 @@ pub fn apply_peer_event(
                 hub.clock.now_secs(),
             );
         }
-        PeerEvent::Dead { peer, reason } => apply_peer_dead(st, peer_book, peer, reason),
+        PeerEvent::Dead { peer, reason } => {
+            // Core `FinalizeNode` refreshes an outbound full-relay row's
+            // time after the peer is gone. The catch-up slot ending is that
+            // point; the dial success only set the flags.
+            if let Some(s) = st.slots.iter().find(|s| s.id == peer) {
+                if matches!(
+                    s.conn_type,
+                    rbitcoin_net::peers::PeerConnType::OutboundFullRelay
+                        | rbitcoin_net::peers::PeerConnType::Manual
+                ) {
+                    let net = s.net;
+                    peer_book.note_disconnected_addr(
+                        net,
+                        hub.clock.now_secs().min(u64::from(u32::MAX)) as u32,
+                    );
+                }
+            }
+            apply_peer_dead(st, peer_book, peer, reason)
+        }
     }
 }
 

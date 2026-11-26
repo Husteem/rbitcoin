@@ -1238,13 +1238,16 @@ async fn handshakes_refresh_only_outbound_rows() {
     )
     .await
     .expect("outbound handshake");
+    let live = first_handshaken(cli.peers.clone(), false);
+    let task = tokio::spawn(run_prepared_outbound(prepared));
+    live.await.unwrap().expect("live outbound row");
     assert_eq!(
         book.lock().unwrap().last_seen_of(&target),
-        now as u32,
-        "a full outbound handshake refreshes its row"
+        1_690_000_000,
+        "a live outbound is not advertised as just seen"
     );
-    drop(prepared);
 
+    // Inbound: bind a fixed source, put that row in the book, handshake in.
     let sock = tokio::net::TcpSocket::new_v4().unwrap();
     sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let src = sock.local_addr().unwrap();
@@ -1255,7 +1258,7 @@ async fn handshakes_refresh_only_outbound_rows() {
         .add_learned_addr_at(src_net, src_net, 1_690_000_000, 0, now, 8));
     let watch = first_handshaken(cli.peers.clone(), true);
     let stream = sock.connect(cli.local_addr).await.unwrap();
-    let _hs = rbitcoin_net::peer::connect_and_handshake_timed(
+    let hs = rbitcoin_net::peer::connect_and_handshake_timed(
         Duration::from_secs(5),
         stream,
         Magic::REGTEST,
@@ -1273,9 +1276,33 @@ async fn handshakes_refresh_only_outbound_rows() {
     assert_eq!(
         book.lock().unwrap().last_seen_of(&src_net),
         1_690_000_000,
-        "an inbound session does not refresh its row"
+        "a live inbound does not refresh its row"
+    );
+
+    // Close the outbound peer: Core `FinalizeNode` refreshes at disconnect.
+    srv.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("outbound session ends")
+        .expect("outbound task")
+        .expect("outbound session result");
+    assert_eq!(
+        book.lock().unwrap().last_seen_of(&target),
+        now as u32,
+        "the outbound row refreshes when the session ends"
+    );
+
+    // Close the inbound peer: an inbound session never refreshes a row.
+    drop(hs);
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while cli.peers.snapshot().iter().any(|p| p.inbound) && std::time::Instant::now() < end {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        book.lock().unwrap().last_seen_of(&src_net),
+        1_690_000_000,
+        "an inbound session never refreshes its row"
     );
 
     cli.shutdown().await;
-    srv.shutdown().await;
 }

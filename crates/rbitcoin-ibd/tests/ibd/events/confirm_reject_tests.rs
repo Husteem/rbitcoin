@@ -958,6 +958,37 @@ fn apply_peer_event_body_and_control_surface() {
         assert!(empty.entry_of(&fresh).is_some(), "pending peer's gossip");
         assert_eq!(empty.source_tally(), (1, 1));
     }
+    /// Core `FinalizeNode` refreshes a full outbound row's time after the
+    /// peer is gone; the catch-up slot's Dead event is that point.
+    fn a_dead_slot_refreshes_its_row_time(
+        hub: &rbitcoin_net::chain::ChainHub,
+        gen: BlockHash,
+        local: SocketAddr,
+        write_next: &AtomicU32,
+    ) {
+        let peer = SocketAddr::from(([10, 9, 9, 9], 18444));
+        let mut st = IbdWorkState::new(vec![dummy_slot(5, peer)], Some(gen), Some(0));
+        let row = rbitcoin_net::NetAddr::from_socket(peer);
+        let mut book = AddrMan::new();
+        assert!(book.add_learned_addr_at(row, row, 1_690_000_000, 0, 1_700_000_000, 8));
+        apply_peer_event(
+            &mut st,
+            hub,
+            PeerEvent::Dead {
+                peer: 5,
+                reason: "bye".to_string(),
+            },
+            write_next,
+            &mut book,
+            local,
+            None,
+        );
+        assert!(
+            book.last_seen_of(&row) > 1_690_000_000,
+            "a dead outbound slot refreshes its row at the node clock"
+        );
+    }
+
     fn dummy_header(prev: BlockHash, n: u8) -> Header {
         let mut h = Header {
             version: Version::from_consensus(4),
@@ -1211,6 +1242,7 @@ fn apply_peer_event_body_and_control_surface() {
 
     addrs_charge_the_sending_slot(&hub, gen, local, &write_next);
     addrs_from_a_pending_slot(&hub, gen, local, &write_next);
+    a_dead_slot_refreshes_its_row_time(&hub, gen, local, &write_next);
 
     // Dead releases work and reopens its heights for densify.
     st.slots[0].in_flight.insert(h(4));

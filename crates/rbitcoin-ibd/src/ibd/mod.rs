@@ -503,11 +503,15 @@ impl PeerBookSession {
                 let mut book = self.book.clone();
                 for e in g.entries() {
                     // A row this session pulled before the shared book changed
-                    // is written back from the session copy. Merge the shared
-                    // row into it first so a reply-side normalized time is not
-                    // lost; a row the session dropped stays out.
-                    let taken = self.seen.contains(&e.addr);
-                    if !taken || book.entry_of(&e.addr).is_some() {
+                    // is written back from the session copy. Merge only the
+                    // shared time into it, so a reply-side normalization is
+                    // kept and a successful connection's cleared flag is not
+                    // restored; a row the session dropped stays out.
+                    if self.seen.contains(&e.addr) {
+                        if book.entry_of(&e.addr).is_some() {
+                            book.merge_seen_from(&g, e.addr);
+                        }
+                    } else {
                         book.copy_row_from(&g, e.addr);
                     }
                 }
@@ -671,7 +675,6 @@ pub async fn ibd_cancellable(
             &mut boot_cooldown,
             &mut boot_strikes,
             Instant::now(),
-            hub.clock.now_secs(),
         );
         tried.extend(wave.attempted.iter().copied());
         let mut slots = wave.slots;
@@ -1120,7 +1123,6 @@ pub async fn ibd_cancellable(
                         &mut st.addr_cooldown,
                         &mut st.addr_strikes,
                         Instant::now(),
-                        hub.clock.now_secs(),
                     );
                     let blocked = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
                     let mut n = 0usize;

@@ -3756,34 +3756,8 @@ impl PeerHub {
         }
         peer.attach_wire(wire);
         peer.mark_handshake_complete();
-        self.note_connected_outbound(&peer);
         self.unregister(from.id);
         self.insert_live(peer)
-    }
-
-    /// Core `FinalizeNode` calls `AddrMan::Connected` for a full outbound
-    /// connection. Refresh its row at the node clock so a tip-mode peer we
-    /// reached is not advertised at its first gossip time.
-    fn note_connected_outbound(&self, peer: &LivePeer) {
-        if peer.inbound
-            || !matches!(
-                peer.conn_type,
-                PeerConnType::OutboundFullRelay | PeerConnType::Manual
-            )
-        {
-            return;
-        }
-        let am = {
-            let g = self.addrman.lock().unwrap_or_else(|e| e.into_inner());
-            g.clone()
-        };
-        let Some(am) = am else {
-            return;
-        };
-        let now = self.now_secs().min(u64::from(u32::MAX)) as u32;
-        am.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .note_connected_addr(peer.net, now);
     }
 
     fn new_live(
@@ -3891,6 +3865,20 @@ impl PeerHub {
         peer
     }
 
+    fn note_disconnected_outbound(&self, net: crate::NetAddr) {
+        let am = {
+            let g = self.addrman.lock().unwrap_or_else(|e| e.into_inner());
+            g.clone()
+        };
+        let Some(am) = am else {
+            return;
+        };
+        let now = self.now_secs().min(u64::from(u32::MAX)) as u32;
+        am.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_disconnected_addr(net, now);
+    }
+
     pub fn unregister(&self, id: u64) {
         if let Some(mp) = self
             .mempool
@@ -3907,6 +3895,18 @@ impl PeerHub {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
         if let Some(p) = removed {
+            // Core `FinalizeNode` calls `AddrMan::Connected` for a full
+            // outbound peer after it is gone, so the time is refreshed at
+            // disconnect, never while the session is live.
+            if p.handshake_complete()
+                && !p.inbound
+                && matches!(
+                    p.conn_type,
+                    PeerConnType::OutboundFullRelay | PeerConnType::Manual
+                )
+            {
+                self.note_disconnected_outbound(p.net);
+            }
             p.release_all_cmpct();
             p.end_block_download();
             self.end_headers_sync(&p);

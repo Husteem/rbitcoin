@@ -11,7 +11,7 @@ fn threshold_dead_cools_after_a_body_and_other_deaths_do_not() {
     let addr = slot.addr;
     let mut st = IbdWorkState::new(vec![slot], None, Some(0));
     let mut book = AddrMan::new();
-    book.note_connected_addr(rbitcoin_net::NetAddr::from_socket(addr), 1_700_000_000);
+    book.note_connected_addr(rbitcoin_net::NetAddr::from_socket(addr));
     apply_peer_dead(
         &mut st,
         &mut book,
@@ -30,10 +30,7 @@ fn threshold_dead_cools_after_a_body_and_other_deaths_do_not() {
     let other_addr = other.addr;
     let mut st = IbdWorkState::new(vec![other], None, Some(0));
     let mut book = AddrMan::new();
-    book.note_connected_addr(
-        rbitcoin_net::NetAddr::from_socket(other_addr),
-        1_700_000_000,
-    );
+    book.note_connected_addr(rbitcoin_net::NetAddr::from_socket(other_addr));
     apply_peer_dead(&mut st, &mut book, 2, "bye".to_string());
     assert!(
         !st.addr_cooldown
@@ -67,7 +64,7 @@ fn onion_death_and_explicit_disconnect_cool_the_actual_identity() {
         let mut st = IbdWorkState::new(vec![slot], None, Some(0));
         let mut book = AddrMan::new();
         book.set_onion_reachable(true);
-        book.note_connected_addr(onion, 1_700_000_000);
+        book.note_connected_addr(onion);
         if explicit {
             disconnect_peer(&mut st, 1);
             assert_eq!(st.addr_strikes.get(&onion), Some(&1));

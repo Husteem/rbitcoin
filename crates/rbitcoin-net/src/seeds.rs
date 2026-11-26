@@ -427,6 +427,10 @@ pub struct AddrMan {
     /// Unix seconds a peer last said it saw the row. A row with no entry has
     /// no learned time; see [`row_reply_time`].
     seen: HashMap<NetAddr, u32>,
+    /// The value [`Self::stamp_missing_seen_for`] replaced on a row. A flush
+    /// or merge keeps the normalized time when the other book still holds
+    /// the replaced one, even when the normalized time is lower.
+    seen_replaced: HashMap<NetAddr, u32>,
     pub asmap: Option<Arc<AsMap>>,
     pub last_attempt: HashMap<NetAddr, Instant>,
     pub only_net: Vec<OnlyNet>,
@@ -793,6 +797,7 @@ impl AddrMan {
         };
         if u64::from(stored) + interval < u64::from(last_seen) {
             self.seen.insert(addr, last_seen);
+            self.seen_replaced.remove(&addr);
         }
     }
 
@@ -833,7 +838,7 @@ impl AddrMan {
     /// Copy `other`'s row `addr` with its flags and learned time. A row this
     /// book lacks also takes `other`'s source, so a copy between live books
     /// keeps each group's share. A row both books hold keeps this book's
-    /// source and takes the newer time. A full book takes no new untried row
+    /// source and takes the newer or normalized time. A full book takes no new untried row
     /// from a group at its share, as [`Self::add_learned_addr`] refuses it: a
     /// group that taught its share in each of two live books does not hold
     /// both after they are reconciled. A row `other` connected to is always
@@ -850,18 +855,30 @@ impl AddrMan {
             return;
         }
         self.add_with_flags_addr(addr, flags);
-        let other_seen = other.last_seen_of(&addr);
-        if other_seen != 0
-            && self.by_addr.contains_key(&addr)
-            && (self.last_seen_of(&addr) == 0 || other_seen > self.last_seen_of(&addr))
-        {
-            self.seen.insert(addr, other_seen);
+        if self.by_addr.contains_key(&addr) {
+            self.merge_seen_from(other, addr);
         }
         if held || !self.by_addr.contains_key(&addr) {
             return;
         }
         if let Some(group) = group {
             self.charge(addr, group);
+        }
+    }
+
+    /// Take `other`'s time for `addr` when it is newer, or when `other` holds
+    /// the normalized value for a time this book replaced (a future time
+    /// reset to the backdate is lower, not newer).
+    pub fn merge_seen_from(&mut self, other: &AddrMan, addr: NetAddr) {
+        let other_seen = other.last_seen_of(&addr);
+        if other_seen == 0 {
+            return;
+        }
+        let self_seen = self.last_seen_of(&addr);
+        let normalized = other.seen_replaced.get(&addr).copied() == Some(self_seen);
+        if normalized || other_seen > self_seen {
+            self.seen.insert(addr, other_seen);
+            self.seen_replaced.remove(&addr);
         }
     }
 
@@ -881,6 +898,7 @@ impl AddrMan {
     pub fn evict_one(&mut self, addr: NetAddr) {
         self.by_addr.remove(&addr);
         self.seen.remove(&addr);
+        self.seen_replaced.remove(&addr);
         self.last_attempt.remove(&addr);
         if let Some(group) = self.learned_from.remove(&addr) {
             if let Entry::Occupied(mut n) = self.taught_by_group.entry(group) {
@@ -949,6 +967,7 @@ impl AddrMan {
         self.order = keep;
         self.by_addr.retain(|a, _| keep_set.contains(a));
         self.seen.retain(|a, _| keep_set.contains(a));
+        self.seen_replaced.retain(|a, _| keep_set.contains(a));
         self.last_attempt.retain(|a, _| keep_set.contains(a));
         self.learned_from.retain(|a, _| keep_set.contains(a));
         self.taught_by_group.clear();
@@ -1023,19 +1042,27 @@ impl AddrMan {
         self.order.is_empty()
     }
 
-    /// Successful BIP324 handshake. Core `Connected_` refreshes the row's
-    /// time when the last one is more than twenty minutes old.
-    pub fn note_connected_addr(&mut self, addr: NetAddr, now: u32) {
+    /// Successful handshake: the row is known good. The time is not touched
+    /// here, as Core's `Good_` leaves `nTime` alone at verack so a live
+    /// outbound peer is not advertised as just seen.
+    pub fn note_connected_addr(&mut self, addr: NetAddr) {
         self.add_addr(addr);
         if let Some(f) = self.by_addr.get_mut(&addr) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.remove(PeerFlags::FAILED_LAST_CONNECT);
             f.remove(PeerFlags::INCOMPATIBLE);
         }
+    }
+
+    /// A full outbound session ended. Core `Connected_` runs from
+    /// `FinalizeNode` and refreshes the row when its time is more than twenty
+    /// minutes old.
+    pub fn note_disconnected_addr(&mut self, addr: NetAddr, now: u32) {
         const REFRESH_SECS: u32 = 20 * 60;
         let stored = self.seen.get(&addr).copied().unwrap_or(0);
         if now.saturating_sub(stored) > REFRESH_SECS {
             self.seen.insert(addr, now);
+            self.seen_replaced.remove(&addr);
         }
     }
 
@@ -1049,12 +1076,11 @@ impl AddrMan {
         let backdated = backdated_seen(now);
         let now32 = now.min(u64::from(u32::MAX)) as u32;
         for addr in addrs {
-            let stale = match self.seen.get(addr).copied() {
-                None | Some(0) => true,
-                Some(t) => u64::from(t) > u64::from(now32).saturating_add(600),
-            };
+            let replaced = self.seen.get(addr).copied().unwrap_or(0);
+            let stale = replaced == 0 || u64::from(replaced) > u64::from(now32).saturating_add(600);
             if stale {
                 self.seen.insert(*addr, backdated);
+                self.seen_replaced.insert(*addr, replaced);
             }
         }
     }
