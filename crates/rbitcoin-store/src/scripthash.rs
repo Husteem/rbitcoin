@@ -120,16 +120,20 @@ pub fn sh_dirty_marked(store_dir: &Path) -> bool {
     store_dir.join(SH_DIRTY_NAME).is_file()
 }
 
-/// Drop the mark: after a wipe for rebuild, or once every write is synced.
-pub fn clear_sh_dirty(store_dir: &Path) -> Result<(), StoreError> {
-    let path = store_dir.join(SH_DIRTY_NAME);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {
-            crate::file::fsync_parent_dir(store_dir).map_err(|e| StoreError::io(store_dir, e))
+/// Sync the directories whose files index writes and wipes create or
+/// remove (ingest seal, sealed and packed heads, compaction), so those
+/// entries are durable before [`SH_DIRTY_NAME`] goes.
+fn fsync_sh_dirs(store_dir: &Path) -> Result<(), StoreError> {
+    for d in [
+        store_dir.join("scripthash.body"),
+        store_dir.join("scripthash.head"),
+        store_dir.join(crate::scripthash_overflow::OVERFLOW_DIR),
+    ] {
+        if d.is_dir() {
+            crate::file::fsync_parent_dir(&d).map_err(|e| StoreError::io(&d, e))?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(StoreError::io(&path, e)),
     }
+    Ok(())
 }
 
 /// [`SH_DIRTY_NAME`] for one open table. A writer marks before it writes
@@ -187,33 +191,37 @@ impl ShDirty {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).marked
     }
 
-    /// The index files were wiped: nothing unsynced is left to distrust.
+    /// The index files were wiped and the wipe synced: nothing is left to
+    /// distrust.
     fn clear_after_wipe(&self, store_dir: &Path) -> Result<(), StoreError> {
         let _quiet = self.scope.write().unwrap_or_else(|e| e.into_inner());
-        clear_sh_dirty(store_dir)?;
+        fsync_sh_dirs(store_dir)?;
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        s.marked = false;
+        Self::remove_marker(&mut s, store_dir)?;
         s.held = false;
         Ok(())
+    }
+
+    /// Remove the file and sync its directory. `marked` follows the file:
+    /// once the unlink lands it is false even if the sync then fails, so the
+    /// next write creates the mark again instead of trusting a missing one.
+    fn remove_marker(s: &mut ShDirtyState, store_dir: &Path) -> Result<(), StoreError> {
+        let path = store_dir.join(SH_DIRTY_NAME);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(StoreError::io(&path, e)),
+        }
+        s.marked = false;
+        crate::file::fsync_parent_dir(store_dir).map_err(|e| StoreError::io(store_dir, e))
     }
 
     fn clear_if_unchanged(&self, store_dir: &Path, gen: u64) -> Result<(), StoreError> {
         let _quiet = self.scope.write().unwrap_or_else(|e| e.into_inner());
         let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if s.marked && !s.held && s.gen == gen {
-            // Files the writes created or removed (ingest seal, sealed heads,
-            // compaction) are durable only once their directories are.
-            for d in [
-                store_dir.join("scripthash.body"),
-                store_dir.join("scripthash.head"),
-                store_dir.join(crate::scripthash_overflow::OVERFLOW_DIR),
-            ] {
-                if d.is_dir() {
-                    crate::file::fsync_parent_dir(&d).map_err(|e| StoreError::io(&d, e))?;
-                }
-            }
-            clear_sh_dirty(store_dir)?;
-            s.marked = false;
+            fsync_sh_dirs(store_dir)?;
+            Self::remove_marker(&mut s, store_dir)?;
         }
         Ok(())
     }
@@ -2672,8 +2680,10 @@ impl ScriptHashTable {
         }
     }
 
-    /// After a wipe for rebuild, drop [`SH_DIRTY_NAME`].
+    /// After a wipe for rebuild, sync the reset bodies and heads, then drop
+    /// [`SH_DIRTY_NAME`] once the wipe is durable.
     pub fn clear_dirty_after_wipe(&self) -> Result<(), StoreError> {
+        self.flush_synced()?;
         self.dirty.clear_after_wipe(&self.store_dir)
     }
 
