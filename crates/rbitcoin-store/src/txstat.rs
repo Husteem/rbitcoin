@@ -226,9 +226,8 @@ pub struct TxStat {
     pub ovf: TableFile,
     pub blk: TableFile,
     pub count: AtomicU64,
-    pub ovf_len: AtomicU64,
-    /// Serialises [`Self::put_header_blob`]'s read of `ovf_len`, append and
-    /// store. Readers stamp blocks too, so appends run on several threads.
+    /// Serialises [`Self::put_header_blob`]'s read of the `ovf` end and its
+    /// append. Readers stamp blocks too, so appends run on several threads.
     ovf_append: Mutex<()>,
 }
 
@@ -264,7 +263,6 @@ impl TxStat {
             ovf,
             blk,
             count: AtomicU64::new(0),
-            ovf_len: AtomicU64::new(0),
             ovf_append: Mutex::new(()),
         })
     }
@@ -301,7 +299,6 @@ impl TxStat {
             f.set_grow_policy(GrowPolicy::Tight1MiB);
             f
         };
-        let ovf_len = ovf.data_len();
         let blk_path = Self::blk_path(dir);
         let blk = if blk_path.exists() {
             let f = TableFile::open(blk_path, TableKind::TxStatBlk)?;
@@ -321,7 +318,6 @@ impl TxStat {
             ovf,
             blk,
             count: AtomicU64::new(count),
-            ovf_len: AtomicU64::new(ovf_len),
             ovf_append: Mutex::new(()),
         })
     }
@@ -574,9 +570,8 @@ impl TxStat {
             (0u64, 0u32, 0u32)
         } else {
             let _append = self.ovf_append.lock().unwrap_or_else(|e| e.into_inner());
-            let at = FILE_HEADER_LEN as u64 + self.ovf_len.load(Ordering::Acquire);
+            let at = FILE_HEADER_LEN as u64 + self.ovf.data_len();
             self.ovf.write_at_pwrite(at, blob)?;
-            self.ovf_len.store(self.ovf.data_len(), Ordering::Release);
             let nlen = blob.len() as u64;
             let n_ovf = decode_ovf_blob(blob)?.len() as u32;
             (

@@ -145,6 +145,14 @@ fn concurrent_header_blobs_keep_their_own_bytes() {
     for h in handles {
         h.join().unwrap();
     }
+    let total: u64 = (1..=THREADS * PER)
+        .map(|fk| blob_for(fk).len() as u64)
+        .sum();
+    assert_eq!(
+        t.ovf.data_len(),
+        total,
+        "appends neither overlap nor leave gaps"
+    );
     let wrong: Vec<u64> = (1..=THREADS * PER)
         .filter(|&fk| t.header_blob(Fk(fk)).unwrap() != blob_for(fk))
         .collect();
