@@ -2644,12 +2644,8 @@ impl ScriptHashTable {
         let Some(g) = g.as_ref() else {
             return Err(StoreError::Corrupt("scripthash: ingest missing"));
         };
-        if new_val.is_empty() {
-            g.clear_key(scripthash)?;
-        } else {
-            g.insert(scripthash, new_val)?;
-        }
-        Ok(())
+        g.stage_rewrites(&[(*scripthash, new_val.clone())])?;
+        g.sync_and_drop_ahead()
     }
 
     #[doc(hidden)]
@@ -2658,21 +2654,27 @@ impl ScriptHashTable {
         scripthash: &[u8; 32],
         new_val: &ShHeadValue,
     ) -> Result<(), StoreError> {
-        let hk = head_key_from_full(scripthash);
-        let si = self.shard_index(scripthash);
-        let updated_sorted = if let Some(slot) = self.sorted_main.get(si) {
-            let g = slot.read().unwrap();
-            match g.as_ref() {
-                Some(h) => h.update_value(&hk, new_val)?,
-                None => false,
-            }
-        } else {
-            false
-        };
-        if !updated_sorted {
+        if !self.sorted_main_updated(scripthash, new_val)? {
             self.unlink_write_ingest(scripthash, new_val)?;
         }
         Ok(())
+    }
+
+    fn sorted_main_updated(
+        &self,
+        scripthash: &[u8; 32],
+        new_val: &ShHeadValue,
+    ) -> Result<bool, StoreError> {
+        let hk = head_key_from_full(scripthash);
+        let si = self.shard_index(scripthash);
+        let Some(slot) = self.sorted_main.get(si) else {
+            return Ok(false);
+        };
+        let g = slot.read().unwrap();
+        match g.as_ref() {
+            Some(h) => h.update_value(&hk, new_val),
+            None => Ok(false),
+        }
     }
 
     #[doc(hidden)]

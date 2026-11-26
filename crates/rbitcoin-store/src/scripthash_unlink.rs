@@ -323,10 +323,33 @@ impl ScriptHashTable {
                 body.sync_data_only()?;
             }
         }
+        let mut ingest_rows = Vec::new();
         for job in &batch.rewrites {
-            self.unlink_write_home(&job.scripthash, job.home, &job.new_val)?;
+            match job.home {
+                LocatedHome::Ingest => {
+                    ingest_rows.push((job.scripthash, job.new_val.clone()));
+                }
+                LocatedHome::Main => {
+                    if !self.sorted_main_updated(&job.scripthash, &job.new_val)? {
+                        ingest_rows.push((job.scripthash, job.new_val.clone()));
+                    }
+                }
+                LocatedHome::SealedOvf => {
+                    self.unlink_write_sealed_ovf(&job.scripthash, &job.new_val)?;
+                }
+            }
+        }
+        if !ingest_rows.is_empty() {
+            let g = self.ingest.lock().unwrap();
+            let Some(head) = g.as_ref() else {
+                return Err(StoreError::Corrupt("scripthash: ingest missing"));
+            };
+            head.stage_rewrites(&ingest_rows)?;
         }
         self.sync_batch_homes(&batch)?;
+        if let Some(head) = self.ingest.lock().unwrap().as_ref() {
+            head.drop_ahead()?;
+        }
         // One barrier per body, after every free-list write for that file.
         let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
         for (i, job) in batch.rewrites.iter().enumerate() {

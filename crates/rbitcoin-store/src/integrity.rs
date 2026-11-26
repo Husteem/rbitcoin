@@ -1,8 +1,8 @@
 //! Tip-window revalidation on store open (Bitcoin Core `checkblocks`-style).
 //!
 //! Default window is [`VERIFY_TIP_BLOCKS`] (6) for both structural checks and
-//! Class A merkle content. Runs **before** the one complement Class C repair
-//! so the fence matches the post-revalidate tip.
+//! Class A merkle content. Open clears leftover strong bits and restores
+//! fence bits, revalidates this window, then clears and restores again.
 //!
 //! Soft sidecar [`TIP_SEAL_NAME`]: written after a successful connect/disconnect
 //! Class C barrier so a kill that advanced `confirmed` without a complete seal

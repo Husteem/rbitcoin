@@ -62,10 +62,10 @@ in-process tip; that is lost progress, not a wrong chain. Open does not invent
 a height, a tx range, or a spend from a partially written block: it re-reads
 the window, rebuilds a derived index from Class A, or cuts the tail.
 
-**The residual in-place state.** Class C pages (`header_txs`, `strong_tx`,
-`header.head`) and `txstat` cells journal a synced `*.ahead` image, and open
+**The residual in-place state.** `header_txs_*`, `header.head`, `txstat.body`,
+and the scripthash ingest head journal a synced `*.ahead` image, and open
 restores it. A strong bit a fence run names is set again by
-`restore_strong_from_fence`. `confirmed[]` is held by `tip_seal` and
+`restore_strong_from_fence`. `strong_tx` has no sidecar. `confirmed[]` is held by `tip_seal` and
 `trim_trailing_nulls`, not by a redo. The scripthash index is gated instead
 of repaired: an append, an unlink or a deferred empty-head commit writes
 `scripthash.dirty` before it writes. A full synced `ScriptHashTable::flush`

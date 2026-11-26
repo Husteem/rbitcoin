@@ -2867,6 +2867,43 @@ fn unlink_batch_syncs_one_body_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two ingest-head rewrites share one page image. A per-key `sync_data` fails
+/// this batch; the home flush is the body barrier, and it leaves no sidecar.
+#[test]
+fn unlink_batch_syncs_the_ingest_head_once() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let a = script_hash(&[0x65]);
+    let b = script_hash(&[0x66]);
+    for i in 1..=3u64 {
+        put_create(&t, rec(a, i, i as u32));
+        put_create(&t, rec(b, i + 10, i as u32));
+    }
+    let (handle, ahead) = {
+        let g = t.ingest.lock().unwrap();
+        let head = g.as_ref().unwrap();
+        let path = head.file.path.clone();
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(".ahead");
+        let ahead = path.parent().unwrap().join(name);
+        (head.file.io_handle(), ahead)
+    };
+    struct Disarm(rbitcoin_store::io_handle::IoHandle);
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            rbitcoin_store::io_handle::disarm_pwrite(self.0);
+        }
+    }
+    let _disarm = Disarm(handle);
+    rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+    t.unlink_creates_batch(&[(a, vec![Fk(2)]), (b, vec![Fk(12)])])
+        .unwrap();
+    assert_eq!(t.entries(&a).unwrap().len(), 2);
+    assert_eq!(t.entries(&b).unwrap().len(), 2);
+    assert!(!ahead.exists(), "ingest ahead sidecar still present");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn reinit_clears_head_when_live_count_already_zero() {
     // Crash mid-finish: heads durable, alloc live_count still 0.

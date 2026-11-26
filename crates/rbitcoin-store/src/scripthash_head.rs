@@ -538,7 +538,7 @@ impl ScriptHashHead {
             }
             if k == key {
                 cache.write_slot(slot, &key, &[0u8; SH_HEAD_VALUE_LEN])?;
-                cache.flush()?;
+                cache.flush_durable()?;
                 return Ok(true);
             }
             slot = (slot + 1) & (slots - 1);
@@ -550,13 +550,12 @@ impl ScriptHashHead {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut upserts: Vec<(ShHeadKey, ShHeadValue)> = Vec::with_capacity(entries.len());
+        let mut upserts = Vec::with_capacity(entries.len());
         for (full, v) in entries {
-            let key = Self::to_key(full);
             if v.is_empty() {
                 self.clear_key(full)?;
             } else {
-                upserts.push((key, v.clone()));
+                upserts.push((*full, v.clone()));
             }
         }
         if upserts.is_empty() {
@@ -568,30 +567,42 @@ impl ScriptHashHead {
             let state = self.state.lock().unwrap();
             if state.occ_known && state.occupied == 0 {
                 drop(state);
-                return self.bulk_fill_empty(&upserts);
+                let keyed: Vec<(ShHeadKey, ShHeadValue)> = upserts
+                    .iter()
+                    .map(|(full, v)| (Self::to_key(full), v.clone()))
+                    .collect();
+                return self.bulk_fill_empty(&keyed);
             }
         }
+        self.stage_rewrites(&upserts)?;
+        self.sync_and_drop_ahead()
+    }
 
-        let mut work = upserts;
+    /// Write every row through one page cache. The `*.ahead` image stays until
+    /// [`Self::sync_and_drop_ahead`] or [`Self::drop_ahead`] after the file sync.
+    #[doc(hidden)]
+    pub fn stage_rewrites(&self, rows: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let slots_now = self.state.lock().unwrap().slots;
-        work.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots_now));
-
         let cap = slots_now.saturating_mul(MAX_LOAD_NUM) / MAX_LOAD_DEN;
-        let mut i = 0usize;
+        let mut rows = rows.to_vec();
+        rows.sort_unstable_by_key(|(full, _)| Self::hash_slot(&Self::to_key(full), slots_now));
         let mut cache = SlotPageCache::new(self, slots_now);
-        while i < work.len() {
-            let (key, ref val) = work[i];
+        for (full, val) in &rows {
+            let key = Self::to_key(full);
+            if val.is_empty() {
+                write_clear(&mut cache, &key)?;
+                continue;
+            }
             let at_cap = {
                 let st = self.state.lock().unwrap();
                 st.occ_known && st.occupied >= cap
             };
-            if at_cap {
-                let mut full = [0u8; 32];
-                full[..SH_HEAD_KEY_LEN].copy_from_slice(&key);
-                if self.get(&full)?.is_none() {
-                    cache.flush()?;
-                    return Err(StoreError::Corrupt(SH_HEAD_FULL));
-                }
+            if at_cap && self.get(full)?.is_none() {
+                cache.flush()?;
+                return Err(StoreError::Corrupt(SH_HEAD_FULL));
             }
             let enc = pack8_bytes(val)?;
             match cache.try_insert(&key, &enc, true)? {
@@ -606,7 +617,6 @@ impl ScriptHashHead {
                             state.occupied = state.occupied.saturating_add(1);
                         }
                     }
-                    i += 1;
                 }
                 InsertResult::NeedSlot => {
                     cache.flush()?;
@@ -615,14 +625,39 @@ impl ScriptHashHead {
             }
         }
         cache.flush()?;
-        // Seal sidecar after batch when count is authoritative.
-        {
-            let state = self.state.lock().unwrap();
-            if state.occ_known {
-                let occ = state.occupied;
-                drop(state);
-                self.persist_occ(occ)?;
-            }
+        let state = self.state.lock().unwrap();
+        if state.occ_known {
+            let occ = state.occupied;
+            drop(state);
+            self.persist_occ(occ)?;
+        }
+        Ok(())
+    }
+
+    /// Sync the head, then drop its `*.ahead` image. No image means nothing to sync.
+    #[doc(hidden)]
+    pub fn sync_and_drop_ahead(&self) -> Result<(), StoreError> {
+        let side = ahead_path(self.file.path());
+        match std::fs::metadata(&side) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(StoreError::io(&side, e)),
+        }
+        self.file.sync_data_only()?;
+        self.drop_ahead()
+    }
+
+    /// Remove a sidecar the file sync already covered.
+    #[doc(hidden)]
+    pub fn drop_ahead(&self) -> Result<(), StoreError> {
+        let side = ahead_path(self.file.path());
+        match std::fs::remove_file(&side) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(StoreError::io(&side, e)),
+        }
+        if let Some(parent) = side.parent() {
+            file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
         }
         Ok(())
     }
@@ -744,8 +779,23 @@ impl ScriptHashHead {
     }
 }
 
-#[doc(hidden)]
-pub fn is_empty_slot(k: &ShHeadKey, v: &[u8; SH_HEAD_VALUE_LEN]) -> bool {
+fn write_clear(cache: &mut SlotPageCache<'_>, key: &ShHeadKey) -> Result<bool, StoreError> {
+    let mut slot = ScriptHashHead::hash_slot(key, cache.slots);
+    for _ in 0..cache.slots {
+        let (k, v) = cache.read_slot(slot)?;
+        if is_empty_slot(&k, &v) {
+            return Ok(false);
+        }
+        if k == *key {
+            cache.write_slot(slot, key, &[0u8; SH_HEAD_VALUE_LEN])?;
+            return Ok(true);
+        }
+        slot = (slot + 1) & (cache.slots - 1);
+    }
+    Ok(false)
+}
+
+fn is_empty_slot(k: &ShHeadKey, v: &[u8; SH_HEAD_VALUE_LEN]) -> bool {
     *k == [0u8; SH_HEAD_KEY_LEN] && *v == [0u8; SH_HEAD_VALUE_LEN]
 }
 
@@ -893,9 +943,7 @@ impl<'a> SlotPageCache<'a> {
                 block += 4096;
             }
         }
-        let side = if blocks.is_empty() {
-            None
-        } else {
+        if !blocks.is_empty() {
             // A leftover sidecar from a failed write keeps pages this write
             // does not replace; new images win on pages they cover.
             let mut merged = load_ahead_pages(self.head.file.path())?;
@@ -910,8 +958,7 @@ impl<'a> SlotPageCache<'a> {
                     std::io::Error::other("injected scripthash head ahead failure"),
                 ));
             }
-            Some(side)
-        };
+        }
         let mut writes = 0u32;
         for (_, chunk) in self.chunks.iter_mut() {
             if chunk.dirty {
@@ -927,16 +974,14 @@ impl<'a> SlotPageCache<'a> {
                 }
             }
         }
-        if side.is_some() {
-            self.head.file.sync_data_only()?;
-        }
         self.chunks.clear();
-        if let Some(side) = side {
-            std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
-            if let Some(parent) = side.parent() {
-                file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
-            }
-        }
         Ok(())
+    }
+
+    /// [`Self::flush`] plus the head sync that drops the sidecar.
+    #[doc(hidden)]
+    pub fn flush_durable(&mut self) -> Result<(), StoreError> {
+        self.flush()?;
+        self.head.sync_and_drop_ahead()
     }
 }
