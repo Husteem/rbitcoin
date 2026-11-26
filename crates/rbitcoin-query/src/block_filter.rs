@@ -550,13 +550,13 @@ impl Query {
         let Some(table) = self.block_filter_table() else {
             return Ok(None);
         };
-        Ok(table
+        table
             .filter(Height(height))?
             .map(|(body, slot)| {
                 check_filter_hash(&body, &slot)?;
                 Ok::<_, StoreError>((body, FilterHeader::from_byte_array(slot.filter_header)))
             })
-            .transpose()?)
+            .transpose()
     }
 
     /// Filter bytes for `start..=end` in one idx and one body read per
@@ -565,7 +565,7 @@ impl Query {
         let Some(table) = self.block_filter_table() else {
             return Ok(None);
         };
-        Ok(table
+        table
             .filters(Height(start), Height(end))?
             .map(|v| {
                 v.into_iter()
@@ -575,7 +575,7 @@ impl Query {
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
-            .transpose()?)
+            .transpose()
     }
 
     /// Filter headers at heights 1,000, 2,000, … through `stop`.
