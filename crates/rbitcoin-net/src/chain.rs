@@ -4531,17 +4531,31 @@ impl ChainHub {
     /// Hold a body that is not on the active chain. Its header is written
     /// first when its parent has a row, as Core stores a side block's header:
     /// a `submitblock` that loses a race otherwise leaves a body that peers
-    /// build on with no header for their children to connect to.
+    /// build on with no header for their children to connect to. Store IO:
+    /// call it on the tip-accept lane or a blocking thread, never a Tokio
+    /// worker; [`Self::park_body`] is the in-RAM part.
     #[doc(hidden)]
     pub fn hold_body(&self, block: Arc<Block>, waive: bool) {
         let hash = block.block_hash();
-        if self.is_connected(&hash) {
-            return;
-        }
-        if !self.knows_header(&hash) && self.knows_header(&block.header.prev_blockhash) {
+        if !self.is_connected(&hash)
+            && !self.knows_header(&hash)
+            && self.knows_header(&block.header.prev_blockhash)
+        {
             if let Err(e) = self.ensure_header(&block.header) {
                 rbitcoin_log::debug!(Tip, "hold {hash}: header not written ({e})");
             }
+        }
+        self.park_body(block, waive);
+    }
+
+    /// Park a body in RAM without writing its header, so an equal-work
+    /// sibling can race it before the lane job runs. The lane job holds it
+    /// with [`Self::hold_body`] if it loses.
+    #[doc(hidden)]
+    pub fn park_body(&self, block: Arc<Block>, waive: bool) {
+        let hash = block.block_hash();
+        if self.is_connected(&hash) {
+            return;
         }
         if let Some(h) = self.held_body_height(block.as_ref()) {
             if let Some(tip) = self.tip_height() {

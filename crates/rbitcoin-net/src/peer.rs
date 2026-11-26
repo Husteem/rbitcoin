@@ -222,7 +222,7 @@ pub async fn accept_received_from_peer(
     let was_held = hub.held_body(&announced).is_some();
     let was_connected = hub.is_connected(&announced);
     let block = std::sync::Arc::new(block);
-    hub.hold_body(std::sync::Arc::clone(&block), waive);
+    hub.park_body(std::sync::Arc::clone(&block), waive);
     let r = if let Some(hub) = hub.shared_arc() {
         crate::tip_accept::run_on_tip_accept_async(move || {
             let r = hub.accept_received_arc_on_lane(block, waive);
