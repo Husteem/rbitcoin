@@ -516,3 +516,88 @@ fn v1_is_a_bind_permission_on_a_private_address() {
         assert!(err.contains("loopback or private address"), "{bind}: {err}");
     }
 }
+
+/// A forwarded loopback skips `--net-permission` grants (above). An inbound
+/// grant that covers loopback is then dead on the shared listener, and the
+/// node reports it so startup can warn. Every forwarding case counts: the
+/// overlay flag, and an onion `--external-ip` with no onion bind.
+#[test]
+fn forwarded_loopback_reports_dead_loopback_grants() {
+    let lo_grant = || {
+        let mut t = NetPermTable::default();
+        t.whitelist
+            .push(parse_whitelist("noban,relay,download@127.0.0.1").unwrap());
+        t
+    };
+
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_net_perms(lo_grant());
+    assert!(!peers.forwarded_loopback_drops_grants(), "no forwarding");
+    peers.set_overlay_loopback_forward(true);
+    assert!(
+        peers.forwarded_loopback_drops_grants(),
+        "overlay forwarding"
+    );
+
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let mut t = NetPermTable::default();
+    t.whitelist
+        .push(parse_whitelist("noban@10.0.0.0/8").unwrap());
+    t.whitelist
+        .push(parse_whitelist("out,noban@127.0.0.1").unwrap());
+    peers.set_net_perms(t);
+    peers.set_overlay_loopback_forward(true);
+    assert!(
+        !peers.forwarded_loopback_drops_grants(),
+        "no inbound grant covers loopback"
+    );
+
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_net_perms(lo_grant());
+    peers.set_external_endpoints(vec![
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
+            .parse()
+            .unwrap(),
+    ]);
+    assert!(
+        peers.forwarded_loopback_drops_grants(),
+        "an external onion with no onion bind"
+    );
+    let mut t = lo_grant();
+    t.onion_bind = Some("127.0.0.1:8334".parse().unwrap());
+    peers.set_net_perms(t.clone());
+    assert!(
+        !peers.forwarded_loopback_drops_grants(),
+        "the onion bind takes the forwarded peers"
+    );
+    peers.set_overlay_loopback_forward(true);
+    assert!(
+        peers.forwarded_loopback_drops_grants(),
+        "I2P incoming still forwards with an onion bind"
+    );
+
+    for scope in ["::1", "127.0.0.2", "127.0.0.0/8", "0.0.0.0/0", "::/0"] {
+        let peers = rbitcoin_net::peers::PeerHub::new();
+        let mut t = NetPermTable::default();
+        t.whitelist
+            .push(parse_whitelist(&format!("noban@{scope}")).unwrap());
+        peers.set_net_perms(t);
+        peers.set_overlay_loopback_forward(true);
+        assert!(
+            peers.forwarded_loopback_drops_grants(),
+            "a grant on {scope} covers a loopback peer"
+        );
+    }
+    for scope in ["126.0.0.0/8", "128.0.0.1", "::2"] {
+        let peers = rbitcoin_net::peers::PeerHub::new();
+        let mut t = NetPermTable::default();
+        t.whitelist
+            .push(parse_whitelist(&format!("noban@{scope}")).unwrap());
+        peers.set_net_perms(t);
+        peers.set_overlay_loopback_forward(true);
+        assert!(
+            !peers.forwarded_loopback_drops_grants(),
+            "a grant on {scope} covers no loopback peer"
+        );
+    }
+}

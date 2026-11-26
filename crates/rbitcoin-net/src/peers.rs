@@ -2565,6 +2565,18 @@ impl PeerHub {
                 || (table.onion_bind.is_none() && self.external_onion().is_some()))
     }
 
+    /// An inbound `--net-permission` grant covers loopback while loopback
+    /// inbound is forwarded Tor or I2P traffic, so the shared P2P listener
+    /// drops it for every loopback peer. Startup warns on this.
+    pub fn forwarded_loopback_drops_grants(&self) -> bool {
+        let table = self.net_perms.lock().unwrap_or_else(|e| e.into_inner());
+        self.loopback_forwarded(&table, IpAddr::from([127, 0, 0, 1]))
+            && table
+                .whitelist
+                .iter()
+                .any(|g| g.inbound && g.subnet.overlaps_loopback())
+    }
+
     /// Inbound that a Tor or I2P forwarder delivers: the marked onion bind,
     /// or [`Self::loopback_forwarded`] on any bind but a `v1` wallet bind,
     /// which forwarders never reach. Every such peer shares the forwarder's

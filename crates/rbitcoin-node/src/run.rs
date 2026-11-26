@@ -587,6 +587,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         .map_err(|e| crate::error::NodeError::Init(format!("index startup repair failed: {e}")))?;
     let clearnet_listen = config.listen.p2p_bind_addr(config.network).is_some();
     let bind = config.listen.start_p2p_bind(config.network);
+    let p2p_inbound = bind.is_some() && config.listen.max_inbound > 0;
 
     let start_tip = handle.query.tip_height().map(|h| h.0).unwrap_or(0);
     let run_started = Instant::now();
@@ -788,6 +789,17 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     );
     node.peers
         .publish_local_endpoints(node.local_addr.port(), external, table.clone());
+    if p2p_inbound && node.peers.forwarded_loopback_drops_grants() {
+        let onion_fix = if config.listen.i2p_accept_incoming {
+            ""
+        } else {
+            ", or mark the Tor bind with --listen <addr>:<port>=onion"
+        };
+        warn!(
+            "--net-permission grants for loopback do not apply on the P2P listener {}: Tor or I2P peers arrive from loopback there. Give local clients --net-permission-bind=<perms>@127.0.0.1:<port> on a port the forwarder does not use{onion_fix}",
+            node.local_addr
+        );
+    }
     if immediate_relay {
         node.peers.set_noban(true);
     }
