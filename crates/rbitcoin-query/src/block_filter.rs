@@ -37,6 +37,16 @@ fn take_lie_filter_body() -> Option<Vec<u8>> {
     LIE_FILTER_BODY.with(|slot| slot.borrow_mut().take())
 }
 
+#[cfg(debug_assertions)]
+fn lie_filter_row(mut row: Option<(Vec<u8>, FilterHeader)>) -> Option<(Vec<u8>, FilterHeader)> {
+    if let Some((body, _)) = row.as_mut() {
+        if let Some(lie) = take_lie_filter_body() {
+            *body = lie;
+        }
+    }
+    row
+}
+
 /// Core `getblockfilter` when the index has not reached this block.
 #[doc(hidden)]
 pub const FILTER_STILL_INDEXING: &str =
@@ -619,7 +629,7 @@ impl Query {
         let Some(table) = self.block_filter_table() else {
             return Ok(None);
         };
-        let mut row = table
+        let row = table
             .filter(Height(height))?
             .map(|(body, slot)| {
                 let (body, slot) = self.repaired_filter_body(height, body, &slot)?;
@@ -627,11 +637,7 @@ impl Query {
             })
             .transpose()?;
         #[cfg(debug_assertions)]
-        if let Some((body, _)) = row.as_mut() {
-            if let Some(lie) = take_lie_filter_body() {
-                *body = lie;
-            }
-        }
+        let row = lie_filter_row(row);
         Ok(row)
     }
 
