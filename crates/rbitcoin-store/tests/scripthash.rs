@@ -294,6 +294,66 @@ fn put_create_batch(t: &ScriptHashTable, recs: impl AsRef<[ScriptHashRecord]>) -
 }
 
 #[test]
+fn ingest_syncs_the_body_before_the_alloc_header() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xc1]);
+    let before = read_alloc_header(t.ovf_file()).unwrap().0.live_count;
+    rbitcoin_store::io_handle::arm_fail_sync(t.ovf_file().io_handle(), 1);
+    let err = t.put_create_batch_append(&[rec(sh, 1, 0)]).unwrap_err();
+    assert!(matches!(err, StoreError::Io { .. }), "{err}");
+    drop(t);
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    let live = read_alloc_header(t.ovf_file()).unwrap().0.live_count;
+    assert_eq!(live, before, "alloc header moved before the body sync");
+    assert!(t.head_value(&sh).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ingest_syncs_the_alloc_header_before_the_head() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xc2]);
+    rbitcoin_store::io_handle::arm_fail_sync_after(t.ovf_file().io_handle(), 1, 1);
+    let err = t.put_create_batch_append(&[rec(sh, 1, 0)]).unwrap_err();
+    assert!(matches!(err, StoreError::Io { .. }), "{err}");
+    drop(t);
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    let live = read_alloc_header(t.ovf_file()).unwrap().0.live_count;
+    assert_eq!(
+        live, 1,
+        "the alloc header must be stored before the second sync"
+    );
+    assert!(
+        t.head_value(&sh).unwrap().is_none(),
+        "ingest head must wait for the alloc-header sync"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn last_create_fk_on_rejects_a_slab_whose_used_lies() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh = script_hash(&[0xc3]);
+    assert_eq!(put_create_batch(&t, [rec(sh, 1, 0), rec(sh, 2, 0)]), 2);
+    let val = t.head_value(&sh).unwrap().unwrap();
+    let ShHeadValue::Slab { off, used, .. } = val else {
+        panic!("two creates must be a slab, got {val:?}");
+    };
+    assert_eq!(used, 2);
+    let body = t.body_for(&sh, t.key_home(&sh).unwrap());
+    body.write_at(off, &1u16.to_le_bytes()).unwrap();
+    let err = t.last_create_fk_on(body, &val).unwrap_err();
+    match err {
+        StoreError::Corrupt(msg) => assert!(msg.contains("used"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn open_refuses_pack8_paged_mode_10_on_ingest() {
     let dir = tmp();
     {
@@ -1600,8 +1660,9 @@ fn alloc_header_reads_the_counts() {
 
     let mut next = state;
     next.live_count = 4;
-    next.bump = state.bump + 8;
-    next.free_head[3] = 8192;
+    next.bump = 8192;
+    next.free_head[3] = 4096;
+    body.set_logical_len(next.bump).unwrap();
     write_alloc_header(&body, &next).unwrap();
     let (state, ver) = match read_alloc_header(&body) {
         Ok(v) => v,
@@ -1610,7 +1671,7 @@ fn alloc_header_reads_the_counts() {
     assert_eq!(ver, SH_ALLOC_VERSION);
     assert_eq!(state.live_count, 4);
     assert_eq!(state.bump, next.bump);
-    assert_eq!(state.free_head[3], 8192);
+    assert_eq!(state.free_head[3], 4096);
 }
 
 #[test]
@@ -2774,6 +2835,173 @@ fn unlink_batch_publishes_both_heads() {
     let t = ScriptHashTable::open_tiny(&dir).unwrap();
     assert_eq!(t.entries(&a).unwrap().len(), 2);
     assert_eq!(t.entries(&b).unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two frees on one body take one device barrier, then one alloc header.
+#[test]
+fn unlink_batch_syncs_one_body_once() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let a = script_hash(&[0x63]);
+    let b = script_hash(&[0x64]);
+    for i in 1..=3u64 {
+        put_create(&t, rec(a, i, i as u32));
+        put_create(&t, rec(b, i + 10, i as u32));
+    }
+    let handle = t.ovf_file().io_handle();
+    struct Disarm(rbitcoin_store::io_handle::IoHandle);
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            rbitcoin_store::io_handle::disarm_pwrite(self.0);
+        }
+    }
+    let _disarm = Disarm(handle);
+    // The batch syncs the overflow body once before the frees. One more
+    // barrier covers both free lists. A third sync is the per-key loop.
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 2, 1);
+    t.unlink_creates_batch(&[(a, vec![Fk(2)]), (b, vec![Fk(12)])])
+        .unwrap();
+    assert_eq!(t.entries(&a).unwrap().len(), 2);
+    assert_eq!(t.entries(&b).unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two ingest-head rewrites share one page image. A per-key `sync_data` fails
+/// this batch; the home flush is the body barrier, and it leaves no sidecar.
+#[test]
+fn unlink_batch_syncs_the_ingest_head_once() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let a = script_hash(&[0x65]);
+    let b = script_hash(&[0x66]);
+    for i in 1..=3u64 {
+        put_create(&t, rec(a, i, i as u32));
+        put_create(&t, rec(b, i + 10, i as u32));
+    }
+    let (handle, ahead) = {
+        let g = t.ingest.lock().unwrap();
+        let head = g.as_ref().unwrap();
+        let path = head.file.path.clone();
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(".ahead");
+        let ahead = path.parent().unwrap().join(name);
+        (head.file.io_handle(), ahead)
+    };
+    struct Disarm(rbitcoin_store::io_handle::IoHandle);
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            rbitcoin_store::io_handle::disarm_pwrite(self.0);
+        }
+    }
+    let _disarm = Disarm(handle);
+    rbitcoin_store::io_handle::arm_fail_sync(handle, 1);
+    t.unlink_creates_batch(&[(a, vec![Fk(2)]), (b, vec![Fk(12)])])
+        .unwrap();
+    assert_eq!(t.entries(&a).unwrap().len(), 2);
+    assert_eq!(t.entries(&b).unwrap().len(), 2);
+    assert!(!ahead.exists(), "ingest ahead sidecar still present");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Covered ingest rows share one head barrier. A second sync is the per-key clear.
+#[test]
+fn drop_ingest_covered_by_packed_main_syncs_the_head_once() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let a = script_hash(&[0x21]);
+    let b = script_hash(&[0x22]);
+    let mut session = t.pack_shard_session(0).unwrap();
+    push_chain(&mut session, a, &[Fk(1)]);
+    push_chain(&mut session, b, &[Fk(2)]);
+    seal_session(&t, 0, session);
+    put_create(&t, rec(script_hash(&[0x23]), 3, 0));
+    {
+        let g = t.ingest.lock().unwrap();
+        let head = g.as_ref().unwrap();
+        head.insert(&a, &ShHeadValue::inline_one(Fk(11))).unwrap();
+        head.insert(&b, &ShHeadValue::inline_one(Fk(12))).unwrap();
+    }
+    let (handle, ahead) = {
+        let g = t.ingest.lock().unwrap();
+        let head = g.as_ref().unwrap();
+        let path = head.file.path.clone();
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(".ahead");
+        (head.file.io_handle(), path.parent().unwrap().join(name))
+    };
+    struct Disarm(rbitcoin_store::io_handle::IoHandle);
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            rbitcoin_store::io_handle::disarm_pwrite(self.0);
+        }
+    }
+    let _disarm = Disarm(handle);
+    rbitcoin_store::io_handle::arm_fail_sync_after(handle, 1, 1);
+    t.drop_ingest_covered_by_packed_main(0).unwrap();
+    assert!(t
+        .ingest
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&a)
+        .unwrap()
+        .is_none());
+    assert!(t
+        .ingest
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&b)
+        .unwrap()
+        .is_none());
+    assert!(!ahead.exists(), "ingest ahead sidecar still present");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sealed-overflow unlink does not sync ingest, so it must leave an
+/// outstanding ingest `.ahead` image in place.
+#[test]
+fn sealed_unlink_keeps_an_outstanding_ingest_ahead() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    let sh_main = script_hash(&[0x10]);
+    let mut session = t.pack_shard_session(0).unwrap();
+    push_chain(&mut session, sh_main, &[Fk(1)]);
+    seal_session(&t, 0, session);
+    let sealed = script_hash(&[0xa6, 0x01]);
+    put_create(&t, rec(sealed, 1, 0));
+    put_create(&t, rec(sealed, 2, 0));
+    put_create(&t, rec(sealed, 3, 0));
+    for i in 0..210u32 {
+        let filler = script_hash(&[0xa6, (i & 0xff) as u8, (i >> 8) as u8, 0x06]);
+        if filler == sealed {
+            continue;
+        }
+        put_create(&t, rec(filler, 5000 + u64::from(i), 0));
+    }
+    assert!(matches!(t.key_home(&sealed).unwrap(), KeyHome::SealedOvf));
+    let live = script_hash(&[0xa7]);
+    put_create(&t, rec(live, 9, 0));
+    let ahead = {
+        let g = t.ingest.lock().unwrap();
+        let head = g.as_ref().unwrap();
+        head.stage_rewrites(&[(live, ShHeadValue::inline_one(Fk(9)))])
+            .unwrap();
+        let path = head.file.path.clone();
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(".ahead");
+        path.parent().unwrap().join(name)
+    };
+    assert!(ahead.is_file(), "stage must leave an ingest ahead image");
+    t.unlink_creates_batch(&[(sealed, vec![Fk(2)])]).unwrap();
+    assert_eq!(t.entries(&sealed).unwrap().len(), 2);
+    assert!(
+        ahead.is_file(),
+        "sealed unlink removed the ingest ahead image"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

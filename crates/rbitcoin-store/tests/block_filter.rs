@@ -95,6 +95,27 @@ fn filter_at_height_reads_only_its_record_and_survives_reopen() {
     assert!(matches!(gap, Err(StoreError::Corrupt(m)) if m.contains("next height")));
 }
 
+/// A same-length body for a slot that is no longer the row must not land.
+#[test]
+fn repair_body_leaves_a_replaced_slot_unchanged() {
+    let dir = tmp_dir();
+    let t = BlockFilterTable::open_or_create(&dir).unwrap();
+    put_range(&t, 0, 1);
+    let (before, live) = t.filter(Height(1)).unwrap().unwrap();
+    let other = BlockFilterSlot {
+        header_fk: Fk(999),
+        ..live
+    };
+    assert_ne!(other, live);
+    let wrote = t
+        .repair_body(Height(1), &other, &vec![0xab; before.len()])
+        .unwrap();
+    assert!(!wrote, "repair_body wrote a body for a slot that is gone");
+    let (after, slot_now) = t.filter(Height(1)).unwrap().unwrap();
+    assert_eq!(after, before);
+    assert_eq!(slot_now, live);
+}
+
 /// Checkpoint headers are heights 1000, 2000, … and nothing in between.
 #[test]
 fn checkpoint_headers_are_every_thousandth_slot() {

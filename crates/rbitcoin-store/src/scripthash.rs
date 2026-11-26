@@ -13,7 +13,7 @@ use crate::scripthash_head::{prefix_shard_of, ScriptHashHead};
 use crate::scripthash_layout::{
     head_key_from_full, pack8, pack8_bytes, payload_start, slab_bytes, ShHeadValue,
     SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC, SH_ALLOC_VERSION, SH_INLINE_CAP, SH_MAX_CLASS,
-    SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS,
+    SH_MAX_SLAB_CLASS, SH_PAGE_SLAB_CLASS, SH_PREFIX_PAGE,
 };
 use crate::scripthash_mphf::{mix_key16, MphfHead};
 use crate::scripthash_overflow::wipe_legacy_fullsize_overflow;
@@ -30,7 +30,7 @@ use crate::scripthash_slabs::{
 use crate::scripthash_sorted_head::SortedHead;
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{le_u64, uleb128_len, Fk, TableKind};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -336,15 +336,24 @@ pub fn pop_free_head(
     body: &TableFile,
     free_head: &mut [u64; SH_MAX_CLASS as usize + 1],
     class: u8,
+    bump: u64,
 ) -> Result<Option<u64>, StoreError> {
     let idx = class as usize;
     if idx >= free_head.len() || free_head[idx] == 0 {
         return Ok(None);
     }
     let off = free_head[idx];
+    let size = slab_bytes(class);
+    if off < SH_PREFIX_PAGE as u64 || off.saturating_add(size) > bump {
+        return Err(StoreError::Corrupt("scripthash free head out of range"));
+    }
     let mut next = [0u8; 8];
     body.read_at(off, &mut next)?;
-    free_head[idx] = u64::from_le_bytes(next);
+    let next = u64::from_le_bytes(next);
+    if next != 0 && (next < SH_PREFIX_PAGE as u64 || next.saturating_add(size) > bump) {
+        return Err(StoreError::Corrupt("scripthash free link out of range"));
+    }
+    free_head[idx] = next;
     Ok(Some(off))
 }
 
@@ -1256,6 +1265,33 @@ impl ScriptHashTable {
         Ok(())
     }
 
+    fn sync_bodies_for(&self, keys: &[([u8; 32], ShHeadValue, KeyHome)]) -> Result<(), StoreError> {
+        let mut seen = BTreeSet::new();
+        for (key, _, kh) in keys {
+            let body = self.body_for(key, *kh);
+            if seen.insert(body.path().to_path_buf()) {
+                body.sync_data_only()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_alloc_headers_for(
+        &self,
+        keys: &[([u8; 32], ShHeadValue, KeyHome)],
+    ) -> Result<(), StoreError> {
+        let mut seen = BTreeSet::new();
+        for (key, _, kh) in keys {
+            let body = self.body_for(key, *kh);
+            if seen.insert(body.path().to_path_buf()) {
+                let alloc_mu = self.alloc_for(key, *kh);
+                let alloc = alloc_mu.lock().unwrap();
+                write_alloc_header(body, &alloc)?;
+            }
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn flush_all_bodies(&self) -> Result<(), StoreError> {
         for b in &self.bodies {
@@ -1736,8 +1772,13 @@ impl ScriptHashTable {
                 let ents = val.inline_entries();
                 Ok(ents.iter().copied().max_by_key(|f| f.0))
             }
-            ShHeadValue::Slab { class, off, .. } => {
+            ShHeadValue::Slab { class, off, used } => {
                 let ents = self.read_slab(body, *class, *off)?;
+                if ents.len() != *used as usize {
+                    return Err(StoreError::Corrupt(
+                        "invariant: scripthash slab used != decoded fk count",
+                    ));
+                }
                 Ok(ents.last().copied())
             }
             ShHeadValue::Extent { last_page } => {
@@ -1857,7 +1898,6 @@ impl ScriptHashTable {
             let alloc_mu = self.alloc_for(&key, kh);
             let mut alloc = alloc_mu.lock().unwrap();
             let new_val = self.append_sorted_creates(body, &mut alloc, &cur, &add)?;
-            write_alloc_header(body, &alloc)?;
             drop(alloc);
             head_final.push((key, new_val, kh));
         }
@@ -1867,6 +1907,11 @@ impl ScriptHashTable {
         if !head_final.is_empty() {
             let t_head = std::time::Instant::now();
             let flush_each = recs.len() as u64 >= Self::LARGE_BATCH_ROWS;
+            // Slabs and free-list links durable, then alloc headers, then the
+            // ingest head that names those slabs.
+            self.sync_bodies_for(&head_final)?;
+            self.write_alloc_headers_for(&head_final)?;
+            self.sync_bodies_for(&head_final)?;
             self.apply_head_upserts(&head_final, flush_each)?;
             timing.head_ns = t_head.elapsed().as_nanos() as u64;
         }
@@ -2521,7 +2566,7 @@ impl ScriptHashTable {
         if class > SH_MAX_CLASS {
             return Err(StoreError::Corrupt("scripthash page class overflow"));
         }
-        if let Some(off) = pop_free_head(body, &mut alloc.free_head, class)? {
+        if let Some(off) = pop_free_head(body, &mut alloc.free_head, class, alloc.bump)? {
             return Ok(off);
         }
         let need = slab_bytes(class);
@@ -2599,12 +2644,8 @@ impl ScriptHashTable {
         let Some(g) = g.as_ref() else {
             return Err(StoreError::Corrupt("scripthash: ingest missing"));
         };
-        if new_val.is_empty() {
-            g.clear_key(scripthash)?;
-        } else {
-            g.insert(scripthash, new_val)?;
-        }
-        Ok(())
+        g.stage_rewrites(&[(*scripthash, new_val.clone())])?;
+        g.sync_and_drop_ahead()
     }
 
     #[doc(hidden)]
@@ -2613,21 +2654,27 @@ impl ScriptHashTable {
         scripthash: &[u8; 32],
         new_val: &ShHeadValue,
     ) -> Result<(), StoreError> {
-        let hk = head_key_from_full(scripthash);
-        let si = self.shard_index(scripthash);
-        let updated_sorted = if let Some(slot) = self.sorted_main.get(si) {
-            let g = slot.read().unwrap();
-            match g.as_ref() {
-                Some(h) => h.update_value(&hk, new_val)?,
-                None => false,
-            }
-        } else {
-            false
-        };
-        if !updated_sorted {
+        if !self.sorted_main_updated(scripthash, new_val)? {
             self.unlink_write_ingest(scripthash, new_val)?;
         }
         Ok(())
+    }
+
+    fn sorted_main_updated(
+        &self,
+        scripthash: &[u8; 32],
+        new_val: &ShHeadValue,
+    ) -> Result<bool, StoreError> {
+        let hk = head_key_from_full(scripthash);
+        let si = self.shard_index(scripthash);
+        let Some(slot) = self.sorted_main.get(si) else {
+            return Ok(false);
+        };
+        let g = slot.read().unwrap();
+        match g.as_ref() {
+            Some(h) => h.update_value(&hk, new_val),
+            None => Ok(false),
+        }
     }
 
     #[doc(hidden)]
@@ -2886,10 +2933,12 @@ impl ScriptHashTable {
         let Some(ingest) = ingest.as_ref() else {
             return Err(StoreError::Corrupt("scripthash: ingest missing"));
         };
-        for key in &covered {
-            ingest.clear_key(key)?;
-        }
-        Ok(())
+        let rows: Vec<([u8; 32], ShHeadValue)> = covered
+            .iter()
+            .map(|key| (*key, ShHeadValue::Empty))
+            .collect();
+        ingest.stage_rewrites(&rows)?;
+        ingest.sync_and_drop_ahead()
     }
 
     #[doc(hidden)]
@@ -3325,8 +3374,9 @@ impl<'a> ScriptHashBulkSession<'a> {
     #[doc(hidden)]
     pub fn alloc_reloc_class(&mut self, class: u8) -> Result<u64, StoreError> {
         {
+            let bump = self.bump;
             let (body, free) = self.body_and_free();
-            if let Some(off) = pop_free_head(body, free, class)? {
+            if let Some(off) = pop_free_head(body, free, class, bump)? {
                 return Ok(off);
             }
         }
@@ -3493,15 +3543,24 @@ pub fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreErr
     }
     let live_count = le_u64!(buf, 8);
     let bump = le_u64!(buf, 16);
+    let logical = body.logical_len();
+    if bump < SH_PREFIX_PAGE as u64 || bump > logical {
+        return Err(StoreError::Corrupt("scripthash alloc bump out of range"));
+    }
     let mut free_head = [0u64; SH_MAX_CLASS as usize + 1];
     let mut off = 24usize;
-    for h in &mut free_head {
+    for (class, h) in free_head.iter_mut().enumerate() {
         if off + 8 > avail {
             break;
         }
         let mut word = [0u8; 8];
         word.copy_from_slice(&buf[off..off + 8]);
         *h = u64::from_le_bytes(word);
+        if *h != 0
+            && (*h < SH_PREFIX_PAGE as u64 || h.saturating_add(slab_bytes(class as u8)) > bump)
+        {
+            return Err(StoreError::Corrupt("scripthash free head out of range"));
+        }
         off += 8;
     }
     Ok((

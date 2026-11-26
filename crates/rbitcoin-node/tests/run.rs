@@ -1920,13 +1920,13 @@ fn enter_tip_mode_does_not_ready_electrum_when_inclusion_lags() {
 }
 
 /// A tip-mode query whose heavy key was torn and then degraded by an append.
-fn degraded_heavy_query(label: &str) -> (std::path::PathBuf, Arc<Query>, [u8; 32]) {
+fn degraded_heavy_query(label: &str) -> (rbitcoin_query::testutil::TempDir, Arc<Query>, [u8; 32]) {
     let (dir, q, key) = rbitcoin_query::testutil::heavy_sh_extent_query(label, 0);
     let q = Arc::new(q);
     rbitcoin_query::testutil::tear_sh_extent_head(&q, &key);
     connect_heavy_pay(&q, 1);
     assert!(q.sh_degraded(), "the append hit the torn key");
-    (dir.path().to_path_buf(), q, key)
+    (dir, q, key)
 }
 
 /// One more block paying the heavy script on top of the tip.

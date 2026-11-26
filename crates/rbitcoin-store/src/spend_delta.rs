@@ -588,32 +588,34 @@ pub type SpendSyncWake = Arc<(Mutex<bool>, Condvar)>;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn fail_after_next_commit_rename(store: &Path) {
-    *FAIL_AFTER_RENAME.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(store.join(SPEND_DELTA_DIR));
+    FAIL_AFTER_RENAME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(store.join(SPEND_DELTA_DIR));
 }
 
 #[cfg(debug_assertions)]
-static FAIL_AFTER_RENAME: Mutex<Option<PathBuf>> = Mutex::new(None);
+static FAIL_AFTER_RENAME: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// Make the next `fold` removal under `store` fail.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn fail_next_fold_removal(store: &Path) {
-    *FAIL_FOLD_REMOVAL.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(store.join(SPEND_DELTA_DIR));
+    FAIL_FOLD_REMOVAL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(store.join(SPEND_DELTA_DIR));
 }
 
 #[cfg(debug_assertions)]
-static FAIL_FOLD_REMOVAL: Mutex<Option<PathBuf>> = Mutex::new(None);
+static FAIL_FOLD_REMOVAL: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 #[cfg(debug_assertions)]
 fn take_fail_after_rename(dir: &Path) -> bool {
-    let mut armed = FAIL_AFTER_RENAME.lock().unwrap_or_else(|e| e.into_inner());
-    if armed.as_deref() == Some(dir) {
-        *armed = None;
-        return true;
-    }
-    false
+    FAIL_AFTER_RENAME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(dir)
 }
 
 /// True when the 8-byte slot lies inside the published body.
@@ -3669,9 +3671,11 @@ fn replay_fold_file(dir: &Path, body: &mut dyn SpentBody) -> Result<(), StoreErr
 fn remove_fold_file(dir: &Path) -> Result<(), StoreError> {
     #[cfg(debug_assertions)]
     {
-        let mut armed = FAIL_FOLD_REMOVAL.lock().unwrap_or_else(|e| e.into_inner());
-        if armed.as_deref() == Some(dir) {
-            *armed = None;
+        if FAIL_FOLD_REMOVAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(dir)
+        {
             return Err(StoreError::io(
                 dir,
                 std::io::Error::other("injected fold removal failure"),

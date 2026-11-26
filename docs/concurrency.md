@@ -346,6 +346,11 @@ has those bytes. A zero gap pwrites zeros across that new span before the
 named slots. A get that sampled a length a truncate has since shortened
 reads as an empty slot. A past-end pread is that empty slot only when the
 reloaded length no longer covers the index.
+`HeaderTxsTable::put_range`, `put_lists_batch`, and `put_ranges_batch` take
+the same `write` lock as `flush`, so a range put waits out that flush,
+sidecar fsyncs included. `TxStat` holds `journal` across `append_batch`,
+`write_row`, and `write_block_rows`, which is the lock around its `*.ahead`
+page images.
 See **[io-modality.md](./io-modality.md)** for operator IO levers.
 
 ### Confirm load read pipeline

@@ -103,7 +103,6 @@ fn confirmed_tx_height_header_txs_surface() {
         Err(StoreError::Corrupt(_))
     ));
     c.flush().unwrap();
-    c.flush_async().unwrap();
 
     let ht = HeaderTxsTable::create(&dir).unwrap();
     assert!(ht.get_range(Fk(1)).unwrap().is_none());
@@ -202,7 +201,6 @@ fn confirmed_tx_height_header_txs_surface() {
     assert_eq!(ht.count_bodies().unwrap(), 4);
 
     ht.flush().unwrap();
-    ht.flush_async().unwrap();
     drop(ht);
     let ht = HeaderTxsTable::open(&dir).unwrap();
     assert_eq!(ht.get_range(Fk(5)).unwrap(), Some((Fk(500), 2)));

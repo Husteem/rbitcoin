@@ -140,6 +140,26 @@ fn ensure_batch_linked_headers_roundtrip() {
 }
 
 #[test]
+fn ensure_batch_syncs_the_body_before_the_head() {
+    let dir = tmp();
+    let t = HeaderTable::create_tiny(&dir).unwrap();
+    rbitcoin_store::io_handle::arm_fail_sync(t.body.io_handle(), 1);
+    let g = sample([0x91; 32]);
+    let err = t.ensure_batch(std::slice::from_ref(&g)).unwrap_err();
+    assert!(matches!(err, StoreError::Io { .. }), "{err}");
+    drop(t);
+    match HeaderTable::open_tiny(&dir) {
+        Err(StoreError::Layout(_)) => {}
+        Ok(t) => assert!(
+            t.get_by_hash(&g.hash).unwrap().is_none(),
+            "header.head must not name a row whose body sync failed"
+        ),
+        Err(other) => panic!("open after a failed body sync: {other}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ensure_batch_duplicate_hash_is_one_row() {
     let dir = tmp();
     let t = HeaderTable::create_tiny(&dir).unwrap();

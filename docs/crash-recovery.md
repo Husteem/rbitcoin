@@ -35,6 +35,17 @@ transaction.
   `tear_guard/tail.0`/`tail.1` slots written with the stems before
   `class_a.synced`. A leftover `{stem}.kept` from #1727 is applied on open as a
   migration, not written by a current append.
+- Class C `confirmed[]`, `header_txs_*`, `header.head`, `txstat.body`, and the
+  scripthash ingest head write a synced `*.ahead` image of the intended pages
+  before an in-place write; open restores it before reading the table. An
+  array flush always images page 0, because it rewrites the length there even
+  when a shrink writes no slot or empties the table.
+- `confirmed[]` has no null slot below the tip open keeps: the lower of the
+  tip and the sealed tip, less a trailing null run. A binary without the
+  image rewrote the 4 KiB block that holds that tip on every barrier, so
+  Store open cuts the tip below a null in that block. It refuses a null
+  anywhere else before it builds the fence: a torn page comes back from its
+  image, so such a null is not crash damage. The fix is a reindex.
 - The tip window re-reads every height above the durable marker `D`
   (`(D, tip]`) and at least the last six. A missing marker walks from genesis.
   A stored mismatch shrinks the tip to the last good height. An OS or
@@ -59,19 +70,12 @@ in-process tip; that is lost progress, not a wrong chain. Open does not invent
 a height, a tx range, or a spend from a partially written block: it re-reads
 the window, rebuilds a derived index from Class A, or cuts the tail.
 
-**The residual in-place state.** The guarantee above does not yet cover a torn
-4 KiB block or 16 B table header in the arrays written in place.
-`header_txs_*` can lose a committed range below or inside the tip window: a
-missing range is accepted as `Ok` and the height is kept
-([#2071](https://github.com/rbitcoin-org/rbitcoin/issues/2071)). `strong_tx`
-can lose a confirmed bit below the window
-([#2072](https://github.com/rbitcoin-org/rbitcoin/issues/2072)), and
-`header.head` can lose a mapping for any height
-([#2073](https://github.com/rbitcoin-org/rbitcoin/issues/2073)). `confirmed[]`
-is held by `tip_seal` and `trim_trailing_nulls`, not by a redo. The scripthash
-index has the same exposure (a same-class slab rewritten in place, a freed
-slab's free-list link, the alloc header) and is gated instead of repaired:
-an append, an unlink or a deferred empty-head commit writes
+**The residual in-place state.** `confirmed.body`, `header_txs_*`,
+`header.head`, `txstat.body`, and the scripthash ingest head journal a synced
+`*.ahead` image, and open restores it. A strong bit a fence run names is set
+again by `restore_strong_from_fence`. `strong_tx` has no sidecar. The
+scripthash index is gated instead
+of repaired: an append, an unlink or a deferred empty-head commit writes
 `scripthash.dirty` before it writes. A full synced `ScriptHashTable::flush`
 (file data, then the `scripthash.body`, `scripthash.head` and
 `scripthash.ovf` directories) removes the mark only when no write started
@@ -83,15 +87,16 @@ pack mark, and its keys stay in ingest or overflow until then. A start with
 `--sh-index` that finds the file refuses and names the fix:
 `RBITCOIN_SH_FORCE_REBUILD=1` (or the `scripthash.rebuild` and degraded
 markers) wipes the index at open and removes the file, or start without
-`--sh-index` ([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)).
-The in-place derived cells are lower severity
-([#2075](https://github.com/rbitcoin-org/rbitcoin/issues/2075)). Until those
-are closed, the whole-store guarantee is the guarded state above, not every
-row. There is also no clean-close gate and no whole-store snapshot, so a Class
-B/C decode error after a crash can be crash damage rather than a hardware
-fault: the scripthash path marks the index degraded and rebuilds, while a
-Class A read error stops open. A design that needs one auditable "closed
-cleanly" predicate, or a whole-store restore, needs a snapshot instead.
+`--sh-index`. A same-class scripthash slab rewritten in place can still tear
+([#2074](https://github.com/rbitcoin-org/rbitcoin/issues/2074)). An undo
+restore of one head word can tear the neighbor slots on that page
+([#2132](https://github.com/rbitcoin-org/rbitcoin/issues/2132)). Until
+those are closed, the whole-store guarantee is the guarded state above, not
+every row. There is also no clean-close gate and no whole-store snapshot, so a
+Class B/C decode error after a crash can be crash damage rather than a
+hardware fault: the scripthash path marks the index degraded and rebuilds,
+while a Class A read error stops open. A design that needs one auditable
+"closed cleanly" predicate, or a whole-store restore, needs a snapshot instead.
 
 ## Tip as commit point
 
@@ -111,9 +116,10 @@ Best-chain views ignore uncommitted Class C state:
 
 On open (in order):
 
-1. Soft `store/tip_seal` (if present): clamp confirmed tip that advanced without a complete barrier seal.
-2. **Tip-window revalidate** (Core `-checkblocks`, default 6, `0` = all): first drop any trailing null `confirmed[]` slots (HWM ahead of last real tip), then the last N confirmed heights — `prev_fk`/hash chain, `header_txs` range bounds, merkle root from `txid.body`, those N runs all-strong, and parent edges on `input`. The walk logs `store: tip revalidate <lo>..=<tip>` before the first height and a progress line every 10 seconds. For each create in a checked block, `input` must be stamped, the edge count must match the `seqsigwit` input count (skipped under `--prune-seqsigwit`), the first tx must be the only coinbase edge, and every other edge must name an existing create with an in-range vout. A missing `spend_durable` file is the whole chain (`n == 0`): nothing has been device-flushed, and a matching last 6 heights is not a proof. A present marker widens any other window to at least 6 and far enough to cover `(D, tip]`. `checkblocks=0` stays the whole chain. On failure: clear bad Class A association and/or shrink tip to last good height, rebuild the fence, flush confirmed. A read that fails is not a bad block. An OS error or a completion-session fault (anything but a corrupt or missing record, or a stored length past the body read cap) stops open with that error and changes nothing, as Core stops on a block it cannot read. The next start walks the same window. A short new-layout `input` high-water mark is Class A count skew: open truncates the other stems to the stamped input count before this window, so a `header_txs` range past that count shrinks the tip. Open does not stamp `n_in = 0` onto `PREV_ON_INPUTS` creates. A legacy store with no `input` file, or a partial legacy tail whose next record still has an inline prevout, still backfills edges from `seqsigwit`.
-3. One `repair_class_c_above_tip`: unstrong bits **not on the fence** via complement ranges (holes + suffix until a zero page). Does **not** walk every set bit. Logs `class_c repair cleared= ranges= ms=` even when zero.
+0. Store open restores `confirmed.body.ahead`, then cuts the tip below a null `confirmed[]` slot in the block that holds the sealed tip, or refuses a null slot anywhere else below it (What open trusts, above).
+1. Soft `store/tip_seal` (if present): clamp confirmed tip that advanced without a complete barrier seal. This runs before the trailing-null trim, so a null run the clamp leaves on top is trimmed too.
+2. **Tip-window revalidate** (Core `-checkblocks`, default 6, `0` = all): first drop any trailing null `confirmed[]` slots (HWM ahead of last real tip), then the last N confirmed heights — `prev_fk`/hash chain, `header_txs` range bounds, merkle root from `txid.body`, and parent edges on `input`. The walk does not reject a height for a missing strong bit: open sets every strong bit a fence run names before the walk, and again after a shrink. The walk logs `store: tip revalidate <lo>..=<tip>` before the first height and a progress line every 10 seconds. For each create in a checked block, `input` must be stamped, the edge count must match the `seqsigwit` input count (skipped under `--prune-seqsigwit`), the first tx must be the only coinbase edge, and every other edge must name an existing create with an in-range vout. A missing `spend_durable` file is the whole chain (`n == 0`): nothing has been device-flushed, and a matching last 6 heights is not a proof. A present marker widens any other window to at least 6 and far enough to cover `(D, tip]`. `checkblocks=0` stays the whole chain. On failure: clear bad Class A association and/or shrink tip to last good height, rebuild the fence, flush confirmed. A read that fails is not a bad block. An OS error or a completion-session fault (anything but a corrupt or missing record, or a stored length past the body read cap) stops open with that error and changes nothing, as Core stops on a block it cannot read. The next start walks the same window. A short new-layout `input` high-water mark is Class A count skew: open truncates the other stems to the stamped input count before this window, so a `header_txs` range past that count shrinks the tip. Open does not stamp `n_in = 0` onto `PREV_ON_INPUTS` creates. A legacy store with no `input` file, or a partial legacy tail whose next record still has an inline prevout, still backfills edges from `seqsigwit`.
+3. After that walk, the same clear and restore run again, so a shrink does not leave strong bits off the final fence. `repair_class_c_above_tip` clears bits **not on the fence** via complement ranges (holes + suffix until a zero page) and does **not** walk every set bit. `restore_strong_from_fence` sets a bit a surviving run names. The clear logs `class_c repair cleared= ranges= ms=` even when zero.
 4. Replay spend annotations for every height in `(A, tip]` (`spend_durable` annotated-through). A missing file has no device-flushed cursor, so `A = 0` and the chain is rewritten. `finish_post_commit_hashes` is idempotent. Then `sync_data` the replay inputs and publish `A` and durable-through `D` at the surviving tip. The replay logs height progress every 10 seconds.
 
 Between the repair and that replay, open builds the in-process confirmed hash → height map when it is empty. A full `0..=tip` walk logs `query: height index` and a progress line every 10 seconds. Later tip moves extend or shrink that map.
@@ -197,7 +203,7 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   a failed unlink, so the next open does not reject it.
   The marker rescues faults that surface after open succeeded: a torn page, a failed write or unlink, a read of a
   torn key. It cannot rescue damage that makes open itself fail (a truncated `scripthash.head/NN.val`, a torn
-  undo record): open validates the SH files before it reads the marker, so such a store does not start, with or
+  undo record, or an alloc header whose bump or free head is out of range): open validates the SH files before it reads the marker, so such a store does not start, with or
   without `RBITCOIN_SH_AUTO_REBUILD` and `RBITCOIN_SH_FORCE_REBUILD`, and the fix is to stop the node, remove
   `scripthash*` (the marker included) from the store directory and start again; tip entry then builds the index
   cold from Class A.
@@ -219,7 +225,7 @@ Confirm stores a snapshot height after annotations are written and does not `syn
 |-------|--------------------------------------|-------|
 | Class C barrier (`strong`, `header_txs`, `confirmed`, `tip_seal`) | No. This is the commit point. | Every barrier |
 | Spend annotations (`spent.body`, `spent.delta/`, `spenders`) | Yes, from the block body and parent outputs, when those bytes are durable. Replay is only `(A, tip]`. Annotate never writes `spent.body`, and reads it only on a page a fold wrote. The checkpoint writes delta records, folds old segments into `spent.body`, and syncs the segments, `spent.body`, and the directory log or new base before `commit` and `A` advance. A schema-29 `spent.body` and `spend.pages` log become the delta's first generation on open, and `meta` moves to 30 only after that publish. A schema-30 store whose `spent.delta/` is gone refuses to open. [046](./external_findings/046-spend-durability.md) fixed the kill-9 gap where the marker advanced without the data sync ([107](./external_findings/107-torn-spend-page.md)) | `rbtc-spend-sync` about every 10 minutes, or early at 2,000,000 open edges, then advance `A` to the pre-sync snapshot |
-| Class A bodies the tip window reads (`txid.body` for the merkle root, `input` edges, `seqsigwit` input count unless pruned) plus the strong bits | No. A torn page cannot be rebuilt from the tip. Historical bodies outside `(D, tip]` are not revalidated. `store.secret` is an XOR of scripts and witness plus a keyed head mix ([`concurrency.md`](./concurrency.md), [`SCHEMA.md`](../SCHEMA.md)). It is not a MAC of record bodies. Bit-rot of those bodies is an accepted reindex ([106](./external_findings/106-historical-bitrot.md)) | Same `sync_data`, which advances durable-through `D` to that snapshot. Open revalidates `(D, tip]` (at least the last 6) when the marker is present, and from genesis when it is missing. The window does not read `txout` or `txstat` |
+| Class A bodies the tip window reads (`txid.body` for the merkle root, `input` edges, `seqsigwit` input count unless pruned) plus the strong bits | Class A bodies in the window are not rebuilt from the tip. A strong bit a fence run names is set from that fence; a bit the fence does not name is cleared. Historical bodies outside `(D, tip]` are not revalidated. `store.secret` is an XOR of scripts and witness plus a keyed head mix ([`concurrency.md`](./concurrency.md), [`SCHEMA.md`](../SCHEMA.md)). It is not a MAC of record bodies. Bit-rot of those bodies is an accepted reindex ([106](./external_findings/106-historical-bitrot.md)) | Same `sync_data`, which advances durable-through `D` to that snapshot. Open revalidates `(D, tip]` (at least the last 6) when the marker is present, and from genesis when it is missing. The window does not read `txout` or `txstat` |
 | Scripthash heads, `tx.head` | Yes, from Class A | No barrier `fsync`. A corrupt record the write-behind apply reads (a torn slab after a power cut; recovery replays the jobs above `include_hwm`, which are the ones that tore) writes `scripthash.rebuild`. The apply is the single appender under `sh.appender`, so a reader racing an append never writes it. The next start treats the mark as `RBITCOIN_SH_FORCE_REBUILD` and removes it after the rebuild finishes; a crash before that rebuilds again. Write-behind runs only in Tip mode, after the inline barrier sealed the block; a failed Class A write latches and fails that barrier, so its postings name sealed creates. The bulk collect (`DONE.keys`, `DONE.post`) and the Class A tail backfill (`include_hwm`) `sync_data` Class A right after they sample the settled create count, so no marker names a create the device does not hold. An older binary did not, so its `include_hwm`, SEAL, or an unfinished collect's `DONE.keys`/`DONE.post` can name creates open then cut. Start, before any append can reuse a cut number, deletes the head and the unsorted collect when any of those marks is past the create count, and recollects from Class A. SH write-behind syncs the SH tables before it advances `scripthash.include_hwm` (a tip block, the end of a catch-up burst, or ≥1 s since the last advance); recovery replays the idempotent appends above that HWM. `sync=` on `tip: accept`. `tx.head` insert keeps the open tail in a private table and syncs `meta`, not those slots. A clean shutdown writes one dense snapshot of that tail (footer `generation` = the segment count) and fsyncs the image before it stores `generation`, then fsyncs that generation. A rebuild of an untrusted tail clears that segment's in-memory count and deletes the image before inserting, so a snapshot taken midway names only the rows stored. That write is about 1–2 s. A crash, or a snapshot whose `generation` is 0 or otherwise not that count, rebuilds the open tail from `txid.body` before probes are served. A full tail is about 10–20 s. An in-flight seal, which open already finishes from `txid.body`, adds about 15 s typical and up to about 30 s, so both together are about 25–50 s. The seal syncs its files before `meta` names it sealed. An IBD missing-parent verdict still scans `txid.body` from the oldest unsealed segment's first fk, read before the head read, and treats such a miss as `Corrupt` ([089](./external_findings/089-missing-parent-verdict.md)) |
 | `txstat` fee/size cells, overflow blobs, `txstat.blk` slots | Yes, from the block (`getblockstats`, and a block size, weight or summary read that had to rebuild an active block, stamp it) | The IBD archive writes them as Class A, so the barrier syncs them before Class C names the block. A later stamp writes the cells, then the blob, then the slot, unsynced until the next barrier. A stamped cell whose tail is missing, undecodable, behind a slot past the end of `txstat.ovf`, or on a create with no confirmed block reads as unstamped, so readers fall back and the next stamp writes it again. An IO error still fails the read |
 | BIP-352 tweaks (`sp_tweaks.*`) | Yes, backfill from Class A | Each put syncs body, then idx. Open drops heights above the tip and fits the last record to its `n_tx` |

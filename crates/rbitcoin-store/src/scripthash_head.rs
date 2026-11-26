@@ -16,15 +16,20 @@
 //! A head this process just created is still empty. The ingest file itself is
 //! created on the first insert, not when the store is created.
 
+use crate::durability::Durable as _;
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{self, TableFile, FILE_HEADER_LEN};
 use crate::open_address::{self, MAX_LOAD_DEN, MAX_LOAD_NUM};
 use crate::scripthash_layout::{
     head_key_from_full, pack8_bytes, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN,
     SH_HEAD_SLOT_SIZE, SH_HEAD_VALUE_LEN,
 };
+use bitcoin_hashes::{sha256, Hash, HashEngine};
 use rbitcoin_primitives::{bytes, TableKind};
 use std::collections::BTreeMap;
+#[cfg(debug_assertions)]
+use std::collections::BTreeSet;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -94,6 +99,10 @@ pub fn remove_ingest_files(head_path: &Path) -> Result<(), StoreError> {
     if occ.exists() {
         std::fs::remove_file(&occ).map_err(|e| StoreError::io(&occ, e))?;
     }
+    let ahead = ahead_path(head_path);
+    if ahead.exists() {
+        std::fs::remove_file(&ahead).map_err(|e| StoreError::io(&ahead, e))?;
+    }
     Ok(())
 }
 
@@ -150,6 +159,175 @@ pub fn scan_occupied(file: &TableFile, slots: u64) -> Result<u64, StoreError> {
     Ok(occupied)
 }
 
+const AHEAD_MAGIC: &[u8; 4] = b"SHA1";
+const AHEAD_VERSION: u16 = 1;
+const AHEAD_HEAD: usize = 12;
+const AHEAD_REC: usize = 8 + 32 + 4096;
+
+#[cfg(debug_assertions)]
+static FAIL_AHEAD: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+#[cfg(debug_assertions)]
+static FAIL_SECOND_WRITE: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// Leave the next scripthash-head page image behind and fail before the pwrite.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_scripthash_head_flush_after_ahead(path: &Path) {
+    FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+/// Fail after the second dirty-chunk pwrite of the next flush of `path`.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_scripthash_head_flush_on_second_write(path: &Path) {
+    FAIL_SECOND_WRITE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_ahead(path: &Path) -> bool {
+    FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_second_write(path: &Path) -> bool {
+    FAIL_SECOND_WRITE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
+}
+
+fn ahead_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("shhead"))
+        .to_os_string();
+    name.push(".ahead");
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+fn read_page(path: &Path, file: &TableFile, block: u64) -> Result<[u8; 4096], StoreError> {
+    let mut image = [0u8; 4096];
+    let len = std::fs::metadata(path)
+        .map_err(|e| StoreError::io(path, e))?
+        .len();
+    if block < len {
+        let n = ((len - block) as usize).min(4096);
+        file.pread_all(block, &mut image[..n])?;
+    }
+    Ok(image)
+}
+
+fn parse_ahead_pages(raw: &[u8]) -> Result<BTreeMap<u64, [u8; 4096]>, StoreError> {
+    if raw.len() < AHEAD_HEAD || raw[0..4] != *AHEAD_MAGIC {
+        return Err(StoreError::Corrupt("scripthash head ahead header"));
+    }
+    if u16::from_le_bytes([raw[4], raw[5]]) != AHEAD_VERSION {
+        return Err(StoreError::Corrupt("scripthash head ahead version"));
+    }
+    let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
+    let payload = raw.len().saturating_sub(AHEAD_HEAD);
+    if !payload.is_multiple_of(AHEAD_REC) || payload / AHEAD_REC != count {
+        return Err(StoreError::Corrupt("scripthash head ahead length"));
+    }
+    let mut at = AHEAD_HEAD;
+    let mut images = BTreeMap::new();
+    for _ in 0..count {
+        if raw.len() < at + AHEAD_REC {
+            return Err(StoreError::Corrupt("scripthash head ahead short"));
+        }
+        let mut off_buf = [0u8; 8];
+        off_buf.copy_from_slice(&raw[at..at + 8]);
+        let off = u64::from_le_bytes(off_buf);
+        let sum = &raw[at + 8..at + 40];
+        let image = &raw[at + 40..at + AHEAD_REC];
+        if !off.is_multiple_of(4096) {
+            return Err(StoreError::Corrupt("scripthash head ahead offset"));
+        }
+        let mut eng = sha256::HashEngine::default();
+        eng.input(&off.to_le_bytes());
+        eng.input(image);
+        if sha256::Hash::from_engine(eng).to_byte_array() != *sum {
+            return Err(StoreError::Corrupt("scripthash head ahead checksum"));
+        }
+        let mut page = [0u8; 4096];
+        page.copy_from_slice(image);
+        images.insert(off, page);
+        at += AHEAD_REC;
+    }
+    if at != raw.len() {
+        return Err(StoreError::Corrupt("scripthash head ahead length"));
+    }
+    Ok(images)
+}
+
+fn load_ahead_pages(path: &Path) -> Result<BTreeMap<u64, [u8; 4096]>, StoreError> {
+    let side = ahead_path(path);
+    match std::fs::read(&side) {
+        Ok(raw) => parse_ahead_pages(&raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(e) => Err(StoreError::io(&side, e)),
+    }
+}
+
+fn encode_ahead_pages(blocks: &BTreeMap<u64, [u8; 4096]>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(AHEAD_MAGIC);
+    buf.extend_from_slice(&AHEAD_VERSION.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes());
+    buf.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    for (off, image) in blocks {
+        buf.extend_from_slice(&off.to_le_bytes());
+        let mut eng = sha256::HashEngine::default();
+        eng.input(&off.to_le_bytes());
+        eng.input(image);
+        buf.extend_from_slice(&sha256::Hash::from_engine(eng).to_byte_array());
+        buf.extend_from_slice(image);
+    }
+    buf
+}
+
+/// Apply full 4 KiB page images left by an interrupted `SlotPageCache::flush`.
+fn restore_ahead(path: &Path) -> Result<(), StoreError> {
+    let side = ahead_path(path);
+    let raw = match std::fs::read(&side) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(&side, e)),
+    };
+    let images = parse_ahead_pages(&raw)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| StoreError::io(path, e))?;
+    for (off, image) in images {
+        file.seek(SeekFrom::Start(off))
+            .map_err(|e| StoreError::io(path, e))?;
+        file.write_all(&image)
+            .map_err(|e| StoreError::io(path, e))?;
+    }
+    file.durable_sync_all()
+        .map_err(|e| StoreError::io(path, e))?;
+    drop(file);
+    std::fs::remove_file(&side).map_err(|e| StoreError::io(&side, e))?;
+    if let Some(parent) = side.parent() {
+        file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+    }
+    Ok(())
+}
+
 impl ScriptHashHead {
     /// Occupied/slots before ingest seals to L0 (`SHSR`).
     pub const SH_SEAL_LOAD: f64 = 0.80;
@@ -178,6 +356,7 @@ impl ScriptHashHead {
         if !path.exists() {
             return Ok(None);
         }
+        restore_ahead(&path)?;
         let file = TableFile::open(&path, TableKind::HashHead)?;
         let head = Self::from_file(file)?;
         if !head.large_and_empty() {
@@ -359,7 +538,7 @@ impl ScriptHashHead {
             }
             if k == key {
                 cache.write_slot(slot, &key, &[0u8; SH_HEAD_VALUE_LEN])?;
-                cache.flush()?;
+                cache.flush_durable()?;
                 return Ok(true);
             }
             slot = (slot + 1) & (slots - 1);
@@ -371,13 +550,12 @@ impl ScriptHashHead {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut upserts: Vec<(ShHeadKey, ShHeadValue)> = Vec::with_capacity(entries.len());
+        let mut upserts = Vec::with_capacity(entries.len());
         for (full, v) in entries {
-            let key = Self::to_key(full);
             if v.is_empty() {
                 self.clear_key(full)?;
             } else {
-                upserts.push((key, v.clone()));
+                upserts.push((*full, v.clone()));
             }
         }
         if upserts.is_empty() {
@@ -389,30 +567,42 @@ impl ScriptHashHead {
             let state = self.state.lock().unwrap();
             if state.occ_known && state.occupied == 0 {
                 drop(state);
-                return self.bulk_fill_empty(&upserts);
+                let keyed: Vec<(ShHeadKey, ShHeadValue)> = upserts
+                    .iter()
+                    .map(|(full, v)| (Self::to_key(full), v.clone()))
+                    .collect();
+                return self.bulk_fill_empty(&keyed);
             }
         }
+        self.stage_rewrites(&upserts)?;
+        self.sync_and_drop_ahead()
+    }
 
-        let mut work = upserts;
+    /// Write every row through one page cache. The `*.ahead` image stays until
+    /// [`Self::sync_and_drop_ahead`] or [`Self::drop_ahead`] after the file sync.
+    #[doc(hidden)]
+    pub fn stage_rewrites(&self, rows: &[([u8; 32], ShHeadValue)]) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let slots_now = self.state.lock().unwrap().slots;
-        work.sort_unstable_by_key(|(k, _)| Self::hash_slot(k, slots_now));
-
         let cap = slots_now.saturating_mul(MAX_LOAD_NUM) / MAX_LOAD_DEN;
-        let mut i = 0usize;
+        let mut rows = rows.to_vec();
+        rows.sort_unstable_by_key(|(full, _)| Self::hash_slot(&Self::to_key(full), slots_now));
         let mut cache = SlotPageCache::new(self, slots_now);
-        while i < work.len() {
-            let (key, ref val) = work[i];
+        for (full, val) in &rows {
+            let key = Self::to_key(full);
+            if val.is_empty() {
+                write_clear(&mut cache, &key)?;
+                continue;
+            }
             let at_cap = {
                 let st = self.state.lock().unwrap();
                 st.occ_known && st.occupied >= cap
             };
-            if at_cap {
-                let mut full = [0u8; 32];
-                full[..SH_HEAD_KEY_LEN].copy_from_slice(&key);
-                if self.get(&full)?.is_none() {
-                    cache.flush()?;
-                    return Err(StoreError::Corrupt(SH_HEAD_FULL));
-                }
+            if at_cap && self.get(full)?.is_none() {
+                cache.flush()?;
+                return Err(StoreError::Corrupt(SH_HEAD_FULL));
             }
             let enc = pack8_bytes(val)?;
             match cache.try_insert(&key, &enc, true)? {
@@ -427,7 +617,6 @@ impl ScriptHashHead {
                             state.occupied = state.occupied.saturating_add(1);
                         }
                     }
-                    i += 1;
                 }
                 InsertResult::NeedSlot => {
                     cache.flush()?;
@@ -436,14 +625,39 @@ impl ScriptHashHead {
             }
         }
         cache.flush()?;
-        // Seal sidecar after batch when count is authoritative.
-        {
-            let state = self.state.lock().unwrap();
-            if state.occ_known {
-                let occ = state.occupied;
-                drop(state);
-                self.persist_occ(occ)?;
-            }
+        let state = self.state.lock().unwrap();
+        if state.occ_known {
+            let occ = state.occupied;
+            drop(state);
+            self.persist_occ(occ)?;
+        }
+        Ok(())
+    }
+
+    /// Sync the head, then drop its `*.ahead` image. No image means nothing to sync.
+    #[doc(hidden)]
+    pub fn sync_and_drop_ahead(&self) -> Result<(), StoreError> {
+        let side = ahead_path(self.file.path());
+        match std::fs::metadata(&side) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(StoreError::io(&side, e)),
+        }
+        self.file.sync_data_only()?;
+        self.drop_ahead()
+    }
+
+    /// Remove a sidecar the file sync already covered.
+    #[doc(hidden)]
+    pub fn drop_ahead(&self) -> Result<(), StoreError> {
+        let side = ahead_path(self.file.path());
+        match std::fs::remove_file(&side) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(StoreError::io(&side, e)),
+        }
+        if let Some(parent) = side.parent() {
+            file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
         }
         Ok(())
     }
@@ -565,8 +779,23 @@ impl ScriptHashHead {
     }
 }
 
-#[doc(hidden)]
-pub fn is_empty_slot(k: &ShHeadKey, v: &[u8; SH_HEAD_VALUE_LEN]) -> bool {
+fn write_clear(cache: &mut SlotPageCache<'_>, key: &ShHeadKey) -> Result<bool, StoreError> {
+    let mut slot = ScriptHashHead::hash_slot(key, cache.slots);
+    for _ in 0..cache.slots {
+        let (k, v) = cache.read_slot(slot)?;
+        if is_empty_slot(&k, &v) {
+            return Ok(false);
+        }
+        if k == *key {
+            cache.write_slot(slot, key, &[0u8; SH_HEAD_VALUE_LEN])?;
+            return Ok(true);
+        }
+        slot = (slot + 1) & (cache.slots - 1);
+    }
+    Ok(false)
+}
+
+fn is_empty_slot(k: &ShHeadKey, v: &[u8; SH_HEAD_VALUE_LEN]) -> bool {
     *k == [0u8; SH_HEAD_KEY_LEN] && *v == [0u8; SH_HEAD_VALUE_LEN]
 }
 
@@ -667,7 +896,9 @@ impl<'a> SlotPageCache<'a> {
         let chunk_idx = slot / SLOTS_PER_CHUNK;
         if !self.chunks.contains_key(&chunk_idx) {
             if self.chunks.len() >= CHUNK_CACHE_MAX {
-                self.flush()?;
+                // This wave is durable before the next one starts, so a later
+                // flush does not rewrite pages the sidecar already retired.
+                self.flush_durable()?;
             }
             let base_slot = chunk_idx * SLOTS_PER_CHUNK;
             let n = ((self.slots - base_slot) as usize).min(SLOTS_PER_CHUNK as usize);
@@ -690,14 +921,69 @@ impl<'a> SlotPageCache<'a> {
 
     #[doc(hidden)]
     pub fn flush(&mut self) -> Result<(), StoreError> {
+        let mut blocks: BTreeMap<u64, [u8; 4096]> = BTreeMap::new();
+        for chunk in self.chunks.values().filter(|chunk| chunk.dirty) {
+            let off = ScriptHashHead::slot_file_off(chunk.base_slot);
+            let len = chunk.data.len() as u64;
+            let first = off & !4095;
+            let last = (off + len - 1) & !4095;
+            let mut block = first;
+            while block <= last {
+                if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(block) {
+                    entry.insert(read_page(self.head.file.path(), &self.head.file, block)?);
+                }
+                let Some(image) = blocks.get_mut(&block) else {
+                    block += 4096;
+                    continue;
+                };
+                let lo = off.max(block);
+                let hi = (off + len).min(block + 4096);
+                let src = (lo - off) as usize;
+                let dst = (lo - block) as usize;
+                image[dst..dst + (hi - lo) as usize]
+                    .copy_from_slice(&chunk.data[src..src + (hi - lo) as usize]);
+                block += 4096;
+            }
+        }
+        if !blocks.is_empty() {
+            // A leftover sidecar from a failed write keeps pages this write
+            // does not replace; new images win on pages they cover.
+            let mut merged = load_ahead_pages(self.head.file.path())?;
+            merged.extend(blocks);
+            let buf = encode_ahead_pages(&merged);
+            let side = ahead_path(self.head.file.path());
+            file::write_synced_tmp_rename(&side, &buf)?;
+            #[cfg(debug_assertions)]
+            if take_fail_ahead(self.head.file.path()) {
+                return Err(StoreError::io(
+                    self.head.file.path(),
+                    std::io::Error::other("injected scripthash head ahead failure"),
+                ));
+            }
+        }
+        let mut writes = 0u32;
         for (_, chunk) in self.chunks.iter_mut() {
             if chunk.dirty {
                 let off = ScriptHashHead::slot_file_off(chunk.base_slot);
                 self.head.file.write_at(off, &chunk.data)?;
-                chunk.dirty = false;
+                writes = writes.saturating_add(1);
+                #[cfg(debug_assertions)]
+                if writes >= 2 && take_fail_second_write(self.head.file.path()) {
+                    return Err(StoreError::io(
+                        self.head.file.path(),
+                        std::io::Error::other("injected scripthash head second-write failure"),
+                    ));
+                }
             }
         }
         self.chunks.clear();
         Ok(())
+    }
+
+    /// [`Self::flush`] plus the head sync that drops the sidecar.
+    #[doc(hidden)]
+    pub fn flush_durable(&mut self) -> Result<(), StoreError> {
+        self.flush()?;
+        self.head.sync_and_drop_ahead()
     }
 }

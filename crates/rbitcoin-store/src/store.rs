@@ -547,6 +547,7 @@ impl Store {
             HeaderTxsTable::create(&path)?
         };
         let confirmed = ConfirmedTable::open(&path)?;
+        crate::integrity::cut_or_refuse_confirmed_hole(&path, &confirmed)?;
         let height_fence = HeightFence::from_confirmed(&confirmed, &header_txs)?;
         drop_leftover_tx_height(&path);
         crate::scripthash::unlink_scripthash_run_leftovers(&path)?;
@@ -1926,6 +1927,46 @@ impl Store {
         self.repair_strong_not_on_fence()
     }
 
+    /// Set every strong bit a fence run names but the bit image does not hold.
+    ///
+    /// A torn strong flush, a hole repair that rewrites a suffix, or a short
+    /// `strong_tx.body` header can clear a confirmed bit. The fence
+    /// (`confirmed[]` + `header_txs`) is the independent source; Query open
+    /// calls this before revalidation so a torn in-window bit cannot shrink a
+    /// good tip, then again after a revalidation shrink.
+    /// The fast path is one popcount over the image; only a real shortfall
+    /// walks the runs.
+    #[doc(hidden)]
+    pub fn restore_strong_from_fence(&self) -> Result<u64, StoreError> {
+        let (runs, max_fk) = {
+            let fence = self.fence();
+            (std::sync::Arc::clone(&fence.runs), fence.max_connected_fk())
+        };
+        if max_fk == 0 {
+            return Ok(0);
+        }
+        let expected: u64 = runs.iter().map(|run| u64::from(run.count)).sum();
+        let actual = self
+            .strong_tx
+            .count_strong_in_fk_range(1, max_fk.saturating_add(1))?;
+        if actual == expected {
+            return Ok(0);
+        }
+        let write = crate::array_table::ClassCWrite::new();
+        let mut repaired = 0u64;
+        for run in runs.iter() {
+            let first = Fk(run.first_fk);
+            if self.strong_tx.all_strong_range(first, run.count)? {
+                continue;
+            }
+            let start = run.first_fk.saturating_sub(1);
+            let end = start.saturating_add(u64::from(run.count));
+            self.strong_tx.set_bits_range(&write, start, end, true)?;
+            repaired = repaired.saturating_add(1);
+        }
+        Ok(repaired)
+    }
+
     #[doc(hidden)]
     pub fn repair_strong_not_on_fence(&self) -> Result<u64, StoreError> {
         let t0 = std::time::Instant::now();
@@ -2036,10 +2077,10 @@ impl Store {
     /// Complete-or-fail per table. Call **before** body-queue dequeue so a kill
     /// mid-commit can re-drive from BQ when the barrier had not finished.
     ///
-    /// **Tip last on connect:** if `confirmed` were durable before `strong_tx`,
-    /// a mid-barrier kill advances tip with missing strong bits; re-confirm
-    /// skips those heights and `repair_class_c_above_tip` only clears leftover
-    /// strong not on the fence — permanent unstrong tip txs.
+    /// **Tip last on connect:** `confirmed` is published after the pre-tip
+    /// tables, so a kill cannot advance the tip ahead of that barrier. Open
+    /// sets a missing fence bit in `restore_strong_from_fence` and clears a
+    /// bit the fence does not name. A missing fence bit is not permanent.
     ///
     /// After confirmed is durable, publish soft `crate::TIP_SEAL_NAME` so open
     /// can clamp an incomplete extension that never finished this barrier.

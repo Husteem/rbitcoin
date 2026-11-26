@@ -19,6 +19,34 @@ use crate::{Query, QueryError};
 use std::sync::atomic::Ordering;
 use std::sync::{Condvar, Mutex};
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static LIE_FILTER_BODY: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The next `basic_filter_at` on this thread that finds a row returns `body`.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn lie_next_basic_filter_body(body: Vec<u8>) {
+    LIE_FILTER_BODY.with(|slot| *slot.borrow_mut() = Some(body));
+}
+
+#[cfg(debug_assertions)]
+fn take_lie_filter_body() -> Option<Vec<u8>> {
+    LIE_FILTER_BODY.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(debug_assertions)]
+fn lie_filter_row(mut row: Option<(Vec<u8>, FilterHeader)>) -> Option<(Vec<u8>, FilterHeader)> {
+    if let Some((body, _)) = row.as_mut() {
+        if let Some(lie) = take_lie_filter_body() {
+            *body = lie;
+        }
+    }
+    row
+}
+
 /// Core `getblockfilter` when the index has not reached this block.
 #[doc(hidden)]
 pub const FILTER_STILL_INDEXING: &str =
@@ -166,6 +194,15 @@ fn golomb_rice_set(
     }
     bits.flush()?;
     Ok(content)
+}
+
+fn check_filter_hash(body: &[u8], slot: &BlockFilterSlot) -> Result<(), StoreError> {
+    if FilterHash::hash(body).to_byte_array() != slot.filter_hash {
+        return Err(StoreError::Corrupt(
+            "invariant: blockfilter body does not match its index hash",
+        ));
+    }
+    Ok(())
 }
 
 impl Query {
@@ -363,10 +400,21 @@ impl Query {
         hash: &[u8; 32],
         max_stale: usize,
     ) -> Result<Option<(Vec<u8>, FilterHeader)>, QueryError> {
-        let height = self.height_of_hash(hash)?;
+        let mut height = self.height_of_hash(hash)?;
         if let Some(h) = height {
-            if let Some(row) = self.basic_filter_at(h.0)? {
-                return Ok(Some(row));
+            match self.basic_filter_at(h.0) {
+                Ok(Some(row)) => {
+                    // A reload inside the repair can observe a block that
+                    // replaced `h`. That row is not this hash, and the hash
+                    // may have left the best chain during the read.
+                    let now = self.height_of_hash(hash)?;
+                    if now == Some(h) && self.stored_row_is_hash(h.0, hash, &row.0)? {
+                        return Ok(Some(row));
+                    }
+                    height = now;
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e),
             }
         }
         let Some((header_fk, _)) = self.get_header_by_hash(hash)? else {
@@ -395,6 +443,25 @@ impl Query {
             filter.content.clone(),
             filter.filter_header(&parent_header),
         )))
+    }
+
+    /// The idx row at `height` still names `hash`, and `body` is that row.
+    fn stored_row_is_hash(
+        &self,
+        height: u32,
+        hash: &[u8; 32],
+        body: &[u8],
+    ) -> Result<bool, QueryError> {
+        let Some(table) = self.block_filter_table() else {
+            return Ok(false);
+        };
+        let Some((fk, _)) = self.get_header_by_hash(hash)? else {
+            return Ok(false);
+        };
+        let Some(slot) = table.slot(Height(height))? else {
+            return Ok(false);
+        };
+        Ok(slot.header_fk == fk && check_filter_hash(body, &slot).is_ok())
     }
 
     #[cfg(debug_assertions)]
@@ -533,6 +600,49 @@ impl Query {
         Ok(spent)
     }
 
+    fn repaired_filter_body(
+        &self,
+        height: u32,
+        mut body: Vec<u8>,
+        slot: &BlockFilterSlot,
+    ) -> Result<(Vec<u8>, BlockFilterSlot), QueryError> {
+        let mut slot = *slot;
+        for _ in 0..2 {
+            if check_filter_hash(&body, &slot).is_ok() {
+                return Ok((body, slot));
+            }
+            let Some(table) = self.block_filter_table() else {
+                return Err(StoreError::Corrupt(
+                    "invariant: blockfilter body does not match its index hash",
+                ));
+            };
+            let block = self.reconstruct_block_at_height(Height(height))?;
+            let spent = self.spent_scripts(&block)?;
+            let filter = self.basic_filter_content(&block, &spent)?;
+            if FilterHash::hash(&filter.content).to_byte_array() != slot.filter_hash {
+                return Err(StoreError::Corrupt(
+                    "invariant: blockfilter body does not match its index hash",
+                ));
+            }
+            if table.repair_body(Height(height), &slot, &filter.content)? {
+                return Ok((filter.content, slot));
+            }
+            match table.filter(Height(height))? {
+                Some((next, next_slot)) => {
+                    body = next;
+                    slot = next_slot;
+                }
+                None => return Err(StoreError::NotFound),
+            }
+        }
+        if check_filter_hash(&body, &slot).is_ok() {
+            return Ok((body, slot));
+        }
+        Err(StoreError::Corrupt(
+            "invariant: blockfilter repair slot moved",
+        ))
+    }
+
     /// Filter bytes and header at `height`. `None` past the watermark.
     pub fn basic_filter_at(
         &self,
@@ -541,9 +651,16 @@ impl Query {
         let Some(table) = self.block_filter_table() else {
             return Ok(None);
         };
-        Ok(table
+        let row = table
             .filter(Height(height))?
-            .map(|(body, slot)| (body, FilterHeader::from_byte_array(slot.filter_header))))
+            .map(|(body, slot)| {
+                let (body, slot) = self.repaired_filter_body(height, body, &slot)?;
+                Ok::<_, QueryError>((body, FilterHeader::from_byte_array(slot.filter_header)))
+            })
+            .transpose()?;
+        #[cfg(debug_assertions)]
+        let row = lie_filter_row(row);
+        Ok(row)
     }
 
     /// Filter bytes for `start..=end` in one idx and one body read per
@@ -552,9 +669,18 @@ impl Query {
         let Some(table) = self.block_filter_table() else {
             return Ok(None);
         };
-        Ok(table
+        table
             .filters(Height(start), Height(end))?
-            .map(|v| v.into_iter().map(|(body, _)| body).collect()))
+            .map(|v| {
+                v.into_iter()
+                    .enumerate()
+                    .map(|(i, (body, slot))| {
+                        self.repaired_filter_body(start.saturating_add(i as u32), body, &slot)
+                            .map(|(body, _slot)| body)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()
     }
 
     /// Filter headers at heights 1,000, 2,000, … through `stop`.

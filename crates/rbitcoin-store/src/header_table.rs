@@ -423,6 +423,9 @@ impl HeaderTable {
             head_entries.push((rec.hash, *fk));
         }
         self.body.write_at(offset, &blob)?;
+        // Head insert fdatasyncs. The body must be durable first so a crash
+        // cannot leave header.head naming an fk above the durable row count.
+        self.body.sync_data_only()?;
         self.count
             .store(base.saturating_add(fresh.len() as u64), Ordering::Release);
         self.head.insert_many(&head_entries)?;

@@ -8,6 +8,35 @@ use std::cell::Cell;
 thread_local! {
     static HEIGHT_INDEX_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
     static INDEX_IO_UNDER_LOCK: Cell<u64> = const { Cell::new(0) };
+    static FORGET_HEIGHT_ON: Cell<u32> = const { Cell::new(0) };
+    static HEIGHT_CALLS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The `n`th `height_of_hash` on this thread returns `Ok(None)`. `n` is 1-based.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn forget_height_of_hash_on_call(n: u32) {
+    HEIGHT_CALLS.with(|slot| slot.set(0));
+    FORGET_HEIGHT_ON.with(|slot| slot.set(n));
+}
+
+#[cfg(debug_assertions)]
+fn forget_this_height_call() -> bool {
+    let armed = FORGET_HEIGHT_ON.with(|slot| slot.get());
+    if armed == 0 {
+        return false;
+    }
+    let seen = HEIGHT_CALLS.with(|slot| {
+        let n = slot.get().saturating_add(1);
+        slot.set(n);
+        n
+    });
+    if seen == armed {
+        FORGET_HEIGHT_ON.with(|slot| slot.set(0));
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -354,6 +383,10 @@ impl Query {
     }
 
     pub fn height_of_hash(&self, hash: &[u8; 32]) -> Result<Option<Height>, QueryError> {
+        #[cfg(debug_assertions)]
+        if forget_this_height_call() {
+            return Ok(None);
+        }
         let Some(tip) = self.tip_height() else {
             return Ok(None);
         };

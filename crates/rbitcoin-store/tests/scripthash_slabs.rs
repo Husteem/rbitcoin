@@ -1,6 +1,10 @@
-use rbitcoin_primitives::Fk;
+use rbitcoin_primitives::{Fk, TableKind};
 use rbitcoin_store::error::StoreError;
-use rbitcoin_store::scripthash_layout::slab_bytes;
+use rbitcoin_store::file::TableFile;
+use rbitcoin_store::scripthash::{
+    pop_free_head, read_alloc_header, write_alloc_header, AllocState,
+};
+use rbitcoin_store::scripthash_layout::{slab_bytes, SH_MAX_CLASS, SH_PREFIX_PAGE};
 use rbitcoin_store::scripthash_pages::SH_FLAG_BIT;
 use rbitcoin_store::scripthash_slabs::*;
 
@@ -28,6 +32,79 @@ fn decode_slab(buf: &[u8]) -> Result<Vec<Fk>, StoreError> {
     let mut out = Vec::new();
     decode_slab_payload_into(buf, &mut out)?;
     Ok(out)
+}
+
+#[test]
+fn alloc_header_rejects_a_free_head_past_bump() {
+    let dir = rbitcoin_store::testutil::fresh_path("sh-alloc-range");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scripthash.body");
+    let file = TableFile::create(&path, TableKind::ScriptHash).unwrap();
+    file.set_logical_len(SH_PREFIX_PAGE as u64).unwrap();
+    let mut state = AllocState {
+        live_count: 0,
+        bump: SH_PREFIX_PAGE as u64,
+        free_head: [0u64; SH_MAX_CLASS as usize + 1],
+    };
+    state.free_head[0] = state.bump.saturating_add(8);
+    write_alloc_header(&file, &state).unwrap();
+    match read_alloc_header(&file) {
+        Err(StoreError::Corrupt(_)) => {}
+        Ok((_, version)) => {
+            panic!("out-of-range free head must be Corrupt, read version {version}")
+        }
+        Err(other) => panic!("out-of-range free head must be Corrupt, got {other}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn alloc_header_rejects_a_bump_outside_the_body() {
+    let dir = rbitcoin_store::testutil::fresh_path("sh-alloc-bump");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scripthash.body");
+    let file = TableFile::create(&path, TableKind::ScriptHash).unwrap();
+    file.set_logical_len(8192).unwrap();
+    let state = AllocState {
+        live_count: 0,
+        bump: 8,
+        free_head: [0u64; SH_MAX_CLASS as usize + 1],
+    };
+    write_alloc_header(&file, &state).unwrap();
+    match read_alloc_header(&file) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("bump"), "{msg}"),
+        Ok(_) => panic!("bump below the prefix must be Corrupt"),
+        Err(other) => panic!("bump below the prefix must be Corrupt, got {other}"),
+    }
+    let state = AllocState {
+        live_count: 0,
+        bump: 9000,
+        free_head: [0u64; SH_MAX_CLASS as usize + 1],
+    };
+    write_alloc_header(&file, &state).unwrap();
+    match read_alloc_header(&file) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("bump"), "{msg}"),
+        Ok(_) => panic!("bump past the body must be Corrupt"),
+        Err(other) => panic!("bump past the body must be Corrupt, got {other}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pop_free_head_rejects_an_out_of_range_head() {
+    let dir = rbitcoin_store::testutil::fresh_path("sh-free-head");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scripthash.body");
+    let file = TableFile::create(&path, TableKind::ScriptHash).unwrap();
+    file.set_logical_len(8192).unwrap();
+    let mut heads = [0u64; SH_MAX_CLASS as usize + 1];
+    heads[0] = 8;
+    match pop_free_head(&file, &mut heads, 0, 8192) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("free head"), "{msg}"),
+        Ok(_) => panic!("a free head below the prefix must be Corrupt"),
+        Err(other) => panic!("a free head below the prefix must be Corrupt, got {other}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -115,4 +192,28 @@ fn fk_delta_stream_roundtrip_and_packed_len() {
     decode_fk_delta_stream_into(&[], 0, &mut keep).unwrap();
     assert_eq!(keep, vec![Fk(99)]);
     assert!(decode_slab_payload_into(&[0], &mut Vec::new()).is_err());
+}
+
+#[test]
+fn popped_free_link_out_of_range_is_corrupt() {
+    let dir = rbitcoin_store::testutil::fresh_path("sh-free-link");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("scripthash.body");
+    let file = TableFile::create(&path, TableKind::ScriptHash).unwrap();
+    file.set_logical_len(8192).unwrap();
+    let mut state = AllocState {
+        live_count: 0,
+        bump: 8192,
+        free_head: [0u64; SH_MAX_CLASS as usize + 1],
+    };
+    state.free_head[0] = 4096;
+    write_alloc_header(&file, &state).unwrap();
+    file.write_at(4096, &8200u64.to_le_bytes()).unwrap();
+    let mut heads = state.free_head;
+    match pop_free_head(&file, &mut heads, 0, 8192) {
+        Err(StoreError::Corrupt(_)) => {}
+        Ok(_) => panic!("an out-of-range next link must be Corrupt"),
+        Err(e) => panic!("an out-of-range next link must be Corrupt, got {e}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,8 +1,8 @@
 //! Tip-window revalidation on store open (Bitcoin Core `checkblocks`-style).
 //!
 //! Default window is [`VERIFY_TIP_BLOCKS`] (6) for both structural checks and
-//! Class A merkle content. Runs **before** the one complement Class C repair
-//! so the fence matches the post-revalidate tip.
+//! Class A merkle content. Open clears leftover strong bits and restores
+//! fence bits, revalidates this window, then clears and restores again.
 //!
 //! Soft sidecar [`TIP_SEAL_NAME`]: written after a successful connect/disconnect
 //! Class C barrier so a kill that advanced `confirmed` without a complete seal
@@ -193,6 +193,60 @@ impl TipFault {
     }
 }
 
+/// Cut or refuse a `confirmed[]` with a null slot under the tip open keeps.
+///
+/// A torn page comes back from the write-ahead image, so the only nulls a
+/// crash of this binary leaves are on top: above the sealed tip, or a
+/// trailing run under it that the trim removes. A binary without the image
+/// rewrote the 4 KiB block that holds the sealed tip on every barrier, so a
+/// null in that block is its crash: the tip is cut below the first one, as
+/// the window used to. A null anywhere else is not crash damage. Open would
+/// build a fence without that height and clear its strong bits, so it
+/// refuses before any repair runs.
+pub(crate) fn cut_or_refuse_confirmed_hole(
+    dir: &Path,
+    confirmed: &crate::chain::ConfirmedTable,
+) -> Result<(), StoreError> {
+    use crate::array_table::{ELEM, FLUSH_SCRATCH};
+    use crate::file::FILE_HEADER_LEN;
+    let Some(tip) = confirmed.tip_height() else {
+        return Ok(());
+    };
+    let cap = TipSeal::load(dir)?.map_or(tip.0, |s| s.tip_height.min(tip.0));
+    let mut top = cap;
+    while confirmed.get(Height(top))?.is_none() {
+        let Some(below) = top.checked_sub(1) else {
+            return Ok(());
+        };
+        top = below;
+    }
+    let Some(hole) = (0..top).find_map(|h| match confirmed.get(Height(h)) {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(Ok(h)),
+        Err(e) => Some(Err(e)),
+    }) else {
+        return Ok(());
+    };
+    let hole = hole?;
+    // The block is the one that holds the sealed tip, not the top non-null
+    // slot: a torn block can null a run that ends in the block before it.
+    let cap_byte = FILE_HEADER_LEN as u64 + u64::from(cap) * ELEM;
+    let block_byte = cap_byte & !(FLUSH_SCRATCH as u64 - 1);
+    let block_first = block_byte.saturating_sub(FILE_HEADER_LEN as u64) / ELEM;
+    if u64::from(hole) < block_first {
+        eprintln!("rbitcoin: confirmed[{hole}] is null below tip {cap}; the store needs a reindex");
+        return Err(StoreError::Corrupt("confirmed[] null slot below the tip"));
+    }
+    eprintln!(
+        "rbitcoin: confirmed[{hole}] is null in the block that holds tip {cap}; \
+         cutting the tip to {}",
+        i64::from(hole) - 1
+    );
+    let write = crate::array_table::ClassCWrite::new();
+    confirmed.arr.truncate(&write, u64::from(hole))?;
+    confirmed.flush()
+}
+
 impl Store {
     /// Persist tip seal after a complete Class C tip barrier (connect or disconnect).
     ///
@@ -233,11 +287,16 @@ impl Store {
         let Some(seal) = TipSeal::load(self.path())? else {
             return Ok(());
         };
-        let Some(tip) = self.confirmed.tip_height() else {
+        let Some(mut tip) = self.confirmed.tip_height() else {
             return Ok(());
         };
         if tip.0 > seal.tip_height {
-            return self.shrink_tip_to(write, Some(seal.tip_height), report);
+            // Then compare the hash at the sealed height like any other tip.
+            self.shrink_tip_to(write, Some(seal.tip_height), report)?;
+            let Some(shrunk) = self.confirmed.tip_height() else {
+                return Ok(());
+            };
+            tip = shrunk;
         }
         if tip.0 < seal.tip_height {
             return Ok(());
@@ -283,6 +342,10 @@ impl Store {
         }
         let write = crate::array_table::ClassCWrite::new();
 
+        // Clamp first: a cut back to the sealed tip can leave a null run on
+        // top, and the trim below must see it.
+        self.clamp_to_tip_seal(&write, &mut report)?;
+
         // HWM can include a trailing run of null slots (crash mid-grow). Trim
         // the whole suffix in one shot so the 6-height window sees a real tip.
         let trimmed = self.confirmed.trim_trailing_nulls(&write)?;
@@ -293,8 +356,6 @@ impl Store {
             report.tip_shrunk = true;
             eprintln!("rbitcoin: trimmed {trimmed} trailing null confirmed[] slots");
         }
-
-        self.clamp_to_tip_seal(&write, &mut report)?;
 
         let Some(tip) = self.confirmed.tip_height() else {
             report.tip_before = report.tip_before.or(None);
@@ -444,13 +505,6 @@ impl Store {
     ) -> Result<(), TipFault> {
         self.block_txid_fault(first, count, tx_count, merkle_root)
             .map_err(|fault| self.drop_body_on_bad(write, fk, report, fault))?;
-        if !self
-            .strong_tx
-            .all_strong_range(first, count)
-            .map_err(TipFault::read("strong_tx read"))?
-        {
-            return Err(TipFault::Bad("strong bits missing in tip window"));
-        }
         self.check_block_input_edges(write, fk, first.0, count, report)
     }
 

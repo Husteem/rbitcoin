@@ -323,19 +323,71 @@ impl ScriptHashTable {
                 body.sync_data_only()?;
             }
         }
+        let mut ingest_rows = Vec::new();
         for job in &batch.rewrites {
-            self.unlink_write_home(&job.scripthash, job.home, &job.new_val)?;
-        }
-        self.sync_batch_homes(&batch)?;
-        for job in &batch.rewrites {
-            let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
-            let alloc_mu = self.alloc_for(&job.scripthash, super::KeyHome::from(job.home));
-            let mut alloc = alloc_mu.lock().unwrap();
-            alloc.live_count = alloc.live_count.saturating_sub(job.removed);
-            if let Err(e) = self.free_if_paged(body, &mut alloc, &job.old) {
-                let _ = write_alloc_header(body, &alloc);
-                return Err(e);
+            match job.home {
+                LocatedHome::Ingest => {
+                    ingest_rows.push((job.scripthash, job.new_val.clone()));
+                }
+                LocatedHome::Main => {
+                    if !self.sorted_main_updated(&job.scripthash, &job.new_val)? {
+                        ingest_rows.push((job.scripthash, job.new_val.clone()));
+                    }
+                }
+                LocatedHome::SealedOvf => {
+                    self.unlink_write_sealed_ovf(&job.scripthash, &job.new_val)?;
+                }
             }
+        }
+        if !ingest_rows.is_empty() {
+            let g = self.ingest.lock().unwrap();
+            let Some(head) = g.as_ref() else {
+                return Err(StoreError::Corrupt("scripthash: ingest missing"));
+            };
+            head.stage_rewrites(&ingest_rows)?;
+        }
+        let ingest_synced = batch
+            .rewrites
+            .iter()
+            .any(|job| matches!(job.home, LocatedHome::Main | LocatedHome::Ingest));
+        self.sync_batch_homes(&batch)?;
+        if ingest_synced {
+            if let Some(head) = self.ingest.lock().unwrap().as_ref() {
+                head.drop_ahead()?;
+            }
+        }
+        // One barrier per body, after every free-list write for that file.
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (i, job) in batch.rewrites.iter().enumerate() {
+            let body = self.body_for(&job.scripthash, super::KeyHome::from(job.home));
+            let key = std::ptr::from_ref(body) as usize;
+            if let Some(group) = groups.iter_mut().find(|(id, _)| *id == key) {
+                group.1.push(i);
+            } else {
+                groups.push((key, vec![i]));
+            }
+        }
+        for (_, jobs) in groups {
+            let first = &batch.rewrites[jobs[0]];
+            let body = self.body_for(&first.scripthash, super::KeyHome::from(first.home));
+            let alloc_mu = self.alloc_for(&first.scripthash, super::KeyHome::from(first.home));
+            let mut alloc = alloc_mu.lock().unwrap();
+            for &i in &jobs {
+                let job = &batch.rewrites[i];
+                alloc.live_count = alloc.live_count.saturating_sub(job.removed);
+                if let Err(e) = self.free_if_paged(body, &mut alloc, &job.old) {
+                    // Links already written in this group must be durable
+                    // before the header that names them.
+                    if body.sync_data_only().is_ok() {
+                        let _ = write_alloc_header(body, &alloc);
+                    }
+                    return Err(e);
+                }
+            }
+            // Free-list links are durable before the header that names them.
+            // A crash between the two leaves the old header and a leak, never
+            // a header pointing at a link the device did not take.
+            body.sync_data_only()?;
             write_alloc_header(body, &alloc)?;
         }
         Ok(())
@@ -527,6 +579,10 @@ impl ScriptHashTable {
             alloc.live_count = alloc.live_count.saturating_sub(job.removed);
             job.live_applied = true;
         }
+        if let Err(e) = body.sync_data_only() {
+            job.pages_left = Some(Vec::new());
+            return Err(e);
+        }
         if let Err(e) = write_alloc_header(body, &alloc) {
             job.pages_left = Some(Vec::new());
             return Err(e);
@@ -655,6 +711,7 @@ impl ScriptHashTable {
                 for off in drop_pages {
                     self.free_slab(body, &mut alloc, SH_PAGE_SLAB_CLASS, off)?;
                 }
+                body.sync_data_only()?;
                 write_alloc_header(body, &alloc)?;
                 Ok(true)
             }
@@ -766,6 +823,7 @@ impl ScriptHashTable {
         };
         let mut alloc = alloc_mu.lock().unwrap();
         self.rollback_undo(body, &mut alloc, &rec)?;
+        body.sync_data_only()?;
         write_alloc_header(body, &alloc)?;
         body.sync_data_only()?;
         Ok(())

@@ -10,6 +10,7 @@ use crate::hashhead::HeadScale;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use rbitcoin_primitives::{Fk, Height, TableKind};
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Best-chain height → header fk. Length = tip_height + 1 when non-empty.
 pub struct ConfirmedTable {
@@ -24,8 +25,13 @@ impl ConfirmedTable {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        let path = dir.join("confirmed.body");
+        // Every flush rewrites page 0 (the length) and the block that holds
+        // the previous tip. A torn one comes back from the synced image.
+        ArrayTable::restore_ahead_keep(&path)?;
+        ArrayTable::remove_ahead(Some(ArrayTable::ahead_path(&path)))?;
         Ok(Self {
-            arr: ArrayTable::open(dir.join("confirmed.body"), TableKind::Confirmed)?,
+            arr: ArrayTable::open(path, TableKind::Confirmed)?,
         })
     }
 
@@ -103,8 +109,9 @@ impl ConfirmedTable {
 
     /// Drop a trailing run of null header fks (HWM ahead of last real tip).
     ///
-    /// Returns how many slots were removed. Mid-array holes are left for
-    /// [`Store::revalidate_tip_window_n`] to shrink to last good.
+    /// Returns how many slots were removed. Store open already cut a hole in
+    /// the block that holds the sealed tip and refused any other mid-array
+    /// hole (`integrity::cut_or_refuse_confirmed_hole`).
     pub fn trim_trailing_nulls(&self, write: &ClassCWrite) -> Result<u64, StoreError> {
         let n = self.arr.len();
         if n == 0 {
@@ -137,12 +144,26 @@ impl ConfirmedTable {
         }
     }
 
+    /// Write the synced image of the pages this flush rewrites, then the
+    /// payload, then drop the image.
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.arr.flush()
-    }
-
-    pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.arr.flush_async()
+        let ahead = ArrayTable::write_aheads(&[&self.arr], 0)?;
+        #[cfg(debug_assertions)]
+        if take_fail_ahead(self.arr.file.path()) {
+            return Err(StoreError::io(
+                self.arr.file.path(),
+                std::io::Error::other("injected confirmed ahead failure"),
+            ));
+        }
+        self.arr.flush()?;
+        #[cfg(debug_assertions)]
+        if take_fail_after_payload(self.arr.file.path()) {
+            return Err(StoreError::io(
+                self.arr.file.path(),
+                std::io::Error::other("injected confirmed payload failure"),
+            ));
+        }
+        ArrayTable::remove_ahead(ahead)
     }
 }
 
@@ -543,6 +564,74 @@ pub struct HeaderTxsTable {
     pub count: ArrayTable,
     /// One counter for a header's `(first, count)` pair.
     seq: AtomicU64,
+    /// Serializes a write with the sidecar+flush pair. A sidecar must describe
+    /// exactly the slots the following flush writes.
+    write: Mutex<()>,
+}
+
+#[cfg(debug_assertions)]
+static FAIL_AHEAD: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+#[cfg(debug_assertions)]
+static FAIL_AFTER_FIRST: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+#[cfg(debug_assertions)]
+static FAIL_AFTER_PAYLOAD: std::sync::Mutex<std::collections::BTreeSet<std::path::PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Leave the next write-ahead sidecar for `path` (`header_txs_*` or
+/// `confirmed`) behind and fail before the payload flush, as a power cut would.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_array_flush_after_ahead(path: &Path) {
+    FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+/// Fail after `first` is durable and before `count` is written.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_header_txs_flush_after_first(path: &Path) {
+    FAIL_AFTER_FIRST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+/// Fail after the payload flush of `path`, before the sidecars are removed.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fail_next_array_flush_after_payload(path: &Path) {
+    FAIL_AFTER_PAYLOAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf());
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_ahead(path: &Path) -> bool {
+    FAIL_AHEAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_after_first(path: &Path) -> bool {
+    FAIL_AFTER_FIRST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
+}
+
+#[cfg(debug_assertions)]
+fn take_fail_after_payload(path: &Path) -> bool {
+    FAIL_AFTER_PAYLOAD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(path)
 }
 
 impl HeaderTxsTable {
@@ -551,14 +640,30 @@ impl HeaderTxsTable {
             first: ArrayTable::create(dir.join("header_txs_first.body"), TableKind::ArrayLink)?,
             count: ArrayTable::create(dir.join("header_txs_count.body"), TableKind::ArrayLink)?,
             seq: AtomicU64::new(0),
+            write: Mutex::new(()),
         })
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        let first_path = dir.join("header_txs_first.body");
+        let count_path = dir.join("header_txs_count.body");
+        // Restore only when both sidecars carry the same nonzero stamp.
+        // A retry with one dirty column writes that stamp again, so a crash
+        // still has one pair. A lone file, stamp 0, or two stamps is not one pair.
+        let first_side = ArrayTable::ahead_path(&first_path);
+        let count_side = ArrayTable::ahead_path(&count_path);
+        let first_gen = Self::sidecar_gen(&first_path)?;
+        let count_gen = Self::sidecar_gen(&count_path)?;
+        if first_gen != 0 && first_gen == count_gen {
+            ArrayTable::restore_ahead_keep(&first_path)?;
+            ArrayTable::restore_ahead_keep(&count_path)?;
+        }
+        ArrayTable::remove_ahead([first_side, count_side])?;
         Ok(Self {
-            first: ArrayTable::open(dir.join("header_txs_first.body"), TableKind::ArrayLink)?,
-            count: ArrayTable::open(dir.join("header_txs_count.body"), TableKind::ArrayLink)?,
+            first: ArrayTable::open(first_path, TableKind::ArrayLink)?,
+            count: ArrayTable::open(count_path, TableKind::ArrayLink)?,
             seq: AtomicU64::new(0),
+            write: Mutex::new(()),
         })
     }
 
@@ -603,6 +708,7 @@ impl HeaderTxsTable {
         if first_tx_fk.is_null() || n == 0 {
             return Err(StoreError::InvalidFk);
         }
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
         self.first.set_zero_gap(write, id - 1, first_tx_fk.0)?;
         self.count.set_zero_gap(write, id - 1, u64::from(n))?;
@@ -626,6 +732,7 @@ impl HeaderTxsTable {
             first_pairs.push((id - 1, first.0));
             count_pairs.push((id - 1, u64::from(n)));
         }
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
         self.first.set_many_zero_gap(write, &first_pairs)?;
         self.count.set_many_zero_gap(write, &count_pairs)?;
@@ -651,6 +758,7 @@ impl HeaderTxsTable {
             first_pairs.push((id - 1, first_tx_fk.0));
             count_pairs.push((id - 1, u64::from(n)));
         }
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
         self.first.set_many_zero_gap(write, &first_pairs)?;
         self.count.set_many_zero_gap(write, &count_pairs)?;
@@ -736,6 +844,7 @@ impl HeaderTxsTable {
         if idx >= self.first.len() {
             return Ok(false);
         }
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let _pair = seq_odd(&self.seq);
         self.first.set(write, idx, 0)?;
         self.count.set(write, idx, 0)?;
@@ -750,15 +859,74 @@ impl HeaderTxsTable {
         })
     }
 
-    pub fn flush(&self) -> Result<(), StoreError> {
-        self.first.flush()?;
-        self.count.flush()?;
-        Ok(())
+    fn sidecar_gen(path: &Path) -> Result<u16, StoreError> {
+        let side = ArrayTable::ahead_path(path);
+        match std::fs::read(&side) {
+            Ok(raw) => ArrayTable::ahead_pair_gen(&raw),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(e) => Err(StoreError::io(&side, e)),
+        }
     }
 
-    pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.first.flush_async()?;
-        self.count.flush_async()?;
+    /// Next stamp for a `(first, count)` sidecar pair. `0` is reserved for
+    /// an image this writer did not stamp.
+    fn next_pair_gen(&self) -> Result<u16, StoreError> {
+        let prev = Self::sidecar_gen(self.first.file.path())?
+            .max(Self::sidecar_gen(self.count.file.path())?);
+        let next = prev.wrapping_add(1);
+        Ok(if next == 0 { 1 } else { next })
+    }
+
+    /// Stamp for this flush. One dirty column keeps the partner sidecar's
+    /// stamp. Two dirty columns take a new stamp and both files are rewritten.
+    fn pair_gen_for_flush(&self) -> Result<u16, StoreError> {
+        let first_dirty = self.first.has_unstored();
+        let count_dirty = self.count.has_unstored();
+        if first_dirty != count_dirty {
+            let partner = if count_dirty {
+                self.first.file.path()
+            } else {
+                self.count.file.path()
+            };
+            let stamp = Self::sidecar_gen(partner)?;
+            if stamp != 0 {
+                return Ok(stamp);
+            }
+        }
+        self.next_pair_gen()
+    }
+
+    pub fn flush(&self) -> Result<(), StoreError> {
+        let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let pair_gen = self.pair_gen_for_flush()?;
+        ArrayTable::write_aheads(&[&self.first, &self.count], pair_gen)?;
+        #[cfg(debug_assertions)]
+        if take_fail_ahead(self.first.file.path()) {
+            return Err(StoreError::io(
+                self.first.file.path(),
+                std::io::Error::other("injected header_txs ahead failure"),
+            ));
+        }
+        self.first.flush()?;
+        #[cfg(debug_assertions)]
+        if take_fail_after_first(self.first.file.path()) {
+            return Err(StoreError::io(
+                self.first.file.path(),
+                std::io::Error::other("injected header_txs first-column failure"),
+            ));
+        }
+        self.count.flush()?;
+        #[cfg(debug_assertions)]
+        if take_fail_after_payload(self.first.file.path()) {
+            return Err(StoreError::io(
+                self.first.file.path(),
+                std::io::Error::other("injected header_txs payload failure"),
+            ));
+        }
+        ArrayTable::remove_ahead([
+            ArrayTable::ahead_path(self.first.file.path()),
+            ArrayTable::ahead_path(self.count.file.path()),
+        ])?;
         Ok(())
     }
 }
