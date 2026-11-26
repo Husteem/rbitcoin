@@ -1134,7 +1134,7 @@ impl ArrayTable {
             return Err(StoreError::Corrupt("array ahead version"));
         }
         let count = u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]) as usize;
-        if count > (raw.len().saturating_sub(AHEAD_HEAD)) / AHEAD_REC {
+        if count == 0 || count > (raw.len().saturating_sub(AHEAD_HEAD)) / AHEAD_REC {
             return Err(StoreError::Corrupt("array ahead count"));
         }
         let header = &raw[12..28];
@@ -1179,6 +1179,9 @@ impl ArrayTable {
             }
             images.push((off, image));
             at = image_at + len;
+        }
+        if at != raw.len() {
+            return Err(StoreError::Corrupt("array ahead length"));
         }
         let mut file = std::fs::OpenOptions::new()
             .read(true)

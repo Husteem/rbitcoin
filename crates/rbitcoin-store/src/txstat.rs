@@ -343,9 +343,13 @@ pub struct TxStat {
     pub ovf: TableFile,
     pub blk: TableFile,
     pub count: AtomicU64,
+    pub ovf_len: AtomicU64,
     /// Serialises [`Self::put_header_blob`]'s read of the `ovf` end and its
     /// append. Readers stamp blocks too, so appends run on several threads.
     ovf_append: Mutex<()>,
+    /// One journal+body write+sync+remove at a time. The IBD append and the
+    /// read-side stamp can otherwise replace each other's `*.ahead` image.
+    journal: Mutex<()>,
 }
 
 impl TxStat {
@@ -447,7 +451,9 @@ impl TxStat {
             ovf,
             blk,
             count: AtomicU64::new(0),
+            ovf_len: AtomicU64::new(0),
             ovf_append: Mutex::new(()),
+            journal: Mutex::new(()),
         })
     }
 
@@ -498,12 +504,15 @@ impl TxStat {
             }
             f
         };
+        let ovf_len = ovf.data_len();
         Ok(Self {
             body,
             ovf,
             blk,
             count: AtomicU64::new(count),
+            ovf_len: AtomicU64::new(ovf_len),
             ovf_append: Mutex::new(()),
+            journal: Mutex::new(()),
         })
     }
 
@@ -649,6 +658,7 @@ impl TxStat {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+        let _journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
         let cur = self.count.load(Ordering::Acquire);
         if cur != base_count {
             return Err(StoreError::Corrupt("txstat.body count mismatch on append"));
@@ -673,6 +683,7 @@ impl TxStat {
     }
 
     pub fn write_row(&self, fk: Fk, row: &TxStatRow) -> Result<(), StoreError> {
+        let _journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         if id > self.count() {
             return Err(StoreError::NotFound);
@@ -695,6 +706,7 @@ impl TxStat {
         first_fk: u64,
         rows: &[TxStatRow],
     ) -> Result<(), StoreError> {
+        let _journal = self.journal.lock().unwrap_or_else(|e| e.into_inner());
         if rows.is_empty() {
             return self.put_header_blob(header_fk, &[]);
         }

@@ -135,6 +135,14 @@ fn torn_header_txs_block_restores_from_ahead_image() {
         s.header_txs.get_range(h601).unwrap().map(|(f, n)| (f.0, n)),
         Some((601, 1))
     );
+    assert_eq!(
+        s.header_txs
+            .get_range(Fk(1))
+            .unwrap()
+            .map(|(f, n)| (f.0, n)),
+        Some((1, 1)),
+        "the page-zero range was not restored"
+    );
     assert!(!dir.join("header_txs_first.body.ahead").exists());
     assert!(!dir.join("header_txs_count.body.ahead").exists());
     let _ = std::fs::remove_dir_all(&dir);
