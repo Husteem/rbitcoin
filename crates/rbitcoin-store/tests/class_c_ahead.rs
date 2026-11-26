@@ -296,6 +296,44 @@ fn leftover_ahead_pages_survive_a_later_write() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every `confirmed[]` flush rewrites the length in page 0 and the block that
+/// holds the previous tip. A tear of either must come back from the image.
+#[test]
+fn torn_confirmed_page_zero_restores_from_ahead_image() {
+    use rbitcoin_primitives::Height;
+    use rbitcoin_store::chain::ConfirmedTable;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("confirmed-ahead").unwrap();
+    let path = dir.path.join("confirmed.body");
+    {
+        let t = ConfirmedTable::create(&dir.path).unwrap();
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        for h in 0..600u32 {
+            t.set(&write, Height(h), Fk(u64::from(h) + 1)).unwrap();
+        }
+        t.flush().unwrap();
+        // Height 600 lands in the block that holds heights 510..=599.
+        t.set(&write, Height(600), Fk(601)).unwrap();
+        rbitcoin_store::chain::fail_next_header_txs_flush_after_ahead(&path);
+        assert!(
+            t.flush().is_err(),
+            "the failpoint must stop before the payload flush"
+        );
+        assert!(dir.path.join("confirmed.body.ahead").is_file());
+    }
+
+    zero_header_and_block(&path);
+    let t = ConfirmedTable::open(&dir.path).unwrap();
+    assert_eq!(t.tip_height(), Some(Height(600)));
+    assert_eq!(t.get(Height(0)).unwrap(), Some(Fk(1)), "page zero was lost");
+    assert_eq!(
+        t.get(Height(599)).unwrap(),
+        Some(Fk(600)),
+        "the committed previous tip was lost"
+    );
+    assert_eq!(t.get(Height(600)).unwrap(), Some(Fk(601)));
+    assert!(!dir.path.join("confirmed.body.ahead").exists());
+}
+
 #[test]
 fn one_header_txs_failpoint_does_not_clear_another_path() {
     let a = rbitcoin_store::testutil::TempDir::labeled("ahead-a").unwrap();

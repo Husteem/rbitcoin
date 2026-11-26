@@ -103,7 +103,6 @@ fn confirmed_tx_height_header_txs_surface() {
         Err(StoreError::Corrupt(_))
     ));
     c.flush().unwrap();
-    c.flush_async().unwrap();
 
     let ht = HeaderTxsTable::create(&dir).unwrap();
     assert!(ht.get_range(Fk(1)).unwrap().is_none());

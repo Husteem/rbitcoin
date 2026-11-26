@@ -25,8 +25,13 @@ impl ConfirmedTable {
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
+        let path = dir.join("confirmed.body");
+        // Every flush rewrites page 0 (the length) and the block that holds
+        // the previous tip. A torn one comes back from the synced image.
+        ArrayTable::restore_ahead_keep(&path)?;
+        ArrayTable::remove_ahead(Some(ArrayTable::ahead_path(&path)))?;
         Ok(Self {
-            arr: ArrayTable::open(dir.join("confirmed.body"), TableKind::Confirmed)?,
+            arr: ArrayTable::open(path, TableKind::Confirmed)?,
         })
     }
 
@@ -138,12 +143,19 @@ impl ConfirmedTable {
         }
     }
 
+    /// Write the synced image of the pages this flush rewrites, then the
+    /// payload, then drop the image.
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.arr.flush()
-    }
-
-    pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.arr.flush_async()
+        let ahead = self.arr.write_ahead(0)?;
+        #[cfg(debug_assertions)]
+        if take_fail_ahead(self.arr.file.path()) {
+            return Err(StoreError::io(
+                self.arr.file.path(),
+                std::io::Error::other("injected confirmed ahead failure"),
+            ));
+        }
+        self.arr.flush()?;
+        ArrayTable::remove_ahead(ahead)
     }
 }
 
