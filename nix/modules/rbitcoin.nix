@@ -78,35 +78,83 @@ let
     else
       lib.head (lib.splitString ":" a);
   onionListenBracketed = cfg.p2p.onionListen != null && lib.hasPrefix "[" cfg.p2p.onionListen;
-  # Rust's Ipv4Addr: four decimal octets, no leading zeros.
-  ipv4Literal =
+  # Rust's Ipv4Addr: four decimal octets, no leading zeros. The octets, or null.
+  ipv4Octets =
     h:
     let
       m = builtins.match "(0|[1-9][0-9]{0,2})\\.(0|[1-9][0-9]{0,2})\\.(0|[1-9][0-9]{0,2})\\.(0|[1-9][0-9]{0,2})" h;
+      octets = if m == null then [ ] else map lib.toInt m;
     in
-    m != null && lib.all (o: lib.toInt o <= 255) m;
-  # Hex groups, an optional dotted tail, at most one `::`, an optional numeric
-  # scope. Group counts are left to the node's SocketAddr parse.
-  ipv6Literal =
-    h:
-    builtins.match "[0-9a-fA-F:.]+(%[0-9]+)?" h != null
-    && lib.hasInfix ":" h
-    && builtins.length (lib.splitString "::" h) <= 2;
-  # The node rejects `to_canonical().is_unspecified()`: all-zero IPv6, and an
-  # IPv4-mapped 0.0.0.0, in any spelling.
-  unspecifiedIp =
+    if m != null && lib.all (o: o <= 255) octets then octets else null;
+  # Rust's Ipv6Addr with SocketAddrV6's numeric scope: one to four hex digits
+  # per group, a dotted IPv4 tail as the last two groups, and at most one `::`
+  # standing for at least one zero group. The eight groups, or null.
+  ipv6Groups =
     h:
     let
-      bare = lib.head (lib.splitString "%" (lib.toLower h));
-      v4 = if lib.hasPrefix "::ffff:" bare && lib.hasInfix "." bare then lib.removePrefix "::ffff:" bare else bare;
+      m = builtins.match "([0-9a-fA-F:.]+)(%[0-9]+)?" h;
+      halves = lib.splitString "::" (lib.head m);
+      nHalves = builtins.length halves;
+      group =
+        t:
+        if builtins.match "[0-9a-fA-F]{1,4}" t != null then [ (lib.fromHexString t) ] else null;
+      dotted =
+        t:
+        let
+          o = ipv4Octets t;
+        in
+        if o == null then
+          null
+        else
+          [
+            (builtins.elemAt o 0 * 256 + builtins.elemAt o 1)
+            (builtins.elemAt o 2 * 256 + builtins.elemAt o 3)
+          ];
+      # `last`: this half ends the address, so its last token may be dotted.
+      side =
+        s: last:
+        let
+          toks = if s == "" then [ ] else lib.splitString ":" s;
+          n = builtins.length toks;
+          parsed = lib.imap0 (
+            i: t: if last && i == n - 1 && lib.hasInfix "." t then dotted t else group t
+          ) toks;
+        in
+        if lib.any (g: g == null) parsed then null else lib.concatLists parsed;
+      left = side (lib.head halves) (nHalves == 1);
+      right = if nHalves == 2 then side (lib.last halves) true else [ ];
+      nGiven = builtins.length left + builtins.length right;
     in
-    builtins.match "[0:.]+" v4 != null;
+    if m == null || nHalves > 2 || left == null || right == null then
+      null
+    else if nHalves == 1 then
+      (if nGiven == 8 then left else null)
+    else if nGiven <= 7 then
+      left ++ lib.genList (_: 0) (8 - nGiven) ++ right
+    else
+      null;
+  # The node rejects `to_canonical().is_unspecified()`: all-zero IPv6 and the
+  # IPv4-mapped 0.0.0.0 (::ffff:0:0), however they are spelled.
+  unspecifiedIpv6 =
+    g:
+    lib.all (x: x == 0) g
+    || (
+      lib.all (x: x == 0) (lib.take 5 g)
+      && builtins.elemAt g 5 == 65535
+      && builtins.elemAt g 6 == 0
+      && builtins.elemAt g 7 == 0
+    );
+  onionListenGroups = ipv6Groups onionListenHost;
   onionListenValid =
     onionListenPort != null
     && onionListenPort > 0
     && onionListenPort <= 65535
-    && (if onionListenBracketed then ipv6Literal onionListenHost else ipv4Literal onionListenHost)
-    && !unspecifiedIp onionListenHost;
+    && (
+      if onionListenBracketed then
+        onionListenGroups != null && !unspecifiedIpv6 onionListenGroups
+      else
+        ipv4Octets onionListenHost != null && onionListenHost != "0.0.0.0"
+    );
   # Port after the last @. IPv6 is `[addr]:port`. A grant with no port is left out;
   # the node rejects it at start.
   whitebindPort = spec:
@@ -121,7 +169,8 @@ let
           in
           if builtins.length parts == 2 then builtins.elemAt parts 1 else "";
     in
-    if builtins.match "[0-9]+" port != null then lib.toInt port else null;
+    # More than five digits is no port, and could overflow toInt.
+    if builtins.match "[0-9]{1,5}" port != null then lib.toInt port else null;
   whitebindPorts = lib.filter (p: p != null) (map whitebindPort cfg.netPermissionBind);
   torControlAddr =
     if cfg.tor.control != null then

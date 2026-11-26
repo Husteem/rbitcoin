@@ -1011,13 +1011,32 @@ assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
 assert builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
   p2p = onionListenOpts.p2p // { onionListen = "[::1]"; };
 }));
+# The IPv4-mapped unspecified address in its hex and expanded spellings, too
+# many groups, a `::` that stands for no group, a five-digit group, and a port
+# past the Nix integer range are refused like the rest, not passed to the node.
+assert nixpkgs.lib.all (a: builtins.elem onionListenAddrMsg (failedAssertions (badSystem {
+  p2p = onionListenOpts.p2p // { onionListen = a; };
+}))) [
+  "[::ffff:0:0]:8334"
+  "[0:0:0:0:0:ffff:0.0.0.0]:8334"
+  "[0:0:0:0:0:0:0:0]:8334"
+  "[1:2:3:4:5:6:7:8:9]:8334"
+  "[1:2:3:4:5:6:7::8]:8334"
+  "[12345::1]:8334"
+  "[::1.2.3]:8334"
+  "127.0.0.1:12345678901234567890"
+];
 # Valid endpoints stay accepted.
-assert rbitcoinFailures (moduleOnly {
-  p2p = onionListenOpts.p2p // { onionListen = "10.0.3.2:8334"; };
-}) == [ ];
-assert rbitcoinFailures (moduleOnly {
-  p2p = onionListenOpts.p2p // { onionListen = "[fd00::2]:8334"; };
-}) == [ ];
+assert nixpkgs.lib.all (a: rbitcoinFailures (moduleOnly {
+  p2p = onionListenOpts.p2p // { onionListen = a; };
+}) == [ ]) [
+  "10.0.3.2:8334"
+  "[fd00::2]:8334"
+  "[::ffff:127.0.0.1]:8334"
+  "[1:2:3:4:5:6:7:8]:8334"
+  "[1::]:8334"
+  "[fe80::1%2]:8334"
+];
 # A grant on the marked listener's own address is a bind grant on that listener
 # (the node accepts it); the firewall still leaves the onion port closed.
 assert
