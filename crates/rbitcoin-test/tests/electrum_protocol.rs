@@ -2774,8 +2774,12 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
 
     let (st, _, body) = http_get_raw(esplora.local_addr, &format!("/tx/{spend_hex}/status")).await;
     // The spend left the best chain and this server has no mempool to hold
-    // it, so it is gone (`confirmed: false` would mean "in the mempool").
-    assert_eq!(st, 404, "spend status after disconnect={body}");
+    // it. `/status` answers a dropped tx as unconfirmed, as electrs does.
+    assert_eq!(
+        (st, body.as_str()),
+        (200, r#"{"confirmed":false}"#),
+        "spend status after disconnect"
+    );
     assert_esplora_asof_dead(
         esplora.local_addr,
         &format!("/scripthash/{esplora_sh}/utxo?asof={asof_spend}"),
