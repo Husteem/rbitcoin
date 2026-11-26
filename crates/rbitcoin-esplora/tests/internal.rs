@@ -545,58 +545,15 @@ async fn tx_outspends_answers_a_large_fanout_whole_or_paged() {
     assert_eq!(bulk.len(), 1);
     assert_eq!(bulk[0], json!(whole_fan));
 
-    // A reply over the page size waits for the node's single heavy turn,
-    // unpaged or in the bulk route. A page, and a tx of the page size, does
-    // not.
-    let turn = Arc::clone(&pad.q.heavy_sh_join)
-        .try_acquire_owned()
-        .expect("turn free");
-    let mut waiting = Vec::new();
-    for route in [
-        format!("/tx/{fan}/outspends"),
-        format!("/txs/outspends?txids={fan}"),
-    ] {
-        let refused = pad
-            .q
-            .heavy_turn_refusals
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let (sock, path) = (sock.clone(), route.clone());
-        let task = tokio::spawn(async move { http_get_unix(&sock, &path).await });
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while pad
-                .q
-                .heavy_turn_refusals
-                .load(std::sync::atomic::Ordering::SeqCst)
-                == refused
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("a reply over the page size refuses while the turn is held");
-        assert!(!task.is_finished(), "{route} answered with the turn held");
-        waiting.push(task);
-    }
-    for route in [
-        format!("/tx/{fan}/outspends?start_index=0"),
-        format!("/tx/{full}/outspends"),
-    ] {
-        let got = tokio::time::timeout(std::time::Duration::from_secs(5), page(route.clone()))
-            .await
-            .unwrap_or_else(|_| panic!("{route} waited for the heavy turn"));
-        assert_eq!(got.len(), 10_000);
-    }
-    drop(turn);
-    let mut after = Vec::new();
-    for task in waiting {
-        let (st, resp) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
-            .await
-            .expect("answers once the turn is free")
-            .expect("join");
-        assert_eq!(st, 200, "{}", &resp[..resp.len().min(200)]);
-        after.push(serde_json::from_str::<Value>(&resp).unwrap());
-    }
-    assert_eq!(after, vec![json!(whole_fan), json!([whole_fan])]);
+    #[cfg(debug_assertions)]
+    outspends_over_a_page_wait_for_the_heavy_turn(
+        &pad.q,
+        &sock,
+        &fan,
+        &full.to_string(),
+        &whole_fan,
+    )
+    .await;
 
     let status = &first[0]["status"];
     assert_eq!(status["confirmed"], true, "{status}");
@@ -656,6 +613,71 @@ async fn tx_outspends_answers_a_large_fanout_whole_or_paged() {
 
     handle.shutdown().await;
     let _ = pad.dir;
+}
+
+/// A reply over the page size waits for the node's single heavy turn,
+/// unpaged or in the bulk route. A page, and a tx of the page size, does not.
+/// The refusal counter is debug-only.
+#[cfg(debug_assertions)]
+async fn outspends_over_a_page_wait_for_the_heavy_turn(
+    q: &Query,
+    sock: &std::path::Path,
+    fan: &str,
+    full: &str,
+    whole_fan: &[Value],
+) {
+    let page = |route: String| async move {
+        let (st, resp) = http_get_unix(sock, &route).await;
+        assert_eq!(st, 200, "{route}: {}", &resp[..resp.len().min(200)]);
+        serde_json::from_str::<Vec<Value>>(&resp).unwrap()
+    };
+    let turn = Arc::clone(&q.heavy_sh_join)
+        .try_acquire_owned()
+        .expect("turn free");
+    let mut waiting = Vec::new();
+    for route in [
+        format!("/tx/{fan}/outspends"),
+        format!("/txs/outspends?txids={fan}"),
+    ] {
+        let refused = q
+            .heavy_turn_refusals
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let (sock, path) = (sock.to_path_buf(), route.clone());
+        let task = tokio::spawn(async move { http_get_unix(&sock, &path).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while q
+                .heavy_turn_refusals
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == refused
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a reply over the page size refuses while the turn is held");
+        assert!(!task.is_finished(), "{route} answered with the turn held");
+        waiting.push(task);
+    }
+    for route in [
+        format!("/tx/{fan}/outspends?start_index=0"),
+        format!("/tx/{full}/outspends"),
+    ] {
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), page(route.clone()))
+            .await
+            .unwrap_or_else(|_| panic!("{route} waited for the heavy turn"));
+        assert_eq!(got.len(), 10_000);
+    }
+    drop(turn);
+    let mut after = Vec::new();
+    for task in waiting {
+        let (st, resp) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("answers once the turn is free")
+            .expect("join");
+        assert_eq!(st, 200, "{}", &resp[..resp.len().min(200)]);
+        after.push(serde_json::from_str::<Value>(&resp).unwrap());
+    }
+    assert_eq!(after, vec![json!(whole_fan), json!([whole_fan])]);
 }
 
 fn hex_hash(h: &[u8; 32]) -> String {
