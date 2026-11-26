@@ -73,6 +73,24 @@ fn zero_header_and_block(path: &Path) {
 }
 
 #[test]
+fn header_txs_flush_dirsyncs_the_pair_once() {
+    let dir = tmp();
+    let t = rbitcoin_store::HeaderTxsTable::create(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    t.put_range(&write, Fk(1), Fk(1), 1).unwrap();
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    t.flush().unwrap();
+    let dirs = rbitcoin_store::file::take_fsynced_dirs();
+    #[cfg(unix)]
+    assert_eq!(
+        dirs.len(),
+        2,
+        "the pair should sync the directory once after the sidecars and once after the unlinks, got {dirs:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn torn_header_txs_block_restores_from_ahead_image() {
     let dir = tmp();
     let (h600, h601);

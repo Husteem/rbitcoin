@@ -5,7 +5,7 @@ use crate::array_table::{
     STRONG_BIT_RESERVE_BYTES, STRONG_BIT_RESERVE_BYTES_TINY,
 };
 use crate::error::StoreError;
-use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::file::{fsync_parent_dir, TableFile, FILE_HEADER_LEN};
 use crate::hashhead::HeadScale;
 use crate::sync::atomic::{AtomicU64, Ordering};
 use rbitcoin_primitives::{Fk, Height, TableKind};
@@ -614,8 +614,7 @@ impl HeaderTxsTable {
         if first_side.is_file() && count_side.is_file() {
             ArrayTable::restore_ahead_keep(&first_path)?;
             ArrayTable::restore_ahead_keep(&count_path)?;
-            ArrayTable::remove_ahead(Some(first_side.clone()))?;
-            ArrayTable::remove_ahead(Some(count_side.clone()))?;
+            ArrayTable::remove_ahead([first_side, count_side])?;
         } else {
             let _ = std::fs::remove_file(&first_side);
             let _ = std::fs::remove_file(&count_side);
@@ -824,6 +823,13 @@ impl HeaderTxsTable {
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let first_ahead = self.first.write_ahead()?;
         let count_ahead = self.count.write_ahead()?;
+        if first_ahead.is_some() || count_ahead.is_some() {
+            if let Some(parent) = self.first.file.path().parent() {
+                if !parent.as_os_str().is_empty() {
+                    fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+                }
+            }
+        }
         #[cfg(debug_assertions)]
         if take_fail_ahead(self.first.file.path()) {
             return Err(StoreError::io(
@@ -839,8 +845,7 @@ impl HeaderTxsTable {
                 std::io::Error::other("injected header_txs payload failure"),
             ));
         }
-        ArrayTable::remove_ahead(first_ahead)?;
-        ArrayTable::remove_ahead(count_ahead)?;
+        ArrayTable::remove_ahead(first_ahead.into_iter().chain(count_ahead))?;
         Ok(())
     }
 }

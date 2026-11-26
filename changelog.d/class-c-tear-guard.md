@@ -1,7 +1,8 @@
 Fixed
 - **Class C and derived writes survive a torn in-place page.** A
   `header_txs` append rewrote the block holding the previous tip's committed
-  range, `header.head` rewrote a 3 KiB chunk beside committed slots, and
+  range. The two sidecars share one directory sync, and the two unlinks
+  share one. `header.head` rewrote a 3 KiB chunk beside committed slots, and
   `txstat.body` stamped cells in place. A power cut could tear those pages, and
   open accepted a missing `header_txs` range as `Ok` or served a
   well-formed wrong stats or filter value. Those writes now put a synced
@@ -16,7 +17,8 @@ Fixed
 - **txstat appends leave the Class A tail guard in charge of new cells.** An
   append-only batch does not copy the new tail into `txstat.body.ahead`. It
   drops leftover images that overlap the append and keeps pages it does not
-  touch. When every leftover page stays, the sidecar file is left in place. Restore will not shrink a durable length past the sidecar or replay
+  touch. When every leftover page stays, the sidecar file is left in place.
+  Restore will not shrink a durable length past the sidecar or replay
   bytes the append already published. A replay of an older page 0 skips that
   image's 16-byte header, so a crash before the header rewrite does not plant
   the old length over a newer tail. The in-place `getblockstats` stamp

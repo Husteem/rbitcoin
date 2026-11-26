@@ -1373,26 +1373,33 @@ impl ArrayTable {
         merged.sort_unstable_by_key(|(off, _)| *off);
         let buf = Self::encode_ahead(&header, &merged);
         let side = Self::ahead_path(self.file.path());
-        file::write_synced_tmp_rename(&side, &buf)?;
+        // File sync only. The caller directory-syncs once for the whole pair.
+        file::write_file_synced_tmp_rename(&side, &buf)?;
         Ok(Some(side))
     }
 
-    /// Remove a sidecar a successful flush made unnecessary. A leftover one is
-    /// harmless: open restores the same image and removes it.
-    pub(crate) fn remove_ahead(side: Option<PathBuf>) -> Result<(), StoreError> {
-        let Some(side) = side else {
-            return Ok(());
-        };
-        match std::fs::remove_file(&side) {
-            Ok(()) => {
-                if let Some(parent) = side.parent() {
-                    file::fsync_parent_dir(parent).map_err(|e| StoreError::io(parent, e))?;
+    /// Remove sidecars a successful flush made unnecessary. One directory
+    /// sync covers every unlink. A leftover sidecar is harmless: open
+    /// restores the same image and removes it.
+    pub(crate) fn remove_ahead(sides: impl IntoIterator<Item = PathBuf>) -> Result<(), StoreError> {
+        let mut parent: Option<PathBuf> = None;
+        for side in sides {
+            match std::fs::remove_file(&side) {
+                Ok(()) => {
+                    if parent.is_none() {
+                        parent = side.parent().map(|p| p.to_path_buf());
+                    }
                 }
-                Ok(())
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StoreError::io(&side, e)),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StoreError::io(&side, e)),
         }
+        if let Some(parent) = parent {
+            if !parent.as_os_str().is_empty() {
+                file::fsync_parent_dir(&parent).map_err(|e| StoreError::io(&parent, e))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
