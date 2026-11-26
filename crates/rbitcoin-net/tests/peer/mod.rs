@@ -11325,10 +11325,22 @@ async fn getcfilters_past_the_send_budget_sends_the_whole_range() {
     };
     write_peer_msg(&mut raw, NetworkMessage::GetCFilters(req)).await;
     wait_session_read(&node, &sess, "getcfilters").await;
+    // The handler has read the range and queued the filter that crosses the
+    // held cap once that filter arrives: every later one is parked, and only
+    // the session loop's resume arm can send it.
+    let first = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let NetworkMessage::CFilter(f) = next_peer_msg(&mut raw).await.unwrap() {
+                return f.block_hash;
+            }
+        }
+    })
+    .await
+    .expect("the filter that crosses the budget arrives");
     // A ping sent while the range is parked is answered after it.
     write_peer_msg(&mut raw, NetworkMessage::Ping(7)).await;
     drop(held);
-    let heights = tokio::time::timeout(Duration::from_secs(10), async {
+    let rest = tokio::time::timeout(Duration::from_secs(10), async {
         let mut got = Vec::new();
         loop {
             match next_peer_msg(&mut raw).await.unwrap() {
@@ -11339,7 +11351,9 @@ async fn getcfilters_past_the_send_budget_sends_the_whole_range() {
         }
     })
     .await
-    .expect("the range and then the pong arrive once the writer drains");
+    .expect("the rest of the range and then the pong arrive once the writer drains");
+    let mut heights = vec![first];
+    heights.extend(rest);
     assert_eq!(
         heights, want,
         "every filter, in height order, before the pong"
