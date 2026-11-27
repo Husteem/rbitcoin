@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-type CapturedParams = Arc<Mutex<Option<serde_json::Value>>>;
+type CapturedCall = Arc<Mutex<Option<(String, serde_json::Value)>>>;
 
 fn exit_ok(c: ExitCode) -> bool {
     format!("{c:?}") == format!("{:?}", ExitCode::SUCCESS)
@@ -258,11 +258,11 @@ fn default_rpc_port_follows_network() {
 }
 
 /// Serve one JSON-RPC request on `listener`, reply `"result": 7`, and
-/// capture the request's `params` into the returned slot.
+/// capture the request's method and `params` into the returned slot.
 #[cfg(unix)]
 fn serve_one_rpc(
     listener: std::os::unix::net::UnixListener,
-) -> (CapturedParams, thread::JoinHandle<()>) {
+) -> (CapturedCall, thread::JoinHandle<()>) {
     let captured = Arc::new(Mutex::new(None));
     let c = captured.clone();
     let h = thread::spawn(move || {
@@ -295,7 +295,12 @@ fn serve_one_rpc(
         }
         let body = &raw[header_end..header_end + content_length];
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
-            *c.lock().unwrap() = v.get("params").cloned();
+            let method = v
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            *c.lock().unwrap() = Some((method, v.get("params").cloned().unwrap_or_default()));
         }
         let body = "{\"jsonrpc\":\"1.0\",\"id\":\"1\",\"result\":7,\"error\":null}\n".to_string();
         let resp = format!(
@@ -410,7 +415,7 @@ fn getblock_keeps_a_digit_only_hash_a_string() {
         "2",
     ]);
     assert!(exit_ok(code), "getblock must succeed, got {code:?}");
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(params, serde_json::json!(["123456789", 2]));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
@@ -431,7 +436,7 @@ fn getnetworkhashps_negative_nblocks_is_a_number() {
         "-1",
     ]);
     assert!(exit_ok(code), "getnetworkhashps must succeed, got {code:?}");
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(params, serde_json::json!([-1]));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
@@ -519,8 +524,72 @@ fn stdin_flag_appends_args_from_stdin() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
 
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(params, serde_json::json!(["123456789", 2]));
+}
+
+#[cfg(unix)]
+#[test]
+fn stdin_flag_takes_the_method_from_stdin_when_argv_has_none() {
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rbitcoin-cli"))
+        .arg("--rpc-socket")
+        .arg(&sock)
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"getblockcount\n").unwrap();
+    }
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "echo getblockcount | rbitcoin-cli --stdin must exit 0, got {status:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
+
+    let (method, params) = captured.lock().unwrap().take().unwrap();
+    assert_eq!(method, "getblockcount");
+    assert_eq!(params, serde_json::json!([]));
+}
+
+#[test]
+fn apply_stdin_args_takes_the_method_from_stdin_only_when_argv_has_none() {
+    let mut cfg = call_cfg(&["rbitcoin-cli", "--stdin"]);
+    apply_stdin_args(&mut cfg, vec!["getblockcount".to_string()]);
+    assert_eq!(cfg.command.as_deref(), Some("getblockcount"));
+    assert!(cfg.params.is_empty());
+
+    let mut cfg = call_cfg(&["rbitcoin-cli", "--stdin"]);
+    apply_stdin_args(
+        &mut cfg,
+        vec![
+            "getblock".to_string(),
+            "123456789".to_string(),
+            "2".to_string(),
+        ],
+    );
+    assert_eq!(cfg.command.as_deref(), Some("getblock"));
+    assert_eq!(cfg.params, vec!["123456789".to_string(), "2".to_string()]);
+
+    let mut cfg = call_cfg(&["rbitcoin-cli", "--stdin", "getblock", "123456789"]);
+    apply_stdin_args(&mut cfg, vec!["2".to_string()]);
+    assert_eq!(cfg.command.as_deref(), Some("getblock"));
+    assert_eq!(cfg.params, vec!["123456789".to_string(), "2".to_string()]);
+
+    let mut cfg = call_cfg(&["rbitcoin-cli", "--stdin"]);
+    apply_stdin_args(&mut cfg, Vec::new());
+    assert_eq!(cfg.command, None);
+    assert!(cfg.params.is_empty());
 }
 
 #[test]
@@ -1282,7 +1351,7 @@ fn named_sends_positionals_in_args_array() {
         exit_ok(code),
         "--named getblockhash 100 must succeed, got {code:?}"
     );
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(params, serde_json::json!({"args": [100]}));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
@@ -1309,7 +1378,7 @@ fn named_keeps_a_value_containing_eq_positional() {
         exit_ok(code),
         "--named submitpackage with an = inside a value must succeed, got {code:?}"
     );
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(params, serde_json::json!({"args": [["tx", "a=b"]]}));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
@@ -1332,7 +1401,7 @@ fn named_keeps_an_explicit_args_over_the_positional_list() {
         r#"["a=b"]"#,
     ]);
     assert!(exit_ok(code), "--named echojson must succeed, got {code:?}");
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(params, serde_json::json!({"args": [1, 2]}));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
@@ -1355,7 +1424,7 @@ fn importmempool_positional_past_options_stays_a_string() {
         "leftover",
     ]);
     assert!(exit_ok(code), "importmempool must succeed, got {code:?}");
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(
         params,
         serde_json::json!(["file.dat", {}, "leftover"]),
@@ -1385,7 +1454,7 @@ fn importmempool_named_bools_convert() {
         exit_ok(code),
         "--named importmempool must succeed, got {code:?}"
     );
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(
         params,
         serde_json::json!({"filepath": "file.dat", "use_current_time": true})
@@ -1414,7 +1483,7 @@ fn named_duplicate_name_last_wins() {
         exit_ok(code),
         "--named getblockhash height=1 height=2 must succeed, got {code:?}"
     );
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(params, serde_json::json!({"height": 2}));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
@@ -1439,7 +1508,7 @@ fn named_params_reach_server_as_object() {
         exit_ok(code),
         "--named getblockhash height=1 must succeed, got {code:?}"
     );
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(params, serde_json::json!({"height": 1}));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
@@ -1465,7 +1534,7 @@ fn named_string_and_bool_params_keep_their_types() {
         exit_ok(code),
         "--named getrawtransaction must succeed, got {code:?}"
     );
-    let params = captured.lock().unwrap().take().unwrap();
+    let (_, params) = captured.lock().unwrap().take().unwrap();
     assert_eq!(
         params,
         serde_json::json!({"txid": "deadbeef", "verbose": true})
@@ -1590,16 +1659,21 @@ fn getinfo_rejects_a_command() {
     );
 }
 
-/// `--stdin` appends to `params` without setting a command, so the guard has to
-/// look at both.
+/// `--stdin` takes its first line as the command when argv has none and
+/// appends the rest to `params`, so the guard has to look at both.
 #[test]
 fn getinfo_rejects_stray_parameters() {
-    let mut cfg = match parse_args(&os_args(&["rbitcoin-cli", "--getinfo"])) {
+    let mut cfg = match parse_args(&os_args(&["rbitcoin-cli", "--getinfo", "--stdin"])) {
         Ok(Action::Call(cfg)) => cfg,
         Ok(_) => panic!("expected Action::Call"),
         Err(e) => panic!("--getinfo must parse, got: {e}"),
     };
-    cfg.params.push("getblockcount".to_string());
+    apply_stdin_args(
+        &mut cfg,
+        vec!["getblockcount".to_string(), "extra".to_string()],
+    );
+    assert_eq!(cfg.command.as_deref(), Some("getblockcount"));
+    assert_eq!(cfg.params, vec!["extra".to_string()]);
     assert_eq!(
         dispatch_call(&cfg).unwrap_err(),
         "--getinfo takes no arguments"
