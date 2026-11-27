@@ -3983,35 +3983,49 @@ async fn sp_timestamp_start_finds_a_payment_older_than_one_chunk() {
 /// A scan that keeps producing steps past one idle window is not closed
 /// mid-history: each step is the subscribe's response, so it restarts the
 /// window. A deadline armed once for the request would cut the history.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn sp_scan_steps_outlive_the_idle_window() {
     use crate::silent_scan::SpChain;
+    use rbitcoin_query::ApiSurface::{Electrum, Rest, Rpc};
 
-    let chain = SpChain::new("el-sp-idle", 30, &[]);
+    let chain = SpChain::new("el-sp-idle", 3, &[]);
     // Two permits: the subscribe's start read and one scan step at a time.
     // The test holds both after the reply, so each release runs one step.
     chain.q.set_api_read_budget(2);
     let budget = chain.q.api_read_budget();
-    let mut held = budget.acquire(rbitcoin_query::ApiSurface::Rpc).await;
+    let mut held = budget.acquire(Rpc).await;
     let mut cfg = sp_cfg();
     cfg.sp_scan_chunk = 1;
     cfg.limits.idle_timeout = Duration::from_millis(800);
-    let mut s = sp_session_with(&chain.q, cfg, 1 << 16);
-    let reply = s
-        .ask(&[sp_subscribe_line(1, chain.sub(json!(0)))])
+    let mut s = sp_session_with(&chain.q, cfg, SP_STALL_BUF);
+    s.send
+        .write_all(sp_subscribe_line(1, chain.sub(json!(0))).as_bytes())
         .await
-        .remove(0);
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), s.client.fill_buf())
+        .await
+        .unwrap()
+        .unwrap();
+    let other = budget.try_acquire(Rest).unwrap();
+    let reply = sp_next_line(&mut s.client).await;
     sp_accepted(&reply);
-    let other = budget.acquire(rbitcoin_query::ApiSurface::Rest).await;
     // Every release lets one step through well inside the idle window, but
     // the four together outlast it.
-    for _ in 0..4 {
-        drop(held);
-        held = budget.acquire(rbitcoin_query::ApiSurface::Rpc).await;
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    drop((held, other));
-    let (history, progress) = sp_read_history(&mut s.client, &reply["result"]).await;
+    let pace_steps = async {
+        let queued_by = Instant::now() + Duration::from_secs(20);
+        for _ in 0..4 {
+            while budget.waiting(Electrum) == 0 {
+                assert!(Instant::now() < queued_by);
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            drop(held);
+            held = budget.acquire(Rpc).await;
+        }
+        drop((held, other));
+    };
+    let ((), (history, progress)) =
+        tokio::join!(pace_steps, sp_read_history(&mut s.client, &reply["result"]));
     assert!(history.is_empty(), "{history:?}");
     assert_eq!(progress.last().copied(), Some(1.0), "{progress:?}");
     s.assert_quiet(2).await;
