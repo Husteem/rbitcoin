@@ -1692,6 +1692,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 {
                     warn!("mempool persist_due: {e}");
                 }
+                log_settle_waits();
                 let mp = mempool.sample_reset_perf();
                 let (esp_n, esp_us, esp_max) = rbitcoin_esplora::sample_reset_perf();
                 let (el_n, el_us, el_max) = rbitcoin_electrum::sample_reset_perf();
@@ -1941,6 +1942,24 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     shutdown.result()?;
     info!("node: clean exit");
     Ok(())
+}
+
+/// One INFO line per 5 s window in which an Esplora or Electrum read met a
+/// block connect holding the pool. Quiet otherwise.
+fn log_settle_waits() {
+    let settle = &rbitcoin_net::SETTLE_WAITS;
+    let (n, us, max_us) = settle.waits.take_window();
+    let gave_up = settle.gave_up.take_window();
+    let refused = settle.refused.take_window();
+    if n == 0 && refused == 0 {
+        return;
+    }
+    info!(
+        "api: settle waits={n} total_ms={} max_ms={} gave_up={gave_up} refused={refused} \
+         (reads that met a block connect)",
+        us / 1000,
+        max_us / 1000
+    );
 }
 
 #[doc(hidden)]

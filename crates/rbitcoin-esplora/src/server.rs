@@ -1772,7 +1772,7 @@ pub fn tx_status_reply(
     asof: Option<[u8; 32]>,
     after_lookup: impl FnOnce(),
 ) -> Response {
-    let settle0 = pool_settle(st.mempool.as_deref());
+    let settle0 = crate::tx_json::settle_unless_asof(st.mempool.as_deref(), asof);
     match st.query.tx_fk_by_txid(txid) {
         Ok(Some(fk)) => {
             after_lookup();

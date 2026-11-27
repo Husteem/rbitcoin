@@ -3265,6 +3265,136 @@ fn dropped_hold_publishes_an_update_that_landed_without_a_commit() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// Every block connect holds the pool. An API read that starts in that window
+/// waits for the hold to end and then reads a settled pool. It no longer
+/// answers "chain view moved" about once per block (#2139). The wait is
+/// counted for `/metrics`.
+#[test]
+fn an_api_read_waits_out_a_connect_hold() {
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+    let waits = SETTLE_WAITS.waits.requests.total();
+    let waited_us = SETTLE_WAITS.waits.wall_us.total();
+    let hold = mp.template_hold();
+    let bg = Arc::clone(&mp);
+    let read = std::thread::spawn(move || {
+        let settle0 = pool_settle(Some(&bg));
+        (settle0, require_settled(Some(&bg), settle0).is_ok())
+    });
+    let parked = Instant::now();
+    while mp.settle_waiters() == 0 {
+        assert!(
+            !read.is_finished(),
+            "the read answered while the pool was held"
+        );
+        assert!(parked.elapsed() < Duration::from_secs(10), "never waited");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop(hold);
+    let (settle0, settled) = read.join().unwrap();
+    assert_eq!(settle0 % 2, 0, "the read sampled a held pool");
+    assert!(settled, "a read after the hold ended was refused");
+    assert!(SETTLE_WAITS.waits.requests.total() > waits);
+    assert!(SETTLE_WAITS.waits.wall_us.total() > waited_us);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// Once a read gives up on a hold, later reads during that hold do not wait
+/// again: a loop of reads, or a crowd of them, waits one bound per hold, not
+/// one per read.
+#[test]
+fn reads_wait_out_one_bound_per_hold() {
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+    mp.set_settle_wait_max(Duration::from_millis(200));
+    let hold = mp.template_hold();
+    let t0 = Instant::now();
+    assert_eq!(pool_settle(Some(&mp)) % 2, 1);
+    assert!(t0.elapsed() >= Duration::from_millis(200), "did not wait");
+    let t1 = Instant::now();
+    for _ in 0..5 {
+        assert_eq!(pool_settle(Some(&mp)) % 2, 1);
+    }
+    assert!(
+        t1.elapsed() < Duration::from_millis(200),
+        "a read waited again on a hold already given up on"
+    );
+    drop(hold);
+    let _again = mp.template_hold();
+    let t2 = Instant::now();
+    assert_eq!(pool_settle(Some(&mp)) % 2, 1);
+    assert!(
+        t2.elapsed() >= Duration::from_millis(200),
+        "the next hold is waited out again"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// A read already parked when another read gives up on the hold stops
+/// waiting then too, rather than at its own deadline.
+#[test]
+fn a_give_up_wakes_reads_already_parked_on_the_hold() {
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = Arc::new(MempoolHub::open(&dir, Arc::new(q)).unwrap());
+    mp.set_settle_wait_max(Duration::from_secs(2));
+    let hold = mp.template_hold();
+    let first = {
+        let mp = Arc::clone(&mp);
+        std::thread::spawn(move || pool_settle(Some(&mp)))
+    };
+    let start = Instant::now();
+    while mp.settle_waiters() == 0 {
+        assert!(
+            !first.is_finished() && start.elapsed() < Duration::from_secs(2),
+            "the first read did not park in its settle wait"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    let t0 = Instant::now();
+    assert_eq!(pool_settle(Some(&mp)) % 2, 1);
+    assert!(
+        t0.elapsed() < Duration::from_millis(1600),
+        "a parked read waited out its own bound after another read gave up: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(first.join().unwrap() % 2, 1);
+    drop(hold);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// A hold that outlasts the bound still gets an answer: the wait gives up and
+/// `require_settled` refuses the read, as before. Both outcomes are counted.
+#[test]
+fn a_read_past_the_settle_bound_is_refused_and_counted() {
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+    mp.set_settle_wait_max(Duration::from_millis(30));
+    let gave_up = SETTLE_WAITS.gave_up.total();
+    let refused = SETTLE_WAITS.refused.total();
+    let _hold = mp.template_hold();
+    let t0 = Instant::now();
+    let settle0 = pool_settle(Some(&mp));
+    assert!(t0.elapsed() >= Duration::from_millis(30), "did not wait");
+    assert_eq!(settle0 % 2, 1);
+    assert!(require_settled(Some(&mp), settle0).is_err());
+    assert!(SETTLE_WAITS.gave_up.total() > gave_up);
+    assert!(SETTLE_WAITS.refused.total() > refused);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
 /// A template build samples the stripped tip twice. If the tip moves between
 /// those reads, the build must retry and arm the new hash, not the stale one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

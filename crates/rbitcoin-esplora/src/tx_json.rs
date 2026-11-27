@@ -6,6 +6,17 @@ use bitcoin::{Network, Transaction, Txid};
 use rbitcoin_net::MempoolHub;
 pub use rbitcoin_net::{pool_settle, require_settled};
 
+/// [`pool_settle`] for a read that may name a block. A read at `asof` never
+/// meets the pool, so it does not wait out a connect hold; its `0` is never
+/// checked, since such a read hands the overlay no mempool.
+pub fn settle_unless_asof(mempool: Option<&MempoolHub>, asof: Option<[u8; 32]>) -> u64 {
+    if asof.is_some() {
+        0
+    } else {
+        pool_settle(mempool)
+    }
+}
+
 use rbitcoin_primitives::{Fk, Height};
 
 use rbitcoin_query::{ChainView, Query, QueryError, ScriptHashHistoryItem, ScriptHashUtxo};

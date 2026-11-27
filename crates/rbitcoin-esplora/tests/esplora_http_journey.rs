@@ -1623,6 +1623,8 @@ async fn unlisted_tx_is_503_while_a_reorg_holds_the_pool() {
     pad.connect(vec![stored_spend(&tx, pad.cbs[0])]);
     pad.q.disconnect_tip().unwrap();
 
+    // Past the wait bound: a hold this long is answered 503.
+    pad.hub.set_settle_wait_max(std::time::Duration::ZERO);
     let hold = pad.hub.template_hold();
     for (path, st, body) in tx_routes(pad.addr, &id).await {
         assert_eq!((st, body.as_str()), (503, "chain view moved"), "{path}");
@@ -1662,6 +1664,7 @@ async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
         format!("/scripthash/{sh}"),
     ];
 
+    pad.hub.set_settle_wait_max(std::time::Duration::ZERO);
     let hold = pad.hub.template_hold();
     for path in &routes {
         let (st, body) = http_get(pad.addr, path).await;
@@ -1680,6 +1683,78 @@ async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
     let slot: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(slot["spent"], true, "{body}");
     assert_eq!(slot["status"]["confirmed"], false, "{body}");
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A read at a named block (`?asof=`) answers from that block and never meets
+/// the pool, so a connect hold does not make it wait.
+#[tokio::test(flavor = "current_thread")]
+async fn reads_at_a_named_block_do_not_wait_out_a_hold() {
+    use bitcoin::hashes::Hash;
+    let (dir, pad, handle) = reorg_pad("asof-hold").await;
+    let asof = block_hash_hex(&pad.hashes[pad.hashes.len() - 1]);
+    let sh = hex_encode(script_hash(&[0x51]));
+    let cb = display_txid(bitcoin::Txid::from_byte_array(pad.cbs[0]));
+    for path in [
+        format!("/scripthash/{sh}/utxo?asof={asof}"),
+        format!("/scripthash/{sh}?asof={asof}"),
+        format!("/tx/{cb}/outspend/0?asof={asof}"),
+        format!("/tx/{cb}/outspends?asof={asof}"),
+        format!("/tx/{cb}/status?asof={asof}"),
+    ] {
+        let hold = pad.hub.template_hold();
+        let t0 = std::time::Instant::now();
+        let (st, body) = http_get(pad.addr, &path).await;
+        let took = t0.elapsed();
+        drop(hold);
+        assert_eq!(st, 200, "{path}: {body}");
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "{path} waited out the hold: {took:?}"
+        );
+    }
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `/utxo` read that arrives while a connect holds the pool waits, then
+/// pins the tip that connect left. Pinning first and waiting after joined the
+/// old tip's coins with the new pool, so a coin spent in the connected block
+/// read unspent (#2147 review).
+#[tokio::test(flavor = "current_thread")]
+async fn a_utxo_read_across_a_connect_pins_the_new_tip() {
+    use bitcoin::hashes::Hash;
+    let (dir, mut pad, handle) = reorg_pad("utxo-across-connect").await;
+    let tx = spend_tx(&pad, 0);
+    let cb = display_txid(bitcoin::Txid::from_byte_array(pad.cbs[0]));
+    let path = format!("/scripthash/{}/utxo", hex_encode(script_hash(&[0x51])));
+    let (st, body) = http_get(pad.addr, &path).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains(&cb), "the coin is unspent before: {body}");
+
+    let hub = Arc::clone(&pad.hub);
+    let hold = hub.template_hold();
+    let addr = pad.addr;
+    let read = tokio::spawn(async move { http_get(addr, &path).await });
+    // The read parks in its settle wait on a blocking thread.
+    let t0 = std::time::Instant::now();
+    while hub.settle_waiters() == 0 {
+        assert!(
+            !read.is_finished() && t0.elapsed() < std::time::Duration::from_secs(5),
+            "the read did not park in its settle wait"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    pad.connect(vec![stored_spend(&tx, pad.cbs[0])]);
+    drop(hold);
+    let (st, body) = read.await.unwrap();
+    assert_eq!(st, 200, "{body}");
+    assert!(
+        !body.contains(&cb),
+        "a coin spent in the connected block read unspent: {body}"
+    );
 
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

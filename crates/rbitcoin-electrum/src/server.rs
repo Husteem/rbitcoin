@@ -1435,11 +1435,18 @@ fn dispatch_off_worker(
     mut work: ElectrumConn,
 ) -> (Result<Value, String>, ElectrumConn, Option<ChainView>) {
     if !method_stamps_chain_tip(method) {
-        let r = dispatch_pinned(method, params, q, cfg, p, mp, &mut work, None, false);
+        let r = dispatch_pinned(method, params, q, cfg, p, mp, &mut work, None, false, None);
         return (r, work, None);
     }
+    // Before the pin: a read that waits out a connect then pins the tip that
+    // connect left. A read at a named block never meets the pool.
+    let at_block = matches!(take_trailing_asof(method, params), Ok((_, Some(_))));
+    let settle0 =
+        (method_reads_settled(method) && !at_block).then(|| rbitcoin_net::pool_settle(mp));
     let (r, view) = electrum_at_chain_view(q, method, params, |q, params, view, is_asof| {
-        dispatch_pinned(method, params, q, cfg, p, mp, &mut work, view, is_asof)
+        dispatch_pinned(
+            method, params, q, cfg, p, mp, &mut work, view, is_asof, settle0,
+        )
     });
     (r, work, view)
 }
@@ -3367,6 +3374,15 @@ where
     }
 }
 
+/// Methods whose answer [`rbitcoin_net::require_settled`] guards. They
+/// sample the settle generation before the request's view is pinned.
+fn method_reads_settled(method: &str) -> bool {
+    matches!(
+        method,
+        "blockchain.scripthash.get_balance" | "blockchain.scripthash.listunspent"
+    )
+}
+
 #[doc(hidden)]
 pub fn dispatch_with_join(
     method: &str,
@@ -3384,7 +3400,7 @@ pub fn dispatch_with_join(
         return Ok(json!([SERVER_VERSION, conn.protocol.as_str()]));
     }
     dispatch_pinned(
-        method, params, query, config, chain, mempool, conn, None, false,
+        method, params, query, config, chain, mempool, conn, None, false, None,
     )
 }
 
@@ -3580,6 +3596,7 @@ pub fn dispatch_pinned(
     conn: &mut ElectrumConn,
     pinned: Option<&ChainView>,
     is_asof: bool,
+    settle0: Option<u64>,
 ) -> Result<Value, String> {
     // Held for the whole dispatch: the rebuild's wipe waits for it. A read a
     // fault, a rebuild step or an unlink batch overlapped is not an answer.
@@ -3599,9 +3616,26 @@ pub fn dispatch_pinned(
         }
     };
     let out = dispatch_method(
-        method, params, query, config, chain, mempool, conn, pinned, is_asof,
+        method, params, query, config, chain, mempool, conn, pinned, is_asof, settle0,
     );
     settle_sh_dispatch(sh_guard, query, conn, out)
+}
+
+/// The settle generation a coin read checks. A caller that pinned a view
+/// sampled it first ([`method_reads_settled`]); without a pin it is sampled
+/// here, before the read pins. A read at a named block (`is_asof` pinned, or
+/// a trailing `asof`) never meets the pool, so it does not wait out a hold
+/// and its `0` is never checked.
+fn read_settle(
+    settle0: Option<u64>,
+    mempool: Option<&MempoolHub>,
+    is_asof: bool,
+    asof: bool,
+) -> u64 {
+    if is_asof || asof {
+        return 0;
+    }
+    settle0.unwrap_or_else(|| rbitcoin_net::pool_settle(mempool))
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
@@ -3615,7 +3649,9 @@ fn dispatch_method(
     conn: &mut ElectrumConn,
     pinned: Option<&ChainView>,
     is_asof: bool,
+    settle0: Option<u64>,
 ) -> Result<Value, String> {
+    let settle0 = |asof: bool| read_settle(settle0, mempool, is_asof, asof);
     let protocol = conn.protocol.clone();
     let header_sub = &mut conn.header_sub;
     let sh_subs = &mut conn.sh_subs;
@@ -3721,7 +3757,7 @@ fn dispatch_method(
                 take_trailing_asof(method, params)?
             };
             let sh = param_scripthash(&params, 0)?;
-            let settle0 = rbitcoin_net::pool_settle(mempool);
+            let settle0 = settle0(asof.is_some());
             let mut b = sh_at_view(
                 query,
                 pinned,
@@ -3762,6 +3798,7 @@ fn dispatch_method(
                 take_trailing_asof(method, params)?
             };
             let sh = param_scripthash(&params, 0)?;
+            let settle0 = settle0(asof.is_some());
             let u = sh_at_view(
                 query,
                 pinned,
@@ -3774,13 +3811,15 @@ fn dispatch_method(
                 },
                 |q, slot, view| {
                     crate::unspent::scripthash_utxos_with_mempool_slot_in(
-                        q, mempool, &sh, slot, view,
+                        q, mempool, &sh, slot, view, settle0,
                     )
                     .map_err(|e| e.to_string())
                 },
                 |q, slot| {
-                    crate::unspent::scripthash_utxos_with_mempool_slot(q, mempool, &sh, slot)
-                        .map_err(|e| e.to_string())
+                    crate::unspent::scripthash_utxos_with_mempool_slot(
+                        q, mempool, &sh, slot, settle0,
+                    )
+                    .map_err(|e| e.to_string())
                 },
             )?;
             let arr: Vec<Value> = u

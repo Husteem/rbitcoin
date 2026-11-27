@@ -7,7 +7,7 @@ use crate::server::{
 };
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, confirmed_status_json_in, history_items_to_tx_json,
-    pool_settle, tx_status_json_in, utxo_list_json, vout_fields, Listing,
+    settle_unless_asof, tx_status_json_in, utxo_list_json, vout_fields, Listing,
 };
 use axum::body::Bytes;
 use axum::extract::{Path, Query as AxumQuery, State};
@@ -765,7 +765,7 @@ pub async fn tx_outspend(
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        let settle0 = pool_settle(st.mempool.as_deref());
+        let settle0 = settle_unless_asof(st.mempool.as_deref(), asof);
         let in_class_a = match st.query.tx_fk_by_txid(&txid) {
             Ok(Some(fk)) if asof.is_none() => match stored_tx_listing(&st, fk, &txid, settle0) {
                 Ok(listing) => listing != Listing::Gone,
@@ -835,7 +835,7 @@ pub async fn tx_outspends(
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        let settle0 = pool_settle(st.mempool.as_deref());
+        let settle0 = settle_unless_asof(st.mempool.as_deref(), asof);
         let fk = match st.query.tx_fk_by_txid(&txid) {
             Ok(Some(fk)) if asof.is_none() => match stored_tx_listing(&st, fk, &txid, settle0) {
                 Ok(Listing::Gone) => return not_found(),
@@ -1345,6 +1345,9 @@ pub fn utxo_response(
     asof: Option<[u8; 32]>,
     client: Option<&str>,
 ) -> Response {
+    // Before the pin: a read that waits out a connect then pins the tip that
+    // connect left.
+    let settle0 = settle_unless_asof(st.mempool.as_deref(), asof);
     let (list, view) = match sh_at_view(
         st,
         sh,
@@ -1357,6 +1360,7 @@ pub fn utxo_response(
                 sh,
                 slot,
                 view,
+                settle0,
             )
         },
         Vec::new(),
@@ -1392,7 +1396,7 @@ pub fn sh_stats_json(
     asof: Option<[u8; 32]>,
     client: Option<&str>,
 ) -> Result<(Value, Option<rbitcoin_query::ChainView>), Response> {
-    let settle0 = crate::tx_json::pool_settle(st.mempool.as_deref());
+    let settle0 = settle_unless_asof(st.mempool.as_deref(), asof);
     let (chain, view) = sh_at_view(
         st,
         sh,

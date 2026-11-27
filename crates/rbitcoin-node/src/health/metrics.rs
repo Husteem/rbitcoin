@@ -174,6 +174,29 @@ pub fn render(status: &NodeStatus) -> String {
         "Electrum dispatch wall time in seconds.",
         seconds(us),
     );
+    let settle = &rbitcoin_net::SETTLE_WAITS;
+    out.counter(
+        "rbitcoin_api_settle_waits_total",
+        "Esplora and Electrum reads that met a block connect holding the pool and \
+         waited for it (tip: api settle waits).",
+        settle.waits.requests.total(),
+    );
+    out.counter(
+        "rbitcoin_api_settle_wait_seconds_total",
+        "Time those reads waited, in seconds.",
+        seconds(settle.waits.wall_us.total()),
+    );
+    out.counter(
+        "rbitcoin_api_settle_gave_up_total",
+        "Block connects that held the pool past the wait bound of a waiting read.",
+        settle.gave_up.total(),
+    );
+    out.counter(
+        "rbitcoin_api_settle_refused_total",
+        "Reads answered \"chain view moved\": the wait gave up, or the tip moved \
+         during the read.",
+        settle.refused.total(),
+    );
     if let Some(sv2) = status.sv2.get() {
         let (checks, _) = sv2.fee_checks.totals();
         out.counter(
