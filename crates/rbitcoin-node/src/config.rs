@@ -2133,27 +2133,27 @@ impl NodeConfig {
             }
             "no_seeds" => self.listen.use_seeds = !is_conf_true(val),
             "regtest" => {
-                if conf_bool("regtest", val)? {
+                if conf_network_bool("regtest", val)? {
                     self.network = Network::Regtest;
                 }
             }
             "signet" => {
-                if conf_bool("signet", val)? {
+                if conf_network_bool("signet", val)? {
                     self.network = Network::Signet;
                 }
             }
             "testnet" => {
-                if conf_bool("testnet", val)? {
+                if conf_network_bool("testnet", val)? {
                     self.network = Network::Testnet;
                 }
             }
             "testnet4" => {
-                if conf_bool("testnet4", val)? {
+                if conf_network_bool("testnet4", val)? {
                     self.network = Network::Testnet4;
                 }
             }
             "testnet5" => {
-                if conf_bool("testnet5", val)? {
+                if conf_network_bool("testnet5", val)? {
                     self.network = Network::Testnet5;
                 }
             }
@@ -2215,6 +2215,16 @@ pub fn parse_authority_sec(key: &str, val: &str) -> Result<Sv2AuthoritySecret, N
                 "conf {key}: want a secp256k1 secret key (64 hex or key-utils base58check)"
             ))
         })
+}
+
+/// A network key (`testnet4=`): an empty value selects the network, as Core's
+/// `InterpretBool` reads it and 0.9.x read the four keys it had. Otherwise
+/// [`conf_bool`].
+fn conf_network_bool(key: &str, val: &str) -> Result<bool, NodeError> {
+    if val.is_empty() {
+        return Ok(true);
+    }
+    conf_bool(key, val)
 }
 
 fn conf_bool(key: &str, val: &str) -> Result<bool, NodeError> {
