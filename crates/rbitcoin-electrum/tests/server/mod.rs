@@ -2300,6 +2300,38 @@ async fn coin_reads_wait_out_a_short_connect_hold() {
     let _ = std::fs::remove_dir_all(&pad.dir);
 }
 
+/// A coin read with a trailing `asof:` answers from the block it names and
+/// never meets the pool, so a connect hold does not make it wait.
+#[tokio::test]
+async fn coin_reads_at_a_named_block_do_not_wait_out_a_hold() {
+    let mut pad = pool_pad().await;
+    pad.mp.set_settle_wait_max(Duration::from_secs(3));
+    let mut tip = [0u8; 32];
+    tip[0] = 0x44;
+    let asof = format!("asof:{}", rbitcoin_primitives::display_hash_hex(tip));
+    let sh = pad.sh.clone();
+    let mp = Arc::clone(&pad.mp);
+    for (i, method) in [
+        "blockchain.scripthash.listunspent",
+        "blockchain.scripthash.get_balance",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let hold = mp.template_hold();
+        let t0 = std::time::Instant::now();
+        let r = pad.call(i as u32, method, json!([sh, asof])).await;
+        let took = t0.elapsed();
+        drop(hold);
+        assert!(r["error"].is_null(), "{method} asof across a hold: {r}");
+        assert!(
+            took < Duration::from_millis(1500),
+            "{method} asof waited out the hold: {took:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
 /// While a connect, disconnect or reorg holds the pool, a coin whose spend
 /// is re-entering it would read unspent. A hold that outlasts the wait bound
 /// (zero here) refuses listunspent, balance and outpoint status until the

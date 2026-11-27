@@ -1688,6 +1688,37 @@ async fn spent_coin_is_503_not_unspent_while_a_reorg_holds_the_pool() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A read at a named block (`?asof=`) answers from that block and never meets
+/// the pool, so a connect hold does not make it wait.
+#[tokio::test(flavor = "current_thread")]
+async fn reads_at_a_named_block_do_not_wait_out_a_hold() {
+    use bitcoin::hashes::Hash;
+    let (dir, pad, handle) = reorg_pad("asof-hold").await;
+    let asof = block_hash_hex(&pad.hashes[pad.hashes.len() - 1]);
+    let sh = hex_encode(script_hash(&[0x51]));
+    let cb = display_txid(bitcoin::Txid::from_byte_array(pad.cbs[0]));
+    for path in [
+        format!("/scripthash/{sh}/utxo?asof={asof}"),
+        format!("/scripthash/{sh}?asof={asof}"),
+        format!("/tx/{cb}/outspend/0?asof={asof}"),
+        format!("/tx/{cb}/outspends?asof={asof}"),
+        format!("/tx/{cb}/status?asof={asof}"),
+    ] {
+        let hold = pad.hub.template_hold();
+        let t0 = std::time::Instant::now();
+        let (st, body) = http_get(pad.addr, &path).await;
+        let took = t0.elapsed();
+        drop(hold);
+        assert_eq!(st, 200, "{path}: {body}");
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "{path} waited out the hold: {took:?}"
+        );
+    }
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `/utxo` read that arrives while a connect holds the pool waits, then
 /// pins the tip that connect left. Pinning first and waiting after joined the
 /// old tip's coins with the new pool, so a coin spent in the connected block

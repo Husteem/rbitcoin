@@ -1439,8 +1439,10 @@ fn dispatch_off_worker(
         return (r, work, None);
     }
     // Before the pin: a read that waits out a connect then pins the tip that
-    // connect left.
-    let settle0 = method_reads_settled(method).then(|| rbitcoin_net::pool_settle(mp));
+    // connect left. A read at a named block never meets the pool.
+    let at_block = matches!(take_trailing_asof(method, params), Ok((_, Some(_))));
+    let settle0 =
+        (method_reads_settled(method) && !at_block).then(|| rbitcoin_net::pool_settle(mp));
     let (r, view) = electrum_at_chain_view(q, method, params, |q, params, view, is_asof| {
         dispatch_pinned(
             method, params, q, cfg, p, mp, &mut work, view, is_asof, settle0,
@@ -3619,6 +3621,23 @@ pub fn dispatch_pinned(
     settle_sh_dispatch(sh_guard, query, conn, out)
 }
 
+/// The settle generation a coin read checks. A caller that pinned a view
+/// sampled it first ([`method_reads_settled`]); without a pin it is sampled
+/// here, before the read pins. A read at a named block (`is_asof` pinned, or
+/// a trailing `asof`) never meets the pool, so it does not wait out a hold
+/// and its `0` is never checked.
+fn read_settle(
+    settle0: Option<u64>,
+    mempool: Option<&MempoolHub>,
+    is_asof: bool,
+    asof: bool,
+) -> u64 {
+    if is_asof || asof {
+        return 0;
+    }
+    settle0.unwrap_or_else(|| rbitcoin_net::pool_settle(mempool))
+}
+
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 fn dispatch_method(
     method: &str,
@@ -3632,10 +3651,7 @@ fn dispatch_method(
     is_asof: bool,
     settle0: Option<u64>,
 ) -> Result<Value, String> {
-    // A caller that pinned `pinned` sampled the settle generation first
-    // ([`method_reads_settled`]). Without a pin it is sampled here, before
-    // the read pins.
-    let settle0 = || settle0.unwrap_or_else(|| rbitcoin_net::pool_settle(mempool));
+    let settle0 = |asof: bool| read_settle(settle0, mempool, is_asof, asof);
     let protocol = conn.protocol.clone();
     let header_sub = &mut conn.header_sub;
     let sh_subs = &mut conn.sh_subs;
@@ -3741,7 +3757,7 @@ fn dispatch_method(
                 take_trailing_asof(method, params)?
             };
             let sh = param_scripthash(&params, 0)?;
-            let settle0 = settle0();
+            let settle0 = settle0(asof.is_some());
             let mut b = sh_at_view(
                 query,
                 pinned,
@@ -3782,7 +3798,7 @@ fn dispatch_method(
                 take_trailing_asof(method, params)?
             };
             let sh = param_scripthash(&params, 0)?;
-            let settle0 = settle0();
+            let settle0 = settle0(asof.is_some());
             let u = sh_at_view(
                 query,
                 pinned,

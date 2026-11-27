@@ -3350,7 +3350,12 @@ fn a_give_up_wakes_reads_already_parked_on_the_hold() {
         let mp = Arc::clone(&mp);
         std::thread::spawn(move || pool_settle(Some(&mp)))
     };
+    let start = Instant::now();
     while mp.settle_waiters() == 0 {
+        assert!(
+            !first.is_finished() && start.elapsed() < Duration::from_secs(2),
+            "the first read did not park in its settle wait"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     std::thread::sleep(Duration::from_secs(1));
