@@ -738,6 +738,15 @@ pub fn read_stdin_args(reader: impl BufRead) -> Result<Vec<String>, String> {
         .collect()
 }
 
+#[doc(hidden)]
+pub fn apply_stdin_args(cfg: &mut CliConfig, extra: Vec<String>) {
+    let mut extra = extra.into_iter();
+    if cfg.command.is_none() {
+        cfg.command = extra.next();
+    }
+    cfg.params.extend(extra);
+}
+
 /// Retry a transient connect error every `delay` until `limit` has passed
 /// (`None`: forever), as Core's `-rpcwaittimeout` does. The last pause is
 /// cut short so the last attempt lands on the limit. Each attempt gets the
@@ -1184,7 +1193,7 @@ where
         Action::Call(mut cfg) => {
             if cfg.stdin {
                 match read_stdin_args(std::io::stdin().lock()) {
-                    Ok(extra) => cfg.params.extend(extra),
+                    Ok(extra) => apply_stdin_args(&mut cfg, extra),
                     Err(e) => {
                         eprintln!("error: {e}");
                         return ExitCode::from(2);
