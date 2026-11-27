@@ -1708,7 +1708,12 @@ async fn a_utxo_read_across_a_connect_pins_the_new_tip() {
     let addr = pad.addr;
     let read = tokio::spawn(async move { http_get(addr, &path).await });
     // The read parks in its settle wait on a blocking thread.
+    let t0 = std::time::Instant::now();
     while hub.settle_waiters() == 0 {
+        assert!(
+            !read.is_finished() && t0.elapsed() < std::time::Duration::from_secs(5),
+            "the read did not park in its settle wait"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     pad.connect(vec![stored_spend(&tx, pad.cbs[0])]);

@@ -3336,6 +3336,37 @@ fn reads_wait_out_one_bound_per_hold() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// A read already parked when another read gives up on the hold stops
+/// waiting then too, rather than at its own deadline.
+#[test]
+fn a_give_up_wakes_reads_already_parked_on_the_hold() {
+    let dir = tmp();
+    let store_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let mp = Arc::new(MempoolHub::open(&dir, Arc::new(q)).unwrap());
+    mp.set_settle_wait_max(Duration::from_secs(2));
+    let hold = mp.template_hold();
+    let first = {
+        let mp = Arc::clone(&mp);
+        std::thread::spawn(move || pool_settle(Some(&mp)))
+    };
+    while mp.settle_waiters() == 0 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+    let t0 = Instant::now();
+    assert_eq!(pool_settle(Some(&mp)) % 2, 1);
+    assert!(
+        t0.elapsed() < Duration::from_millis(1600),
+        "a parked read waited out its own bound after another read gave up: {:?}",
+        t0.elapsed()
+    );
+    assert_eq!(first.join().unwrap() % 2, 1);
+    drop(hold);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
 /// A hold that outlasts the bound still gets an answer: the wait gives up and
 /// `require_settled` refuses the read, as before. Both outcomes are counted.
 #[test]

@@ -1814,6 +1814,9 @@ impl SettleGate {
         SETTLE_WAITS.waits.note(waited);
         if !gen.is_multiple_of(2) && self.gave_up_on.swap(gen, Ordering::SeqCst) != gen {
             SETTLE_WAITS.gave_up.add(1);
+            // Reads parked before this give-up stop waiting now too.
+            drop(self.wake.lock().unwrap_or_else(|e| e.into_inner()));
+            self.settled.notify_all();
             rbitcoin_log::warn!(
                 "api: a read waited {max:?} for a block connect to settle and answered \
                  \"chain view moved\"; reads during this hold no longer wait"
